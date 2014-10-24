@@ -61,7 +61,7 @@ namespace mongo {
 
         virtual bool findRecord( OperationContext* txn, const RecordId& loc, RecordData* rd ) const;
 
-        virtual void deleteRecord( OperationContext* txn, const RecordId& dl );
+        virtual void deleteRecord( OperationContext* txn, const RecordId& dl, const RecordData *rec = NULL );
 
         virtual StatusWith<RecordId> insertRecord( OperationContext* txn,
                                                   const char* data,

@@ -177,7 +177,7 @@ namespace mongo {
         return true;
     }
 
-    void InMemoryRecordStore::deleteRecord(OperationContext* txn, const RecordId& loc) {
+    void InMemoryRecordStore::deleteRecord(OperationContext* txn, const RecordId& loc, const RecordData *) {
         InMemoryRecord* rec = recordFor(loc);
         txn->recoveryUnit()->registerChange(new RemoveChange(_data, loc, *rec));
         _data->dataSize -= rec->size;

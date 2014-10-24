@@ -329,7 +329,7 @@ namespace {
         return true;
     }
 
-    void WiredTigerRecordStore::deleteRecord( OperationContext* txn, const RecordId& loc ) {
+    void WiredTigerRecordStore::deleteRecord( OperationContext* txn, const RecordId& loc, const RecordData * ) {
         WiredTigerCursor cursor( _uri, _instanceId, true, txn );
         cursor.assertInActiveTxn();
         WT_CURSOR *c = cursor.get();

@@ -158,7 +158,12 @@ namespace mongo {
                                  const RecordId& loc,
                                  RecordData* out ) const = 0;
 
-        virtual void deleteRecord( OperationContext* txn, const RecordId& dl ) = 0;
+        /**
+         * @param rec - If non-null, this is the record to be deleted, which
+         *              can be accessed (but not modified) by the implementation
+         *              as it sees fit.
+         */
+        virtual void deleteRecord( OperationContext* txn, const RecordId& dl, const RecordData* rec = NULL ) = 0;
 
         virtual StatusWith<RecordId> insertRecord( OperationContext* txn,
                                                   const char* data,

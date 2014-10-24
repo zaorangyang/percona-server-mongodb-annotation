@@ -430,7 +430,7 @@ namespace mongo {
         return Status::OK();
     }
 
-    void RecordStoreV1Base::deleteRecord( OperationContext* txn, const RecordId& rid ) {
+    void RecordStoreV1Base::deleteRecord( OperationContext* txn, const RecordId& rid, const RecordData* rec ) {
         const DiskLoc dl = DiskLoc::fromRecordId(rid);
 
         Record* todelete = recordFor( dl );

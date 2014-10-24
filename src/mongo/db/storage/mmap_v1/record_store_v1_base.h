@@ -192,7 +192,8 @@ namespace mongo {
         virtual bool findRecord( OperationContext* txn, const RecordId& loc, RecordData* rd ) const;
 
         void deleteRecord( OperationContext* txn,
-                           const RecordId& dl );
+                           const RecordId& dl,
+                           const RecordData* rec = NULL );
 
         virtual RecordFetcher* recordNeedsFetch( OperationContext* txn,
                                                  const RecordId& loc ) const;

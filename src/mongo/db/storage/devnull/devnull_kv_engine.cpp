@@ -81,7 +81,7 @@ namespace mongo {
             return false;
         }
 
-        virtual void deleteRecord( OperationContext* txn, const RecordId& dl ) {}
+        virtual void deleteRecord( OperationContext* txn, const RecordId& dl, const RecordData* rec = NULL ) {}
 
         virtual StatusWith<RecordId> insertRecord( OperationContext* txn,
                                                   const char* data,

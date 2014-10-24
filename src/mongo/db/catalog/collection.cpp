@@ -294,6 +294,7 @@ namespace mongo {
         }
 
         BSONObj doc = docFor( txn, loc );
+        const RecordData record(doc.objdata(), doc.objsize());
 
         if ( deletedId ) {
             BSONElement e = doc["_id"];
@@ -307,7 +308,7 @@ namespace mongo {
 
         _indexCatalog.unindexRecord(txn, doc, loc, noWarn);
 
-        _recordStore->deleteRecord( txn, loc );
+        _recordStore->deleteRecord(txn, loc, &record);
 
         _infoCache.notifyOfWriteOp();
     }
