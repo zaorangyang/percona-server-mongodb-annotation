@@ -245,6 +245,7 @@ namespace mongo {
         const int64_t _cappedMaxSize;
         const int64_t _cappedMaxSizeSlack;  // when to start applying backpressure
         const int64_t _cappedMaxDocs;
+        std::atomic<int64_t> _cappedCounter;
         CappedDocumentDeleteCallback* _cappedDeleteCallback;
         mutable boost::timed_mutex _cappedDeleterMutex;  // see comment in ::cappedDeleteAsNeeded
         int _cappedDeleteCheckCount;      // see comment in ::cappedDeleteAsNeeded

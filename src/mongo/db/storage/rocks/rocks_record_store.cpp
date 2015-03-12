@@ -182,6 +182,7 @@ namespace mongo {
           _cappedMaxSize(cappedMaxSize),
           _cappedMaxSizeSlack(std::min(cappedMaxSize / 10, int64_t(16 * 1024 * 1024))),
           _cappedMaxDocs(cappedMaxDocs),
+          _cappedCounter(0),
           _cappedDeleteCallback(cappedDeleteCallback),
           _cappedDeleteCheckCount(0),
           _isOplog(NamespaceString::oplog(ns)),
@@ -348,7 +349,13 @@ namespace mongo {
         boost::timed_mutex::scoped_lock lock(_cappedDeleterMutex, boost::defer_lock);
 
         if (_cappedMaxDocs != -1) {
-            lock.lock(); // Max docs has to be exact, so have to check every time.
+            // we can tolerate 10% extra capped docs
+            int64_t cappedDeleteEvery = std::max(_cappedMaxDocs / 10, static_cast<int64_t>(2));
+            auto counter = _cappedCounter.fetch_add(1);
+            if (counter % cappedDeleteEvery != 0) {
+                return 0;
+            }
+            lock.lock();
         }
         else if(_hasBackgroundThread) {
             // We are foreground, and there is a background thread,
