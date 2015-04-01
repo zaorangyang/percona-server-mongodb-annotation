@@ -89,6 +89,30 @@ namespace {
 
     const long long WiredTigerRecordStore::kCollectionScanOnCreationThreshold = 10000;
 
+    StatusWith<std::string> WiredTigerRecordStore::parseOptionsField(const BSONObj options) {
+        StringBuilder ss;
+        BSONForEach(elem, options) {
+            if (elem.fieldNameStringData() == "configString") {
+                if (elem.type() != String) {
+                    return StatusWith<std::string>(ErrorCodes::TypeMismatch, str::stream()
+                                                   << "storageEngine.wiredTiger.configString "
+                                                   << "must be a string. "
+                                                   << "Not adding 'configString' value "
+                                                   << elem << " to collection configuration");
+                }
+                ss << elem.valueStringData() << ',';
+            }
+            else {
+                // Return error on first unrecognized field.
+                return StatusWith<std::string>(ErrorCodes::InvalidOptions, str::stream()
+                                               << '\'' << elem.fieldNameStringData() << '\''
+                                               << " is not a supported option in "
+                                               << "storageEngine.wiredTiger");
+            }
+        }
+        return StatusWith<std::string>(ss.str());
+    }
+
     // static
     StatusWith<std::string> WiredTigerRecordStore::generateCreateString(
         StringData ns,
@@ -114,30 +138,12 @@ namespace {
 
         ss << extraStrings << ",";
 
-        // Validate configuration object.
-        // Warn about unrecognized fields that may be introduced in newer versions of this
-        // storage engine instead of raising an error.
-        // Ensure that 'configString' field is a string. Warn if this is not the case.
-        BSONForEach(elem, options.storageEngine.getObjectField(kWiredTigerEngineName)) {
-            if (elem.fieldNameStringData() == "configString") {
-                if (elem.type() != String) {
-                    return StatusWith<std::string>(ErrorCodes::TypeMismatch, str::stream()
-                                                   << "storageEngine.wiredTiger.configString "
-                                                   << "must be a string. "
-                                                   << "Not adding 'configString' value "
-                                                   << elem << " to collection configuration");
-                    continue;
-                }
-                ss << elem.valueStringData() << ",";
-            }
-            else {
-                // Return error on first unrecognized field.
-                return StatusWith<std::string>(ErrorCodes::InvalidOptions, str::stream()
-                                               << '\'' << elem.fieldNameStringData() << '\''
-                                               << " is not a supported option in "
-                                               << "storageEngine.wiredTiger");
-            }
-        }
+        StatusWith<std::string> customOptions =
+            parseOptionsField(options.storageEngine.getObjectField(kWiredTigerEngineName));
+        if (!customOptions.isOK())
+            return customOptions;
+
+        ss << customOptions.getValue();
 
         if ( NamespaceString::oplog(ns) ) {
             // force file for oplog
@@ -250,7 +256,7 @@ namespace {
 
     WiredTigerRecordStore::~WiredTigerRecordStore() {
         {
-            boost::timed_mutex::scoped_lock lk(_cappedDeleterMutex);
+            boost::lock_guard<boost::timed_mutex> lk(_cappedDeleterMutex);
             _shuttingDown = true;
         }
 
@@ -265,7 +271,7 @@ namespace {
     }
 
     bool WiredTigerRecordStore::inShutdown() const {
-        boost::timed_mutex::scoped_lock lk(_cappedDeleterMutex);
+        boost::lock_guard<boost::timed_mutex> lk(_cappedDeleterMutex);
         return _shuttingDown;
     }
 
@@ -392,7 +398,7 @@ namespace {
             return 0;
 
         // ensure only one thread at a time can do deletes, otherwise they'll conflict.
-        boost::timed_mutex::scoped_lock lock(_cappedDeleterMutex, boost::defer_lock);
+        boost::unique_lock<boost::timed_mutex> lock(_cappedDeleterMutex, boost::defer_lock);
 
         if (_cappedMaxDocs != -1) {
             lock.lock(); // Max docs has to be exact, so have to check every time.
@@ -560,14 +566,14 @@ namespace {
                 return status;
             loc = status.getValue();
             if ( loc > _oplog_highestSeen ) {
-                boost::mutex::scoped_lock lk( _uncommittedDiskLocsMutex );
+                boost::lock_guard<boost::mutex> lk( _uncommittedDiskLocsMutex );
                 if ( loc > _oplog_highestSeen ) {
                     _oplog_highestSeen = loc;
                 }
             }
         }
         else if ( _isCapped ) {
-            boost::mutex::scoped_lock lk( _uncommittedDiskLocsMutex );
+            boost::lock_guard<boost::mutex> lk( _uncommittedDiskLocsMutex );
             loc = _nextId();
             _addUncommitedDiskLoc_inlock( txn, loc );
         }
@@ -597,7 +603,7 @@ namespace {
     }
 
     void WiredTigerRecordStore::dealtWithCappedLoc( const RecordId& loc ) {
-        boost::mutex::scoped_lock lk( _uncommittedDiskLocsMutex );
+        boost::lock_guard<boost::mutex> lk( _uncommittedDiskLocsMutex );
         SortedDiskLocs::iterator it = std::find(_uncommittedDiskLocs.begin(),
                                                 _uncommittedDiskLocs.end(),
                                                 loc);
@@ -606,7 +612,7 @@ namespace {
     }
 
     bool WiredTigerRecordStore::isCappedHidden( const RecordId& loc ) const {
-        boost::mutex::scoped_lock lk( _uncommittedDiskLocsMutex );
+        boost::lock_guard<boost::mutex> lk( _uncommittedDiskLocsMutex );
         if (_uncommittedDiskLocs.empty()) {
             return false;
         }
@@ -670,7 +676,7 @@ namespace {
     }
 
     void WiredTigerRecordStore::_oplogSetStartHack( WiredTigerRecoveryUnit* wru ) const {
-        boost::mutex::scoped_lock lk( _uncommittedDiskLocsMutex );
+        boost::lock_guard<boost::mutex> lk( _uncommittedDiskLocsMutex );
         if ( _uncommittedDiskLocs.empty() ) {
             wru->setOplogReadTill( _oplog_highestSeen );
         }
@@ -726,7 +732,7 @@ namespace {
         WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(txn)->getSessionCache();
         WiredTigerSession* session = cache->getSession();
         WT_SESSION *s = session->getSession();
-        int ret = s->compact(s, getURI().c_str(), NULL);
+        int ret = s->compact(s, getURI().c_str(), "timeout=0");
         invariantWTOK(ret);
         cache->releaseSession(session);
         return Status::OK();
@@ -738,6 +744,25 @@ namespace {
                                             ValidateAdaptor* adaptor,
                                             ValidateResults* results,
                                             BSONObjBuilder* output ) {
+
+        {
+            int err = WiredTigerUtil::verifyTable(txn, _uri, &results->errors);
+            if (err == EBUSY) {
+                const char* msg = "verify() returned EBUSY. Not treating as invalid.";
+                warning() << msg;
+                results->errors.push_back(msg);
+            }
+            else if (err) {
+                std::string msg = str::stream()
+                    << "verify() returned " << wiredtiger_strerror(err) << ". "
+                    << "This indicates structural damage. "
+                    << "Not examining individual documents.";
+                error() << msg;
+                results->errors.push_back(msg);
+                results->valid = false;
+                return Status::OK();
+            }
+        }
 
         long long nrecords = 0;
         long long dataSizeTotal = 0;
@@ -786,17 +811,6 @@ namespace {
         }
 
         output->appendNumber( "nrecords", nrecords );
-
-        WiredTigerSession* session = WiredTigerRecoveryUnit::get(txn)->getSession(txn);
-        WT_SESSION* s = session->getSession();
-        BSONObjBuilder bob(output->subobjStart(kWiredTigerEngineName));
-        Status status = WiredTigerUtil::exportTableToBSON(s, "statistics:" + getURI(),
-                                                          "statistics=(fast)", &bob);
-        if (!status.isOK()) {
-            bob.append("error", "unable to retrieve statistics");
-            bob.append("code", static_cast<int>(status.code()));
-            bob.append("reason", status.reason());
-        }
         return Status::OK();
     }
 
@@ -853,7 +867,7 @@ namespace {
         if ( !loc.isOK() )
             return loc.getStatus();
 
-        boost::mutex::scoped_lock lk( _uncommittedDiskLocsMutex );
+        boost::lock_guard<boost::mutex> lk( _uncommittedDiskLocsMutex );
         _addUncommitedDiskLoc_inlock( txn, loc.getValue() );
         return Status::OK();
     }

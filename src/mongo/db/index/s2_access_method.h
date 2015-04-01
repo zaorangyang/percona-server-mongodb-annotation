@@ -30,7 +30,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/index/s2_common.h"
-#include "mongo/db/index/btree_based_access_method.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 
@@ -39,12 +39,9 @@ namespace mongo {
     class IndexCursor;
     struct S2IndexingParams;
 
-    class S2AccessMethod : public BtreeBasedAccessMethod {
+    class S2AccessMethod : public IndexAccessMethod {
     public:
-        using BtreeBasedAccessMethod::_descriptor;
-
         S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
-        virtual ~S2AccessMethod() { }
 
         /**
          * Takes an index spec object for this index and returns a copy tweaked to conform to the

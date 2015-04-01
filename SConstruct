@@ -43,42 +43,60 @@ def findSettingsSetup():
 def versiontuple(v):
     return tuple(map(int, (v.split("."))))
 
-# --- platform identification ---
+# --- OS identification ---
 #
 # This needs to precede the options section so that we can only offer some options on certain
-# platforms.
+# operating systems.
 
-platform = os.sys.platform
-nix = False
-linux = False
-darwin = False
-windows = False
-freebsd = False
-openbsd = False
-solaris = False
+# This function gets the running OS as identified by Python
+# It should only be used to set up defaults for options/variables, because
+# its value could potentially be overridden by setting TARGET_OS on the
+# command-line. Treat this output as the value of HOST_OS
+def get_running_os_name():
+    running_os = os.sys.platform
+    if running_os.startswith('linux'):
+        running_os = 'linux'
+    elif running_os.startswith('freebsd'):
+        running_os = 'freebsd'
+    elif running_os.startswith('openbsd'):
+        running_os = 'openbsd'
+    elif running_os == 'sunos5':
+        running_os = 'solaris'
+    elif running_os == 'win32':
+        running_os = 'windows'
+    elif running_os == 'darwin':
+        running_os = 'osx'
+    else:
+        running_os = 'unknown'
+    return running_os
 
-if "darwin" == platform:
-    darwin = True
-    platform = "osx" # prettier than darwin
-elif platform.startswith("linux"):
-    linux = True
-    platform = "linux"
-elif "sunos5" == platform:
-    solaris = True
-elif platform.startswith( "freebsd" ):
-    freebsd = True
-elif platform.startswith( "openbsd" ):
-    openbsd = True
-elif "win32" == platform:
-    windows = True
-else:
-    print( "No special config for [" + platform + "] which probably means it won't work" )
+def env_get_os_name_wrapper(self):
+    return env['TARGET_OS']
 
-nix = not windows
+def is_os_raw(target_os, os_list_to_check):
+    okay = False
+    posix_os_list = [ 'linux', 'openbsd', 'freebsd', 'osx', 'solaris' ]
+
+    for p in os_list_to_check:
+        if p == 'posix' and target_os in posix_os_list:
+            okay = True
+            break
+        elif p == target_os:
+            okay = True
+            break
+    return okay
+
+# This function tests the running OS as identified by Python
+# It should only be used to set up defaults for options/variables, because
+# its value could potentially be overridden by setting TARGET_OS on the
+# command-line. Treat this output as the value of HOST_OS
+def is_running_os(*os_list):
+    return is_os_raw(get_running_os_name(), os_list)
+
+def env_os_is_wrapper(self, *os_list):
+    return is_os_raw(self['TARGET_OS'], os_list)
 
 # --- options ----
-use_clang = False
-
 options = {}
 
 def add_option( name, help, nargs, contributesToVariantDir,
@@ -173,7 +191,7 @@ def get_variant_dir():
         s = "cached"
         s += "/".join(extras) + "/"
     else:
-        s = "${PYSYSPLATFORM}/"
+        s = "${TARGET_ARCH}/"
         a += extras
 
         if len(a) > 0:
@@ -200,15 +218,11 @@ add_option( "variant-dir", "override variant subdirectory", 1, False )
 
 # linking options
 add_option( "release" , "release build" , 0 , True )
-add_option( "static" , "fully static build" , 0 , False )
-add_option( "static-libstdc++" , "statically link libstdc++" , 0 , False )
+
 add_option( "lto", "enable link time optimizations (experimental, except with MSVC)" , 0 , True )
 add_option( "dynamic-windows", "dynamically link on Windows", 0, True)
 
 # base compile flags
-add_option( "64" , "whether to force 64 bit" , 0 , True , "force64" )
-add_option( "32" , "whether to force 32 bit" , 0 , True , "force32" )
-
 add_option( "endian" , "endianness of target platform" , 1 , False , "endian",
             type="choice", choices=["big", "little", "auto"], default="auto" )
 
@@ -216,25 +230,17 @@ add_option( "cxx", "compiler to use" , 1 , True )
 add_option( "cc", "compiler to use for c" , 1 , True )
 add_option( "cc-use-shell-environment", "use $CC from shell for C compiler" , 0 , False )
 add_option( "cxx-use-shell-environment", "use $CXX from shell for C++ compiler" , 0 , False )
-add_option( "ld", "linker to use" , 1 , True )
-add_option( "c++11", "enable c++11 support", "?", True,
-            type="choice", choices=["on", "off", "auto"], const="on", default="on" )
 add_option( "disable-minimum-compiler-version-enforcement",
             "allow use of unsupported older compilers (NEVER for production builds)",
             0, False )
 
-add_option( "cpppath", "Include path if you have headers in a nonstandard directory" , 1 , False )
-add_option( "libpath", "Library path if you have libraries in a nonstandard directory" , 1 , False )
+# unused, but here for backwards compatibility
+add_option( "c++11", "enable c++11 support", "?", True,
+            type="choice", choices=["on", "off", "auto"], const="on", default="on" )
 
-add_option( "extrapath", "comma separated list of add'l paths  (--extrapath /opt/foo/,/foo) static linking" , 1 , False )
-add_option( "extrapathdyn", "comma separated list of add'l paths  (--extrapath /opt/foo/,/foo) dynamic linking" , 1 , False )
-add_option( "extralib", "comma separated list of libraries  (--extralib js_static,readline" , 1 , False )
 
-# experimental features
-add_option( "mm", "use main memory instead of memory mapped files" , 0 , True )
 add_option( "ssl" , "Enable SSL" , 0 , True )
 add_option( "ssl-fips-capability", "Enable the ability to activate FIPS 140-2 mode", 0, True );
-add_option( "rocksdb" , "Enable RocksDB" , 0 , False )
 add_option( "wiredtiger", "Enable wiredtiger", "?", True, "wiredtiger",
             type="choice", choices=["on", "off"], const="on", default="on")
 add_option( "tokuft" , "Enable TokuFT" , 0 , False )
@@ -253,13 +259,6 @@ add_option( "use-glibcxx-debug",
 # mongo feature options
 add_option( "noshell", "don't build shell" , 0 , True )
 add_option( "safeshell", "don't let shell scripts run programs (still, don't run untrusted scripts)" , 0 , True )
-add_option( "win2008plus",
-            "use newer operating system API features (deprecated, use win-version-min instead)" ,
-            0 , False )
-
-# dev options
-add_option( "d", "debug build no optimization, etc..." , 0 , True , "debugBuild" )
-add_option( "dd", "debug build no optimization, additional debug logging, etc..." , 0 , True , "debugBuildAndLogging" )
 
 # new style debug and optimize flags
 add_option( "dbg", "Enable runtime debugging checks", "?", True, "dbg",
@@ -274,17 +273,14 @@ add_option( "llvm-symbolizer", "name of (or path to) the LLVM symbolizer", 1, Fa
 add_option( "durableDefaultOn" , "have durable default to on" , 0 , True )
 add_option( "durableDefaultOff" , "have durable default to off" , 0 , True )
 
-add_option( "distcc" , "use distcc for distributing builds" , 0 , False )
-
 # debugging/profiling help
-if os.sys.platform.startswith("linux"):
+if is_running_os('linux'):
     defaultAllocator = 'tcmalloc'
 else:
     defaultAllocator = 'system'
 add_option( "allocator" , "allocator to use (tcmalloc or system)" , 1 , True,
             default=defaultAllocator )
 add_option( "gdbserver" , "build in gdb server support" , 0 , True )
-add_option( "heapcheck", "link to heap-checking malloc-lib and look for memory leaks during tests" , 0 , False )
 add_option( "gcov" , "compile with flags for gcov" , 0 , True )
 
 add_option("smokedbprefix", "prefix to dbpath et al. for smoke tests", 1 , False )
@@ -299,9 +295,9 @@ add_option( "use-system-pcre", "use system version of pcre library", 0, True )
 add_option( "use-system-wiredtiger", "use system version of wiredtiger library", 0, True)
 
 # library choices
-boost_choices = ['1.49', '1.56']
+boost_choices = ['1.56']
 add_option( "internal-boost", "Specify internal boost version to use", 1, True,
-           type='choice', default=boost_choices[1], choices=boost_choices)
+           type='choice', default=boost_choices[0], choices=boost_choices)
 
 add_option( "system-boost-lib-search-suffixes",
             "Comma delimited sequence of boost library suffixes to search",
@@ -344,35 +340,20 @@ add_option('skip-buildinfo',
 add_option('variables-help',
            "Print the help text for SCons variables", 0, False)
 
-if darwin:
-    add_option("osx-version-min", "minimum OS X version to support", 1, True)
+add_option("osx-version-min", "minimum OS X version to support", 1, True)
 
-elif windows:
-    win_version_min_choices = {
-        'xpsp3'   : ('0501', '0300'),
-        'ws03sp2' : ('0502', '0200'),
-        'vista'   : ('0600', '0000'),
-        'ws08r2'  : ('0601', '0000'),
-        'win7'    : ('0601', '0000'),
-        'win8'    : ('0602', '0000'),
-    }
+win_version_min_choices = {
+    'xpsp3'   : ('0501', '0300'),
+    'ws03sp2' : ('0502', '0200'),
+    'vista'   : ('0600', '0000'),
+    'ws08r2'  : ('0601', '0000'),
+    'win7'    : ('0601', '0000'),
+    'win8'    : ('0602', '0000'),
+}
 
-    add_option("win-version-min", "minimum Windows version to support", 1, True,
-               type = 'choice', default = None,
-               choices = win_version_min_choices.keys())
-
-    # Someday get rid of --32 and --64 for windows and use these with a --msvc-target-arch flag
-    # that mirrors msvc-host-arch.
-    msvc_arch_choices = ['x86', 'i386', 'amd64', 'emt64', 'x86_64', 'ia64']
-
-    add_option("msvc-host-arch", "host architecture for ms toolchain", 1, True,
-               type="choice", choices=msvc_arch_choices)
-
-    add_option("msvc-script",
-               "msvc toolchain setup script, pass no argument to suppress script execution",
-               1, True)
-
-    add_option("msvc-version", "select msvc version", 1, True)
+add_option("win-version-min", "minimum Windows version to support", 1, True,
+           type = 'choice', default = None,
+           choices = win_version_min_choices.keys())
 
 add_option('cache',
            "Use an object cache rather than a per-build variant directory (experimental)",
@@ -382,9 +363,60 @@ add_option('cache-dir',
            "Specify the directory to use for caching objects if --cache is in use",
            1, False, default="$BUILD_ROOT/scons/cache")
 
+variable_parse_mode_choices=['auto', 'posix', 'other']
+add_option('variable-parse-mode',
+           "Select which parsing mode is used to interpret command line variables",
+           1, False,
+           type='choice', default=variable_parse_mode_choices[0],
+           choices=variable_parse_mode_choices)
+
 # Setup the command-line variables
 def variable_shlex_converter(val):
-    return shlex.split(val)
+    parse_mode = get_option('variable-parse-mode')
+    if parse_mode == 'auto':
+        parse_mode = 'other' if is_running_os('windows') else 'posix'
+    return shlex.split(val, posix=(parse_mode == 'posix'))
+
+def variable_arch_converter(val):
+    arches = {
+        'x86_64': 'x86_64',
+        'amd64':  'x86_64',
+        'emt64':   'x86_64',
+        'x86':    'i386',
+    }
+    val = val.lower()
+
+    if val in arches:
+        return arches[val]
+
+    # Uname returns a bunch of possible x86's on Linux.
+    # Check whether the value is an i[3456]86 processor.
+    if re.match(r'^i[3-6]86$', val):
+        return 'i386'
+
+    # Return whatever val is passed in - hopefully it's legit
+    return val
+
+# The Scons 'default' tool enables a lot of tools that we don't actually need to enable.
+# On platforms like Solaris, it actually does the wrong thing by enabling the sunstudio
+# toolchain first. As such it is simpler and more efficient to manually load the precise
+# set of tools we need for each platform.
+# If we aren't on a platform where we know the minimal set of tools, we fall back to loading
+# the 'default' tool.
+def decide_platform_tools():
+    if is_running_os('windows'):
+        # we only support MS toolchain on windows
+        return ['msvc', 'mslink', 'mslib']
+    elif is_running_os('linux', 'solaris'):
+        return ['gcc', 'g++', 'gnulink', 'ar']
+    elif is_running_os('osx'):
+        return ['gcc', 'g++', 'applelink', 'ar']
+    else:
+        return ["default"]
+
+def variable_tools_converter(val):
+    tool_list = shlex.split(val)
+    return tool_list + ["jsheader", "mergelib", "mongo_unittest", "textfile"]
 
 env_vars = Variables()
 
@@ -402,7 +434,8 @@ env_vars.Add('CFLAGS',
 
 env_vars.Add('CPPDEFINES',
     help='Sets pre-processor definitions for C and C++',
-    converter=variable_shlex_converter)
+    converter=variable_shlex_converter,
+    default=[])
 
 env_vars.Add('CPPPATH',
     help='Adds paths to the preprocessor search path',
@@ -411,6 +444,11 @@ env_vars.Add('CPPPATH',
 env_vars.Add('CXXFLAGS',
     help='Sets flags for the C++ compiler',
     converter=variable_shlex_converter)
+
+env_vars.Add('HOST_ARCH',
+    help='Sets the native architecture of the compiler',
+    converter=variable_arch_converter,
+    default=None)
 
 env_vars.Add('LIBPATH',
     help='Adds paths to the linker search path',
@@ -422,6 +460,16 @@ env_vars.Add('LIBS',
 
 env_vars.Add('LINKFLAGS',
     help='Sets flags for the linker',
+    converter=variable_shlex_converter)
+
+env_vars.Add('MSVC_USE_SCRIPT',
+    help='Sets the script used to setup Visual Studio.')
+
+env_vars.Add('MSVC_VERSION',
+    help='Sets the version of Visual Studio to use (e.g.  12.0, 11.0, 10.0)')
+
+env_vars.Add('RPATH',
+    help='Set the RPATH for dynamic libraries and executables',
     converter=variable_shlex_converter)
 
 env_vars.Add('SHCCFLAGS',
@@ -440,15 +488,26 @@ env_vars.Add('SHLINKFLAGS',
     help='Sets flags for the linker when building shared libraries',
     converter=variable_shlex_converter)
 
+env_vars.Add('TARGET_ARCH',
+    help='Sets the architecture to build for',
+    converter=variable_arch_converter,
+    default=None)
+
+env_vars.Add('TARGET_OS',
+    help='Sets the target OS to build for',
+    default=get_running_os_name()
+)
+
+env_vars.Add('TOOLS',
+    help='Sets the list of SCons tools to add to the environment',
+    converter=variable_tools_converter,
+    default=decide_platform_tools())
+
 # don't run configure if user calls --help
 if GetOption('help'):
     Return()
 
 # --- environment setup ---
-
-if get_option("c++11") != "on":
-    print("MongoDB requires C++11 to build")
-    Exit(1)
 
 # If the user isn't using the # to indicate top-of-tree or $ to expand a variable, forbid
 # relative paths. Relative paths don't really work as expected, because they end up relative to
@@ -462,7 +521,7 @@ if buildDir[0] not in ['$', '#']:
 
 cacheDir = get_option('cache-dir').rstrip('/')
 if cacheDir[0] not in ['$', '#']:
-    if not os.path.isabs(cachdDIr):
+    if not os.path.isabs(cacheDir):
         print("Do not use relative paths with --cache-dir")
         Exit(1)
 
@@ -486,23 +545,7 @@ boostLibs = [ "thread" , "filesystem" , "program_options", "system" ]
 
 onlyServer = len( COMMAND_LINE_TARGETS ) == 0 or ( len( COMMAND_LINE_TARGETS ) == 1 and str( COMMAND_LINE_TARGETS[0] ) in [ "mongod" , "mongos" , "test" ] )
 
-linux64  = False
-force32 = has_option( "force32" ) 
-force64 = has_option( "force64" )
-if not force64 and not force32 and os.getcwd().endswith( "mongo-64" ):
-    force64 = True
-    print( "*** assuming you want a 64-bit build b/c of directory *** " )
-msarch = None
-if force32:
-    msarch = "x86"
-elif force64:
-    msarch = "amd64"
-
 releaseBuild = has_option("release")
-
-if has_option("debugBuild") or has_option("debugBuildAndLogging"):
-    print("Error: the --d and --dd flags are no longer permitted; use --dbg and --opt instead")
-    Exit(1)
 
 dbg_opt_mapping = {
     # --dbg, --opt   :   dbg    opt
@@ -522,8 +565,6 @@ if releaseBuild and (debugBuild or not optBuild):
     print("Error: A --release build may not have debugging, and must have optimization")
     Exit(1)
 
-static = has_option( "static" )
-
 noshell = has_option( "noshell" ) 
 
 jsEngine = get_option( "js-engine")
@@ -538,26 +579,13 @@ v8suffix = '' if v8version == '3.12' else '-' + v8version
 if not serverJs and not usev8:
     print("Warning: --server-js=off is not needed with --js-engine=none")
 
-# The Scons 'default' tool enables a lot of tools that we don't actually need to enable.
-# On platforms like Solaris, it actually does the wrong thing by enabling the sunstudio
-# toolchain first. As such it is simpler and more efficient to manually load the precise
-# set of tools we need for each platform.
-# If we aren't on a platform where we know the minimal set of tools, we fall back to loading
-# the 'default' tool.
-def decide_platform_tools():
-    if windows:
-        # we only support MS toolchain on windows
-        return ['msvc', 'mslink', 'mslib']
-    elif linux:
-        return ['gcc', 'g++', 'gnulink', 'ar']
-    elif solaris:
-        return ['gcc', 'g++', 'gnulink', 'ar']
-    elif darwin:
-        return ['gcc', 'g++', 'applelink', 'ar']
-    else:
-        return ["default"]
-
-tools = decide_platform_tools() + ["jsheader", "mergelib", "mongo_unittest", "textfile"]
+def getMongoCodeVersion():
+    with open("version.txt") as version_txt:
+        content = version_txt.readlines()
+        if len(content) != 1:
+            print("Malformed version file")
+            Exit(1)
+        return content[0].strip()
 
 # We defer building the env until we have determined whether we want certain values. Some values
 # in the env actually have semantics for 'None' that differ from being absent, so it is better
@@ -571,58 +599,29 @@ tools = decide_platform_tools() + ["jsheader", "mergelib", "mongo_unittest", "te
 envDict = dict(BUILD_ROOT=buildDir,
                BUILD_DIR=get_variant_dir(),
                DIST_ARCHIVE_SUFFIX='.tgz',
-               EXTRAPATH=get_option("extrapath"),
                MODULE_BANNERS=[],
                ARCHIVE_ADDITION_DIR_MAP={},
                ARCHIVE_ADDITIONS=[],
                PYTHON=utils.find_python(),
                SERVER_ARCHIVE='${SERVER_DIST_BASENAME}${DIST_ARCHIVE_SUFFIX}',
-               tools=tools,
                UNITTEST_ALIAS='unittests',
                # TODO: Move unittests.txt to $BUILD_DIR, but that requires
                # changes to MCI.
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
-               PYSYSPLATFORM=os.sys.platform,
-               PCRE_VERSION='8.30',
+               PCRE_VERSION='8.36',
                CONFIGUREDIR=sconsDataDir.Dir('sconf_temp'),
                CONFIGURELOG=sconsDataDir.File('config.log'),
                INSTALL_DIR=installDir,
+               MONGO_GIT_VERSION=utils.getGitVersion(),
+               MONGO_CODE_VERSION=getMongoCodeVersion(),
+               CONFIG_HEADER_DEFINES={},
                )
-
-if windows:
-    if msarch:
-        envDict['TARGET_ARCH'] = msarch
-
-    # We can't set this to None without disturbing the autodetection,
-    # so only set it conditionally.
-    if has_option('msvc-host-arch'):
-        envDict['HOST_ARCH'] = get_option('msvc-host-arch')
-
-    msvc_version = get_option('msvc-version')
-    msvc_script = get_option('msvc-script')
-
-    if msvc_version:
-        if msvc_script:
-            print("Passing --msvc-version with --msvc-script is not meaningful")
-            Exit(1)
-        envDict['MSVC_VERSION'] = msvc_version
-
-    # The python None value is meaningful to MSVC_USE_SCRIPT; we want to interpret
-    # --msvc-script= with no argument as meaning 'None', so check explicitly against None so
-    # that '' is not interpreted as false.
-    if msvc_script is not None:
-        if has_option('msvc-host-arch'):
-            print("Passing --msvc-host-arch with --msvc-script is not meaningful")
-            Exit(1)
-        if msarch:
-            print("Passing --32 or --64 with --msvc-script is not meaningful")
-            Exit(1)
-        if msvc_script == "":
-            msvc_script = None
-        envDict['MSVC_USE_SCRIPT'] = msvc_script
 
 env = Environment(variables=env_vars, **envDict)
 del envDict
+
+env.AddMethod(env_os_is_wrapper, 'TargetOSIs')
+env.AddMethod(env_get_os_name_wrapper, 'GetTargetOSName')
 
 if has_option('variables-help'):
     print env_vars.GenerateHelpText(env)
@@ -633,28 +632,197 @@ if unknown_vars:
     print "Unknown variables specified: {0}".format(", ".join(unknown_vars.keys()))
     Exit(1)
 
+def set_config_header_define(env, varname, varval = 1):
+    env['CONFIG_HEADER_DEFINES'][varname] = varval
+env.AddMethod(set_config_header_define, 'SetConfigHeaderDefine')
 
-# Add any scons options that conflict with scons variables here.
-# The first item in each tuple is the option name and the second
-# is the variable name
-variable_conflicts = [
-    ('libpath', 'LIBPATH'),
-    ('cpppath', 'CPPPATH'),
-    ('extrapath', 'CPPPATH'),
-    ('extrapathdyn', 'CPPPATH'),
-    ('extrapath', 'LIBPATH'),
-    ('extrapathdyn', 'LIBPATH'),
-    ('extralib', 'LIBS')
-]
+if has_option( "cc-use-shell-environment" ) and has_option( "cc" ):
+    print("Cannot specify both --cc-use-shell-environment and --cc")
+    Exit(1)
+elif has_option( "cxx-use-shell-environment" ) and has_option( "cxx" ):
+    print("Cannot specify both --cxx-use-shell-environment and --cxx")
+    Exit(1)
 
-for (opt_name, var_name) in variable_conflicts:
-    if has_option(opt_name) and var_name in env:
-        print("Both option \"--{0}\" and variable {1} were specified".
-            format(opt_name, var_name))
+if has_option( "cxx-use-shell-environment" ):
+    env["CXX"] = os.getenv("CXX");
+if has_option( "cc-use-shell-environment" ):
+    env["CC"] = os.getenv("CC");
+
+if has_option( "cxx" ):
+    if not has_option( "cc" ):
+        print "Must specify C compiler when specifying C++ compiler"
         Exit(1)
+    env["CXX"] = get_option( "cxx" )
+if has_option( "cc" ):
+    if not has_option( "cxx" ):
+        print "Must specify C++ compiler when specifying C compiler"
+        Exit(1)
+    env["CC"] = get_option( "cc" )
+
+detectEnv = env.Clone()
+
+# Identify the toolchain in use. We currently support the following:
+# These macros came from
+# http://nadeausoftware.com/articles/2012/10/c_c_tip_how_detect_compiler_name_and_version_using_compiler_predefined_macros
+toolchain_macros = {
+    'GCC': 'defined(__GNUC__) && !defined(__clang__)',
+    'clang': 'defined(__clang__)',
+    'MSVC': 'defined(_MSC_VER)'
+}
+
+def CheckForToolchain(context, toolchain, lang_name, compiler_var, source_suffix):
+    test_body = textwrap.dedent("""
+    #if {0}
+    /* we are using toolchain {0} */
+    #else
+    #error
+    #endif
+    """.format(toolchain_macros[toolchain]))
+
+    print_tuple = (lang_name, context.env[compiler_var], toolchain)
+    context.Message('Checking if %s compiler "%s" is %s... ' % print_tuple)
+
+    # Strip indentation from the test body to ensure that the newline at the end of the
+    # endif is the last character in the file (rather than a line of spaces with no
+    # newline), and that all of the preprocessor directives start at column zero. Both of
+    # these issues can trip up older toolchains.
+    result = context.TryCompile(test_body, source_suffix)
+    context.Result(result)
+    return result
+
+# These preprocessor macros came from
+# http://nadeausoftware.com/articles/2012/02/c_c_tip_how_detect_processor_type_using_compiler_predefined_macros
+processor_macros = {
+    'x86_64': ('__x86_64', '_M_AMD64'),
+    'i386': ('__i386', '_M_IX86'),
+    'sparc': ('__sparc'),
+    'PowerPC': ('__powerpc__', '__PPC'),
+    'arm' : ('__arm__'),
+    'arm64' : ('__arm64__', '__aarch64__'),
+}
+
+def CheckForProcessor(context, which_arch):
+    def run_compile_check(arch):
+        full_macros = " || ".join([ "defined(%s)" % (v) for v in processor_macros[arch]])
+        test_body = """
+        #if {0}
+        /* Detected {1} */
+        #else
+        #error not {1}
+        #endif
+        """.format(full_macros, arch)
+
+        return context.TryCompile(textwrap.dedent(test_body), ".c")
+
+    if which_arch:
+        ret = run_compile_check(which_arch)
+        context.Message('Checking if target processor is %s ' % which_arch)
+        context.Result(ret)
+        return ret;
+
+    for k in processor_macros.keys():
+        ret = run_compile_check(k)
+        if ret:
+            context.Result('Detected a %s processor' % k)
+            return k
+
+    context.Result('Could not detect processor model/architecture')
+    return False
+
+# Taken from http://nadeausoftware.com/articles/2012/01/c_c_tip_how_use_compiler_predefined_macros_detect_operating_system
+os_macros = {
+    "windows": "_WIN32",
+    "solaris": "__sun",
+    "freebsd": "__FreeBSD__",
+    "openbsd": "__OpenBSD__",
+    "osx": "__APPLE__",
+    "linux": "__linux__",
+}
+
+def CheckForOS(context, which_os):
+    test_body = """
+    #if defined({0})
+    /* detected {1} */
+    #else
+    #error
+    #endif
+    """.format(os_macros[which_os], which_os)
+    context.Message('Checking if target OS {0} is supported by the toolchain '.format(which_os))
+    ret = context.TryCompile(textwrap.dedent(test_body), ".c")
+    context.Result(ret)
+    return ret
+
+detectConf = Configure(detectEnv, help=False, custom_tests = {
+    'CheckForToolchain' : CheckForToolchain,
+    'CheckForProcessor': CheckForProcessor,
+    'CheckForOS': CheckForOS,
+})
+
+if not detectConf.CheckCXX():
+    print "C++ compiler %s doesn't work" % (detectEnv['CXX'])
+    Exit(1)
+if not detectConf.CheckCC():
+    print "C compiler %s doesn't work" % (detectEnv['CC'])
+    Exit(1)
+
+toolchain_search_sequence = [ "GCC", "clang" ]
+if is_running_os('windows'):
+    toolchain_search_sequence = [ 'MSVC', 'clang', 'GCC' ]
+for candidate_toolchain in toolchain_search_sequence:
+    if detectConf.CheckForToolchain(candidate_toolchain, "C++", "CXX", ".cpp"):
+        detected_toolchain = candidate_toolchain
+        break
+
+if not detected_toolchain:
+    print "Couldn't identity the C++ compiler"
+    Exit(1)
+
+if not detectConf.CheckForToolchain(detected_toolchain, "C", "CC", ".c"):
+    print "C compiler does not match identified C++ compiler"
+    Exit(1)
+
+# Now that we've detected the toolchain, we add methods to the env
+# to get the canonical name of the toolchain and to test whether
+# scons is using a particular toolchain.
+def get_toolchain_name(self):
+    return detected_toolchain.lower()
+def is_toolchain(self, *args):
+    actual_toolchain = self.ToolchainName()
+    for v in args:
+        if v.lower() == actual_toolchain:
+            return True
+    return False
+
+env.AddMethod(get_toolchain_name, 'ToolchainName')
+env.AddMethod(is_toolchain, 'ToolchainIs')
+
+if env['TARGET_ARCH']:
+    if not detectConf.CheckForProcessor(env['TARGET_ARCH']):
+        print "Could not detect processor specified in TARGET_ARCH variable"
+        Exit(1)
+else:
+    detected_processor = detectConf.CheckForProcessor(None)
+    if not detected_processor:
+        Exit(1)
+    env['TARGET_ARCH'] = detected_processor
+
+if env['TARGET_OS'] not in os_macros:
+    print "No special config for [{0}] which probably means it won't work".format(env['TARGET_OS'])
+elif not detectConf.CheckForOS(env['TARGET_OS']):
+    print "TARGET_OS is not supported by compiler"
+    Exit(1)
+
+detectConf.Finish()
+
+if not env['HOST_ARCH']:
+    env['HOST_ARCH'] = env['TARGET_ARCH']
+
+# In some places we have POSIX vs Windows cpp files, and so there's an additional
+# env variable to interpolate their names in child sconscripts
+
+env['TARGET_OS_FAMILY'] = 'posix' if env.TargetOSIs('posix') else env.GetTargetOSName()
 
 if has_option("cache"):
-    EnsureSConsVersion( 2, 3, 0 )
     if has_option("release"):
         print("Using the experimental --cache option is not permitted for --release builds")
         Exit(1)
@@ -664,7 +832,7 @@ if has_option("cache"):
     env.CacheDir(str(env.Dir(cacheDir)))
 
 if optBuild:
-    env.Append( CPPDEFINES=["MONGO_OPTIMIZED_BUILD"] )
+    env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")
 
 if has_option("propagate-shell-environment"):
     env['ENV'] = dict(os.environ);
@@ -690,9 +858,9 @@ if endian == "auto":
     endian = sys.byteorder
 
 if endian == "little":
-    env.Append( CPPDEFINES=[("MONGO_BYTE_ORDER", "1234")] )
+    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "1234")
 elif endian == "big":
-    env.Append( CPPDEFINES=[("MONGO_BYTE_ORDER", "4321")] )
+    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "4321")
 
 env['_LIBDEPS'] = '$_LIBDEPS_OBJS'
 
@@ -714,78 +882,15 @@ if env['_LIBDEPS'] == '$_LIBDEPS_OBJS':
 
 libdeps.setup_environment( env )
 
-if env['PYSYSPLATFORM'] == 'linux3':
-    env['PYSYSPLATFORM'] = 'linux2'
-if 'freebsd' in env['PYSYSPLATFORM']:
-    env['PYSYSPLATFORM'] = 'freebsd'
-
-if os.sys.platform == 'win32':
-    env['OS_FAMILY'] = 'win'
-else:
-    env['OS_FAMILY'] = 'posix'
-
-if has_option( "cc-use-shell-environment" ) and has_option( "cc" ):
-    print("Cannot specify both --cc-use-shell-environment and --cc")
-    Exit(1)
-elif has_option( "cxx-use-shell-environment" ) and has_option( "cxx" ):
-    print("Cannot specify both --cxx-use-shell-environment and --cxx")
-    Exit(1)
-
-if has_option( "cxx-use-shell-environment" ):
-    env["CXX"] = os.getenv("CXX");
-    env["CC"] = env["CXX"]
-if has_option( "cc-use-shell-environment" ):
-    env["CC"] = os.getenv("CC");
-
-if has_option( "cxx" ):
-    if not has_option( "cc" ):
-        print "Must specify C compiler when specifying C++ compiler"
-        exit(1)
-    env["CXX"] = get_option( "cxx" )
-if has_option( "cc" ):
-    if not has_option( "cxx" ):
-        print "Must specify C++ compiler when specifying C compiler"
-        exit(1)
-    env["CC"] = get_option( "cc" )
-
-if has_option( "ld" ):
-    env["LINK"] = get_option( "ld" )
-
-if env['PYSYSPLATFORM'] in ('linux2', 'freebsd'):
+if env.TargetOSIs('linux', 'freebsd'):
     env['LINK_LIBGROUP_START'] = '-Wl,--start-group'
     env['LINK_LIBGROUP_END'] = '-Wl,--end-group'
-    env['RELOBJ_LIBDEPS_START'] = '--whole-archive'
-    env['RELOBJ_LIBDEPS_END'] = '--no-whole-archive'
-    env['RELOBJ_LIBDEPS_ITEM'] = ''
-elif env['PYSYSPLATFORM'] == 'darwin':
-    env['RELOBJFLAGS'] = [ '-arch', '$PROCESSOR_ARCHITECTURE' ]
+elif env.TargetOSIs('osx'):
     env['LINK_LIBGROUP_START'] = ''
     env['LINK_LIBGROUP_END'] = ''
-    env['RELOBJ_LIBDEPS_START'] = '-all_load'
-    env['RELOBJ_LIBDEPS_END'] = ''
-    env['RELOBJ_LIBDEPS_ITEM'] = ''
-elif env['PYSYSPLATFORM'].startswith('sunos'):
-    if force64:
-        env['RELOBJFLAGS'] = ['-64']
+elif env.TargetOSIs('solaris'):
     env['LINK_LIBGROUP_START'] = '-z rescan'
     env['LINK_LIBGROUP_END'] = ''
-    env['RELOBJ_LIBDEPS_START'] = '-z allextract'
-    env['RELOBJ_LIBDEPS_END'] = '-z defaultextract'
-    env['RELOBJ_LIBDEPS_ITEM'] = ''
-
-if has_option( "libpath" ):
-    env["LIBPATH"] = [get_option( "libpath" )]
-
-if has_option( "cpppath" ):
-    env["CPPPATH"] = [get_option( "cpppath" )]
-
-env.Prepend( CPPDEFINES=[ "_SCONS" , 
-                          "MONGO_EXPOSE_MACROS" ,
-                          "SUPPORT_UTF8" ],  # for pcre
-)
-
-if has_option( "safeshell" ):
-    env.Append( CPPDEFINES=[ "MONGO_SAFE_SHELL" ] )
 
 if has_option( "durableDefaultOn" ):
     env.Append( CPPDEFINES=[ "_DURABLEDEFAULTON" ] )
@@ -793,97 +898,33 @@ if has_option( "durableDefaultOn" ):
 if has_option( "durableDefaultOff" ):
     env.Append( CPPDEFINES=[ "_DURABLEDEFAULTOFF" ] )
 
-extraLibPlaces = []
-
-env['EXTRACPPPATH'] = []
-env['EXTRALIBPATH'] = []
-env['EXTRABINPATH'] = []
-
-def addExtraLibs( s ):
-    for x in s.split(","):
-        env.Append( EXTRABINPATH=[ x + "/bin" ] )
-        env.Append( EXTRACPPPATH=[ x + "/include" ] )
-        env.Append( EXTRALIBPATH=[ x + "/lib" ] )
-        env.Append( EXTRALIBPATH=[ x + "/lib64" ] )
-        extraLibPlaces.append( x + "/lib" )
-
-if has_option( "extrapath" ):
-    addExtraLibs( GetOption( "extrapath" ) )
-
-if has_option( "extrapathdyn" ):
-    addExtraLibs( GetOption( "extrapathdyn" ) )
-
-if has_option( "extralib" ):
-    for x in GetOption( "extralib" ).split( "," ):
-        env.Append( LIBS=[ x ] )
-
 # ---- other build setup -----
-
-if "uname" in dir(os):
-    processor = os.uname()[4]
-else:
-    processor = "i386"
-
-if force32:
-    processor = "i386"
-if force64:
-    processor = "x86_64"
-
-env['PROCESSOR_ARCHITECTURE'] = processor
-
-nixLibPrefix = "lib"
-
 dontReplacePackage = False
 isBuildingLatest = False
 
 def filterExists(paths):
     return filter(os.path.exists, paths)
 
-if darwin:
-    pass
-elif linux:
+if debugBuild:
+    env.SetConfigHeaderDefine("MONGO_CONFIG_DEBUG_BUILD")
 
+if env.TargetOSIs('linux'):
     env.Append( LIBS=['m'] )
 
-    if os.uname()[4] == "x86_64" and not force32:
-        linux64 = True
-        nixLibPrefix = "lib64"
-        env.Append( EXTRALIBPATH=["/usr/lib64" , "/lib64" ] )
-        env.Append( LIBS=["pthread"] )
-
-        force64 = False
-
-    if force32:
-        env.Append( EXTRALIBPATH=["/usr/lib32"] )
-
-    if static:
-        env.Append( LINKFLAGS=" -static " )
-
-elif solaris:
-     env.Append( CPPDEFINES=[ "__sunos__" ] )
+elif env.TargetOSIs('solaris'):
      env.Append( LIBS=["socket","resolv","lgrp"] )
 
-elif freebsd:
+elif env.TargetOSIs('freebsd'):
     env.Append( LIBS=[ "kvm" ] )
-    env.Append( EXTRACPPPATH=[ "/usr/local/include" ] )
-    env.Append( EXTRALIBPATH=[ "/usr/local/lib" ] )
-    env.Append( CPPDEFINES=[ "__freebsd__" ] )
     env.Append( CCFLAGS=[ "-fno-omit-frame-pointer" ] )
 
-elif openbsd:
-    env.Append( EXTRACPPPATH=[ "/usr/local/include" ] )
-    env.Append( EXTRALIBPATH=[ "/usr/local/lib" ] )
-    env.Append( CPPDEFINES=[ "__openbsd__" ] )
+elif env.TargetOSIs('openbsd'):
     env.Append( LIBS=[ "kvm" ] )
 
-elif windows:
+elif env.TargetOSIs('windows'):
     dynamicCRT = has_option("dynamic-windows")
 
     env['DIST_ARCHIVE_SUFFIX'] = '.zip'
-
-    if has_option('win-version-min') and has_option('win2008plus'):
-        print("Can't specify both 'win-version-min' and 'win2008plus'")
-        Exit(1)
 
     # If tools configuration fails to set up 'cl' in the path, fall back to importing the whole
     # shell environment and hope for the best. This will work, for instance, if you have loaded
@@ -894,6 +935,12 @@ elif windows:
     else:
         print("NOTE: Tool configuration did not find 'cl' compiler, falling back to os environment")
         env['ENV'] = dict(os.environ)
+
+    env.Append(CPPDEFINES=[
+    # This tells the Windows compiler not to link against the .lib files
+    # and to use boost as a bunch of header-only libraries
+        "BOOST_ALL_NO_LIB",
+    ])
 
     env.Append( CPPDEFINES=[ "_UNICODE" ] )
     env.Append( CPPDEFINES=[ "UNICODE" ] )
@@ -933,7 +980,13 @@ elif windows:
     #  identifier' : type name first seen using 'objecttype1' now seen using 'objecttype2'
     #    This warning occurs when classes and structs are declared with a mix of struct and class
     #    which can cause linker failures
-    env.Append( CCFLAGS=["/we4099"] )
+    # c4930
+    #  'identifier': prototyped function not called (was a variable definition intended?)
+    #     This warning indicates a most-vexing parse error, where a user declared a function that
+    #     was probably intended as a variable definition.  A common example is accidentally
+    #     declaring a function called lock that takes a mutex when one meant to create a guard
+    #     object called lock on the stack.
+    env.Append( CCFLAGS=["/we4099", "/we4930"] )
 
     env.Append( CPPDEFINES=["_CONSOLE","_CRT_SECURE_NO_WARNINGS"] )
 
@@ -973,7 +1026,7 @@ elif windows:
     # so that our 32-bit builds run on Windows XP
     # See https://software.intel.com/en-us/articles/linking-applications-using-visual-studio-2012-to-run-on-windows-xp
     #
-    if msarch == "x86":
+    if env["TARGET_ARCH"] == "i386":
         env.Append( LINKFLAGS=["/SUBSYSTEM:CONSOLE,5.01"])
 
     if optBuild:
@@ -1007,17 +1060,8 @@ elif windows:
     if usev8:
         env.Append(LIBS=['winmm.lib'])
 
-    env.Append( EXTRACPPPATH=["#/../winpcap/Include"] )
-    env.Append( EXTRALIBPATH=["#/../winpcap/Lib"] )
-
 env['STATIC_AND_SHARED_OBJECTS_ARE_THE_SAME'] = 1
-if nix:
-
-    if has_option( "static-libstdc++" ):
-        env.Append( LINKFLAGS=["-static-libstdc++", "-static-libgcc"] )
-
-    if has_option( "distcc" ):
-        env["CXX"] = "distcc " + env["CXX"]
+if env.TargetOSIs('posix'):
 
     # -Winvalid-pch Warn if a precompiled header (see Precompiled Headers) is found in the search path but can't be used.
     env.Append( CCFLAGS=["-fPIC",
@@ -1029,12 +1073,10 @@ if nix:
                          "-Wno-unknown-pragmas",
                          "-Winvalid-pch"] )
     # env.Append( " -Wconversion" ) TODO: this doesn't really work yet
-    if linux or darwin:
-        env.Append( CCFLAGS=["-pipe"] )
+    if env.TargetOSIs('linux', 'osx'):
         if not has_option("disable-warnings-as-errors"):
             env.Append( CCFLAGS=["-Werror"] )
 
-    env.Append( CPPDEFINES=["_FILE_OFFSET_BITS=64"] )
     env.Append( CXXFLAGS=["-Wnon-virtual-dtor", "-Woverloaded-virtual"] )
     env.Append( LINKFLAGS=["-fPIC", "-pthread"] )
 
@@ -1043,14 +1085,12 @@ if nix:
     #
     # TODO: Is it necessary to add to both linkflags and shlinkflags, or are LINKFLAGS
     # propagated to SHLINKFLAGS?
-    if darwin:
+    if env.TargetOSIs('osx'):
         env.Append( LINKFLAGS=["-Wl,-bind_at_load"] )
         env.Append( SHLINKFLAGS=["-Wl,-bind_at_load"] )
     else:
         env.Append( LINKFLAGS=["-Wl,-z,now"] )
         env.Append( SHLINKFLAGS=["-Wl,-z,now"] )
-
-    if not darwin:
         env.Append( LINKFLAGS=["-rdynamic"] )
 
     env.Append( LIBS=[] )
@@ -1062,13 +1102,12 @@ if nix:
         except KeyError:
             pass
 
-    if linux and has_option( "gcov" ):
+    if env.TargetOSIs('linux') and has_option( "gcov" ):
         env.Append( CXXFLAGS=" -fprofile-arcs -ftest-coverage " )
-        env.Append( CPPDEFINES=["MONGO_GCOV"] )
         env.Append( LINKFLAGS=" -fprofile-arcs -ftest-coverage " )
 
     if optBuild:
-        env.Append( CCFLAGS=["-O3"] )
+        env.Append( CCFLAGS=["-O2"] )
     else:
         env.Append( CCFLAGS=["-O0"] )
 
@@ -1077,47 +1116,53 @@ if nix:
             env.Append( CCFLAGS=["-fstack-protector"] )
             env.Append( LINKFLAGS=["-fstack-protector"] )
             env.Append( SHLINKFLAGS=["-fstack-protector"] )
-        env['ENV']['GLIBCXX_FORCE_NEW'] = 1; # play nice with valgrind
-        env.Append( CPPDEFINES=["_DEBUG"] );
-
-    if force64:
-        env.Append( CCFLAGS="-m64" )
-        env.Append( LINKFLAGS="-m64" )
-
-    if force32:
-        env.Append( CCFLAGS="-m32" )
-        env.Append( LINKFLAGS="-m32" )
-
-    if has_option( "gdbserver" ):
-        env.Append( CPPDEFINES=["USE_GDBSERVER"] )
-
-if "uname" in dir(os):
-    hacks = buildscripts.findHacks( os.uname() )
-    if hacks is not None:
-        hacks.insert( env , { "linux64" : linux64 } )
 
 if has_option( "ssl" ):
-    env.Append( CPPDEFINES=["MONGO_SSL"] )
+    env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
     env.Append( MONGO_CRYPTO=["openssl"] )
-    if windows:
+    if env.TargetOSIs('windows'):
         env.Append( LIBS=["libeay32"] )
         env.Append( LIBS=["ssleay32"] )
     else:
         env.Append( LIBS=["ssl"] )
         env.Append( LIBS=["crypto"] )
     if has_option("ssl-fips-capability"):
-        env.Append( CPPDEFINES=["MONGO_SSL_FIPS"] )
+        env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_FIPS")
 else:
     env.Append( MONGO_CRYPTO=["tom"] )
 
-wiredtiger = (get_option('wiredtiger') == 'on')
+wiredtiger = False
+if get_option('wiredtiger') == 'on':
+    # Wiredtiger only supports 64-bit architecture, and will fail to compile on 32-bit
+    # so disable WiredTiger automatically on 32-bit since wiredtiger is on by default
+    if env['TARGET_ARCH'] == 'i386':
+        print "WiredTiger is not supported on 32-bit platforms"
+        print "Re-run scons with --wiredtiger=off to build on 32-bit platforms"
+        Exit(1)
+    else:
+        wiredtiger = True
+
+if env['TARGET_ARCH'] == 'i386':
+    # If we are using GCC or clang to target 32 bit, set the ISA minimum to 'nocona',
+    # and the tuning to 'generic'. The choice of 'nocona' is selected because it
+    #  -- includes MMX extenions which we need for tcmalloc on 32-bit
+    #  -- can target 32 bit
+    #  -- is at the time of this writing a widely-deployed 10 year old microarchitecture
+    #  -- is available as a target architecture from GCC 4.0+
+    # However, we only want to select an ISA, not the nocona specific scheduling, so we
+    # select the generic tuning. For installations where hardware and system compiler rev are
+    # contemporaries, the generic scheduling should be appropriate for a wide range of
+    # deployed hardware.
+
+    if env.ToolchainIs('GCC', 'clang'):
+        env.Append( CCFLAGS=['-march=nocona', '-mtune=generic'] )
 
 try:
     umask = os.umask(022)
 except OSError:
     pass
 
-if not windows:
+if not env.TargetOSIs('windows'):
     for keysuffix in [ "1" , "2" ]:
         keyfile = "jstests/libs/key%s" % keysuffix
         os.chmod( keyfile , stat.S_IWUSR|stat.S_IRUSR )
@@ -1139,12 +1184,9 @@ if get_option("system-boost-lib-search-suffixes") is not None:
 # of boost is in play.
 boostSuffix = "";
 if not use_system_version_of_library("boost"):
-    if get_option( "internal-boost") != "1.49":
-        boostSuffix = "-1.56.0"
-    env.Prepend(CPPDEFINES=['BOOST_ALL_NO_LIB'])
-
-env.Append( CPPPATH=['$EXTRACPPPATH'],
-            LIBPATH=['$EXTRALIBPATH'] )
+    # Boost release numbers are x.y.z, where z is usually 0 which we do not include in
+    # the internal-boost option
+    boostSuffix = "-%s.0" % get_option( "internal-boost")
 
 # discover modules, and load the (python) module for each module's build.py
 mongo_modules = moduleconfig.discover_modules('src/mongo/db/modules')
@@ -1160,92 +1202,7 @@ def doConfigure(myenv):
     # TODO: Currently, we have some flags already injected. Eventually, this should test the
     # bare compilers, and we should re-check at the very end that TryCompile and TryLink still
     # work with the flags we have selected.
-    conf = Configure(myenv, help=False)
-
-    if 'CheckCXX' in dir( conf ):
-        if not conf.CheckCXX():
-            print("C++ compiler %s does not work" % (conf.env["CXX"]))
-            Exit(1)
-
-    # Only do C checks if CC != CXX
-    check_c = (myenv["CC"] != myenv["CXX"])
-
-    if check_c and 'CheckCC' in dir( conf ):
-        if not conf.CheckCC():
-            print("C compiler %s does not work" % (conf.env["CC"]))
-            Exit(1)
-    myenv = conf.Finish()
-
-    # Identify the toolchain in use. We currently support the following:
-    # TODO: Goes in the env?
-    toolchain_gcc = "GCC"
-    toolchain_clang = "clang"
-    toolchain_msvc = "MSVC"
-
-    def CheckForToolchain(context, toolchain, lang_name, compiler_var, source_suffix):
-        test_bodies = {
-            toolchain_gcc : (
-                # Clang also defines __GNUC__
-                """
-                #if !defined(__GNUC__) || defined(__clang__)
-                #error
-                #endif
-                """),
-            toolchain_clang : (
-                """
-                #if !defined(__clang__)
-                #error
-                #endif
-                """),
-            toolchain_msvc : (
-                """
-                #if !defined(_MSC_VER)
-                #error
-                #endif
-                """),
-        }
-        print_tuple = (lang_name, context.env[compiler_var], toolchain)
-        context.Message('Checking if %s compiler "%s" is %s... ' % print_tuple)
-        # Strip indentation from the test body to ensure that the newline at the end of the
-        # endif is the last character in the file (rather than a line of spaces with no
-        # newline), and that all of the preprocessor directives start at column zero. Both of
-        # these issues can trip up older toolchains.
-        test_body = textwrap.dedent(test_bodies[toolchain])
-        result = context.TryCompile(test_body, source_suffix)
-        context.Result(result)
-        return result
-
-    conf = Configure(myenv, help=False, custom_tests = {
-        'CheckForToolchain' : CheckForToolchain,
-    })
-
-    toolchain = None
-    have_toolchain = lambda: toolchain != None
-    using_msvc = lambda: toolchain == toolchain_msvc
-    using_gcc = lambda: toolchain == toolchain_gcc
-    using_clang = lambda: toolchain == toolchain_clang
-
-    if windows:
-        toolchain_search_sequence = [toolchain_msvc]
-    else:
-        toolchain_search_sequence = [toolchain_gcc, toolchain_clang]
-
-    for candidate_toolchain in toolchain_search_sequence:
-        if conf.CheckForToolchain(candidate_toolchain, "C++", "CXX", ".cpp"):
-            toolchain = candidate_toolchain
-            break
-
-    if not have_toolchain():
-        print("Couldn't identify the toolchain")
-        Exit(1)
-
-    if check_c and not conf.CheckForToolchain(toolchain, "C", "CC", ".c"):
-        print("C toolchain doesn't match identified C++ toolchain")
-        Exit(1)
-
-    myenv = conf.Finish()
-
-    if using_msvc():
+    if myenv.ToolchainIs('msvc'):
         compiler_minimum_string = "Microsoft Visual Studio 2013 Update 2"
         compiler_test_body = textwrap.dedent(
         """
@@ -1261,15 +1218,15 @@ def doConfigure(myenv):
             return 0;
         }
         """ % compiler_minimum_string)
-    elif using_gcc():
-        compiler_minimum_string = "GCC 4.8.2"
+    elif myenv.ToolchainIs('gcc'):
+        compiler_minimum_string = "GCC 4.8.1"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(__GNUC__) || defined(__clang__)
         #error
         #endif
 
-        #if (__GNUC__ < 4) || (__GNUC__ == 4 && __GNUC_MINOR__ < 8) || (__GNUC__ == 4 && __GNUC_MINOR__ == 8 && __GNUC_PATCHLEVEL__ < 2)
+        #if (__GNUC__ < 4) || (__GNUC__ == 4 && __GNUC_MINOR__ < 8) || (__GNUC__ == 4 && __GNUC_MINOR__ == 8 && __GNUC_PATCHLEVEL__ < 1)
         #error %s or newer is required to build MongoDB
         #endif
 
@@ -1277,7 +1234,7 @@ def doConfigure(myenv):
             return 0;
         }
         """ % compiler_minimum_string)
-    elif using_clang:
+    elif myenv.ToolchainIs('clang'):
         compiler_minimum_string = "clang 3.4 (or Apple XCode 5.1.1)"
         compiler_test_body = textwrap.dedent(
         """
@@ -1316,12 +1273,8 @@ def doConfigure(myenv):
         'CheckForMinimumCompiler' : CheckForMinimumCompiler,
     })
 
-    c_compiler_validated = True
-    if check_c:
-        c_compiler_validated = conf.CheckForMinimumCompiler('C')
+    c_compiler_validated = conf.CheckForMinimumCompiler('C')
     cxx_compiler_validated = conf.CheckForMinimumCompiler('C++')
-
-    myenv = conf.Finish();
 
     suppress_invalid = has_option("disable-minimum-compiler-version-enforcement")
     if releaseBuild and suppress_invalid:
@@ -1335,94 +1288,26 @@ def doConfigure(myenv):
         print("WARNING: Ignoring failed compiler version check per explicit user request.")
         print("WARNING: The build may fail, binaries may crash, or may run but corrupt data...")
 
-    global use_clang
-    use_clang = using_clang()
-
     # Figure out what our minimum windows version is. If the user has specified, then use
     # that. Otherwise, if they have explicitly selected between 32 bit or 64 bit, choose XP or
     # Vista respectively. Finally, if they haven't done either of these, try invoking the
     # compiler to figure out whether we are doing a 32 or 64 bit build and select as
     # appropriate.
-    if windows:
+    if env.TargetOSIs('windows'):
         win_version_min = None
-        default_32_bit_min = 'xpsp3'
-        default_64_bit_min = 'ws03sp2'
         if has_option('win-version-min'):
             win_version_min = get_option('win-version-min')
-        elif has_option('win2008plus'):
-            win_version_min = 'win7'
-        else:
-            if force32:
-                win_version_min = default_32_bit_min
-            elif force64:
-                win_version_min = default_64_bit_min
-            else:
-                def CheckFor64Bit(context):
-                    win64_test_body = textwrap.dedent(
-                        """
-                        #if !defined(_WIN64)
-                        #error
-                        #endif
-                        """
-                    )
-                    context.Message('Checking if toolchain is in 64-bit mode... ')
-                    result = context.TryCompile(win64_test_body, ".c")
-                    context.Result(result)
-                    return result
-
-                conf = Configure(myenv, help=False, custom_tests = {
-                    'CheckFor64Bit' : CheckFor64Bit
-                })
-                if conf.CheckFor64Bit():
-                    win_version_min = default_64_bit_min
-                else:
-                    win_version_min = default_32_bit_min
-                conf.Finish();
+        # If no minimum version has beeen specified, use our defaults for 32-bit/64-bit windows.
+        elif env['TARGET_ARCH'] == 'x86_64':
+            win_version_min = 'ws03sp2'
+        elif env['TARGET_ARCH'] == 'i386':
+            win_version_min = 'xpsp3'
 
         env['WIN_VERSION_MIN'] = win_version_min
         win_version_min = win_version_min_choices[win_version_min]
         env.Append( CPPDEFINES=[("_WIN32_WINNT", "0x" + win_version_min[0])] )
         env.Append( CPPDEFINES=[("NTDDI_VERSION", "0x" + win_version_min[0] + win_version_min[1])] )
 
-    def CheckForx86(context):
-        # See http://nadeausoftware.com/articles/2012/02/c_c_tip_how_detect_processor_type_using_compiler_predefined_macros
-        test_body = """
-        #if defined(__i386) || defined(_M_IX86)
-        /* x86 32-bit */
-        #else
-        #error not 32-bit x86
-        #endif
-        """
-        context.Message('Checking if target architecture is 32-bit x86...')
-        ret = context.TryCompile(textwrap.dedent(test_body), ".c")
-        context.Result(ret)
-        return ret
-
-    conf = Configure(myenv, help=False, custom_tests = {
-        'CheckForx86' : CheckForx86,
-    })
-
-    if conf.CheckForx86():
-
-        # If we are using GCC or clang to target 32 or x86, set the ISA minimum to 'nocona',
-        # and the tuning to 'generic'. The choice of 'nocona' is selected because it
-        #  -- includes MMX extenions which we need for tcmalloc on 32-bit
-        #  -- can target 32 bit
-        #  -- is at the time of this writing a widely-deployed 10 year old microarchitecture
-        #  -- is available as a target architecture from GCC 4.0+
-        # However, we only want to select an ISA, not the nocona specific scheduling, so we
-        # select the generic tuning. For installations where hardware and system compiler rev are
-        # contemporaries, the generic scheduling should be appropriate for a wide range of
-        # deployed hardware.
-
-        if using_gcc() or using_clang():
-                myenv.Append( CCFLAGS=['-march=nocona', '-mtune=generic'] )
-
-        # Wiredtiger only supports 64-bit architecture, and will fail to compile on 32-bit
-        # so disable WiredTiger automatically on 32-bit since wiredtiger is on by default
-        if wiredtiger == True:
-            print "WARNING: WiredTiger is not supported on 32-bit platforms, disabling support"
-            wiredtiger = False
     conf.Finish()
 
     def AddFlagIfSupported(env, tool, extension, flag, **mutation):
@@ -1433,12 +1318,12 @@ def doConfigure(myenv):
             context.Result(ret)
             return ret
 
-        if using_msvc():
+        if env.ToolchainIs('msvc'):
             print("AddFlagIfSupported is not currently supported with MSVC")
             Exit(1)
 
         test_mutation = mutation
-        if using_gcc():
+        if env.ToolchainIs('gcc'):
             test_mutation = copy.deepcopy(mutation)
             # GCC helpfully doesn't issue a diagnostic on unknown flags of the form -Wno-xxx
             # unless other diagnostics are triggered. That makes it tough to check for support
@@ -1477,7 +1362,7 @@ def doConfigure(myenv):
     def AddToCXXFLAGSIfSupported(env, flag):
         return AddFlagIfSupported(env, 'C++', '.cpp', flag, CXXFLAGS=[flag])
 
-    if using_gcc() or using_clang():
+    if myenv.ToolchainIs('clang', 'gcc'):
         # This warning was added in g++-4.8.
         AddToCCFLAGSIfSupported(myenv, '-Wno-unused-local-typedefs')
 
@@ -1517,7 +1402,7 @@ def doConfigure(myenv):
         AddToCCFLAGSIfSupported(myenv, "-Wno-missing-braces")
 
     # Check if we need to disable null-conversion warnings
-    if using_clang():
+    if myenv.ToolchainIs('clang'):
         def CheckNullConversion(context):
 
             test_body = """
@@ -1542,7 +1427,7 @@ def doConfigure(myenv):
         conf.Finish()
 
     # This needs to happen before we check for libc++, since it affects whether libc++ is available.
-    if darwin and has_option('osx-version-min'):
+    if env.TargetOSIs('osx') and has_option('osx-version-min'):
         min_version = get_option('osx-version-min')
         min_version_flag = '-mmacosx-version-min=%s' % (min_version)
         if not AddToCCFLAGSIfSupported(myenv, min_version_flag):
@@ -1552,10 +1437,10 @@ def doConfigure(myenv):
 
     usingLibStdCxx = False
     if has_option('libc++'):
-        if not using_clang():
+        if not myenv.ToolchainIs('clang'):
             print( 'libc++ is currently only supported for clang')
             Exit(1)
-        if darwin and has_option('osx-version-min') and versiontuple(min_version) < versiontuple('10.7'):
+        if env.TargetOSIs('osx') and has_option('osx-version-min') and versiontuple(min_version) < versiontuple('10.7'):
             print("Warning: You passed option 'libc++'. You probably want to also pass 'osx-version-min=10.7' or higher for libc++ support.")
         if AddToCXXFLAGSIfSupported(myenv, '-stdlib=libc++'):
             myenv.Append(LINKFLAGS=['-stdlib=libc++'])
@@ -1582,7 +1467,7 @@ def doConfigure(myenv):
         usingLibStdCxx = conf.CheckLibStdCxx()
         conf.Finish()
 
-    if not using_msvc():
+    if not myenv.ToolchainIs('msvc'):
         if not AddToCXXFLAGSIfSupported(myenv, '-std=c++11'):
             print( 'Compiler does not honor -std=c++11' )
             Exit(1)
@@ -1692,6 +1577,7 @@ def doConfigure(myenv):
         'CheckPosixSystem' : CheckPosixSystem,
     })
     posix_system = conf.CheckPosixSystem()
+
     conf.Finish()
 
     # Check if we are on a system that support the POSIX clock_gettime function
@@ -1718,25 +1604,33 @@ def doConfigure(myenv):
             'CheckPosixMonotonicClock' : CheckPosixMonotonicClock,
         })
         posix_monotonic_clock = conf.CheckPosixMonotonicClock()
+
+        # On 32-bit systems, we need to define this in order to get access to
+        # the 64-bit versions of fseek, etc.
+        if not conf.CheckTypeSize('off_t', includes="#include <sys/types.h>", expect=8):
+            myenv.Append(CPPDEFINES=["_FILE_OFFSET_BITS=64"])
+
         conf.Finish()
 
     if has_option('sanitize'):
 
-        if not (using_clang() or using_gcc()):
+        if not myenv.ToolchainIs('clang', 'gcc'):
             print( 'sanitize is only supported with clang or gcc')
+            Exit(1)
+
+        if get_option('allocator') == 'tcmalloc':
+            # There are multiply defined symbols between the sanitizer and
+            # our vendorized tcmalloc.
+            print("Cannot use --sanitize with tcmalloc")
             Exit(1)
 
         sanitizer_list = get_option('sanitize').split(',')
 
         using_lsan = 'leak' in sanitizer_list
         using_asan = 'address' in sanitizer_list or using_lsan
+        using_tsan = 'thread' in sanitizer_list
 
-        if using_asan:
-            if get_option('allocator') == 'tcmalloc':
-                print("Cannot use address or leak sanitizer with tcmalloc")
-                Exit(1)
-
-        # If the user asked for leak sanitizer turn on the detect_leaks
+        # If the user asked for leak sanitizer, turn on the detect_leaks
         # ASAN_OPTION. If they asked for address sanitizer as well, drop
         # 'leak', because -fsanitize=leak means no address.
         #
@@ -1785,11 +1679,16 @@ def doConfigure(myenv):
         if llvm_symbolizer:
             myenv['ENV']['ASAN_SYMBOLIZER_PATH'] = llvm_symbolizer
             myenv['ENV']['LSAN_SYMBOLIZER_PATH'] = llvm_symbolizer
+            tsan_options = "external_symbolizer_path=\"%s\" " % llvm_symbolizer
         elif using_lsan:
             print("Using the leak sanitizer requires a valid symbolizer")
             Exit(1)
 
-    if using_msvc() and optBuild:
+        if using_tsan:
+            tsan_options += "suppressions=\"%s\" " % myenv.File("#etc/tsan.suppressions").abspath
+            myenv['ENV']['TSAN_OPTIONS'] = tsan_options
+
+    if myenv.ToolchainIs('msvc') and optBuild:
         # http://blogs.msdn.com/b/vcblog/archive/2013/09/11/introducing-gw-compiler-switch.aspx
         #
         myenv.Append( CCFLAGS=["/Gw", "/Gy"] )
@@ -1801,7 +1700,7 @@ def doConfigure(myenv):
 
     # Apply any link time optimization settings as selected by the 'lto' option.
     if has_option('lto'):
-        if using_msvc():
+        if myenv.ToolchainIs('msvc'):
             # Note that this is actually more aggressive than LTO, it is whole program
             # optimization due to /GL. However, this is historically what we have done for
             # windows, so we are keeping it.
@@ -1811,7 +1710,7 @@ def doConfigure(myenv):
             myenv.Append(CCFLAGS=['/GL'])
             myenv.Append(LINKFLAGS=['/LTCG'])
             myenv.Append(ARFLAGS=['/LTCG'])
-        elif using_gcc() or using_clang():
+        elif myenv.ToolchainIs('gcc', 'clang'):
             # For GCC and clang, the flag is -flto, and we need to pass it both on the compile
             # and link lines.
             if AddToCCFLAGSIfSupported(myenv, '-flto'):
@@ -1857,13 +1756,13 @@ def doConfigure(myenv):
             printf("Don't know how to enable --lto on current toolchain")
             Exit(1)
 
-    # glibc's memcmp is faster than gcc's
-    if linux:
+    # We set this to work around https://gcc.gnu.org/bugzilla/show_bug.cgi?id=43052
+    if not myenv.ToolchainIs('msvc'):
         AddToCCFLAGSIfSupported(myenv, "-fno-builtin-memcmp")
 
     # When using msvc, check for support for __declspec(thread), unless we have been asked
     # explicitly not to use it. For other compilers, see if __thread works.
-    if using_msvc():
+    if myenv.ToolchainIs('msvc'):
         haveDeclSpecThread = False
         def CheckDeclspecThread(context):
             test_body = """
@@ -1883,7 +1782,7 @@ def doConfigure(myenv):
         haveDeclSpecThread = conf.CheckDeclspecThread()
         conf.Finish()
         if haveDeclSpecThread:
-            myenv.Append(CPPDEFINES=['MONGO_HAVE___DECLSPEC_THREAD'])
+            myenv.SetConfigHeaderDefine("MONGO_CONFIG_HAVE___DECLSPEC_THREAD")
     else:
         def CheckUUThread(context):
             test_body = """
@@ -1903,7 +1802,7 @@ def doConfigure(myenv):
         haveUUThread = conf.CheckUUThread()
         conf.Finish()
         if haveUUThread:
-            myenv.Append(CPPDEFINES=['MONGO_HAVE___THREAD'])
+            myenv.SetConfigHeaderDefine("MONGO_CONFIG_HAVE___THREAD")
 
     # not all C++11-enabled gcc versions have type properties
     def CheckCXX11IsTriviallyCopyable(context):
@@ -1942,7 +1841,30 @@ def doConfigure(myenv):
     })
 
     if conf.CheckCXX11IsTriviallyCopyable():
-        conf.env.Append(CPPDEFINES=['MONGO_HAVE_STD_IS_TRIVIALLY_COPYABLE'])
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_STD_IS_TRIVIALLY_COPYABLE")
+
+    myenv = conf.Finish()
+
+    def CheckCXX14MakeUnique(context):
+        test_body = """
+        #include <memory>
+        int main(int argc, char **argv) {
+            auto foo = std::make_unique<int>(5);
+            return 0;
+        }
+        """
+        context.Message('Checking for C++14 std::make_unique support... ')
+        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
+        context.Result(ret)
+        return ret
+
+    # Check for std::make_unique support without using the __cplusplus macro
+    conf = Configure(myenv, help=False, custom_tests = {
+        'CheckCXX14MakeUnique': CheckCXX14MakeUnique,
+    })
+
+    if conf.CheckCXX14MakeUnique():
+        conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_MAKE_UNIQUE')
 
     myenv = conf.Finish()
 
@@ -1968,6 +1890,8 @@ def doConfigure(myenv):
     if use_system_version_of_library("pcre"):
         conf.FindSysLibDep("pcre", ["pcre"])
         conf.FindSysLibDep("pcrecpp", ["pcrecpp"])
+    else:
+        env.Prepend(CPPDEFINES=['PCRE_STATIC'])
 
     if use_system_version_of_library("snappy"):
         conf.FindSysLibDep("snappy", ["snappy"])
@@ -2011,23 +1935,23 @@ def doConfigure(myenv):
                     language='C++')
 
     if posix_system:
-        conf.env.Append(CPPDEFINES=['MONGO_HAVE_HEADER_UNISTD_H'])
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_HEADER_UNISTD_H")
         conf.CheckLib('rt')
         conf.CheckLib('dl')
 
     if posix_monotonic_clock:
-        conf.env.Append(CPPDEFINES=['MONGO_HAVE_POSIX_MONOTONIC_CLOCK'])
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_POSIX_MONOTONIC_CLOCK")
 
     if (conf.CheckCXXHeader( "execinfo.h" ) and
         conf.CheckDeclaration('backtrace', includes='#include <execinfo.h>') and
         conf.CheckDeclaration('backtrace_symbols', includes='#include <execinfo.h>') and
         conf.CheckDeclaration('backtrace_symbols_fd', includes='#include <execinfo.h>')):
 
-        conf.env.Append( CPPDEFINES=[ "MONGO_HAVE_EXECINFO_BACKTRACE" ] )
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_EXECINFO_BACKTRACE")
 
     conf.env["_HAVEPCAP"] = conf.CheckLib( ["pcap", "wpcap"], autoadd=False )
 
-    if solaris:
+    if env.TargetOSIs('solaris'):
         conf.CheckLib( "nsl" )
 
     if usev8 and use_system_version_of_library("v8"):
@@ -2047,7 +1971,7 @@ def doConfigure(myenv):
         Exit(1)
 
     # requires ports devel/libexecinfo to be installed
-    if freebsd or openbsd:
+    if env.TargetOSIs('freebsd', 'openbsd'):
         if not conf.CheckLib("execinfo"):
             print("Cannot find libexecinfo, please install devel/libexecinfo.")
             Exit(1)
@@ -2057,10 +1981,6 @@ def doConfigure(myenv):
     if get_option('allocator') == 'tcmalloc':
         if use_system_version_of_library('tcmalloc'):
             conf.FindSysLibDep("tcmalloc", ["tcmalloc"])
-        elif has_option("heapcheck"):
-            print ("--heapcheck does not work with the tcmalloc embedded in the mongodb source "
-                   "tree.  Use --use-system-tcmalloc.")
-            Exit(1)
     elif get_option('allocator') == 'jemalloc':
         pass
     elif get_option('allocator') == 'system':
@@ -2068,18 +1988,6 @@ def doConfigure(myenv):
     else:
         print "Invalid --allocator parameter: \"%s\"" % get_option('allocator')
         Exit(1)
-
-    if has_option("heapcheck"):
-        if not debugBuild:
-            print( "--heapcheck needs --d or --dd" )
-            Exit( 1 )
-
-        if not conf.CheckCXXHeader( "google/heap-checker.h" ):
-            print( "--heapcheck neads header 'google/heap-checker.h'" )
-            Exit( 1 )
-
-        conf.env.Append( CPPDEFINES=[ "HEAP_CHECKING" ] )
-        conf.env.Append( CCFLAGS=["-fno-omit-frame-pointer"] )
 
     # ask each module to configure itself and the build environment.
     moduleconfig.configure_modules(mongo_modules, conf)
@@ -2097,14 +2005,6 @@ def checkErrorCodes():
         Exit(-1)
 
 checkErrorCodes()
-
-#  ---- Docs ----
-def build_docs(env, target, source):
-    from buildscripts import docs
-    docs.main()
-
-env.Alias("docs", [], [build_docs])
-env.AlwaysBuild("docs")
 
 #  ---- astyle ----
 
@@ -2145,13 +2045,11 @@ env.AlwaysBuild( "lint" )
 
 def getSystemInstallName():
     dist_arch = GetOption("distarch")
-    arch_name = processor if not dist_arch else dist_arch
-    n = platform + "-" + arch_name
-    if static:
-        n += "-static"
+    arch_name = env['TARGET_ARCH'] if not dist_arch else dist_arch
+    n = env.GetTargetOSName() + "-" + arch_name
     if has_option("nostrip"):
         n += "-debugsymbols"
-    if nix and os.uname()[2].startswith("8."):
+    if env.TargetOSIs('posix') and os.uname()[2].startswith("8."):
         n += "-tiger"
 
     if len(mongo_modules):
@@ -2171,15 +2069,7 @@ def getSystemInstallName():
 
     return n
 
-def getCodeVersion():
-    fullSource = open( "src/mongo/util/version.cpp" , "r" ).read()
-    allMatches = re.findall( r"versionString.. = \"(.*?)\"" , fullSource );
-    if len(allMatches) != 1:
-        print( "can't find version # in code" )
-        return None
-    return allMatches[0]
-
-mongoCodeVersion = getCodeVersion()
+mongoCodeVersion = env['MONGO_CODE_VERSION']
 if mongoCodeVersion == None:
     Exit(-1)
 
@@ -2196,8 +2086,6 @@ else:
 env['SERVER_DIST_BASENAME'] = 'mongodb-%s-%s' % (getSystemInstallName(), distName)
 
 distFile = "${SERVER_ARCHIVE}"
-
-env['NIX_LIB_DIR'] = nixLibPrefix
 
 #  ---- CONVENIENCE ----
 
@@ -2291,17 +2179,13 @@ module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 Export("env")
 Export("get_option")
 Export("has_option use_system_version_of_library")
-Export("skip_buildinfo")
-Export("mongoCodeVersion")
 Export("serverJs")
 Export("usev8")
 Export("v8version v8suffix")
 Export("boostSuffix")
-Export("darwin windows solaris linux freebsd nix openbsd")
 Export('module_sconscripts')
 Export("debugBuild optBuild")
 Export("s3push")
-Export("use_clang")
 Export("wiredtiger")
 
 def injectMongoIncludePaths(thisEnv):
@@ -2309,7 +2193,7 @@ def injectMongoIncludePaths(thisEnv):
 env.AddMethod(injectMongoIncludePaths, 'InjectMongoIncludePaths')
 
 env.SConscript('src/SConscript', variant_dir='$BUILD_DIR', duplicate=False)
-env.SConscript(['SConscript.buildinfo', 'SConscript.smoke'])
+env.SConscript('SConscript.smoke')
 
 def clean_old_dist_builds(env, target, source):
     prefix = "mongodb-%s-%s" % (platform, processor)

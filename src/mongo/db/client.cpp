@@ -32,8 +32,6 @@
    to an open socket (or logical connection if pooling on sockets) from a client.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
@@ -57,7 +55,6 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/s/chunk_version.h"
@@ -67,7 +64,6 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -77,45 +73,6 @@ namespace mongo {
     using logger::LogComponent;
 
 namespace {
-
-    class HandshakeCmd : public Command {
-    public:
-        void help(stringstream& h) const { h << "internal"; }
-        HandshakeCmd() : Command("handshake") {}
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return false; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-            const BSONObj& cmdObj,
-            std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::internal);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-
-        virtual bool run(OperationContext* txn,
-                         const string& ns,
-                         BSONObj& cmdObj,
-                         int options,
-                         string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
-
-            repl::HandshakeArgs handshake;
-            Status status = handshake.initialize(cmdObj);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
-
-            // TODO(dannenberg) move this into actual processing for both version
-            txn->getClient()->setRemoteID(handshake.getRid());
-
-            status = repl::getGlobalReplicationCoordinator()->processHandshake(txn, handshake);
-            return appendCommandStatus(result, status);
-        }
-
-    } handshakeCmd;
-
 
     /**
      * Create an appropriate new locker for the storage engine in use. Caller owns the return.
@@ -163,7 +120,7 @@ namespace {
         currentClient.reset(client);
 
         // This makes the client visible to maintenance threads
-        boost::mutex::scoped_lock clientLock(clientsMutex);
+        boost::lock_guard<boost::mutex> clientLock(clientsMutex);
         clients.insert(client);
     }
 
@@ -172,9 +129,8 @@ namespace {
           _desc(desc),
           _threadId(boost::this_thread::get_id()),
           _connectionId(p ? p->connectionId() : 0),
-          _god(0),
+          _inDirectClient(false),
           _txn(NULL),
-          _locker(newLocker()),
           _lastOp(0),
           _shutdown(false) {
 
@@ -182,12 +138,10 @@ namespace {
     }
 
     Client::~Client() {
-        _god = 0;
-
         if ( ! inShutdown() ) {
             // we can't clean up safely once we're in shutdown
             {
-                boost::mutex::scoped_lock clientLock(clientsMutex);
+                boost::lock_guard<boost::mutex> clientLock(clientsMutex);
                 if ( ! _shutdown )
                     clients.erase(this);
             }
@@ -206,170 +160,20 @@ namespace {
         if ( inShutdown() )
             return false;
         {
-            boost::mutex::scoped_lock clientLock(clientsMutex);
+            boost::lock_guard<boost::mutex> clientLock(clientsMutex);
             clients.erase(this);
         }
 
         return false;
     }
 
-
-    Client::Context::Context(OperationContext* txn, const std::string& ns, Database * db)
-        : _justCreated(false),
-          _doVersion(true),
-          _ns(ns),
-          _db(db),
-          _txn(txn) {
-    }
-
-    Client::Context::Context(OperationContext* txn,
-                             const std::string& ns,
-                             Database* db,
-                             bool justCreated)
-        : _justCreated(justCreated),
-          _doVersion(true),
-          _ns(ns),
-          _db(db),
-          _txn(txn) {
-        _finishInit();
-    }
-
-    Client::Context::Context(OperationContext* txn,
-                             const string& ns,
-                             bool doVersion)
-        : _justCreated(false), // set for real in finishInit
-          _doVersion(doVersion),
-          _ns(ns),
-          _db(NULL),
-          _txn(txn) {
-
-        _finishInit();
-    }
-
-    void Client::Context::_finishInit() {
-        _db = dbHolder().get(_txn, _ns);
-        if (_db) {
-            _justCreated = false;
-        }
-        else {
-            invariant(_txn->lockState()->isDbLockedForMode(nsToDatabaseSubstring(_ns), MODE_X));
-            _db = dbHolder().openDb(_txn, _ns, &_justCreated);
-            invariant(_db);
+    Locker* Client::getLocker() {
+        if (!_locker) {
+            _locker.reset(newLocker());
         }
 
-        if (_doVersion) {
-            _checkNotStale();
-        }
-
-        _txn->getCurOp()->enter(_ns.c_str(), _db->getProfilingLevel());
+        return _locker.get();
     }
-
-    void Client::Context::_checkNotStale() const {
-        switch (_txn->getCurOp()->getOp()) {
-        case dbGetMore: // getMore is special and should be handled elsewhere.
-        case dbUpdate:  // update & delete check shard version in instance.cpp, so don't check
-        case dbDelete:  // here as well.
-            break;
-        default:
-            ensureShardVersionOKOrThrow(_ns);
-        }
-    }
-
-    Client::Context::~Context() {
-        // Lock must still be held
-        invariant(_txn->lockState()->isLocked());
-
-        _txn->getCurOp()->recordGlobalTime(_txn->lockState()->isWriteLocked(), _timer.micros());
-    }
-
-
-    AutoGetDb::AutoGetDb(OperationContext* txn, StringData ns, LockMode mode)
-            : _dbLock(txn->lockState(), ns, mode),
-              _db(dbHolder().get(txn, ns)) {
-
-    }
-
-    AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* txn,
-                                         StringData ns,
-                                         LockMode mode)
-            :  _transaction(txn, MODE_IX),
-               _dbLock(txn->lockState(), ns, mode),
-              _db(dbHolder().get(txn, ns)) {
-        invariant(mode == MODE_IX || mode == MODE_X);
-        _justCreated = false;
-        // If the database didn't exist, relock in MODE_X
-        if (_db == NULL) {
-            if (mode != MODE_X) {
-                _dbLock.relockWithMode(MODE_X);
-            }
-            _db = dbHolder().openDb(txn, ns);
-            _justCreated = true;
-        }
-    }
-
-    AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* txn,
-                                                       const std::string& ns)
-            : _txn(txn),
-              _transaction(txn, MODE_IS),
-              _db(_txn, nsToDatabaseSubstring(ns), MODE_IS),
-              _collLock(_txn->lockState(), ns, MODE_IS),
-              _coll(NULL) {
-
-        _init(ns, nsToCollectionSubstring(ns));
-    }
-
-    AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* txn,
-                                                       const NamespaceString& nss)
-            : _txn(txn),
-              _transaction(txn, MODE_IS),
-              _db(_txn, nss.db(), MODE_IS),
-              _collLock(_txn->lockState(), nss.toString(), MODE_IS),
-              _coll(NULL) {
-
-        _init(nss.toString(), nss.coll());
-    }
-
-    void AutoGetCollectionForRead::_init(const std::string& ns, StringData coll) {
-        massert(28535, "need a non-empty collection name", !coll.empty());
-
-        // TODO: Client::Context legacy, needs to be removed
-        _txn->getCurOp()->ensureStarted();
-        _txn->getCurOp()->setNS(ns);
-
-        // We have both the DB and collection locked, which the prerequisite to do a stable shard
-        // version check.
-        ensureShardVersionOKOrThrow(ns);
-
-        // At this point, we are locked in shared mode for the database by the DB lock in the
-        // constructor, so it is safe to load the DB pointer.
-        if (_db.getDb()) {
-            // TODO: Client::Context legacy, needs to be removed
-            _txn->getCurOp()->enter(ns.c_str(), _db.getDb()->getProfilingLevel());
-
-            _coll = _db.getDb()->getCollection(ns);
-        }
-    }
-
-    AutoGetCollectionForRead::~AutoGetCollectionForRead() {
-        // Report time spent in read lock
-        _txn->getCurOp()->recordGlobalTime(false, _timer.micros());
-    }
-
-    Client::WriteContext::WriteContext(OperationContext* opCtx, const std::string& ns)
-        : _txn(opCtx),
-          _nss(ns),
-          _autodb(opCtx, _nss.db(), MODE_IX),
-          _collk(opCtx->lockState(), ns, MODE_IX),
-          _c(opCtx, ns, _autodb.getDb(), _autodb.justCreated()) {
-        _collection = _c.db()->getCollection( ns );
-        if ( !_collection && !_autodb.justCreated() ) {
-            // relock in MODE_X
-            _collk.relockWithMode( MODE_X, _autodb.lock() );
-            Database* db = dbHolder().get(_txn, ns );
-            invariant( db == _c.db() );
-        }
-    }
-
 
     void Client::appendLastOp( BSONObjBuilder& b ) const {
         // _lastOp is never set if replication is off
@@ -575,7 +379,7 @@ namespace {
                 }
             }
         }
-    }
+    } // namespace
 
 #define OPDEBUG_APPEND_NUMBER(x) if( x != -1 ) b.appendNumber( #x , (x) )
 #define OPDEBUG_APPEND_BOOL(x) if( x ) b.appendBool( #x , (x) )
@@ -643,4 +447,4 @@ namespace {
         // This can be called in mongod, which is unfortunate.  To fix this,
         // we can redesign how connection pooling works on mongod for sharded operations.
     }
-}
+} // namespace mongo

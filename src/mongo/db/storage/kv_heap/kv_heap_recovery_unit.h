@@ -35,7 +35,6 @@
 #include "mongo/db/storage/kv/dictionary/kv_recovery_unit.h"
 #include "mongo/db/storage/kv/slice.h"
 #include "mongo/util/assert_util.h"
-#include "third_party/boost/boost/shared_ptr.hpp"
 
 namespace mongo {
 
@@ -105,7 +104,7 @@ namespace mongo {
     class KVHeapRecoveryUnit : public KVRecoveryUnit {
         MONGO_DISALLOW_COPYING(KVHeapRecoveryUnit);
 
-        std::vector<boost::shared_ptr<Change> > _ops;
+        std::vector< std::shared_ptr<Change> > _ops;
 
     public:
         KVHeapRecoveryUnit() {}

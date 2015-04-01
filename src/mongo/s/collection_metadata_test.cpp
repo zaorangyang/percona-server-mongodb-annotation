@@ -36,7 +36,6 @@
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/collection_metadata.h"
 #include "mongo/s/metadata_loader.h"
-#include "mongo/s/range_arithmetic.h"
 #include "mongo/s/type_chunk.h"
 #include "mongo/s/type_collection.h"
 #include "mongo/unittest/unittest.h"
@@ -99,7 +98,7 @@ namespace {
             chunkType.setMax( BSON( "a" << MAXKEY ) );
             chunkType.setVersion( ChunkVersion( 1, 0, epoch ) );
             chunkType.setName( OID::gen().toString() );
-            ASSERT( chunkType.isValid( &errMsg ) );
+            ASSERT(chunkType.validate().isOK());
 
             _dummyConfig->insert( ChunkType::ConfigNS, chunkType.toBSON() );
 

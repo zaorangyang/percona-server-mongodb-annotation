@@ -1,6 +1,6 @@
 # -*- mode: python -*-
 
-Import("env use_system_version_of_library windows darwin usev8 v8suffix solaris boostSuffix")
+Import("env use_system_version_of_library usev8 v8suffix boostSuffix")
 Import("wiredtiger")
 
 snappySuffix = '-1.1.2'
@@ -13,7 +13,7 @@ thirdPartyIncludePathList = [
 
 if not use_system_version_of_library('tcmalloc'):
     thirdPartyIncludePathList.append(
-        ('gperftools', '#/src/third_party/gperftools-2.2'))
+        ('gperftools', '#/src/third_party/gperftools-2.2/src'))
 
 if not use_system_version_of_library('pcre'):
     thirdPartyIncludePathList.append(
@@ -100,13 +100,14 @@ boostEnv = env
 if use_system_version_of_library("boost"):
     # On windows, we don't need the syslibdeps because autolib will select the right libraries
     # for us automatically.
-    if not windows:
+    if not env.TargetOSIs('windows'):
         boostEnv = env.Clone(
             SYSLIBDEPS=[
                 env['LIBDEPS_BOOST_PROGRAM_OPTIONS_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_FILESYSTEM_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_THREAD_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_SYSTEM_SYSLIBDEP'],
+                env['LIBDEPS_BOOST_CHRONO_SYSLIBDEP'],
             ])
 else:
     boostDirectory = 'boost' + boostSuffix
@@ -119,6 +120,7 @@ else:
             boostDirectory + '/boost_filesystem',
             boostDirectory + '/boost_thread',
             boostDirectory + '/boost_system',
+            boostDirectory + '/boost_chrono',
         ])
 
 boostEnv.Library(
@@ -174,7 +176,7 @@ if usev8:
     if use_system_version_of_library("v8"):
         v8Env = env.Clone(
             SYSLIBDEPS=[
-                env['LIBDEPS_v8_SYSLIBDEP'],
+                env['LIBDEPS_V8_SYSLIBDEP'],
             ])
     else:
         v8Env = env.Clone()
@@ -262,7 +264,7 @@ yamlEnv.Library(
 
 
 tzEnv = env.Clone()
-if solaris:
+if env.TargetOSIs('solaris'):
     tzEnv.InjectThirdPartyIncludePaths(libraries=['tz'])
     tzEnv.SConscript('tz/SConscript', exports={ 'env' : tzEnv })
     tzEnv = tzEnv.Clone(
