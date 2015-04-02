@@ -95,14 +95,6 @@ namespace {
         return bb.obj();
     }
 
-    // taken from btree_logic.cpp
-    Status dupKeyError(const BSONObj& key) {
-        StringBuilder sb;
-        sb << "E11000 duplicate key error ";
-        sb << "dup key: " << key;
-        return Status(ErrorCodes::DuplicateKey, sb.str());
-    }
-
     Status checkKeySize(const BSONObj& key) {
         if ( key.objsize() >= TempKeyMaxSize ) {
             string msg = mongoutils::str::stream()
@@ -115,8 +107,18 @@ namespace {
 
 } // namespace
 
+    Status WiredTigerIndex::dupKeyError(const BSONObj& key) {
+        StringBuilder sb;
+        sb << "E11000 duplicate key error";
+        sb << " collection: " << _collectionNamespace;
+        sb << " index: " << _indexName;
+        sb << " dup key: " << key;
+        return Status(ErrorCodes::DuplicateKey, sb.str());
+    }
+
     // static
     StatusWith<std::string> WiredTigerIndex::parseIndexOptions(const BSONObj& options) {
+        StringBuilder ss;
         BSONForEach(elem, options) {
             if (elem.fieldNameStringData() == "configString") {
                 if (elem.type() != String) {
@@ -125,11 +127,7 @@ namespace {
                         << "Not adding 'configString' value "
                         << elem << " to index configuration");
                 }
-                if (elem.valueStringData().empty()) {
-                    return StatusWith<std::string>(ErrorCodes::InvalidOptions,
-                        "configString must be not be an empty string.");
-                }
-                return StatusWith<std::string>(elem.String());
+                ss << elem.valueStringData() << ',';
             }
             else {
                 // Return error on first unrecognized field.
@@ -138,8 +136,7 @@ namespace {
                     << " is not a supported option.");
             }
         }
-        return StatusWith<std::string>(ErrorCodes::BadValue,
-            "Storage engine options document must not be empty.");
+        return StatusWith<std::string>(ss.str());
     }
 
     // static
@@ -204,7 +201,9 @@ namespace {
                                      const IndexDescriptor* desc)
         : _ordering(Ordering::make(desc->keyPattern())),
           _uri( uri ),
-          _instanceId( WiredTigerSession::genCursorId() ) {
+          _instanceId( WiredTigerSession::genCursorId() ),
+          _collectionNamespace( desc->parentNS() ),
+          _indexName( desc->indexName() ){
 
         Status versionStatus =
             WiredTigerUtil::checkApplicationMetadataFormatVersion(ctx,
@@ -251,6 +250,36 @@ namespace {
 
     void WiredTigerIndex::fullValidate(OperationContext* txn, bool full, long long *numKeysOut,
                                        BSONObjBuilder* output) const {
+        {
+            std::vector<std::string> errors;
+            int err = WiredTigerUtil::verifyTable(txn, _uri, output ? &errors : NULL);
+            if (err == EBUSY) {
+                const char* msg = "verify() returned EBUSY. Not treating as invalid.";
+                warning() << msg;
+                if (output) {
+                    if (!errors.empty()) {
+                        *output << "errors" << errors;
+                    }
+                    *output << "warning" << msg;
+                }
+            }
+            else if (err) {
+                std::string msg = str::stream()
+                    << "verify() returned " << wiredtiger_strerror(err) << ". "
+                    << "This indicates structural damage. "
+                    << "Not examining individual index entries.";
+                error() << msg;
+                if (output) {
+                    errors.push_back(msg);
+                    *output << "errors" << errors;
+                    *output << "valid" << false;
+                }
+                return;
+            }
+        }
+
+        if (output) *output << "valid" << true;
+
         boost::scoped_ptr<SortedDataInterface::Cursor> cursor(newCursor(txn, 1));
         cursor->locate( minKey, RecordId::min() );
         long long count = 0;
@@ -270,7 +299,6 @@ namespace {
         }
 
         invariant(output);
-        appendCustomStats(txn, output, 1);
     }
 
     bool WiredTigerIndex::appendCustomStats(OperationContext* txn,
@@ -502,7 +530,7 @@ namespace {
             else {
                 // Dup found!
                 if (!_dupsAllowed) {
-                    return dupKeyError(newKey);
+                    return _idx->dupKeyError(newKey);
                 }
 
                 // If we get here, we are in the weird mode where dups are allowed on a unique

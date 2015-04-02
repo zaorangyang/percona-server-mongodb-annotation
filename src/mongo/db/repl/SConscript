@@ -153,8 +153,7 @@ env.CppUnitTest('repl_coordinator_impl_reconfig_test',
 
 env.Library('repl_coordinator_interface',
             ['replication_coordinator.cpp',
-             'replication_coordinator_external_state.cpp',
-             'repl_set_seed_list.cpp'],
+             'replication_coordinator_external_state.cpp'],
             LIBDEPS=[
                 '$BUILD_DIR/mongo/hostandport',
             ])
@@ -210,5 +209,6 @@ env.CppUnitTest('isself_test',
                     '$BUILD_DIR/mongo/serveronly',
                     '$BUILD_DIR/mongo/coreserver',
                     '$BUILD_DIR/mongo/coredb',
+                    "$BUILD_DIR/mongo/ntservice_mock",
                 ],
                 NO_CRUTCH = True)

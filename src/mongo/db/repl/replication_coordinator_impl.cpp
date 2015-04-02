@@ -1148,7 +1148,8 @@ namespace {
         if (now >= waitUntil) {
             *result = Status(ErrorCodes::ExceededTimeLimit, str::stream() <<
                              "No electable secondaries caught up as of " <<
-                             dateToISOStringLocal(now));
+                             dateToISOStringLocal(now) <<
+                             ". Please use {force: true} to force node to step down.");
             return;
         }
 
@@ -1237,7 +1238,7 @@ namespace {
     Status ReplicationCoordinatorImpl::checkCanServeReadsFor(OperationContext* txn,
                                                              const NamespaceString& ns,
                                                              bool slaveOk) {
-        if (txn->isGod()) {
+        if (txn->getClient()->isInDirectClient()) {
             return Status::OK();
         }
         if (canAcceptWritesForDatabase(ns.db())) {
@@ -2203,7 +2204,7 @@ namespace {
     }
 
     WriteConcernOptions ReplicationCoordinatorImpl::getGetLastErrorDefault() {
-        boost::mutex::scoped_lock lock(_mutex);
+        boost::lock_guard<boost::mutex> lock(_mutex);
         if (_rsConfig.isInitialized()) {
             return _rsConfig.getDefaultWriteConcern();
         }

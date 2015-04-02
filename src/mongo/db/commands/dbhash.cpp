@@ -34,10 +34,11 @@
 
 #include <boost/scoped_ptr.hpp>
 
-#include "mongo/db/client.h"
-#include "mongo/db/commands.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
@@ -62,9 +63,7 @@ namespace mongo {
 
     // ----
 
-    DBHashCmd::DBHashCmd()
-        : Command( "dbHash", false, "dbhash" ),
-          _cachedHashedMutex( "_cachedHashedMutex" ){
+    DBHashCmd::DBHashCmd() : Command("dbHash", false, "dbhash") {
     }
 
     void DBHashCmd::addRequiredPrivileges(const std::string& dbname,
@@ -75,11 +74,14 @@ namespace mongo {
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
     }
 
-    string DBHashCmd::hashCollection( OperationContext* opCtx, Database* db, const string& fullCollectionName, bool* fromCache ) {
-        scoped_ptr<scoped_lock> cachedHashedLock;
+    std::string DBHashCmd::hashCollection(OperationContext* opCtx,
+                                          Database* db,
+                                          const std::string& fullCollectionName,
+                                          bool* fromCache) {
+        boost::unique_lock<boost::mutex> cachedHashedLock(_cachedHashedMutex, boost::defer_lock);
 
         if ( isCachable( fullCollectionName ) ) {
-            cachedHashedLock.reset( new scoped_lock( _cachedHashedMutex ) );
+            cachedHashedLock.lock();
             string hash = _cachedHashed[fullCollectionName];
             if ( hash.size() > 0 ) {
                 *fromCache = true;
@@ -133,7 +135,7 @@ namespace mongo {
         md5_finish(&st, d);
         string hash = digestToString( d );
 
-        if ( cachedHashedLock.get() ) {
+        if (cachedHashedLock.owns_lock()) {
             _cachedHashed[fullCollectionName] = hash;
         }
 
@@ -225,7 +227,7 @@ namespace mongo {
 
         }
         void commit() {
-            scoped_lock lk( _dCmd->_cachedHashedMutex );
+            boost::lock_guard<boost::mutex> lk( _dCmd->_cachedHashedMutex );
             _dCmd->_cachedHashed.erase(_ns);
         }
         void rollback() { }

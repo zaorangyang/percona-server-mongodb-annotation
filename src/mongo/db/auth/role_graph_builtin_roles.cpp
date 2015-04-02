@@ -356,9 +356,6 @@ namespace {
                 Privilege(ResourcePattern::forClusterResource(), ActionType::listDatabases));
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,
-                Privilege(ResourcePattern::forClusterResource(), ActionType::authSchemaUpgrade));
-        Privilege::addPrivilegeToPrivilegeVector(
-                privileges,
                 Privilege(ResourcePattern::forClusterResource(), ActionType::invalidateUserCache));
 
 
@@ -413,6 +410,8 @@ namespace {
                 Privilege(ResourcePattern::forCollectionName("system.namespaces"),
                           readRoleActions));
         ActionSet profileActions = readRoleActions;
+        profileActions.addAction(ActionType::convertToCapped);
+        profileActions.addAction(ActionType::createCollection);
         profileActions.addAction(ActionType::dropCollection);
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,

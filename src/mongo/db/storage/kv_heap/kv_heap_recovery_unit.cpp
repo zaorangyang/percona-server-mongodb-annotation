@@ -36,7 +36,7 @@
 namespace mongo {
 
     void KVHeapRecoveryUnit::commitUnitOfWork() {
-        for (std::vector< boost::shared_ptr<Change> >::iterator it = _ops.begin();
+        for (std::vector< std::shared_ptr<Change> >::iterator it = _ops.begin();
              it != _ops.end(); ++it) {
             Change *op = it->get();
             op->commit();
@@ -49,7 +49,7 @@ namespace mongo {
     }
 
     void KVHeapRecoveryUnit::endUnitOfWork() {
-        for (std::vector< boost::shared_ptr<Change> >::reverse_iterator it = _ops.rbegin();
+        for (std::vector< std::shared_ptr<Change> >::reverse_iterator it = _ops.rbegin();
              it != _ops.rend(); ++it) {
             Change *op = it->get();
             op->rollback();
@@ -58,7 +58,7 @@ namespace mongo {
     }
 
     void KVHeapRecoveryUnit::registerChange(Change* change) {
-        _ops.push_back(boost::shared_ptr<Change>(change));
+        _ops.push_back(std::shared_ptr<Change>(change));
     }
 
     KVHeapRecoveryUnit* KVHeapRecoveryUnit::getKVHeapRecoveryUnit(OperationContext* opCtx) {

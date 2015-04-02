@@ -36,6 +36,8 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
+#include "mongo/config.h"
+
 #include "mongo/platform/basic.h"
 
 #include <boost/filesystem/operations.hpp>
@@ -124,7 +126,7 @@ namespace PerfTests {
     static boost::shared_ptr<DBClientConnection> conn;
     static string _perfhostname;
     void pstatsConnect() {
-        // no writing to perf db if _DEBUG
+        // no writing to perf db if this is a debug build
         DEV return;
 
         const char *fn = "../../settings.py";
@@ -287,7 +289,7 @@ namespace PerfTests {
                         inf.append("os", "win");
 #endif
                         inf.append("git", gitVersion());
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
                         inf.append("OpenSSL", openSSLVersion());
 #endif
                         inf.append("boost", BOOST_VERSION);
@@ -312,7 +314,7 @@ namespace PerfTests {
         int howLong() { 
             int hlm = howLongMillis();
             DEV {
-                // don't run very long with _DEBUG - not very meaningful anyway on that build
+                // don't run very long with in debug mode - not very meaningful anyway on that build
                 hlm = min(hlm, 500);
             }
             return hlm;
@@ -537,7 +539,6 @@ namespace PerfTests {
 
     RWLock lk("testrw");
     SimpleMutex m("simptst");
-    mongo::mutex mtest("mtest");
     boost::mutex mboost;
     boost::timed_mutex mboost_timed;
     std::mutex mstd;
@@ -554,22 +555,13 @@ namespace PerfTests {
             c.notify_one();
         }
     };
-    class mutexspeed : public B {
-    public:
-        string name() { return "mutex"; }
-        virtual int howLongMillis() { return 500; }
-        virtual bool showDurStats() { return false; }
-        void timed() {
-            mongo::mutex::scoped_lock lk(mtest);
-        }
-    };
     class boostmutexspeed : public B {
     public:
         string name() { return "boost::mutex"; }
         virtual int howLongMillis() { return 500; }
         virtual bool showDurStats() { return false; }
         void timed() {
-            boost::mutex::scoped_lock lk(mboost);
+            boost::lock_guard<boost::mutex> lk(mboost);
         }
     };
     class boosttimed_mutexspeed : public B {
@@ -578,7 +570,7 @@ namespace PerfTests {
         virtual int howLongMillis() { return 500; }
         virtual bool showDurStats() { return false; }
         void timed() {
-            boost::timed_mutex::scoped_lock lk(mboost_timed);
+            boost::lock_guard<boost::timed_mutex> lk(mboost_timed);
         }
     };
     class simplemutexspeed : public B {
@@ -1125,7 +1117,7 @@ namespace PerfTests {
             c->findOne(ns(), q);
         }
         void post() {
-#if !defined(_DEBUG)
+#if !defined(MONGO_CONFIG_DEBUG_BUILD)
             verify( client()->count(ns()) > 50 );
 #endif
         }
@@ -1443,23 +1435,7 @@ namespace PerfTests {
                 add< Throw< thr1 > >();
                 add< Throw< thr2 > >();
                 add< Throw< thr3 > >();
-
-#if !defined(__clang__) || !defined(MONGO_OPTIMIZED_BUILD)
-                // clang-3.2 (and earlier?) miscompiles this test when optimization is on (see
-                // SERVER-9767 and SERVER-11183 for additional details, including a link to the
-                // LLVM ticket and LLVM fix).
-                //
-                // Ideally, the test above would also say
-                // || (__clang_major__ > 3) || ((__clang_major__ == 3) && (__clang_minor__ > 2))
-                // so that the test would still run on known good vesrions of clang; see
-                // comments in SERVER-11183 for why that doesn't work.
-                //
-                // TODO: Remove this when we no longer need to support clang-3.2. We should
-                // also consider requiring clang > 3.2 in our configure tests once XCode 5 is
-                // ubiquitious.
                 add< Throw< thr4 > >();
-#endif
-
                 add< Timer >();
                 add< Sleep0Ms >();
 #if defined(__USE_XOPEN2K)
@@ -1474,7 +1450,6 @@ namespace PerfTests {
                 add< locker_contestedS >();
                 add< locker_uncontestedS >();
                 add< NotifyOne >();
-                add< mutexspeed >();
                 add< simplemutexspeed >();
                 add< boostmutexspeed >();
                 add< boosttimed_mutexspeed >();

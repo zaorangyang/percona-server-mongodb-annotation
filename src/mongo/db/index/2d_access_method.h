@@ -30,7 +30,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/index/2d_common.h"
-#include "mongo/db/index/btree_based_access_method.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
@@ -40,13 +40,9 @@ namespace mongo {
     class IndexDescriptor;
     struct TwoDIndexingParams;
 
-    class TwoDAccessMethod : public BtreeBasedAccessMethod {
+    class TwoDAccessMethod : public IndexAccessMethod {
     public:
-        using BtreeBasedAccessMethod::_descriptor;
-
-        TwoDAccessMethod(IndexCatalogEntry* btreeState,
-                         SortedDataInterface* btree);
-        virtual ~TwoDAccessMethod() { }
+        TwoDAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
 
     private:
 
