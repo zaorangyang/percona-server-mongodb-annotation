@@ -159,7 +159,9 @@ namespace mongo {
         void deleteKey(RocksRecoveryUnit* ru, const RecordId& loc) {
             ru->writeBatch()->Delete(RocksRecordStore::_makePrefixedKey(_prefix, loc));
         }
-        rocksdb::Iterator* newIterator(RocksRecoveryUnit* ru) { return ru->NewIterator(_prefix); }
+        rocksdb::Iterator* newIterator(RocksRecoveryUnit* ru) {
+            return ru->NewIterator(_prefix, true);
+        }
         int decodeSize(const rocksdb::Slice& value) {
             uint32_t size =
                 endian::littleToNative(*reinterpret_cast<const uint32_t*>(value.data()));
@@ -890,7 +892,8 @@ namespace mongo {
           _dir(dir),
           _eof(true),
           _readUntilForOplog(RocksRecoveryUnit::getRocksRecoveryUnit(txn)->getOplogReadTill()),
-          _iterator(RocksRecoveryUnit::getRocksRecoveryUnit(txn)->NewIterator(_prefix)) {
+          _iterator(RocksRecoveryUnit::getRocksRecoveryUnit(txn)
+                        ->NewIterator(_prefix, /* isOplog */ !_readUntilForOplog.isNull())) {
 
         _locate(start);
     }
@@ -962,7 +965,7 @@ namespace mongo {
         }
 
         auto ru = RocksRecoveryUnit::getRocksRecoveryUnit(txn);
-        _iterator.reset(ru->NewIterator(_prefix));
+        _iterator.reset(ru->NewIterator(_prefix, /* isOplog */ !_readUntilForOplog.isNull()));
 
         RecordId saved = _lastLoc;
         _locate(_lastLoc);
