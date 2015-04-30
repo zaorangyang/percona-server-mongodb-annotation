@@ -42,6 +42,7 @@
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/util/timer.h"
 
 namespace rocksdb {
     class DB;
@@ -259,6 +260,11 @@ namespace mongo {
         // _oplogNextToDelete. However, we prevent this from happening by using
         // _cappedVisibilityManager and checking isCappedHidden() during deletions
         RecordId _oplogNextToDelete;
+        // keep track of when we compacted oplog last time. only valid when _isOplog == true.
+        // Protected by _cappedDeleterMutex.
+        Timer _oplogSinceLastCompaction;
+        // compact oplog every 30 min
+        static const int kOplogCompactEveryMins = 30;
 
         boost::shared_ptr<CappedVisibilityManager> _cappedVisibilityManager;
 
