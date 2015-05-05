@@ -6,6 +6,10 @@
  * See the file LICENSE for redistribution information.
  */
 
+/*
+ * Helpers for calling a function with a data handle in session->dhandle
+ * then restoring afterwards.
+ */
 #define	WT_WITH_DHANDLE(s, d, e) do {					\
 	WT_DATA_HANDLE *__saved_dhandle = (s)->dhandle;			\
 	(s)->dhandle = (d);						\
@@ -14,6 +18,15 @@
 } while (0)
 
 #define	WT_WITH_BTREE(s, b, e)	WT_WITH_DHANDLE(s, (b)->dhandle, e)
+
+/* Call a function without the caller's data handle, restore afterwards. */
+#define	WT_WITHOUT_DHANDLE(s, e) WT_WITH_DHANDLE(s, NULL, e)
+
+/*
+ * Call a function with the caller's data handle, restore it afterwards in case
+ * it is overwritten.
+ */
+#define	WT_SAVE_DHANDLE(s, e) WT_WITH_DHANDLE(s, (s)->dhandle, e)
 
 /*
  * WT_DATA_HANDLE --
@@ -52,11 +65,12 @@ struct __wt_data_handle {
 	WT_DSRC_STATS stats;		/* Data-source statistics */
 
 	/* Flags values over 0xff are reserved for WT_BTREE_* */
-#define	WT_DHANDLE_DISCARD	        0x01	/* Discard on release */
-#define	WT_DHANDLE_DISCARD_CLOSE	0x02	/* Close on release */
-#define	WT_DHANDLE_EXCLUSIVE	        0x04	/* Need exclusive access */
-#define	WT_DHANDLE_HAVE_REF		0x08	/* Already have ref */
-#define	WT_DHANDLE_LOCK_ONLY	        0x10	/* Handle only used as a lock */
-#define	WT_DHANDLE_OPEN		        0x20	/* Handle is open */
+#define	WT_DHANDLE_DEAD		        0x01	/* Dead, awaiting discard */
+#define	WT_DHANDLE_DISCARD	        0x02	/* Discard on release */
+#define	WT_DHANDLE_DISCARD_FORCE	0x04	/* Force discard on release */
+#define	WT_DHANDLE_EXCLUSIVE	        0x08	/* Need exclusive access */
+#define	WT_DHANDLE_HAVE_REF		0x10	/* Already have ref */
+#define	WT_DHANDLE_LOCK_ONLY	        0x20	/* Handle only used as a lock */
+#define	WT_DHANDLE_OPEN		        0x40	/* Handle is open */
 	uint32_t flags;
 };
