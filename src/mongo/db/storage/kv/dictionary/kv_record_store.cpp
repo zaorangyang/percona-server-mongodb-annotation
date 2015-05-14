@@ -435,6 +435,8 @@ namespace mongo {
     void KVRecordStore::appendCustomStats( OperationContext* txn,
                                            BSONObjBuilder* result,
                                            double scale ) const {
+        // KVRecordStore is not capped, KVRecordStoreCapped is capped.
+        result->appendBool("capped", false);
         _db->appendCustomStats(txn, result, scale);
     }
 
