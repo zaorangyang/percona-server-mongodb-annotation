@@ -238,7 +238,7 @@ namespace mongo {
 
         // Internal version of dataFor that takes a KVDictionary - used by
         // the RecordIterator to implement dataFor.
-        static RecordData _getDataFor(const KVDictionary* db, OperationContext* txn, const RecordId& loc, bool skipPessimisticLocking=false);
+        static RecordData _getDataFor(KVDictionary* db, OperationContext* txn, const RecordId& loc, bool skipPessimisticLocking=false);
 
         // Generate the next unique RecordId key value for new records stored by this record store.
         RecordId _nextId();

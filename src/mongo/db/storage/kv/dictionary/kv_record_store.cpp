@@ -188,12 +188,12 @@ namespace mongo {
 
     // Peek at the incoming global lock to tell if we may need to write.
     inline bool transactionWillWrite(OperationContext *txn) {
-        const Locker *state = opCtx->lockState();
-        const LockMode mode = state->getLockMode(ResourceId(RESOURCE_GLOBAL, 1ULL)));
+        const Locker *state = txn->lockState();
+        const LockMode mode = state->getLockMode(ResourceId(RESOURCE_GLOBAL, 1ULL));
         return mode == MODE_IX || mode == MODE_X;
     }
 
-    RecordData KVRecordStore::_getDataFor(const KVDictionary *db, OperationContext* txn, const RecordId& id, bool skipPessimisticLocking) {
+    RecordData KVRecordStore::_getDataFor(KVDictionary *db, OperationContext* txn, const RecordId& id, bool skipPessimisticLocking) {
         Slice value;
         // Note: Don't prelock if the caller doesn't require pessimistic locking.
         if (transactionWillWrite(txn) && !skipPessimisticLocking) {

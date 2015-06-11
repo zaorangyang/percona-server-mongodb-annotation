@@ -266,7 +266,7 @@ namespace mongo {
 
     bool TokuFTDictionary::lockRecordWithoutCursor(OperationContext *txn, const RecordId &id)
     {
-        int r = _db->get_key_lock(_getDBTxn(txn), slice2ftslice(Slice::of(KeyString(id))));
+        int r = _db.ftcxx::DB::get_key_lock(_getDBTxn(txn), slice2ftslice(Slice::of(KeyString(id))));
 
         // TODO: Investigate if it is worth it to propagate specific errors up to Mongo shell.
         // For now, just say whether we failed or not, as this is needed for correctly
