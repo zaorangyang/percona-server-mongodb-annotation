@@ -164,6 +164,8 @@ namespace mongo {
 
         virtual Status compact(OperationContext *opCtx);
 
+	virtual bool lockRecordWithoutCursor(OperationContext *txn, const RecordId &id);
+
         const ftcxx::DB &db() const { return _db; }
 
     private:

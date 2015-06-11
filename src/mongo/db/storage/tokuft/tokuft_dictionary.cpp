@@ -264,6 +264,20 @@ namespace mongo {
         }
     }
 
+    bool TokuFTDictionary::lockRecordWithoutCursor(OperationContext *txn, const RecordId &id)
+    {
+        int r = _db->get_key_lock(_getDBTxn(txn), Slice::of(KeyString(id)));
+
+        // TODO: Investigate if it is worth it to propagate specific errors up to Mongo shell.
+        // For now, just say whether we failed or not, as this is needed for correctly
+        // setting and passing the pessimistic locking flag in the caller's path.
+        if (r == 0) {
+            return true;
+        }
+
+        return false;
+    }
+
     TokuFTDictionary::Cursor::Cursor(const TokuFTDictionary &dict, OperationContext *txn, const Slice &key, const int direction)
         : _cur(dict.db().buffered_cursor(_getDBTxn(txn), slice2ftslice(key),
                                          dict.encoding(), ftcxx::DB::NullFilter(), 0, (direction == 1))),

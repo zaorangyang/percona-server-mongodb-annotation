@@ -347,6 +347,21 @@ namespace mongo {
         virtual Cursor *getCursor(OperationContext *opCtx, const Slice &key, const int direction = 1) const = 0;
 
         virtual Cursor *getCursor(OperationContext *opCtx, const int direction = 1) const = 0;
+
+	/**
+	 * Lock the given Record with respect to the given transaction.
+	 * This is used for prelocking individual records accessed through
+	 * the RecordStore methods that are not passed a
+	 * SortedDataInterface::Cursor. Serializable transactions need
+	 * exclusive access to Records that are being accessed in the
+	 * context of a write operation.
+	 *
+	 * Return: true if locking was successful, false on lock acquisition failure.
+	 *
+	 * Note: This is only used by the FractalTree engine at the moment
+	 * due to its implementation of pessimistic locking.
+	 */
+	virtual bool lockRecordWithoutCursor(OperationContext *opCtx, const RecordId &record) { return false; };
     };
 
 } // namespace mongo
