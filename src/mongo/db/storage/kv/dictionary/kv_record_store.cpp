@@ -37,6 +37,7 @@
 #include <boost/static_assert.hpp>
 
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/concurrency/locker_noop.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/key_string.h"
@@ -189,7 +190,9 @@ namespace mongo {
     // Peek at the incoming global lock to tell if we may need to write.
     inline bool transactionWillWrite(OperationContext *txn) {
         const Locker *state = txn->lockState();
-        const LockMode mode = state->getLockMode(ResourceId(RESOURCE_GLOBAL, 1ULL));
+        invariant(state != NULL);
+        const LockMode mode =
+            (dynamic_cast<const LockerNoop *>(state) != NULL ? MODE_X : state->getLockMode(ResourceId(RESOURCE_GLOBAL, 1ULL)));
         return mode == MODE_IX || mode == MODE_X;
     }
 
