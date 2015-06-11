@@ -201,7 +201,9 @@ namespace mongo {
             // As such, prelocking the desired Record is an optimization
             // that prevents nested lock contention/pileup when we later get the Record.
             const bool success = db->lockRecordWithoutCursor(txn, id);
-            skipPessimisticLocking = true;
+            if (sucess) {
+                skipPessimisticLocking = true;
+            }
         }
 
         Status status = db->get(txn, Slice::of(KeyString(id)), value, skipPessimisticLocking);
