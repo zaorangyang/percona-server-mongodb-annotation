@@ -172,7 +172,7 @@ namespace mongo {
           _compactionScheduler(compactionScheduler),
           _durable(durable),
           _transaction(transactionEngine),
-          _writeBatch(),
+          _writeBatch(rocksdb::BytewiseComparator(), 0, true),
           _snapshot(NULL),
           _depth(0),
           _myTransactionCount(1) {
@@ -193,7 +193,7 @@ namespace mongo {
             return; // only outermost gets committed.
         }
 
-        if (_writeBatch) {
+        if (_writeBatch.GetWriteBatch()->Count() > 0) {
             _commit();
         }
 
@@ -232,18 +232,7 @@ namespace mongo {
         commitUnitOfWork();
     }
 
-    // lazily initialized because Recovery Units are sometimes initialized just for reading,
-    // which does not require write batches
-    rocksdb::WriteBatchWithIndex* RocksRecoveryUnit::writeBatch() {
-        if (!_writeBatch) {
-            // this assumes that default column family uses default comparator. change this if you
-            // change default column family's comparator
-            _writeBatch.reset(
-                new rocksdb::WriteBatchWithIndex(rocksdb::BytewiseComparator(), 0, true));
-        }
-
-        return _writeBatch.get();
-    }
+    rocksdb::WriteBatchWithIndex* RocksRecoveryUnit::writeBatch() { return &_writeBatch; }
 
     void RocksRecoveryUnit::setOplogReadTill(const RecordId& record) { _oplogReadTill = record; }
 
@@ -261,8 +250,7 @@ namespace mongo {
     }
 
     void RocksRecoveryUnit::_commit() {
-        invariant(_writeBatch);
-        rocksdb::WriteBatch* wb = _writeBatch->GetWriteBatch();
+        rocksdb::WriteBatch* wb = _writeBatch.GetWriteBatch();
         for (auto pair : _deltaCounters) {
             auto& counter = pair.second;
             counter._value->fetch_add(counter._delta, std::memory_order::memory_order_relaxed);
@@ -280,7 +268,7 @@ namespace mongo {
             _transaction.commit();
         }
         _deltaCounters.clear();
-        _writeBatch.reset();
+        _writeBatch.Clear();
     }
 
     void RocksRecoveryUnit::_abort() {
@@ -296,7 +284,7 @@ namespace mongo {
         }
 
         _deltaCounters.clear();
-        _writeBatch.reset();
+        _writeBatch.Clear();
 
         _releaseSnapshot();
     }
@@ -313,8 +301,8 @@ namespace mongo {
     }
 
     rocksdb::Status RocksRecoveryUnit::Get(const rocksdb::Slice& key, std::string* value) {
-        if (_writeBatch && _writeBatch->GetWriteBatch()->Count() > 0) {
-            boost::scoped_ptr<rocksdb::WBWIIterator> wb_iterator(_writeBatch->NewIterator());
+        if (_writeBatch.GetWriteBatch()->Count() > 0) {
+            boost::scoped_ptr<rocksdb::WBWIIterator> wb_iterator(_writeBatch.NewIterator());
             wb_iterator->Seek(key);
             if (wb_iterator->Valid() && wb_iterator->Entry().key == key) {
                 const auto& entry = wb_iterator->Entry();
@@ -335,10 +323,7 @@ namespace mongo {
         rocksdb::ReadOptions options;
         options.iterate_upper_bound = upperBound.get();
         options.snapshot = snapshot();
-        auto iterator = _db->NewIterator(options);
-        if (_writeBatch && _writeBatch->GetWriteBatch()->Count() > 0) {
-            iterator = _writeBatch->NewIteratorWithBase(iterator);
-        }
+        auto iterator = _writeBatch.NewIteratorWithBase(_db->NewIterator(options));
         return new PrefixStrippingIterator(std::move(prefix), iterator,
                                            isOplog ? nullptr : _compactionScheduler,
                                            std::move(upperBound));
