@@ -228,8 +228,10 @@ namespace mongo {
     }
 
     void RocksRecoveryUnit::commitAndRestart() {
-        invariant( _depth == 0 );
-        commitUnitOfWork();
+        invariant(_depth == 0);
+        _deltaCounters.clear();
+        _writeBatch.Clear();
+        _releaseSnapshot();
     }
 
     rocksdb::WriteBatchWithIndex* RocksRecoveryUnit::writeBatch() { return &_writeBatch; }
