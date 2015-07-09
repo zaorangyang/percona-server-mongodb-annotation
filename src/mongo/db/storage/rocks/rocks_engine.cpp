@@ -168,7 +168,7 @@ namespace mongo {
                     cacheSizeGB = 1;
                 }
             }
-            _block_cache = rocksdb::NewLRUCache(cacheSizeGB * 1024 * 1024 * 1024LL, 7);
+            _block_cache = rocksdb::NewLRUCache(cacheSizeGB * 1024 * 1024 * 1024LL, 6);
         }
         _maxWriteMBPerSec = rocksGlobalOptions.maxWriteMBPerSec;
         _rateLimiter.reset(
