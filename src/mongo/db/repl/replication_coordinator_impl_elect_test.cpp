@@ -135,7 +135,6 @@ namespace {
      */
     TEST_F(ReplCoordElectTest, ElectTwoNodesWithOneZeroVoter) {
         OperationContextReplMock txn;
-        startCapturingLogMessages();
         assertStartSuccess(
             BSON("_id" << "mySet" <<
                  "version" << 1 <<
@@ -156,6 +155,11 @@ namespace {
         net->enterNetwork();
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
+                              net->now(),
+                              ResponseStatus(ErrorCodes::OperationFailed, "timeout"));
+        net->runReadyNetworkOperations();
+        const NetworkInterfaceMock::NetworkOperationIterator noi2 = net->getNextReadyRequest();
+        net->scheduleResponse(noi2,
                               net->now(),
                               ResponseStatus(ErrorCodes::OperationFailed, "timeout"));
         net->runReadyNetworkOperations();

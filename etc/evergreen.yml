@@ -158,7 +158,7 @@ functions:
             set -o igncr
         fi;
 
-        git checkout r3.0.3
+        git checkout r3.0.4
         . ./${set_tools_gopath|set_gopath.sh}
 
         # In RHEL 5.5, /usr/bin/ld can't handle --build-id parameters, so
@@ -947,52 +947,6 @@ tasks:
 
           cp mongodb*/bin/* .
           ${asan_symbolizer} ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} mongosTest
-
-- name: mongosTest_WT
-  depends_on:
-  - name: compile
-  commands:
-    - func: "fetch artifacts"
-    - func: "fetch binaries"
-    - func: "extract binaries"
-    - func: "setup credentials"
-    - func: "get buildnumber"
-    - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          export MONGO_USE_BUILDLOGGER="true"
-          export MONGO_BUILDER_NAME=MCI_${build_variant}
-          export MONGO_BUILD_NUMBER=${builder_num|}
-          export BUILDLOGGER_URL=${logger_url|https://logkeeper.mongodb.org/}
-          export BUILDLOGGER_CREDENTIALS=./mci.buildlogger
-          export MONGO_PHASE="${task_name}_${execution}"
-
-          cp mongodb*/bin/* .
-          ${asan_symbolizer} ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --storageEngine=wiredTiger mongosTest
-
-- name: mongosTest_auth
-  depends_on:
-  - name: compile
-  commands:
-    - func: "fetch artifacts"
-    - func: "fetch binaries"
-    - func: "extract binaries"
-    - func: "setup credentials"
-    - func: "get buildnumber"
-    - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          export MONGO_USE_BUILDLOGGER="true"
-          export MONGO_BUILDER_NAME=MCI_${build_variant}
-          export MONGO_BUILD_NUMBER=${builder_num|}
-          export BUILDLOGGER_URL=${logger_url|https://logkeeper.mongodb.org/}
-          export BUILDLOGGER_CREDENTIALS=./mci.buildlogger
-          export MONGO_PHASE="${task_name}_${execution}"
-
-          cp mongodb*/bin/* .
-          ${asan_symbolizer} ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --auth mongosTest
 
 - name: multiversion
   depends_on:
@@ -2197,8 +2151,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
@@ -2230,23 +2182,6 @@ buildvariants:
   - name: push
     distros:
     - rhel55-test
-
-# This build variant was introduced in BUILD-374 to ensure we maintain
-# compatibility with C++03 after turning on C++11 for all build varaints.
-- name: linux-64-cxx03
-  display_name: C++03 Enterprise RHEL 5.5 SSL/Debug 64-bit
-  modules:
-  - enterprise
-  run_on:
-  - rhel55
-  expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    compile_flags: --dbg=on --ssl --ssl-fips-capability -j$(grep -c ^processor /proc/cpuinfo) --cc=/opt/mongodbtoolchain/bin/gcc --cxx=/opt/mongodbtoolchain/bin/g++ --variant-dir="linux2/release" --c++11=off
-    test_flags: --continue-on-failure
-    has_debugsymbols: false
-  tasks:
-  - name: compile
 
 - name: linux-64-debug
   display_name: Linux 64-bit DEBUG
@@ -2288,8 +2223,6 @@ buildvariants:
   - name: jsCore_small_oplog
   - name: jsCore_small_oplog_WT
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: noPassthrough
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
@@ -2352,7 +2285,6 @@ buildvariants:
   - name: jsCore_small_oplog
   - name: mongosTest
   - name: mmap
-  - name: mongosTest_auth
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: parallel
@@ -2392,7 +2324,6 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_small_oplog_WT
-  - name: mongosTest_WT
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod_WT
   - name: parallel_WT
@@ -2448,9 +2379,7 @@ buildvariants:
   - name: jsCore_small_oplog
   - name: jsCore_small_oplog_WT
   - name: mongosTest
-  - name: mongosTest_WT
   - name: mmap
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
@@ -2527,8 +2456,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
@@ -2652,8 +2579,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
@@ -2800,11 +2725,10 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
-  - name: jsCore_small_oplog
+  #- name: jsCore_small_oplog
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
   - name: noPassthrough
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
@@ -2866,11 +2790,10 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
-  - name: jsCore_small_oplog
+  #- name: jsCore_small_oplog
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
   - name: noPassthrough
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
@@ -2931,11 +2854,10 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
-  - name: jsCore_small_oplog
+  #- name: jsCore_small_oplog
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
   - name: noPassthrough
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
@@ -3030,11 +2952,10 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
-  - name: jsCore_small_oplog
+  #- name: jsCore_small_oplog
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
   - name: noPassthrough
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
@@ -3143,7 +3064,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
   - name: noPassthrough
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
@@ -3166,6 +3086,73 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: tool
+  - name: tool_WT
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: osx-108-ssl
+  display_name: SSL OS X 10.8
+  modules: ~
+  run_on:
+  - osx-108
+  expansions:
+    push_path: osx
+    push_bucket: downloads.mongodb.org
+    push_name: osx-ssl
+    push_arch: x86_64
+    tooltags: "-tags ssl"
+    compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++
+    num_jobs_unittests: $(sysctl -n hw.logicalcpu)
+    test_flags: --continue-on-failure
+  tasks:
+  - name: compile
+  - name: aggregation
+  - name: aggregation_WT
+  - name: auth
+  - name: auth_WT
+  - name: dbtest
+  - name: dbtest_WT
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: gle_auth
+  - name: gle_auth_WT
+  - name: gle_auth_write_cmd
+  - name: gle_auth_write_cmd_WT
+  - name: jsCore
+  - name: jsCore_WT
+  - name: jsCore_compatibility
+  - name: jsCore_compatibility_WT
+  - name: jsCore_small_oplog
+  - name: jsCore_small_oplog_WT
+  - name: mmap
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthrough_WT
+  - name: noPassthroughWithMongod
+  - name: noPassthroughWithMongod_WT
+  - name: parallel
+  - name: parallel_WT
+  - name: parallel_compatibility
+  - name: parallel_compatibility_WT
+  - name: concurrency
+  - name: concurrency_WT
+  - name: concurrency_compatibility
+  - name: concurrency_compatibility_WT
+  - name: replicasets
+  - name: replicasets_WT
+  - name: replication
+  - name: replication_WT
+  - name: sharding
+  - name: sharding_WT
+  - name: slow1
+  - name: slow1_WT
+  - name: slow2
+  - name: slow2_WT
+  - name: ssl
+  - name: sslSpecial
   - name: tool
   - name: tool_WT
   - name: push
@@ -3201,7 +3188,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replication
@@ -3219,7 +3205,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel57-test
+  - rhel55-test
   expansions:
     gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
@@ -3363,8 +3349,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
@@ -3442,8 +3426,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
@@ -3521,8 +3503,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
@@ -3713,8 +3693,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
@@ -3878,8 +3856,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
@@ -3956,8 +3932,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
@@ -4030,8 +4004,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: mongosTest_WT
-  - name: mongosTest_auth
   - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT

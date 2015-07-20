@@ -276,7 +276,7 @@ add_option( "pch" , "use precompiled headers to speed up the build (experimental
 add_option( "distcc" , "use distcc for distributing builds" , 0 , False )
 
 # debugging/profiling help
-if os.sys.platform.startswith("linux"):
+if os.sys.platform.startswith("linux") or os.sys.platform == "win32":
     defaultAllocator = 'tcmalloc'
 else:
     defaultAllocator = 'system'
@@ -589,7 +589,7 @@ envDict = dict(BUILD_ROOT=buildDir,
                # changes to MCI.
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
                PYSYSPLATFORM=os.sys.platform,
-               PCRE_VERSION='8.36',
+               PCRE_VERSION='8.37',
                CONFIGUREDIR=sconsDataDir.Dir('sconf_temp'),
                CONFIGURELOG=sconsDataDir.File('config.log'),
                INSTALL_DIR=installDir,
