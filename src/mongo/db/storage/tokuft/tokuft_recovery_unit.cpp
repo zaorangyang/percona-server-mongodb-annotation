@@ -158,14 +158,16 @@ namespace mongo {
     bool TokuFTRecoveryUnit::_opCtxIsWriting(OperationContext *opCtx) {
         const Locker *state = opCtx->lockState();
         invariant(state != NULL);
-        const LockMode mode =
-                (dynamic_cast<const LockerNoop *>(state) != NULL
-                 // Only for c++ tests, assume tests can do whatever without proper locks.
-                 ? MODE_X
-                 // We don't have the ns so just check the global resource, generally it should have
-                 // the IX or IS lock.
-                 : state->getLockMode(ResourceId(RESOURCE_GLOBAL, 1ULL)));
-        return mode == MODE_IX || mode == MODE_X;
+        if (dynamic_cast<const LockerNoop *>(state) != NULL) {
+            // NOTE: Only for c++ tests, assume tests can do whatever
+            // without proper locks.
+            return true;
+        }
+
+        // We don't have the ns so just check the global resource,
+        // generally it should have the IX or IS lock.
+        LockMode mode = state->getLockMode(ResourceId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL));
+        return (mode == MODE_IX || mode == MODE_X);
     }
 
     const ftcxx::DBTxn &TokuFTRecoveryUnit::txn(OperationContext *opCtx) {
