@@ -114,7 +114,7 @@ public:
 
     virtual RecordData dataFor(OperationContext* txn, const RecordId& loc) const;
 
-    virtual bool findRecord(OperationContext* txn, const RecordId& loc, RecordData* out) const;
+    virtual bool findRecord(OperationContext* txn, const RecordId& loc, RecordData* out, bool skipPessimisticLocking=false) const;
 
     virtual void deleteRecord(OperationContext* txn, const RecordId& dl);
 

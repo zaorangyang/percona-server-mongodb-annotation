@@ -865,7 +865,8 @@ RecordId RocksRecordStore::_makeRecordId(const rocksdb::Slice& slice) {
 
 bool RocksRecordStore::findRecord(OperationContext* txn,
                                   const RecordId& loc,
-                                  RecordData* out) const {
+                                  RecordData* out,
+                                  bool skipPessimisticLocking) const {
     RecordData rd = _getDataFor(_db, _prefix, txn, loc);
     if (rd.data() == NULL)
         return false;
