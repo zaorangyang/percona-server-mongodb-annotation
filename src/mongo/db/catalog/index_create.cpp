@@ -104,7 +104,7 @@ namespace mongo {
         while (true) {
             try {
                 WriteUnitOfWork wunit(_txn);
-                // This cleans up all index builds. 
+                // This cleans up all index builds.
                 // Because that may need to write, it is done inside
                 // of a WUOW. Nothing inside this block can fail, and it is made fatal if it does.
                 for (size_t i = 0; i < _indexes.size(); i++) {
@@ -266,7 +266,10 @@ namespace mongo {
                 WriteUnitOfWork wunit(_txn);
                 Status ret = insert(objToIndex.value(), loc);
                 if (ret.isOK()) {
+                    // yield before commit
+                    exec->saveState();
                     wunit.commit();
+                    exec->restoreState(_txn);
                 }
                 else if (dupsOut && ret.code() == ErrorCodes::DuplicateKey) {
                     // If dupsOut is non-null, we should only fail the specific insert that
@@ -303,7 +306,7 @@ namespace mongo {
                 abortWithoutCleanup();
             }
 
-            uasserted(28550, 
+            uasserted(28550,
                       "Unable to complete index build as the collection is no longer readable");
         }
 
