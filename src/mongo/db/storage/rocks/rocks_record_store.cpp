@@ -871,7 +871,8 @@ namespace mongo {
     }
 
     bool RocksRecordStore::findRecord( OperationContext* txn,
-                                       const RecordId& loc, RecordData* out ) const {
+                                       const RecordId& loc, RecordData* out,
+				       bool skipPessimisticLocking ) const {
         RecordData rd = _getDataFor(_db, _prefix, txn, loc);
         if ( rd.data() == NULL )
             return false;
