@@ -32,7 +32,7 @@ namespace mongo {
 
     Status statusFromTokuFTException(const ftcxx::ft_exception &ftexc) {
         int r = ftexc.code();
-        std::string errmsg = str::stream() << "TokuFT: " << ftexc.what();
+        std::string errmsg = str::stream() << "PerconaFT: " << ftexc.what();
         if (r == DB_KEYEXIST) {
             return Status(ErrorCodes::DuplicateKey, errmsg);
         } else if (r == DB_LOCK_DEADLOCK) {
@@ -56,7 +56,7 @@ namespace mongo {
         }
 
         return Status(ErrorCodes::InternalError,
-                      str::stream() << "TokuFT: internal error code "
+                      str::stream() << "PerconaFT: internal error code "
                       << ftexc.code() << ": " << ftexc.what());
     }
 

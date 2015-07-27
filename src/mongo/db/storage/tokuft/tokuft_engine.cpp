@@ -149,16 +149,16 @@ namespace mongo {
                     }
                     locks.doneFast();
                 }
-                LOG(2) << "TokuFT: live transaction: " << status.done();
+                LOG(2) << "PerconaFT: live transaction: " << status.done();
                 return 0;
             } catch (const DBException &e) {
-                warning() << "TokuFT: caught exception " << e.what() << " (code " << e.getCode() << ") in iterate transactions callback.";
+                warning() << "PerconaFT: caught exception " << e.what() << " (code " << e.getCode() << ") in iterate transactions callback.";
                 return -1;
             } catch (const std::exception &e) {
-                warning() << "TokuFT: caught exception " << e.what() << " in iterate transactions callback.";
+                warning() << "PerconaFT: caught exception " << e.what() << " in iterate transactions callback.";
                 return -1;
             } catch (...) {
-                warning() << "TokuFT: caught unknown exception in iterate transactions callback.";
+                warning() << "PerconaFT: caught unknown exception in iterate transactions callback.";
                 return -1;
             }
         }
@@ -178,16 +178,16 @@ namespace mongo {
                     prettyBounds(ftcxx::DB(db), leftKey, rightKey, bounds);
                     bounds.doneFast();
                 }
-                LOG(2) << "TokuFT: pending lock: " << status.done();
+                LOG(2) << "PerconaFT: pending lock: " << status.done();
                 return 0;
             } catch (const DBException &e) {
-                warning() << "TokuFT: caught exception " << e.what() << " (code " << e.getCode() << ") in pending lock requests callback.";
+                warning() << "PerconaFT: caught exception " << e.what() << " (code " << e.getCode() << ") in pending lock requests callback.";
                 return -1;
             } catch (const std::exception &e) {
-                warning() << "TokuFT: caught exception " << e.what() << " in pending lock requests callback.";
+                warning() << "PerconaFT: caught exception " << e.what() << " in pending lock requests callback.";
                 return -1;
             } catch (...) {
-                warning() << "TokuFT: caught unknown exception in pending lock requests callback.";
+                warning() << "PerconaFT: caught unknown exception in pending lock requests callback.";
                 return -1;
             }
         }
@@ -207,7 +207,7 @@ namespace mongo {
                 BSONArrayBuilder bounds(info.subarrayStart("bounds"));
                 prettyBounds(ftcxx::DB(db), leftKey, rightKey, bounds);
                 bounds.doneFast();
-                LOG(1) << "TokuFT: lock not granted, details: " << info.done();
+                LOG(1) << "PerconaFT: lock not granted, details: " << info.done();
 
                 if (!logger::globalLogDomain()->shouldLog(MONGO_LOG_DEFAULT_COMPONENT, LogstreamBuilder::severityCast(2))) {
                     return;
@@ -216,11 +216,11 @@ namespace mongo {
                 db->dbenv->iterate_live_transactions(db->dbenv, iterateTransactionsCallback, NULL);
                 db->dbenv->iterate_pending_lock_requests(db->dbenv, pendingLockRequestsCallback, NULL);
             } catch (const DBException &e) {
-                warning() << "TokuFT: caught exception " << e.what() << " (code " << e.getCode() << ") in lock not granted callback.";
+                warning() << "PerconaFT: caught exception " << e.what() << " (code " << e.getCode() << ") in lock not granted callback.";
             } catch (const std::exception &e) {
-                warning() << "TokuFT: caught exception " << e.what() << " in lock not granted callback.";
+                warning() << "PerconaFT: caught exception " << e.what() << " in lock not granted callback.";
             } catch (...) {
-                warning() << "TokuFT: caught unknown exception in lock not granted callback.";
+                warning() << "PerconaFT: caught unknown exception in lock not granted callback.";
             }
         }
 
@@ -263,7 +263,7 @@ namespace mongo {
             builder.set_lock_wait_time_msec(engineOptions.locktreeMaxMemory);
         }
 
-        LOG(1) << "TokuFT: opening environment at " << path;
+        LOG(1) << "PerconaFT: opening environment at " << path;
         _env = builder
                .set_update(&ftcxx::wrapped_updater<tokuft_update>)
                .open(path.c_str(), env_flags, env_mode);
@@ -285,7 +285,7 @@ namespace mongo {
     void TokuFTEngine::cleanShutdownImpl() {
         invariant(_env.env() != NULL);
 
-        LOG(1) << "TokuFT: shutdown";
+        LOG(1) << "PerconaFT: shutdown";
 
         _internalMetadataDict.reset();
         _metadataDict.reset();
@@ -312,12 +312,12 @@ namespace mongo {
         TokuFTDiskFormatVersion diskFormatVersion(_internalMetadataDict.get());
         Status s = diskFormatVersion.initialize(&opCtx);
         if (!s.isOK()) {
-            severe() << "TokuFT: While checking disk format version, got error " << s;
+            severe() << "PerconaFT: While checking disk format version, got error " << s;
             fassertFailed(28625);
         }
         s = diskFormatVersion.upgradeToCurrent(&opCtx);
         if (!s.isOK()) {
-            severe() << "TokuFT: While upgrading disk format version, got error " << s;
+            severe() << "PerconaFT: While upgrading disk format version, got error " << s;
             fassertFailed(28626);
         }
 
@@ -367,7 +367,7 @@ namespace mongo {
     }
 
     int TokuFTEngine::flushAllFiles(bool sync) {
-        LOG(1) << "TokuFT: running checkpoint on-demand";
+        LOG(1) << "PerconaFT: running checkpoint on-demand";
         Status s = statusFromTokuFTError(_env.env()->txn_checkpoint(_env.env(), 0, 0, 0));
         uassertStatusOK(s);
         return 1;

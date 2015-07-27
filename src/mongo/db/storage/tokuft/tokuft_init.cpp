@@ -43,8 +43,8 @@ namespace mongo {
               _durable(durable)
         {
             if (!_durable) {
-                warning() << "TokuFT: Initializing with --nojournal.  Note that this will cause {j: true} writes to fail, but will not actually disable journaling.";
-                warning() << "TokuFT: This is only for tests, there is no reason to run with --nojournal in production.";
+                warning() << "PerconaFT: Initializing with --nojournal.  Note that this will cause {j: true} writes to fail, but will not actually disable journaling.";
+                warning() << "PerconaFT: This is only for tests, there is no reason to run with --nojournal in production.";
             }
         }
 
@@ -60,13 +60,13 @@ namespace mongo {
         virtual StorageEngine *create(const StorageGlobalParams &params,
                                       const StorageEngineLockFile &lockFile) const {
             if (params.directoryperdb) {
-                severe() << "TokuFT: directoryPerDB not yet supported.  This option is incompatible with TokuFT.";
-                severe() << "TokuFT: The following server crash is intentional.";
+                severe() << "PerconaFT: directoryPerDB not yet supported.  This option is incompatible with PerconaFT.";
+                severe() << "PerconaFT: The following server crash is intentional.";
                 fassertFailedNoTrace(28628);
             }
             if (tokuftGlobalOptions.engineOptions.directoryForIndexes) {
-                severe() << "TokuFT: directoryForIndexes not yet supported.  This option is incompatible with TokuFT.";
-                severe() << "TokuFT: The following server crash is intentional.";
+                severe() << "PerconaFT: directoryForIndexes not yet supported.  This option is incompatible with PerconaFT.";
+                severe() << "PerconaFT: The following server crash is intentional.";
                 fassertFailedNoTrace(28629);
             }
 
