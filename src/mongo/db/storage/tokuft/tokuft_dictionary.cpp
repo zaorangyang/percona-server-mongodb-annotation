@@ -61,7 +61,7 @@ namespace mongo {
               .open(env, txn, ident.toString().c_str(), NULL,
                     DB_BTREE /* legacy flag */, DB_CREATE, 0644))
     {
-        LOG(1) << "TokuFT: Opening dictionary \"" << ident << "\" with options " << options.toBSON();
+        LOG(1) << "PerconaFT: Opening dictionary \"" << ident << "\" with options " << options.toBSON();
     }
 
     namespace {
@@ -246,10 +246,10 @@ namespace mongo {
         } cb;
 
         uint64_t loops;
-        LOG(1) << "TokuFT: running compact";
+        LOG(1) << "PerconaFT: running compact";
         const int r = _db.db()->hot_optimize(_db.db(), NULL, NULL, &OptimizeCallback::callback, &cb, &loops);
         if (r == -1 || r == 0) {
-            LOG(1) << "TokuFT: ran " << loops << " iterations of optimization to compact";
+            LOG(1) << "PerconaFT: ran " << loops << " iterations of optimization to compact";
             return Status::OK();
         } else {
             return statusFromTokuFTError(r);
