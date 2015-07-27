@@ -155,7 +155,7 @@ namespace mongo {
             }
 
             uint64_t getInteger() const {
-                massert(28617, "TokuFT: wrong engine status type for getInteger", _type == UInt64);
+                massert(28617, "PerconaFT: wrong engine status type for getInteger", _type == UInt64);
                 return _uint64;
             }
 
@@ -165,7 +165,7 @@ namespace mongo {
                 } else if (_type == UnixTime) {
                     return static_cast<double>(_time);
                 }
-                msgasserted(28591, "TokuFT: wrong engine status type for getDouble");
+                msgasserted(28591, "PerconaFT: wrong engine status type for getDouble");
             }
         };
 

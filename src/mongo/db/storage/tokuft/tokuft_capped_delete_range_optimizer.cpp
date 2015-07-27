@@ -84,7 +84,7 @@ namespace mongo {
 
             ~CappedDeleteRangeOptimizeCallback() {
                 if (_loops >= kLoopsWarningLimit) {
-                    LOG(1) << "TokuFT: Capped deleter optimized " << _loops
+                    LOG(1) << "PerconaFT: Capped deleter optimized " << _loops
                            << " nodes in one shot, may be falling behind.";
                 }
             }
@@ -99,10 +99,10 @@ namespace mongo {
                 if (secs > _lastWarnedAboutTime) {
                     _lastWarnedAboutTime = secs;
                     if (secs >= 10) {
-                        severe() << "TokuFT: Capped deleter has been optimizing for " << secs
+                        severe() << "PerconaFT: Capped deleter has been optimizing for " << secs
                                  << " seconds, may be seriously falling behind.";
                     } else  {
-                        warning() << "TokuFT: Capped deleter has been optimizing for " << secs
+                        warning() << "PerconaFT: Capped deleter has been optimizing for " << secs
                                   << " seconds, may be falling behind.";
                     }
                 }
@@ -143,7 +143,7 @@ namespace mongo {
 
             Status s = statusFromTokuFTError(r);
             if (!s.isOK()) {
-                log() << "TokuFT: Capped deleter got error from hot optimize operation " << s;
+                log() << "PerconaFT: Capped deleter got error from hot optimize operation " << s;
             }
         }
 
@@ -180,7 +180,7 @@ namespace mongo {
             // gradually, once other threads insert enough to get them to start waiting behind that
             // mutex.
             while (_optimizableSize > lowWatermark) {
-                log() << "TokuFT: Capped delete optimizer is " << (_optimizableSize>>20)
+                log() << "PerconaFT: Capped delete optimizer is " << (_optimizableSize>>20)
                       << "MB behind, waiting for it to catch up somewhat.";
 
                 _backpressureCond.wait(lk);
