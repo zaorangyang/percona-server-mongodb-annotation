@@ -45,31 +45,31 @@ namespace mongo {
     {}
 
     Status TokuFTEngineOptions::add(moe::OptionSection* options) {
-        moe::OptionSection tokuftOptions("TokuFT engine options");
+        moe::OptionSection tokuftOptions("PerconaFT engine options");
 
         tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.cacheSize",
-                "tokuftEngineCacheSize", moe::UnsignedLongLong, "TokuFT engine cache size (bytes)");
+                "PerconaFTEngineCacheSize", moe::UnsignedLongLong, "PerconaFT engine cache size (bytes)");
         tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.cleanerIterations",
-                "tokuftEngineCleanerIterations", moe::Int, "TokuFT engine cleaner iterations");
+                "PerconaFTEngineCleanerIterations", moe::Int, "PerconaFT engine cleaner iterations");
         tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.cleanerPeriod",
-                "tokuftEngineCleanerPeriod", moe::Int, "TokuFT engine cleaner period (s)");
+                "PerconaFTEngineCleanerPeriod", moe::Int, "PerconaFT engine cleaner period (s)");
         tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.directio",
-                "tokuftEngineDirectio", moe::Bool, "TokuFT engine use Direct I/O");
+                "PerconaFTEngineDirectio", moe::Bool, "PerconaFT engine use Direct I/O");
         tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.fsRedzone",
-                "tokuftEngineFsRedzone", moe::Int, "TokuFT engine filesystem redzone");
+                "PerconaFTEngineFsRedzone", moe::Int, "PerconaFT engine filesystem redzone");
         tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.journalCommitInterval",
-                "tokuftEngineJournalCommitInterval", moe::Int, "TokuFT engine journal commit interval (ms)");
+                "PerconaFTEngineJournalCommitInterval", moe::Int, "PerconaFT engine journal commit interval (ms)");
         tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.lockTimeout",
-                "tokuftEngineLockTimeout", moe::Int, "TokuFT engine lock wait timeout (ms)");
+                "PerconaFTEngineLockTimeout", moe::Int, "PerconaFT engine lock wait timeout (ms)");
         tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.locktreeMaxMemory",
-                "tokuftEngineLocktreeMaxMemory", moe::UnsignedLongLong, "TokuFT locktree size (bytes)");
+                "PerconaFTEngineLocktreeMaxMemory", moe::UnsignedLongLong, "PerconaFT locktree size (bytes)");
         // TODO: MSE-39
         //tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.directoryForIndexes",
-        //        "tokuftEngineDirectoryForIndexes", moe::Bool, "TokuFT use a separate directory for indexes");
+        //        "PerconaFTEngineDirectoryForIndexes", moe::Bool, "PerconaFT use a separate directory for indexes");
         tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.compressBuffersBeforeEviction",
-                "tokuftEngineCompressBuffersBeforeEviction", moe::Bool, "TokuFT engine compress buffers before eviction");
+                "PerconaFTEngineCompressBuffersBeforeEviction", moe::Bool, "PerconaFT engine compress buffers before eviction");
         tokuftOptions.addOptionChaining("storage.tokuft.engineOptions.numCachetableBucketMutexes",
-                "tokuftEngineNumCachetableBucketMutexes", moe::Int, "TokuFT engine num cachetable bucket mutexes");
+                "PerconaFTEngineNumCachetableBucketMutexes", moe::Int, "PerconaFT engine num cachetable bucket mutexes");
 
         return options->addSection(tokuftOptions);
     }
@@ -83,7 +83,7 @@ namespace mongo {
         if (params.count("storage.tokuft.engineOptions.cacheSize")) {
             cacheSize = params["storage.tokuft.engineOptions.cacheSize"].as<unsigned long long>();
             if (cacheSize < (1ULL<<30)) {
-                warning() << "TokuFT: cacheSize is under 1GB, this is not recommended for production." << std::endl;
+                warning() << "PerconaFT: cacheSize is under 1GB, this is not recommended for production." << std::endl;
             }
         }
         if (params.count("storage.syncPeriodSecs")) {
@@ -146,7 +146,7 @@ namespace mongo {
         if (params.count("storage.tokuft.engineOptions.locktreeMaxMemory")) {
             locktreeMaxMemory = params["storage.tokuft.engineOptions.locktreeMaxMemory"].as<unsigned long long>();
             if (lockTimeout < (100LL<<20)) {
-                warning() << "TokuFT: locktreeMaxMemory is under 100MB, this is not recommended for production." << std::endl;
+                warning() << "PerconaFT: locktreeMaxMemory is under 100MB, this is not recommended for production." << std::endl;
             }
         }
         // TODO: MSE-39

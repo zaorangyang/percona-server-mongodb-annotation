@@ -104,15 +104,15 @@ namespace mongo {
             
         if (_startupVersion < MIN_SUPPORTED_VERSION) {
             warning() << "Found unsupported disk format version: " << static_cast<int>(_startupVersion) << "." << startupWarningsLog;
-            warning() << "The minimum supported disk format version by TokuFT is " << static_cast<int>(MIN_SUPPORTED_VERSION) << "." << startupWarningsLog;
-            warning() << "Please use an earlier version of TokuFT to dump your data and reload it into this version." << startupWarningsLog;
+            warning() << "The minimum supported disk format version by PerconaFT is " << static_cast<int>(MIN_SUPPORTED_VERSION) << "." << startupWarningsLog;
+            warning() << "Please use an earlier version of PerconaFT to dump your data and reload it into this version." << startupWarningsLog;
             return Status(ErrorCodes::UnsupportedFormat, "version on disk too low");
         }
 
         if (_startupVersion > MAX_SUPPORTED_VERSION) {
             warning() << "Found unsupported disk format version: " << static_cast<int>(_startupVersion) << "." << startupWarningsLog;
-            warning() << "The maximum supported disk format version by TokuFT is " << static_cast<int>(MAX_SUPPORTED_VERSION) << "." << startupWarningsLog;
-            warning() << "Please upgrade to a later version of TokuFT to use the data on disk." << startupWarningsLog;
+            warning() << "The maximum supported disk format version by PerconaFT is " << static_cast<int>(MAX_SUPPORTED_VERSION) << "." << startupWarningsLog;
+            warning() << "Please upgrade to a later version of PerconaFT to use the data on disk." << startupWarningsLog;
             return Status(ErrorCodes::UnsupportedFormat, "version on disk too high");
         }
 

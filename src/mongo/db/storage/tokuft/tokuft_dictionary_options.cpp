@@ -55,16 +55,16 @@ namespace mongo {
     }
 
     Status TokuFTDictionaryOptions::add(moe::OptionSection* options) {
-        moe::OptionSection tokuftOptions(str::stream() << "TokuFT " << _objectName << " options");
+        moe::OptionSection tokuftOptions(str::stream() << "PerconaFT " << _objectName << " options");
 
         tokuftOptions.addOptionChaining(optionName("pageSize"),
-                shortOptionName("pageSize"), moe::UnsignedLongLong, str::stream() << "TokuFT " << _objectName << " page size");
+                shortOptionName("pageSize"), moe::UnsignedLongLong, str::stream() << "PerconaFT " << _objectName << " page size");
         tokuftOptions.addOptionChaining(optionName("readPageSize"),
-                shortOptionName("readPageSize"), moe::UnsignedLongLong, str::stream() << "TokuFT " << _objectName << " read page size");
+                shortOptionName("readPageSize"), moe::UnsignedLongLong, str::stream() << "PerconaFT " << _objectName << " read page size");
         tokuftOptions.addOptionChaining(optionName("compression"),
-                shortOptionName("compression"), moe::String, str::stream() << "TokuFT " << _objectName << " compression method (none, zlib, lzma, or quicklz)");
+                shortOptionName("compression"), moe::String, str::stream() << "PerconaFT " << _objectName << " compression method (none, zlib, lzma, or quicklz)");
         tokuftOptions.addOptionChaining(optionName("fanout"),
-                shortOptionName("fanout"), moe::Int, str::stream() << "TokuFT " << _objectName << " fanout");
+                shortOptionName("fanout"), moe::Int, str::stream() << "PerconaFT " << _objectName << " fanout");
 
         return options->addSection(tokuftOptions);
     }
@@ -133,35 +133,35 @@ namespace mongo {
             std::string name(elem.fieldName());
             if (found.find(name) != found.end()) {
                 StringBuilder sb;
-                sb << "TokuFT: Duplicated dictionary options field \"" << name << "\" in " << options;
+                sb << "PerconaFT: Duplicated dictionary options field \"" << name << "\" in " << options;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
             found.insert(name);
             if (name == "pageSize" || name == "readPageSize" || name == "fanout") {
                 if (!elem.isNumber()) {
                     StringBuilder sb;
-                    sb << "TokuFT: Expected number type for \"" << name << "\" in dictionary options "
+                    sb << "PerconaFT: Expected number type for \"" << name << "\" in dictionary options "
                        << options;
                     return Status(ErrorCodes::BadValue, sb.str());
                 }
                 if (elem.type() == NumberDouble &&
                     (elem.numberDouble() - elem.numberLong()) > 0) {
                     StringBuilder sb;
-                    sb << "TokuFT: Dictionary options field \"" << name << "\" must be a whole number in options "
+                    sb << "PerconaFT: Dictionary options field \"" << name << "\" must be a whole number in options "
                        << options;
                     return Status(ErrorCodes::BadValue, sb.str());
                 }
                 long long val = elem.numberLong();
                 if (val <= 0) {
                     StringBuilder sb;
-                    sb << "TokuFT: Dictionary options field \"" << name << "\" must be positive in options "
+                    sb << "PerconaFT: Dictionary options field \"" << name << "\" must be positive in options "
                        << options;
                     return Status(ErrorCodes::BadValue, sb.str());
                 }
             } else if (name == "compression") {
                 if (elem.type() != mongo::String) {
                     StringBuilder sb;
-                    sb << "TokuFT: \"compression\" option must be a string in options "
+                    sb << "PerconaFT: \"compression\" option must be a string in options "
                        << options;
                     return Status(ErrorCodes::BadValue, sb.str());
                 }
@@ -171,13 +171,13 @@ namespace mongo {
                     val != "lzma" &&
                     val != "none") {
                     StringBuilder sb;
-                    sb << "TokuFT: \"compression\" must be one of \"zlib\", \"quicklz\", \"lzma\", or \"none\", in options "
+                    sb << "PerconaFT: \"compression\" must be one of \"zlib\", \"quicklz\", \"lzma\", or \"none\", in options "
                        << options;
                     return Status(ErrorCodes::BadValue, sb.str());
                 }
             } else {
                 StringBuilder sb;
-                sb << "TokuFT: Dictionary options contains unknown field \"" << name << "\" in options "
+                sb << "PerconaFT: Dictionary options contains unknown field \"" << name << "\" in options "
                    << options;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
@@ -200,7 +200,7 @@ namespace mongo {
         if (tokuftOptions.hasField("fanout")) {
             merged.fanout = tokuftOptions["fanout"].numberLong();
         }
-        LOG(1) << "TokuFT: Merged default options " << toBSON() << " with user options " << tokuftOptions << " to get " << merged.toBSON();
+        LOG(1) << "PerconaFT: Merged default options " << toBSON() << " with user options " << tokuftOptions << " to get " << merged.toBSON();
         return merged;
     }
 
