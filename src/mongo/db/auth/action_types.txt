@@ -69,6 +69,7 @@
 "listDatabases",
 "listIndexes",
 "listShards",
+"logApplicationMessage",
 "logRotate",
 "moveChunk",
 "netstat",

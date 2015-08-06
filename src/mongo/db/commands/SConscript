@@ -44,6 +44,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver',
         '$BUILD_DIR/mongo/db/audit',
+        '$BUILD_DIR/mongo/db/audit/audit',
         '$BUILD_DIR/mongo/db/auth/authcommon',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
         '$BUILD_DIR/mongo/db/auth/serverauth',
