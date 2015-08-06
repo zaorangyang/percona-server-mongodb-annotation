@@ -116,6 +116,14 @@ struct ServerGlobalParams {
     ProcessId leaderProc;  // --fork pid of leader process
 #endif
 
+    /***************************************
+     * Percona Server for MongoDB features.
+     **************************************/
+    std::string auditDestination; // Output type: enables auditing functionality.
+    std::string auditFormat;      // Output format
+    std::string auditFilter;      // JSON query filter on events, users, etc.
+    std::string auditPath;        // Event destination file path and name.
+
     /**
      * Switches to enable experimental (unsupported) features.
      */
