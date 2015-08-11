@@ -21,6 +21,8 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
     <http://www.gnu.org/licenses/>.
 ======= */
 
+#ifdef PERCONA_AUDIT_ENABLED
+
 #include "mongo/client/undef_macros.h"
 
 #include <cstdio>
@@ -59,6 +61,8 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/util/time_support.h"
 
 #include "audit_options.h"
+
+#define PERCONA_AUDIT_STUB {}
 
 namespace mongo {
 
@@ -369,6 +373,10 @@ namespace audit {
     }
 
     void logAuthentication(ClientBasic* client,
+                           const StringData& mechanism,
+                           const UserName& user,
+                           ErrorCodes::Error result) PERCONA_AUDIT_STUB
+    void logAuthentication(ClientBasic* client,
                            const StringData& dbname,
                            const StringData& mechanism,
                            const std::string& user,
@@ -383,6 +391,11 @@ namespace audit {
         _auditEvent(client, "authenticate", params, result);
     }
 
+    void logCommandAuthzCheck(ClientBasic* client,
+                              const std::string& dbname,
+                              const BSONObj& cmdObj,
+                              Command* command,
+                              ErrorCodes::Error result) PERCONA_AUDIT_STUB
     void logCommandAuthzCheck(ClientBasic* client,
                               const NamespaceString& ns,
                               const BSONObj& cmdObj,
@@ -412,6 +425,10 @@ namespace audit {
             _auditEvent(client, "dropUser", BSON("db" << ns.db() << "pattern" << pattern));
         }
     }
+
+    void logFsyncUnlockAuthzCheck(
+            ClientBasic* client,
+            ErrorCodes::Error result) PERCONA_AUDIT_STUB
 
     void logGetMoreAuthzCheck(
             ClientBasic* client,
@@ -678,5 +695,80 @@ namespace audit {
                                     "options" << BSON("unique" << unique));
         _auditEvent(client, "shardCollection", params);
     }
+
+    void logCreateUser(ClientBasic* client,
+                       const UserName& username,
+                       bool password,
+                       const BSONObj* customData,
+                       const std::vector<RoleName>& roles) PERCONA_AUDIT_STUB
+
+    void logDropUser(ClientBasic* client,
+                     const UserName& username) PERCONA_AUDIT_STUB
+
+    void logDropAllUsersFromDatabase(ClientBasic* client,
+                                     const StringData& dbname) PERCONA_AUDIT_STUB
+
+    void logUpdateUser(ClientBasic* client,
+                       const UserName& username,
+                       bool password,
+                       const BSONObj* customData,
+                       const std::vector<RoleName>* roles) PERCONA_AUDIT_STUB
+
+    void logGrantRolesToUser(ClientBasic* client,
+                             const UserName& username,
+                             const std::vector<RoleName>& roles) PERCONA_AUDIT_STUB
+
+    void logRevokeRolesFromUser(ClientBasic* client,
+                                const UserName& username,
+                                const std::vector<RoleName>& roles) PERCONA_AUDIT_STUB
+
+    void logCreateRole(ClientBasic* client,
+                       const RoleName& role,
+                       const std::vector<RoleName>& roles,
+                       const PrivilegeVector& privileges) PERCONA_AUDIT_STUB
+
+    void logUpdateRole(ClientBasic* client,
+                       const RoleName& role,
+                       const std::vector<RoleName>* roles,
+                       const PrivilegeVector* privileges) PERCONA_AUDIT_STUB
+
+    void logDropRole(ClientBasic* client,
+                     const RoleName& role) PERCONA_AUDIT_STUB
+
+    void logDropAllRolesFromDatabase(ClientBasic* client,
+                                     const StringData& dbname) PERCONA_AUDIT_STUB
+
+    void logGrantRolesToRole(ClientBasic* client,
+                             const RoleName& role,
+                             const std::vector<RoleName>& roles) PERCONA_AUDIT_STUB
+
+    void logRevokeRolesFromRole(ClientBasic* client,
+                                const RoleName& role,
+                                const std::vector<RoleName>& roles) PERCONA_AUDIT_STUB
+
+    void logGrantPrivilegesToRole(ClientBasic* client,
+                                  const RoleName& role,
+                                  const PrivilegeVector& privileges) PERCONA_AUDIT_STUB
+
+    void logRevokePrivilegesFromRole(ClientBasic* client,
+                                     const RoleName& role,
+                                     const PrivilegeVector& privileges) PERCONA_AUDIT_STUB
+
+    void appendImpersonatedUsers(BSONObjBuilder* cmd) PERCONA_AUDIT_STUB
+
+    void parseAndRemoveImpersonatedUsersField(
+            BSONObj cmdObj,
+            AuthorizationSession* authSession,
+            std::vector<UserName>* parsedUserNames,
+            bool* fieldIsPresent) PERCONA_AUDIT_STUB
+
+    void parseAndRemoveImpersonatedRolesField(
+            BSONObj cmdObj,
+            AuthorizationSession* authSession,
+            std::vector<RoleName>* parsedRoleNames,
+            bool* fieldIsPresent) PERCONA_AUDIT_STUB
+
 }  // namespace audit
 }  // namespace mongo
+
+#endif  // PERCONA_AUDIT_ENABLED

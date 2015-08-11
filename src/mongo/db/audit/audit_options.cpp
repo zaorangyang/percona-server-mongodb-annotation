@@ -89,8 +89,9 @@ namespace audit {
             path = serverGlobalParams.auditPath;
         } else if (!serverGlobalParams.logWithSyslog && !serverGlobalParams.logpath.empty()) {
             path = (boost::filesystem::path(serverGlobalParams.logpath).parent_path() / "auditLog.json").native();
-        } else if (!storageGlobalParams.dbpath.empty()) {
-            path = (boost::filesystem::path(storageGlobalParams.dbpath) / "auditLog.json").native();
+        // storageGlobalParams is not available in mongos    
+        //} else if (!storageGlobalParams.dbpath.empty()) {
+        //    path = (boost::filesystem::path(storageGlobalParams.dbpath) / "auditLog.json").native();
         } else {
             path = (boost::filesystem::path(serverGlobalParams.cwd) / "auditLog.json").native();
         }

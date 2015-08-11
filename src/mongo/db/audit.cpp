@@ -28,7 +28,7 @@
 
 #include "mongo/db/audit.h"
 
-#if MONGO_ENTERPRISE_VERSION
+#if PERCONA_AUDIT_ENABLED
 #define MONGO_AUDIT_STUB ;
 #else
 #define MONGO_AUDIT_STUB {}
