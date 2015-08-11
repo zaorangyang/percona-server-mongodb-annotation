@@ -191,6 +191,11 @@ add_option('wiredtiger',
     type='choice',
 )
 
+add_option('audit',
+    help='Enable auditing',
+    nargs=0,
+)
+
 js_engine_choices = ['mozjs', 'none']
 add_option('js-engine',
     choices=js_engine_choices,
@@ -1199,6 +1204,9 @@ elif env.TargetOSIs('solaris'):
     env['LINK_LIBGROUP_END'] = '-z rescan-end'
     env['LINK_WHOLE_ARCHIVE_START'] = '-z allextract'
     env['LINK_WHOLE_ARCHIVE_END'] = '-z defaultextract'
+
+if has_option('audit'):
+    env.Append( CPPDEFINES=[ 'PERCONA_AUDIT_ENABLED' ] )
 
 # ---- other build setup -----
 if debugBuild:
