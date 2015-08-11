@@ -42,12 +42,18 @@ env.Library('authcommon',
             ['internal_user_auth.cpp'],
             LIBDEPS=['$BUILD_DIR/mongo/bson'])
 
+## NOTE: We could make external auth non-optional by removing this
+## predicate check on the SASL_CLIENT flag.
+optionalExternalSaslDeps = []
+if env['MONGO_BUILD_SASL_CLIENT']:
+    optionalExternalSaslDeps = ['external/externalsaslauth']
+
 env.Library('authservercommon',
             ['authorization_manager_global.cpp',
              'authz_session_external_state_server_common.cpp',
              'sasl_commands.cpp',
              'security_key.cpp'],
-            LIBDEPS=['authcommon', 'authcore', 'authmocks', 'saslauth'])
+            LIBDEPS=['authcommon', 'authcore', 'authmocks', 'saslauth'] + optionalExternalSaslDeps)
 
 env.Library('saslauth',
              ['native_sasl_authentication_session.cpp',
