@@ -48,6 +48,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/copydb.h"
 #include "mongo/db/commands/rename_collection.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index_builder.h"
@@ -145,17 +146,21 @@ namespace mongo {
                          << "collection dropped during clone ["
                          << to_collection.ns() << "]",
                          !createdCollection );
-                WriteUnitOfWork wunit(txn);
-                collection = db->createCollection(txn, to_collection.ns());
-                verify(collection);
+                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
 
-                if (logForRepl) {
-                    repl::logOp(txn,
-                                "c",
-                                (_dbName + ".$cmd").c_str(),
-                                BSON("create" << to_collection.coll()));
-                }
-                wunit.commit();
+                    WriteUnitOfWork wunit(txn);
+                    Status s = userCreateNS(txn, db, to_collection.toString(),
+                                            from_options, logForRepl, false);
+                    verify(s.isOK());
+
+                    if (logForRepl) {
+                        repl::logOp(txn,
+                                    "c",
+                                    (_dbName + ".$cmd").c_str(),
+                                    BSON("create" << to_collection.coll()));
+                    }
+                    wunit.commit();
+                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createCollection", to_collection.ns());
             }
 
             while( i.moreInCurrentBatch() ) {
@@ -221,21 +226,22 @@ namespace mongo {
                 }
 
                 ++numSeen;
-                WriteUnitOfWork wunit(txn);
+                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                    WriteUnitOfWork wunit(txn);
 
-                BSONObj js = tmp;
+                    BSONObj js = tmp;
 
-                StatusWith<RecordId> loc = collection->insertDocument( txn, js, true );
-                if ( !loc.isOK() ) {
-                    error() << "error: exception cloning object in " << from_collection
-                            << ' ' << loc.toString() << " obj:" << js;
-                }
-                uassertStatusOK( loc.getStatus() );
-                if (logForRepl)
-                    repl::logOp(txn, "i", to_collection.ns().c_str(), js);
+                    StatusWith<RecordId> loc = collection->insertDocument( txn, js, true );
+                    if ( !loc.isOK() ) {
+                        error() << "error: exception cloning object in " << from_collection
+                                << ' ' << loc.toString() << " obj:" << js;
+                    }
+                    uassertStatusOK( loc.getStatus() );
+                    if (logForRepl)
+                        repl::logOp(txn, "i", to_collection.ns().c_str(), js);
 
-                wunit.commit();
-
+                    wunit.commit();
+                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "cloner insert", to_collection.ns());
                 RARELY if ( time( 0 ) - saveLast > 60 ) {
                     log() << numSeen << " objects cloned so far from collection " << from_collection;
                     saveLast = time( 0 );
@@ -249,6 +255,7 @@ namespace mongo {
 
         int64_t numSeen;
         NamespaceString from_collection;
+        BSONObj from_options;
         NamespaceString to_collection;
         time_t saveLast;
         bool logForRepl;
@@ -261,6 +268,7 @@ namespace mongo {
     void Cloner::copy(OperationContext* txn,
                       const string& toDBName,
                       const NamespaceString& from_collection,
+                      const BSONObj& from_opts,
                       const NamespaceString& to_collection,
                       bool logForRepl,
                       bool masterSameProcess,
@@ -273,6 +281,7 @@ namespace mongo {
         Fun f(txn, toDBName);
         f.numSeen = 0;
         f.from_collection = from_collection;
+        f.from_options = from_opts;
         f.to_collection = to_collection;
         f.saveLast = time( 0 );
         f.logForRepl = logForRepl;
@@ -297,6 +306,7 @@ namespace mongo {
     void Cloner::copyIndexes(OperationContext* txn,
                              const string& toDBName,
                              const NamespaceString& from_collection,
+                             const BSONObj& from_opts,
                              const NamespaceString& to_collection,
                              bool logForRepl,
                              bool masterSameProcess,
@@ -335,16 +345,21 @@ namespace mongo {
 
         Collection* collection = db->getCollection( to_collection );
         if ( !collection ) {
-            WriteUnitOfWork wunit(txn);
-            collection = db->createCollection( txn, to_collection.ns() );
-            invariant(collection);
-            if (logForRepl) {
-                repl::logOp(txn,
-                            "c",
-                            (toDBName + ".$cmd").c_str(),
-                            BSON("create" << to_collection.coll()));
-            }
-            wunit.commit();
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                WriteUnitOfWork wunit(txn);
+                Status s = userCreateNS(txn, db, to_collection.toString(), 
+                                        from_opts, logForRepl, false);
+                invariant(s.isOK());
+                collection = db->getCollection(to_collection);
+                invariant(collection);
+                if (logForRepl) {
+                    repl::logOp(txn,
+                                "c",
+                                (toDBName + ".$cmd").c_str(),
+                                BSON("create" << to_collection.coll()));
+                }
+                wunit.commit();
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createCollection", to_collection.ns());
         }
 
         // TODO pass the MultiIndexBlock when inserting into the collection rather than building the
@@ -402,23 +417,28 @@ namespace mongo {
         // config
         BSONObj filter = BSON("name" << nss.coll().toString());
         list<BSONObj> collList = _conn->getCollectionInfos( dbname, filter);
+        BSONObj options;
         if (!collList.empty()) {
             invariant(collList.size() <= 1);
             BSONObj col = collList.front();
+            options = col.getObjectField("options");
             if (col["options"].isABSONObj()) {
-                WriteUnitOfWork wunit(txn);
-                Status status = userCreateNS(txn, db, ns, col["options"].Obj(), logForRepl, 0);
-                if ( !status.isOK() ) {
-                    errmsg = status.toString();
-                    return false;
-                }
-                wunit.commit();
+                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                    WriteUnitOfWork wunit(txn);
+                    Status status = userCreateNS(txn, db, ns, options, logForRepl, 0);
+                    if ( !status.isOK() ) {
+                        errmsg = status.toString();
+                        // aborts write unit of work
+                        return false;
+                    }
+                    wunit.commit();
+                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createCollection", ns);
             }
         }
 
         // main data
         copy(txn, dbname,
-             nss, nss,
+             nss, options, nss,
              logForRepl, false, true, mayYield, mayBeInterrupted,
              Query(query).snapshot());
 
@@ -429,7 +449,7 @@ namespace mongo {
 
         // indexes
         copyIndexes(txn, dbname,
-                    NamespaceString(ns), NamespaceString(ns),
+                    NamespaceString(ns), options, NamespaceString(ns),
                     logForRepl, false, true, mayYield,
                     mayBeInterrupted);
 
@@ -583,7 +603,7 @@ namespace mongo {
 
                 Database* db = dbHolder().openDb(txn, toDBName);
 
-                {
+                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
                     WriteUnitOfWork wunit(txn);
 
                     // we defer building id index for performance - building it in batch is much
@@ -600,9 +620,8 @@ namespace mongo {
                                                << createStatus.reason();
                         return false;
                     }
-
                     wunit.commit();
-                }
+                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createCollection", to_name.ns());
 
                 LOG(1) << "\t\t cloning " << from_name << " -> " << to_name << endl;
                 Query q;
@@ -612,6 +631,7 @@ namespace mongo {
                 copy(txn,
                      toDBName,
                      from_name,
+                     options,
                      to_name,
                      opts.logForRepl,
                      masterSameProcess,
@@ -685,6 +705,7 @@ namespace mongo {
                 copyIndexes(txn,
                             toDBName,
                             from_name,
+                            collection.getObjectField("options"),
                             to_name,
                             opts.logForRepl,
                             masterSameProcess,

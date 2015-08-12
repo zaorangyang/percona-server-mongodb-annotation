@@ -62,11 +62,11 @@ namespace mongo {
     public:
 
         /**
-         * During record store creation, if size storer reports a record count under
-         * 'kCollectionScanOnCreationThreshold', perform a collection scan to update size storer
-         * as well as internal record and data size counters.
+         * Parses collections options for wired tiger configuration string for table creation.
+         * The document 'options' is typically obtained from the 'wiredTiger' field of
+         * CollectionOptions::storageEngine.
          */
-        static const long long kCollectionScanOnCreationThreshold;
+        static StatusWith<std::string> parseOptionsField(const BSONObj options);
 
         /**
          * Creates a configuration string suitable for 'config' parameter in WT_SESSION::create().
@@ -273,6 +273,7 @@ namespace mongo {
         const int64_t _cappedMaxSize;
         const int64_t _cappedMaxSizeSlack; // when to start applying backpressure
         const int64_t _cappedMaxDocs;
+        RecordId _cappedFirstRecord;
         CappedDocumentDeleteCallback* _cappedDeleteCallback;
         int _cappedDeleteCheckCount; // see comment in ::cappedDeleteAsNeeded
         mutable boost::timed_mutex _cappedDeleterMutex; // see comment in ::cappedDeleteAsNeeded

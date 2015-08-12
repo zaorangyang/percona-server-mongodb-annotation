@@ -17,6 +17,8 @@ import buildscripts
 import copy
 import datetime
 import imp
+import errno
+import json
 import os
 import re
 import shlex
@@ -233,7 +235,6 @@ add_option( "extralib", "comma separated list of libraries  (--extralib js_stati
 # experimental features
 add_option( "mm", "use main memory instead of memory mapped files" , 0 , True )
 add_option( "ssl" , "Enable SSL" , 0 , True )
-add_option( "ssl-fips-capability", "Enable the ability to activate FIPS 140-2 mode", 0, True );
 add_option( "rocksdb" , "Enable RocksDB" , 0 , False )
 add_option( "wiredtiger", "Enable wiredtiger", "?", True, "wiredtiger",
             type="choice", choices=["on", "off"], const="on", default="on")
@@ -388,12 +389,43 @@ add_option('variable-parse-mode',
            type='choice', default=variable_parse_mode_choices[0],
            choices=variable_parse_mode_choices)
 
+try:
+    with open("version.json", "r") as version_fp:
+        version_data = json.load(version_fp)
+
+    if 'version' not in version_data:
+        print "version.json does not contain a version string"
+        Exit(1)
+    if 'githash' not in version_data:
+        version_data['githash'] = utils.getGitVersion()
+
+except IOError as e:
+    # If the file error wasn't because the file is missing, error out
+    if e.errno != errno.ENOENT:
+        print "Error opening version.json: {0}".format(e.strerror)
+        Exit(1)
+
+    version_data = {
+        'version': utils.getGitDescribe()[1:],
+        'githash': utils.getGitVersion(),
+    }
+
+except ValueError as e:
+    print "Error decoding version.json: {0}".format(e)
+    Exit(1)
+
+
 # Setup the command-line variables
 def variable_shlex_converter(val):
     parse_mode = get_option('variable-parse-mode')
     if parse_mode == 'auto':
         parse_mode = 'other' if windows else 'posix'
     return shlex.split(val, posix=(parse_mode == 'posix'))
+
+def variable_distsrc_converter(val):
+    if not val.endswith("/"):
+        return val + "/"
+    return val
 
 env_vars = Variables()
 
@@ -432,6 +464,19 @@ env_vars.Add('LIBS',
 env_vars.Add('LINKFLAGS',
     help='Sets flags for the linker',
     converter=variable_shlex_converter)
+
+env_vars.Add('MONGO_DIST_SRC_PREFIX',
+    help='Sets the prefix for files in the source distribution archive',
+    converter=variable_distsrc_converter,
+    default="mongodb-src-r${MONGO_VERSION}")
+
+env_vars.Add('MONGO_VERSION',
+    help='Sets the version string for MongoDB',
+    default=version_data['version'])
+
+env_vars.Add('MONGO_GIT_HASH',
+    help='Sets the githash to store in the MongoDB version information',
+    default=version_data['githash'])
 
 env_vars.Add('RPATH',
     help='Set the RPATH for dynamic libraries and executables',
@@ -563,7 +608,9 @@ def decide_platform_tools():
     else:
         return ["default"]
 
-tools = decide_platform_tools() + ["gch", "jsheader", "mergelib", "mongo_unittest", "textfile"]
+tools = decide_platform_tools() + [
+    "gch", "jsheader", "mergelib", "mongo_unittest", "textfile", "distsrc", "gziptool"
+]
 
 # We defer building the env until we have determined whether we want certain values. Some values
 # in the env actually have semantics for 'None' that differ from being absent, so it is better
@@ -940,7 +987,13 @@ elif windows:
     #  identifier' : type name first seen using 'objecttype1' now seen using 'objecttype2'
     #    This warning occurs when classes and structs are declared with a mix of struct and class
     #    which can cause linker failures
-    env.Append( CCFLAGS=["/we4099"] )
+    # c4930
+    #  'identifier': prototyped function not called (was a variable definition intended?)
+    #     This warning indicates a most-vexing parse error, where a user declared a function that
+    #     was probably intended as a variable definition.  A common example is accidentally
+    #     declaring a function called lock that takes a mutex when one meant to create a guard
+    #     object called lock on the stack.
+    env.Append( CCFLAGS=["/we4099", "/we4930"] )
 
     env.Append( CPPDEFINES=["_CONSOLE","_CRT_SECURE_NO_WARNINGS"] )
 
@@ -1112,8 +1165,6 @@ if has_option( "ssl" ):
     else:
         env.Append( LIBS=["ssl"] )
         env.Append( LIBS=["crypto"] )
-    if has_option("ssl-fips-capability"):
-        env.Append( CPPDEFINES=["MONGO_SSL_FIPS"] )
 else:
     env.Append( MONGO_CRYPTO=["tom"] )
 
@@ -1538,6 +1589,13 @@ def doConfigure(myenv):
         # This has been suppressed in gcc 4.8, due to false positives, but not in clang.  So
         # we explicitly disable it here.
         AddToCCFLAGSIfSupported(myenv, "-Wno-missing-braces")
+
+        # Suppress warnings about not consistently using override everywhere in a class. It seems
+        # very pedantic, and we have a fair number of instances.
+        AddToCCFLAGSIfSupported(myenv, "-Wno-inconsistent-missing-override")
+
+        # Don't issue warnings about potentially evaluated expressions
+        AddToCCFLAGSIfSupported(myenv, "-Wno-potentially-evaluated-expression")
 
     # Check if we need to disable null-conversion warnings
     if using_clang():
@@ -2128,6 +2186,12 @@ def doConfigure(myenv):
             Exit(1)
         conf.FindSysLibDep("wiredtiger", ["wiredtiger"])
 
+    conf.env.Append(
+        CPPDEFINES=[
+            "BOOST_SYSTEM_NO_DEPRECATED",
+        ]
+    )
+
     if use_system_version_of_library("boost"):
         if not conf.CheckCXXHeader( "boost/filesystem/operations.hpp" ):
             print( "can't find boost headers" )
@@ -2222,6 +2286,41 @@ def doConfigure(myenv):
     # ask each module to configure itself and the build environment.
     moduleconfig.configure_modules(mongo_modules, conf)
 
+    def CheckLinkSSL(context):
+        test_body = """
+        #include <openssl/err.h>
+        #include <openssl/ssl.h>
+        #include <stdlib.h>
+
+        int main() {
+            SSL_library_init();
+            SSL_load_error_strings();
+            ERR_load_crypto_strings();
+
+            OpenSSL_add_all_algorithms();
+            ERR_free_strings();
+            return EXIT_SUCCESS;
+        }
+        """
+        context.Message("Checking if OpenSSL is available...")
+        ret = context.TryLink(textwrap.dedent(test_body), ".c")
+        context.Result(ret)
+        return ret
+    conf.AddTest("CheckLinkSSL", CheckLinkSSL)
+
+    if has_option("ssl"):
+        if not conf.CheckLinkSSL():
+            print "SSL is enabled, but is unavailable"
+            Exit(1)
+
+        if conf.CheckDeclaration(
+            "FIPS_mode_set",
+            includes="""
+                #include <openssl/crypto.h>
+                #include <openssl/evp.h>
+            """):
+            conf.env.Append(CPPDEFINES=['MONGO_HAVE_FIPS_MODE_SET'])
+
     return conf.Finish()
 
 env = doConfigure( env )
@@ -2309,27 +2408,31 @@ def getSystemInstallName():
 
     return n
 
-def getCodeVersion():
-    fullSource = open( "src/mongo/util/version.cpp" , "r" ).read()
-    allMatches = re.findall( r"versionString.. = \"(.*?)\"" , fullSource );
-    if len(allMatches) != 1:
-        print( "can't find version # in code" )
-        return None
-    return allMatches[0]
+# This function will add the version.txt file to the source tarball
+# so that versioning will work without having the git repo available.
+def add_version_to_distsrc(env, archive):
+    version_file_path = env.subst("$MONGO_DIST_SRC_PREFIX") + "version.json"
+    if version_file_path not in archive:
+        version_data = {
+            'version': env['MONGO_VERSION'],
+            'githash': env['MONGO_GIT_HASH'],
+        }
+        archive.append_file_contents(
+            version_file_path,
+            json.dumps(
+                version_data,
+                sort_keys=True,
+                indent=4,
+                separators=(',', ': ')
+            )
+        )
 
-mongoCodeVersion = getCodeVersion()
-if mongoCodeVersion == None:
-    Exit(-1)
+env.AddDistSrcCallback(add_version_to_distsrc)
 
 if has_option('distname'):
     distName = GetOption( "distname" )
-elif mongoCodeVersion[-1] not in ("+", "-"):
-    dontReplacePackage = True
-    distName = mongoCodeVersion
 else:
-    isBuildingLatest = True
-    distName = utils.getGitBranchString("" , "-") + datetime.date.today().strftime("%Y-%m-%d")
-
+    distName = env['MONGO_VERSION']
 
 env['SERVER_DIST_BASENAME'] = 'mongodb-%s-%s' % (getSystemInstallName(), distName)
 
@@ -2429,8 +2532,6 @@ module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 Export("env")
 Export("get_option")
 Export("has_option use_system_version_of_library")
-Export("skip_buildinfo")
-Export("mongoCodeVersion")
 Export("usev8")
 Export("v8version v8suffix")
 Export("boostSuffix")
@@ -2445,8 +2546,15 @@ def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
 env.AddMethod(injectMongoIncludePaths, 'InjectMongoIncludePaths')
 
+env.Alias("distsrc-tar", env.DistSrc("mongodb-src-${MONGO_VERSION}.tar"))
+env.Alias("distsrc-tgz", env.GZip(
+    target="mongodb-src-${MONGO_VERSION}.tgz",
+    source=["mongodb-src-${MONGO_VERSION}.tar"])
+)
+env.Alias("distsrc-zip", env.DistSrc("mongodb-src-${MONGO_VERSION}.zip"))
+env.Alias("distsrc", "distsrc-tgz")
+
 env.SConscript('src/SConscript', variant_dir='$BUILD_DIR', duplicate=False)
-env.SConscript(['SConscript.buildinfo', 'SConscript.smoke'])
 
 def clean_old_dist_builds(env, target, source):
     prefix = "mongodb-%s-%s" % (platform, processor)

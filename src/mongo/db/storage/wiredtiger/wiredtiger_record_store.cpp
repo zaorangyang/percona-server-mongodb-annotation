@@ -87,7 +87,29 @@ namespace {
 
     const std::string kWiredTigerEngineName = "wiredTiger";
 
-    const long long WiredTigerRecordStore::kCollectionScanOnCreationThreshold = 10000;
+    StatusWith<std::string> WiredTigerRecordStore::parseOptionsField(const BSONObj options) {
+        StringBuilder ss;
+        BSONForEach(elem, options) {
+            if (elem.fieldNameStringData() == "configString") {
+                if (elem.type() != String) {
+                    return StatusWith<std::string>(ErrorCodes::TypeMismatch, str::stream()
+                                                   << "storageEngine.wiredTiger.configString "
+                                                   << "must be a string. "
+                                                   << "Not adding 'configString' value "
+                                                   << elem << " to collection configuration");
+                }
+                ss << elem.valueStringData() << ',';
+            }
+            else {
+                // Return error on first unrecognized field.
+                return StatusWith<std::string>(ErrorCodes::InvalidOptions, str::stream()
+                                               << '\'' << elem.fieldNameStringData() << '\''
+                                               << " is not a supported option in "
+                                               << "storageEngine.wiredTiger");
+            }
+        }
+        return StatusWith<std::string>(ss.str());
+    }
 
     // static
     StatusWith<std::string> WiredTigerRecordStore::generateCreateString(
@@ -105,7 +127,7 @@ namespace {
         // Choose a higher split percent, since most usage is append only. Allow some space
         // for workloads where updates increase the size of documents.
         ss << "split_pct=90,";
-        ss << "leaf_value_max=1MB,";
+        ss << "leaf_value_max=64MB,";
         ss << "checksum=on,";
         if (wiredTigerGlobalOptions.useCollectionPrefixCompression) {
             ss << "prefix_compression,";
@@ -115,30 +137,12 @@ namespace {
 
         ss << extraStrings << ",";
 
-        // Validate configuration object.
-        // Warn about unrecognized fields that may be introduced in newer versions of this
-        // storage engine instead of raising an error.
-        // Ensure that 'configString' field is a string. Warn if this is not the case.
-        BSONForEach(elem, options.storageEngine.getObjectField(kWiredTigerEngineName)) {
-            if (elem.fieldNameStringData() == "configString") {
-                if (elem.type() != String) {
-                    return StatusWith<std::string>(ErrorCodes::TypeMismatch, str::stream()
-                                                   << "storageEngine.wiredTiger.configString "
-                                                   << "must be a string. "
-                                                   << "Not adding 'configString' value "
-                                                   << elem << " to collection configuration");
-                    continue;
-                }
-                ss << elem.valueStringData() << ",";
-            }
-            else {
-                // Return error on first unrecognized field.
-                return StatusWith<std::string>(ErrorCodes::InvalidOptions, str::stream()
-                                               << '\'' << elem.fieldNameStringData() << '\''
-                                               << " is not a supported option in "
-                                               << "storageEngine.wiredTiger");
-            }
-        }
+        StatusWith<std::string> customOptions =
+            parseOptionsField(options.storageEngine.getObjectField(kWiredTigerEngineName));
+        if (!customOptions.isOK())
+            return customOptions;
+
+        ss << customOptions.getValue();
 
         if ( NamespaceString::oplog(ns) ) {
             // force file for oplog
@@ -178,6 +182,7 @@ namespace {
               _cappedMaxSize( cappedMaxSize ),
               _cappedMaxSizeSlack( std::min(cappedMaxSize/10, int64_t(16*1024*1024)) ),
               _cappedMaxDocs( cappedMaxDocs ),
+              _cappedFirstRecord(),
               _cappedDeleteCallback( cappedDeleteCallback ),
               _cappedDeleteCheckCount(0),
               _useOplogHack(shouldUseOplogHack(ctx, _uri)),
@@ -224,10 +229,8 @@ namespace {
                 _numRecords.store( numRecords );
                 _dataSize.store( dataSize );
                 _sizeStorer->onCreate( this, numRecords, dataSize );
-            }
-
-            if (_sizeStorer == NULL || _numRecords.load() < kCollectionScanOnCreationThreshold) {
-                LOG(1) << "doing scan of collection " << ns << " to get info";
+            } else {
+                LOG(1) << "Doing scan of collection " << ns << " to get size and count info";
 
                 _numRecords.store(0);
                 _dataSize.store(0);
@@ -237,10 +240,6 @@ namespace {
                     RecordData data = iterator->dataFor( loc );
                     _numRecords.fetchAndAdd(1);
                     _dataSize.fetchAndAdd(data.size());
-                }
-
-                if ( _sizeStorer ) {
-                    _sizeStorer->storeToCache( _uri, _numRecords.load(), _dataSize.load() );
                 }
             }
 
@@ -298,7 +297,7 @@ namespace {
         WiredTigerSession* session = WiredTigerRecoveryUnit::get(txn)->getSession(txn);
         StatusWith<int64_t> result = WiredTigerUtil::getStatisticsValueAs<int64_t>(
             session->getSession(),
-            "statistics:" + getURI(), "statistics=(fast)", WT_STAT_DSRC_BLOCK_SIZE);
+            "statistics:" + getURI(), "statistics=(size)", WT_STAT_DSRC_BLOCK_SIZE);
         uassertStatusOK(result.getStatus());
 
         int64_t size = result.getValue();
@@ -461,10 +460,25 @@ namespace {
             WiredTigerCursor curwrap( _uri, _instanceId, true, txn);
             WT_CURSOR *c = curwrap.get();
             RecordId newestOld;
-            int ret = 0;
+            int64_t firstKey = 0;
+            int first = 0, ret = 0;
+            if (_cappedFirstRecord != RecordId()) {
+                c->set_key(c, _makeKey(_cappedFirstRecord));
+                if ((ret = WT_OP_CHECK(c->search(c))) != WT_NOTFOUND) {
+                    invariantWTOK(ret);
+                    invariantWTOK(c->get_key(c, &firstKey));
+                    first = 1;
+                }
+            }
+
             while ((sizeSaved < sizeOverCap || docsRemoved < docsOverCap) &&
-                   (docsRemoved < 20000) &&
-                   (ret = WT_OP_CHECK(c->next(c))) == 0) {
+                   (docsRemoved < 20000)) {
+
+                if (first)
+                    first = 0;
+                else if ((ret = WT_OP_CHECK(c->next(c))) == WT_NOTFOUND)
+                    break;
+                invariantWTOK(ret);
 
                 int64_t key;
                 ret = c->get_key(c, &key);
@@ -493,10 +507,6 @@ namespace {
                 }
             }
 
-            if (ret != WT_NOTFOUND) {
-                invariantWTOK(ret);
-            }
-
             if (docsRemoved > 0) {
                 // if we scanned to the end of the collection or past our insert, go back one
                 if (ret == WT_NOTFOUND || newestOld >= justInserted) {
@@ -505,9 +515,11 @@ namespace {
                 invariantWTOK(ret);
 
                 WiredTigerCursor startWrap( _uri, _instanceId, true, txn);
-                WT_CURSOR* start = startWrap.get();
-                ret = WT_OP_CHECK(start->next(start));
-                invariantWTOK(ret);
+                WT_CURSOR* start = NULL;
+                if (firstKey != 0) {
+                    start = startWrap.get();
+                    start->set_key(start, firstKey);
+                }
 
                 ret = session->truncate(session, NULL, start, c, NULL);
                 if (ret == ENOENT || ret == WT_NOTFOUND) {
@@ -520,6 +532,9 @@ namespace {
                     _changeNumRecords(txn, -docsRemoved);
                     _increaseDataSize(txn, -sizeSaved);
                     wuow.commit();
+
+                    // Update the starting key
+                    _cappedFirstRecord = newestOld;
                 }
             }
         }
@@ -983,7 +998,7 @@ namespace {
 
     private:
         WiredTigerRecordStore* _rs;
-        bool _amount;
+        int _amount;
     };
 
     void WiredTigerRecordStore::_increaseDataSize( OperationContext* txn, int amount ) {
@@ -1251,6 +1266,9 @@ namespace {
         while( !iter->isEOF() ) {
             RecordId loc = iter->getNext();
             if ( end < loc || ( inclusive && end == loc ) ) {
+                if (_cappedDeleteCallback)
+                    uassertStatusOK(
+                        _cappedDeleteCallback->aboutToDeleteCapped(txn, loc, dataFor(txn, loc)));
                 deleteRecord( txn, loc );
             }
         }
