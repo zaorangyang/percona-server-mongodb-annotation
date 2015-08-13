@@ -246,7 +246,7 @@ namespace mongo {
         // TODO: Lock wait timeout callback, lock killed callback
         // TODO: logdir
         ftcxx::DBEnvBuilder builder = ftcxx::DBEnvBuilder()
-                .set_product_name("tokuft")
+                .set_product_name("perconaft")
                 .set_cachesize(cacheSizeGB, cacheSizeB)
                 .checkpointing_set_period(engineOptions.checkpointPeriod)
                 .cleaner_set_iterations(engineOptions.cleanerIterations)
