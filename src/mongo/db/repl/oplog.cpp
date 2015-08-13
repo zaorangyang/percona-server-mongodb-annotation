@@ -313,7 +313,7 @@ namespace {
         b.appendTimestamp("ts", slot.first.asDate());
         b.append("op", opstr);
         b.append("ns", ns);
-        if (fromMigrate) 
+        if (fromMigrate)
             b.appendBool("fromMigrate", true);
         if ( bb )
             b.appendBool("b", *bb);
@@ -412,6 +412,8 @@ namespace {
                 checkOplogInsert(localOplogRSCollection->insertDocument(txn, op, false));
 
                 if (!(lastOptime < ts)) {
+                    auto opBeingApplied = op.toString();
+                    auto previousOp = (--it)->toString();
                     severe() << "replication oplog stream went back in time. "
                         "previous timestamp: " << lastOptime << " newest timestamp: " << ts
                              << ". Op being applied: " << op;
@@ -680,9 +682,9 @@ namespace {
                         // in the query for idempotence
                     }
                 }
-                else { 
+                else {
                     // this could happen benignly on an oplog duplicate replay of an upsert
-                    // (because we are idempotent), 
+                    // (because we are idempotent),
                     // if an regular non-mod update fails the item is (presumably) missing.
                     if( !upsert ) {
                         failedUpdate = true;
