@@ -51,7 +51,7 @@ namespace mongo {
     }
 
     std::string TokuFTDictionaryOptions::shortOptionName(const std::string& opt) const {
-        return str::stream() << "tokuft" << capitalize(_objectName) << capitalize(opt);
+        return str::stream() << "PerconaFT" << capitalize(_objectName) << capitalize(opt);
     }
 
     Status TokuFTDictionaryOptions::add(moe::OptionSection* options) {
