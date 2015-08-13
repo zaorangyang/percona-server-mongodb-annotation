@@ -110,7 +110,7 @@ namespace mongo {
     class TokuFTEngineCheckpointPeriodSetting : public TokuFTEngineServerParameter<int> {
     public:
         TokuFTEngineCheckpointPeriodSetting()
-            : TokuFTEngineServerParameter("tokuftEngineCheckpointPeriod",
+            : TokuFTEngineServerParameter("PerconaFTEngineCheckpointPeriod",
                                           tokuftGlobalOptions.engineOptions.checkpointPeriod)
         {}
 
@@ -118,7 +118,7 @@ namespace mongo {
         Status check(long long newValue) const {
             if (newValue <= 0) {
                 StringBuilder sb;
-                sb << "tokuftEngineCheckpointPeriod must be > 0, but attempted to set to: "
+                sb << "PerconaFTEngineCheckpointPeriod must be > 0, but attempted to set to: "
                    << newValue;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
@@ -133,7 +133,7 @@ namespace mongo {
     class TokuFTEngineCleanerIterationsSetting : public TokuFTEngineServerParameter<int> {
     public:
         TokuFTEngineCleanerIterationsSetting()
-            : TokuFTEngineServerParameter("tokuftEngineCleanerIterations",
+            : TokuFTEngineServerParameter("PerconaFTEngineCleanerIterations",
                                           tokuftGlobalOptions.engineOptions.cleanerIterations)
         {}
 
@@ -141,7 +141,7 @@ namespace mongo {
         Status check(long long newValue) const {
             if (newValue < 0) {
                 StringBuilder sb;
-                sb << "tokuftEngineCleanerIterations must be >= 0, but attempted to set to: "
+                sb << "PerconaFTEngineCleanerIterations must be >= 0, but attempted to set to: "
                    << newValue;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
@@ -156,7 +156,7 @@ namespace mongo {
     class TokuFTEngineCleanerPeriodSetting : public TokuFTEngineServerParameter<int> {
     public:
         TokuFTEngineCleanerPeriodSetting()
-            : TokuFTEngineServerParameter("tokuftEngineCleanerPeriod",
+            : TokuFTEngineServerParameter("PerconaFTEngineCleanerPeriod",
                                           tokuftGlobalOptions.engineOptions.cleanerPeriod)
         {}
 
@@ -164,7 +164,7 @@ namespace mongo {
         Status check(long long newValue) const {
             if (newValue < 0) {
                 StringBuilder sb;
-                sb << "tokuftEngineCleanerPeriod must be >= 0, but attempted to set to: "
+                sb << "PerconaFTEngineCleanerPeriod must be >= 0, but attempted to set to: "
                    << newValue;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
@@ -179,7 +179,7 @@ namespace mongo {
     class TokuFTEngineLockTimeoutSetting : public TokuFTEngineServerParameter<int> {
     public:
         TokuFTEngineLockTimeoutSetting()
-            : TokuFTEngineServerParameter("tokuftEngineLockTimeout",
+            : TokuFTEngineServerParameter("PerconaFTEngineLockTimeout",
                                           tokuftGlobalOptions.engineOptions.lockTimeout)
         {}
 
@@ -187,7 +187,7 @@ namespace mongo {
         Status check(long long newValue) const {
             if (newValue < 0 || newValue > 60000) {
                 StringBuilder sb;
-                sb << "tokuftEngineLockTimeout must be between 0 and 60000, but attempted to set to: "
+                sb << "PerconaFTEngineLockTimeout must be between 0 and 60000, but attempted to set to: "
                    << newValue;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
@@ -202,7 +202,7 @@ namespace mongo {
     class TokuFTEngineJournalCommitIntervalSetting : public TokuFTEngineServerParameter<int> {
     public:
         TokuFTEngineJournalCommitIntervalSetting()
-            : TokuFTEngineServerParameter("tokuftEngineJournalCommitInterval",
+            : TokuFTEngineServerParameter("PerconaFTEngineJournalCommitInterval",
                                           tokuftGlobalOptions.engineOptions.journalCommitInterval)
         {}
 
@@ -210,7 +210,7 @@ namespace mongo {
         Status check(long long newValue) const {
             if (newValue <= 0 || newValue > 300) {
                 StringBuilder sb;
-                sb << "tokuftEngineJournalCommitInterval must be between 1 and 300, but attempted to set to: "
+                sb << "PerconaFTEngineJournalCommitInterval must be between 1 and 300, but attempted to set to: "
                    << newValue;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
