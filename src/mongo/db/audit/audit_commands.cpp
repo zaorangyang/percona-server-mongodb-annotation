@@ -103,7 +103,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) { }
 
         bool run(OperationContext* txn, const std::string& dbname, BSONObj& jsobj, int, std::string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            result.appendElements(audit::_auditOptions.toBSON());
+            result.appendElements(auditOptions.toBSON());
             return true;
         }
     };

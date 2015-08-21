@@ -21,45 +21,29 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
     <http://www.gnu.org/licenses/>.
 ======= */
 
-
-#include <cstdio>
-#include <iostream>
-//#include <memory>
-#include <string>
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
 
 #include <boost/filesystem/path.hpp>
-#include <boost/scoped_ptr.hpp>
 
-#include "mongo/base/init.h"
-#include "mongo/bson/bson_field.h"
-#include "mongo/db/audit.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/client_basic.h"
-#include "mongo/db/commands.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/matcher/matcher.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/exit_code.h"
+#include "mongo/base/status.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/json.h"
 #include "mongo/util/file.h"
-//#include "mongo/util/log.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
-#include "mongo/util/paths.h"
-#include "mongo/util/time_support.h"
+#include "mongo/util/options_parser/startup_option_init.h"
+#include "mongo/util/options_parser/startup_options.h"
 
 #include "audit_options.h"
 
 namespace mongo {
 
-namespace audit {
+    AuditOptions auditOptions;
 
-
-    AuditOptions::AuditOptions() :
+    AuditOptions::AuditOptions():
         format("JSON"),
-        path(""),
-        destination("file"),
-        filter("{}") {
+        filter("{}")
+    {
     }
 
     BSONObj AuditOptions::toBSON() {
@@ -69,56 +53,98 @@ namespace audit {
                     "filter" << filter);
     }
 
-    Status AuditOptions::initializeFromCommandLine() {
-        if (serverGlobalParams.auditFormat != "") {
-            if (serverGlobalParams.auditFormat != "JSON") {
-                return Status(ErrorCodes::BadValue,
-                              "The only audit format currently supported is `JSON'");
-            }
-            format = serverGlobalParams.auditFormat;
-        }
+    Status addAuditOptions(optionenvironment::OptionSection* options) {
+        optionenvironment::OptionSection auditOptions("Audit Options");
 
-        if (serverGlobalParams.auditPath != "") {
-            File auditFile;
-            auditFile.open(serverGlobalParams.auditPath.c_str(), false, false);
-            if (auditFile.bad()) {
-                return Status(ErrorCodes::BadValue,
-                              "Could not open a file for writing at the given auditPath: "
-                              + serverGlobalParams.auditPath);
-            }
-            path = serverGlobalParams.auditPath;
-        } else if (!serverGlobalParams.logWithSyslog && !serverGlobalParams.logpath.empty()) {
-            path = (boost::filesystem::path(serverGlobalParams.logpath).parent_path() / "auditLog.json").native();
-        // storageGlobalParams is not available in mongos    
-        //} else if (!storageGlobalParams.dbpath.empty()) {
-        //    path = (boost::filesystem::path(storageGlobalParams.dbpath) / "auditLog.json").native();
-        } else {
-            path = (boost::filesystem::path(serverGlobalParams.cwd) / "auditLog.json").native();
-        }
+        auditOptions.addOptionChaining("audit.destination", "auditDestination", optionenvironment::String,
+                "Output type: enables auditing functionality");
 
-        if (serverGlobalParams.auditDestination != "") {
-            if (serverGlobalParams.auditDestination != "file") {
-                return Status(ErrorCodes::BadValue,
-                              "The only audit destination currently supported is `file'");
-            }
-            destination = serverGlobalParams.auditDestination;
-        }
+        auditOptions.addOptionChaining("audit.format", "auditFormat", optionenvironment::String,
+                "Output format");
 
-        if (serverGlobalParams.auditFilter != "") {
-            try {
-                fromjson(serverGlobalParams.auditFilter);
-            } catch (const std::exception &ex) {
-                return Status(ErrorCodes::BadValue,
-                              "Could not parse audit filter into valid json: "
-                              + serverGlobalParams.auditFilter);
-            }
-            filter = serverGlobalParams.auditFilter;
+        auditOptions.addOptionChaining("audit.filter", "auditFilter", optionenvironment::String,
+                "JSON query filter on events, users, etc.");
+
+        auditOptions.addOptionChaining("audit.path", "auditPath", optionenvironment::String,
+                "Event destination file path and name");
+
+        Status ret = options->addSection(auditOptions);
+        if (!ret.isOK()) {
+            log() << "Failed to add audit option section: " << ret.toString();
+            return ret;
         }
 
         return Status::OK();
     }
-    
-    AuditOptions _auditOptions;
 
-}  // namespace audit
-}  // namespace mongo
+    Status storeAuditOptions(const optionenvironment::Environment& params) {
+        if (params.count("audit.destination")) {
+            auditOptions.destination =
+                params["audit.destination"].as<std::string>();
+        }
+        if (auditOptions.destination != "") {
+            if (auditOptions.destination != "file") {
+                return Status(ErrorCodes::BadValue,
+                              "The only audit destination currently supported is 'file'");
+            }
+        }
+
+        if (params.count("audit.format")) {
+            auditOptions.format =
+                params["audit.format"].as<std::string>();
+        }
+        if (auditOptions.format != "JSON") {
+            return Status(ErrorCodes::BadValue,
+                          "The only audit format currently supported is 'JSON'");
+        }
+
+        if (params.count("audit.filter")) {
+            auditOptions.filter =
+                params["audit.filter"].as<std::string>();
+        }
+        try {
+            fromjson(auditOptions.filter);
+        }
+        catch (const std::exception &ex) {
+            return Status(ErrorCodes::BadValue,
+                          "Could not parse audit filter into valid json: "
+                          + auditOptions.filter);
+        }
+
+        if (params.count("audit.path")) {
+            auditOptions.path =
+                params["audit.path"].as<std::string>();
+        }
+        if (auditOptions.path != "") {
+            File auditFile;
+            auditFile.open(auditOptions.path.c_str(), false, false);
+            if (auditFile.bad()) {
+                return Status(ErrorCodes::BadValue,
+                              "Could not open a file for writing at the given auditPath: "
+                              + auditOptions.path);
+            }
+        } else if (!serverGlobalParams.logWithSyslog && !serverGlobalParams.logpath.empty()) {
+            auditOptions.path =
+                (boost::filesystem::path(serverGlobalParams.logpath).parent_path() / "auditLog.json").native();
+        // storageGlobalParams is not available in mongos    
+        //} else if (!storageGlobalParams.dbpath.empty()) {
+        //    auditOptions.path =
+        //        (boost::filesystem::path(storageGlobalParams.dbpath) / "auditLog.json").native();
+        //}
+        } else {
+            auditOptions.path =
+                (boost::filesystem::path(serverGlobalParams.cwd) / "auditLog.json").native();
+        }
+
+        return Status::OK();
+    }
+
+    MONGO_MODULE_STARTUP_OPTIONS_REGISTER(AuditOptions)(InitializerContext* context) {
+        return addAuditOptions(&optionenvironment::startupOptions);
+    }
+
+    MONGO_STARTUP_OPTIONS_STORE(AuditOptions)(InitializerContext* context) {
+        return storeAuditOptions(optionenvironment::startupOptionsParsed);
+    }
+
+} // namespace mongo

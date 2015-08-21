@@ -102,17 +102,6 @@ namespace mongo {
         ProcessId leaderProc;      // --fork pid of leader process
 #endif
 
-        /***************************************
-         * Percona Server for MongoDB features.
-         **************************************/
-
-#ifdef PERCONA_AUDIT_ENABLED
-        std::string auditDestination; // Output type: enables auditing functionality.
-        std::string auditFormat;      // Output format
-        std::string auditFilter;      // JSON query filter on events, users, etc.
-        std::string auditPath;        // Event destination file path and name.
-#endif
-
         /**
          * Switches to enable experimental (unsupported) features.
          */

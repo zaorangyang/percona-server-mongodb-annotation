@@ -25,36 +25,39 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 #include <string>
 
-#include "mongo/base/init.h"
-#include "mongo/bson/bson_field.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/paths.h"
+#include "mongo/base/status.h"
 
 namespace mongo {
 
-namespace audit {
+namespace optionenvironment {
+    class OptionSection;
+    class Environment;
+} // namespace optionenvironment
 
     struct AuditOptions {
+
+        // Output type: enables auditing functionality, eg 'file'
+        std::string destination;
+
         // Output format, 'eg JSON'
         std::string format;
 
-        // Destination path, eg '/data/db/audit.json'
-        std::string path;
-
-        // Destination style, eg 'file'
-        std::string destination;
-
+        // JSON query filter on events, users, etc.
         // Filter query for audit events.
         // eg "{ atype: { $in: [ 'authenticate', 'dropDatabase' ] } }"
         std::string filter;
 
+        // Event destination file path and name, eg '/data/db/audit.json'
+        std::string path;
+
         AuditOptions();
         BSONObj toBSON();
-        Status initializeFromCommandLine();
     };
 
-    extern AuditOptions _auditOptions;
-    
-}  // namespace audit
-}  // namespace mongo
+    extern AuditOptions auditOptions;
+
+    Status addAuditOptions(optionenvironment::OptionSection* options);
+
+    Status storeAuditOptions(const optionenvironment::Environment& params);
+
+} // namespace mongo

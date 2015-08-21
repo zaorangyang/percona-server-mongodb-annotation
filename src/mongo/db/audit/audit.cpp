@@ -267,11 +267,9 @@ namespace audit {
     }
 
     static bool _auditEnabledOnCommandLine() {
-        return serverGlobalParams.auditDestination != "";
+        return auditOptions.destination != "";
     }
 
-///////////////////////// audit.h functions ////////////////////////////
-    
     Status initialize() {
         if (!_auditEnabledOnCommandLine()) {
             // Write audit events into the void for debug builds, so we get
@@ -284,16 +282,19 @@ namespace audit {
         }
 
         log() << "Initializing audit..." << std::endl;
-        Status s = _auditOptions.initializeFromCommandLine();
-        if (!s.isOK()) {
-            return s;
-        }
-
-        const BSONObj filter = fromjson(_auditOptions.filter);            
-        _setGlobalAuditLog(new JSONAuditLog(_auditOptions.path, filter));
+        const BSONObj filter = fromjson(auditOptions.filter);
+        _setGlobalAuditLog(new JSONAuditLog(auditOptions.path, filter));
         return Status::OK();
     }
 
+    MONGO_INITIALIZER_WITH_PREREQUISITES(AuditInit, ("SetGlobalEnvironment"))
+                                         (InitializerContext *context)
+    {
+        return initialize();
+    }
+
+///////////////////////// audit.h functions ////////////////////////////
+    
     namespace AuditFields {
         // Common fields
         BSONField<StringData> type("atype");
