@@ -50,6 +50,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/paths.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/logger/auditlog.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit_code.h"
 #include "mongo/util/log.h"
@@ -66,21 +67,6 @@ namespace mongo {
 
 namespace audit {
 
-    // NOTE: This base class / interface was put in the higher level
-    // logging code.  That logging code only cared about destroying
-    // the object on shutdown and rotating the log.  Our main child
-    // class took care of rotation.  In the newer logging code
-    // rotation of the main log is handled by the
-    // RotatableFileManager.  It is possible to still let our classes
-    // handle rotation: our AuditLog pointer must live at the same
-    // level as the RotatableFileManager AND have it's rotate() method
-    // called when the other log rotates.
-    class AuditLog {
-    public:
-        virtual void rotate() {};
-        virtual ~AuditLog() {};
-    };
-    
     NOINLINE_DECL void realexit( ExitCode rc ) {
 #ifdef _COVERAGE
         // Need to make sure coverage data is properly flushed before exit.
@@ -93,7 +79,7 @@ namespace audit {
     }
 
     // Writable interface for audit events
-    class WritableAuditLog : public AuditLog {
+    class WritableAuditLog : public logger::AuditLog {
     public:
         virtual ~WritableAuditLog() {}
         virtual void append(const BSONObj &obj) = 0;
@@ -199,8 +185,6 @@ namespace audit {
         }
 
         virtual void rotate() {
-            int x = 0;
-            x++;
             stdx::lock_guard<SimpleMutex> lck(_mutex);
 
             // Close the current file.
@@ -250,8 +234,7 @@ namespace audit {
 
         // Sets the audit log in the general logging framework which
         // will rotate() the audit log when the server log rotates.
-        // TODO: Not sure what the new logging framework requires....
-        //setAuditLog(log);
+        setAuditLog(log);
     }
 
     static bool _auditEnabledOnCommandLine() {
