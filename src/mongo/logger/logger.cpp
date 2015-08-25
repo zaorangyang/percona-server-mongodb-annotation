@@ -59,5 +59,9 @@ MONGO_INITIALIZER_GENERAL(GlobalLogManager, ("ValidateLocale"), ("default"))(Ini
     return Status::OK();
 }
 
+void setAuditLog(AuditLog * const auditLog) {
+    globalRotatableFileManager()->setAuditLog(auditLog);
+}
+
 }  // namespace logger
 }  // namespace mongo

@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include "mongo/logger/auditlog.h"
 #include "mongo/logger/message_log_domain.h"
 #include "mongo/logger/log_manager.h"
 #include "mongo/logger/rotatable_file_manager.h"
@@ -50,6 +51,11 @@ LogManager* globalLogManager();
 inline ComponentMessageLogDomain* globalLogDomain() {
     return globalLogManager()->getGlobalDomain();
 }
+
+/**
+ * Sets current audit logger instance.
+ */
+void setAuditLog(AuditLog * const auditLog);
 
 }  // namespace logger
 }  // namespace mongo
