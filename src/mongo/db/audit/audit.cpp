@@ -53,7 +53,6 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/namespace_string.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit_code.h"
-#include "mongo/util/file.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
@@ -61,6 +60,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/util/time_support.h"
 
 #include "audit_options.h"
+#include "audit_file.h"
 
 #define PERCONA_AUDIT_STUB {}
 
@@ -101,15 +101,6 @@ namespace audit {
         virtual void append(const BSONObj &obj) = 0;
         virtual void rotate() = 0;
     };
-
-    // TODO: We need to implement these or use a better file error
-    // handler similar to the newer, higher level logging code.
-    class AuditFile : public File {
-    public:
-        int fsyncReturningError() { assert(false); return 0; }
-        int writeReturningError(fileofs o, const char *data, unsigned len) { assert(false); return len; }
-    };
-
 
     // Writes audit events to a json file
     class JSONAuditLog : public WritableAuditLog {
