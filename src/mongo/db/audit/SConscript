@@ -2,4 +2,4 @@
 
 Import("env")
 
-env.Library('audit', ['audit_commands.cpp', 'audit_options.cpp', 'audit.cpp'])
+env.Library('audit', ['audit_commands.cpp', 'audit_file.cpp', 'audit_options.cpp', 'audit.cpp'])
