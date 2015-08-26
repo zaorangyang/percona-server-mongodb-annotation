@@ -722,9 +722,6 @@ if has_option("cache"):
 if optBuild:
     env.Append( CPPDEFINES=["MONGO_OPTIMIZED_BUILD"] )
 
-if get_option('profiling') == "on":
-    env.Append( CCFLAGS=[ "-fno-omit-frame-pointer" ] )
-
 if has_option("propagate-shell-environment"):
     env['ENV'] = dict(os.environ);
 
@@ -1602,6 +1599,11 @@ def doConfigure(myenv):
 
         # Don't issue warnings about potentially evaluated expressions
         AddToCCFLAGSIfSupported(myenv, "-Wno-potentially-evaluated-expression")
+
+    # BLD-300, allow debug and profiling
+    if get_option('profiling') == 'on':
+      AddToCCFLAGSIfSupported(myenv, "-fno-omit-frame-pointer")
+      AddToCXXFLAGSIfSupported(myenv, "-fno-omit-frame-pointer")
 
     # Check if we need to disable null-conversion warnings
     if using_clang():
