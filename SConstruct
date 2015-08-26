@@ -268,7 +268,7 @@ add_option( "opt", "Enable compile-time optimization", "?", True, "opt",
             type="choice", choices=["on", "off"], const="on" )
 
 add_option( "profiling", "Allow profiling and debugging", "?", True, "profiling",
-            type="choice", choices=["on", "off"], const="on" )
+            default="on", type="choice", choices=["on", "off"], const="on" )
 
 add_option( "sanitize", "enable selected sanitizers", 1, True, metavar="san1,san2,...sanN" )
 add_option( "llvm-symbolizer", "name of (or path to) the LLVM symbolizer", 1, False, default="llvm-symbolizer" )
