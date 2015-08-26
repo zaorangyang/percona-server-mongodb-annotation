@@ -267,6 +267,9 @@ add_option( "dbg", "Enable runtime debugging checks", "?", True, "dbg",
 add_option( "opt", "Enable compile-time optimization", "?", True, "opt",
             type="choice", choices=["on", "off"], const="on" )
 
+add_option( "profiling", "Allow profiling and debugging", "?", True, "profiling",
+            default="on", type="choice", choices=["on", "off"], const="on" )
+
 add_option( "sanitize", "enable selected sanitizers", 1, True, metavar="san1,san2,...sanN" )
 add_option( "llvm-symbolizer", "name of (or path to) the LLVM symbolizer", 1, False, default="llvm-symbolizer" )
 
@@ -1596,6 +1599,11 @@ def doConfigure(myenv):
 
         # Don't issue warnings about potentially evaluated expressions
         AddToCCFLAGSIfSupported(myenv, "-Wno-potentially-evaluated-expression")
+
+    # BLD-300, allow debug and profiling
+    if get_option('profiling') == 'on':
+      AddToCCFLAGSIfSupported(myenv, "-fno-omit-frame-pointer")
+      AddToCXXFLAGSIfSupported(myenv, "-fno-omit-frame-pointer")
 
     # Check if we need to disable null-conversion warnings
     if using_clang():
