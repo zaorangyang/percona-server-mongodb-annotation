@@ -107,7 +107,7 @@ namespace audit {
 
         virtual void append(const BSONObj &obj) {
             if (_matcher.matches(obj)) {
-                const std::string str = mongoutils::str::stream() << obj.toString() << "\n";
+                const std::string str = mongoutils::str::stream() << obj.jsonString() << "\n";
 
                 // mongo::File does not have an "atomic append" operation.
                 // As such, with a rwlock we are vulnerable to a race
@@ -139,12 +139,12 @@ namespace audit {
                     if (writeRet == 0) {
                         break;
                     } else if (!ioErrorShouldRetry(writeRet)) {
-                        error() << "Audit system cannot write event " << obj.toString() << " to log file " << _fileName << std::endl;
+                        error() << "Audit system cannot write event " << obj.jsonString() << " to log file " << _fileName << std::endl;
                         error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
                         error() << "As audit cannot make progress, the server will now shut down." << std::endl;
                         realexit(EXIT_AUDIT_ERROR);
                     }
-                    warning() << "Audit system cannot write event " << obj.toString() << " to log file " << _fileName << std::endl;
+                    warning() << "Audit system cannot write event " << obj.jsonString() << " to log file " << _fileName << std::endl;
                     warning() << "Write failed with retryable error " << errnoWithDescription(writeRet) << std::endl;
                     warning() << "Audit system will retry this write another " << retries - 1 << " times." << std::endl;
                     if (retries <= 7 && retries > 0) {
@@ -153,7 +153,7 @@ namespace audit {
                 }
 
                 if (writeRet != 0) {
-                    error() << "Audit system cannot write event " << obj.toString() << " to log file " << _fileName << std::endl;
+                    error() << "Audit system cannot write event " << obj.jsonString() << " to log file " << _fileName << std::endl;
                     error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
                     error() << "As audit cannot make progress, the server will now shut down." << std::endl;
                     realexit(EXIT_AUDIT_ERROR);
@@ -165,12 +165,12 @@ namespace audit {
                     if (fsyncRet == 0) {
                         break;
                     } else if (!ioErrorShouldRetry(fsyncRet)) {
-                        error() << "Audit system cannot fsync event " << obj.toString() << " to log file " << _fileName << std::endl;
+                        error() << "Audit system cannot fsync event " << obj.jsonString() << " to log file " << _fileName << std::endl;
                         error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
                         error() << "As audit cannot make progress, the server will now shut down." << std::endl;
                         realexit(EXIT_AUDIT_ERROR);
                     }
-                    warning() << "Audit system cannot fsync event " << obj.toString() << " to log file " << _fileName << std::endl;
+                    warning() << "Audit system cannot fsync event " << obj.jsonString() << " to log file " << _fileName << std::endl;
                     warning() << "Fsync failed with retryable error " << errnoWithDescription(fsyncRet) << std::endl;
                     warning() << "Audit system will retry this fsync another " << retries - 1 << " times." << std::endl;
                     if (retries <= 7 && retries > 0) {
@@ -179,7 +179,7 @@ namespace audit {
                 }
 
                 if (fsyncRet != 0) {
-                    error() << "Audit system cannot fsync event " << obj.toString() << " to log file " << _fileName << std::endl;
+                    error() << "Audit system cannot fsync event " << obj.jsonString() << " to log file " << _fileName << std::endl;
                     error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
                     error() << "As audit cannot make progress, the server will now shut down." << std::endl;
                     realexit(EXIT_AUDIT_ERROR);
@@ -218,13 +218,13 @@ namespace audit {
     };    
 
     // A void audit log does not actually write any audit events. Instead, it
-    // verifies that we can call toString() on the generatd bson obj and that
+    // verifies that we can call jsonString() on the generatd bson obj and that
     // the result is non-empty. This is useful for sanity testing the audit bson
     // generation code even when auditing is not explicitly enabled in debug builds.
     class VoidAuditLog : public WritableAuditLog {
     public:
         void append(const BSONObj &obj) {
-            verify(!obj.toString().empty());
+            verify(!obj.jsonString().empty());
         }
 
         void rotate() { }
@@ -323,7 +323,26 @@ namespace audit {
             builder << "users" << BSONObj();
         }
     }
-    
+
+    static void appendPrivileges(BSONObjBuilder &builder, const PrivilegeVector& privileges) {
+        BSONArrayBuilder privbuilder(builder.subarrayStart("privileges"));
+        for (PrivilegeVector::const_iterator it = privileges.begin(); it != privileges.end(); ++it) {
+            privbuilder.append(it->toBSON());
+        }
+        privbuilder.doneFast();
+    }
+
+    static void appendRoles(BSONObjBuilder &builder, const std::vector<RoleName>& roles) {
+        BSONArrayBuilder rolebuilder(builder.subarrayStart("roles"));
+        for (std::vector<RoleName>::const_iterator it = roles.begin(); it != roles.end(); ++it) {
+            BSONObjBuilder r(rolebuilder.subobjStart());
+            r.append("role", it->getRole());
+            r.append("db", it->getDB());
+            r.doneFast();
+        }
+        rolebuilder.doneFast();
+    }
+
 
     static void _auditEvent(ClientBasic* client,
                             const StringData& atype,
@@ -350,18 +369,13 @@ namespace audit {
     void logAuthentication(ClientBasic* client,
                            const StringData& mechanism,
                            const UserName& user,
-                           ErrorCodes::Error result) PERCONA_AUDIT_STUB
-    void logAuthentication(ClientBasic* client,
-                           const StringData& dbname,
-                           const StringData& mechanism,
-                           const std::string& user,
                            ErrorCodes::Error result) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("user" << user <<
-                                    "db" << dbname <<
+        const BSONObj params = BSON("user" << user.getUser() <<
+                                    "db" << user.getDB() <<
                                     "mechanism" << mechanism);
         _auditEvent(client, "authenticate", params, result);
     }
@@ -370,17 +384,13 @@ namespace audit {
                               const std::string& dbname,
                               const BSONObj& cmdObj,
                               Command* command,
-                              ErrorCodes::Error result) PERCONA_AUDIT_STUB
-    void logCommandAuthzCheck(ClientBasic* client,
-                              const NamespaceString& ns,
-                              const BSONObj& cmdObj,
                               ErrorCodes::Error result) {
         if (!_auditLog) {
             return;
         }
 
         if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), cmdObj.firstElement().fieldName(), cmdObj, result);
+            _auditAuthzFailure(client, command->parseNs(dbname, cmdObj), cmdObj.firstElement().fieldName(), cmdObj, result);
         }
     }
 
@@ -403,7 +413,15 @@ namespace audit {
 
     void logFsyncUnlockAuthzCheck(
             ClientBasic* client,
-            ErrorCodes::Error result) PERCONA_AUDIT_STUB
+            ErrorCodes::Error result) {
+        if (!_auditLog) {
+            return;
+        }
+
+        if (result != ErrorCodes::OK) {
+            _auditAuthzFailure(client, "", "fsyncUnlock", BSONObj(), result);
+        }
+    }
 
     void logGetMoreAuthzCheck(
             ClientBasic* client,
@@ -675,59 +693,193 @@ namespace audit {
                        const UserName& username,
                        bool password,
                        const BSONObj* customData,
-                       const std::vector<RoleName>& roles) PERCONA_AUDIT_STUB
+                       const std::vector<RoleName>& roles) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params << "user" << username.getUser()
+               << "db" << username.getDB() 
+               << "password" << password 
+               << "customData" << (customData ? *customData : BSONObj());
+        appendRoles(params, roles);
+        _auditEvent(client, "createUser", params.done());
+    }
 
     void logDropUser(ClientBasic* client,
-                     const UserName& username) PERCONA_AUDIT_STUB
+                     const UserName& username) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("user" << username.getUser() <<
+                                    "db" << username.getDB());
+        _auditEvent(client, "dropUser", params);
+    }
 
     void logDropAllUsersFromDatabase(ClientBasic* client,
-                                     const StringData& dbname) PERCONA_AUDIT_STUB
+                                     const StringData& dbname) {
+        if (!_auditLog) {
+            return;
+        }
+
+        _auditEvent(client, "dropAllUsers", BSON("db" << dbname));
+    }
 
     void logUpdateUser(ClientBasic* client,
                        const UserName& username,
                        bool password,
                        const BSONObj* customData,
-                       const std::vector<RoleName>* roles) PERCONA_AUDIT_STUB
+                       const std::vector<RoleName>* roles) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params << "user" << username.getUser()
+               << "db" << username.getDB() 
+               << "password" << password 
+               << "customData" << (customData ? *customData : BSONObj());
+        appendRoles(params, *roles);
+        _auditEvent(client, "updateUser", params.done());
+    }
 
     void logGrantRolesToUser(ClientBasic* client,
                              const UserName& username,
-                             const std::vector<RoleName>& roles) PERCONA_AUDIT_STUB
+                             const std::vector<RoleName>& roles) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params << "user" << username.getUser()
+               << "db" << username.getDB();
+        appendRoles(params, roles);
+        _auditEvent(client, "grantRolesToUser", params.done());
+    }
 
     void logRevokeRolesFromUser(ClientBasic* client,
                                 const UserName& username,
-                                const std::vector<RoleName>& roles) PERCONA_AUDIT_STUB
+                                const std::vector<RoleName>& roles) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params << "user" << username.getUser()
+               << "db" << username.getDB();
+        appendRoles(params, roles);
+        _auditEvent(client, "revokeRolesFromUser", params.done());
+    }
 
     void logCreateRole(ClientBasic* client,
                        const RoleName& role,
                        const std::vector<RoleName>& roles,
-                       const PrivilegeVector& privileges) PERCONA_AUDIT_STUB
+                       const PrivilegeVector& privileges) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params << "role" << role.getRole()
+               << "db" << role.getDB();
+        appendRoles(params, roles);
+        appendPrivileges(params, privileges);
+        _auditEvent(client, "createRole", params.done());
+    }
 
     void logUpdateRole(ClientBasic* client,
                        const RoleName& role,
                        const std::vector<RoleName>* roles,
-                       const PrivilegeVector* privileges) PERCONA_AUDIT_STUB
+                       const PrivilegeVector* privileges) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params << "role" << role.getRole()
+               << "db" << role.getDB();
+        appendRoles(params, *roles);
+        appendPrivileges(params, *privileges);
+        _auditEvent(client, "updateRole", params.done());
+    }
 
     void logDropRole(ClientBasic* client,
-                     const RoleName& role) PERCONA_AUDIT_STUB
+                     const RoleName& role) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("role" << role.getRole() <<
+                                    "db" << role.getDB());
+        _auditEvent(client, "dropRole", params);
+    }
 
     void logDropAllRolesFromDatabase(ClientBasic* client,
-                                     const StringData& dbname) PERCONA_AUDIT_STUB
+                                     const StringData& dbname) {
+        if (!_auditLog) {
+            return;
+        }
+
+        _auditEvent(client, "dropAllRoles", BSON("db" << dbname));
+    }
 
     void logGrantRolesToRole(ClientBasic* client,
                              const RoleName& role,
-                             const std::vector<RoleName>& roles) PERCONA_AUDIT_STUB
+                             const std::vector<RoleName>& roles) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params << "role" << role.getRole()
+               << "db" << role.getDB();
+        appendRoles(params, roles);
+        _auditEvent(client, "grantRolesToRole", params.done());
+    }
 
     void logRevokeRolesFromRole(ClientBasic* client,
                                 const RoleName& role,
-                                const std::vector<RoleName>& roles) PERCONA_AUDIT_STUB
+                                const std::vector<RoleName>& roles) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params << "role" << role.getRole()
+               << "db" << role.getDB();
+        appendRoles(params, roles);
+        _auditEvent(client, "revokeRolesFromRole", params.done());
+    }
 
     void logGrantPrivilegesToRole(ClientBasic* client,
                                   const RoleName& role,
-                                  const PrivilegeVector& privileges) PERCONA_AUDIT_STUB
+                                  const PrivilegeVector& privileges) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params << "role" << role.getRole()
+               << "db" << role.getDB();
+        appendPrivileges(params, privileges);
+        _auditEvent(client, "grantPrivilegesToRole", params.done());
+    }
 
     void logRevokePrivilegesFromRole(ClientBasic* client,
                                      const RoleName& role,
-                                     const PrivilegeVector& privileges) PERCONA_AUDIT_STUB
+                                     const PrivilegeVector& privileges) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params << "role" << role.getRole()
+               << "db" << role.getDB();
+        appendPrivileges(params, privileges);
+        _auditEvent(client, "revokePrivilegesFromRole", params.done());
+    }
 
     void appendImpersonatedUsers(BSONObjBuilder* cmd) PERCONA_AUDIT_STUB
 
