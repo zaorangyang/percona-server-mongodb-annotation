@@ -12,16 +12,13 @@ auditTest(
     'renameCollection',
     function(m) {
         testDB = m.getDB(testDBName);
-        testDB.dropDatabase();
-        assert.eq(null, testDB.getLastError());
+        assert.commandWorked(testDB.dropDatabase());
 
         var oldName = 'john';
         var newName = 'christian';
 
-        testDB.createCollection(oldName);
-        assert.eq(null, testDB.getLastError());
-        testDB.getCollection(oldName).renameCollection(newName);
-        assert.eq(null, testDB.getLastError());
+        assert.commandWorked(testDB.createCollection(oldName));
+        assert.commandWorked(testDB.getCollection(oldName).renameCollection(newName));
 
         var auditColl = getAuditEventsCollection(m);
         var checkAuditLogForSingleRename = function() {
@@ -35,8 +32,7 @@ auditTest(
         }
         checkAuditLogForSingleRename();
 
-        testDB.getCollection(oldName).renameCollection(newName);
-        assert.neq(null, testDB.getLastError());
+        assert.commandFailed(testDB.getCollection(oldName).renameCollection(newName));
 
         // Second rename won't be audited because it did not succeed.
         checkAuditLogForSingleRename();
