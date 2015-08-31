@@ -29,10 +29,8 @@ auditTest(
 
         // This should generate a few new audit log entries on ns 'test.foo'
         testDB = m.getDB(testDBName);
-        testDB.createCollection('foo');
-        assert.eq(null, testDB.getLastError());
-        testDB.getCollection('foo').drop();
-        assert.eq(null, testDB.getLastError());
+        assert.commandWorked(testDB.createCollection('foo'));
+        assert(testDB.getCollection('foo').drop());
 
         // There should be something in the audit log since we created 'test.foo'
         assert.neq(0, getAuditEventsCollection(m).count(),
@@ -43,7 +41,7 @@ auditTest(
         assert.commandWorked(m.getDB('admin').runCommand({ logRotate: 1 }));
         var auditLogAfterRotate = getAuditEventsCollection(m).find({ 
             // skip audit events that will be triggered by getAuditEventsCollection itself
-            $not: { 'params.ns': 'local.auditCollection' }
+            'params.ns': { $ne: 'local.auditCollection' }
         }).toArray();
         assert.eq(0, auditLogAfterRotate.length,
                   "Audit log has old events after rotate: " + tojson(auditLogAfterRotate));

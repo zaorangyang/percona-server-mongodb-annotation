@@ -25,8 +25,7 @@ auditTest(
         // returned batch set.
 	var n = 1000;
         for (var i = 0; i < n; ++i) {
-            testDB.foo.insert({'_id': i, s: 'lotsofdummydata'});
-            assert.eq(null, testDB.getLastError());
+            assert.writeOK(testDB.foo.insert({'_id': i, s: 'lotsofdummydata'}));
         }
 
         // Using the admin user, get a bunch of batches, but not all of them.
@@ -47,15 +46,7 @@ auditTest(
         // just before calling next().  Since Tom is not authorized for hasNext(), next() (and
         // getMore), the hasNext() call will throw.  We want to ignore that throw, and assert if it
         // does NOT throw.
-        var ok = true;
-        try {
-            // if everything is good, this will throw!
-            document = myCursor.next();
-            ok = false;
-        } catch (o) { }
-
-        assert(ok);
-        assert.neq(null, testDB.getLastError());
+        assert.throws( function(){ myCursor.next(); } );
 
         // Tom logs out.
         testDB.logout();
@@ -65,7 +56,7 @@ auditTest(
         assert.eq(1, auditColl.count({
             atype: "authCheck",
             ts: withinTheLastFewSeconds(),
-            users: [ { user:'tom', db:testDBName} ],
+            users: { $elemMatch: { user:'tom', db:testDBName} },
             'params.ns': testDBName + '.' + 'foo',
             'params.command': 'getMore',
             result: 13, // <-- Unauthorized error, see error_codes.err...

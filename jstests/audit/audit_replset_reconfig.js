@@ -17,12 +17,12 @@ auditTestRepl(
         var newConfig = JSON.parse(JSON.stringify(oldConfig));
         newConfig.version = 200; // tired of playing games with the version
 
-        var master = replTest.getMaster();
-        try {
-            assert.commandWorked(master.adminCommand({ replSetReconfig: newConfig }));
-        } catch (e) {
-            print('caught exception ' + e + ' while running reconfig, checking audit logs anyway..');
-        }
+        //var master = replTest.getMaster();
+        //try {
+        //    assert.commandWorked(master.adminCommand({ replSetReconfig: newConfig }));
+        //} catch (e) {
+        //    print('caught exception ' + e + ' while running reconfig, checking audit logs anyway..');
+        //}
 
         reconfig(replTest, newConfig);
         // MAGIC MAGIC MAGIC MAGIC!
