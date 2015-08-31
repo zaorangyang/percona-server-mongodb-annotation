@@ -20,18 +20,16 @@ auditTest(
         // when an 'admin' user performs this operation.
         var adminDB = m.getDB('admin');
         adminDB.auth('admin','admin');
-        testDB.foo.insert({'_id': 1});
-        testDB.foo.insert({'_id': 2});
-        testDB.foo.remove({'_id': 2});
-        assert.eq(null, testDB.getLastError());
+        assert.writeOK(testDB.foo.insert({'_id': 1}));
+        assert.writeOK(testDB.foo.insert({'_id': 2}));
+        assert.writeOK(testDB.foo.remove({'_id': 2}));
         adminDB.logout();
 
         // User with no permissions logs in.
         testDB.auth('tom', 'tom');
         
         // Tom inserts data.
-        testDB.foo.remove({'_id': 1});
-        assert.neq(null, testDB.getLastError());
+        assert.writeError(testDB.foo.remove({'_id': 1}));
 
         // Tom logs out.
         testDB.logout();
@@ -41,7 +39,7 @@ auditTest(
         assert.eq(1, auditColl.count({
             atype: "authCheck",
             ts: withinTheLastFewSeconds(),
-            users: [ { user:'tom', db:testDBName} ],
+            users: { $elemMatch: { user:'tom', db:testDBName} },
             'params.ns': testDBName + '.' + 'foo',
             'params.command': 'delete',
             result: 13, // <-- Unauthorized error, see error_codes.err...

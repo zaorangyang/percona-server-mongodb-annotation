@@ -12,14 +12,11 @@ auditTest(
     'createIndex',
     function(m) {
         testDB = m.getDB(testDBName);
-        testDB.dropDatabase();
-        assert.eq(null, testDB.getLastError());
+        assert.commandWorked(testDB.dropDatabase());
 
-        coll = testDB.coll.ensureIndex({ a: 1 }, { name: 'cold', background: false });
-        assert.eq(null, testDB.getLastError());
+        assert.commandWorked(testDB.coll.createIndex({ a: 1 }, { name: 'cold', background: false }));
 
-        coll = testDB.coll.ensureIndex({ b: 1 }, { name: 'hot', background: true });
-        assert.eq(null, testDB.getLastError());
+        assert.commandWorked(testDB.coll.createIndex({ b: 1 }, { name: 'hot', background: true }));
 
         auditColl = getAuditEventsCollection(m);
 

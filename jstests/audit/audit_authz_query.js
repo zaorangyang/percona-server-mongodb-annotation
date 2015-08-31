@@ -20,8 +20,7 @@ auditTest(
         // when an 'admin' user performs this operation.
         var adminDB = m.getDB('admin');
         adminDB.auth('admin','admin');
-        testDB.foo.insert({'_id':1});
-        assert.eq(null, testDB.getLastError());
+        assert.writeOK(testDB.foo.insert({'_id':1}));
         adminDB.logout();
 
         // User (tom) with no permissions logs in.
@@ -34,14 +33,7 @@ auditTest(
         // have to ignore that exception in this test.
         var cursor = testDB.foo.find( {_id:1} );
         assert.eq(null, testDB.getLastError());
-        var ok = true;
-        try {
-            cursor.next();
-            ok = false;
-        } catch (o) { }
-
-        assert(ok);
-        assert.neq(null, testDB.getLastError());
+        assert.throws( function(){ cursor.next(); } );
 
         // Tom logs out.
         testDB.logout();
@@ -51,7 +43,7 @@ auditTest(
         assert.eq(1, auditColl.count({
             atype: "authCheck",
             ts: withinTheLastFewSeconds(),
-            users: [ { user:'tom', db:testDBName} ],
+            users: { $elemMatch: { user:'tom', db:testDBName} },
             'params.ns': testDBName + '.' + 'foo',
             'params.command': 'query',
             result: 13, // <-- Unauthorized error, see error_codes.err...

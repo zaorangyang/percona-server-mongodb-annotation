@@ -10,8 +10,7 @@ auditTestShard(
     'enableSharding',
     function(st) {
         testDB = st.s0.getDB(jsTestName());
-        testDB.dropDatabase();
-        assert.eq(null, testDB.getLastError());
+        assert.commandWorked(testDB.dropDatabase());
         assert.commandWorked(st.s0.adminCommand({enableSharding: jsTestName()}));
 
         auditColl = loadAuditEventsIntoCollection(st.s0, '/data/db/auditLog-s0.json', testDB.getName(), 'auditEvents');

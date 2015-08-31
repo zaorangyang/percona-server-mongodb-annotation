@@ -14,10 +14,8 @@ auditTest(
         testDB = m.getDB(testDBName);
         var collName = 'foo';
         var coll = testDB.getCollection(collName);
-        coll.insert({ a: 17 });
-        assert.eq(null, testDB.getLastError());
-        coll.drop();
-        assert.eq(null, testDB.getLastError());
+        assert.writeOK(coll.insert({ a: 17 }));
+        assert(coll.drop());
 
         var auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({

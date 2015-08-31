@@ -15,10 +15,8 @@ auditTest(
         var collName = 'foo';
         var idxName = 'fooIdx';
         var coll = testDB.getCollection(collName);
-        coll.ensureIndex({ a: 1 }, { name: idxName });
-        assert.eq(null, testDB.getLastError());
-        coll.dropIndex({ a: 1 });
-        assert.eq(null, testDB.getLastError());
+        assert.commandWorked(coll.createIndex({ a: 1 }, { name: idxName }));
+        assert.commandWorked(coll.dropIndex({ a: 1 }));
 
         var auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({

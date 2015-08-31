@@ -10,8 +10,7 @@ auditTestShard(
     'shardCollection',
     function(st) {
         testDB = st.s0.getDB(jsTestName());
-        testDB.dropDatabase();
-        assert.eq(null, testDB.getLastError());
+        assert.commandWorked(testDB.dropDatabase());
         assert.commandWorked(st.s0.adminCommand({enableSharding: jsTestName()}));
         assert.commandWorked(st.s0.adminCommand({shardCollection: jsTestName() + '.foo', key: {a: 1, b: 1}}));
 

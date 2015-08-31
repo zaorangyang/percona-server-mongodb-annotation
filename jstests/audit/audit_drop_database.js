@@ -12,10 +12,8 @@ auditTest(
     'dropDatabase',
     function(m) {
         testDB = m.getDB(testDBName);
-        testDB.getCollection('foo').insert({ a: 1 });
-        assert.eq(null, testDB.getLastError());
-        testDB.dropDatabase();
-        assert.eq(null, testDB.getLastError());
+        assert.writeOK(testDB.getCollection('foo').insert({ a: 1 }));
+        assert.commandWorked(testDB.dropDatabase());
 
         var auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({
