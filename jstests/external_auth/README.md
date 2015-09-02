@@ -13,6 +13,6 @@ example:
 
         cd support-files/ldap-sasl
         ./deploy_ldap_and_sasl.sh
-        cd ../jstests/external_auth
-        export MONGODB_HOME=/opt/percona-server-for-mongodb-3.x
+        cd ../../jstests/external_auth
+        export MONGODB_HOME=/opt/percona-server-for-mongodb
         ./run.sh
