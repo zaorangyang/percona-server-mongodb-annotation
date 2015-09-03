@@ -28,6 +28,11 @@ env.SConscript(
     ],
 )
 
+HotBackup = []
+if has_option( "tokubackup" ):
+    env.Append(LIBPATH = ['$BUILD_DIR/third_party/tokubackup/lib'])
+    HotBackup = ['HotBackup']
+
 #
 # The db/'common' lib has the abstractions that are shared by components of the
 # server. Ideally, many of the object in 'coredb' should be moved here when their dependencies
@@ -438,8 +443,10 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/serveronly',
         '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
+        '$BUILD_DIR/mongo/db/storage/tokuft/backup/tokubackup', # Even though we include the Hot Backup command's source dir here, they  won't actually be built without the respective flag.
         'server_options',
     ],
+    SYSLIBDEPS=HotBackup # The Hot Backup library should only be linked with mongod.
 )
 
 env.Library(

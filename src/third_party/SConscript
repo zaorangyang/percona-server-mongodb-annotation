@@ -74,6 +74,8 @@ if not use_system_version_of_library('asio'):
 
 thirdPartyIncludePathList.append(
     ('tokuft', '#/src/third_party/install/include'))
+thirdPartyIncludePathList.append(
+    ('tokubackup', '#/src/third_party/tokubackup/include'))
 
 if not use_system_version_of_library('intel_decimal128'):
     thirdPartyIncludePathList.append(
