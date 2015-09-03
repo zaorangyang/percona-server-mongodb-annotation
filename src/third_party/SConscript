@@ -2,6 +2,7 @@
 
 Import("env use_system_version_of_library windows darwin usev8 v8suffix solaris boostSuffix")
 Import("wiredtiger")
+Import("has_option")
 
 snappySuffix = '-1.1.2'
 zlibSuffix = '-1.2.8'
@@ -52,6 +53,11 @@ if not use_system_version_of_library('yaml'):
 
 thirdPartyIncludePathList.append(
     ('tokuft', '#/src/third_party/tokuft/include'))
+thirdPartyIncludePathList.append(
+    ('tokubackup', '#/src/third_party/tokubackup/include'))
+
+if has_option("tokubackup"):
+    env.Append(LIBPATH=['#/src/third_party/tokubackup/lib'])
 
 def injectAllThirdPartyIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=[entry[1] for entry in thirdPartyIncludePathList])
