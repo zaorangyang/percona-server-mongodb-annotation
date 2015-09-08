@@ -159,7 +159,7 @@ namespace {
                 try {
                     status = indexer.init(_index);
                     if ( status.code() == ErrorCodes::IndexAlreadyExists ) {
-                        if (allowBackgroundBuilding) {
+                        if (allowBackgroundBuilding && !haveSetBgIndexStarting) {
                             // Must set this in case anyone is waiting for this build.
                             _setBgIndexStarting();
                         }
@@ -209,11 +209,14 @@ namespace {
                 status = wce.toStatus();
             }
 
-            if (status.code() != ErrorCodes::WriteConflict)
+            if (status.code() == ErrorCodes::WriteConflict) {
+                LOG(2) << "WriteConflictException while creating index in IndexBuilder, retrying.";
+            } else if (status.code() == 28550) {
+                LOG(2) << "Status 28550 when building an index in IndexBuilder, retrying";
+            } else {
                 return status;
+            }
 
-
-            LOG(2) << "WriteConflictException while creating index in IndexBuilder, retrying.";
             txn->recoveryUnit()->commitAndRestart();
         }
     }
