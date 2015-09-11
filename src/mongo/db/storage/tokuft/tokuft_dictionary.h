@@ -142,7 +142,7 @@ namespace mongo {
 
         virtual KVDictionary::Cursor *getCursor(OperationContext *opCtx, const int direction = 1) const;
 
-        virtual const char *name() const { return "tokuft"; }
+        virtual const char *name() const { return "PerconaFT"; }
 
         virtual KVDictionary::Stats getStats() const;
     

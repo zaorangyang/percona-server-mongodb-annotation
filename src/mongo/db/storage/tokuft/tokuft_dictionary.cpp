@@ -212,7 +212,7 @@ namespace mongo {
     }
 
     bool TokuFTDictionary::appendCustomStats(OperationContext *opCtx, BSONObjBuilder* result, double scale ) const {
-        BSONObjBuilder b(result->subobjStart("tokuft"));
+        BSONObjBuilder b(result->subobjStart("PerconaFT"));
         KVDictionary::Stats stats = getStats();
         {
             BSONObjBuilder sizeBuilder(b.subobjStart("size"));

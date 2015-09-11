@@ -45,7 +45,7 @@ namespace mongo {
             // todo unique
             std::auto_ptr<OperationContext> opCtx(new OperationContextNoop(newRecoveryUnit()));
 
-            const std::string ident = mongoutils::str::stream() << "TokuFTSortedDataInterface-" << _seq++;
+            const std::string ident = mongoutils::str::stream() << "PerconaFTSortedDataInterface-" << _seq++;
             Status status = _engine->createSortedDataInterface(opCtx.get(), ident, NULL);
             invariant(status.isOK());
 

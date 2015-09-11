@@ -1078,7 +1078,7 @@ serveronlyLibdeps = ["coreshard",
                      'elapsed_tracker',
                      '$BUILD_DIR/third_party/shim_snappy']
 
-if has_option("tokuft"):
+if has_option("PerconaFT"):
     serveronlyLibdeps.append( 'db/storage/tokuft/storage_tokuft' )
 
 if wiredtiger:

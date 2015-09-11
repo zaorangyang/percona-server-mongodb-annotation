@@ -1,4 +1,4 @@
-if (TestData.storageEngine == "tokuft") {
+if (TestData.storageEngine == "PerconaFT") {
     print("Skipping due to MSE-42");
 } else {
 
