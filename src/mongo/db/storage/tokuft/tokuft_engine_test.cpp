@@ -33,7 +33,7 @@ namespace mongo {
 
     class TokuFTEngineHarnessHelper : public KVHarnessHelper {
     public:
-        TokuFTEngineHarnessHelper() : _dbpath("mongo-tokuft-engine-test") {
+        TokuFTEngineHarnessHelper() : _dbpath("mongo-perconaft-engine-test") {
             boost::filesystem::remove_all(_dbpath.path());
             boost::filesystem::create_directory(_dbpath.path());
             _engine.reset(new TokuFTEngine(_dbpath.path()));

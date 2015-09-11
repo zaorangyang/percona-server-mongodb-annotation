@@ -230,7 +230,7 @@ namespace mongo {
 
     class TokuFTServerStatusSection : public ServerStatusSection {
     public:
-        TokuFTServerStatusSection() : ServerStatusSection("tokuft") {}
+        TokuFTServerStatusSection() : ServerStatusSection("PerconaFT") {}
         virtual bool includeByDefault() const { return true; }
 
         BSONObj generateSection(OperationContext *opCtx, const BSONElement &configElement) const {

@@ -45,7 +45,7 @@ namespace mongo {
         virtual RecordStore* newNonCappedRecordStore() {
             std::auto_ptr<OperationContext> opCtx(new OperationContextNoop(newRecoveryUnit()));
 
-            const std::string ident = mongoutils::str::stream() << "TokuFTRecordStore-" << _seq++;
+            const std::string ident = mongoutils::str::stream() << "PerconaFTRecordStore-" << _seq++;
             Status status = _engine->createRecordStore(opCtx.get(), "ns", ident, CollectionOptions());
             invariant(status.isOK());
 

@@ -243,7 +243,7 @@ add_option( "ssl" , "Enable SSL" , 0 , True )
 add_option( "ssl-fips-capability", "Enable the ability to activate FIPS 140-2 mode", 0, True );
 add_option( "wiredtiger", "Enable wiredtiger", "?", True, "wiredtiger",
             type="choice", choices=["on", "off"], const="on", default="on")
-add_option( "tokuft" , "Enable TokuFT" , 0 , False )
+add_option( "PerconaFT" , "Enable PerconaFT" , 0 , False )
 
 # library choices
 js_engine_choices = ['v8-3.12', 'v8-3.25', 'none']
