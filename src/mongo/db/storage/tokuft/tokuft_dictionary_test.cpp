@@ -41,7 +41,7 @@ namespace mongo {
 	virtual KVDictionary* newKVDictionary() {
             std::auto_ptr<OperationContext> opCtx(new OperationContextNoop(newRecoveryUnit()));
 
-            const std::string ident = mongoutils::str::stream() << "TokuFTDictionary-" << _seq++;
+            const std::string ident = mongoutils::str::stream() << "PerconaFTDictionary-" << _seq++;
             Status status = _engine->createKVDictionary(opCtx.get(), ident, KVDictionary::Encoding(), BSONObj());
             invariant(status.isOK());
 

@@ -77,7 +77,7 @@ namespace mongo {
             return new TokuFTStorageEngine(params.dbpath, params.dur, options);
         }
         virtual StringData getCanonicalName() const {
-            return "tokuft";
+            return "PerconaFT";
         }
         virtual Status validateCollectionStorageOptions(const BSONObj& options) const {
             return TokuFTDictionaryOptions::validateOptions(options);
@@ -113,7 +113,7 @@ namespace mongo {
     MONGO_INITIALIZER_WITH_PREREQUISITES(TokuFTStorageEngineInit,
                                          ("SetGlobalEnvironment"))
                                          (InitializerContext *context) {
-        getGlobalEnvironment()->registerStorageEngine("tokuft", new TokuFTFactory());
+        getGlobalEnvironment()->registerStorageEngine("PerconaFT", new TokuFTFactory());
         return Status::OK();
     }
 

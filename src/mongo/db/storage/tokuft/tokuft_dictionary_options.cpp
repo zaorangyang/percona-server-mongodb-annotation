@@ -47,7 +47,7 @@ namespace mongo {
     }
 
     std::string TokuFTDictionaryOptions::optionName(const std::string& opt) const {
-        return str::stream() << "storage.tokuft." << _objectName << "Options." << opt;
+        return str::stream() << "storage.PerconaFT." << _objectName << "Options." << opt;
     }
 
     std::string TokuFTDictionaryOptions::shortOptionName(const std::string& opt) const {
@@ -129,7 +129,7 @@ namespace mongo {
 
     Status TokuFTDictionaryOptions::validateOptions(const BSONObj& options) {
         std::set<std::string> found;
-        BSONForEach(elem, options.getObjectField("tokuft")) {
+        BSONForEach(elem, options.getObjectField("PerconaFT")) {
             std::string name(elem.fieldName());
             if (found.find(name) != found.end()) {
                 StringBuilder sb;
@@ -186,7 +186,7 @@ namespace mongo {
     }
 
     TokuFTDictionaryOptions TokuFTDictionaryOptions::mergeOptions(const BSONObj& options) const {
-        BSONObj tokuftOptions = options.getObjectField("tokuft");
+        BSONObj tokuftOptions = options.getObjectField("PerconaFT");
         TokuFTDictionaryOptions merged(*this);
         if (tokuftOptions.hasField("pageSize")) {
             merged.pageSize = tokuftOptions["pageSize"].numberLong();
