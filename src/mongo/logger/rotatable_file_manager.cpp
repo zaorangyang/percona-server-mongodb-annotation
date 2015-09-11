@@ -35,7 +35,7 @@
 namespace mongo {
 namespace logger {
 
-    RotatableFileManager::RotatableFileManager() {}
+    RotatableFileManager::RotatableFileManager() : _auditLog(0) {}
 
     RotatableFileManager::~RotatableFileManager() {
         for (WriterByNameMap::iterator iter = _writers.begin(); iter != _writers.end(); ++iter) {
@@ -76,7 +76,14 @@ namespace logger {
                 badStatuses.push_back(std::make_pair(iter->first, status));
             }
         }
+        if (_auditLog) {
+            _auditLog->rotate();
+        }
         return badStatuses;
+    }
+
+    void RotatableFileManager::setAuditLog(AuditLog * const auditLog) {
+        _auditLog = auditLog;
     }
 
 }  // namespace logger

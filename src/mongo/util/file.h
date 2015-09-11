@@ -57,7 +57,7 @@ namespace mongo {
 
         static intmax_t freeSpace(const std::string& path);
 
-    private:
+    protected:
         bool _bad;
 #ifdef _WIN32
         HANDLE _handle;
