@@ -61,5 +61,9 @@ namespace logger {
         return Status::OK();
     }
 
+    void setAuditLog(AuditLog * const auditLog) {
+        globalRotatableFileManager()->setAuditLog(auditLog);
+    }
+
 }  // namespace logger
 }  // namespace mongo

@@ -26,6 +26,7 @@ env.InjectMongoIncludePaths()
 env.SConscript(['base/SConscript',
                 'crypto/SConscript',
                 'crypto/tom/SConscript',
+                'db/audit/SConscript',
                 'db/auth/SConscript',
                 'db/auth/external/SConscript',
                 'db/catalog/SConscript',
@@ -526,6 +527,11 @@ if get_option('allocator') == 'tcmalloc':
 
 coredbEnv = env.Clone()
 coredbEnv.InjectThirdPartyIncludePaths(libraries=['snappy'])
+coredbOptionalLibdeps = []
+
+if has_option("audit"):
+    coredbOptionalLibdeps.append( 'db/audit/audit' )
+
 coredbEnv.Library("coredb", [
         "client/parallel.cpp",
         "db/audit.cpp",
@@ -596,7 +602,7 @@ coredbEnv.Library("coredb", [
                            '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
                            '$BUILD_DIR/mongo/logger/parse_log_component_settings',
                            'clientdriver',
-                           ])
+                           ] + coredbOptionalLibdeps)
 
 env.Library('ntservice', ['util/ntservice.cpp'],
             LIBDEPS=['foundation',

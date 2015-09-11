@@ -34,6 +34,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/logger/auditlog.h"
 #include "mongo/logger/rotatable_file_writer.h"
 #include "mongo/platform/unordered_map.h"
 
@@ -81,10 +82,16 @@ namespace logger {
          */
         FileNameStatusPairVector rotateAll(bool renameFiles, const std::string& renameTargetSuffix);
 
+        /**
+         * Set AuditLog instance for rotating.
+         */
+        void setAuditLog(AuditLog * const auditLog);
+
     private:
         typedef unordered_map<std::string, RotatableFileWriter*> WriterByNameMap;
 
         WriterByNameMap _writers;
+        AuditLog * _auditLog;
     };
 
 }  // namespace logger

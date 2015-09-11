@@ -239,6 +239,7 @@ add_option( "rocksdb" , "Enable RocksDB" , 0 , False )
 add_option( "wiredtiger", "Enable wiredtiger", "?", True, "wiredtiger",
             type="choice", choices=["on", "off"], const="on", default="on")
 add_option( "tokuft" , "Enable TokuFT" , 0 , False )
+add_option( "audit" , "Enable auditing" , 0 , False )
 
 # library choices
 js_engine_choices = ['v8-3.12', 'v8-3.25', 'none']
@@ -846,6 +847,9 @@ if has_option( "durableDefaultOn" ):
 
 if has_option( "durableDefaultOff" ):
     env.Append( CPPDEFINES=[ "_DURABLEDEFAULTOFF" ] )
+
+if has_option( "audit" ):
+    env.Append( CPPDEFINES=[ "PERCONA_AUDIT_ENABLED" ] )
 
 extraLibPlaces = []
 
