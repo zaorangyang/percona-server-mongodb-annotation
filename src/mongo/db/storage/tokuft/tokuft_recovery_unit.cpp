@@ -131,7 +131,7 @@ namespace mongo {
     //
     
     void *TokuFTRecoveryUnit::writingPtr(void *data, size_t len) {
-        log() << "tokuft-engine: writingPtr does nothing" << std::endl;
+        log() << "PerconaFT-engine: writingPtr does nothing" << std::endl;
         return data;
     }
 

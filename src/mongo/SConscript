@@ -1063,7 +1063,7 @@ serveronlyLibdeps = ["coreshard",
 if has_option("rocksdb" ):
     serveronlyLibdeps.append( 'db/storage/rocks/storage_rocks' )
 
-if has_option("tokuft"):
+if has_option("PerconaFT"):
     serveronlyLibdeps.append( 'db/storage/tokuft/storage_tokuft' )
 
 if wiredtiger:

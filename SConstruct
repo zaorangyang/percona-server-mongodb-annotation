@@ -238,7 +238,7 @@ add_option( "ssl" , "Enable SSL" , 0 , True )
 add_option( "rocksdb" , "Enable RocksDB" , 0 , False )
 add_option( "wiredtiger", "Enable wiredtiger", "?", True, "wiredtiger",
             type="choice", choices=["on", "off"], const="on", default="on")
-add_option( "tokuft" , "Enable TokuFT" , 0 , False )
+add_option( "PerconaFT" , "Enable PerconaFT" , 0 , False )
 add_option( "audit" , "Enable auditing" , 0 , False )
 
 # library choices

@@ -270,10 +270,10 @@ namespace mongo {
 
         ftcxx::DBTxn txn(_env);
         _metadataDict.reset(
-            new TokuFTDictionary(_env, txn, "tokuft.metadata", KVDictionary::Encoding(),
+            new TokuFTDictionary(_env, txn, "perconaft.metadata", KVDictionary::Encoding(),
                                  tokuftGlobalOptions.collectionOptions));
         _internalMetadataDict.reset(
-            new TokuFTDictionary(_env, txn, "tokuft-internal.metadata", KVDictionary::Encoding(),
+            new TokuFTDictionary(_env, txn, "perconaft-internal.metadata", KVDictionary::Encoding(),
                                  tokuftGlobalOptions.collectionOptions));
         txn.commit();
 
@@ -359,7 +359,7 @@ namespace mongo {
         const int r = _env.env()->dbremove(_env.env(), _getDBTxn(opCtx).txn(), identStr.c_str(), NULL, 0);
         if (r != 0) {
             return Status(ErrorCodes::InternalError,
-                          str::stream() << "TokuFTEngine::dropKVDictionary - Not found "
+                          str::stream() << "PerconaFTEngine::dropKVDictionary - Not found "
                                         << ident);
         }
         invariant(r == 0);
@@ -417,10 +417,10 @@ namespace mongo {
                 filename = filename.substr(0, filename.size() - 1);
             }
 
-            if (filename == "tokuft.metadata") {
+            if (filename == "perconaft.metadata") {
                 continue;
             }
-            if (filename == "tokuft-internal.metadata") {
+            if (filename == "perconaft-internal.metadata") {
                 continue;
             }
 

@@ -32,7 +32,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 namespace mongo {
 
     bool globalStorageEngineIsTokuFT() {
-        return storageGlobalParams.engine == "tokuft";
+        return storageGlobalParams.engine == "PerconaFT";
     }
 
     TokuFTEngine* tokuftGlobalEngine() {
