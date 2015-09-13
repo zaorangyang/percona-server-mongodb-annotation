@@ -1,3 +1,9 @@
 [submodule "PerconaFT"]
 	path = src/third_party/PerconaFT
 	url = https://github.com/percona/PerconaFT
+[submodule "Jemalloc"]
+	path = src/third_party/jemalloc
+	url = https://github.com/percona/jemalloc.git
+[submodule "RocksDB"]
+	path = src/third_party/rocksdb
+	url = https://github.com/facebook/rocksdb.git
