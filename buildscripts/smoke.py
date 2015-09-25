@@ -935,6 +935,7 @@ suiteGlobalConfig = {"js": ("core/*.js", True),
                      "rocksDB": ("rocksDB/*.js", True),
                      "slow1": ("slow1/*.js", True),
                      "slow2": ("slow2/*.js", True),
+                     "audit": ("audit/[!_]*.js", False),
                      }
 
 def get_module_suites():
