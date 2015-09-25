@@ -13,7 +13,7 @@ var auditTest = function(name, fn, serverParams) {
     removeFile(auditPath);
     var port = allocatePorts(1);
     var startServer = function(extraParams) {
-        params = Object.merge(serverParams, extraParams);
+        params = Object.merge(mongodOptions(serverParams), extraParams);
         return MongoRunner.runMongod(
             Object.merge({
                 port: port,
@@ -47,7 +47,7 @@ var auditTestRepl = function(name, fn, serverParams) {
     }
 
     loudTestEcho(name + ' STARTING ');
-    var replTest = new ReplSetTest({ name: 'auditTestReplSet', cleanData: true, nodes: 2 });
+    var replTest = new ReplSetTest({ name: 'auditTestReplSet', cleanData: true, nodes: 2, nodeOptions: mongodOptions(serverParams) });
     replTest.startSet({ auditDestination: 'file' });
     var config = {
         _id: 'auditTestReplSet',
@@ -89,7 +89,7 @@ var auditTestShard = function(name, fn, serverParams) {
                                     shardOptions: Object.merge({
                                         auditDestination: 'file',
                                         auditFormat: 'JSON'
-                                    }, serverParams),
+                                    }, mongodOptions(serverParams)),
                                 },
                               });
     try {
@@ -188,4 +188,12 @@ var createNoPermissionUserForAudit = function (m, db) {
     db.createUser( {'user':'tom', 'pwd':'tom', 'roles':[]} );
     adminDB.logout();
     return passwordUserNameUnion;
+}
+
+// Extracts mongod options from TestData and appends them to the object
+var mongodOptions = function(o) {
+    if ('storageEngine' in TestData && TestData.storageEngine != "") {
+        o.storageEngine = TestData.storageEngine;
+    }
+    return o;
 }
