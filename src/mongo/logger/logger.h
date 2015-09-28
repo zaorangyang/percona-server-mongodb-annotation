@@ -36,20 +36,22 @@
 namespace mongo {
 namespace logger {
 
-    /**
-     * Gets a global singleton instance of RotatableFileManager.
-     */
-    RotatableFileManager* globalRotatableFileManager();
+/**
+ * Gets a global singleton instance of RotatableFileManager.
+ */
+RotatableFileManager* globalRotatableFileManager();
 
-    /**
-     * Gets a global singleton instance of LogManager.
-     */
-    MONGO_CLIENT_API LogManager* globalLogManager();
+/**
+ * Gets a global singleton instance of LogManager.
+ */
+MONGO_CLIENT_API LogManager* globalLogManager();
 
-    /**
-     * Gets the global MessageLogDomain associated for the global log manager.
-     */
-    inline ComponentMessageLogDomain* globalLogDomain() { return globalLogManager()->getGlobalDomain(); }
+/**
+ * Gets the global MessageLogDomain associated for the global log manager.
+ */
+inline ComponentMessageLogDomain* globalLogDomain() {
+    return globalLogManager()->getGlobalDomain();
+}
 
     /**
      * Sets current audit logger instance.
@@ -58,4 +60,3 @@ namespace logger {
 
 }  // namespace logger
 }  // namespace mongo
-
