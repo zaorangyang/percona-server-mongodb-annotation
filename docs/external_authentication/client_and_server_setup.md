@@ -84,11 +84,7 @@ Use the following command to add an external user to the mongod server:
 $ db.getSiblingDB("$external").createUser( {user : christian, roles: [ {role: "read", db: "test"} ]} );
 ```
 
-Currently, you can only add externally authenticated users using the `mongo` shell included with the TokuMX build.  The command is a hybrid of 2.4 and 2.6 administration methods.  This also assumes that you have setup the server-wide admin user/role and have successfully locally authenticated as that admin user.
-
-The `mongo` client will add an external user to each database filed in the roles array.  To remove a user from a database simply use the existing 2.4 `db.removeUser()` call.
-
-NOTE: There is no single command to remove the external user from all the databases.  The `removeUser()` command must be called on each database for the given user.
+This example assumes that you have setup the server-wide admin user/role and have successfully locally authenticated as that admin user.
 
 NOTE: External users cannot have roles assigned in the 'admin' database.
 
@@ -99,13 +95,9 @@ When running the `mongo` client, a user can authenticate against a given databas
 $ db.auth({ mechanism:"PLAIN", user:"christian", pwd:"secret", digestPassword:false})
 ```
 
-The other MongoDB drivers need to support the 2.4 interface for authenticating externally.  This means they must be:
+MongoDB drivers need to support the command interface for authenticating externally.  This means they must be:
 
 1. Compiled/run with SASL authentication support.  Should include usage of the libsasl2 library.
 2. Allows users to specify a BSON argument for auth() calls.
 3. Allows users to specify the authentication `mechanism` field in the BSON argument.
 4. Allows users to specify the `digestPassword` field.
-
-Our implementation follows the 2.4 mongo client code, though some drivers diverge from this logic.  For example, some driver versions only conform to the 2.6 external authentication API, which will not work with the 2.4-based TokuMX implementation.
-
-These newer driver clients expect the external user to only authenticate against the `"$external"` database, not a regular local database.  The driver may need to be modified to detect the mechanism field being set, and then take the external authentication path, using the local db name instead of `$external`.  Drivers that are totally compatible with the 2.4 `mongo` client should work as expected.

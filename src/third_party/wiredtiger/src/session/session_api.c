@@ -202,9 +202,9 @@ __session_reconfigure(WT_SESSION *wt_session, const char *config)
 	if (cval.len != 0)
 		session->isolation = session->txn.isolation =
 		    WT_STRING_MATCH("snapshot", cval.str, cval.len) ?
-		    TXN_ISO_SNAPSHOT :
+		    WT_ISO_SNAPSHOT :
 		    WT_STRING_MATCH("read-uncommitted", cval.str, cval.len) ?
-		    TXN_ISO_READ_UNCOMMITTED : TXN_ISO_READ_COMMITTED;
+		    WT_ISO_READ_UNCOMMITTED : WT_ISO_READ_COMMITTED;
 
 err:	API_END_RET_NOTFOUND_MAP(session, ret);
 }
@@ -1064,13 +1064,13 @@ __wt_open_session(WT_CONNECTION_IMPL *conn,
 	WT_ERR(__wt_cond_alloc(session, "session", 0, &session_ret->cond));
 
 	if (WT_SESSION_FIRST_USE(session_ret))
-		__wt_random_init(session_ret->rnd);
+		__wt_random_init(&session_ret->rnd);
 
 	__wt_event_handler_set(session_ret,
 	    event_handler == NULL ? session->event_handler : event_handler);
 
 	TAILQ_INIT(&session_ret->cursors);
-	SLIST_INIT(&session_ret->dhandles);
+	TAILQ_INIT(&session_ret->dhandles);
 	/*
 	 * If we don't have one, allocate the dhandle hash array.
 	 * Allocate the table hash array as well.
@@ -1082,12 +1082,12 @@ __wt_open_session(WT_CONNECTION_IMPL *conn,
 		WT_ERR(__wt_calloc(session_ret, WT_HASH_ARRAY_SIZE,
 		    sizeof(struct __tables_hash), &session_ret->tablehash));
 	for (i = 0; i < WT_HASH_ARRAY_SIZE; i++) {
-		SLIST_INIT(&session_ret->dhhash[i]);
-		SLIST_INIT(&session_ret->tablehash[i]);
+		TAILQ_INIT(&session_ret->dhhash[i]);
+		TAILQ_INIT(&session_ret->tablehash[i]);
 	}
 
 	/* Initialize transaction support: default to read-committed. */
-	session_ret->isolation = TXN_ISO_READ_COMMITTED;
+	session_ret->isolation = WT_ISO_READ_COMMITTED;
 	WT_ERR(__wt_txn_init(session_ret));
 
 	/*
