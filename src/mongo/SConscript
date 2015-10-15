@@ -20,7 +20,7 @@ Import("wiredtiger")
 
 # Boost we need everywhere. 's2' is spammed in all over the place by
 # db/geo unfortunately. pcre is also used many places.
-env.InjectThirdPartyIncludePaths(libraries=['boost', 's2', 'pcre', 'tokuft'])
+env.InjectThirdPartyIncludePaths(libraries=['boost', 's2', 'pcre', 'tokuft', 'tokubackup'])
 env.InjectMongoIncludePaths()
 
 env.SConscript(['base/SConscript',
@@ -49,6 +49,7 @@ env.SConscript(['base/SConscript',
                 'db/storage/mmap_v1/SConscript',
                 'db/storage/rocks/SConscript',
                 'db/storage/tokuft/SConscript',
+                'db/storage/tokuft/backup/SConscript',
                 'db/storage/wiredtiger/SConscript',
                 'db/SConscript',
                 'installer/msi/SConscript',
@@ -1065,6 +1066,10 @@ if has_option("rocksdb" ):
 
 if has_option("PerconaFT"):
     serveronlyLibdeps.append( 'db/storage/tokuft/storage_tokuft' )
+HotBackup = []
+if has_option("tokubackup"):
+    env.Append(LIBPATH = ['$BUILD_DIR/third_party/tokubackup/lib'])
+    HotBackup = ['HotBackup']
 
 if wiredtiger:
     serveronlyLibdeps.append( 'db/storage/wiredtiger/storage_wiredtiger' )
@@ -1130,10 +1135,12 @@ env.Library(
 env.Library("mongod_options", ["db/mongod_options.cpp"],
             LIBDEPS=['server_options',
                      'mongocommon',
+                     'db/storage/tokuft/backup/tokubackup', # Even though we include the Hot Backup command's source dir here, they  won't actually be built without the respective flag.
                      'serveronly',
                      'coreserver',
                      'coredb',
-                     '$BUILD_DIR/mongo/util/options_parser/options_parser_init'])
+                     '$BUILD_DIR/mongo/util/options_parser/options_parser_init'],
+            SYSLIBDEPS=HotBackup) # The Hot Backup library should only be linked with mongod.
 
 # main db target
 mongod = env.Install(

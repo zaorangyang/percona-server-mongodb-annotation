@@ -42,6 +42,7 @@ const std::string RoleGraph::BUILTIN_ROLE_V0_ADMIN_READ = "readAnyDatabase";
 const std::string RoleGraph::BUILTIN_ROLE_V0_ADMIN_READ_WRITE = "root";
 
 namespace {
+
 const std::string ADMIN_DBNAME = "admin";
 
 const std::string BUILTIN_ROLE_READ = "read";
@@ -132,6 +133,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
 
     // DB admin role
     dbAdminRoleActions << ActionType::collMod
+                       << ActionType::backupStatus
                        << ActionType::collStats  // clusterMonitor gets this also
                        << ActionType::compact
                        << ActionType::convertToCapped   // read_write gets this also
@@ -147,6 +149,8 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
                        << ActionType::reIndex
                        << ActionType::renameCollectionSameDB  // read_write gets this also
                        << ActionType::repairDatabase << ActionType::storageDetails
+                       << ActionType::startBackup
+                       << ActionType::throttleBackup
                        << ActionType::validate;
 
     // clusterMonitor role actions that target the cluster resource
