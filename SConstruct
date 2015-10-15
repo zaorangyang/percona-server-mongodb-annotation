@@ -240,6 +240,7 @@ add_option( "wiredtiger", "Enable wiredtiger", "?", True, "wiredtiger",
             type="choice", choices=["on", "off"], const="on", default="on")
 add_option( "PerconaFT" , "Enable PerconaFT" , 0 , False )
 add_option( "audit" , "Enable auditing" , 0 , False )
+add_option( "tokubackup", "Enable Hot Backup for the Fractal Tree engine.", 0, False)
 
 # library choices
 js_engine_choices = ['v8-3.12', 'v8-3.25', 'none']
@@ -1090,7 +1091,6 @@ if nix:
     env.Append( CCFLAGS=["-fPIC",
                          "-fno-strict-aliasing",
                          "-ggdb",
-                         "-pthread",
                          "-Wall",
                          "-Wsign-compare",
                          "-Wno-unknown-pragmas",
@@ -1103,7 +1103,7 @@ if nix:
 
     env.Append( CPPDEFINES=["_FILE_OFFSET_BITS=64"] )
     env.Append( CXXFLAGS=["-Wnon-virtual-dtor", "-Woverloaded-virtual"] )
-    env.Append( LINKFLAGS=["-fPIC", "-pthread"] )
+    env.Append( LINKFLAGS=["-fPIC"] )
 
     # SERVER-9761: Ensure early detection of missing symbols in dependent libraries at program
     # startup.
@@ -2228,7 +2228,8 @@ def doConfigure(myenv):
         conf.env.Append(CPPDEFINES=['MONGO_HAVE_HEADER_UNISTD_H'])
         conf.CheckLib('rt')
         conf.CheckLib('dl')
-
+        conf.CheckLib('pthread') ## pthread should be last linker arg list for HotBackup.
+        
     if posix_monotonic_clock:
         conf.env.Append(CPPDEFINES=['MONGO_HAVE_POSIX_MONOTONIC_CLOCK'])
 
