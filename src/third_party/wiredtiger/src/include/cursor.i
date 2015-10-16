@@ -150,7 +150,7 @@ __wt_cursor_dhandle_incr_use(WT_SESSION_IMPL *session)
 	dhandle = session->dhandle;
 
 	/* If we open a handle with a time of death set, clear it. */
-	if (WT_ATOMIC_ADD4(dhandle->session_inuse, 1) == 1 &&
+	if (__wt_atomic_addi32(&dhandle->session_inuse, 1) == 1 &&
 	    dhandle->timeofdeath != 0)
 		dhandle->timeofdeath = 0;
 }
@@ -168,7 +168,7 @@ __wt_cursor_dhandle_decr_use(WT_SESSION_IMPL *session)
 
 	/* If we close a handle with a time of death set, clear it. */
 	WT_ASSERT(session, dhandle->session_inuse > 0);
-	if (WT_ATOMIC_SUB4(dhandle->session_inuse, 1) == 0 &&
+	if (__wt_atomic_subi32(&dhandle->session_inuse, 1) == 0 &&
 	    dhandle->timeofdeath != 0)
 		dhandle->timeofdeath = 0;
 }
@@ -178,7 +178,7 @@ __wt_cursor_dhandle_decr_use(WT_SESSION_IMPL *session)
  *	Cursor call setup.
  */
 static inline int
-__cursor_func_init(WT_CURSOR_BTREE *cbt, int reenter)
+__cursor_func_init(WT_CURSOR_BTREE *cbt, bool reenter)
 {
 	WT_SESSION_IMPL *session;
 
@@ -295,8 +295,8 @@ __cursor_row_slot_return(WT_CURSOR_BTREE *cbt, WT_ROW *rip, WT_UPDATE *upd)
 		 * Call __wt_row_leaf_key_work instead of __wt_row_leaf_key: we
 		 * already did __wt_row_leaf_key's fast-path checks inline.
 		 */
-slow:		WT_RET(
-		    __wt_row_leaf_key_work(session, page, rip, &cbt->tmp, 0));
+slow:		WT_RET(__wt_row_leaf_key_work(
+		    session, page, rip, &cbt->tmp, false));
 	}
 	kb->data = cbt->tmp.data;
 	kb->size = cbt->tmp.size;

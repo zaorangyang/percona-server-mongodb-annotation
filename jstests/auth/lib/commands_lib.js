@@ -219,6 +219,24 @@ var authCommandsLib = {
             ]
         },
         {
+            // Test that clusterManager role has permission to run addTagRange
+            testname: "addTagRange",
+            command: {  // addTagRange is not a "real command"; it updates config.tags
+                update: "tags",
+                updates: [ {
+                    q: {_id: { ns : "test.x" , min : 1 }},
+                    u: {_id: { ns : "test.x" , min : 1 },
+                    ns : "test.x"}
+                } ] },
+            skipStandalone: true,
+            testcases: [
+                {
+                    runOnDb: "config",
+                    roles: Object.extend({readWriteAnyDatabase: 1}, roles_clusterManager)
+                }
+            ]
+        },
+        {
             testname: "applyOps",
             command: {applyOps: "x"},
             testcases: [
@@ -1472,7 +1490,7 @@ var authCommandsLib = {
                         }
                     ]
                 },
-                // test legacy (pre 3.0) way of authorizing listCollections
+                // Test legacy (pre 3.0) way of authorizing listCollections.
                 {
                     runOnDb: firstDbName,
                     privileges: [
@@ -1511,6 +1529,16 @@ var authCommandsLib = {
                         {
                             resource: {db: firstDbName, collection: ""},
                             actions: ["listIndexes"]
+                        }
+                    ]
+                },
+                // Test legacy (pre 3.0) way of authorizing listIndexes.
+                {
+                    runOnDb: firstDbName,
+                    privileges: [
+                        {
+                            resource: {db: firstDbName, collection: "system.indexes"},
+                            actions: ["find"]
                         }
                     ]
                 }
@@ -2499,6 +2527,20 @@ var authCommandsLib = {
                     privileges: [
                         { resource: {db: secondDbName, collection: "x"}, actions: ["validate"] }
                     ]
+                }
+            ]
+        },
+        {
+            // Test that the root role has the privilege to validate any system.* collection
+            testname: "validate_system",
+            command: {validate: "system.users"},
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: {
+                        root: 1,
+                        __system: 1
+                    }
                 }
             ]
         },
