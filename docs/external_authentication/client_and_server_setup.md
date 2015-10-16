@@ -81,7 +81,7 @@ This assumes that libsasl2 has been installed in the system as a dynamic library
 Use the following command to add an external user to the mongod server:
 
 ```
-$ db.getSiblingDB("$external").createUser( {user : christian, roles: [ {role: "read", db: "test"} ]} );
+$ db.getSiblingDB("$external").createUser( {user : "christian", roles: [ {role: "read", db: "test"} ]} );
 ```
 
 This example assumes that you have setup the server-wide admin user/role and have successfully locally authenticated as that admin user.

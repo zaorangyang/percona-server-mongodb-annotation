@@ -33,7 +33,7 @@ An authentication session in this environment moves from component to component 
 Use the following command to add an external user to the mongod server:
 
 ```
-$ db.getSiblingDB("$external").createUser( {user : christian, roles: [ {role: "read", db: "test"} ]} );
+$ db.getSiblingDB("$external").createUser( {user : "christian", roles: [ {role: "read", db: "test"} ]} );
 ```
 
 When running the `mongo` client, a user can authenticate against a given database by using the following command:
