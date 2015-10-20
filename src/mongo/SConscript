@@ -1066,10 +1066,13 @@ if has_option("rocksdb" ):
 
 if has_option("PerconaFT"):
     serveronlyLibdeps.append( 'db/storage/tokuft/storage_tokuft' )
-HotBackup = []
+
+HotBackupLibraryName = []
+HotBackupCommands = []
 if has_option("tokubackup"):
     env.Append(LIBPATH = ['$BUILD_DIR/third_party/tokubackup/lib'])
-    HotBackup = ['HotBackup']
+    HotBackupLibraryName = ['HotBackup']
+    HotBackupCommands = ['db/storage/tokuft/backup/tokubackup']
 
 if wiredtiger:
     serveronlyLibdeps.append( 'db/storage/wiredtiger/storage_wiredtiger' )
@@ -1135,12 +1138,11 @@ env.Library(
 env.Library("mongod_options", ["db/mongod_options.cpp"],
             LIBDEPS=['server_options',
                      'mongocommon',
-                     'db/storage/tokuft/backup/tokubackup', # Even though we include the Hot Backup command's source dir here, they  won't actually be built without the respective flag.
                      'serveronly',
                      'coreserver',
                      'coredb',
-                     '$BUILD_DIR/mongo/util/options_parser/options_parser_init'],
-            SYSLIBDEPS=HotBackup) # The Hot Backup library should only be linked with mongod.
+                     '$BUILD_DIR/mongo/util/options_parser/options_parser_init'] + HotBackupCommands,
+            SYSLIBDEPS=HotBackupLibraryName) # The Hot Backup library should only be linked with mongod.
 
 # main db target
 mongod = env.Install(
