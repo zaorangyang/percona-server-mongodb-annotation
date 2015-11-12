@@ -129,6 +129,11 @@ public:
 
     void shuttingDown();
 
+    /**
+     * Waits until all commits that happened before this call are durable.
+     */
+    void waitUntilDurable(WiredTigerSession* session);
+
     WT_CONNECTION* conn() const {
         return _conn;
     }
@@ -143,11 +148,15 @@ private:
     boost::shared_mutex _shutdownLock;
     AtomicUInt32 _shuttingDown;  // Used as boolean - 0 = false, 1 = true
 
-    SpinLock _cacheLock;
+    boost::mutex _cacheLock;
     typedef std::list<WiredTigerSession*> SessionCache;
     SessionCache _sessions;
 
     // Bumped when all open sessions need to be closed
     AtomicUInt64 _epoch;  // atomic so we can check it outside of the lock
+
+    // Counter and critical section mutex for waitUntilDurable
+    AtomicUInt32 _lastSyncTime;
+    boost::mutex _lastSyncMutex;
 };
-}
+}  // namespace

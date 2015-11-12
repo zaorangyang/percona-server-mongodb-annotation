@@ -60,10 +60,10 @@ if has_option("tokubackup"):
     env.Append(LIBPATH=['#/src/third_party/tokubackup/lib'])
 
 def injectAllThirdPartyIncludePaths(thisEnv):
-    thisEnv.AppendUnique(CPPPATH=[entry[1] for entry in thirdPartyIncludePathList])
+    thisEnv.PrependUnique(CPPPATH=[entry[1] for entry in thirdPartyIncludePathList])
 
 def injectThirdPartyIncludePaths(thisEnv, libraries):
-    thisEnv.AppendUnique(CPPPATH=[
+    thisEnv.PrependUnique(CPPPATH=[
         entry[1] for entry in thirdPartyIncludePathList if entry[0] in libraries])
 
 env.AddMethod(injectAllThirdPartyIncludePaths, 'InjectAllThirdPartyIncludePaths')

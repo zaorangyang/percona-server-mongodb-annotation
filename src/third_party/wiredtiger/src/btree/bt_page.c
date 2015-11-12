@@ -53,7 +53,7 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_PAGE *page, uint32_t flags)
 	__wt_txn_update_oldest(session, 0);
 
 	/* If eviction cannot succeed, don't try. */
-	return (__wt_page_can_evict(session, page, 1));
+	return (__wt_page_can_evict(session, page, 1, NULL));
 }
 
 /*
@@ -71,9 +71,10 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 	WT_DECL_RET;
 	WT_PAGE *page;
 	u_int sleep_cnt, wait_cnt;
-	int busy, force_attempts, oldgen;
+	int force_attempts;
+	bool busy, oldgen;
 
-	for (force_attempts = oldgen = 0, wait_cnt = 0;;) {
+	for (force_attempts = 0, oldgen = false, wait_cnt = 0;;) {
 		switch (ref->state) {
 		case WT_REF_DISK:
 		case WT_REF_DELETED:
@@ -81,10 +82,12 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 				return (WT_NOTFOUND);
 
 			/*
-			 * The page isn't in memory, attempt to read it.
-			 * Make sure there is space in the cache.
+			 * The page isn't in memory, read it. If this thread is
+			 * allowed to do eviction work, check for space in the
+			 * cache.
 			 */
-			WT_RET(__wt_cache_full_check(session));
+			if (!LF_ISSET(WT_READ_NO_EVICT))
+				WT_RET(__wt_cache_full_check(session));
 			WT_RET(__wt_cache_read(session, ref));
 			oldgen = LF_ISSET(WT_READ_WONT_NEED) ||
 			    F_ISSET(session, WT_SESSION_NO_CACHE);
@@ -185,6 +188,13 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 		if (++wait_cnt < 1000)
 			__wt_yield();
 		else {
+			/*
+			 * If stalling and this thread is allowed to do eviction
+			 * work, check if the cache needs help.
+			 */
+			if (!LF_ISSET(WT_READ_NO_EVICT))
+				WT_RET(__wt_cache_full_check(session));
+
 			sleep_cnt = WT_MIN(wait_cnt, 10000);
 			wait_cnt *= 2;
 			WT_STAT_FAST_CONN_INCRV(session, page_sleep, sleep_cnt);
@@ -199,7 +209,7 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
  */
 int
 __wt_page_alloc(WT_SESSION_IMPL *session, uint8_t type,
-    uint64_t recno, uint32_t alloc_entries, int alloc_refs, WT_PAGE **pagep)
+    uint64_t recno, uint32_t alloc_entries, bool alloc_refs, WT_PAGE **pagep)
 {
 	WT_CACHE *cache;
 	WT_DECL_RET;
@@ -295,8 +305,8 @@ err:			if ((pindex = WT_INTL_INDEX_GET_SAFE(page)) != NULL) {
 
 	/* Increment the cache statistics. */
 	__wt_cache_page_inmem_incr(session, page, size);
-	(void)WT_ATOMIC_ADD8(cache->bytes_read, size);
-	(void)WT_ATOMIC_ADD8(cache->pages_inmem, 1);
+	(void)__wt_atomic_add64(&cache->bytes_read, size);
+	(void)__wt_atomic_add64(&cache->pages_inmem, 1);
 
 	*pagep = page;
 	return (0);
@@ -369,7 +379,7 @@ __wt_page_inmem(WT_SESSION_IMPL *session, WT_REF *ref,
 
 	/* Allocate and initialize a new WT_PAGE. */
 	WT_RET(__wt_page_alloc(
-	    session, dsk->type, dsk->recno, alloc_entries, 1, &page));
+	    session, dsk->type, dsk->recno, alloc_entries, true, &page));
 	page->dsk = dsk;
 	F_SET_ATOMIC(page, flags);
 

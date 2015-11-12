@@ -142,12 +142,35 @@ void WiredTigerSessionCache::shuttingDown() {
     closeAll();
 }
 
+void WiredTigerSessionCache::waitUntilDurable(WiredTigerSession* session) {
+    uint32_t start = _lastSyncTime.load();
+    // Do the remainder in a critical section that ensures only a single thread at a time
+    // will attempt to synchronize.
+    boost::unique_lock<boost::mutex> lk(_lastSyncMutex);
+    uint32_t current = _lastSyncTime.loadRelaxed();  // synchronized with writes through mutex
+    if (current != start) {
+        // Someone else synced already since we read lastSyncTime, so we're done!
+        return;
+    }
+    _lastSyncTime.store(current + 1);
+
+    // Nobody has synched yet, so we have to sync ourselves.
+    WT_SESSION* s = session->getSession();
+
+    // Use the journal when available, or a checkpoint otherwise.
+    if (_engine->isDurable()) {
+        invariantWTOK(s->log_flush(s, "sync=on"));
+    } else {
+        invariantWTOK(s->checkpoint(s, NULL));
+    }
+}
+
 void WiredTigerSessionCache::closeAll() {
     // Increment the epoch as we are now closing all sessions with this epoch
     SessionCache swap;
 
     {
-        boost::lock_guard<SpinLock> lock(_cacheLock);
+        boost::lock_guard<boost::mutex> lock(_cacheLock);
         _epoch.fetchAndAdd(1);
         _sessions.swap(swap);
     }
@@ -165,7 +188,7 @@ WiredTigerSession* WiredTigerSessionCache::getSession() {
     invariant(!_shuttingDown.loadRelaxed());
 
     {
-        boost::lock_guard<SpinLock> lock(_cacheLock);
+        boost::lock_guard<boost::mutex> lock(_cacheLock);
         if (!_sessions.empty()) {
             // Get the most recently used session so that if we discard sessions, we're
             // discarding older ones
@@ -205,7 +228,7 @@ void WiredTigerSessionCache::releaseSession(WiredTigerSession* session) {
     uint64_t currentEpoch = _epoch.load();
 
     if (session->_getEpoch() == currentEpoch) {  // check outside of lock to reduce contention
-        boost::lock_guard<SpinLock> lock(_cacheLock);
+        boost::lock_guard<boost::mutex> lock(_cacheLock);
         if (session->_getEpoch() == _epoch.load()) {  // recheck inside the lock for correctness
             returnedToCache = true;
             _sessions.push_back(session);

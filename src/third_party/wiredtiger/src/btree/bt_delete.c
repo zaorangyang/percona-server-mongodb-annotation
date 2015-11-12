@@ -61,24 +61,24 @@
  *	If deleting a range, try to delete the page without instantiating it.
  */
 int
-__wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, int *skipp)
+__wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, bool *skipp)
 {
 	WT_DECL_RET;
 	WT_PAGE *parent;
 
-	*skipp = 0;
+	*skipp = false;
 
 	/* If we have a clean page in memory, attempt to evict it. */
 	if (ref->state == WT_REF_MEM &&
-	    WT_ATOMIC_CAS4(ref->state, WT_REF_MEM, WT_REF_LOCKED)) {
+	    __wt_atomic_casv32(&ref->state, WT_REF_MEM, WT_REF_LOCKED)) {
 		if (__wt_page_is_modified(ref->page)) {
 			WT_PUBLISH(ref->state, WT_REF_MEM);
 			return (0);
 		}
 
-		(void)WT_ATOMIC_ADD4(S2BT(session)->evict_busy, 1);
+		(void)__wt_atomic_addv32(&S2BT(session)->evict_busy, 1);
 		ret = __wt_evict_page(session, ref);
-		(void)WT_ATOMIC_SUB4(S2BT(session)->evict_busy, 1);
+		(void)__wt_atomic_subv32(&S2BT(session)->evict_busy, 1);
 		WT_RET_BUSY_OK(ret);
 	}
 
@@ -93,7 +93,7 @@ __wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, int *skipp)
 	 * unclear optimizing for overlapping range deletes is worth the effort.
 	 */
 	if (ref->state != WT_REF_DISK ||
-	    !WT_ATOMIC_CAS4(ref->state, WT_REF_DISK, WT_REF_LOCKED))
+	    !__wt_atomic_casv32(&ref->state, WT_REF_DISK, WT_REF_LOCKED))
 		return (0);
 
 	/*
@@ -126,7 +126,7 @@ __wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, int *skipp)
 	 * future reconciliation of the child leaf page that will dirty it as
 	 * we write the tree.
 	 */
-	WT_ERR(__wt_page_parent_modify_set(session, ref, 0));
+	WT_ERR(__wt_page_parent_modify_set(session, ref, false));
 
 	/*
 	 * Record the change in the transaction structure and set the change's
@@ -137,7 +137,7 @@ __wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, int *skipp)
 
 	WT_ERR(__wt_txn_modify_ref(session, ref));
 
-	*skipp = 1;
+	*skipp = true;
 	WT_PUBLISH(ref->state, WT_REF_DELETED);
 	return (0);
 
@@ -176,8 +176,8 @@ __wt_delete_page_rollback(WT_SESSION_IMPL *session, WT_REF *ref)
 			 * If the page is still "deleted", it's as we left it,
 			 * reset the state.
 			 */
-			if (WT_ATOMIC_CAS4(
-			    ref->state, WT_REF_DELETED, WT_REF_DISK))
+			if (__wt_atomic_casv32(
+			    &ref->state, WT_REF_DELETED, WT_REF_DISK))
 				return;
 			break;
 		case WT_REF_LOCKED:
@@ -216,10 +216,10 @@ __wt_delete_page_rollback(WT_SESSION_IMPL *session, WT_REF *ref)
  * __wt_delete_page_skip --
  *	If iterating a cursor, skip deleted pages that are visible to us.
  */
-int
+bool
 __wt_delete_page_skip(WT_SESSION_IMPL *session, WT_REF *ref)
 {
-	int skip;
+	bool skip;
 
 	/*
 	 * Deleted pages come from two sources: either it's a fast-delete as
@@ -240,10 +240,10 @@ __wt_delete_page_skip(WT_SESSION_IMPL *session, WT_REF *ref)
 	 * the structure, just to be safe.
 	 */
 	if (ref->page_del == NULL)
-		return (1);
+		return (true);
 
-	if (!WT_ATOMIC_CAS4(ref->state, WT_REF_DELETED, WT_REF_LOCKED))
-		return (0);
+	if (!__wt_atomic_casv32(&ref->state, WT_REF_DELETED, WT_REF_LOCKED))
+		return (false);
 
 	skip = (ref->page_del == NULL ||
 	    __wt_txn_visible(session, ref->page_del->txnid));

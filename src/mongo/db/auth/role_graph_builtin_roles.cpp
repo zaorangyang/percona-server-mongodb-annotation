@@ -401,6 +401,10 @@ void addClusterManagerPrivileges(PrivilegeVector* privileges) {
         privileges,
         Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "system.replset")),
                   readRoleActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("config", "tags")),
+                  configSettingsActions));
 }
 
 void addClusterAdminPrivileges(PrivilegeVector* privileges) {
@@ -548,6 +552,9 @@ void addRootRolePrivileges(PrivilegeVector* privileges) {
     addUserAdminAnyDbPrivileges(privileges);
     addDbAdminAnyDbPrivileges(privileges);
     addReadWriteAnyDbPrivileges(privileges);
+    addRestorePrivileges(privileges);
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::validate));
 }
 
 void addInternalRolePrivileges(PrivilegeVector* privileges) {
