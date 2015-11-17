@@ -76,7 +76,7 @@ AtomicUInt32 nextOpId{1};
 using std::string;
 
 OperationContextImpl::OperationContextImpl()
-    : OperationContext(
+    : DocumentRangeOperationContext(
           &cc(), nextOpId.fetchAndAdd(1), clientOperationInfoDecoration(cc()).getLocker()),
       _writesAreReplicated(true) {
     StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
