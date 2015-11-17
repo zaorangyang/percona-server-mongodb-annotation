@@ -91,10 +91,11 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
         _shouldDedup = _params.descriptor->isMultikey(getOpCtx());
     }
 
-    // Perform the possibly heavy-duty initialization of the underlying index cursor.
-    _indexCursor = _iam->newCursor(getOpCtx(), _forward);
+    /* NOTE: Had to move cursor creation AFTER setting of key bounds. */
 
     if (_params.bounds.isSimpleRange) {
+        _indexCursor = _iam->newCursor(getOpCtx(), _forward);
+
         // Start at one key, end at another.
         _endKey = _params.bounds.endKey;
         _endKeyInclusive = _params.bounds.endKeyInclusive;
@@ -108,6 +109,7 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
         bool startKeyInclusive;
         if (IndexBoundsBuilder::isSingleInterval(
                 _params.bounds, &startKey, &startKeyInclusive, &_endKey, &_endKeyInclusive)) {
+            _indexCursor = _iam->newCursor(getOpCtx(), _forward);
             _indexCursor->setEndPosition(_endKey, _endKeyInclusive);
             return _indexCursor->seek(startKey, startKeyInclusive);
         } else {
@@ -116,6 +118,7 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
             if (!_checker->getStartSeekPoint(&_seekPoint))
                 return boost::none;
 
+            _indexCursor = _iam->newCursor(getOpCtx(), _forward);
             return _indexCursor->seek(_seekPoint);
         }
     }
