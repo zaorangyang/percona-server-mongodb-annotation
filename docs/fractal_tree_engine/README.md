@@ -105,6 +105,8 @@ This will create and install an optimized build of the Fractal Tree library, wit
 
 #### Build MongoDB
 
+**Note:** *This will build the binaries for testing the Fractal Tree storage engine and does not include other components of the normal production build.*
+
 Now that the Fractal Tree library has been built, we can build the MongoDB server components by adding the appropriate arguments:
 
 ```
