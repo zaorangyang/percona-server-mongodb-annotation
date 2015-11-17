@@ -191,6 +191,11 @@ add_option('wiredtiger',
     type='choice',
 )
 
+add_option('PerconaFT',
+           help='Enable PerconaFT',
+           nargs=0,
+)
+
 js_engine_choices = ['mozjs', 'none']
 add_option('js-engine',
     choices=js_engine_choices,

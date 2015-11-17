@@ -208,7 +208,8 @@ namespace mongo {
                                        "object to insert exceeds cappedMaxSize");
         }
 
-        StatusWith<RecordId> id(Status::OK());
+        RecordId nullRecord;
+        StatusWith<RecordId> id(nullRecord);
         if (_isOplog) {
             id = oploghack::extractKey(data, len);
             if (!id.isOK()) {

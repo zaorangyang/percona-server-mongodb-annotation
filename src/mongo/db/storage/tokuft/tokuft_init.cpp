@@ -21,8 +21,9 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
 #include "mongo/base/init.h"
+#include "mongo/db/service_context_d.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/tokuft/tokuft_dictionary_options.h"
@@ -32,31 +33,13 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 namespace mongo {
 
-    class TokuFTStorageEngine : public KVStorageEngine {
-        MONGO_DISALLOW_COPYING(TokuFTStorageEngine);
-
-        bool _durable;
-
-    public:
-        TokuFTStorageEngine(const std::string &path, bool durable, const KVStorageEngineOptions &options)
-            : KVStorageEngine(new TokuFTEngine(path), options),
-              _durable(durable)
-        {
-            if (!_durable) {
-                warning() << "PerconaFT: Initializing with --nojournal.  Note that this will cause {j: true} writes to fail, but will not actually disable journaling.";
-                warning() << "PerconaFT: This is only for tests, there is no reason to run with --nojournal in production.";
-            }
-        }
-
-        // Even though the engine is always durable, we sometimes need to fake that we aren't for tests.  SERVER-15942
-        virtual bool isDurable() const { return _durable; }
-
-        virtual ~TokuFTStorageEngine() { }
-    };
-
     class TokuFTFactory : public StorageEngine::Factory {
     public:
         virtual ~TokuFTFactory() { }
+        KVStorageEngine *createTokuFTEngine(const std::string &path, const KVStorageEngineOptions &options) const {
+            TokuFTEngine *p = new TokuFTEngine(path);
+            return new KVStorageEngine(p, options);
+        }
         virtual StorageEngine *create(const StorageGlobalParams &params,
                                       const StorageEngineLockFile &lockFile) const {
             if (params.directoryperdb) {
@@ -74,7 +57,9 @@ namespace mongo {
             options.directoryPerDB = params.directoryperdb;
             options.directoryForIndexes = tokuftGlobalOptions.engineOptions.directoryForIndexes;
             options.forRepair = params.repair;
-            return new TokuFTStorageEngine(params.dbpath, params.dur, options);
+            // TODO: Possibly push the durability flag down to the FT Engine...
+            //return new TokuFTStorageEngine(params.dbpath, params.dur, options);
+            return createTokuFTEngine(params.dbpath, options);
         }
         virtual StringData getCanonicalName() const {
             return "PerconaFT";

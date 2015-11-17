@@ -21,8 +21,9 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 ======= */
 
 #include "mongo/base/checked_cast.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage/tokuft/tokuft_engine.h"
 #include "mongo/util/assert_util.h"
@@ -36,7 +37,7 @@ namespace mongo {
     }
 
     TokuFTEngine* tokuftGlobalEngine() {
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         massert(28627, "no storage engine available", storageEngine);
         KVStorageEngine* kvStorageEngine = checked_cast<KVStorageEngine*>(storageEngine);
         KVEngine* kvEngine = kvStorageEngine->getEngine();

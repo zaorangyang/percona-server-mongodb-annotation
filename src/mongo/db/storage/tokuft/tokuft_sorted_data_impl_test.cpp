@@ -23,6 +23,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include <boost/filesystem/operations.hpp>
 
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
+#include "mongo/db/storage/kv/dictionary/kv_sorted_data_impl.h"
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 #include "mongo/db/storage/tokuft/tokuft_recovery_unit.h"
 #include "mongo/unittest/unittest.h"
@@ -41,19 +42,17 @@ namespace mongo {
 
         virtual ~TokuFTSortedDataImplHarness() { }
 
-	virtual SortedDataInterface* newSortedDataInterface(bool unique) {
-            // todo unique
-            std::auto_ptr<OperationContext> opCtx(new OperationContextNoop(newRecoveryUnit()));
-
+	virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique) {
+            std::unique_ptr<OperationContext> opCtx(newOperationContext());
             const std::string ident = mongoutils::str::stream() << "PerconaFTSortedDataInterface-" << _seq++;
             Status status = _engine->createSortedDataInterface(opCtx.get(), ident, NULL);
             invariant(status.isOK());
-
-	    return _engine->getSortedDataInterface(opCtx.get(), ident, NULL);
+            SortedDataInterface *p = _engine->getSortedDataInterface(opCtx.get(), ident, NULL);
+            return std::unique_ptr<SortedDataInterface>(p);
 	}
 
-	virtual RecoveryUnit* newRecoveryUnit() {
-	    return _engine->newRecoveryUnit();
+	virtual std::unique_ptr<RecoveryUnit> newRecoveryUnit() {
+	    return std::unique_ptr<RecoveryUnit>(_engine->newRecoveryUnit());
 	}
 
     private:
@@ -62,8 +61,8 @@ namespace mongo {
         int _seq;
     };
 
-    HarnessHelper* newHarnessHelper() {
-        return new TokuFTSortedDataImplHarness();
+    std::unique_ptr<HarnessHelper> newHarnessHelper() {
+        return std::unique_ptr<HarnessHelper>(new TokuFTSortedDataImplHarness());
     }
 
 } // namespace mongo

@@ -30,6 +30,15 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 namespace mongo {
 
+    class TokuFTEngineHarnessHelper;
+    class TokuFTEngine;
+    TokuFTEngineHarnessHelper* createTokuEngineHarness();
+    class FractalTreeEngineAccess {
+    public:
+        virtual ~FractalTreeEngineAccess() {}
+        virtual TokuFTEngine* getFractalTreeEngine() = 0;
+    };
+
     class OperationContext;
     class TokuFTStorageEngine;
 

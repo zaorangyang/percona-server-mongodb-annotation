@@ -40,6 +40,8 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include <ftcxx/db_txn.hpp>
 #include <ftcxx/slice.hpp>
 
+#include <boost/scoped_ptr.hpp>
+
 namespace mongo {
 
     class BSONElement;

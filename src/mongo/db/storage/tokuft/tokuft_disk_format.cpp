@@ -61,7 +61,6 @@ namespace mongo {
     const BSONField<std::string> TokuFTDiskFormatVersion::mongodbVersionField("mongodbVersion");
     const BSONField<std::string> TokuFTDiskFormatVersion::mongodbGitField("mongodbGitVersion");
     const BSONField<std::string> TokuFTDiskFormatVersion::tokuftGitField("tokuftGitVersion");
-    const BSONField<std::string> TokuFTDiskFormatVersion::sysInfoField("sysInfo");
 
     TokuFTDiskFormatVersion::TokuFTDiskFormatVersion(KVDictionary *metadataDict)
         : _startupVersion(DISK_VERSION_INVALID),
@@ -78,8 +77,7 @@ namespace mongo {
                            upgradedAtField(jsTime()) <<
                            upgradedByField(BSON(mongodbVersionField(versionString) <<
                                                 mongodbGitField(gitVersion()) <<
-                                                tokuftGitField(tokuftGitVersion()) <<
-                                                sysInfoField(sysInfo())))));
+                                                tokuftGitField(tokuftGitVersion()) ))));
 
             BSONObj versionObj = BSON(currentVersionField(DISK_VERSION_CURRENT) <<
                                       originalVersionField(DISK_VERSION_CURRENT) <<
@@ -195,8 +193,7 @@ namespace mongo {
                        upgradedAtField(jsTime()) <<
                        upgradedByField(BSON(mongodbVersionField(versionString) <<
                                             mongodbGitField(gitVersion()) <<
-                                            tokuftGitField(tokuftGitVersion()) <<
-                                            sysInfoField(sysInfo())))));
+                                            tokuftGitField(tokuftGitVersion())))));
 
         long long originalVersion;
         s = bsonExtractIntegerField(oldVersionObj, originalVersionField(), &originalVersion);

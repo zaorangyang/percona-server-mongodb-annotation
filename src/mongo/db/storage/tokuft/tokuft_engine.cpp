@@ -33,6 +33,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/storage/tokuft/tokuft_errors.h"
 #include "mongo/db/storage/tokuft/tokuft_global_options.h"
 #include "mongo/db/storage/tokuft/tokuft_recovery_unit.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/processinfo.h"
@@ -172,7 +173,7 @@ namespace mongo {
                 status.append("index", getIndexName(db));
                 status.appendNumber("requestingTxnid", requestingTxnid);
                 status.appendNumber("blockingTxnid", blockingTxnid);
-                status.appendDate("started", startTime);
+                status.appendDate("started", mongo::Date_t::fromMillisSinceEpoch(startTime));
                 {
                     BSONArrayBuilder bounds(status.subarrayStart("bounds"));
                     prettyBounds(ftcxx::DB(db), leftKey, rightKey, bounds);
@@ -307,6 +308,7 @@ namespace mongo {
 
     void TokuFTEngine::_checkAndUpgradeDiskFormatVersion() {
         OperationContextNoop opCtx(new TokuFTRecoveryUnit(_env));
+        {
         WriteUnitOfWork wuow(&opCtx);
 
         TokuFTDiskFormatVersion diskFormatVersion(_internalMetadataDict.get());
@@ -322,6 +324,7 @@ namespace mongo {
         }
 
         wuow.commit();
+        }
     }
 
     TokuFTDictionaryOptions TokuFTEngine::_createOptions(const BSONObj& options, bool isRecordStore) {

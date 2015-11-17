@@ -8,6 +8,7 @@ env.SConscript(
         'kv/dictionary',
         'kv_heap',
         'mmap_v1',
+        'tokuft',
         'wiredtiger',
     ],
 )

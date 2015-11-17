@@ -23,13 +23,22 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include <boost/filesystem/operations.hpp>
 #include <boost/scoped_ptr.hpp>
 
+#include "mongo/base/init.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_noop.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
 #include "mongo/db/storage/tokuft/tokuft_engine.h"
 #include "mongo/unittest/temp_dir.h"
 
 namespace mongo {
+
+    MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
+        std::unique_ptr<ServiceContext>p(new ServiceContextNoop());
+        setGlobalServiceContext(std::move(p));
+        return Status::OK();
+    }
 
     class TokuFTEngineHarnessHelper : public KVHarnessHelper {
     public:
@@ -67,5 +76,4 @@ namespace mongo {
     KVHarnessHelper* KVHarnessHelper::create() {
         return new TokuFTEngineHarnessHelper();
     }
-
 }
