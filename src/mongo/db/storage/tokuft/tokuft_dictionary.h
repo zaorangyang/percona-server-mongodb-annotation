@@ -94,8 +94,18 @@ namespace mongo {
         class Cursor : public KVDictionary::Cursor {
         public:
             Cursor(const TokuFTDictionary &dict, OperationContext *txn, const Slice &key, const int direction = 1);
+            Cursor(const TokuFTDictionary &dict,
+                   OperationContext *txn,
+                   const Slice &key,
+                   const bool prelock,
+                   const int direction = 1);
 
             Cursor(const TokuFTDictionary &dict, OperationContext *txn, const int direction = 1);
+            Cursor(const TokuFTDictionary &dict,
+                   OperationContext *txn,
+                   const Slice &leftKey,
+                   const Slice &rightKey,
+                   const int direction = 1);
 
             virtual bool ok() const;
 
@@ -159,10 +169,21 @@ namespace mongo {
         const ftcxx::DB &db() const { return _db; }
 
     private:
+        KVDictionary::Cursor *CreatePrelockedCursorWithRetryAndStartKey(OperationContext *opCtx,
+                                                                        const Slice &key,
+                                                                        const int direction) const;
+        KVDictionary::Cursor *CreatePrelockedCursorWithRetry(OperationContext *opCtx, const int direction = 1) const;
+        KVDictionary::Cursor *CreatePrelockedCursorWithStartKey(OperationContext *opCtx,
+                                                                const Slice &key,
+                                                                const int direction) const;
+        KVDictionary::Cursor *CreatePrelockedCursor(OperationContext *opCtx, const int direction = 1) const;
         Encoding encoding() const {
             return TokuFTDictionary::Encoding(_db.descriptor());
         }
 
+        // This is a rough initial guess based on the apparent typical
+        // number of concurrent index scans on the same range.
+        static const int MAX_WRITE_CONFLICT_RETRIES = 32;
         TokuFTDictionaryOptions _options;
         ftcxx::DB _db;
         boost::scoped_ptr<TokuFTCappedDeleteRangeOptimizer> _rangeOptimizer;
