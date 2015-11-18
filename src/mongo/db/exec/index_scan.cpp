@@ -109,6 +109,8 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
         bool startKeyInclusive;
         if (IndexBoundsBuilder::isSingleInterval(
                 _params.bounds, &startKey, &startKeyInclusive, &_endKey, &_endKeyInclusive)) {
+            getOpCtx()->SetLeftBounds(startKey);
+            getOpCtx()->SetRightBounds(_endKey);
             _indexCursor = _iam->newCursor(getOpCtx(), _forward);
             _indexCursor->setEndPosition(_endKey, _endKeyInclusive);
             return _indexCursor->seek(startKey, startKeyInclusive);
