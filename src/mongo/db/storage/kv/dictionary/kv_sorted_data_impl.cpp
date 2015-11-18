@@ -524,7 +524,9 @@ namespace mongo {
               _restoredPositionFound(false),
               _keyStringWasSaved(false),
               _dupsAllowed(true)
-        {}
+        {
+            _txn->SetCursorOrdering(&_ordering);
+        }
 
         virtual ~KVSortedDataInterfaceCursor() {}
 
