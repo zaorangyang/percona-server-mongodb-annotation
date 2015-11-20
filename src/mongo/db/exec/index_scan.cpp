@@ -94,6 +94,8 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
     /* NOTE: Had to move cursor creation AFTER setting of key bounds. */
 
     if (_params.bounds.isSimpleRange) {
+        getOpCtx()->SetLeftBounds(_params.bounds.startKey);
+        getOpCtx()->SetRightBounds(_params.bounds.endKey);
         _indexCursor = _iam->newCursor(getOpCtx(), _forward);
 
         // Start at one key, end at another.
