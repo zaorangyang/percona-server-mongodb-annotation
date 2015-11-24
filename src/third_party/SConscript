@@ -52,7 +52,7 @@ if not use_system_version_of_library('yaml'):
         ('yaml', '#/src/third_party/yaml-cpp-0.5.1/include'))
 
 thirdPartyIncludePathList.append(
-    ('tokuft', '#/src/third_party/tokuft/include'))
+    ('tokuft', '#/src/third_party/install/include'))
 thirdPartyIncludePathList.append(
     ('tokubackup', '#/src/third_party/tokubackup/include'))
 
