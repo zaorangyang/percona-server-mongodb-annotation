@@ -214,10 +214,11 @@ __wt_delete_page_rollback(WT_SESSION_IMPL *session, WT_REF *ref)
 
 /*
  * __wt_delete_page_skip --
- *	If iterating a cursor, skip deleted pages that are visible to us.
+ *	If iterating a cursor, skip deleted pages that are either visible to
+ * us or globally visible.
  */
 bool
-__wt_delete_page_skip(WT_SESSION_IMPL *session, WT_REF *ref)
+__wt_delete_page_skip(WT_SESSION_IMPL *session, WT_REF *ref, bool visible_all)
 {
 	bool skip;
 
@@ -245,8 +246,21 @@ __wt_delete_page_skip(WT_SESSION_IMPL *session, WT_REF *ref)
 	if (!__wt_atomic_casv32(&ref->state, WT_REF_DELETED, WT_REF_LOCKED))
 		return (false);
 
-	skip = (ref->page_del == NULL ||
+	skip = ref->page_del == NULL || (visible_all ?
+	    __wt_txn_visible_all(session, ref->page_del->txnid) :
 	    __wt_txn_visible(session, ref->page_del->txnid));
+
+	/*
+	 * The page_del structure can be freed as soon as the delete is stable:
+	 * it is only read when the ref state is WT_REF_DELETED.  It is worth
+	 * checking every time we come through because once this is freed, we
+	 * no longer need synchronization to check the ref.
+	 */
+	if (skip && ref->page_del != NULL && (visible_all ||
+	    __wt_txn_visible_all(session, ref->page_del->txnid))) {
+		__wt_free(session, ref->page_del->update_list);
+		__wt_free(session, ref->page_del);
+	}
 
 	WT_PUBLISH(ref->state, WT_REF_DELETED);
 	return (skip);

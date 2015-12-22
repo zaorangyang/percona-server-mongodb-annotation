@@ -946,7 +946,8 @@ __wt_page_can_split(WT_SESSION_IMPL *session, WT_PAGE *page)
 	WT_BTREE *btree;
 	WT_INSERT_HEAD *ins_head;
 	WT_INSERT *ins;
-	int i;
+	size_t size;
+	int count;
 
 	btree = S2BT(session);
 
@@ -976,23 +977,89 @@ __wt_page_can_split(WT_SESSION_IMPL *session, WT_PAGE *page)
 		return (false);
 
 	/*
-	 * There is no point splitting if the list is small, no deep items is
-	 * our heuristic for that. A 1/4 probability of adding a new skiplist
-	 * level, with level-0 always created, means there will be a 5th level
-	 * entry for roughly every 1024 entries in the list. If there are at
-	 * least 4 5th level entries (4K items), the list is large enough.
+	 * There is no point doing an in-memory split unless there is a lot of
+	 * data in the last skiplist on the page.  Split if there are enough
+	 * items and the skiplist does not fit within a single disk page.
+	 *
+	 * Rather than scanning the whole list, walk a higher level, which
+	 * gives a sample of the items -- at level 0 we have all the items, at
+	 * level 1 we have 1/4 and at level 2 we have 1/16th.  If we see more
+	 * than 30 items and more data than would fit in a disk page, split.
 	 */
-#define	WT_MIN_SPLIT_SKIPLIST_DEPTH	WT_MIN(5, WT_SKIP_MAXDEPTH - 1)
+#define	WT_MIN_SPLIT_DEPTH	2
+#define	WT_MIN_SPLIT_COUNT	30
+#define	WT_MIN_SPLIT_MULTIPLIER 16      /* At level 2, we see 1/16th entries */
+
 	ins_head = page->pg_row_entries == 0 ?
 	    WT_ROW_INSERT_SMALLEST(page) :
 	    WT_ROW_INSERT_SLOT(page, page->pg_row_entries - 1);
 	if (ins_head == NULL)
 		return (false);
-	for (i = 0, ins = ins_head->head[WT_MIN_SPLIT_SKIPLIST_DEPTH];
-	    ins != NULL; ins = ins->next[WT_MIN_SPLIT_SKIPLIST_DEPTH])
-		if (++i == 4)
+	for (count = 0, size = 0, ins = ins_head->head[WT_MIN_SPLIT_DEPTH];
+	    ins != NULL; ins = ins->next[WT_MIN_SPLIT_DEPTH]) {
+		count += WT_MIN_SPLIT_MULTIPLIER;
+		size += WT_MIN_SPLIT_MULTIPLIER *
+		    (WT_INSERT_KEY_SIZE(ins) + WT_UPDATE_MEMSIZE(ins->upd));
+		if (count > WT_MIN_SPLIT_COUNT &&
+		    size > (size_t)btree->maxleafpage)
 			return (true);
+	}
 	return (false);
+}
+
+/*
+ * __wt_ref_addr_free --
+ *	Free the address in a reference, if necessary.
+ */
+static inline void
+__wt_ref_addr_free(WT_SESSION_IMPL *session, WT_REF *ref)
+ {
+	if (ref->addr == NULL)
+		return;
+
+	if (ref->home == NULL || __wt_off_page(ref->home, ref->addr)) {
+		__wt_free(session, ((WT_ADDR *)ref->addr)->addr);
+		__wt_free(session, ref->addr);
+	}
+	ref->addr = NULL;
+}
+
+/*
+ * __wt_btree_block_free --
+ *	Helper function to free a block from the current tree.
+ */
+static inline int
+__wt_btree_block_free(
+    WT_SESSION_IMPL *session, const uint8_t *addr, size_t addr_size)
+{
+	WT_BM *bm;
+	WT_BTREE *btree;
+
+	btree = S2BT(session);
+	bm = btree->bm;
+
+	return (bm->free(bm, session, addr, addr_size));
+}
+
+/*
+ * __wt_ref_block_free --
+ *	Free the on-disk block for a reference and clear the address.
+ */
+static inline int
+__wt_ref_block_free(WT_SESSION_IMPL *session, WT_REF *ref)
+{
+	const uint8_t *addr;
+	size_t addr_size;
+
+	if (ref->addr == NULL)
+		return (0);
+
+	WT_RET(__wt_ref_info(session, ref, &addr, &addr_size, NULL));
+	WT_RET(__wt_btree_block_free(session, addr, addr_size));
+
+	/* Clear the address (so we don't free it twice). */
+	__wt_ref_addr_free(session, ref);
+	return (0);
 }
 
 /*
@@ -1196,13 +1263,9 @@ __wt_page_swap_func(WT_SESSION_IMPL *session, WT_REF *held,
 #endif
 	    );
 
-	/* An expected failure: WT_NOTFOUND when doing a cache-only read. */
-	if (LF_ISSET(WT_READ_CACHE) && ret == WT_NOTFOUND)
-		return (WT_NOTFOUND);
-
-	/* An expected failure: WT_RESTART */
-	if (ret == WT_RESTART)
-		return (WT_RESTART);
+	/* Expected failures: page not found or restart. */
+	if (ret == WT_NOTFOUND || ret == WT_RESTART)
+		return (ret);
 
 	/* Discard the original held page. */
 	acquired = ret == 0;
