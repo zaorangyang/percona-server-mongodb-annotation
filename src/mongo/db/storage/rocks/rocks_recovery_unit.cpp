@@ -111,6 +111,17 @@ public:
         endOp();
     }
 
+    virtual rocksdb::Slice* GetUpperBound() override {
+        return _upperBound.get();
+    }
+
+    virtual void Refresh(rocksdb::Iterator* newBaseIterator) override {
+        if (_baseIterator->Valid()) {
+            newBaseIterator->Seek(_baseIterator->key());
+        }
+        _baseIterator.reset(newBaseIterator);
+    }
+
     virtual void Next() {
         startOp();
         _baseIterator->Next();
@@ -132,17 +143,6 @@ public:
     }
     virtual rocksdb::Status status() const {
         return _baseIterator->status();
-    }
-
-    virtual rocksdb::Slice* GetUpperBound() override {
-        return _upperBound.get();
-    }
-
-    virtual void Refresh(rocksdb::Iterator* newBaseIterator) override {
-        if (_baseIterator->Valid()) {
-            newBaseIterator->Seek(_baseIterator->key());
-        }
-        _baseIterator.reset(newBaseIterator);
     }
 
 private:
@@ -176,7 +176,6 @@ private:
     // can be nullptr
     RocksCompactionScheduler* _compactionScheduler;  // not owned
     std::unique_ptr<rocksdb::Slice> _upperBound;
-
     std::function<void(RocksIterator*)> _deletionCallback;
 };
 }  // namespace
@@ -230,7 +229,6 @@ void RocksRecoveryUnit::commitUnitOfWork() {
 
     _releaseSnapshot();
 }
-
 
 void RocksRecoveryUnit::endUnitOfWork() {
     _depth--;

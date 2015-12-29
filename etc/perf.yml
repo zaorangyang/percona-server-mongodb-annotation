@@ -3,11 +3,23 @@ stepback: false
 
 pre:
     - command: shell.track
+    - command: shell.exec
+      params:
+        silent: true
+        script: |
+          ${killall_mci|pkill -9 mongod; pkill -9 mongos; pkill -9 mongo; pkill -9 bsondump; pkill -9 mongoimport; pkill -9 mongoexport; pkill -9 mongodump; pkill -9 mongorestore; pkill -9 mongostat; pkill -9 mongofiles; pkill -9 mongooplog; pkill -9 mongotop; pkill -9 mongobridge; pkill -9 mongod-2.6; pkill -9 mongos-2.6; pkill -9 mongo-2.6; pkill -9 bsondump-2.6; pkill -9 mongoimport-2.6; pkill -9 mongoexport-2.6; pkill -9 mongodump-2.6; pkill -9 mongorestore-2.6; pkill -9 mongostat-2.6; pkill -9 mongofiles-2.6; pkill -9 mongooplog-2.6; pkill -9 mongotop-2.6; pkill -9 mongobridge-2.6; pkill -9 mongod-2.4; pkill -9 mongos-2.4; pkill -9 mongo-2.4; pkill -9 bsondump-2.4; pkill -9 mongoimport-2.4; pkill -9 mongoexport-2.4; pkill -9 mongodump-2.4; pkill -9 mongorestore-2.4; pkill -9 mongostat-2.4; pkill -9 mongofiles-2.4; pkill -9 mongooplog-2.4; pkill -9 mongotop-2.4; pkill -9 resmoke.py; pkill -9 python; pkill -9 lldb; pkill -9 _test} >/dev/null 2>&1
+          exit 0
 
 post:
     - command: attach.results
       params:
         file_location: src/report.json
+    - command: shell.exec
+      params:
+        silent: true
+        script: |
+          ${killall_mci|pkill -9 mongod; pkill -9 mongos; pkill -9 mongo; pkill -9 bsondump; pkill -9 mongoimport; pkill -9 mongoexport; pkill -9 mongodump; pkill -9 mongorestore; pkill -9 mongostat; pkill -9 mongofiles; pkill -9 mongooplog; pkill -9 mongotop; pkill -9 mongobridge; pkill -9 mongod-2.6; pkill -9 mongos-2.6; pkill -9 mongo-2.6; pkill -9 bsondump-2.6; pkill -9 mongoimport-2.6; pkill -9 mongoexport-2.6; pkill -9 mongodump-2.6; pkill -9 mongorestore-2.6; pkill -9 mongostat-2.6; pkill -9 mongofiles-2.6; pkill -9 mongooplog-2.6; pkill -9 mongotop-2.6; pkill -9 mongobridge-2.6; pkill -9 mongod-2.4; pkill -9 mongos-2.4; pkill -9 mongo-2.4; pkill -9 bsondump-2.4; pkill -9 mongoimport-2.4; pkill -9 mongoexport-2.4; pkill -9 mongodump-2.4; pkill -9 mongorestore-2.4; pkill -9 mongostat-2.4; pkill -9 mongofiles-2.4; pkill -9 mongooplog-2.4; pkill -9 mongotop-2.4; pkill -9 resmoke.py; pkill -9 python; pkill -9 lldb; pkill -9 _test} >/dev/null 2>&1
+          exit 0
     - command: shell.cleanup
 
 functions:
@@ -21,14 +33,14 @@ functions:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: perf-3.0/${build_variant}/${revision}/mongod-${build_id}
+        remote_file: perf-3.0/${version_id}/${revision}/mongod-${version_id}
         bucket: mciuploads
         local_file: src/mongod
     - command: s3.get
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: perf-3.0/${build_variant}/${revision}/mongo-${build_id}
+        remote_file: perf-3.0/${version_id}/${revision}/mongo-${version_id}
         bucket: mciuploads
         local_file: src/mongo
     - command: shell.exec
@@ -51,6 +63,12 @@ functions:
           set -o verbose
           mkdir -p ./dbdata
           ${mongod_exec_wrapper} ./mongod --dbpath ./dbdata ${mongod_flags}
+    - command : shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -e
+          set -o verbose
           sleep 5
           # if we started a replset, initiate it and wait for it to become primary
           ./mongo --eval "if(db.isMaster().isreplicaset){rs.initiate(); assert.soon(function(){return db.isMaster().ismaster}, 'no primary')}"
@@ -60,7 +78,7 @@ functions:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: perf-3.0/${build_variant}/${revision}/perf_regression_check.py-${build_id}
+        remote_file: perf-3.0/${version_id}/${revision}/perf_regression_check.py-${version_id}
         bucket: mciuploads
         local_file: src/perf_regression_check.py
     - command: shell.exec
@@ -140,7 +158,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: src/mongod
-        remote_file: perf-3.0/${build_variant}/${revision}/mongod-${build_id}
+        remote_file: perf-3.0/${version_id}/${revision}/mongod-${version_id}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/octet-stream}
@@ -150,7 +168,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: src/mongo
-        remote_file: perf-3.0/${build_variant}/${revision}/mongo-${build_id}
+        remote_file: perf-3.0/${version_id}/${revision}/mongo-${version_id}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/octet-stream}
@@ -160,7 +178,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: src/buildscripts/perf_regression_check.py
-        remote_file: perf-3.0/${build_variant}/${revision}/perf_regression_check.py-${build_id}
+        remote_file: perf-3.0/${version_id}/${revision}/perf_regression_check.py-${version_id}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/octet-stream}
@@ -168,7 +186,8 @@ tasks:
 
 - name: query
   depends_on:
-  - name: compile
+  - variant: linux-wt-standalone
+    name: compile
   commands:
     - func: "start server"
     - func: "run perf tests"
@@ -180,7 +199,8 @@ tasks:
     - func: "analyze"
 - name: where
   depends_on:
-  - name: compile
+  - variant: linux-wt-standalone
+    name: compile
   commands:
     - func: "start server"
     - func: "run perf tests"
@@ -192,7 +212,8 @@ tasks:
     - func: "analyze"
 - name: update
   depends_on:
-  - name: compile
+  - variant: linux-wt-standalone
+    name: compile
   commands:
     - func: "start server"
     - func: "run perf tests"
@@ -204,7 +225,8 @@ tasks:
     - func: "analyze"
 - name: insert
   depends_on:
-  - name: compile
+  - variant: linux-wt-standalone
+    name: compile
   commands:
     - func: "start server"
     - func: "run perf tests"
@@ -216,7 +238,8 @@ tasks:
     - func: "analyze"
 - name: geo
   depends_on:
-  - name: compile
+  - variant: linux-wt-standalone
+    name: compile
   commands:
     - func: "start server"
     - func: "run perf tests"
@@ -228,7 +251,8 @@ tasks:
     - func: "analyze"
 - name: misc
   depends_on:
-  - name: compile
+  - variant: linux-wt-standalone
+    name: compile
   commands:
     - func: "start server"
     - func: "run perf tests"
@@ -240,7 +264,8 @@ tasks:
     - func: "analyze"
 - name: singleThreaded
   depends_on:
-  - name: compile
+  - variant: linux-wt-standalone
+    name: compile
   commands:
     - func: "start server"
     - func: "run perf tests"
@@ -250,10 +275,10 @@ tasks:
         excludeFilter : "none"
         threads : "1"
     - func: "analyze"
-
+ 
 buildvariants:
 - name: linux-wt-standalone
-  display_name: Linux WT Standalone
+  display_name: Standalone Linux WT
   batchtime: 90 # 1.5 hours
   expansions:
     compile_flags: &compile_flags -j$(grep -c ^processor /proc/cpuinfo) --cc=/opt/mongodbtoolchain/bin/gcc --cxx=/opt/mongodbtoolchain/bin/g++ --release --variant-dir="linux2/release"
@@ -276,7 +301,7 @@ buildvariants:
   - name: singleThreaded
 
 - name: linux-mmap-standalone
-  display_name: Linux MMAPv1 Standalone
+  display_name: Standalone Linux MMAPv1
   batchtime: 90 # 1.5 hours
   expansions:
     compile_flags: *compile_flags
@@ -287,9 +312,6 @@ buildvariants:
   run_on:
   - "centos6-perf"
   tasks:
-  - name: compile
-    distros:
-    - rhel55
   - name: query
   - name: where
   - name: update
@@ -299,7 +321,7 @@ buildvariants:
   - name: singleThreaded
 
 - name: linux-wt-repl
-  display_name: Linux WT 1-Node ReplSet
+  display_name: 1-Node ReplSet Linux WT
   batchtime: 360 # 6 hours
   expansions:
     compile_flags: *compile_flags 
@@ -310,16 +332,13 @@ buildvariants:
   run_on:
   - "centos6-perf"
   tasks:
-  - name: compile
-    distros:
-    - rhel55
   - name: update
   - name: insert
   - name: misc
   - name: singleThreaded
 
 - name: linux-mmap-repl
-  display_name: Linux MMapv1 1-Node ReplSet
+  display_name: 1-Node ReplSet Linux MMAPv1
   batchtime: 360 # 6 hours
   expansions:
     compile_flags: *compile_flags 
@@ -330,9 +349,6 @@ buildvariants:
   run_on:
   - "centos6-perf"
   tasks:
-  - name: compile
-    distros:
-    - rhel55
   - name: update
   - name: insert
   - name: misc

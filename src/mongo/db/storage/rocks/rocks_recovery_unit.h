@@ -75,7 +75,6 @@ public:
     virtual void Refresh(rocksdb::Iterator* newBaseIterator) = 0;
 };
 
-
 class RocksRecoveryUnit : public RecoveryUnit {
     MONGO_DISALLOW_COPYING(RocksRecoveryUnit);
 

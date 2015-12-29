@@ -355,7 +355,6 @@ public:
         updatePosition();
     }
 
-
     virtual bool _locate(const KeyString& query, RecordId loc) {
         // loc already encoded in _key
         return seekCursor(query);
