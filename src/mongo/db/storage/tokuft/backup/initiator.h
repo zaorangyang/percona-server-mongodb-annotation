@@ -41,10 +41,9 @@ namespace mongo {
             bool UserWantsToCancelBackup() const;
             void HandleErrorFromBackupProcess(int i, const char *c);
         private:
-            bool SetupDestinationDirectories();
-            bool CreateDestinationSubdirectories();
+            bool SetupDestinationDirectory();
             void HandleFileError(const char *);
-            void ResolveFullPathOfSourceDirectories();
+            void ResolveFullPathOfSourceDirectory();
             int CreateBackup();
             void LogAnyErrors() const;
             inline bool IsOk() const {

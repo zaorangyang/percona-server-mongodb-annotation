@@ -68,10 +68,10 @@ namespace mongo {
         }
 
         void BackupInitiator::ExecuteBackup() {
-            this->ResolveFullPathOfSourceDirectories();
+            this->ResolveFullPathOfSourceDirectory();
             verify(!_sources.empty());
             verify(_sources.size() <= 2);
-            this->SetupDestinationDirectories();
+            this->SetupDestinationDirectory();
             if (!_fileErrorOccurred) {
                 _backupReturnValue = this->CreateBackup();
             }
@@ -117,33 +117,14 @@ namespace mongo {
             }
         }
 
-        bool BackupInitiator::SetupDestinationDirectories() {
+        bool BackupInitiator::SetupDestinationDirectory() {
             bool result = false;
             if (this->HasOnlyOneSourceDirectory()) {
                 _destinations.push_back(_destinationDirectory);
                 result = true;
-            } else {
-                result = this->CreateDestinationSubdirectories();
             }
 
             return result;
-        }
-
-        bool BackupInitiator::CreateDestinationSubdirectories() {
-            const boost::filesystem::path dest_path = _destinationDirectory;
-            const boost::filesystem::path data_dest = dest_path / "data";
-            const boost::filesystem::path log_dest = dest_path / "log";
-            try {
-                boost::filesystem::create_directory(data_dest);
-                boost::filesystem::create_directory(log_dest);
-            } catch (const boost::filesystem::filesystem_error &e) {
-                this->HandleFileError(e.what());
-                return false;
-            }
-
-            _destinations.push_back(data_dest.generic_string());
-            _destinations.push_back(log_dest.generic_string());
-            return true;
         }
 
         void BackupInitiator::HandleFileError(const char * error) {
@@ -153,44 +134,12 @@ namespace mongo {
             _fileErrorMessage = *e;
         }
 
-        void BackupInitiator::ResolveFullPathOfSourceDirectories() {
-            // We want the fully resolved path, rid of '..' and symlinks,
-            // for both the data dir and the log dir (if it exists).
-            const boost::filesystem::path data_src = canonical(boost::filesystem::path(storageGlobalParams.dbpath));
-            const boost::filesystem::path log_src = canonical(boost::filesystem::path(serverGlobalParams.logpath));
-            std::string data = data_src.generic_string();
-            std::string log = log_src.generic_string();
-            if (serverGlobalParams.logpath.empty()) {
-                _sources.push_back(data);
-                return;
-            }
-
-            if (equivalent(data_src, log_src)) {
-                _sources.push_back(data);
-                return;
-            }
-
-            if (data.size() < log.size()) {
-                // Compare just the prefix of data's length, to see if log
-                // is a subdirectory.
-                if (data.compare(0, data.size(), log) == 0) {
-                    _sources.push_back(data);
-                } else {
-                    _sources.push_back(data);
-                    _sources.push_back(log);
-                }
-            } else {
-                // Check whether data is a subdirectory of log.  This
-                // would be weird, but we should be consistent.
-                if (log.compare(0, log.size(), data) == 0) {
-                    _sources.push_back(log);
-                } else {
-                    // We always pass dbpath before logDir, if we're using
-                    // two directories.
-                    _sources.push_back(data);
-                    _sources.push_back(log);
-                }
-            }
+        void BackupInitiator::ResolveFullPathOfSourceDirectory() {
+            // We want the fully resolved path, rid of '..' and
+            // symlinks, for the data dir.
+            const boost::filesystem::path data = canonical(boost::filesystem::path(storageGlobalParams.dbpath));
+            std::string data_path = data.generic_string();
+            _sources.push_back(data_path);
         }
 
         int BackupInitiator::CreateBackup() {
