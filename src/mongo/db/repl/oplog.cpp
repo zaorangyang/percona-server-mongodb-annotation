@@ -35,6 +35,7 @@
 #include "mongo/db/repl/oplog.h"
 
 #include <deque>
+#include <set>
 #include <vector>
 
 #include "mongo/db/auth/action_set.h"
@@ -43,16 +44,24 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/background.h"
+#include "mongo/db/catalog/apply_ops.h"
+#include "mongo/db/catalog/capped_utils.h"
+#include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/drop_collection.h"
+#include "mongo/db/catalog/drop_database.h"
+#include "mongo/db/catalog/drop_indexes.h"
+#include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/dbhash.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/global_optime.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/global_timestamp.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
@@ -61,6 +70,7 @@
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -90,7 +100,7 @@ namespace {
     Database* _localDB = nullptr;
     Collection* _localOplogCollection = nullptr;
 
-    // Synchronizes the section where a new OpTime is generated and when it actually
+    // Synchronizes the section where a new Timestamp is generated and when it actually
     // appears in the oplog.
     mongo::mutex newOpMutex;
     boost::condition newOptimeNotifier;
@@ -114,13 +124,13 @@ namespace {
      * function registers the new optime with the storage system and the replication coordinator,
      * and provides no facility to revert those registrations on rollback.
      */
-    std::pair<OpTime, long long> getNextOpTime(OperationContext* txn,
+    std::pair<Timestamp, long long> getNextOpTime(OperationContext* txn,
                                                Collection* oplog,
                                                const char* ns,
                                                ReplicationCoordinator* replCoord,
                                                const char* opstr) {
         boost::lock_guard<boost::mutex> lk(newOpMutex);
-        OpTime ts = getNextGlobalOptime();
+        Timestamp ts = getNextGlobalTimestamp();
         newOptimeNotifier.notify_all();
 
         fassert(28560, oplog->getRecordStore()->oplogDiskLocRegister(txn, ts));
@@ -150,7 +160,7 @@ namespace {
         }
 
         replCoord->setMyLastOptime(ts);
-        return std::pair<OpTime,long long>(ts, hashNew);
+        return std::pair<Timestamp,long long>(ts, hashNew);
     }
 
     /**
@@ -235,6 +245,20 @@ namespace {
             return;
         }
 
+        if (NamespaceString(ns).isSystemDotProfile()) {
+            return;
+        }
+
+        if (!getGlobalReplicationCoordinator()->isReplEnabled()) {
+            return;
+        }
+
+        if (!txn->writesAreReplicated()) {
+            return;
+        }
+
+        fassert(28626, txn->recoveryUnit());
+
         Lock::DBLock lk(txn->lockState(), "local", MODE_IX);
 
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
@@ -258,7 +282,7 @@ namespace {
                     _localOplogCollection);
         }
 
-        std::pair<OpTime, long long> slot = getNextOpTime(txn,
+        std::pair<Timestamp, long long> slot = getNextOpTime(txn,
                                                           _localOplogCollection,
                                                           ns,
                                                           replCoord,
@@ -269,81 +293,81 @@ namespace {
         */
 
         BSONObjBuilder b(256);
-        b.appendTimestamp("ts", slot.first.asDate());
+        b.append("ts", slot.first);
         b.append("h", slot.second);
         b.append("v", OPLOG_VERSION);
         b.append("op", opstr);
         b.append("ns", ns);
-        if (fromMigrate)
+        if (fromMigrate) {
             b.appendBool("fromMigrate", true);
-        if ( o2 )
+        }
+
+        if (txn->getWriteConcern().shouldWaitForOtherNodes()
+            && txn->getWriteConcern().syncMode == WriteConcernOptions::JOURNAL)
+        {
+            b.appendBool("j", true);
+        }
+
+        if ( o2 ) {
             b.append("o2", *o2);
+        }
         BSONObj partial = b.done();
 
         OplogDocWriter writer( partial, obj );
         checkOplogInsert( _localOplogCollection->insertDocument( txn, &writer, false ) );
 
-        txn->getClient()->setLastOp( slot.first );
+        ReplClientInfo::forClient(txn->getClient()).setLastOp( slot.first );
     }
 
-    OpTime writeOpsToOplog(OperationContext* txn, const std::deque<BSONObj>& ops) {
+    Timestamp writeOpsToOplog(OperationContext* txn, const std::deque<BSONObj>& ops) {
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-        OpTime lastOptime = replCoord->getMyLastOptime();
-        invariant(!ops.empty());
 
-        while (1) {
-            try {
-                ScopedTransaction transaction(txn, MODE_IX);
-                Lock::DBLock lk(txn->lockState(), "local", MODE_X);
+        Timestamp lastOptime;
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            lastOptime = replCoord->getMyLastOptime();
+            invariant(!ops.empty());
+            ScopedTransaction transaction(txn, MODE_IX);
+            Lock::DBLock lk(txn->lockState(), "local", MODE_X);
 
-                if ( _localOplogCollection == 0 ) {
-                    OldClientContext ctx(txn, rsOplogName);
+            if ( _localOplogCollection == 0 ) {
+                OldClientContext ctx(txn, rsOplogName);
 
-                    _localDB = ctx.db();
-                    verify( _localDB );
-                    _localOplogCollection = _localDB->getCollection(rsOplogName);
-                    massert(13389,
-                            "local.oplog.rs missing. did you drop it? if so restart server",
-                            _localOplogCollection);
-                }
-
-                OldClientContext ctx(txn, rsOplogName, _localDB);
-                WriteUnitOfWork wunit(txn);
-
-                for (std::deque<BSONObj>::const_iterator it = ops.begin();
-                     it != ops.end();
-                     ++it) {
-                    const BSONObj& op = *it;
-                    const OpTime ts = op["ts"]._opTime();
-
-                    checkOplogInsert(_localOplogCollection->insertDocument(txn, op, false));
-
-                    if (!(lastOptime < ts)) {
-                        severe() << "replication oplog stream went back in time. "
-                            "previous timestamp: " << lastOptime << " newest timestamp: " << ts
-                                 << ". Op being applied: " << op;
-                        fassertFailedNoTrace(18905);
-                    }
-                    lastOptime = ts;
-                }
-                wunit.commit();
-
-                BackgroundSync* bgsync = BackgroundSync::get();
-                // Keep this up-to-date, in case we step up to primary.
-                long long hash = ops.back()["h"].numberLong();
-                bgsync->setLastAppliedHash(hash);
-
-                txn->getClient()->setLastOp(lastOptime);
-
-                replCoord->setMyLastOptime(lastOptime);
-                setNewOptime(lastOptime);
-
-                return lastOptime;
+                _localDB = ctx.db();
+                verify( _localDB );
+                _localOplogCollection = _localDB->getCollection(rsOplogName);
+                massert(13389,
+                        "local.oplog.rs missing. did you drop it? if so restart server",
+                        _localOplogCollection);
             }
-            catch (const WriteConflictException& wce) {
-                log() << "WriteConflictException while writing oplog, retrying.";
+
+            OldClientContext ctx(txn, rsOplogName, _localDB);
+            WriteUnitOfWork wunit(txn);
+
+            for (std::deque<BSONObj>::const_iterator it = ops.begin();
+                 it != ops.end();
+                 ++it) {
+                const BSONObj& op = *it;
+                const Timestamp ts = op["ts"].timestamp();
+
+                checkOplogInsert(_localOplogCollection->insertDocument(txn, op, false));
+
+                if (!(lastOptime < ts)) {
+                    severe() << "replication oplog stream went back in time. "
+                        "previous timestamp: " << lastOptime << " newest timestamp: " << ts
+                             << ". Op being applied: " << op;
+                    fassertFailedNoTrace(18905);
+                }
+                lastOptime = ts;
             }
-        }
+            wunit.commit();
+        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "writeOps", _localOplogCollection->ns().ns());
+
+        BackgroundSync* bgsync = BackgroundSync::get();
+        // Keep this up-to-date, in case we step up to primary.
+        long long hash = ops.back()["h"].numberLong();
+        bgsync->setLastAppliedHash(hash);
+
+        return lastOptime;
     }
 
     void createOplog(OperationContext* txn) {
@@ -412,31 +436,169 @@ namespace {
         options.cappedSize = sz;
         options.autoIndexId = CollectionOptions::NO;
 
-        WriteUnitOfWork uow( txn );
-        invariant(ctx.db()->createCollection(txn, _oplogCollectionName, options));
-        if( !rs )
-            getGlobalEnvironment()->getOpObserver()->onOpMessage(txn, BSONObj());
-        uow.commit();
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            WriteUnitOfWork uow( txn );
+            invariant(ctx.db()->createCollection(txn, _oplogCollectionName, options));
+            if( !rs )
+                getGlobalServiceContext()->getOpObserver()->onOpMessage(txn, BSONObj());
+            uow.commit();
+        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createCollection", _oplogCollectionName);
 
         /* sync here so we don't get any surprising lag later when we try to sync */
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         storageEngine->flushAllFiles(true);
         log() << "******" << endl;
     }
 
     // -------------------------------------
 
-    // @param fromRepl false if from ApplyOpsCmd
+namespace {
+    NamespaceString parseNs(const string& ns, const BSONObj& cmdObj) {
+        BSONElement first = cmdObj.firstElement();
+        uassert(28635,
+                "no collection name specified",
+                first.canonicalType() == canonicalizeBSONType(mongo::String)
+                && first.valuestrsize() > 0);
+        std::string coll = first.valuestr();
+        return NamespaceString(NamespaceString(ns).db().toString(), coll);
+    }
+
+    using OpApplyFn = stdx::function<Status (OperationContext*, const char*, BSONObj&)>;
+
+    struct ApplyOpMetadata {
+        OpApplyFn applyFunc;
+        std::set<ErrorCodes::Error> acceptableErrors;
+
+        ApplyOpMetadata(OpApplyFn fun) {
+            applyFunc = fun;
+        }
+
+        ApplyOpMetadata(OpApplyFn fun, std::set<ErrorCodes::Error> theAcceptableErrors) {
+            applyFunc = fun;
+            acceptableErrors = theAcceptableErrors;
+        }
+    };
+
+    std::map<std::string, ApplyOpMetadata> opsMap = {
+        {"create",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    return createCollection(txn, NamespaceString(ns).db().toString(), cmd);
+                },
+                {ErrorCodes::NamespaceExists}
+            }
+        },
+        {"collMod",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return collMod(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+                }
+            }
+        },
+        {"dropDatabase", 
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    return dropDatabase(txn, NamespaceString(ns).db().toString());
+                }
+            }
+        },
+        {"drop", 
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return dropCollection(txn, parseNs(ns, cmd), resultWeDontCareAbout);
+                },
+                {ErrorCodes::NamespaceNotFound}
+            }
+        },
+        // deleteIndex(es) is deprecated but still works as of April 10, 2015
+        {"deleteIndex", 
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return dropIndexes(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+                },
+                {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}
+            }
+        },
+        {"deleteIndexes", 
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return dropIndexes(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+                },
+                {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}
+            }
+        },
+        {"dropIndex",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return dropIndexes(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+                },
+                {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}
+            }
+        },
+        {"dropIndexes", 
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return dropIndexes(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+                },
+                {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}
+            }
+        },
+        {"renameCollection",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    return renameCollection(txn,
+                                            NamespaceString(cmd.firstElement().valuestrsafe()),
+                                            NamespaceString(cmd["to"].valuestrsafe()),
+                                            cmd["stayTemp"].trueValue(),
+                                            cmd["dropTarget"].trueValue());
+                },
+                {ErrorCodes::NamespaceNotFound, ErrorCodes::NamespaceExists}
+            }
+        },
+        {"applyOps",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return applyOps(txn, ns, cmd, &resultWeDontCareAbout);
+                },
+                {ErrorCodes::UnknownError}
+            }
+        },
+        {"convertToCapped",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    return convertToCapped(txn,
+                                           parseNs(ns, cmd),
+                                           cmd["size"].number());
+                }
+            }
+        },
+        {"emptycapped",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    return emptyCapped(txn, parseNs(ns, cmd));
+                }
+            }
+        },
+    };
+
+} // namespace
+
     // @return failure status if an update should have happened and the document DNE.
     // See replset initial sync code.
     Status applyOperation_inlock(OperationContext* txn,
                                Database* db,
                                const BSONObj& op,
-                               bool fromRepl,
                                bool convertUpdateToUpsert) {
         LOG(3) << "applying op: " << op << endl;
 
-        OpCounters * opCounters = fromRepl ? &replOpCounters : &globalOpCounters;
+        OpCounters * opCounters = txn->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
 
         const char *names[] = { "o", "ns", "op", "b", "o2" };
         BSONElement fields[5];
@@ -522,7 +684,6 @@ namespace {
                 request.setQuery(b.done());
                 request.setUpdates(o);
                 request.setUpsert();
-                request.setFromReplication();
                 UpdateLifecycleImpl updateLifecycle(true, requestNs);
                 request.setLifecycle(&updateLifecycle);
 
@@ -546,7 +707,6 @@ namespace {
             request.setQuery(updateCriteria);
             request.setUpdates(o);
             request.setUpsert(upsert);
-            request.setFromReplication();
             UpdateLifecycleImpl updateLifecycle(true, requestNs);
             request.setLifecycle(&updateLifecycle);
 
@@ -599,24 +759,28 @@ namespace {
                     "Failed to apply delete due to missing _id: " << op.toString(),
                     o.hasField("_id"));
 
-            if ( opType[1] == 0 )
+            if (opType[1] == 0) {
                 deleteObjects(txn, db, ns, o, PlanExecutor::YIELD_MANUAL, /*justOne*/ valueB);
+            }
             else
                 verify( opType[1] == 'b' ); // "db" advertisement
         }
         else if ( *opType == 'c' ) {
+            // Applying commands in repl is done under Global W-lock, so it is safe to not
+            // perform the current DB checks after reacquiring the lock.
+            invariant(txn->lockState()->isW());
+            
             bool done = false;
+
             while (!done) {
-                BufBuilder bb;
-                BSONObjBuilder runCommandResult;
-
-                // Applying commands in repl is done under Global W-lock, so it is safe to not
-                // perform the current DB checks after reacquiring the lock.
-                invariant(txn->lockState()->isW());
-
-                _runCommands(txn, ns, o, bb, runCommandResult, true, 0);
-                // _runCommands takes care of adjusting opcounters for command counting.
-                Status status = Command::getStatusFromCommandResult(runCommandResult.done());
+                ApplyOpMetadata curOpToApply = opsMap.find(o.firstElementFieldName())->second;
+                Status status = Status::OK();
+                try {
+                    status = curOpToApply.applyFunc(txn, ns, o);
+                }
+                catch (...) {
+                    status = exceptionToStatus();
+                }
                 switch (status.code()) {
                 case ErrorCodes::WriteConflict: {
                     // Need to throw this up to a higher level where it will be caught and the
@@ -638,9 +802,16 @@ namespace {
                     break;
                 }
                 default:
-                    warning() << "Failed command " << o << " on " <<
-                        nsToDatabaseSubstring(ns) << " with status " << status <<
-                        " during oplog application";
+                    if (_oplogCollectionName == masterSlaveOplogName) {
+                        error() << "Failed command " << o << " on " << nsToDatabaseSubstring(ns)
+                                << " with status " << status << " during oplog application";
+                    }
+                    else if (curOpToApply.acceptableErrors.find(status.code())
+                            == curOpToApply.acceptableErrors.end()) {
+                        error() << "Failed command " << o << " on " << nsToDatabaseSubstring(ns)
+                                << " with status " << status << " during oplog application";
+                        return status;
+                    }
                     // fallthrough
                 case ErrorCodes::OK:
                     done = true;
@@ -669,19 +840,19 @@ namespace {
         return Status::OK();
     }
 
-    void waitUpToOneSecondForOptimeChange(const OpTime& referenceTime) {
+    void waitUpToOneSecondForTimestampChange(const Timestamp& referenceTime) {
         boost::unique_lock<boost::mutex> lk(newOpMutex);
 
-        while (referenceTime == getLastSetOptime()) {
+        while (referenceTime == getLastSetTimestamp()) {
             if (!newOptimeNotifier.timed_wait(lk,
                                               boost::posix_time::seconds(1)))
                 return;
         }
     }
 
-    void setNewOptime(const OpTime& newTime) {
+    void setNewOptime(const Timestamp& newTime) {
         boost::lock_guard<boost::mutex> lk(newOpMutex);
-        setGlobalOptime(newTime);
+        setGlobalTimestamp(newTime);
         newOptimeNotifier.notify_all();
     }
 

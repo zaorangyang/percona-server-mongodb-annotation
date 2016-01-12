@@ -29,12 +29,15 @@
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
+#include "mongo/db/client.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_noop.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/platform/cstdint.h"
 #include "mongo/s/client/shard_connection.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 #include <vector>
@@ -47,15 +50,23 @@
  * the internal connections together, like in client/scoped_db_conn_test.cpp.
  */
 
-using boost::scoped_ptr;
-using mongo::DBClientBase;
-using mongo::MockRemoteDBServer;
-using mongo::ShardConnection;
-using std::string;
-using std::vector;
-
+namespace mongo {
 namespace {
+
+    using std::string;
+    using std::vector;
+
     const string TARGET_HOST = "$dummy:27017";
+
+    MONGO_INITIALIZER(SCFTestGlobalServiceContext)(InitializerContext*) {
+        invariant(!hasGlobalServiceContext());
+        setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
+        AuthorizationManager::set(
+                getGlobalServiceContext(),
+                stdx::make_unique<AuthorizationManager>(
+                        new mongo::AuthzManagerExternalStateMock()));
+        return Status::OK();
+    }
 
     /**
      * Warning: cannot run in parallel
@@ -63,15 +74,15 @@ namespace {
     class ShardConnFixture: public mongo::unittest::Test {
     public:
         void setUp() {
+            if (!haveClient()) {
+                Client::initThread("ShardConnFixture", getGlobalServiceContext(), NULL);
+            }
             _maxPoolSizePerHost = mongo::shardConnectionPool.getMaxPoolSize();
 
             mongo::ConnectionString::setConnectionHook(
                     mongo::MockConnRegistry::get()->getConnStrHook());
             _dummyServer = new MockRemoteDBServer(TARGET_HOST);
             mongo::MockConnRegistry::get()->addServer(_dummyServer);
-
-            mongo::setGlobalAuthorizationManager(new mongo::AuthorizationManager(
-                    new mongo::AuthzManagerExternalStateMock()));
         }
 
         void tearDown() {
@@ -81,8 +92,6 @@ namespace {
             delete _dummyServer;
 
             mongo::shardConnectionPool.setMaxPoolSize(_maxPoolSizePerHost);
-
-            mongo::clearGlobalAuthorizationManager();
         }
 
         void killServer() {
@@ -313,3 +322,4 @@ namespace {
     }
 
 } // namespace
+} // namespace mongo

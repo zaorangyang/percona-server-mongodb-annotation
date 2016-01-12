@@ -82,23 +82,13 @@ namespace mongo {
 
         virtual PlanStageStats* getStats();
 
-        virtual const CommonStats* getCommonStats();
+        virtual const CommonStats* getCommonStats() const;
 
-        virtual const SpecificStats* getSpecificStats();
+        virtual const SpecificStats* getSpecificStats() const;
 
         static const char* kStageType;
 
     private:
-        /**
-         * Initialize the underlying IndexCursor
-         */
-        void initIndexCursor();
-
-        /**
-         * See if we've hit the end yet.
-         */
-        void checkEnd();
-
         // transactional context for read locks. Not owned by us
         OperationContext* _txn;
 
@@ -109,20 +99,13 @@ namespace mongo {
         const IndexDescriptor* _descriptor;
         const IndexAccessMethod* _iam;
 
-        // Our start cursor.
-        boost::scoped_ptr<IndexCursor> _cursor;
-
-        // Our end marker.
-        boost::scoped_ptr<IndexCursor> _endCursor;
+        std::unique_ptr<SortedDataInterface::Cursor> _cursor;
 
         // Could our index have duplicates?  If so, we use _returned to dedup.
+        bool _shouldDedup;
         unordered_set<RecordId, RecordId::Hasher> _returned;
 
         CountScanParams _params;
-
-        bool _hitEnd;
-
-        bool _shouldDedup;
 
         CommonStats _commonStats;
         CountScanStats _specificStats;

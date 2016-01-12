@@ -32,16 +32,17 @@
 
 #pragma once
 
-#include "mongo/config.h"
-
+#include <boost/thread/lock_guard.hpp>
 #include <boost/noncopyable.hpp>
 #include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/string_data.h"
-#include "mongo/bson/bson_field.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/config.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/logger/log_severity.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/cstdint.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/message.h"
@@ -198,161 +199,6 @@ namespace mongo {
 
     class DBClientBase;
     class DBClientConnection;
-
-    /**
-     * ConnectionString handles parsing different ways to connect to mongo and determining method
-     * samples:
-     *    server
-     *    server:port
-     *    foo/server:port,server:port   SET
-     *    server,server,server          SYNC
-     *                                    Warning - you usually don't want "SYNC", it's used
-     *                                    for some special things such as sharding config servers.
-     *                                    See syncclusterconnection.h for more info.
-     *
-     * tyipcal use
-     * std::string errmsg,
-     * ConnectionString cs = ConnectionString::parse( url , errmsg );
-     * if ( ! cs.isValid() ) throw "bad: " + errmsg;
-     * DBClientBase * conn = cs.connect( errmsg );
-     */
-    class ConnectionString {
-    public:
-
-        enum ConnectionType { INVALID , MASTER , PAIR , SET , SYNC, CUSTOM };
-
-        ConnectionString() {
-            _type = INVALID;
-        }
-
-        // Note: This should only be used for direct connections to a single server.  For replica
-        // set and SyncClusterConnections, use ConnectionString::parse.
-        ConnectionString( const HostAndPort& server ) {
-            _type = MASTER;
-            _servers.push_back( server );
-            _finishInit();
-        }
-
-        ConnectionString( ConnectionType type , const std::string& s , const std::string& setName = "" ) {
-            _type = type;
-            _setName = setName;
-            _fillServers( s );
-
-            switch ( _type ) {
-            case MASTER:
-                verify( _servers.size() == 1 );
-                break;
-            case SET:
-                verify( _setName.size() );
-                verify( _servers.size() >= 1 ); // 1 is ok since we can derive
-                break;
-            case PAIR:
-                verify( _servers.size() == 2 );
-                break;
-            default:
-                verify( _servers.size() > 0 );
-            }
-
-            _finishInit();
-        }
-
-        ConnectionString( const std::string& s , ConnectionType favoredMultipleType ) {
-            _type = INVALID;
-
-            _fillServers( s );
-            if ( _type != INVALID ) {
-                // set already
-            }
-            else if ( _servers.size() == 1 ) {
-                _type = MASTER;
-            }
-            else {
-                _type = favoredMultipleType;
-                verify( _type == SET || _type == SYNC );
-            }
-            _finishInit();
-        }
-
-        bool isValid() const { return _type != INVALID; }
-
-        std::string toString() const { return _string; }
-
-        DBClientBase* connect( std::string& errmsg, double socketTimeout = 0 ) const;
-
-        std::string getSetName() const { return _setName; }
-
-        const std::vector<HostAndPort>& getServers() const { return _servers; }
-
-        ConnectionType type() const { return _type; }
-
-        /**
-         * This returns true if this and other point to the same logical entity.
-         * For single nodes, thats the same address.
-         * For replica sets, thats just the same replica set name.
-         * For pair (deprecated) or sync cluster connections, that's the same hosts in any ordering.
-         */
-        bool sameLogicalEndpoint( const ConnectionString& other ) const;
-
-        static ConnectionString parse( const std::string& url , std::string& errmsg );
-
-        static std::string typeToString( ConnectionType type );
-
-        //
-        // Allow overriding the default connection behavior
-        // This is needed for some tests, which otherwise would fail because they are unable to contact
-        // the correct servers.
-        //
-
-        class ConnectionHook {
-        public:
-            virtual ~ConnectionHook(){}
-
-            // Returns an alternative connection object for a string
-            virtual DBClientBase* connect( const ConnectionString& c,
-                                             std::string& errmsg,
-                                             double socketTimeout ) = 0;
-        };
-
-        static void setConnectionHook( ConnectionHook* hook ){
-            boost::lock_guard<boost::mutex> lk( _connectHookMutex );
-            _connectHook = hook;
-        }
-
-        static ConnectionHook* getConnectionHook() {
-            boost::lock_guard<boost::mutex> lk( _connectHookMutex );
-            return _connectHook;
-        }
-
-        // Allows ConnectionStrings to be stored more easily in sets/maps
-        bool operator<(const ConnectionString& other) const {
-            return _string < other._string;
-        }
-
-        //
-        // FOR TESTING ONLY - useful to be able to directly mock a connection std::string without
-        // including the entire client library.
-        //
-
-        static ConnectionString mock( const HostAndPort& server ) {
-            ConnectionString connStr;
-            connStr._servers.push_back( server );
-            connStr._string = server.toString();
-            return connStr;
-        }
-
-    private:
-
-        void _fillServers( std::string s );
-        void _finishInit();
-
-        ConnectionType _type;
-        std::vector<HostAndPort> _servers;
-        std::string _string;
-        std::string _setName;
-
-        static mutex _connectHookMutex;
-        static ConnectionHook* _connectHook;
-    };
 
     /**
      * controls how much a clients cares about writes
@@ -848,7 +694,6 @@ namespace mongo {
         bool setDbProfilingLevel(const std::string &dbname, ProfilingLevel level, BSONObj *info = 0);
         bool getDbProfilingLevel(const std::string &dbname, ProfilingLevel& level, BSONObj *info = 0);
 
-
         /** This implicitly converts from char*, string, and BSONObj to be an argument to mapreduce
             You shouldn't need to explicitly construct this
          */
@@ -1036,6 +881,24 @@ namespace mongo {
             return _postRunCommandHook;
         }
 
+        /**
+         * Run a pseudo-command such as sys.inprog/currentOp, sys.killop/killOp
+         * or sys.unlock/fsyncUnlock
+         *
+         * The real command will be tried first, and if the remote server does not
+         * implement the command, it will fall back to the pseudoCommand.
+         *
+         * The cmdArgs parameter should NOT include {<commandName>: 1}.
+         *
+         * TODO: remove after MongoDB 3.2 is released and replace all callers with
+         * a call to plain runCommand
+         */
+        virtual bool runPseudoCommand(StringData db,
+                                      StringData realCommandName,
+                                      StringData pseudoCommandCol,
+                                      const BSONObj& cmdArgs,
+                                      BSONObj& info,
+                                      int options=0);
 
     protected:
         /** if the result of a command is ok*/

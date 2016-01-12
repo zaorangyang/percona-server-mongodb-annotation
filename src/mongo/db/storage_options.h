@@ -57,14 +57,8 @@ namespace mongo {
             directoryperdb(false),
             syncdelay(60.0) {
             dur = false;
-#if defined(_DURABLEDEFAULTON)
-            dur = true;
-#endif
             if (sizeof(void*) == 8)
                 dur = true;
-#if defined(_DURABLEDEFAULTOFF)
-            dur = false;
-#endif
         }
 
         // --storageEngine
@@ -111,9 +105,5 @@ namespace mongo {
     };
 
     extern StorageGlobalParams storageGlobalParams;
-
-    // This is not really related to persistence, but mongos and the other executables share code
-    // and we use this function to determine at runtime which executable we are in.
-    bool isMongos();
 
 } // namespace mongo

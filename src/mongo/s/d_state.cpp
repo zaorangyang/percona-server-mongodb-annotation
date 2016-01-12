@@ -28,12 +28,6 @@
 *    then also delete it in the license file.
 */
 
-
-/**
-   these are commands that live in mongod
-   mostly around shard management and checking
- */
-
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
@@ -58,15 +52,18 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/catalog/legacy/catalog_manager_legacy.h"
 #include "mongo/s/client/shard_connection.h"
+#include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/legacy_dist_lock_manager.h"
 #include "mongo/s/metadata_loader.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/log.h"
-#include "mongo/util/queue.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
@@ -75,6 +72,12 @@ namespace mongo {
     using std::string;
     using std::stringstream;
     using std::vector;
+
+
+    bool isMongos() {
+        return false;
+    }
+
 
     // -----ShardingState START ----
 
@@ -477,11 +480,17 @@ namespace mongo {
 
         ShardedConnectionInfo::addHook();
 
-        vector<string> configdbs;
-        splitStringDelim(server, &configdbs, ',');
+        std::string errmsg;
+        ConnectionString configServerCS = ConnectionString::parse(server, errmsg);
+        uassert(28633,
+                str::stream() << "Invalid config server connection string: " << errmsg,
+                configServerCS.isValid());
 
-        configServer.init(configdbs);
-        grid.initCatalogManager(configdbs);
+        configServer.init(configServerCS);
+
+        auto catalogManager = stdx::make_unique<CatalogManagerLegacy>();
+        uassertStatusOK(catalogManager->init(configServerCS));
+        grid.setCatalogManager(std::move(catalogManager));
 
         _enabled = true;
     }
@@ -574,10 +583,11 @@ namespace mongo {
 
         Timer refreshTimer;
         Status status =
-                mdLoader.makeCollectionMetadata( ns,
-                                                 getShardName(),
-                                                 ( fullReload ? NULL : beforeMetadata.get() ),
-                                                 remoteMetadataRaw );
+                mdLoader.makeCollectionMetadata(grid.catalogManager(),
+                                                ns,
+                                                getShardName(),
+                                                fullReload ? NULL : beforeMetadata.get(),
+                                                remoteMetadataRaw);
         long long refreshMillis = refreshTimer.millis();
 
         if ( status.code() == ErrorCodes::NamespaceNotFound ) {
@@ -921,7 +931,12 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
 
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             ShardedConnectionInfo::reset();
             return true;
         }
@@ -987,7 +1002,12 @@ namespace mongo {
             return checkConfigOrInit(txn, configdb, authoritative, errmsg, result, true);
         }
 
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
 
             // Compatibility error for < v3.0 mongoses still active in the cluster
             // TODO: Remove post-3.0
@@ -1228,7 +1248,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                     ActionType::getShardVersion)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -1239,7 +1259,12 @@ namespace mongo {
             return parseNsFullyQualified(dbname, cmdObj);
         }
 
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             const string ns = cmdObj["getShardVersion"].valuestrsafe();
             if (ns.size() == 0) {
                 errmsg = "need to specify full namespace";
@@ -1293,7 +1318,12 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
 
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             OldClientContext ctx(txn, dbname);
@@ -1338,6 +1368,11 @@ namespace mongo {
         // TODO : all collections at some point, be sharded or not, will have a version
         //  (and a CollectionMetadata)
         received = info->getVersion( ns );
+
+        if (ChunkVersion::isIgnoredVersion(received)) {
+            return true;
+        }
+
         wanted = shardingState.getVersion( ns );
 
         if( received.isWriteCompatibleWith( wanted ) ) return true;
@@ -1400,4 +1435,12 @@ namespace mongo {
 
     void usingAShardConnection( const string& addr ) {
     }
+
+    void saveGLEStats(const BSONObj& result, const std::string& conn) {
+        // Declared in cluster_last_error_info.h.
+        //
+        // This can be called in mongod, which is unfortunate.  To fix this,
+        // we can redesign how connection pooling works on mongod for sharded operations.
+    }
+
 }

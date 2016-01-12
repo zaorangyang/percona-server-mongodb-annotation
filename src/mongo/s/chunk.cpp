@@ -1,7 +1,5 @@
-// @file chunk.cpp
-
 /**
- *    Copyright (C) 2008-2012 10gen Inc.
+ *    Copyright (C) 2008-2015 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -19,18 +17,16 @@
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
-#include "mongo/config.h"
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +37,7 @@
 #include "mongo/base/owned_pointer_map.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/config.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/write_concern.h"
@@ -48,13 +45,13 @@
 #include "mongo/platform/random.h"
 #include "mongo/s/balancer_policy.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/client_info.h"
-#include "mongo/s/cluster_write.h"
+#include "mongo/s/config.h"
 #include "mongo/s/config_server_checker_service.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/type_settings.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/log.h"
 
@@ -449,7 +446,6 @@ namespace {
         cmd.append( "max" , getMax() );
         cmd.append( "from" , getShard().getName() );
         cmd.append( "splitKeys" , m );
-        cmd.append( "shardId" , genID() );
         cmd.append( "configdb" , configServer.modelServer() );
         cmd.append("epoch", _manager->getVersion().epoch());
         BSONObj cmdObj = cmd.obj();
@@ -501,7 +497,6 @@ namespace {
         builder.append("min", _min);
         builder.append("max", _max);
         builder.append("maxChunkSizeBytes", chunkSize);
-        builder.append("shardId", genID());
         builder.append("configdb", configServer.modelServer());
 
         // For legacy secondary throttle setting.
@@ -555,14 +550,6 @@ namespace {
             }
             TicketHolderReleaser releaser( &(getManager()->_splitHeuristics._splitTickets) );
 
-            if (!configServer.allUp(true)) {
-                LOG(1) << "not performing auto-split because not all config servers are up";
-
-                // Back off indirectly by resetting _dataWritten.
-                _dataWritten = 0;
-                return false;
-            }
-
             // this is a bit ugly
             // we need it so that mongos blocks for the writes to actually be committed
             // this does mean mongos has more back pressure than mongod alone
@@ -598,8 +585,17 @@ namespace {
                 _dataWritten = 0;
             }
 
-            const bool shouldBalance = grid.getConfigShouldBalance() &&
-                    grid.getCollShouldBalance(_manager->getns());
+            bool shouldBalance = grid.getConfigShouldBalance();
+            if (shouldBalance) {
+                auto status = grid.catalogManager()->getCollection(_manager->getns());
+                if (!status.isOK()) {
+                    log() << "Auto-split for " << _manager->getns()
+                          << " failed to load collection metadata due to " << status.getStatus();
+                    return false;
+                }
+
+                shouldBalance = status.getValue().getAllowBalance();
+            }
 
             log() << "autosplitted " << _manager->getns()
                   << " shard: " << toString()
@@ -734,20 +730,19 @@ namespace {
     }
 
     void Chunk::refreshChunkSize() {
-        BSONObj o = grid.getConfigSetting("chunksize");
-
-        if ( o.isEmpty() ) {
-           return;
-        }
-
-        int csize = o[SettingsType::chunksize()].numberInt();
-
-        // validate chunksize before proceeding
-        if ( csize == 0 ) {
-            // setting was not modified; mark as such
-            log() << "warning: invalid chunksize (" << csize << ") ignored";
+        auto chunkSizeSettingsResult =
+            grid.catalogManager()->getGlobalSettings(SettingsType::ChunkSizeDocKey);
+        if (!chunkSizeSettingsResult.isOK()) {
+            log() << chunkSizeSettingsResult.getStatus();
             return;
         }
+        SettingsType chunkSizeSettings = chunkSizeSettingsResult.getValue();
+        string errMsg;
+        if (!chunkSizeSettings.isValid(&errMsg)) {
+            log() << errMsg;
+            return;
+        }
+        int csize = chunkSizeSettings.getChunksize();
 
         LOG(1) << "Refreshing MaxChunkSize: " << csize << "MB";
 

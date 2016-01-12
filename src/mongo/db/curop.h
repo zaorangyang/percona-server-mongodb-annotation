@@ -171,6 +171,7 @@ namespace mongo {
         bool fastmod;
         bool fastmodinsert;  // upsert of an $operation. builds a default object
         bool upsert;         // true if the update actually did an insert
+        bool cursorExhausted; // true if the cursor has been closed at end a find/getMore operation
         int keyUpdates;
         long long writeConflicts;
         ThreadSafeString planSummary; // a brief std::string describing the query solution
@@ -193,7 +194,10 @@ namespace mongo {
     */
     class CurOp : boost::noncopyable {
     public:
-        CurOp( Client * client , CurOp * wrapped = 0 );
+        static CurOp* get(const Client* client);
+        static CurOp* get(const Client& client);
+
+        explicit CurOp(Client* client);
         ~CurOp();
 
         bool haveQuery() const { return _query.have(); }
@@ -278,11 +282,10 @@ namespace mongo {
         int elapsedSeconds() { return elapsedMillis() / 1000; }
 
         void setQuery(const BSONObj& query) { _query.set( query ); }
-        Client * getClient() const { return _client; }
-        
+
         Command * getCommand() const { return _command; }
         void setCommand(Command* command) { _command = command; }
-        
+
         void reportState(BSONObjBuilder* builder);
 
         // Fetches less information than "info()"; used to search for ops with certain criteria
@@ -300,7 +303,7 @@ namespace mongo {
                                   int secondsBetween = 3);
         std::string getMessage() const { return _message.toString(); }
         ProgressMeter& getProgressMeter() { return _progressMeter; }
-        CurOp *parent() const { return _wrapped; }
+        CurOp *parent() const { return _parent; }
         void kill(); 
         bool killPendingStrict() const { return _killPending.load(); }
         bool killPending() const { return _killPending.loadRelaxed(); }
@@ -320,12 +323,17 @@ namespace mongo {
         void setNS( StringData ns );
 
     private:
-        friend class Client;
+        class ClientCuropStack;
+
+        static const Client::Decoration<ClientCuropStack> _curopStack;
+
+        CurOp(Client*, ClientCuropStack*);
+
         void _reset();
 
         static AtomicUInt32 _nextOpNum;
-        Client * _client;
-        CurOp * _wrapped;
+        ClientCuropStack* _stack;
+        CurOp* _parent = nullptr;
         Command * _command;
         long long _start;
         long long _end;

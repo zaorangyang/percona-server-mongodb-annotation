@@ -157,9 +157,7 @@ jsTestOptions = function(){
                               authPassword : TestData.keyFileData,
                               authMechanism : TestData.authMechanism,
                               adminUser : TestData.adminUser || "admin",
-                              adminPassword : TestData.adminPassword || "password",
-                              useSSL : TestData.useSSL,
-                              useX509 : TestData.useX509});
+                              adminPassword : TestData.adminPassword || "password"});
     }
     return _jsTestOptions;
 }
@@ -195,7 +193,7 @@ jsTest.randomize = function( seed ) {
 }
 
 jsTest.authenticate = function(conn) {
-    if (!jsTest.options().auth && !jsTest.options().keyFile && !jsTest.options().useX509) {
+    if (!jsTest.options().auth && !jsTest.options().keyFile) {
         conn.authenticated = true;
         return true;
     }
@@ -1160,16 +1158,8 @@ help = shellHelper.help = function (x) {
         return;
     }
     else if (x == "test") {
-        print("\tstartMongodEmpty(args)        DELETES DATA DIR and then starts mongod");
+        print("\tMongoRunner.runMongod(args)   DELETES DATA DIR and then starts mongod");
         print("\t                              returns a connection to the new server");
-        print("\tstartMongodTest(port,dir,options)");
-        print("\t                              DELETES DATA DIR");
-        print("\t                              automatically picks port #s starting at 27000 and increasing");
-        print("\t                              or you can specify the port as the first arg");
-        print("\t                              dir is /data/db/<port>/ if not specified as the 2nd arg");
-        print("\t                              returns a connection to the new server");
-        print("\tresetDbpath(dirpathstr)       deletes everything under the dir specified including subdirs");
-        print("\tstopMongoProgram(port[, signal])");
         return;
     }
     else if (x == "") {

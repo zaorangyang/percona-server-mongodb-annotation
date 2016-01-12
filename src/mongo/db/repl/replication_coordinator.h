@@ -35,6 +35,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/reporter.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -44,7 +45,7 @@ namespace mongo {
     class IndexDescriptor;
     class NamespaceString;
     class OperationContext;
-    class OpTime;
+    class Timestamp;
     struct WriteConcernOptions;
 
 namespace repl {
@@ -53,9 +54,15 @@ namespace repl {
     class HandshakeArgs;
     class IsMasterResponse;
     class OplogReader;
-    class ReplicaSetConfig;
+    class ReplSetDeclareElectionWinnerArgs;
+    class ReplSetDeclareElectionWinnerResponse;
     class ReplSetHeartbeatArgs;
+    class ReplSetHeartbeatArgsV1;
     class ReplSetHeartbeatResponse;
+    class ReplSetHeartbeatResponseV1;
+    class ReplSetRequestVotesArgs;
+    class ReplSetRequestVotesResponse;
+    class ReplicaSetConfig;
     class UpdatePositionArgs;
 
     /**
@@ -73,7 +80,7 @@ namespace repl {
      * with the rest of the system.  The public methods on ReplicationCoordinator are the public
      * API that the replication subsystem presents to the rest of the codebase.
      */
-    class ReplicationCoordinator {
+    class ReplicationCoordinator : public ReplicationProgressManager {
         MONGO_DISALLOW_COPYING(ReplicationCoordinator);
 
     public:
@@ -172,7 +179,7 @@ namespace repl {
          * ErrorCodes::Interrupted if the operation was killed with killop()
          */
         virtual StatusAndDuration awaitReplication(const OperationContext* txn,
-                                                   const OpTime& ts,
+                                                   const Timestamp& ts,
                                                    const WriteConcernOptions& writeConcern) = 0;
 
         /**
@@ -246,7 +253,7 @@ namespace repl {
          * Updates our internal tracking of the last OpTime applied for the given slave
          * identified by "rid".  Only valid to call in master/slave mode
          */
-        virtual Status setLastOptimeForSlave(const OID& rid, const OpTime& ts) = 0;
+        virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts) = 0;
 
         /**
          * Updates our internal tracking of the last OpTime applied to this node.
@@ -256,7 +263,7 @@ namespace repl {
          * that after calls to resetLastOpTimeFromOplog(), the minimum acceptable value for "ts" is
          * reset based on the contents of the oplog, and may go backwards due to rollback.
          */
-        virtual void setMyLastOptime(const OpTime& ts) = 0;
+        virtual void setMyLastOptime(const Timestamp& ts) = 0;
 
         /**
          * Same as above, but used during places we need to zero our last optime.
@@ -271,7 +278,7 @@ namespace repl {
         /**
          * Returns the last optime recorded by setMyLastOptime.
          */
-        virtual OpTime getMyLastOptime() const = 0;
+        virtual Timestamp getMyLastOptime() const = 0;
 
         /**
          * Retrieves and returns the current election id, which is a unique id that is local to
@@ -398,6 +405,8 @@ namespace repl {
          */
         virtual Status processHeartbeat(const ReplSetHeartbeatArgs& args,
                                         ReplSetHeartbeatResponse* response) = 0;
+        virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
+                                          ReplSetHeartbeatResponseV1* response) = 0;
 
         /**
          * Arguments for the replSetReconfig command.
@@ -439,11 +448,11 @@ namespace repl {
          * Arguments to the replSetFresh command.
          */
         struct ReplSetFreshArgs {
-            StringData setName;  // Name of the replset
+            std::string setName;  // Name of the replset
             HostAndPort who;  // host and port of the member that sent the replSetFresh command
             unsigned id;  // replSet id of the member that sent the replSetFresh command
             int cfgver;  // replSet config version that the member who sent the command thinks it has
-            OpTime opTime;  // last optime seen by the member who sent the replSetFresh command
+            Timestamp opTime;  // last optime seen by the member who sent the replSetFresh command
         };
 
         /*
@@ -457,7 +466,7 @@ namespace repl {
          * Arguments to the replSetElect command.
          */
         struct ReplSetElectArgs {
-            StringData set;  // Name of the replset
+            std::string set;  // Name of the replset
             int whoid;  // replSet id of the member that sent the replSetFresh command
             int cfgver;  // replSet config version that the member who sent the command thinks it has
             OID round;  // unique ID for this election
@@ -503,7 +512,7 @@ namespace repl {
         /**
          * Returns a vector of members that have applied the operation with OpTime 'op'.
          */
-        virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op) = 0;
+        virtual std::vector<HostAndPort> getHostsWrittenTo(const Timestamp& op) = 0;
 
         /**
          * Returns a vector of the members other than ourself in the replica set, as specified in
@@ -548,6 +557,38 @@ namespace repl {
          * currentSource: the current sync source
          */
         virtual bool shouldChangeSyncSource(const HostAndPort& currentSource) = 0;
+
+        /**
+         * Returns the OpTime of the latest replica set-committed op known to this server.
+         * Committed means a majority of the voting nodes of the config are known to have the
+         * operation in their oplogs.  This implies such ops will never be rolled back.
+         */
+        virtual Timestamp getLastCommittedOpTime() const = 0;
+
+        /*
+        * Handles an incoming replSetRequestVotes command.
+        * Adds BSON to 'resultObj'; returns a Status with either OK or an error message.
+        */
+        virtual Status processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
+                                                  ReplSetRequestVotesResponse* response) = 0;
+
+        /*
+        * Handles an incoming replSetDeclareElectionWinner command.
+        * Returns a Status with either OK or an error message.
+        */
+        virtual Status processReplSetDeclareElectionWinner(
+                const ReplSetDeclareElectionWinnerArgs& args,
+                ReplSetDeclareElectionWinnerResponse* response) = 0;
+
+        /**
+         * Prepares a BSONObj describing the current term, primary, and lastOp information.
+         */
+        virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder) = 0;
+
+        /**
+         * Returns true if the V1 election protocol is being used and false otherwise.
+         */ 
+        virtual bool isV1ElectionProtocol() = 0;
 
     protected:
 

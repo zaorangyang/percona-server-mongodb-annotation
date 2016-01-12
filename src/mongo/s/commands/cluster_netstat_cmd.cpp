@@ -67,8 +67,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             result.append("configserver", configServer.getPrimary().getConnString());
             result.append("isdbgrid", 1);

@@ -37,6 +37,7 @@ namespace {
 
     using std::auto_ptr;
     using std::string;
+    using std::unique_ptr;
 
     static const char* ns = "somebogusns";
 
@@ -45,12 +46,53 @@ namespace {
      * tree.  Returns the resulting tree, or an error Status.
      */
     StatusWithMatchExpression parseNormalize(const std::string& queryStr) {
+        // TODO Parsing a MatchExpression from a temporary BSONObj is invalid.  SERVER-18086.
         StatusWithMatchExpression swme = MatchExpressionParser::parse(fromjson(queryStr));
         if (!swme.getStatus().isOK()) {
             return swme;
         }
         return StatusWithMatchExpression(CanonicalQuery::normalizeTree(swme.getValue()));
     }
+
+    MatchExpression* parseMatchExpression(const BSONObj& obj) {
+        StatusWithMatchExpression status = MatchExpressionParser::parse(obj);
+        if (!status.isOK()) {
+            mongoutils::str::stream ss;
+            ss << "failed to parse query: " << obj.toString()
+               << ". Reason: " << status.getStatus().toString();
+            FAIL(ss);
+        }
+        return status.getValue();
+    }
+
+    void assertEquivalent(const char* queryStr,
+                          const MatchExpression* expected,
+                          const MatchExpression* actual) {
+        if (actual->equivalent(expected)) {
+            return;
+        }
+        mongoutils::str::stream ss;
+        ss << "Match expressions are not equivalent."
+           << "\nOriginal query: " << queryStr
+           << "\nExpected: " << expected->toString()
+           << "\nActual: " << actual->toString();
+        FAIL(ss);
+    }
+
+    void assertNotEquivalent(const char* queryStr,
+                             const MatchExpression* expected,
+                             const MatchExpression* actual) {
+        if (!actual->equivalent(expected)) {
+            return;
+        }
+        mongoutils::str::stream ss;
+        ss << "Match expressions are equivalent."
+           << "\nOriginal query: " << queryStr
+           << "\nExpected: " << expected->toString()
+           << "\nActual: " << actual->toString();
+        FAIL(ss);
+    }
+
 
     TEST(CanonicalQueryTest, IsValidText) {
         // Passes in default values for LiteParsedQuery.
@@ -416,6 +458,66 @@ namespace {
         ASSERT_NOT_OK(CanonicalQuery::isValid(me.get(), *lpq));
     }
 
+    //
+    // Tests for CanonicalQuery::sortTree
+    //
+
+    /**
+     * Helper function for testing CanonicalQuery::sortTree().
+     *
+     * Verifies that sorting the expression 'unsortedQueryStr' yields an expression equivalent to
+     * the expression 'sortedQueryStr'.
+     */
+    void testSortTree(const char* unsortedQueryStr, const char* sortedQueryStr) {
+        BSONObj unsortedQueryObj = fromjson(unsortedQueryStr);
+        unique_ptr<MatchExpression> unsortedQueryExpr(parseMatchExpression(unsortedQueryObj));
+
+        BSONObj sortedQueryObj = fromjson(sortedQueryStr);
+        unique_ptr<MatchExpression> sortedQueryExpr(parseMatchExpression(sortedQueryObj));
+
+        // Sanity check that the unsorted expression is not equivalent to the sorted expression.
+        assertNotEquivalent(unsortedQueryStr, unsortedQueryExpr.get(), sortedQueryExpr.get());
+
+        // Sanity check that sorting the sorted expression is a no-op.
+        {
+            unique_ptr<MatchExpression> sortedQueryExprClone(parseMatchExpression(sortedQueryObj));
+            CanonicalQuery::sortTree(sortedQueryExprClone.get());
+            assertEquivalent(unsortedQueryStr, sortedQueryExpr.get(), sortedQueryExprClone.get());
+        }
+
+        // Test that sorting the unsorted expression yields the sorted expression.
+        CanonicalQuery::sortTree(unsortedQueryExpr.get());
+        assertEquivalent(unsortedQueryStr, unsortedQueryExpr.get(), sortedQueryExpr.get());
+    }
+
+    // Test that an EQ expression sorts before a GT expression.
+    TEST(CanonicalQueryTest, SortTreeMatchTypeComparison) {
+        testSortTree("{a: {$gt: 1}, a: 1}", "{a: 1, a: {$gt: 1}}");
+    }
+
+    // Test that an EQ expression on path "a" sorts before an EQ expression on path "b".
+    TEST(CanonicalQueryTest, SortTreePathComparison) {
+        testSortTree("{b: 1, a: 1}", "{a: 1, b: 1}");
+        testSortTree("{'a.b': 1, a: 1}", "{a: 1, 'a.b': 1}");
+        testSortTree("{'a.c': 1, 'a.b': 1}", "{'a.b': 1, 'a.c': 1}");
+    }
+
+    // Test that AND expressions sort according to their first differing child.
+    TEST(CanonicalQueryTest, SortTreeChildComparison) {
+        testSortTree("{$or: [{a: 1, c: 1}, {a: 1, b: 1}]}", "{$or: [{a: 1, b: 1}, {a: 1, c: 1}]}");
+    }
+
+    // Test that an AND with 2 children sorts before an AND with 3 children, if the first 2 children
+    // are equivalent in both.
+    TEST(CanonicalQueryTest, SortTreeNumChildrenComparison) {
+        testSortTree("{$or: [{a: 1, b: 1, c: 1}, {a: 1, b: 1}]}",
+                     "{$or: [{a: 1, b: 1}, {a: 1, b: 1, c: 1}]}");
+    }
+
+    //
+    // Tests for CanonicalQuery::logicalRewrite
+    //
+
     /**
      * Utility function to create a CanonicalQuery
      */
@@ -439,39 +541,6 @@ namespace {
         ASSERT_OK(result);
         return cq;
     }
-
-   /**
-    * Utility function to create MatchExpression
-    */
-    MatchExpression* parseMatchExpression(const BSONObj& obj) {
-        StatusWithMatchExpression status = MatchExpressionParser::parse(obj);
-        if (!status.isOK()) {
-            mongoutils::str::stream ss;
-            ss << "failed to parse query: " << obj.toString()
-               << ". Reason: " << status.getStatus().toString();
-            FAIL(ss);
-        }
-        MatchExpression* expr(status.getValue());
-        return expr;
-    }
-
-    void assertEquivalent(const char* queryStr,
-                          const MatchExpression* expected,
-                          const MatchExpression* actual) {
-        if (actual->equivalent(expected)) {
-            return;
-        }
-        mongoutils::str::stream ss;
-        ss << "Match expressions are not equivalent."
-           << "\nOriginal query: " << queryStr
-           << "\nExpected: " << expected->toString()
-           << "\nActual: " << actual->toString();
-        FAIL(ss);
-    }
-
-    //
-    // Tests for CanonicalQuery::logicalRewrite
-    //
 
     // Don't do anything with a double OR.
     TEST(CanonicalQueryTest, RewriteNoDoubleOr) {
@@ -528,110 +597,6 @@ namespace {
         // $and absorbs $and children.
         testNormalizeQuery("{$and: [{$and: [{a: 1}, {b: 1}]}, {c: 1}]}",
                            "{$and: [{a: 1}, {b: 1}, {c: 1}]}");
-    }
-
-    /**
-     * Test functions for getPlanCacheKey.
-     * Cache keys are intentionally obfuscated and are meaningful only
-     * within the current lifetime of the server process. Users should treat
-     * plan cache keys as opaque.
-     */
-    void testGetPlanCacheKey(const char* queryStr, const char* sortStr,
-                             const char* projStr,
-                             const char *expectedStr) {
-        auto_ptr<CanonicalQuery> cq(canonicalize(queryStr, sortStr, projStr));
-        const PlanCacheKey& key = cq->getPlanCacheKey();
-        PlanCacheKey expectedKey(expectedStr);
-        if (key == expectedKey) {
-            return;
-        }
-        mongoutils::str::stream ss;
-        ss << "Unexpected plan cache key. Expected: " << expectedKey << ". Actual: " << key
-           << ". Query: " << cq->toString();
-        FAIL(ss);
-    }
-
-    TEST(PlanCacheTest, GetPlanCacheKey) {
-        // Generated cache keys should be treated as opaque to the user.
-
-        // No sorts
-        testGetPlanCacheKey("{}", "{}", "{}", "an");
-        testGetPlanCacheKey("{$or: [{a: 1}, {b: 2}]}", "{}", "{}", "or[eqa,eqb]");
-        testGetPlanCacheKey("{$or: [{a: 1}, {b: 1}, {c: 1}], d: 1}", "{}", "{}",
-                            "an[or[eqa,eqb,eqc],eqd]");
-        testGetPlanCacheKey("{$or: [{a: 1}, {b: 1}], c: 1, d: 1}", "{}", "{}",
-                            "an[or[eqa,eqb],eqc,eqd]");
-        testGetPlanCacheKey("{a: 1, b: 1, c: 1}", "{}", "{}", "an[eqa,eqb,eqc]");
-        testGetPlanCacheKey("{a: 1, beqc: 1}", "{}", "{}", "an[eqa,eqbeqc]");
-        testGetPlanCacheKey("{ap1a: 1}", "{}", "{}", "eqap1a");
-        testGetPlanCacheKey("{aab: 1}", "{}", "{}", "eqaab");
-
-        // With sort
-        testGetPlanCacheKey("{}", "{a: 1}", "{}", "an~aa");
-        testGetPlanCacheKey("{}", "{a: -1}", "{}", "an~da");
-        testGetPlanCacheKey("{}", "{a: {$meta: 'textScore'}}", "{a: {$meta: 'textScore'}}",
-                            "an~ta|{ $meta: \"textScore\" }a");
-        testGetPlanCacheKey("{a: 1}", "{b: 1}", "{}", "eqa~ab");
-
-        // With projection
-        testGetPlanCacheKey("{}", "{}", "{a: 1}", "an|1a");
-        testGetPlanCacheKey("{}", "{}", "{a: 0}", "an|0a");
-        testGetPlanCacheKey("{}", "{}", "{a: 99}", "an|99a");
-        testGetPlanCacheKey("{}", "{}", "{a: 'foo'}", "an|\"foo\"a");
-        testGetPlanCacheKey("{}", "{}", "{a: {$slice: [3, 5]}}", "an|{ $slice: \\[ 3\\, 5 \\] }a");
-        testGetPlanCacheKey("{}", "{}", "{a: {$elemMatch: {x: 2}}}",
-                            "an|{ $elemMatch: { x: 2 } }a");
-        testGetPlanCacheKey("{a: 1}", "{}", "{'a.$': 1}", "eqa|1a.$");
-        testGetPlanCacheKey("{a: 1}", "{}", "{a: 1}", "eqa|1a");
-
-        // Projection should be order-insensitive
-        testGetPlanCacheKey("{}", "{}", "{a: 1, b: 1}", "an|1a1b");
-        testGetPlanCacheKey("{}", "{}", "{b: 1, a: 1}", "an|1a1b");
-
-        // With or-elimination and projection
-        testGetPlanCacheKey("{$or: [{a: 1}]}", "{}", "{_id: 0, a: 1}", "eqa|0_id1a");
-        testGetPlanCacheKey("{$or: [{a: 1}]}", "{}", "{'a.$': 1}", "eqa|1a.$");
-    }
-
-    // Delimiters found in user field names or non-standard projection field values
-    // must be escaped.
-    TEST(PlanCacheTest, GetPlanCacheKeyEscaped) {
-        // Field name in query.
-        testGetPlanCacheKey("{'a,[]~|': 1}", "{}", "{}", "eqa\\,\\[\\]\\~\\|");
-
-        // Field name in sort.
-        testGetPlanCacheKey("{}", "{'a,[]~|': 1}", "{}", "an~aa\\,\\[\\]\\~\\|");
-
-        // Field name in projection.
-        testGetPlanCacheKey("{}", "{}", "{'a,[]~|': 1}", "an|1a\\,\\[\\]\\~\\|");
-
-        // Value in projection.
-        testGetPlanCacheKey("{}", "{}", "{a: 'foo,[]~|'}", "an|\"foo\\,\\[\\]\\~\\|\"a");
-    }
-
-    // Cache keys for $geoWithin queries with legacy and GeoJSON coordinates should
-    // not be the same.
-    TEST(PlanCacheTest, GetPlanCacheKeyGeoWithin) {
-        // Legacy coordinates.
-        auto_ptr<CanonicalQuery> cqLegacy(canonicalize("{a: {$geoWithin: "
-                                                       "{$box: [[-180, -90], [180, 90]]}}}"));
-        // GeoJSON coordinates.
-        auto_ptr<CanonicalQuery> cqNew(canonicalize("{a: {$geoWithin: "
-                                                    "{$geometry: {type: 'Polygon', coordinates: "
-                                                    "[[[0, 0], [0, 90], [90, 0], [0, 0]]]}}}}"));
-        ASSERT_NOT_EQUALS(cqLegacy->getPlanCacheKey(), cqNew->getPlanCacheKey());
-    }
-
-    // GEO_NEAR cache keys should include information on geometry and CRS in addition
-    // to the match type and field name.
-    TEST(PlanCacheTest, GetPlanCacheKeyGeoNear) {
-        testGetPlanCacheKey("{a: {$near: [0,0], $maxDistance:0.3 }}", "{}", "{}",
-                            "gnanrfl");
-        testGetPlanCacheKey("{a: {$nearSphere: [0,0], $maxDistance: 0.31 }}", "{}", "{}",
-                            "gnanssp");
-        testGetPlanCacheKey("{a: {$geoNear: {$geometry: {type: 'Point', coordinates: [0,0]},"
-                            "$maxDistance:100}}}", "{}", "{}",
-                            "gnanrsp");
     }
 
 }

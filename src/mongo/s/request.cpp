@@ -35,9 +35,10 @@
 #include "mongo/s/request.h"
 
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/s/client_info.h"
+#include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/strategy.h"
@@ -50,41 +51,38 @@ namespace mongo {
     using std::string;
 
     Request::Request(Message& m, AbstractMessagingPort* p)
-        : _clientInfo(ClientInfo::get()),
+        : _clientInfo(&cc()),
           _m(m),
           _d(m),
           _p(p),
           _id(_m.header().getId()),
           _didInit(false) {
 
-        if (p) {
-            _clientInfo->newPeerRequest(p->remote());
-        }
-        else {
-            _clientInfo->newRequest();
-        }
+        ClusterLastErrorInfo::get(_clientInfo).newRequest();
     }
 
     void Request::init() {
-        if ( _didInit )
-            return;
-        _didInit = true;
-        reset();
-        _clientInfo->getAuthorizationSession()->startRequest(NULL);
-    }
-
-    // Deprecated, will move to the strategy itself
-    void Request::reset() {
-        _m.header().setId(_id);
-        _clientInfo->clearRequestInfo();
-
-        if ( !_d.messageShouldHaveNs()) {
+        if (_didInit) {
             return;
         }
 
-        uassert( 13644 , "can't use 'local' database through mongos" , ! str::startsWith( getns() , "local." ) );
+        _m.header().setId(_id);
+        ClusterLastErrorInfo::get(_clientInfo).clearRequestInfo();
 
-        grid.getDBConfig( getns() );
+        if (_d.messageShouldHaveNs()) {
+            const NamespaceString nss(getns());
+
+            uassert(ErrorCodes::IllegalOperation,
+                    "can't use 'local' database through mongos",
+                    nss.db() != "local");
+
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << "Invalid ns [" << nss.ns() << "]",
+                    nss.isValid());
+        }
+
+        AuthorizationSession::get(_clientInfo)->startRequest(NULL);
+        _didInit = true;
     }
 
     void Request::process( int attempt ) {
@@ -92,7 +90,7 @@ namespace mongo {
         int op = _m.operation();
         verify( op > dbMsg );
 
-        int msgId = (int)(_m.header().getId());
+        const MSGID msgId = _m.header().getId();
 
         Timer t;
         LOG(3) << "Request::process begin ns: " << getns()

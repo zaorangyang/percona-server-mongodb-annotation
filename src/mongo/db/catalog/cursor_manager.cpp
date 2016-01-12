@@ -39,7 +39,7 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/platform/random.h"
@@ -210,7 +210,7 @@ namespace mongo {
 
         // Check if we are authorized to erase this cursor.
         if (checkAuth) {
-            AuthorizationSession* as = txn->getClient()->getAuthorizationSession();
+            AuthorizationSession* as = AuthorizationSession::get(txn->getClient());
             Status authorizationStatus = as->checkAuthForKillCursors(nss, id);
             if (!authorizationStatus.isOK()) {
                 audit::logKillCursorsAuthzCheck(txn->getClient(),
@@ -298,7 +298,7 @@ namespace mongo {
         ConstDataCursor ids(_ids);
         int numDeleted = 0;
         for ( int i = 0; i < n; i++ ) {
-            if ( eraseCursorGlobalIfAuthorized(txn, ids.readLEAndAdvance<int64_t>()))
+            if ( eraseCursorGlobalIfAuthorized(txn, ids.readAndAdvance<LittleEndian<int64_t>>()))
                 numDeleted++;
             if ( inShutdown() )
                 break;

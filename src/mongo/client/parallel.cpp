@@ -42,6 +42,7 @@
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
@@ -269,7 +270,7 @@ namespace mongo {
     }
 
     // LEGACY Constructor
-    ParallelSortClusteredCursor::ParallelSortClusteredCursor( const set<ServerAndQuery>& servers , const string& ns ,
+    ParallelSortClusteredCursor::ParallelSortClusteredCursor( const set<string>& servers , const string& ns ,
             const Query& q ,
             int options , const BSONObj& fields  )
         : _servers( servers ) {
@@ -520,31 +521,37 @@ namespace mongo {
         forceReload = tries > 2;
     }
 
-    void ParallelSortClusteredCursor::_handleStaleNS( const NamespaceString& staleNS, bool forceReload, bool fullReload ){
+    void ParallelSortClusteredCursor::_handleStaleNS(const NamespaceString& staleNS,
+                                                     bool forceReload,
+                                                     bool fullReload) {
 
-        DBConfigPtr config = grid.getDBConfig( staleNS.db() );
+        auto status = grid.catalogCache()->getDatabase(staleNS.db().toString());
+        if (!status.isOK()) {
+            warning() << "cannot reload database info for stale namespace " << staleNS;
+            return;
+        }
+
+        shared_ptr<DBConfig> config = status.getValue();
 
         // Reload db if needed, make sure it works
-        if( config && fullReload && ! config->reload() ){
-            // We didn't find the db after the reload, the db may have been dropped,
-            // reset this ptr
+        if (fullReload && !config->reload()) {
+            // We didn't find the db after reload, the db may have been dropped, reset this ptr
             config.reset();
         }
 
-        if( ! config ){
-            warning() << "cannot reload database info for stale namespace " << staleNS << endl;
+        if (!config) {
+            warning() << "cannot reload database info for stale namespace " << staleNS;
         }
         else {
             // Reload chunk manager, potentially forcing the namespace
-            config->getChunkManagerIfExists( staleNS, true, forceReload );
+            config->getChunkManagerIfExists(staleNS, true, forceReload);
         }
-
     }
 
     void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(
         PCStatePtr state,
         const Shard& shard,
-        ShardPtr primary,
+        boost::shared_ptr<Shard> primary,
         const NamespaceString& ns,
         const string& vinfo,
         ChunkManagerPtr manager ) {
@@ -631,12 +638,11 @@ namespace mongo {
     }
     
     void ParallelSortClusteredCursor::startInit() {
+        const bool returnPartial = (_qSpec.options() & QueryOption_PartialResults);
+        const NamespaceString ns(!_cInfo.isEmpty() ? _cInfo.versionedNS : _qSpec.ns());
 
-        const bool returnPartial = ( _qSpec.options() & QueryOption_PartialResults );
-        NamespaceString ns( !_cInfo.isEmpty() ? _cInfo.versionedNS : _qSpec.ns() );
-
-        ChunkManagerPtr manager;
-        ShardPtr primary;
+        shared_ptr<ChunkManager> manager;
+        shared_ptr<Shard> primary;
 
         string prefix;
         if (MONGO_unlikely(shouldLog(pc))) {
@@ -649,35 +655,40 @@ namespace mongo {
         }
         LOG( pc ) << prefix << " pcursor over " << _qSpec << " and " << _cInfo << endl;
 
-        set<Shard> todoStorage;
-        set<Shard>& todo = todoStorage;
+        set<Shard> shardsSet;
         string vinfo;
 
-        DBConfigPtr config = grid.getDBConfig( ns.db() ); // Gets or loads the config
-        uassert( 15989, "database not found for parallel cursor request", config );
+        {
+            shared_ptr<DBConfig> config;
 
-        // Try to get either the chunk manager or the primary shard
-        config->getChunkManagerOrPrimary( ns, manager, primary );
-
-        if (MONGO_unlikely(shouldLog(pc))) {
-            if (manager) {
-                vinfo = str::stream() << "[" << manager->getns() << " @ "
-                    << manager->getVersion().toString() << "]";
-            }
-            else {
-                vinfo = str::stream() << "[unsharded @ "
-                    << primary->toString() << "]";
+            auto status = grid.catalogCache()->getDatabase(ns.db().toString());
+            if (status.isOK()) {
+                config = status.getValue();
+                config->getChunkManagerOrPrimary(ns, manager, primary);
             }
         }
 
-        if( manager ) manager->getShardsForQuery( todo, !_cInfo.isEmpty() ? _cInfo.cmdFilter : _qSpec.filter() );
-        else if( primary ) todo.insert( *primary );
+        if (manager) {
+            if (MONGO_unlikely(shouldLog(pc))) {
+                vinfo = str::stream() << "[" << manager->getns() << " @ "
+                                      << manager->getVersion().toString() << "]";
+            }
+
+            manager->getShardsForQuery(shardsSet,
+                                       !_cInfo.isEmpty() ? _cInfo.cmdFilter : _qSpec.filter());
+        }
+        else if (primary) {
+            if (MONGO_unlikely(shouldLog(pc))) {
+                vinfo = str::stream() << "[unsharded @ " << primary->toString() << "]";
+            }
+
+            shardsSet.insert(*primary);
+        }
 
         // Close all cursors on extra shards first, as these will be invalid
         for (map<Shard, PCMData>::iterator i = _cursorMap.begin(), end = _cursorMap.end(); i != end;
             ++i) {
-            if (todo.find(i->first) == todo.end()) {
-
+            if (shardsSet.find(i->first) == shardsSet.end()) {
                 LOG( pc ) << "closing cursor on shard " << i->first
                           << " as the connection is no longer required by " << vinfo << endl;
 
@@ -685,29 +696,24 @@ namespace mongo {
             }
         }
 
-        verify( todo.size() );
-
-        LOG( pc ) << "initializing over " << todo.size()
-            << " shards required by " << vinfo << endl;
+        LOG(pc) << "initializing over " << shardsSet.size()
+                << " shards required by " << vinfo;
 
         // Don't retry indefinitely for whatever reason
         _totalTries++;
         uassert( 15986, "too many retries in total", _totalTries < 10 );
 
-        for( set<Shard>::iterator i = todo.begin(), end = todo.end(); i != end; ++i ){
-
+        for (set<Shard>::iterator i = shardsSet.begin(), end = shardsSet.end(); i != end; ++i) {
             const Shard& shard = *i;
             PCMData& mdata = _cursorMap[ shard ];
 
             LOG( pc ) << "initializing on shard " << shard
-                << ", current connection state is " << mdata.toBSON() << endl;
+                      << ", current connection state is " << mdata.toBSON() << endl;
 
             // This may be the first time connecting to this shard, if so we can get an error here
             try {
-
-                if( mdata.initialized ){
-
-                    verify( mdata.pcState );
+                if (mdata.initialized) {
+                    invariant(mdata.pcState);
 
                     PCStatePtr state = mdata.pcState;
 
@@ -759,7 +765,7 @@ namespace mongo {
                     // shard version must have changed on the single shard between queries.
                     //
 
-                    if (todo.size() > 1) {
+                    if (shardsSet.size() > 1) {
 
                         // Query limits split for multiple shards
 
@@ -895,24 +901,39 @@ namespace mongo {
         }
 
         // Sanity check final init'ed connections
-        for( map< Shard, PCMData >::iterator i = _cursorMap.begin(), end = _cursorMap.end(); i != end; ++i ){
-
+        for (map<Shard, PCMData>::iterator i = _cursorMap.begin(), end = _cursorMap.end();
+             i != end;
+             ++i) {
             const Shard& shard = i->first;
             PCMData& mdata = i->second;
 
-            if( ! mdata.pcState ) continue;
+            if (!mdata.pcState) {
+                continue;
+            }
 
             // Make sure all state is in shards
-            verify( todo.find( shard ) != todo.end() );
-            verify( mdata.initialized == true );
-            if( ! mdata.completed ) verify( mdata.pcState->conn->ok() );
-            verify( mdata.pcState->cursor );
-            verify( mdata.pcState->primary || mdata.pcState->manager );
-            verify( ! mdata.retryNext );
+            invariant(shardsSet.find(shard) != shardsSet.end());
+            invariant(mdata.initialized == true);
 
-            if( mdata.completed ) verify( mdata.finished );
-            if( mdata.finished ) verify( mdata.initialized );
-            if( ! returnPartial ) verify( mdata.initialized );
+            if (!mdata.completed) {
+                invariant(mdata.pcState->conn->ok());
+            }
+
+            invariant(mdata.pcState->cursor);
+            invariant(mdata.pcState->primary || mdata.pcState->manager);
+            invariant(!mdata.retryNext);
+
+            if (mdata.completed) {
+                invariant(mdata.finished);
+            }
+
+            if (mdata.finished) {
+                invariant(mdata.initialized);
+            }
+
+            if (!returnPartial) {
+                invariant(mdata.initialized);
+            }
         }
 
     }
@@ -1114,7 +1135,7 @@ namespace mongo {
             PCMData& mdata = i->second;
 
             _cursors[ index ].reset( mdata.pcState->cursor.get(), &mdata );
-            _servers.insert( ServerAndQuery( i->first.getConnString(), BSONObj() ) );
+            _servers.insert(i->first.getConnString());
 
             index++;
         }
@@ -1137,8 +1158,8 @@ namespace mongo {
         return _cursorMap.size();
     }
 
-    ShardPtr ParallelSortClusteredCursor::getQueryShard() {
-        return ShardPtr(new Shard(_cursorMap.begin()->first));
+    boost::shared_ptr<Shard> ParallelSortClusteredCursor::getQueryShard() {
+        return boost::shared_ptr<Shard>(new Shard(_cursorMap.begin()->first));
     }
 
     void ParallelSortClusteredCursor::getQueryShards(set<Shard>& shards) {
@@ -1148,9 +1169,9 @@ namespace mongo {
         }
     }
 
-    ShardPtr ParallelSortClusteredCursor::getPrimary() {
+    boost::shared_ptr<Shard> ParallelSortClusteredCursor::getPrimary() {
         if (isSharded())
-            return ShardPtr();
+            return boost::shared_ptr<Shard>();
         return _cursorMap.begin()->second.pcState->primary;
     }
 
@@ -1170,45 +1191,15 @@ namespace mongo {
         else return i->second.pcState->cursor;
     }
 
-    static BSONObj _concatFilter( const BSONObj& filter , const BSONObj& extra ) {
-        BSONObjBuilder b;
-        b.appendElements( filter );
-        b.appendElements( extra );
-        return b.obj();
-        // TODO: should do some simplification here if possibl ideally
-    }
-
-    static BSONObj concatQuery( const BSONObj& query , const BSONObj& extraFilter ) {
-        if ( ! query.hasField( "query" ) )
-            return _concatFilter( query , extraFilter );
-
-        BSONObjBuilder b;
-        BSONObjIterator i( query );
-        while ( i.more() ) {
-            BSONElement e = i.next();
-
-            if ( strcmp( e.fieldName() , "query" ) ) {
-                b.append( e );
-                continue;
-            }
-
-            b.append( "query" , _concatFilter( e.embeddedObjectUserCheck() , extraFilter ) );
-        }
-        return b.obj();
-    }
-
-    // DEPRECATED
+    // DEPRECATED (but still used by map/reduce)
     void ParallelSortClusteredCursor::_oldInit() {
-
-        // log() << "Starting parallel search..." << endl;
-
         // make sure we're not already initialized
         verify( ! _cursors );
         _cursors = new DBClientCursorHolder[_numServers];
 
         bool returnPartial = ( _options & QueryOption_PartialResults );
 
-        vector<ServerAndQuery> queries( _servers.begin(), _servers.end() );
+        vector<string> serverHosts(_servers.begin(), _servers.end());
         set<int> retryQueries;
         int finishedQueries = 0;
 
@@ -1232,35 +1223,34 @@ namespace mongo {
 
             if( ! firstPass ){
                 log() << "retrying " << ( returnPartial ? "(partial) " : "" ) << "parallel connection to ";
-                for( set<int>::iterator it = retryQueries.begin(); it != retryQueries.end(); ++it ){
-                    log() << queries[*it]._server << ", ";
+                for (set<int>::const_iterator it = retryQueries.begin();
+                     it != retryQueries.end();
+                     ++it) {
+
+                    log() << serverHosts[*it] << ", ";
                 }
                 log() << finishedQueries << " finished queries." << endl;
             }
 
             size_t num = 0;
-            for ( vector<ServerAndQuery>::iterator it = queries.begin(); it != queries.end(); ++it ) {
+            for (vector<string>::const_iterator it = serverHosts.begin();
+                 it != serverHosts.end();
+                 ++it) {
+
                 size_t i = num++;
 
-                const ServerAndQuery& sq = *it;
+                const string& serverHost = *it;
 
                 // If we're not retrying this cursor on later passes, continue
                 if( ! firstPass && retryQueries.find( i ) == retryQueries.end() ) continue;
 
-                // log() << "Querying " << _query << " from " << _ns << " for " << sq._server << endl;
-
-                BSONObj q = _query;
-                if ( ! sq._extra.isEmpty() ) {
-                    q = concatQuery( q , sq._extra );
-                }
-
-                string errLoc = " @ " + sq._server;
+                const string errLoc = " @ " + serverHost;
 
                 if( firstPass ){
 
                     // This may be the first time connecting to this shard, if so we can get an error here
                     try {
-                        conns.push_back( shared_ptr<ShardConnection>( new ShardConnection( sq._server , _ns ) ) );
+                        conns.push_back(shared_ptr<ShardConnection>(new ShardConnection(serverHost, _ns)));
                     }
                     catch( std::exception& e ){
                         socketExs.push_back( e.what() + errLoc );
@@ -1272,7 +1262,7 @@ namespace mongo {
                         continue;
                     }
 
-                    servers.push_back( sq._server );
+                    servers.push_back(serverHost);
                 }
 
                 if ( conns[i]->setVersion() ) {
@@ -1289,11 +1279,12 @@ namespace mongo {
                     break;
                 }
 
-                LOG(5) << "ParallelSortClusteredCursor::init server:" << sq._server << " ns:" << _ns
-                       << " query:" << q << " _fields:" << _fields << " options: " << _options  << endl;
+                LOG(5) << "ParallelSortClusteredCursor::init server:" << serverHost
+                       << " ns:" << _ns << " query:" << _query << " fields:" << _fields
+                       << " options: " << _options;
 
                 if( ! _cursors[i].get() )
-                    _cursors[i].reset( new DBClientCursor( conns[i]->get() , _ns , q ,
+                    _cursors[i].reset( new DBClientCursor( conns[i]->get() , _ns , _query,
                                                             0 , // nToReturn
                                                             0 , // nToSkip
                                                             _fields.isEmpty() ? 0 : &_fields , // fieldsToReturn
@@ -1324,9 +1315,7 @@ namespace mongo {
             // TODO:  Better error classification would make this easier, errors are indicated in all sorts of ways
             // here that we need to trap.
             for ( size_t i = 0; i < num; i++ ) {
-
-                // log() << "Finishing query for " << cons[i].get()->getHost() << endl;
-                string errLoc = " @ " + queries[i]._server;
+                const string errLoc = " @ " + serverHosts[i];
 
                 if( ! _cursors[i].get() || ( ! firstPass && retryQueries.find( i ) == retryQueries.end() ) ){
                     if( conns[i] ) conns[i].get()->done();

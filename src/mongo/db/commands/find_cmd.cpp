@@ -39,9 +39,10 @@
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/cursor_responses.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/get_executor.h"
@@ -85,7 +86,7 @@ namespace mongo {
         Status checkAuthForCommand(ClientBasic* client,
                                    const std::string& dbname,
                                    const BSONObj& cmdObj) override {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
             if (authzSession->isAuthorizedForActionsOnResource(pattern, ActionType::find)) {
@@ -174,8 +175,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  std::string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) override {
+                 BSONObjBuilder& result) override {
             const std::string fullns = parseNs(dbname, cmdObj);
             const NamespaceString nss(fullns);
 
@@ -185,8 +185,7 @@ namespace mongo {
             if (txn->getClient()->isInDirectClient()) {
                 return appendCommandStatus(result,
                                            Status(ErrorCodes::IllegalOperation,
-                                                  "Cannot run find command from "
-                                                  "inside DBDirectClient"));
+                                                  "Cannot run find command from eval()"));
             }
 
             // 1a) Parse the command BSON to a LiteParsedQuery.
@@ -265,7 +264,7 @@ namespace mongo {
                 const CursorId cursorId = 0;
                 endQueryOp(execHolder.get(), dbProfilingLevel, numResults, cursorId,
                            txn->getCurOp());
-                Command::appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
+                appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
                 return true;
             }
 
@@ -336,7 +335,7 @@ namespace mongo {
                     // subsequent getMore requests. The calling OpCtx gets a fresh RecoveryUnit.
                     txn->recoveryUnit()->commitAndRestart();
                     cursor->setOwnedRecoveryUnit(txn->releaseRecoveryUnit());
-                    StorageEngine* engine = getGlobalEnvironment()->getGlobalStorageEngine();
+                    StorageEngine* engine = getGlobalServiceContext()->getGlobalStorageEngine();
                     txn->setRecoveryUnit(engine->newRecoveryUnit());
                 }
             }
@@ -348,7 +347,7 @@ namespace mongo {
             endQueryOp(exec, dbProfilingLevel, numResults, cursorId, txn->getCurOp());
 
             // 7) Generate the response object to send to the client.
-            Command::appendCursorResponseObject(cursorId, nss.ns(), firstBatch.arr(), &result);
+            appendCursorResponseObject(cursorId, nss.ns(), firstBatch.arr(), &result);
             if (cursorId) {
                 cursorFreer.Dismiss();
             }

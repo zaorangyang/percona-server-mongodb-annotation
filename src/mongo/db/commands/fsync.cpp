@@ -30,6 +30,7 @@
 
 #include "mongo/db/commands/fsync.h"
 
+#include <boost/thread/condition.hpp>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -46,7 +47,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/client.h"
@@ -74,7 +75,6 @@ namespace mongo {
             catch ( std::exception& e ) {
                 error() << "FSyncLockThread exception: " << e.what() << endl;
             }
-            cc().shutdown();
         }
     };
 
@@ -104,7 +104,12 @@ namespace mongo {
             actions.addAction(ActionType::fsync);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
 
             if (txn->lockState()->isLocked()) {
                 errmsg = "fsync: Cannot execute fsync command from contexts that hold a data lock";
@@ -152,7 +157,7 @@ namespace mongo {
 
                 // Take a global IS lock to ensure the storage engine is not shutdown
                 Lock::GlobalLock global(txn->lockState(), MODE_IS, UINT_MAX);
-                StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+                StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
                 result.append( "numFiles" , storageEngine->flushAllFiles( sync ) );
             }
             return 1;
@@ -178,7 +183,7 @@ namespace mongo {
                                    const std::string& dbname,
                                    const BSONObj& cmdObj) override {
 
-            bool isAuthorized = client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            bool isAuthorized = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                                     ResourcePattern::forClusterResource(),
                                     ActionType::unlock);
 
@@ -190,8 +195,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  std::string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) override {
+                 BSONObjBuilder& result) override {
 
             log() << "command: unlock requested";
 
@@ -233,7 +237,7 @@ namespace mongo {
         txn.lockState()->downgradeGlobalXtoSForMMAPV1();
 
         try {
-            StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+            StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
             storageEngine->flushAllFiles(true);
         }
         catch( std::exception& e ) {

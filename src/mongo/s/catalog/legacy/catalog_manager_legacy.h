@@ -31,8 +31,10 @@
 #include <string>
 #include <vector>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/dist_lock_manager.h"
 
 namespace mongo {
 
@@ -48,25 +50,68 @@ namespace mongo {
          * Initializes the catalog manager with the hosts, which will be used as a configuration
          * server. Can only be called once for the lifetime.
          */
-        Status init(const std::vector<std::string>& configHosts);
+        Status init(const ConnectionString& configCS);
+
+        virtual void shutDown() override;
 
         virtual Status enableSharding(const std::string& dbName);
+
+        virtual Status shardCollection(const std::string& ns,
+                                       const ShardKeyPattern& fieldsAndOrder,
+                                       bool unique,
+                                       std::vector<BSONObj>* initPoints,
+                                       std::vector<Shard>* initShards);
 
         virtual StatusWith<std::string> addShard(const std::string& name,
                                                  const ConnectionString& shardConnectionString,
                                                  const long long maxSize);
 
+        virtual StatusWith<ShardDrainingStatus> removeShard(OperationContext* txn,
+                                                            const std::string& name);
+
+        virtual Status createDatabase(const std::string& dbName, const Shard* shard);
+
         virtual Status updateDatabase(const std::string& dbName, const DatabaseType& db);
 
         virtual StatusWith<DatabaseType> getDatabase(const std::string& dbName);
+
+        virtual Status updateCollection(const std::string& collNs, const CollectionType& coll);
+
+        virtual StatusWith<CollectionType> getCollection(const std::string& collNs);
+
+        virtual Status getCollections(const std::string* dbName,
+                                      std::vector<CollectionType>* collections);
+
+        virtual Status dropCollection(const std::string& collectionNs);
+
+        virtual void getDatabasesForShard(const std::string& shardName,
+                                          std::vector<std::string>* dbs);
+
+        virtual Status getChunksForShard(const std::string& shardName,
+                                         std::vector<ChunkType>* chunks);
+
+        virtual Status getAllShards(std::vector<ShardType>* shards);
+
+        virtual bool isShardHost(const ConnectionString& shardConnectionString);
+
+        virtual bool doShardsExist();
+
+        virtual Status applyChunkOpsDeprecated(const BSONArray& updateOps,
+                                               const BSONArray& preCondition);
+
+        virtual void logAction(const ActionLogType& actionLog);
 
         virtual void logChange(OperationContext* txn,
                                const std::string& what,
                                const std::string& ns,
                                const BSONObj& detail);
 
+        virtual StatusWith<SettingsType> getGlobalSettings(const std::string& key);
+
         virtual void writeConfigServerDirect(const BatchedCommandRequest& request,
                                              BatchedCommandResponse* response);
+
+        virtual DistLockManager* getDistLockManager() override;
 
     private:
         /**
@@ -81,9 +126,18 @@ namespace mongo {
          */
         StatusWith<std::string> _getNewShardName() const;
 
+        /**
+         * Returns the number of shards recognized by the config servers
+         * in this sharded cluster.
+         * Optional: use query parameter to filter shard count.
+         */
+        size_t _getShardCount(const BSONObj& query = {}) const;
+
         // Parsed config server hosts, as specified on the command line.
         ConnectionString _configServerConnectionString;
         std::vector<ConnectionString> _configServers;
+
+        std::unique_ptr<DistLockManager> _distLockManager;
     };
 
 } // namespace mongo

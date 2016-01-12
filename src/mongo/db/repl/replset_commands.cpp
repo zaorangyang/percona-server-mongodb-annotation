@@ -30,6 +30,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/repl/repl_set_command.h"
+
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/util/bson_extract.h"
@@ -39,12 +41,14 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/initial_sync.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
+#include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
+#include "mongo/db/repl/repl_set_heartbeat_response_v1.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_executor.h"
@@ -59,28 +63,6 @@ namespace repl {
     using std::string;
     using std::stringstream;
 
-    /**
-     * Base class for repl set commands.
-     */
-    class ReplSetCommand : public Command {
-    protected:
-        ReplSetCommand(const char * s, bool show=false) : Command(s, show) { }
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual Status checkAuthForCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
-            ActionSet actions;
-            actions.addAction(ActionType::internal);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forClusterResource(), actions)) {
-                return Status(ErrorCodes::Unauthorized, "Unauthorized");
-            }
-            return Status::OK();
-        }    
-    };
-
     // Testing only, enabled via command-line.
     class CmdReplSetTest : public ReplSetCommand {
     public:
@@ -94,7 +76,12 @@ namespace repl {
             return Status::OK();
         }
         CmdReplSetTest() : ReplSetCommand("replSetTest") { }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             log() << "replSetTest command received: " << cmdObj.toString();
 
             if( cmdObj.hasElement("forceInitialSyncFailure") ) {
@@ -124,7 +111,12 @@ namespace repl {
     class CmdReplSetGetRBID : public ReplSetCommand {
     public:
         CmdReplSetGetRBID() : ReplSetCommand("replSetGetRBID") {}
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
@@ -146,14 +138,19 @@ namespace repl {
                                            const BSONObj& cmdObj) {
             ActionSet actions;
             actions.addAction(ActionType::replSetGetStatus);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
             return Status::OK();
         }
         CmdReplSetGetStatus() : ReplSetCommand("replSetGetStatus", true) { }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             if ( cmdObj["forShell"].trueValue() )
                 lastError.disableForCommand();
 
@@ -178,15 +175,19 @@ namespace repl {
                                            const BSONObj& cmdObj) {
             ActionSet actions;
             actions.addAction(ActionType::replSetGetConfig);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
             return Status::OK();
         } 
         CmdReplSetGetConfig() : ReplSetCommand("replSetGetConfig", true) { }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj,
-                         int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
@@ -286,7 +287,7 @@ namespace {
                                            const BSONObj& cmdObj) {
             ActionSet actions;
             actions.addAction(ActionType::replSetConfigure);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
@@ -295,9 +296,9 @@ namespace {
         virtual bool run(OperationContext* txn,
                          const string& ,
                          BSONObj& cmdObj,
-                         int, string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
 
             BSONObj configObj;
             if( cmdObj["replSetInitiate"].type() == Object ) {
@@ -371,14 +372,19 @@ namespace {
                                            const BSONObj& cmdObj) {
             ActionSet actions;
             actions.addAction(ActionType::replSetConfigure);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
             return Status::OK();
         }
         CmdReplSetReconfig() : ReplSetCommand("replSetReconfig") { }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
@@ -401,7 +407,7 @@ namespace {
 
             WriteUnitOfWork wuow(txn);
             if (status.isOK() && !parsedArgs.force) {
-                getGlobalEnvironment()->getOpObserver()->onOpMessage(
+                getGlobalServiceContext()->getOpObserver()->onOpMessage(
                         txn,
                         BSON("msg" << "Reconfig set" <<
                              "version" << parsedArgs.newConfigObj["version"]));
@@ -427,14 +433,19 @@ namespace {
                                            const BSONObj& cmdObj) {
             ActionSet actions;
             actions.addAction(ActionType::replSetStateChange);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
             return Status::OK();
         }
         CmdReplSetFreeze() : ReplSetCommand("replSetFreeze") { }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
@@ -459,14 +470,19 @@ namespace {
                                            const BSONObj& cmdObj) {
             ActionSet actions;
             actions.addAction(ActionType::replSetStateChange);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
             return Status::OK();
         }
         CmdReplSetStepDown() : ReplSetCommand("replSetStepDown") { }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
@@ -534,14 +550,19 @@ namespace {
                                            const BSONObj& cmdObj) {
             ActionSet actions;
             actions.addAction(ActionType::replSetStateChange);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
             return Status::OK();
         }
         CmdReplSetMaintenance() : ReplSetCommand("replSetMaintenance") { }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
@@ -564,19 +585,19 @@ namespace {
                                            const BSONObj& cmdObj) {
             ActionSet actions;
             actions.addAction(ActionType::replSetStateChange);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
             return Status::OK();
         }        
         CmdReplSetSyncFrom() : ReplSetCommand("replSetSyncFrom") { }
-        virtual bool run(OperationContext* txn, const string&, 
+        virtual bool run(OperationContext* txn,
+                         const string&, 
                          BSONObj& cmdObj, 
                          int, 
                          string& errmsg, 
-                         BSONObjBuilder& result, 
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
@@ -596,8 +617,12 @@ namespace {
     class CmdReplSetUpdatePosition: public ReplSetCommand {
     public:
         CmdReplSetUpdatePosition() : ReplSetCommand("replSetUpdatePosition") { }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg,
-                         BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
@@ -634,7 +659,7 @@ namespace {
      */
     bool replHasDatabases(OperationContext* txn) {
         std::vector<string> names;
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         storageEngine->listDatabases(&names);
 
         if( names.size() >= 2 ) return true;
@@ -659,7 +684,12 @@ namespace {
     class CmdReplSetHeartbeat : public ReplSetCommand {
     public:
         CmdReplSetHeartbeat() : ReplSetCommand("replSetHeartbeat") { }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
 
             MONGO_FAIL_POINT_BLOCK(rsDelayHeartbeatResponse, delay) {
                 const BSONObj& data = delay.getData();
@@ -682,22 +712,36 @@ namespace {
                     mp->tag |= ReplicationExecutor::NetworkInterface::kMessagingPortKeepOpen;
             }
 
-            ReplSetHeartbeatArgs args;
-            status = args.initialize(cmdObj);
-            if (!status.isOK()) {
+            if (getGlobalReplicationCoordinator()->isV1ElectionProtocol()) {
+                ReplSetHeartbeatArgsV1 args;
+                status = args.initialize(cmdObj);
+                if (!status.isOK()) {
+                    return appendCommandStatus(result, status);
+                }
+                ReplSetHeartbeatResponseV1 response;
+                status = getGlobalReplicationCoordinator()->processHeartbeatV1(args, &response);
+                if (status.isOK())
+                    response.addToBSON(&result);
                 return appendCommandStatus(result, status);
             }
+            else {
+                ReplSetHeartbeatArgs args;
+                status = args.initialize(cmdObj);
+                if (!status.isOK()) {
+                    return appendCommandStatus(result, status);
+                }
 
-            // ugh.
-            if (args.getCheckEmpty()) {
-                result.append("hasData", replHasDatabases(txn));
+                // ugh.
+                if (args.getCheckEmpty()) {
+                    result.append("hasData", replHasDatabases(txn));
+                }
+
+                ReplSetHeartbeatResponse response;
+                status = getGlobalReplicationCoordinator()->processHeartbeat(args, &response);
+                if (status.isOK())
+                    response.addToBSON(&result);
+                return appendCommandStatus(result, status);
             }
-
-            ReplSetHeartbeatResponse response;
-            status = getGlobalReplicationCoordinator()->processHeartbeat(args, &response);
-            if (status.isOK())
-                response.addToBSON(&result);
-            return appendCommandStatus(result, status);
         }
     } cmdReplSetHeartbeat;
 
@@ -713,15 +757,14 @@ namespace {
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
 
             ReplicationCoordinator::ReplSetFreshArgs parsedArgs;
             parsedArgs.id = cmdObj["id"].Int();
-            parsedArgs.setName = cmdObj["set"].checkAndGetStringData();
+            parsedArgs.setName = cmdObj["set"].String();
             parsedArgs.who = HostAndPort(cmdObj["who"].String());
             BSONElement cfgverElement = cmdObj["cfgver"];
             uassert(28525,
@@ -729,7 +772,7 @@ namespace {
                     "numeric type, but found " << typeName(cfgverElement.type()),
                     cfgverElement.isNumber());
             parsedArgs.cfgver = cfgverElement.safeNumberLong();
-            parsedArgs.opTime = OpTime(cmdObj["opTime"].Date());
+            parsedArgs.opTime = Timestamp(cmdObj["opTime"].Date());
 
             status = getGlobalReplicationCoordinator()->processReplSetFresh(parsedArgs, &result);
             return appendCommandStatus(result, status);
@@ -745,8 +788,7 @@ namespace {
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
             DEV log() << "received elect msg " << cmdObj.toString();
             else LOG(2) << "received elect msg " << cmdObj.toString();
 
@@ -755,7 +797,7 @@ namespace {
                 return appendCommandStatus(result, status);
 
             ReplicationCoordinator::ReplSetElectArgs parsedArgs;
-            parsedArgs.set = cmdObj["set"].checkAndGetStringData();
+            parsedArgs.set = cmdObj["set"].String();
             parsedArgs.whoid = cmdObj["whoid"].Int();
             BSONElement cfgverElement = cmdObj["cfgver"];
             uassert(28526,

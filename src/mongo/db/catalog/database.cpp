@@ -48,13 +48,14 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/global_environment_d.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage_options.h"
@@ -221,7 +222,7 @@ namespace mongo {
         }
 
         vector<string> others;
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         storageEngine->listDatabases(&others);
 
         set<string> allShortNames;
@@ -272,8 +273,6 @@ namespace mongo {
                     continue;
                 }
 
-                getGlobalEnvironment()->getOpObserver()->onDropCollection(
-                        txn, NamespaceString(ns));
                 wunit.commit();
             }
             catch (const WriteConflictException& exp) {
@@ -351,7 +350,7 @@ namespace mongo {
         _dbEntry->appendExtraStats( opCtx, output, scale );
     }
 
-    Status Database::dropCollection( OperationContext* txn, StringData fullns ) {
+    Status Database::dropCollection(OperationContext* txn, StringData fullns) {
         invariant(txn->lockState()->isDbLockedForMode(name(), MODE_X));
 
         LOG(1) << "dropCollection: " << fullns << endl;
@@ -363,12 +362,12 @@ namespace mongo {
             return Status::OK();
         }
 
+        NamespaceString nss(fullns);
         {
-            NamespaceString s( fullns );
-            verify( s.db() == _name );
+            verify(nss.db() == _name);
 
-            if( s.isSystem() ) {
-                if( s.coll() == "system.profile" ) {
+            if (nss.isSystem()) {
+                if (nss.isSystemDotProfile()) {
                     if ( _profile != 0 )
                         return Status( ErrorCodes::IllegalOperation,
                                        "turn off profiling before dropping system.profile collection" );
@@ -381,7 +380,7 @@ namespace mongo {
 
         BackgroundOperation::assertNoBgOpInProgForNs( fullns );
 
-        audit::logDropCollection( currentClient.get(), fullns );
+        audit::logDropCollection( &cc(), fullns );
 
         Status s = collection->getIndexCatalog()->dropAllIndexes(txn, true);
         if ( !s.isOK() ) {
@@ -393,7 +392,7 @@ namespace mongo {
         verify( collection->_details->getTotalIndexCount( txn ) == 0 );
         LOG(1) << "\t dropIndexes done" << endl;
 
-        Top::global.collectionDropped( fullns );
+        Top::get(txn->getClient()->getServiceContext()).collectionDropped(fullns);
 
         s = _dbEntry->dropCollection( txn, fullns );
 
@@ -417,6 +416,7 @@ namespace mongo {
             }
         }
 
+        getGlobalServiceContext()->getOpObserver()->onDropCollection(txn, nss);
         return Status::OK();
     }
 
@@ -450,7 +450,7 @@ namespace mongo {
                                        StringData toNS,
                                        bool stayTemp ) {
 
-        audit::logRenameCollection( currentClient.get(), fromNS, toNS );
+        audit::logRenameCollection( &cc(), fromNS, toNS );
         invariant(txn->lockState()->isDbLockedForMode(name(), MODE_X));
 
         { // remove anything cached
@@ -466,7 +466,7 @@ namespace mongo {
             _clearCollectionCache( txn, fromNS );
             _clearCollectionCache( txn, toNS );
 
-            Top::global.collectionDropped( fromNS.toString() );
+            Top::get(txn->getClient()->getServiceContext()).collectionDropped(fromNS.toString());
         }
 
         txn->recoveryUnit()->registerChange( new AddCollectionChange(this, toNS) );
@@ -486,7 +486,6 @@ namespace mongo {
     Collection* Database::createCollection( OperationContext* txn,
                                             StringData ns,
                                             const CollectionOptions& options,
-                                            bool allocateDefaultSpace,
                                             bool createIdIndex ) {
         massert( 17399, "collection already exists", getCollection( ns ) == NULL );
         massertNamespaceNotIndex( ns, "createCollection" );
@@ -509,11 +508,11 @@ namespace mongo {
         NamespaceString nss( ns );
         uassert( 17316, "cannot create a blank collection", nss.coll() > 0 );
 
-        audit::logCreateCollection( currentClient.get(), ns );
+        audit::logCreateCollection( &cc(), ns );
 
         txn->recoveryUnit()->registerChange( new AddCollectionChange(this, ns) );
 
-        Status status = _dbEntry->createCollection(txn, ns, options, allocateDefaultSpace);
+        Status status = _dbEntry->createCollection(txn, ns, options, true /*allocateDefaultSpace*/);
         massertNoTraceStatusOK(status);
 
 
@@ -537,6 +536,8 @@ namespace mongo {
 
         }
 
+        getGlobalServiceContext()->getOpObserver()->onCreateCollection(txn, nss, options);
+
         return collection;
     }
 
@@ -549,7 +550,7 @@ namespace mongo {
         Lock::GlobalWrite lk(txn->lockState());
 
         vector<string> n;
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         storageEngine->listDatabases(&n);
 
         if( n.size() == 0 ) return;
@@ -557,10 +558,18 @@ namespace mongo {
 
         for (vector<string>::iterator i = n.begin(); i != n.end(); i++) {
             if (*i != "local") {
-                Database* db = dbHolder().get(txn, *i);
-                invariant(db);
-
-                dropDatabase(txn, db);
+                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                    Database* db = dbHolder().get(txn, *i);
+                    // This is needed since dropDatabase can't be rolled back.
+                    // This is safe be replaced by "invariant(db);dropDatabase(txn, db);" once fixed
+                    if (db == nullptr) {
+                        log() << "database disappeared after listDatabases but before drop: " << *i;
+                    } else {
+                        dropDatabase(txn, db);
+                    }
+                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn,
+                                                      "dropAllDatabasesExceptLocal",
+                                                      *i);
             }
         }
     }
@@ -576,12 +585,12 @@ namespace mongo {
 
         BackgroundOperation::assertNoBgOpInProgForDb(name.c_str());
 
-        audit::logDropDatabase( currentClient.get(), name );
+        audit::logDropDatabase( &cc(), name );
 
         dbHolder().close( txn, name );
         db = NULL; // d is now deleted
 
-        getGlobalEnvironment()->getGlobalStorageEngine()->dropDatabase( txn, name );
+        getGlobalServiceContext()->getGlobalStorageEngine()->dropDatabase( txn, name );
     }
 
     /** { ..., capped: true, size: ..., max: ... }
@@ -592,7 +601,6 @@ namespace mongo {
                          Database* db,
                          StringData ns,
                          BSONObj options,
-                         bool logForReplication,
                          bool createDefaultIndexes ) {
 
         invariant( db );
@@ -619,13 +627,7 @@ namespace mongo {
         if ( !status.isOK() )
             return status;
 
-        invariant( db->createCollection( txn, ns, collectionOptions, true, createDefaultIndexes ) );
-
-        if ( logForReplication ) {
-            getGlobalEnvironment()->getOpObserver()->onCreateCollection(txn,
-                                                                        NamespaceString(ns),
-                                                                        collectionOptions);
-        }
+        invariant(db->createCollection(txn, ns, collectionOptions, createDefaultIndexes));
 
         return Status::OK();
     }

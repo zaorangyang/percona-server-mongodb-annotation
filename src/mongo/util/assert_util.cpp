@@ -29,8 +29,6 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/config.h"
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/assert_util.h"
@@ -42,11 +40,17 @@ using namespace std;
 #include <sys/file.h>
 #endif
 
+#include <boost/exception/diagnostic_information.hpp>
+#include <boost/exception/exception.hpp>
+#include <exception>
+
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/debugger.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/stacktrace.h"
 
@@ -120,7 +124,7 @@ namespace mongo {
         log() << "warning assertion failure " << expr << ' ' << file << ' ' << dec << line << endl;
         logContext();
         assertionCount.condrollover( ++assertionCount.warning );
-#if defined(MONGO_CONFIG_DEBUG_BUILD) || defined(_DURABLEDEFAULTON) || defined(_DURABLEDEFAULTOFF)
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
         // this is so we notice in buildbot
         log() << "\n\n***aborting after wassert() failure in a debug/test build\n\n" << endl;
         quickExit(EXIT_ABRUPT);
@@ -135,7 +139,7 @@ namespace mongo {
         temp << "assertion " << file << ":" << line;
         AssertionException e(temp.str(),0);
         breakpoint();
-#if defined(MONGO_CONFIG_DEBUG_BUILD) || defined(_DURABLEDEFAULTON) || defined(_DURABLEDEFAULTOFF)
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
         // this is so we notice in buildbot
         log() << "\n\n***aborting after verify() failure as this is a debug/test build\n\n" << endl;
         quickExit(EXIT_ABRUPT);
@@ -272,6 +276,34 @@ namespace mongo {
         free(niceName);
         return s;
 #endif
+    }
+
+    Status exceptionToStatus() {
+        try {
+            throw;
+        }
+        catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+        catch (const std::exception& ex) {
+            return Status(ErrorCodes::UnknownError,
+                          str::stream() << "Caught std::exception of type "
+                                        << demangleName(typeid(ex))
+                                        << ": "
+                                        << ex.what());
+        }
+        catch (const boost::exception& ex) {
+            return Status(ErrorCodes::UnknownError,
+                          str::stream() << "Caught boost::exception of type "
+                                        << demangleName(typeid(ex))
+                                        << ": "
+                                        << boost::diagnostic_information(ex));
+
+        }
+        catch (...) {
+            severe() << "Caught unknown exception in exceptionToStatus()";
+            std::terminate();
+        }
     }
 
     string ExceptionInfo::toString() const {

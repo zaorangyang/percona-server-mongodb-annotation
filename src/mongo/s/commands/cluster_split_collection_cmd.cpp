@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/shared_ptr.hpp>
 #include <string>
 #include <vector>
 
@@ -40,13 +41,16 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
+    using boost::shared_ptr;
     using std::string;
     using std::vector;
 
@@ -80,7 +84,7 @@ namespace {
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
 
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                                                         ResourcePattern::forExactNamespace(
                                                             NamespaceString(parseNs(dbname,
                                                                                     cmdObj))),
@@ -99,28 +103,29 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
-
-            if (!configServer.allUp(false, errmsg)) {
-                return false;
-            }
+                         BSONObjBuilder& result) {
 
             ShardConnection::sync();
 
-            const std::string ns = parseNs(dbname, cmdObj);
-            if (ns.size() == 0) {
-                errmsg = "no ns";
-                return false;
+            const NamespaceString nss(parseNs(dbname, cmdObj));
+            if (nss.size() == 0) {
+                return appendCommandStatus(result, Status(ErrorCodes::InvalidNamespace,
+                                                          "no namespace specified"));
             }
 
-            DBConfigPtr config = grid.getDBConfig(ns);
-            if (!config->isSharded(ns)) {
+            auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status.getStatus());
+            }
+
+            boost::shared_ptr<DBConfig> config = status.getValue();
+            if (!config->isSharded(nss.ns())) {
                 config->reload();
 
-                if (!config->isSharded(ns)) {
-                    errmsg = "ns not sharded.  have to shard before can split";
-                    return false;
+                if (!config->isSharded(nss.ns())) {
+                    return appendCommandStatus(result,
+                                               Status(ErrorCodes::NamespaceNotSharded,
+                                                      "ns [" + nss.ns() + " is not sharded."));
                 }
             }
 
@@ -179,7 +184,7 @@ namespace {
             }
 
             // This refreshes the chunk metadata if stale.
-            ChunkManagerPtr info = config->getChunkManager(ns, true);
+            ChunkManagerPtr info = config->getChunkManager(nss.ns(), true);
             ChunkPtr chunk;
 
             if (!find.isEmpty()) {
@@ -255,7 +260,7 @@ namespace {
 
             invariant(chunk.get());
             log() << "splitting chunk [" << chunk->getMin() << "," << chunk->getMax() << ")"
-                  << " in collection " << ns
+                  << " in collection " << nss.ns()
                   << " on shard " << chunk->getShard().getName();
 
             BSONObj res;

@@ -1,13 +1,15 @@
+# -*- mode: python -*-
+
 Import("env")
 Import("has_option")
 
 env.Library(
-    target= 'intrusive_counter',
-    source= [
+    target='intrusive_counter',
+    source=[
         'intrusive_counter.cpp',
         ],
-    LIBDEPS= [
-        '$BUILD_DIR/mongo/foundation',
+    LIBDEPS=[
+        'foundation',
         ]
     )
 
@@ -16,9 +18,137 @@ if has_option("gdbserver"):
     debuggerEnv.Append(CPPDEFINES=["USE_GDBSERVER"])
 
 debuggerEnv.Library(
-    target= 'debugger',
-    source= [
+    target='debugger',
+    source=[
         'debugger.cpp',
         ],
-    LIBDEPS= []
+    LIBDEPS=[]
     )
+
+env.Library(
+    target='decorable',
+    source=[
+        'decoration_container.cpp',
+        'decoration_registry.cpp',
+    ],
+    LIBDEPS=[]
+    )
+
+env.CppUnitTest(
+    target='decorable_test',
+    source=[
+        'decorable_test.cpp'
+        ],
+    LIBDEPS=[
+        'decorable',
+        ]
+    )
+
+env.Library(
+    target='progress_meter',
+    source=[
+        'progress_meter.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/logger/logger',
+    ],
+)
+
+env.CppUnitTest(
+    target='progress_meter_test',
+    source=[
+        'progress_meter_test.cpp',
+    ],
+    LIBDEPS=[
+        'progress_meter',
+    ],
+)
+
+env.Library(
+    target='md5',
+    source=[
+        'md5.cpp',
+        'password_digest.cpp',
+    ],
+)
+
+env.CppUnitTest(
+    target="md5_test",
+    source=[
+        "md5_test.cpp",
+        "md5main.cpp",
+    ],
+    LIBDEPS=[
+        "md5",
+    ],
+)
+
+env.Library(
+    target='foundation',
+    source=[
+        "startup_test.cpp",
+        "touch_pages.cpp",
+        'assert_util.cpp',
+        'concurrency/mutex.cpp',
+        'concurrency/thread_pool.cpp',
+        'exception_filter_win32.cpp',
+        'file.cpp',
+        'log.cpp',
+        'platform_init.cpp',
+        'text.cpp',
+        'thread_safe_string.cpp',
+        'time_support.cpp',
+        'timer.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base/base',
+        '$BUILD_DIR/mongo/logger/logger',
+        '$BUILD_DIR/mongo/platform/platform',
+        '$BUILD_DIR/mongo/stacktrace',
+        '$BUILD_DIR/mongo/util/concurrency/synchronization',
+        '$BUILD_DIR/mongo/util/concurrency/thread_name',
+        '$BUILD_DIR/mongo/util/debugger',
+        '$BUILD_DIR/third_party/shim_allocator',
+        '$BUILD_DIR/third_party/shim_boost',
+        '$BUILD_DIR/third_party/shim_tz',
+    ],
+)
+
+env.CppUnitTest(
+    target='text_test',
+    source=[
+        'text_test.cpp'
+    ],
+    LIBDEPS=[
+        'foundation',
+    ],
+)
+
+env.CppUnitTest(
+    target='time_support_test',
+    source=[
+        'time_support_test.cpp',
+    ],
+    LIBDEPS=[
+        'foundation',
+    ],
+)
+
+env.Library(
+    target='stringutils',
+    source=[
+        'base64.cpp',
+        'hex.cpp',
+        'stringutils.cpp',
+    ],
+)
+
+env.CppUnitTest(
+    target="stringutils_test",
+    source=[
+        "stringutils_test.cpp",
+    ],
+    LIBDEPS=[
+        "stringutils",
+    ],
+)

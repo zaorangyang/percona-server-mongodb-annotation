@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -44,6 +44,7 @@
 #include "mongo/db/namespace_string.h"
 
 namespace mongo {
+    class ClientBasic;
 
     /**
      * Contains all the authorization logic for a single client connection.  It contains a set of
@@ -62,9 +63,35 @@ namespace mongo {
     class AuthorizationSession {
         MONGO_DISALLOW_COPYING(AuthorizationSession);
     public:
+        /**
+         * Gets the AuthorizationSession associated with the given "client", or nullptr.
+         *
+         * The "client" object continues to own the returned AuthorizationSession.
+         */
+        static AuthorizationSession* get(ClientBasic* client);
+
+        /**
+         * Gets the AuthorizationSession associated with the given "client", or nullptr.
+         *
+         * The "client" object continues to own the returned AuthorizationSession.
+         */
+        static AuthorizationSession* get(ClientBasic& client);
+
+        /**
+         * Returns false if AuthorizationSession::get(client) would return nullptr.
+         */
+        static bool exists(ClientBasic* client);
+
+        /**
+         * Sets the AuthorizationSession associated with "client" to "session".
+         *
+         * "session" must not be NULL, and it is only legal to call this function once
+         * on each instance of "client".
+         */
+        static void set(ClientBasic* client, std::unique_ptr<AuthorizationSession> session);
 
         // Takes ownership of the externalState.
-        explicit AuthorizationSession(AuthzSessionExternalState* externalState);
+        explicit AuthorizationSession(std::unique_ptr<AuthzSessionExternalState> externalState);
         ~AuthorizationSession();
 
         AuthorizationManager& getAuthorizationManager();
@@ -232,7 +259,7 @@ namespace mongo {
         // lock on the admin database (to update out-of-date user privilege information).
         bool _isAuthorizedForPrivilege(const Privilege& privilege);
 
-        boost::scoped_ptr<AuthzSessionExternalState> _externalState;
+        std::unique_ptr<AuthzSessionExternalState> _externalState;
 
         // All Users who have been authenticated on this connection.
         UserSet _authenticatedUsers;

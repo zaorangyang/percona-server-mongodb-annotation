@@ -29,6 +29,8 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
@@ -67,10 +69,10 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
-            grid.flushConfig();
+            grid.catalogCache()->invalidateAll();
+
             result.appendBool("flushed", true);
             return true;
         }

@@ -80,7 +80,7 @@ namespace mongo {
             ActionSet actions;
             actions.addAction(ActionType::insert);
             actions.addAction(ActionType::createIndex);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forDatabaseName(dbname), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
@@ -92,8 +92,7 @@ namespace mongo {
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             string from = cmdObj.getStringField("clone");
             if ( from.empty() )
@@ -101,7 +100,6 @@ namespace mongo {
 
             CloneOptions opts;
             opts.fromDB = dbname;
-            opts.logForRepl = ! fromRepl;
             opts.slaveOk = cmdObj["slaveOk"].trueValue();
 
             // See if there's any collections we should ignore

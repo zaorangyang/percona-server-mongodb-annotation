@@ -38,13 +38,13 @@
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/config_server_fixture.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/chunk_diff.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
-#include "mongo/s/type_chunk.h"
-#include "mongo/s/type_collection.h"
-#include "mongo/s/type_shard.h"
 #include "mongo/util/log.h"
 
 namespace ShardingTests {
@@ -57,25 +57,6 @@ namespace ShardingTests {
     using std::set;
     using std::string;
     using std::vector;
-
-    namespace serverandquerytests {
-        class test1 {
-        public:
-            void run() {
-                ServerAndQuery a( "foo:1" , BSON( "a" << GT << 0 << LTE << 100 ) );
-                ServerAndQuery b( "foo:1" , BSON( "a" << GT << 200 << LTE << 1000 ) );
-
-                ASSERT( a < b );
-                ASSERT( ! ( b < a ) );
-
-                set<ServerAndQuery> s;
-                s.insert( a );
-                s.insert( b );
-
-                ASSERT_EQUALS( (unsigned int)2 , s.size() );
-            }
-        };
-    }
 
     static int rand( int max = -1 ){
         static unsigned seed = 1337;
@@ -278,17 +259,15 @@ namespace ShardingTests {
                                                           ChunkType::DEPRECATED_lastmod());
 
             // Make manager load existing chunks
-            BSONObjBuilder collDocBuilder;
-            collDocBuilder << CollectionType::ns(collName());
-            collDocBuilder << CollectionType::keyPattern(BSON( "_id" << 1 ));
-            collDocBuilder << CollectionType::unique(false);
-            collDocBuilder << CollectionType::dropped(false);
-            collDocBuilder << CollectionType::DEPRECATED_lastmod(jsTime());
-            collDocBuilder << CollectionType::DEPRECATED_lastmodEpoch(version.epoch());
+            CollectionType collType;
+            collType.setNs(collName());
+            collType.setEpoch(version.epoch());
+            collType.setUpdatedAt(jsTime());
+            collType.setKeyPattern(BSON("_id" << 1));
+            collType.setUnique(false);
+            collType.setDropped(false);
 
-            BSONObj collDoc(collDocBuilder.done());
-
-            ChunkManager manager(collDoc);
+            ChunkManager manager(collType);
             manager.loadExistingRanges(shard().getConnString(), NULL);
 
             ASSERT(manager.getVersion().epoch() == version.epoch());
@@ -682,7 +661,6 @@ namespace ShardingTests {
         }
 
         void setupTests() {
-            add< serverandquerytests::test1 >();
             add< ChunkManagerCreateBasicTest >();
             add< ChunkManagerCreateFullTest >();
             add< ChunkManagerLoadBasicTest >();

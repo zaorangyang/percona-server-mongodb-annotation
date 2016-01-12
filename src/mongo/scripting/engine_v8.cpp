@@ -36,7 +36,7 @@
 #include <iostream>
 
 #include "mongo/base/init.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/scripting/v8_db.h"
@@ -362,8 +362,8 @@ namespace mongo {
          if (!globalScriptEngine) {
              globalScriptEngine = new V8ScriptEngine();
 
-             if (hasGlobalEnvironment()) {
-                 getGlobalEnvironment()->registerKillOpListener(globalScriptEngine);
+             if (hasGlobalServiceContext()) {
+                 getGlobalServiceContext()->registerKillOpListener(globalScriptEngine);
              }
          }
      }
@@ -1469,7 +1469,7 @@ namespace mongo {
             argv[1] = v8::String::New(ss.str().c_str());
             return BinDataFT()->GetFunction()->NewInstance(2, argv);
         }
-        case mongo::Timestamp: {
+        case mongo::bsonTimestamp: {
             v8::TryCatch tryCatch;
 
             argv[0] = v8::Number::New(elem.timestampTime() / 1000);
@@ -1602,8 +1602,8 @@ namespace mongo {
         } else if (BinDataFT()->HasInstance(value)) {
             v8ToMongoBinData(b, elementName, obj);
         } else if (TimestampFT()->HasInstance(value)) {
-            OpTime ot (obj->Get(strLitToV8("t"))->Uint32Value(),
-                       obj->Get(strLitToV8("i"))->Uint32Value());
+            Timestamp ot (obj->Get(strLitToV8("t"))->Uint32Value(),
+                          obj->Get(strLitToV8("i"))->Uint32Value());
             b.append(elementName, ot);
         } else if (MinKeyFT()->HasInstance(value)) {
             b.appendMinKey(elementName);

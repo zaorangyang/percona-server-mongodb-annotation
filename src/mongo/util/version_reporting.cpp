@@ -29,8 +29,6 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
-#include "mongo/config.h"
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/version_reporting.h"
@@ -40,13 +38,13 @@
 #include <string>
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/config.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/version.h"
-
 
 namespace mongo {
 
@@ -67,11 +65,11 @@ namespace mongo {
     }
 
     BSONArray storageEngineList() {
-        if (!hasGlobalEnvironment())
+        if (!hasGlobalServiceContext())
             return BSONArray();
 
         boost::scoped_ptr<StorageFactoriesIterator> sfi(
-            getGlobalEnvironment()->makeStorageFactoriesIterator());
+            getGlobalServiceContext()->makeStorageFactoriesIterator());
 
         if (!sfi)
             return BSONArray();
@@ -88,12 +86,10 @@ namespace mongo {
 #if defined(_WIN32)
     std::string targetMinOS() {
         stringstream ss;
-#if (NTDDI_VERSION >= 0x06010000)
+#if (NTDDI_VERSION >= NTDDI_WIN7)
         ss << "Windows 7/Windows Server 2008 R2";
-#elif (NTDDI_VERSION >= 0x05020200)
-        ss << "Windows Server 2003 SP2";
-#elif (NTDDI_VERSION >= 0x05010300)
-        ss << "Windows XP SP3";
+#elif (NTDDI_VERSION >= NTDDI_VISTA)
+        ss << "Windows Vista/Windows Server 2008";
 #else
 #error This targetted Windows version is not supported
 #endif // NTDDI_VERSION

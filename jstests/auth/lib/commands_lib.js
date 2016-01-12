@@ -752,6 +752,21 @@ var authCommandsLib = {
             ]
         },
         {
+            testname: "currentOp",
+            command: {currentOp: 1, $all: true},
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: roles_monitoring,
+                    privileges: [
+                       { resource: {cluster: true}, actions: ["inprog"] }
+                    ]
+                },
+                { runOnDb: firstDbName, roles: {} },
+                { runOnDb: secondDbName, roles: {} }
+           ]
+        },
+        {
             testname: "currentOpCtx",
             command: {currentOpCtx: 1},
             skipSharded: true,
@@ -1083,6 +1098,27 @@ var authCommandsLib = {
             ]
         },
         {
+            testname: "find",
+            command: {find: "foo"},
+            skipSharded: true, // TODO: remove when find command is implemented in mongos
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: roles_read,
+                    privileges: [
+                        { resource: {db: firstDbName, collection: "foo"}, actions: ["find"] }
+                    ]
+                },
+                {
+                    runOnDb: secondDbName,
+                    roles: roles_readAny,
+                    privileges: [
+                        { resource: {db: secondDbName, collection: "foo"}, actions: ["find"] }
+                    ]
+                }
+            ]
+        },
+        {
             testname: "findAndModify",
             command: {findAndModify: "x", query: {_id: "abc"}, update: {$inc: {n: 1}}},
             setup: function (db) {
@@ -1252,6 +1288,29 @@ var authCommandsLib = {
             ]
         },
         {
+            testname: "getMore",
+            command: {getMore: NumberLong("1"), collection: "foo"},
+            skipSharded: true, // TODO: remove when getMore command is implemented in mongos
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: roles_read,
+                    privileges: [
+                        { resource: {db: firstDbName, collection: "foo"}, actions: ["find"] }
+                    ],
+                    expectFail: true
+                },
+                {
+                    runOnDb: secondDbName,
+                    roles: roles_readAny,
+                    privileges: [
+                        { resource: {db: secondDbName, collection: "foo"}, actions: ["find"] }
+                    ],
+                    expectFail: true
+                }
+            ]
+        },
+        {
             testname: "getnonce",
             command: {getnonce: 1},
             testcases: [
@@ -1416,6 +1475,39 @@ var authCommandsLib = {
                 { runOnDb: adminDbName, roles: roles_all, privileges: [ ] },
                 { runOnDb: firstDbName, roles: roles_all, privileges: [ ] },
                 { runOnDb: secondDbName, roles: roles_all, privileges: [ ] }
+            ]
+        },
+        {
+            testname: "killOp", // standalone version
+            command: {killOp: 1, op: 123},
+            skipSharded: true,
+            testcases : [
+                {
+                    runOnDb: adminDbName,
+                    roles: roles_hostManager,
+                    privileges: [
+                        { resource: {cluster: true}, actions: ["killop"] }
+                    ]
+                },
+                { runOnDb: firstDbName, roles: {} },
+                { runOnDb: secondDbName, roles: {} }
+            ]
+        },
+        {
+            testname: "killOp", // sharded version
+            command: {killOp: 1, op: "shard1:123"},
+            skipStandalone: true,
+            testcases : [
+                {
+                    runOnDb: adminDbName,
+                    roles: roles_hostManager,
+                    privileges: [
+                        { resource: {cluster: true}, actions: ["killop"] }
+                    ],
+                    expectFail: true // we won't be able to find the shardId
+                },
+                { runOnDb: firstDbName, roles: {} },
+                { runOnDb: secondDbName, roles: {} }
             ]
         },
         {

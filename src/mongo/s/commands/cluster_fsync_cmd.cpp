@@ -29,7 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
-#include "mongo/s/shard.h"
+#include "mongo/s/client/shard.h"
 
 namespace mongo {
 namespace {
@@ -67,8 +67,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             if (cmdObj["lock"].trueValue()) {
                 errmsg = "can't do lock through mongos";

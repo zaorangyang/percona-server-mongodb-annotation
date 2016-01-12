@@ -42,7 +42,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_constants.h"
@@ -197,6 +197,7 @@ namespace mongo {
         // Fill out basic curop query exec properties.
         curop->debug().nreturned = numResults;
         curop->debug().cursorid = (0 == cursorId ? -1 : cursorId);
+        curop->debug().cursorExhausted = (0 == cursorId);
 
         // Fill out curop based on explain summary statistics.
         PlanSummaryStats summaryStats;
@@ -352,7 +353,7 @@ namespace mongo {
                 if (!cc->hasRecoveryUnit()) {
                     // Start using a new RecoveryUnit
                     cc->setOwnedRecoveryUnit(
-                        getGlobalEnvironment()->getGlobalStorageEngine()->newRecoveryUnit());
+                        getGlobalServiceContext()->getGlobalStorageEngine()->newRecoveryUnit());
 
                 }
                 // Swap RecoveryUnit(s) between the ClientCursor and OperationContext.
@@ -368,7 +369,7 @@ namespace mongo {
             txn->checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
 
             if (0 == pass) { 
-                cc->updateSlaveLocation(txn, curop); 
+                cc->updateSlaveLocation(txn); 
             }
 
             if (cc->isAggCursor()) {
@@ -377,7 +378,7 @@ namespace mongo {
             }
 
             // If we're replaying the oplog, we save the last time that we read.
-            OpTime slaveReadTill;
+            Timestamp slaveReadTill;
 
             // What number result are we starting at?  Used to fill out the reply.
             startingResult = cc->pos();
@@ -401,8 +402,8 @@ namespace mongo {
                 // Possibly note slave's position in the oplog.
                 if (queryOptions & QueryOption_OplogReplay) {
                     BSONElement e = obj["ts"];
-                    if (Date == e.type() || Timestamp == e.type()) {
-                        slaveReadTill = e._opTime();
+                    if (Date == e.type() || bsonTimestamp == e.type()) {
+                        slaveReadTill = e.timestamp();
                     }
                 }
 
@@ -455,6 +456,7 @@ namespace mongo {
                 // cc is now invalid, as is the executor
                 cursorid = 0;
                 cc = NULL;
+                curop.debug().cursorExhausted = true;
                 LOG(5) << "getMore NOT saving client cursor, ended with state "
                        << PlanExecutor::statestr(state)
                        << endl;
@@ -615,7 +617,7 @@ namespace mongo {
         int numResults = 0;
 
         // If we're replaying the oplog, we save the last time that we read.
-        OpTime slaveReadTill;
+        Timestamp slaveReadTill;
 
         BSONObj obj;
         PlanExecutor::ExecState state;
@@ -634,8 +636,8 @@ namespace mongo {
             // Possibly note slave's position in the oplog.
             if (pq.isOplogReplay()) {
                 BSONElement e = obj["ts"];
-                if (Date == e.type() || Timestamp == e.type()) {
-                    slaveReadTill = e._opTime();
+                if (Date == e.type() || bsonTimestamp == e.type()) {
+                    slaveReadTill = e.timestamp();
                 }
             }
 
@@ -678,7 +680,6 @@ namespace mongo {
         // Fill out curop based on query results. If we have a cursorid, we will fill out curop with
         // this cursorid later.
         long long ccId = 0;
-        endQueryOp(exec.get(), dbProfilingLevel, numResults, ccId, &curop);
 
         if (shouldSaveCursor(txn, collection, state, exec.get())) {
             // We won't use the executor until it's getMore'd.
@@ -705,7 +706,7 @@ namespace mongo {
                 // getMore requests.  The calling OpCtx gets a fresh RecoveryUnit.
                 txn->recoveryUnit()->commitAndRestart();
                 cc->setOwnedRecoveryUnit(txn->releaseRecoveryUnit());
-                StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+                StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
                 txn->setRecoveryUnit(storageEngine->newRecoveryUnit());
             }
 
@@ -727,9 +728,12 @@ namespace mongo {
             // If the query had a time limit, remaining time is "rolled over" to the cursor (for
             // use by future getmore ops).
             cc->setLeftoverMaxTimeMicros(curop.getRemainingMaxTimeMicros());
+
+            endQueryOp(cc->getExecutor(), dbProfilingLevel, numResults, ccId, &curop);
         }
         else {
             LOG(5) << "Not caching executor but returning " << numResults << " results.\n";
+            endQueryOp(exec.get(), dbProfilingLevel, numResults, ccId, &curop);
         }
 
         // Add the results from the query into the output buffer.
@@ -739,7 +743,6 @@ namespace mongo {
         // Fill out the output buffer's header.
         QueryResult::View qr = result.header().view2ptr();
         qr.setCursorId(ccId);
-        curop.debug().cursorid = (0 == ccId ? -1 : ccId);
         qr.setResultFlagsToOk();
         qr.msgdata().setOperation(opReply);
         qr.setStartingFrom(0);

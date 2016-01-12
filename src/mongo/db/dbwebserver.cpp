@@ -48,7 +48,7 @@
 #include "mongo/db/background.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/stats/snapshots.h"
@@ -166,7 +166,7 @@ namespace {
                 string errmsg;
 
                 BSONObjBuilder sub;
-                if (!c->run(txn, "admin.$cmd", co, 0, errmsg, sub, false))
+                if (!c->run(txn, "admin.$cmd", co, 0, errmsg, sub))
                     buf.append(cmd, errmsg);
                 else
                     buf.append(cmd, sub.obj());
@@ -253,7 +253,7 @@ namespace {
             BSONObj cmdObj = BSON(cmd << 1);
 
             BSONObjBuilder result;
-            Command::execCommand(txn, c, 0, "admin.", cmdObj, result, false);
+            Command::execCommand(txn, c, 0, "admin.", cmdObj, result);
 
             responseCode = 200;
 
@@ -297,7 +297,7 @@ namespace {
                                 vector<string>& headers,
                                 const SockAddr &from) {
 
-        boost::scoped_ptr<OperationContext> txn(getGlobalEnvironment()->newOpCtx());
+        boost::scoped_ptr<OperationContext> txn(getGlobalServiceContext()->newOpCtx());
 
         if (url.size() > 1) {
 
@@ -420,7 +420,7 @@ namespace {
                                vector<string>& headers,
                                const SockAddr &from) {
 
-        AuthorizationSession* authSess = cc().getAuthorizationSession();
+        AuthorizationSession* authSess = AuthorizationSession::get(cc());
         if (!authSess->getAuthorizationManager().isAuthEnabled()) {
             return true;
         }
@@ -448,7 +448,7 @@ namespace {
             UserName userName(parms["username"], "admin");
             User* user;
             AuthorizationManager& authzManager =
-                cc().getAuthorizationSession()->getAuthorizationManager();
+                AuthorizationSession::get(cc())->getAuthorizationManager();
             Status status = authzManager.acquireUser(txn, userName, &user);
             if (!status.isOK()) {
                 if (status.code() != ErrorCodes::UserNotFound) {
@@ -591,8 +591,6 @@ namespace {
         Client::initThread("websvr");
 
         dbWebServer->initAndListen();
-
-        cc().shutdown();
     }
 
 } // namespace mongo

@@ -130,6 +130,7 @@ namespace {
         // for workloads where updates increase the size of documents.
         ss << "split_pct=90,";
         ss << "leaf_value_max=1MB,";
+        ss << "checksum=on,";
         if (wiredTigerGlobalOptions.useCollectionPrefixCompression) {
             ss << "prefix_compression,";
         }
@@ -862,7 +863,7 @@ namespace {
     }
 
     Status WiredTigerRecordStore::oplogDiskLocRegister( OperationContext* txn,
-                                                        const OpTime& opTime ) {
+                                                        const Timestamp& opTime ) {
         StatusWith<RecordId> loc = oploghack::keyForOptime( opTime );
         if ( !loc.isOK() )
             return loc.getStatus();

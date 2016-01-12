@@ -43,7 +43,9 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/repl/network_interface_impl_downconvert_find_getmore.h"
 #include "mongo/platform/unordered_map.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/list.h"
 #include "mongo/util/assert_util.h"
@@ -115,7 +117,7 @@ namespace {
 
             DBClientConnection& operator*();
             DBClientConnection* operator->();
-
+            operator DBClientConnection*();
         private:
             ConnectionPool* _pool;
             const ConnectionList::iterator _connInfo;
@@ -221,6 +223,10 @@ namespace {
     }
 
     DBClientConnection* NetworkInterfaceImpl::ConnectionPool::ConnectionPtr::operator->() {
+        return _connInfo->conn;
+    }
+
+    NetworkInterfaceImpl::ConnectionPool::ConnectionPtr::operator DBClientConnection*() {
         return _connInfo->conn;
     }
 
@@ -656,7 +662,33 @@ namespace {
                                                request.target,
                                                requestStartDate,
                                                Milliseconds(timeoutMillis.getValue()));
-            conn->runCommand(request.dbname, request.cmdObj, output);
+            bool ok = conn->runCommand(request.dbname, request.cmdObj, output);
+
+            // If remote server does not support either find or getMore commands, down convert
+            // to using DBClientInterface::query()/getMore().
+            // TODO: Perform down conversion based on wire protocol version.
+            //       Refer to the down conversion implementation in the shell.
+            if (!ok &&
+                getStatusFromCommandResult(output).code() == ErrorCodes::CommandNotFound) {
+
+                // 'commandName' will be an empty string if the command object is an empty BSON
+                // document.
+                StringData commandName = request.cmdObj.firstElement().fieldNameStringData();
+                if (commandName == "find") {
+                    runDownconvertedFindCommand(
+                        conn,
+                        request.dbname,
+                        request.cmdObj,
+                        &output);
+                }
+                else if (commandName == "getMore") {
+                    runDownconvertedGetMoreCommand(
+                        conn,
+                        request.dbname,
+                        request.cmdObj,
+                        &output);
+                }
+            }
             const Date_t requestFinishDate = now();
             conn.done(requestFinishDate);
             return ResponseStatus(Response(output,

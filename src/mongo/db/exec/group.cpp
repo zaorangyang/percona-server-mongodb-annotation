@@ -91,7 +91,7 @@ namespace mongo {
     void GroupStage::initGroupScripting() {
         // Initialize _scope.
         const std::string userToken =
-            ClientBasic::getCurrent()->getAuthorizationSession()
+            AuthorizationSession::get(ClientBasic::getCurrent())
                                      ->getAuthenticatedUserNamesToken();
 
         const NamespaceString nss(_request.ns);
@@ -292,11 +292,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* GroupStage::getCommonStats() {
+    const CommonStats* GroupStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* GroupStage::getSpecificStats() {
+    const SpecificStats* GroupStage::getSpecificStats() const {
         return &_specificStats;
     }
 

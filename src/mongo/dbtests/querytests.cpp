@@ -38,9 +38,9 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_environment_d.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/global_optime.h"
+#include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/global_timestamp.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context_impl.h"
@@ -193,7 +193,7 @@ namespace QueryTests {
                     _collection = NULL;
                     db->dropCollection( &_txn, ns() );
                 }
-                _collection = db->createCollection( &_txn, ns(), CollectionOptions(), true, false );
+                _collection = db->createCollection( &_txn, ns(), CollectionOptions(), false );
                 wunit.commit();
             }
             ASSERT( _collection );
@@ -298,7 +298,7 @@ namespace QueryTests {
     class GetMoreKillOp : public ClientBase {
     public:
         ~GetMoreKillOp() {
-            getGlobalEnvironment()->unsetKillAllOperations();
+            getGlobalServiceContext()->unsetKillAllOperations();
             _client.dropCollection( "unittests.querytests.GetMoreKillOp" );
         }
         void run() {
@@ -321,13 +321,13 @@ namespace QueryTests {
             
             // Set the killop kill all flag, forcing the next get more to fail with a kill op
             // exception.
-            getGlobalEnvironment()->setKillAllOperations();
+            getGlobalServiceContext()->setKillAllOperations();
             while( cursor->more() ) {
                 cursor->next();
             }
             
             // Revert the killop kill all flag.
-            getGlobalEnvironment()->unsetKillAllOperations();
+            getGlobalServiceContext()->unsetKillAllOperations();
 
             // Check that the cursor has been removed.
             {
@@ -350,7 +350,7 @@ namespace QueryTests {
     class GetMoreInvalidRequest : public ClientBase {
     public:
         ~GetMoreInvalidRequest() {
-            getGlobalEnvironment()->unsetKillAllOperations();
+            getGlobalServiceContext()->unsetKillAllOperations();
             _client.dropCollection( "unittests.querytests.GetMoreInvalidRequest" );
         }
         void run() {
@@ -665,9 +665,9 @@ namespace QueryTests {
                                      "capped" << true << "size" << 8192 ),
                                 info );
 
-            Date_t one = getNextGlobalOptime().asDate();
-            Date_t two = getNextGlobalOptime().asDate();
-            Date_t three = getNextGlobalOptime().asDate();
+            Date_t one = getNextGlobalTimestamp().asULL();
+            Date_t two = getNextGlobalTimestamp().asULL();
+            Date_t three = getNextGlobalTimestamp().asULL();
             insert( ns, BSON( "ts" << one ) );
             insert( ns, BSON( "ts" << two ) );
             insert( ns, BSON( "ts" << three ) );
@@ -680,7 +680,7 @@ namespace QueryTests {
             
             ClientCursorPin clientCursor( ctx.db()->getCollection( ns )->getCursorManager(),
                                           cursorId );
-            ASSERT_EQUALS( three.millis, clientCursor.c()->getSlaveReadTill().asDate() );
+            ASSERT_EQUALS( three.millis, clientCursor.c()->getSlaveReadTill().asULL() );
         }
     };
 
@@ -1509,7 +1509,7 @@ namespace QueryTests {
             DbMessage dbMessage( message );
             QueryMessage queryMessage( dbMessage );
             Message result;
-            string exhaust = runQuery(&_txn, queryMessage, NamespaceString(ns()), *cc().curop(),
+            string exhaust = runQuery(&_txn, queryMessage, NamespaceString(ns()), *CurOp::get(cc()),
                                       result);
             ASSERT( exhaust.size() );
             ASSERT_EQUALS( string( ns() ), exhaust );

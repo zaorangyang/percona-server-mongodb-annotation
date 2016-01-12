@@ -28,8 +28,6 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
-#include "mongo/config.h"
-
 #include "mongo/db/server_options_helpers.h"
 
 #ifdef _WIN32
@@ -45,6 +43,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/logger/log_component.h"
@@ -953,8 +952,5 @@ namespace {
 
         return Status::OK();
     }
-
-    // FIXME: This function will not return the correct value if someone renames the mongos binary
-    bool isMongos() { return serverGlobalParams.binaryName == "mongos"; }
 
 } // namespace mongo

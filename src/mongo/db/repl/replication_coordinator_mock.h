@@ -66,7 +66,7 @@ namespace repl {
 
         virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
                 const OperationContext* txn,
-                const OpTime& ts,
+                const Timestamp& ts,
                 const WriteConcernOptions& writeConcern);
 
         virtual ReplicationCoordinator::StatusAndDuration awaitReplicationOfLastOpForClient(
@@ -91,15 +91,15 @@ namespace repl {
 
         virtual bool shouldIgnoreUniqueIndex(const IndexDescriptor* idx);
 
-        virtual Status setLastOptimeForSlave(const OID& rid, const OpTime& ts);
+        virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
 
-        virtual void setMyLastOptime(const OpTime& ts);
+        virtual void setMyLastOptime(const Timestamp& ts);
 
         virtual void resetMyLastOptime();
 
         virtual void setMyHeartbeatMessage(const std::string& msg);
 
-        virtual OpTime getMyLastOptime() const;
+        virtual Timestamp getMyLastOptime() const;
 
         virtual OID getElectionId();
 
@@ -164,7 +164,7 @@ namespace repl {
 
         virtual bool buildsIndexes();
 
-        virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op);
+        virtual std::vector<HostAndPort> getHostsWrittenTo(const Timestamp& op);
 
         virtual std::vector<HostAndPort> getOtherNodesInReplSet() const;
 
@@ -179,6 +179,22 @@ namespace repl {
         virtual void resetLastOpTimeFromOplog(OperationContext* txn);
 
         virtual bool shouldChangeSyncSource(const HostAndPort& currentSource);
+
+        virtual Timestamp getLastCommittedOpTime() const;
+
+        virtual Status processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
+                                                  ReplSetRequestVotesResponse* response);
+
+        virtual Status processReplSetDeclareElectionWinner(
+                const ReplSetDeclareElectionWinnerArgs& args,
+                ReplSetDeclareElectionWinnerResponse* response);
+
+        virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder);
+
+        virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
+                                          ReplSetHeartbeatResponseV1* response);
+
+        virtual bool isV1ElectionProtocol();
 
     private:
 

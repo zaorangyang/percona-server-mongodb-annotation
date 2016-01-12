@@ -23,9 +23,15 @@ var addUsersToEachShard = function(st) {
     }
 };
 
-var addShard = function(st, expectedResult) {
-    var m = MongoRunner.runMongod({ auth: "", keyFile: keyfile })
-    assert.eq(st.getDB("admin").runCommand({ addShard: m.host }).ok, expectedResult, "Add shard");
+var addShard = function(st, shouldPass) {
+    var m = MongoRunner.runMongod({ auth: "", keyFile: keyfile, useHostname: false });
+    var res = st.getDB("admin").runCommand({ addShard: m.host });
+    if (shouldPass) {
+        assert.commandWorked(res, "Add shard");
+    }
+    else {
+        assert.commandFailed(res, "Add shard");
+    }
     return m.port;
 };
 
@@ -156,17 +162,16 @@ var setupSharding = function(mongo) {
     }
 };
 
-var start = function(useHostName) {
+var start = function() {
     return new ShardingTest({
         auth: "",
         keyFile: keyfile, 
         shards: numShards, 
         chunksize: 1, 
         config: numConfigs, 
-        separateConfig: true,
         other : { 
             nopreallocj: 1, 
-            useHostName: useHostName 
+            useHostname: false // Must use localhost to take advantage of the localhost auth bypass
         } 
     });
 };
@@ -209,11 +214,11 @@ var shutdown = function(st) {
     st.stop();
 };
 
-var runTest = function(useHostName) {
+var runTest = function() {
     print("=====================");
-    print("starting shards: useHostName=" + useHostName);
+    print("starting shards");
     print("=====================");
-    var st = start(useHostName);
+    var st = start();
     var host = st.s.host;
     var extraShards = [];
 
@@ -254,5 +259,4 @@ var runTest = function(useHostName) {
     });
 }
 
-runTest(false);
-runTest(true);
+runTest();

@@ -30,8 +30,10 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/shared_ptr.hpp>
 #include <set>
 
+#include "mongo/client/connpool.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -39,14 +41,16 @@
 #include "mongo/db/client_basic.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/dist_lock_manager.h"
 #include "mongo/s/config.h"
-#include "mongo/s/distlock.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
+    using boost::shared_ptr;
     using std::set;
     using std::string;
 
@@ -76,7 +80,7 @@ namespace {
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
 
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                                                         ResourcePattern::forDatabaseName(
                                                                         parseNs(dbname, cmdObj)),
                                                         ActionType::moveChunk)) {
@@ -95,8 +99,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             const string dbname = parseNs("admin", cmdObj);
 
@@ -110,14 +113,15 @@ namespace {
                 return false;
             }
 
-            // Flush the configuration. This can't be perfect, but it's better than nothing.
-            grid.flushConfig();
+            // Flush all cached information. This can't be perfect, but it's better than nothing.
+            grid.catalogCache()->invalidate(dbname);
 
-            DBConfigPtr config = grid.getDBConfig(dbname, false);
-            if (!config) {
-                errmsg = "can't find db!";
-                return false;
+            auto status = grid.catalogCache()->getDatabase(dbname);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status.getStatus());
             }
+
+            shared_ptr<DBConfig> config = status.getValue();
 
             const string to = cmdObj["to"].valuestrsafe();
             if (!to.size()) {
@@ -141,7 +145,7 @@ namespace {
                 return false;
             }
 
-            if (!grid.knowAboutShard(s.getConnString())) {
+            if (!grid.catalogManager()->isShardHost(s.getAddress())) {
                 errmsg = "that server isn't known to me";
                 return false;
             }
@@ -149,13 +153,12 @@ namespace {
             log() << "Moving " << dbname << " primary from: "
                   << config->getPrimary().toString() << " to: " << s.toString();
 
-            ScopedDistributedLock distLock(configServer.getConnectionString(),
-                                           dbname + "-movePrimary");
-            distLock.setLockMessage(str::stream() << "Moving primary shard of " << dbname);
+            string whyMessage(str::stream() << "Moving primary shard of " << dbname);
+            auto scopedDistLock = grid.catalogManager()->getDistLockManager()->lock(
+                    dbname + "-movePrimary", whyMessage);
 
-            Status lockStatus = distLock.tryAcquire();
-            if (!lockStatus.isOK()) {
-                return appendCommandStatus(result, lockStatus);
+            if (!scopedDistLock.isOK()) {
+                return appendCommandStatus(result, scopedDistLock.getStatus());
             }
 
             set<string> shardedColls;

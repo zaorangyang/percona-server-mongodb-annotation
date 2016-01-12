@@ -203,7 +203,9 @@ namespace ReplTests {
                     if ( 0 ) {
                         mongo::unittest::log() << "op: " << *i << endl;
                     }
+                    _txn.setReplicatedWrites(false);
                     a.applyOperation( &_txn, ctx.db(), *i );
+                    _txn.setReplicatedWrites(true);
                 }
             }
         }
@@ -247,7 +249,9 @@ namespace ReplTests {
             }
             delete it;
             for( vector< RecordId >::iterator i = toDelete.begin(); i != toDelete.end(); ++i ) {
+                _txn.setReplicatedWrites(false);
                 coll->deleteDocument( &_txn, *i, true );
+                _txn.setReplicatedWrites(true);
             }
             wunit.commit();
         }
@@ -263,7 +267,9 @@ namespace ReplTests {
             }
 
             if ( o.hasField( "_id" ) ) {
+                _txn.setReplicatedWrites(false);
                 coll->insertDocument( &_txn, o, true );
+                _txn.setReplicatedWrites(true);
                 wunit.commit();
                 return;
             }
@@ -273,7 +279,9 @@ namespace ReplTests {
             id.init();
             b.appendOID( "_id", &id );
             b.appendElements( o );
+                _txn.setReplicatedWrites(false);
             coll->insertDocument( &_txn, b.obj(), true );
+                _txn.setReplicatedWrites(true);
             wunit.commit();
         }
         static BSONObj wid( const char *json ) {
@@ -290,9 +298,9 @@ namespace ReplTests {
     class LogBasic : public Base {
     public:
         void run() {
-            ASSERT_EQUALS( 1, opCount() );
-            _client.insert( ns(), fromjson( "{\"a\":\"b\"}" ) );
             ASSERT_EQUALS( 2, opCount() );
+            _client.insert( ns(), fromjson( "{\"a\":\"b\"}" ) );
+            ASSERT_EQUALS( 3, opCount() );
         }
     };
 
@@ -1366,15 +1374,15 @@ namespace ReplTests {
     public:
         void run() {
             DatabaseIgnorer d;
-            ASSERT( !d.ignoreAt( "a", OpTime( 4, 0 ) ) );
-            d.doIgnoreUntilAfter( "a", OpTime( 5, 0 ) );
-            ASSERT( d.ignoreAt( "a", OpTime( 4, 0 ) ) );
-            ASSERT( !d.ignoreAt( "b", OpTime( 4, 0 ) ) );
-            ASSERT( d.ignoreAt( "a", OpTime( 4, 10 ) ) );
-            ASSERT( d.ignoreAt( "a", OpTime( 5, 0 ) ) );
-            ASSERT( !d.ignoreAt( "a", OpTime( 5, 1 ) ) );
+            ASSERT( !d.ignoreAt( "a", Timestamp( 4, 0 ) ) );
+            d.doIgnoreUntilAfter( "a", Timestamp( 5, 0 ) );
+            ASSERT( d.ignoreAt( "a", Timestamp( 4, 0 ) ) );
+            ASSERT( !d.ignoreAt( "b", Timestamp( 4, 0 ) ) );
+            ASSERT( d.ignoreAt( "a", Timestamp( 4, 10 ) ) );
+            ASSERT( d.ignoreAt( "a", Timestamp( 5, 0 ) ) );
+            ASSERT( !d.ignoreAt( "a", Timestamp( 5, 1 ) ) );
             // Ignore state is expired.
-            ASSERT( !d.ignoreAt( "a", OpTime( 4, 0 ) ) );
+            ASSERT( !d.ignoreAt( "a", Timestamp( 4, 0 ) ) );
         }
     };
 
@@ -1382,19 +1390,19 @@ namespace ReplTests {
     public:
         void run() {
             DatabaseIgnorer d;
-            d.doIgnoreUntilAfter( "a", OpTime( 5, 0 ) );
-            d.doIgnoreUntilAfter( "a", OpTime( 6, 0 ) );
-            ASSERT( d.ignoreAt( "a", OpTime( 5, 5 ) ) );
-            ASSERT( d.ignoreAt( "a", OpTime( 6, 0 ) ) );
-            ASSERT( !d.ignoreAt( "a", OpTime( 6, 1 ) ) );
+            d.doIgnoreUntilAfter( "a", Timestamp( 5, 0 ) );
+            d.doIgnoreUntilAfter( "a", Timestamp( 6, 0 ) );
+            ASSERT( d.ignoreAt( "a", Timestamp( 5, 5 ) ) );
+            ASSERT( d.ignoreAt( "a", Timestamp( 6, 0 ) ) );
+            ASSERT( !d.ignoreAt( "a", Timestamp( 6, 1 ) ) );
 
-            d.doIgnoreUntilAfter( "a", OpTime( 5, 0 ) );
-            d.doIgnoreUntilAfter( "a", OpTime( 6, 0 ) );
-            d.doIgnoreUntilAfter( "a", OpTime( 6, 0 ) );
-            d.doIgnoreUntilAfter( "a", OpTime( 5, 0 ) );
-            ASSERT( d.ignoreAt( "a", OpTime( 5, 5 ) ) );
-            ASSERT( d.ignoreAt( "a", OpTime( 6, 0 ) ) );
-            ASSERT( !d.ignoreAt( "a", OpTime( 6, 1 ) ) );
+            d.doIgnoreUntilAfter( "a", Timestamp( 5, 0 ) );
+            d.doIgnoreUntilAfter( "a", Timestamp( 6, 0 ) );
+            d.doIgnoreUntilAfter( "a", Timestamp( 6, 0 ) );
+            d.doIgnoreUntilAfter( "a", Timestamp( 5, 0 ) );
+            ASSERT( d.ignoreAt( "a", Timestamp( 5, 5 ) ) );
+            ASSERT( d.ignoreAt( "a", Timestamp( 6, 0 ) ) );
+            ASSERT( !d.ignoreAt( "a", Timestamp( 6, 1 ) ) );
         }
     };
 

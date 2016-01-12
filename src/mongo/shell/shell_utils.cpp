@@ -53,7 +53,6 @@ namespace mongo {
 
     namespace JSFiles {
         extern const JSFile servers;
-        extern const JSFile mongodtest;
         extern const JSFile shardingtest;
         extern const JSFile servers_misc;
         extern const JSFile replsettest;
@@ -251,7 +250,6 @@ namespace mongo {
             scope.externalSetup();
             mongo::shell_utils::installShellUtils( scope );
             scope.execSetup(JSFiles::servers);
-            scope.execSetup(JSFiles::mongodtest);
             scope.execSetup(JSFiles::shardingtest);
             scope.execSetup(JSFiles::servers_misc);
             scope.execSetup(JSFiles::replsettest);
@@ -318,13 +316,21 @@ namespace mongo {
                 }
                 
                 const set<string>& uris = i->second;
-                
-                BSONObj inprog = conn->findOne( "admin.$cmd.sys.inprog", Query() )[ "inprog" ]
-                        .embeddedObject().getOwned();
+
+                BSONObj currentOpRes;
+                conn->runPseudoCommand("admin",
+                                       "currentOp",
+                                       "$cmd.sys.inprog", {}, currentOpRes);
+                auto inprog = currentOpRes["inprog"].embeddedObject();
                 BSONForEach( op, inprog ) {
                     if ( uris.count( op[ "client" ].String() ) ) {
                         if ( !withPrompt || prompter.confirm() ) {
-                            conn->findOne( "admin.$cmd.sys.killop", QUERY( "op"<< op[ "opid" ] ) );                        
+                            BSONObjBuilder cmdBob;
+                            BSONObj info;
+                            cmdBob.append("op", op["opid"]);
+                            auto cmdArgs = cmdBob.done();
+                            conn->runPseudoCommand("admin", "killOp", "$cmd.sys.killop",
+                                                   cmdArgs, info);
                         }
                         else {
                             return;

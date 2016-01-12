@@ -63,7 +63,9 @@ namespace mongo {
           _plannerParams(params),
           _query(cq),
           _child(NULL),
-          _commonStats(kStageType) { }
+          _commonStats(kStageType) {
+        invariant(_collection);
+    }
 
     // static
     bool SubplanStage::canUseSubplanning(const CanonicalQuery& query) {
@@ -544,11 +546,11 @@ namespace mongo {
         return NULL != _branchResults[i]->cachedSolution.get();
     }
 
-    const CommonStats* SubplanStage::getCommonStats() {
+    const CommonStats* SubplanStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* SubplanStage::getSpecificStats() {
+    const SpecificStats* SubplanStage::getSpecificStats() const {
         return NULL;
     }
 

@@ -91,9 +91,6 @@ namespace mutablebson {
         /* run the given command
            implement this...
 
-           fromRepl - command is being invoked as part of replication syncing.  In this situation you
-                      normally do not want to log the command to the local oplog.
-
            return value is true if succeeded.  if false, set errmsg text.
         */
         virtual bool run(OperationContext* txn,
@@ -101,8 +98,7 @@ namespace mutablebson {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl = false ) = 0;
+                         BSONObjBuilder& result) = 0;
 
         /**
          * This designation for the command is only used by the 'help' call and has nothing to do 
@@ -130,7 +126,6 @@ namespace mutablebson {
         virtual bool localHostOnlyIfNoAuth(const BSONObj& cmdObj) { return false; }
 
         /* Return true if slaves are allowed to execute the command
-           (the command directly from a client -- if fromRepl, always allowed).
         */
         virtual bool slaveOk() const = 0;
 
@@ -243,10 +238,6 @@ namespace mutablebson {
         ServerStatusMetricField<Counter64> _commandsFailedMetric;
 
     public:
-        // Stops all index builds required to run this command and returns index builds killed.
-        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db, 
-                                                     const BSONObj& cmdObj);
 
         static const CommandMap* commandsByBestName() { return _commandsByBestName; }
         static const CommandMap* webCommands() { return _webCommands; }
@@ -266,8 +257,7 @@ namespace mutablebson {
                                 int queryOptions,
                                 const char *ns,
                                 BSONObj& cmdObj,
-                                BSONObjBuilder& result,
-                                bool fromRepl );
+                                BSONObjBuilder& result);
         // For mongos
         static void execCommandClientBasic(OperationContext* txn,
                                            Command* c,
@@ -275,8 +265,7 @@ namespace mutablebson {
                                            int queryOptions,
                                            const char *ns,
                                            BSONObj& cmdObj,
-                                           BSONObjBuilder& result,
-                                           bool fromRepl );
+                                           BSONObjBuilder& result);
 
         // Helper for setting errmsg and ok field in command result object.
         static void appendCommandStatus(BSONObjBuilder& result, bool ok, const std::string& errmsg);
@@ -305,30 +294,6 @@ namespace mutablebson {
                                                 long long* batchSize);
 
         /**
-         * Builds a cursor response object from the provided cursor identifiers and "firstBatch",
-         * and appends the response object to the provided builder under the field name "cursor".
-         *
-         * The response object has the following format:
-         *   { id: <NumberLong>, ns: <String>, firstBatch: <Array> }.
-         */
-        static void appendCursorResponseObject(long long cursorId,
-                                               StringData cursorNamespace,
-                                               BSONArray firstBatch,
-                                               BSONObjBuilder* builder);
-
-        /**
-         * Builds a getMore response object from the provided cursor identifiers and "nextBatch",
-         * and appends the response object to the provided builder under the field name "cursor".
-         *
-         * The response object has the following format:
-         *   { id: <NumberLong>, ns: <String>, nextBatch: <Array> }.
-         */
-        static void appendGetMoreResponseObject(long long cursorId,
-                                                StringData cursorNamespace,
-                                                BSONArray nextBatch,
-                                                BSONObjBuilder* builder);
-
-        /**
          * Helper for setting a writeConcernError field in the command result object if
          * a writeConcern error occurs.
          */
@@ -343,10 +308,6 @@ namespace mutablebson {
          * Checks to see if the client is authorized to run the given command with the given
          * parameters on the given named database.
          *
-         * fromRepl is true if this command is running as part of oplog application, which for
-         * historic reasons has slightly different authorization semantics.  TODO(schwerin): Check
-         * to see if this oddity can now be eliminated.
-         *
          * Returns Status::OK() if the command is authorized.  Most likely returns
          * ErrorCodes::Unauthorized otherwise, but any return other than Status::OK implies not
          * authorized.
@@ -354,8 +315,7 @@ namespace mutablebson {
         static Status _checkAuthorization(Command* c,
                                           ClientBasic* client,
                                           const std::string& dbname,
-                                          const BSONObj& cmdObj,
-                                          bool fromRepl);
+                                          const BSONObj& cmdObj);
     };
 
     bool _runCommands(OperationContext* txn,
@@ -363,7 +323,7 @@ namespace mutablebson {
                       BSONObj& _cmdobj,
                       BufBuilder& b,
                       BSONObjBuilder& anObjBuilder,
-                      bool fromRepl, int queryOptions);
+                      int queryOptions);
 
     bool runCommands(OperationContext* txn,
                      const char* ns,
@@ -371,7 +331,6 @@ namespace mutablebson {
                      CurOp& curop,
                      BufBuilder& b,
                      BSONObjBuilder& anObjBuilder,
-                     bool fromRepl,
                      int queryOptions);
 
 } // namespace mongo

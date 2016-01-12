@@ -31,14 +31,13 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/config.h"
-
 #include "mongo/platform/basic.h"
 
 #include <boost/thread.hpp>
 #include <boost/version.hpp>
 #include <iostream>
 
+#include "mongo/config.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/operation_context_impl.h"
@@ -247,7 +246,6 @@ namespace ThreadedTests {
                 }
                 pm.hit();
             }
-            cc().shutdown();
         }
 
         virtual void validate() {
@@ -569,8 +567,6 @@ namespace ThreadedTests {
             default:
                 ASSERT(false);
             }
-
-            cc().shutdown();
         }
     };
 
@@ -737,7 +733,6 @@ namespace ThreadedTests {
                 LOG(Z) << t.millis() << endl;
                 ASSERT( t.millis() > 50 );
             }
-            cc().shutdown();
         }
     };
 
@@ -801,9 +796,6 @@ namespace ThreadedTests {
                     mongo::unittest::log() << "checked in " << i << " times..." << endl;
 
             }
-
-            cc().shutdown();
-
         }
 
         virtual void validate() {

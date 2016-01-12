@@ -43,6 +43,7 @@ namespace mongo {
     static const char kUpsertedFieldName[] = "upserted";
     static const char kGLEStatsFieldName[] = "$gleStats";
     static const char kGLEStatsLastOpTimeFieldName[] = "lastOpTime";
+    static const char kGLEStatsLastOpTimeTermFieldName[] = "lastOpTimeTerm";
     static const char kGLEStatsElectionIdFieldName[] = "electionId";
 
     struct LastError {
@@ -51,17 +52,10 @@ namespace mongo {
         enum UpdatedExistingType { NotUpdate, True, False } updatedExisting;
         // _id field value from inserted doc, returned as kUpsertedFieldName (above)
         BSONObj upsertedId;
-        OID writebackId; // this shouldn't get reset so that old GLE are handled
-        int writebackSince;
         long long nObjects;
         int nPrev;
         bool valid;
         bool disabled;
-        void writeback(const OID& oid) {
-            reset( true );
-            writebackId = oid;
-            writebackSince = 0;
-        }
         void raiseError(int _code , const char *_msg) {
             reset( true );
             code = _code;
@@ -81,7 +75,6 @@ namespace mongo {
         }
         LastError() {
             reset();
-            writebackSince = 0;
         }
         void reset( bool _valid = false ) {
             code = 0;
@@ -98,13 +91,6 @@ namespace mongo {
          * @return if there is an err
          */
         bool appendSelf( BSONObjBuilder &b , bool blankErr = true );
-
-        /**
-         * appends fields which are not "error" related
-         * this whole mechanism needs to be re-written
-         * but needs a lot of real thought
-         */
-        void appendSelfStatus( BSONObjBuilder &b );
 
         struct Disabled : boost::noncopyable {
             Disabled( LastError * le ) {
@@ -144,14 +130,10 @@ namespace mongo {
         /** ok to call more than once. */
         void initThread();
 
-        int getID();
-        
         void release();
 
         /** when db receives a message/request, call this */
         LastError * startRequest( Message& m , LastError * connectionOwned );
-
-        void disconnect( int clientId );
 
         // used to disable lastError reporting while processing a killCursors message
         // disable causes get() to return 0.

@@ -33,7 +33,6 @@
 #include <algorithm>
 
 #include "mongo/base/status.h"
-#include "mongo/db/get_status_from_command_result.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/elect_cmd_runner.h"
 #include "mongo/db/repl/freshness_checker.h"
@@ -44,6 +43,7 @@
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/topology_coordinator.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
@@ -126,7 +126,7 @@ namespace {
         const bool isUnauthorized = (responseStatus.code() == ErrorCodes::Unauthorized) ||
                                     (responseStatus.code() == ErrorCodes::AuthenticationFailed);
         const Date_t now = _replExecutor.now();
-        const OpTime lastApplied = getMyLastOptime();  // Locks and unlocks _mutex.
+        const Timestamp lastApplied = getMyLastOptime();  // Locks and unlocks _mutex.
         Milliseconds networkTime(0);
         StatusWith<ReplSetHeartbeatResponse> hbStatusResponse(hbResponse);
 
@@ -159,10 +159,13 @@ namespace {
                 targetIndex >= 0 &&
                 hbStatusResponse.getValue().hasState() &&
                 hbStatusResponse.getValue().getState() != MemberState::RS_PRIMARY) {
-            boost::lock_guard<boost::mutex> lk(_mutex);
+            boost::unique_lock<boost::mutex> lk(_mutex);
             if (hbStatusResponse.getValue().getVersion() == _rsConfig.getConfigVersion()) {
                 _updateOpTimeFromHeartbeat_inlock(targetIndex,
                                                   hbStatusResponse.getValue().getOpTime());
+                // TODO: Enable with Data Replicator
+                //lk.unlock();
+                //_dr.slavesHaveProgressed();
             }
         }
 
@@ -177,7 +180,7 @@ namespace {
     }
 
     void ReplicationCoordinatorImpl::_updateOpTimeFromHeartbeat_inlock(int targetIndex,
-                                                                       OpTime optime) {
+                                                                       Timestamp optime) {
         invariant(_selfIndex >= 0);
         invariant(targetIndex >= 0);
 

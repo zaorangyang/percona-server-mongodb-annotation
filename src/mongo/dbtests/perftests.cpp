@@ -36,19 +36,19 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/config.h"
-
 #include "mongo/platform/basic.h"
 
 #include <boost/filesystem/operations.hpp>
 #include <boost/shared_ptr.hpp>
 #include <boost/thread/thread.hpp>
+#include <boost/thread/condition.hpp>
 #include <boost/version.hpp>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
 #include <mutex>
 
+#include "mongo/config.h"
 #include "mongo/db/db.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
@@ -399,7 +399,6 @@ namespace PerfTests {
                 if( stop ) 
                     break;
             }
-            cc().shutdown();
         }
 
         unsigned long long launchThreads(int remaining) {

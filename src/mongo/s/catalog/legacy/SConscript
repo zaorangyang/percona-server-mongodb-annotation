@@ -2,11 +2,17 @@
 
 Import("env")
 
+# TODO: config upgrade tests are currently in dbtests
 env.Library(
     target='catalog_manager_legacy',
     source=[
         'catalog_manager_legacy.cpp',
+        'cluster_client_internal.cpp',
         'config_coordinator.cpp',
+        'config_upgrade.cpp',
+        'config_upgrade_helpers.cpp',
+        'config_upgrade_v0_to_v7.cpp',
+        'config_upgrade_v6_to_v7.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/s/catalog/catalog_manager',
@@ -14,13 +20,14 @@ env.Library(
     ]
 )
 
+
 env.CppUnitTest(
     target='catalog_manager_legacy_test',
     source=[
         'config_coordinator_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/s/catalog/legacy/catalog_manager_legacy',
+        'catalog_manager_legacy',
         '$BUILD_DIR/mongo/coredb',
         '$BUILD_DIR/mongo/coreserver',
         '$BUILD_DIR/mongo/coreshard',

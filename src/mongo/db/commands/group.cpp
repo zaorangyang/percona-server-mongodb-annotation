@@ -56,7 +56,7 @@ namespace mongo {
                                              const std::string& dbname,
                                              const BSONObj& cmdObj) {
         std::string ns = parseNs(dbname, cmdObj);
-        if (!client->getAuthorizationSession()->isAuthorizedForActionsOnNamespace(
+        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnNamespace(
                 NamespaceString(ns), ActionType::find)) {
             return Status(ErrorCodes::Unauthorized, "unauthorized");
         }
@@ -132,8 +132,7 @@ namespace mongo {
                            BSONObj& cmdObj,
                            int,
                            std::string& errmsg,
-                           BSONObjBuilder& out,
-                           bool fromRepl) {
+                           BSONObjBuilder& out) {
         GroupRequest groupRequest;
         Status parseRequestStatus = parseRequest(dbname, cmdObj, &groupRequest);
         if (!parseRequestStatus.isOK()) {

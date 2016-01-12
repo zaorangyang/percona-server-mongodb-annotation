@@ -37,13 +37,14 @@
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/cursor_responses.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/query/find_constants.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
@@ -91,8 +92,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool /*fromRepl*/) {
+                 BSONObjBuilder& result) {
 
             BSONElement first = cmdObj.firstElement();
             uassert(
@@ -196,8 +196,7 @@ namespace mongo {
                 cursorId = cursor->cursorid();
             }
 
-            Command::appendCursorResponseObject( cursorId, cursorNamespace, firstBatch.arr(),
-                                                 &result );
+            appendCursorResponseObject( cursorId, cursorNamespace, firstBatch.arr(), &result );
 
             return true;
         }

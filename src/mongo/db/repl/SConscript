@@ -16,11 +16,19 @@ env.Library('rslog',
             ])
 
 env.Library(
-    'network_interface_impl',
-    'network_interface_impl.cpp',
+    target='network_interface_impl',
+    source=[
+        'network_interface_impl.cpp',
+        'network_interface_impl_downconvert_find_getmore.cpp',
+    ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base/base',
-        '$BUILD_DIR/mongo/clientdriver'
+        '$BUILD_DIR/mongo/bson',
+        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/coredb',
+        '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/query/getmore_request',
+        '$BUILD_DIR/mongo/db/query/lite_parsed_query',
         ])
 
 env.Library('replication_executor',
@@ -29,13 +37,40 @@ env.Library('replication_executor',
                 'scatter_gather_algorithm.cpp',
                 'scatter_gather_runner.cpp',
             ],
-            LIBDEPS=['$BUILD_DIR/mongo/foundation',
-                     '$BUILD_DIR/mongo/hostandport'])
+            LIBDEPS=['$BUILD_DIR/mongo/util/foundation',
+                     '$BUILD_DIR/mongo/util/net/hostandport'])
 
-env.CppUnitTest('replication_executor_test',
-                'replication_executor_test.cpp',
-                LIBDEPS=['replication_executor',
-                         'replmocks'])
+env.Library(
+    target='replication_executor_test_fixture',
+    source=[
+        'replication_executor_test_fixture.cpp',
+    ],
+    LIBDEPS=[
+        'replication_executor',
+        'replmocks',
+    ],
+)
+
+env.CppUnitTest(
+    target='replication_executor_test',
+    source=[
+        'replication_executor_test.cpp',
+    ],
+    LIBDEPS=[
+        'replication_executor_test_fixture',
+    ],
+)
+
+env.Library(
+    target='data_replicator',
+    source=[
+        'data_replicator.cpp',
+    ],
+    LIBDEPS=[
+        'fetcher',
+        'repl_coordinator_interface',
+    ],
+)
 
 env.Library('topology_coordinator',
             [
@@ -72,21 +107,25 @@ env.Library('repl_coordinator_impl',
                 'check_quorum_for_config_change.cpp',
                 'elect_cmd_runner.cpp',
                 'freshness_checker.cpp',
+                'repl_client_info.cpp',
+                'replica_set_config_checks.cpp',
                 'replication_coordinator_impl.cpp',
                 'replication_coordinator_impl_elect.cpp',
                 'replication_coordinator_impl_heartbeat.cpp',
-                'replica_set_config_checks.cpp',
             ],
-            LIBDEPS=['$BUILD_DIR/mongo/db/common',
+            LIBDEPS=[
+                     '$BUILD_DIR/mongo/db/common',
                      '$BUILD_DIR/mongo/db/index/index_descriptor',
                      '$BUILD_DIR/mongo/fail_point',
-                     '$BUILD_DIR/mongo/foundation',
-                     '$BUILD_DIR/mongo/global_environment_experiment',
-                     '$BUILD_DIR/mongo/global_optime',
+                     '$BUILD_DIR/mongo/db/global_timestamp',
+                     '$BUILD_DIR/mongo/rpc/command_status',
                      '$BUILD_DIR/mongo/server_options_core',
+                     '$BUILD_DIR/mongo/service_context',
+                     'data_replicator',
                      'repl_coordinator_interface',
                      'replica_set_messages',
                      'replication_executor',
+                     'reporter',
                      'rslog',
                      'topology_coordinator',
                  ])
@@ -113,6 +152,19 @@ env.CppUnitTest('replica_set_config_checks_test',
                     'repl_coordinator_impl',
                     'replmocks'
                 ])
+                
+env.CppUnitTest(
+    target='data_replicator_test',
+    source=[
+        'data_replicator_test.cpp',
+    ],
+    LIBDEPS=[
+        'data_replicator',
+        'replica_set_messages',
+        'replication_executor_test_fixture',
+        'repl_coordinator_test_fixture',
+    ],
+)
 
 env.CppUnitTest('scatter_gather_test',
                 'scatter_gather_test.cpp',
@@ -155,7 +207,8 @@ env.Library('repl_coordinator_interface',
             ['replication_coordinator.cpp',
              'replication_coordinator_external_state.cpp'],
             LIBDEPS=[
-                '$BUILD_DIR/mongo/hostandport',
+                '$BUILD_DIR/mongo/util/net/hostandport',
+                'reporter',
             ])
 
 env.Library('repl_coordinator_global',
@@ -182,14 +235,16 @@ env.Library('replica_set_messages',
                 'is_master_response.cpp',
                 'member_config.cpp',
                 'repl_set_heartbeat_args.cpp',
+                'repl_set_heartbeat_args_v1.cpp',
                 'repl_set_heartbeat_response.cpp',
+                'repl_set_heartbeat_response_v1.cpp',
                 'replica_set_config.cpp',
                 'replica_set_tag.cpp',
                 'update_position_args.cpp',
             ],
             LIBDEPS=[
                 '$BUILD_DIR/mongo/bson',
-                '$BUILD_DIR/mongo/hostandport',
+                '$BUILD_DIR/mongo/util/net/hostandport',
                 '$BUILD_DIR/mongo/db/common',
             ])
 
@@ -212,3 +267,113 @@ env.CppUnitTest('isself_test',
                     "$BUILD_DIR/mongo/ntservice_mock",
                 ],
                 NO_CRUTCH = True)
+
+env.Library(
+    target='replset_commands',
+    source=[
+        'replset_commands.cpp',
+        'repl_set_command.cpp',
+        'repl_set_request_votes.cpp',
+        'repl_set_request_votes_args.cpp',
+        'repl_set_declare_election_winner.cpp',
+        'repl_set_declare_election_winner_args.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/logger/logger',
+    ],
+)
+
+env.Library(
+    target='reporter',
+    source=[
+        'reporter.cpp',
+    ],
+    LIBDEPS=[
+        'replication_executor',
+        '$BUILD_DIR/mongo/logger/logger',
+        '$BUILD_DIR/mongo/namespace_string',
+        '$BUILD_DIR/mongo/rpc/command_status',
+    ],
+)
+
+env.Library(
+    target='fetcher',
+    source=[
+        'fetcher.cpp',
+    ],
+    LIBDEPS=[
+        'replication_executor',
+        '$BUILD_DIR/mongo/logger/logger',
+        '$BUILD_DIR/mongo/namespace_string',
+        '$BUILD_DIR/mongo/rpc/command_status',
+    ],
+)
+
+env.CppUnitTest(
+    target='reporter_test',
+    source='reporter_test.cpp',
+    LIBDEPS=[
+        'reporter',
+        'replication_executor_test_fixture',
+    ],
+)
+
+env.CppUnitTest(
+    target='fetcher_test',
+    source='fetcher_test.cpp',
+    LIBDEPS=[
+        'fetcher',
+        'replication_executor_test_fixture',
+    ],
+)
+
+env.Library(
+    target='base_cloner_test_fixture',
+    source=[
+        'base_cloner_test_fixture.cpp',
+    ],
+    LIBDEPS=[
+        'replication_executor_test_fixture',
+    ],
+)
+
+env.Library(
+    target='collection_cloner',
+    source=[
+        'collection_cloner.cpp',
+    ],
+    LIBDEPS=[
+        'fetcher',
+        'replication_executor',
+        '$BUILD_DIR/mongo/db/catalog/collection_options',
+        '$BUILD_DIR/mongo/logger/logger',
+    ],
+)
+
+env.CppUnitTest(
+    target='collection_cloner_test',
+    source='collection_cloner_test.cpp',
+    LIBDEPS=[
+        'collection_cloner',
+        'base_cloner_test_fixture',
+    ],
+)
+
+env.Library(
+    target='database_cloner',
+    source=[
+        'database_cloner.cpp',
+    ],
+    LIBDEPS=[
+        'collection_cloner',
+    ],
+)
+
+env.CppUnitTest(
+    target='database_cloner_test',
+    source='database_cloner_test.cpp',
+    LIBDEPS=[
+        'database_cloner',
+        'base_cloner_test_fixture',
+    ],
+)

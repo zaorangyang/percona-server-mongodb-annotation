@@ -49,12 +49,12 @@
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/bson_serializable.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager_targeter.h"
 #include "mongo/s/client/dbclient_multi_command.h"
-#include "mongo/s/client_info.h"
-#include "mongo/s/cluster_write.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/config.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/dbclient_shard_resolver.h"
 #include "mongo/s/grid.h"
@@ -67,11 +67,10 @@
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/timer.h"
 
-// error codes 8010-8040
-
 namespace mongo {
 
     using boost::scoped_ptr;
+    using boost::shared_ptr;
     using std::endl;
     using std::set;
     using std::string;
@@ -85,14 +84,18 @@ namespace mongo {
     /**
      * Returns true if request is a query for sharded indexes.
      */
-    static bool doShardedIndexQuery( Request& r, const QuerySpec& qSpec ) {
-
+    static bool doShardedIndexQuery(Request& r, const QuerySpec& qSpec) {
         // Extract the ns field from the query, which may be embedded within the "query" or
         // "$query" field.
-        string indexNSQuery(qSpec.filter()["ns"].str());
-        DBConfigPtr config = grid.getDBConfig( r.getns() );
+        const NamespaceString indexNSSQuery(qSpec.filter()["ns"].str());
 
-        if ( !config->isSharded( indexNSQuery )) {
+        auto status = grid.catalogCache()->getDatabase(indexNSSQuery.db().toString());
+        if (!status.isOK()) {
+            return false;
+        }
+
+        shared_ptr<DBConfig> config = status.getValue();
+        if (!config->isSharded(indexNSSQuery.ns())) {
             return false;
         }
 
@@ -102,7 +105,7 @@ namespace mongo {
 
         ShardPtr shard;
         ChunkManagerPtr cm;
-        config->getChunkManagerOrPrimary( indexNSQuery, cm, shard );
+        config->getChunkManagerOrPrimary(indexNSSQuery.ns(), cm, shard);
         if ( cm ) {
             set<Shard> shards;
             cm->getAllShards( shards );
@@ -147,7 +150,7 @@ namespace mongo {
 
         NamespaceString ns(q.ns);
         ClientBasic* client = ClientBasic::getCurrent();
-        AuthorizationSession* authSession = client->getAuthorizationSession();
+        AuthorizationSession* authSession = AuthorizationSession::get(client);
         Status status = authSession->checkAuthForQuery(ns, q.query);
         audit::logQueryAuthzCheck(client, ns, q.query, status.code());
         uassertStatusOK(status);
@@ -330,105 +333,43 @@ namespace mongo {
         }
     }
 
+    // TODO: remove after MongoDB 3.2
     bool Strategy::handleSpecialNamespaces( Request& r , QueryMessage& q ) {
         const char * ns = strstr( r.getns() , ".$cmd.sys." );
         if ( ! ns )
             return false;
         ns += 10;
 
-        BSONObjBuilder b;
-        vector<Shard> shards;
+        BSONObjBuilder reply;
 
-        ClientBasic* client = ClientBasic::getCurrent();
-        AuthorizationSession* authSession = client->getAuthorizationSession();
+        const auto upgradeToRealCommand = [&r, &q, &reply](StringData commandName) {
+            BSONObjBuilder cmdBob;
+            cmdBob.append(commandName, 1);
+            cmdBob.appendElements(q.query); // fields are validated by Commands
+            auto interposedCmd = cmdBob.done();
+            NamespaceString nss(r.getns());
+            NamespaceString interposedNss(nss.db(), "$cmd");
+            Command::runAgainstRegistered(interposedNss.ns().c_str(),
+                                          interposedCmd,
+                                          reply,
+                                          q.queryOptions);
+        };
+
         if ( strcmp( ns , "inprog" ) == 0 ) {
-            const bool isAuthorized = authSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forClusterResource(), ActionType::inprog);
-            audit::logInProgAuthzCheck(
-                    client, q.query, isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
-            uassert(ErrorCodes::Unauthorized, "not authorized to run inprog", isAuthorized);
-
-            Shard::getAllShards( shards );
-
-            BSONArrayBuilder arr( b.subarrayStart( "inprog" ) );
-
-            for ( unsigned i=0; i<shards.size(); i++ ) {
-                Shard shard = shards[i];
-                ScopedDbConnection conn(shard.getConnString());
-                BSONObj temp = conn->findOne( r.getns() , q.query );
-                if ( temp["inprog"].isABSONObj() ) {
-                    BSONObjIterator i( temp["inprog"].Obj() );
-                    while ( i.more() ) {
-                        BSONObjBuilder x;
-
-                        BSONObjIterator j( i.next().Obj() );
-                        while( j.more() ) {
-                            BSONElement e = j.next();
-                            if ( str::equals( e.fieldName() , "opid" ) ) {
-                                stringstream ss;
-                                ss << shard.getName() << ':' << e.numberInt();
-                                x.append( "opid" , ss.str() );
-                            }
-                            else if ( str::equals( e.fieldName() , "client" ) ) {
-                                x.appendAs( e , "client_s" );
-                            }
-                            else {
-                                x.append( e );
-                            }
-                        }
-                        arr.append( x.obj() );
-                    }
-                }
-                conn.done();
-            }
-
-            arr.done();
+            upgradeToRealCommand("currentOp");
         }
         else if ( strcmp( ns , "killop" ) == 0 ) {
-            const bool isAuthorized = authSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forClusterResource(), ActionType::killop);
-            audit::logKillOpAuthzCheck(
-                    client,
-                    q.query,
-                    isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
-            uassert(ErrorCodes::Unauthorized, "not authorized to run killop", isAuthorized);
-
-            BSONElement e = q.query["op"];
-            if ( e.type() != String ) {
-                b.append( "err" , "bad op" );
-                b.append( e );
-            }
-            else {
-                b.append( e );
-                string s = e.String();
-                string::size_type i = s.find( ':' );
-                if ( i == string::npos ) {
-                    b.append( "err" , "bad opid" );
-                }
-                else {
-                    string shard = s.substr( 0 , i );
-                    int opid = atoi( s.substr( i + 1 ).c_str() );
-                    b.append( "shard" , shard );
-                    b.append( "shardid" , opid );
-
-                    log() << "want to kill op: " << e << endl;
-                    Shard s(shard);
-
-                    ScopedDbConnection conn(s.getConnString());
-                    conn->findOne( r.getns() , BSON( "op" << opid ) );
-                    conn.done();
-                }
-            }
+            upgradeToRealCommand("killOp");
         }
         else if ( strcmp( ns , "unlock" ) == 0 ) {
-            b.append( "err" , "can't do unlock through mongos" );
+            reply.append( "err" , "can't do unlock through mongos" );
         }
         else {
             warning() << "unknown sys command [" << ns << "]" << endl;
             return false;
         }
 
-        BSONObj x = b.done();
+        BSONObj x = reply.done();
         replyToQuery(0, r.p(), r.m(), x);
         return true;
     }
@@ -554,15 +495,15 @@ namespace mongo {
 
         // Note that this implementation will not handle targeting retries and fails when the
         // sharding metadata is too stale
-
-        DBConfigPtr conf = grid.getDBConfig(db , false);
-        if (!conf) {
+        auto status = grid.catalogCache()->getDatabase(db);
+        if (!status.isOK()) {
             mongoutils::str::stream ss;
             ss << "Passthrough command failed: " << command.toString()
-               << " on ns " << versionedNS << ". Cannot find db config info.";
+               << " on ns " << versionedNS << ". Caused by " << causedBy(status.getStatus());
             return Status(ErrorCodes::IllegalOperation, ss);
         }
 
+        shared_ptr<DBConfig> conf = status.getValue();
         if (conf->isSharded(versionedNS)) {
             mongoutils::str::stream ss;
             ss << "Passthrough command failed: " << command.toString()
@@ -576,7 +517,13 @@ namespace mongo {
         try {
             ShardConnection conn(primaryShard, "");
             // TODO: this can throw a stale config when mongos is not up-to-date -- fix.
-            conn->runCommand(db, command, shardResult, options);
+            if (!conn->runCommand(db, command, shardResult, options)) {
+                conn.done();
+                return Status(ErrorCodes::OperationFailed,
+                              str::stream() << "Passthrough command failed: " << command
+                                            << " on ns " << versionedNS
+                                            << "; result: " << shardResult);
+            }
             conn.done();
         }
         catch (const DBException& ex) {
@@ -592,14 +539,26 @@ namespace mongo {
     }
 
     void Strategy::getMore( Request& r ) {
-
         Timer getMoreTimer;
 
-        const char *ns = r.getns();
+        const char* ns = r.getns();
+        const int ntoreturn = r.d().pullInt();
+        const long long id = r.d().pullInt64();
 
         // TODO:  Handle stale config exceptions here from coll being dropped or sharded during op
         // for now has same semantics as legacy request
-        DBConfigPtr config = grid.getDBConfig( ns );
+        const NamespaceString nss(ns);
+        auto statusGetDb = grid.catalogCache()->getDatabase(nss.db().toString());
+        if (statusGetDb == ErrorCodes::DatabaseNotFound) {
+            cursorCache.remove(id);
+            replyToQuery(ResultFlag_CursorNotFound, r.p(), r.m(), 0, 0, 0);
+            return;
+        }
+
+        uassertStatusOK(statusGetDb);
+
+        shared_ptr<DBConfig> config = statusGetDb.getValue();
+
         ShardPtr primary;
         ChunkManagerPtr info;
         config->getChunkManagerOrPrimary( ns, info, primary );
@@ -607,10 +566,7 @@ namespace mongo {
         //
         // TODO: Cleanup cursor cache, consolidate into single codepath
         //
-
-        int ntoreturn = r.d().pullInt();
-        long long id = r.d().pullInt64();
-        string host = cursorCache.getRef( id );
+        const string host = cursorCache.getRef(id);
         ShardedClientCursorPtr cursor = cursorCache.get( id );
         int cursorMaxTimeMS = cursorCache.getMaxTimeMS( id );
 
@@ -622,7 +578,7 @@ namespace mongo {
 
         ClientBasic* client = ClientBasic::getCurrent();
         NamespaceString nsString(ns);
-        AuthorizationSession* authSession = client->getAuthorizationSession();
+        AuthorizationSession* authSession = AuthorizationSession::get(client);
         Status status = authSession->checkAuthForGetMore( nsString, id );
         audit::logGetMoreAuthzCheck( client, nsString, id, status.code() );
         uassertStatusOK(status);

@@ -71,7 +71,7 @@ namespace {
         {
             WriteUnitOfWork uow( txn );
             ASSERT( !collectionExists( &ctx, nss.ns() ) );
-            ASSERT_OK( userCreateNS( txn, ctx.db(), nss.ns(), BSONObj(), false, false ) );
+            ASSERT_OK( userCreateNS( txn, ctx.db(), nss.ns(), BSONObj(), false ) );
             ASSERT( collectionExists( &ctx, nss.ns() ) );
             uow.commit();
         }
@@ -128,22 +128,16 @@ namespace {
         IndexDescriptor* desc = catalog->findIndexByName( txn, idxName, false );
 
         if ( desc ) {
-            CursorOptions cursorOptions;
-            cursorOptions.direction = CursorOptions::INCREASING;
+            auto cursor = catalog->getIndex(desc)->newCursor(txn);
 
-            IndexCursor *cursor;
-            ASSERT_OK( catalog->getIndex( desc )->newCursor( txn, cursorOptions, &cursor ) );
-            ASSERT_OK( cursor->seek( minKey ) );
-
-            while ( !cursor->isEOF() ) {
+            for (auto kv = cursor->seek(minKey, true); kv; kv = cursor->next()) {
                 numEntries++;
-                cursor->next();
             }
-            delete cursor;
         }
 
         return numEntries;
     }
+
     void dropIndex( OperationContext* txn, const NamespaceString& nss, const string& idxName ) {
         Collection* coll = dbHolder().get( txn, nss.db() )->getCollection(nss.ns() );
         IndexDescriptor* desc = coll->getIndexCatalog()->findIndexByName( txn, idxName );
@@ -167,7 +161,7 @@ namespace {
             {
                 WriteUnitOfWork uow( &txn );
                 ASSERT( !collectionExists( &ctx, ns ) );
-                ASSERT_OK( userCreateNS( &txn, ctx.db(), ns, BSONObj(), false, defaultIndexes ) );
+                ASSERT_OK( userCreateNS( &txn, ctx.db(), ns, BSONObj(), defaultIndexes ) );
                 ASSERT( collectionExists( &ctx, ns ) );
                 if ( !rollback ) {
                     uow.commit();
@@ -197,7 +191,7 @@ namespace {
             {
                 WriteUnitOfWork uow( &txn );
                 ASSERT( !collectionExists( &ctx, ns ) );
-                ASSERT_OK( userCreateNS( &txn, ctx.db(), ns, BSONObj(), false, defaultIndexes ) );
+                ASSERT_OK( userCreateNS( &txn, ctx.db(), ns, BSONObj(), defaultIndexes ) );
                 uow.commit();
             }
             ASSERT( collectionExists( &ctx, ns ) );
@@ -241,8 +235,7 @@ namespace {
                 WriteUnitOfWork uow( &txn );
                 ASSERT( !collectionExists( &ctx, source ) );
                 ASSERT( !collectionExists( &ctx, target ) );
-                ASSERT_OK( userCreateNS( &txn, ctx.db(), source.ns(), BSONObj(), false,
-                                         defaultIndexes ) );
+                ASSERT_OK( userCreateNS( &txn, ctx.db(), source.ns(), BSONObj(), defaultIndexes ) );
                 uow.commit();
             }
             ASSERT( collectionExists( &ctx, source ) );
@@ -292,10 +285,8 @@ namespace {
                 WriteUnitOfWork uow( &txn );
                 ASSERT( !collectionExists( &ctx, source ) );
                 ASSERT( !collectionExists( &ctx, target ) );
-                ASSERT_OK( userCreateNS( &txn, ctx.db(), source.ns(), BSONObj(), false,
-                                         defaultIndexes ) );
-                ASSERT_OK( userCreateNS( &txn, ctx.db(), target.ns(), BSONObj(), false,
-                                         defaultIndexes ) );
+                ASSERT_OK( userCreateNS( &txn, ctx.db(), source.ns(), BSONObj(), defaultIndexes ) );
+                ASSERT_OK( userCreateNS( &txn, ctx.db(), target.ns(), BSONObj(), defaultIndexes ) );
 
                 insertRecord( &txn, source, sourceDoc );
                 insertRecord( &txn, target, targetDoc );
@@ -352,8 +343,7 @@ namespace {
             {
                 WriteUnitOfWork uow( &txn );
                 ASSERT( !collectionExists( &ctx, nss ) );
-                ASSERT_OK( userCreateNS( &txn, ctx.db(), nss.ns(), BSONObj(), false,
-                                         defaultIndexes ) );
+                ASSERT_OK( userCreateNS( &txn, ctx.db(), nss.ns(), BSONObj(), defaultIndexes ) );
                 insertRecord( &txn, nss, oldDoc );
                 uow.commit();
             }
@@ -366,8 +356,7 @@ namespace {
                 WriteUnitOfWork uow( &txn );
                 ASSERT_OK( ctx.db()->dropCollection( &txn, nss.ns() ) );
                 ASSERT( !collectionExists( &ctx, nss ) );
-                ASSERT_OK( userCreateNS( &txn, ctx.db(), nss.ns(), BSONObj(), false,
-                                         defaultIndexes ) );
+                ASSERT_OK( userCreateNS( &txn, ctx.db(), nss.ns(), BSONObj(), defaultIndexes ) );
                 ASSERT( collectionExists( &ctx, nss ) );
                 insertRecord( &txn, nss, newDoc );
                 assertOnlyRecord( &txn, nss, newDoc );
@@ -403,8 +392,7 @@ namespace {
             {
                 WriteUnitOfWork uow( &txn );
 
-                ASSERT_OK( userCreateNS( &txn, ctx.db(), nss.ns(), BSONObj(), false,
-                                         defaultIndexes ) );
+                ASSERT_OK( userCreateNS( &txn, ctx.db(), nss.ns(), BSONObj(), defaultIndexes ) );
                 ASSERT( collectionExists( &ctx, nss ) );
                 insertRecord( &txn, nss, doc );
                 assertOnlyRecord( &txn, nss, doc );
@@ -438,8 +426,7 @@ namespace {
             {
                 WriteUnitOfWork uow( &txn );
 
-                ASSERT_OK( userCreateNS( &txn, ctx.db(), nss.ns(), BSONObj(), false,
-                                         defaultIndexes ) );
+                ASSERT_OK( userCreateNS( &txn, ctx.db(), nss.ns(), BSONObj(), defaultIndexes ) );
                 ASSERT( collectionExists( &ctx, nss ) );
                 insertRecord( &txn, nss, doc );
                 assertOnlyRecord( &txn, nss, doc );
@@ -695,7 +682,7 @@ namespace {
             {
                 WriteUnitOfWork uow( &txn );
                 ASSERT( !collectionExists( &ctx, nss.ns() ) );
-                ASSERT_OK( userCreateNS( &txn, ctx.db(), nss.ns(), BSONObj(), false, false ) );
+                ASSERT_OK( userCreateNS( &txn, ctx.db(), nss.ns(), BSONObj(), false ) );
                 ASSERT( collectionExists( &ctx, nss.ns() ) );
                 Collection* coll = ctx.db()->getCollection( ns );
                 IndexCatalog* catalog = coll->getIndexCatalog();

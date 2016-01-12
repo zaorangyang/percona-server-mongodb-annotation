@@ -28,8 +28,6 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
-#include "mongo/config.h"
-
 #include "mongo/db/mongod_options.h"
 
 #include <boost/filesystem.hpp>
@@ -39,8 +37,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/config.h"
 #include "mongo/db/db.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -956,11 +953,11 @@ namespace mongo {
         }
         if (params.count("security.authorization") &&
             params["security.authorization"].as<std::string>() == "disabled") {
-            getGlobalAuthorizationManager()->setAuthEnabled(false);
+            serverGlobalParams.isAuthEnabled = false;
         }
         if (params.count("security.authorization") &&
             params["security.authorization"].as<std::string>() == "enabled") {
-            getGlobalAuthorizationManager()->setAuthEnabled(true);
+            serverGlobalParams.isAuthEnabled = true;
         }
         if (params.count("storage.mmapv1.quota.enforced")) {
             mmapv1GlobalOptions.quota = params["storage.mmapv1.quota.enforced"].as<bool>();
@@ -1143,12 +1140,6 @@ namespace mongo {
             params["sharding.clusterRole"].as<std::string>() == "configsvr") {
             serverGlobalParams.configsvr = true;
             mmapv1GlobalOptions.smallfiles = true; // config server implies small files
-            if (replSettings.usingReplSets()
-                    || replSettings.master
-                    || replSettings.slave) {
-                return Status(ErrorCodes::BadValue,
-                              "replication should not be enabled on a config server");
-            }
 
             // If we haven't explicitly specified a journal option, default journaling to true for
             // the config server role

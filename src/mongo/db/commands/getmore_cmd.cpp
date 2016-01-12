@@ -39,9 +39,10 @@
 #include "mongo/db/catalog/cursor_manager.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/cursor_responses.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/stats/counters.h"
@@ -94,7 +95,7 @@ namespace mongo {
             }
             const GetMoreRequest& request = parseStatus.getValue();
 
-            return client->getAuthorizationSession()->checkAuthForGetMore(request.nss,
+            return AuthorizationSession::get(client)->checkAuthForGetMore(request.nss,
                                                                           request.cursorid);
         }
 
@@ -110,16 +111,14 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  std::string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) override {
+                 BSONObjBuilder& result) override {
             // Counted as a getMore, not as a command.
             globalOpCounters.gotGetMore();
 
             if (txn->getClient()->isInDirectClient()) {
                 return appendCommandStatus(result,
                                            Status(ErrorCodes::IllegalOperation,
-                                                  "Cannot run getMore command from "
-                                                  "inside DBDirectClient"));
+                                                  "Cannot run getMore command from eval()"));
             }
 
             StatusWith<GetMoreRequest> parseStatus = GetMoreRequest::parseFromBSON(dbname, cmdObj);
@@ -184,7 +183,7 @@ namespace mongo {
             if (!cursor->hasRecoveryUnit()) {
                 // Start using a new RecoveryUnit.
                 cursor->setOwnedRecoveryUnit(
-                    getGlobalEnvironment()->getGlobalStorageEngine()->newRecoveryUnit());
+                    getGlobalServiceContext()->getGlobalStorageEngine()->newRecoveryUnit());
             }
 
             // Swap RecoveryUnit(s) between the ClientCursor and OperationContext.
@@ -258,9 +257,11 @@ namespace mongo {
                     ruSwapper.dismiss();
                 }
             }
+            else {
+                txn->getCurOp()->debug().cursorExhausted = true;
+            }
 
-            Command::appendGetMoreResponseObject(respondWithId, request.nss.ns(), nextBatch.arr(),
-                                                 &result);
+            appendGetMoreResponseObject(respondWithId, request.nss.ns(), nextBatch.arr(), &result);
             if (respondWithId) {
                 cursorFreer.Dismiss();
             }

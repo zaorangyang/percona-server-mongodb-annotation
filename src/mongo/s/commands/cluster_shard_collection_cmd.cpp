@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/shared_ptr.hpp>
 #include <list>
 #include <set>
 #include <vector>
@@ -44,6 +45,8 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/config.h"
@@ -52,6 +55,7 @@
 
 namespace mongo {
 
+    using boost::shared_ptr;
     using std::list;
     using std::set;
     using std::string;
@@ -85,7 +89,7 @@ namespace {
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
 
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                                                         ResourcePattern::forExactNamespace(
                                                             NamespaceString(parseNs(dbname,
                                                                                     cmdObj))),
@@ -105,8 +109,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             const string ns = parseNs(dbname, cmdObj);
             if (ns.size() == 0) {
@@ -115,20 +118,26 @@ namespace {
             }
 
             const NamespaceString nsStr(ns);
-            if (!nsStr.isValid()){
-                errmsg = str::stream() << "bad ns[" << ns << "]";
-                return false;
+            if (!nsStr.isValid()) {
+                return appendCommandStatus(
+                            result,
+                            Status(ErrorCodes::InvalidNamespace,
+                                   "invalid collection namespace [" + ns + "]"));
             }
 
-            DBConfigPtr config = grid.getDBConfig(ns);
+            auto config = uassertStatusOK(grid.catalogCache()->getDatabase(nsStr.db().toString()));
             if (!config->isShardingEnabled()) {
-                errmsg = "sharding not enabled for db";
-                return false;
+                return appendCommandStatus(
+                            result,
+                            Status(ErrorCodes::IllegalOperation,
+                                   str::stream() << "sharding not enabled for db " << nsStr.db()));
             }
 
             if (config->isSharded(ns)) {
-                errmsg = "already sharded";
-                return false;
+                return appendCommandStatus(
+                            result,
+                            Status(ErrorCodes::IllegalOperation,
+                                   str::stream() << "sharding already enabled for collection " << ns));
             }
 
             // NOTE: We *must* take ownership of the key here - otherwise the shared BSONObj
@@ -161,10 +170,6 @@ namespace {
 
             if (ns.find(".system.") != string::npos) {
                 errmsg = "can't shard system namespaces";
-                return false;
-            }
-
-            if (!configServer.allUp(false, errmsg)) {
                 return false;
             }
 
@@ -324,10 +329,10 @@ namespace {
                 // 5. If no useful index exists, and collection empty, create one on proposedKey.
                 //    Only need to call ensureIndex on primary shard, since indexes get copied to
                 //    receiving shard whenever a migrate occurs.
-                Status result = clusterCreateIndex(ns, proposedKey, careAboutUnique, NULL);
-                if (!result.isOK()) {
+                Status status = clusterCreateIndex(ns, proposedKey, careAboutUnique, NULL);
+                if (!status.isOK()) {
                     errmsg = str::stream() << "ensureIndex failed to create index on "
-                        << "primary shard: " << result.reason();
+                        << "primary shard: " << status.reason();
                     conn.done();
                     return false;
                 }
@@ -402,7 +407,13 @@ namespace {
                                       proposedKey,
                                       careAboutUnique);
 
-            config->shardCollection(ns, proposedShardKey, careAboutUnique, &initSplits);
+            Status status = grid.catalogManager()->shardCollection(ns,
+                                                                   proposedShardKey,
+                                                                   careAboutUnique,
+                                                                   &initSplits);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
 
             result << "collectionsharded" << ns;
 

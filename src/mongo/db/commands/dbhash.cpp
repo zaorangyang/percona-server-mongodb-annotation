@@ -34,6 +34,7 @@
 
 #include <boost/scoped_ptr.hpp>
 
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/client.h"
@@ -142,7 +143,12 @@ namespace mongo {
         return hash;
     }
 
-    bool DBHashCmd::run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+    bool DBHashCmd::run(OperationContext* txn,
+                        const string& dbname,
+                        BSONObj& cmdObj,
+                        int,
+                        string& errmsg,
+                        BSONObjBuilder& result) {
         Timer timer;
 
         set<string> desiredCollections;

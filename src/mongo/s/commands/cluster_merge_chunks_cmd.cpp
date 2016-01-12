@@ -28,7 +28,8 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/init.h"
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -36,16 +37,20 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard.h"
+#include "mongo/s/client/shard.h"
 
 namespace mongo {
 
+    using boost::shared_ptr;
     using std::string;
     using std::stringstream;
     using std::vector;
+
+namespace {
 
     /**
      * Mongos-side command for merging chunks, passes command to appropriate shard.
@@ -62,7 +67,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                     ActionType::splitChunk)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -86,31 +91,12 @@ namespace mongo {
         static BSONField<string> shardNameField;
         static BSONField<string> configField;
 
-        // TODO: This refresh logic should be consolidated
-        ChunkManagerPtr refreshChunkCache(const NamespaceString& nss) {
-
-            DBConfigPtr config = grid.getDBConfig(nss.ns());
-            if (!config->isSharded(nss))
-                return ChunkManagerPtr();
-
-            // Refreshes chunks as a side-effect
-            return config->getChunkManagerIfExists(nss, true);
-        }
-
 
         bool run(OperationContext* txn, const string& dbname,
                   BSONObj& cmdObj,
                   int,
                   string& errmsg,
-                  BSONObjBuilder& result,
-                  bool ) {
-
-            string ns = parseNs(dbname, cmdObj);
-
-            if ( ns.size() == 0 ) {
-                errmsg = "no namespace specified";
-                return false;
-            }
+                  BSONObjBuilder& result) {
 
             vector<BSONObj> bounds;
             if ( !FieldParser::extract( cmdObj, boundsField, &bounds, &errmsg ) ) {
@@ -140,16 +126,32 @@ namespace mongo {
                 return false;
             }
 
-            // This refreshes the chunk metadata if stale.
-            ChunkManagerPtr manager = refreshChunkCache(NamespaceString(ns));
+            const NamespaceString nss(parseNs(dbname, cmdObj));
+            if (nss.size() == 0) {
+                return appendCommandStatus(result, Status(ErrorCodes::InvalidNamespace,
+                                                          "no namespace specified"));
+            }
 
+            auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status.getStatus());
+            }
+
+            boost::shared_ptr<DBConfig> config = status.getValue();
+            if (!config->isSharded(nss.ns())) {
+                return appendCommandStatus(result, Status(ErrorCodes::NamespaceNotSharded,
+                                                   "ns [" + nss.ns() + " is not sharded."));
+            }
+
+            // This refreshes the chunk metadata if stale.
+            ChunkManagerPtr manager = config->getChunkManagerIfExists(nss, true);
             if (!manager) {
-                errmsg = (string) "collection " + ns + " is not sharded, cannot merge chunks";
-                return false;
+                return appendCommandStatus(result, Status(ErrorCodes::NamespaceNotSharded,
+                                                   "ns [" + nss.ns() + " is not sharded."));
             }
 
             if (!manager->getShardKeyPattern().isShardKey(minKey)
-                || !manager->getShardKeyPattern().isShardKey(maxKey)) {
+                    || !manager->getShardKeyPattern().isShardKey(maxKey)) {
                 errmsg = stream() << "shard key bounds " << "[" << minKey << "," << maxKey << ")"
                                   << " are not valid for shard key pattern "
                                   << manager->getShardKeyPattern().toBSON();
@@ -181,7 +183,8 @@ namespace mongo {
             result.appendElements( remoteResult );
             return ok;
         }
-    };
+
+    } clusterMergeChunksCommand;
 
     BSONField<string> ClusterMergeChunksCommand::nsField( "mergeChunks" );
     BSONField<vector<BSONObj> > ClusterMergeChunksCommand::boundsField( "bounds" );
@@ -189,9 +192,5 @@ namespace mongo {
     BSONField<string> ClusterMergeChunksCommand::configField( "config" );
     BSONField<string> ClusterMergeChunksCommand::shardNameField( "shardName" );
 
-    MONGO_INITIALIZER(InitMergeChunksPassCommand)(InitializerContext* context) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new ClusterMergeChunksCommand();
-        return Status::OK();
-    }
-}
+} // namespace
+} // namespace mongo

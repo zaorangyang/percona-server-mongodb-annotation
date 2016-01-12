@@ -50,8 +50,9 @@ import time
 import threading
 import traceback
 
-from pymongo import Connection
+from pymongo import MongoClient
 from pymongo.errors import OperationFailure
+from pymongo import ReadPreference
 
 import cleanbb
 import smoke
@@ -252,14 +253,13 @@ class mongod(NullMongod):
             self.auth = True
         if self.kwargs.get('keyFile'):
             argv += ['--keyFile', self.kwargs.get('keyFile')]
-        if self.kwargs.get('use_ssl') or self.kwargs.get('use_x509'):
+        if self.kwargs.get('use_ssl'):
             argv += ['--sslMode', "requireSSL",
                      '--sslPEMKeyFile', 'jstests/libs/server.pem',
                      '--sslCAFile', 'jstests/libs/ca.pem',
-                     '--sslWeakCertificateValidation']
-        if self.kwargs.get('use_x509'):
-            argv += ['--clusterAuthMode','x509'];
-            self.auth = True
+                     '--sslAllowConnectionsWithoutCertificates']
+        if self.kwargs.get('rlp_path'):
+            argv += ['--basisTechRootDirectory', self.kwargs.get('rlp_path')]
         print "running " + " ".join(argv)
         self.proc = self._start(buildlogger(argv, is_global=True))
 
@@ -267,11 +267,12 @@ class mongod(NullMongod):
             raise Exception("Failed to start mongod")
 
         if self.slave:
-            local = Connection(port=self.port, slave_okay=True).local
+            local = MongoClient(port=self.port,
+                read_preference=ReadPreference.SECONDARY_PREFERRED).local
             synced = False
             while not synced:
                 synced = True
-                for source in local.sources.find(fields=["syncedTo"]):
+                for source in local.sources.find({}, ["syncedTo"]):
                     synced = synced and "syncedTo" in source and source["syncedTo"]
 
     def _start(self, argv):
@@ -344,7 +345,7 @@ class mongod(NullMongod):
 
     def wait_for_repl(self):
         print "Awaiting replicated (w:2, wtimeout:5min) insert (port:" + str(self.port) + ")"
-        Connection(port=self.port).testing.smokeWait.insert({}, w=2, wtimeout=5*60*1000)
+        MongoClient(port=self.port).testing.smokeWait.insert({}, w=2, wtimeout=5*60*1000)
         print "Replicated write completed -- done wait_for_repl"
 
 class Bug(Exception):
@@ -379,7 +380,8 @@ def check_db_hashes(master, slave):
 
     # FIXME: maybe make this run dbhash on all databases?
     for mongod in [master, slave]:
-        mongod.dbhash = Connection(port=mongod.port, slave_okay=True).test.command("dbhash")
+        client = MongoClient(port=mongod.port, read_preference=ReadPreference.SECONDARY_PREFERRED)
+        mongod.dbhash = client.test.command("dbhash")
         mongod.dict = mongod.dbhash["collections"]
 
     global lost_in_slave, lost_in_master, screwy_in_slave, replicated_collections
@@ -392,8 +394,9 @@ def check_db_hashes(master, slave):
         mhash = master.dict[coll]
         shash = slave.dict[coll]
         if mhash != shash:
-            mTestDB = Connection(port=master.port, slave_okay=True).test
-            sTestDB = Connection(port=slave.port, slave_okay=True).test
+            mTestDB = MongoClient(port=master.port).test
+            sTestDB = MongoClient(port=slave.port,
+                read_preference=ReadPreference.SECONDARY_PREFERRED).test
             mCount = mTestDB[coll].count()
             sCount = sTestDB[coll].count()
             stats = {'hashes': {'master': mhash, 'slave': shash},
@@ -446,17 +449,7 @@ def skipTest(path):
                         ## Capped tests
                         "capped_max1.js", "capped_convertToCapped1.js", "rename.js"]:
             return True
-    if use_ssl:
-        # Skip tests using mongobridge since it does not support SSL
-        # TODO: Remove when SERVER-10910 has been resolved.  
-        if basename in ["gridfs.js", "initial_sync3.js", "majority.js", "no_chaining.js",
-                        "rollback4.js", "slavedelay3.js", "sync2.js", "tags.js"]:
-            return True
-        # TODO: For now skip tests using MongodRunner, remove when SERVER-10909 has been resolved
-        if basename in ["fastsync.js", "index_retry.js", "ttl_repl_maintenance.js", 
-                        "unix_socket1.js"]:
-            return True;
-    if auth or keyFile or use_x509: # For tests running with auth
+    if auth or keyFile: # For tests running with auth
         # Skip any tests that run with auth explicitly
         if parentDir.lower() == "auth" or "auth" in basename.lower():
             return True
@@ -588,9 +581,7 @@ def runTest(test, result):
                      'TestData.keyFile = ' + ternary( keyFile , '"' + str(keyFile) + '"' , 'null' ) + ";" + \
                      'TestData.keyFileData = ' + ternary( keyFile , '"' + str(keyFileData) + '"' , 'null' ) + ";" + \
                      'TestData.authMechanism = ' + ternary( authMechanism,
-                                               '"' + str(authMechanism) + '"', 'null') + ";" + \
-                     'TestData.useSSL = ' + ternary( use_ssl ) + ";" + \
-                     'TestData.useX509 = ' + ternary( use_x509 ) + ";"
+                                               '"' + str(authMechanism) + '"', 'null') + ";"
         # this updates the default data directory for mongod processes started through shell (src/mongo/shell/servers.js)
         evalString += 'MongoRunner.dataDir = "' + os.path.abspath(smoke_db_prefix + '/data/db') + '";'
         evalString += 'MongoRunner.dataPath = MongoRunner.dataDir + "/";'
@@ -702,8 +693,8 @@ def run_tests(tests):
                             auth=auth,
                             authMechanism=authMechanism,
                             keyFile=keyFile,
-                            use_ssl=use_ssl,
-                            use_x509=use_x509)
+                            rlp_path=rlp_path,
+                            use_ssl=use_ssl)
             master.start()
 
         if small_oplog:
@@ -730,10 +721,10 @@ def run_tests(tests):
                            auth=auth,
                            authMechanism=authMechanism,
                            keyFile=keyFile,
-                           use_ssl=use_ssl,
-                           use_x509=use_x509)
+                           rlp_path=rlp_path,
+                           use_ssl=use_ssl)
             slave.start()
-            primary = Connection(port=master.port, slave_okay=True);
+            primary = MongoClient(port=master.port);
 
             primary.admin.command({'replSetInitiate' : {'_id' : 'foo', 'members' : [
                             {'_id': 0, 'host':'localhost:%s' % master.port},
@@ -749,7 +740,8 @@ def run_tests(tests):
                     time.sleep(.2)
             
             secondaryUp = False
-            sConn = Connection(port=slave.port, slave_okay=True);
+            sConn = MongoClient(port=slave.port,
+                read_preference=ReadPreference.SECONDARY_PREFERRED);
             while not secondaryUp:
                 result = sConn.admin.command("ismaster");
                 secondaryUp = result["secondary"]
@@ -812,8 +804,8 @@ def run_tests(tests):
                                         auth=auth,
                                         authMechanism=authMechanism,
                                         keyFile=keyFile,
-                                        use_ssl=use_ssl,
-                                        use_x509=use_x509)
+                                        rlp_path=rlp_path,
+                                        use_ssl=use_ssl)
                         master.start()
 
             except TestFailure, f:
@@ -1095,7 +1087,8 @@ def set_globals(options, tests):
     global small_oplog, small_oplog_rs
     global no_journal, set_parameters, set_parameters_mongos, no_preallocj, storage_engine, wiredtiger_engine_config_string, wiredtiger_collection_config_string, wiredtiger_index_config_string
     global auth, authMechanism, keyFile, keyFileData, smoke_db_prefix, test_path, start_mongod
-    global use_ssl, use_x509
+    global rlp_path
+    global use_ssl
     global file_of_commands_mode
     global report_file, shell_write_mode, use_write_commands
     global temp_path
@@ -1105,9 +1098,6 @@ def set_globals(options, tests):
     start_mongod = options.start_mongod
     if hasattr(options, 'use_ssl'):
         use_ssl = options.use_ssl
-    if hasattr(options, 'use_x509'):
-        use_x509 = options.use_x509
-        use_ssl = use_ssl or use_x509
     #Careful, this can be called multiple times
     test_path = options.test_path
 
@@ -1137,6 +1127,7 @@ def set_globals(options, tests):
     auth = options.auth
     authMechanism = options.authMechanism
     keyFile = options.keyFile
+    rlp_path = options.rlp_path
 
     clean_every_n_tests = options.clean_every_n_tests
     clean_whole_dbroot = options.with_cleanbb
@@ -1246,7 +1237,7 @@ def add_to_failfile(tests, options):
 def main():
     global mongod_executable, mongod_port, shell_executable, continue_on_failure, small_oplog
     global no_journal, set_parameters, set_parameters_mongos, no_preallocj, auth, storage_engine, wiredtiger_engine_config_string, wiredtiger_collection_config_string, wiredtiger_index_config_string
-    global keyFile, smoke_db_prefix, test_path, use_write_commands
+    global keyFile, smoke_db_prefix, test_path, use_write_commands, rlp_path
 
     try:
         signal.signal(signal.SIGUSR1, dump_stacks)
@@ -1298,9 +1289,6 @@ def main():
     parser.add_option('--auth', dest='auth', default=False,
                       action="store_true",
                       help='Run standalone mongods in tests with authentication enabled')
-    parser.add_option('--use-x509', dest='use_x509', default=False,
-                      action="store_true",
-                      help='Use x509 auth for internal cluster authentication')
     parser.add_option('--authMechanism', dest='authMechanism', default='SCRAM-SHA-1',
                       help='Use the given authentication mechanism, when --auth is used.')
     parser.add_option('--keyFile', dest='keyFile', default=None,
@@ -1332,15 +1320,15 @@ def main():
     parser.add_option('--temp-path', dest='temp_path', default=None,
                       help='If present, passed as --tempPath to unittests and dbtests or TestData.tmpPath to mongo')
     # Buildlogger invocation from command line
-    parser.add_option('--buildlogger-builder', dest='buildlogger_builder', default=None,
+    parser.add_option('--buildlogger-builder', dest='buildlogger_builder', default=os.getenv("BUILDLOGGER_BUILDER"),
                       action="store", help='Set the "builder name" for buildlogger')
-    parser.add_option('--buildlogger-buildnum', dest='buildlogger_buildnum', default=None,
+    parser.add_option('--buildlogger-buildnum', dest='buildlogger_buildnum', default=os.getenv("BUILDLOGGER_NUMBER"),
                       action="store", help='Set the "build number" for buildlogger')
-    parser.add_option('--buildlogger-url', dest='buildlogger_url', default=None,
+    parser.add_option('--buildlogger-url', dest='buildlogger_url', default=os.getenv('BUILDLOGGER_URL'),
                       action="store", help='Set the url root for the buildlogger service')
-    parser.add_option('--buildlogger-credentials', dest='buildlogger_credentials', default=None,
+    parser.add_option('--buildlogger-credentials', dest='buildlogger_credentials', default=os.getenv("BUILDLOGGER_CREDENTIALS"),
                       action="store", help='Path to Python file containing buildlogger credentials')
-    parser.add_option('--buildlogger-phase', dest='buildlogger_phase', default=None,
+    parser.add_option('--buildlogger-phase', dest='buildlogger_phase', default=os.getenv("BUILDLOGGER_PHASE"),
                       action="store", help='Set the "phase" for buildlogger (e.g. "core", "auth") for display in the webapp (optional)')
     parser.add_option('--report-file', dest='report_file', default=None,
                       action='store',
@@ -1350,6 +1338,8 @@ def main():
                       help='Deprecated(use --shell-write-mode): Sets the shell to use write commands by default')
     parser.add_option('--shell-write-mode', dest='shell_write_mode', default="commands",
                       help='Sets the shell to use a specific write mode: commands/compatibility/legacy (default:legacy)')
+    parser.add_option('--basisTechRootDirectory', dest='rlp_path', default=None,
+                      help='Basis Tech Rosette Linguistics Platform root directory')
 
     parser.add_option('--include-tags', dest='include_tags', default="", action='store',
                       help='Filters jstests run by tag regex(es) - a tag in the test must match the regexes.  ' +

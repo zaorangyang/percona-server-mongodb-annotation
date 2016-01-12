@@ -42,7 +42,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
@@ -70,7 +70,7 @@ namespace mongo {
             ActionSet actions;
             actions.addAction(ActionType::createIndex);
             Privilege p(parseResourcePattern(dbname, cmdObj), actions);
-            if (client->getAuthorizationSession()->isAuthorizedForPrivilege(p))
+            if (AuthorizationSession::get(client)->isAuthorizedForPrivilege(p))
                 return Status::OK();
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
@@ -84,9 +84,7 @@ namespace mongo {
         }
 
         virtual bool run(OperationContext* txn,  const string& dbname, BSONObj& cmdObj, int options,
-                          string& errmsg, BSONObjBuilder& result,
-                          bool fromRepl = false ) {
-
+                          string& errmsg, BSONObjBuilder& result) {
             // ---  parse
 
             NamespaceString ns( dbname, cmdObj[name].String() );
@@ -143,8 +141,7 @@ namespace mongo {
             // Note: createIndexes command does not currently respect shard versioning.
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbLock(txn->lockState(), ns.db(), MODE_X);
-            if (!fromRepl &&
-                !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
+            if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
                 return appendCommandStatus(result, Status(ErrorCodes::NotMaster, str::stream()
                     << "Not primary while creating indexes in " << ns.ns()));
             }
@@ -159,14 +156,8 @@ namespace mongo {
             if ( !collection ) {
                 MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
                     WriteUnitOfWork wunit(txn);
-                    collection = db->createCollection( txn, ns.ns() );
+                    collection = db->createCollection(txn, ns.ns(), CollectionOptions());
                     invariant( collection );
-                    if (!fromRepl) {
-                        getGlobalEnvironment()->getOpObserver()->onCreateCollection(
-                                txn,
-                                ns,
-                                CollectionOptions());
-                    }
                     wunit.commit();
                 } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createIndexes", ns.ns());
             }
@@ -212,8 +203,7 @@ namespace mongo {
             if (indexer.getBuildInBackground()) {
                 txn->recoveryUnit()->commitAndRestart();
                 dbLock.relockWithMode(MODE_IX);
-                if (!fromRepl &&
-                    !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
+                if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
                     return appendCommandStatus(result, Status(ErrorCodes::NotMaster, str::stream()
                         << "Not primary while creating background indexes in " << ns.ns()));
                 }
@@ -233,8 +223,7 @@ namespace mongo {
                         // that day, to avoid data corruption due to lack of index cleanup.
                         txn->recoveryUnit()->commitAndRestart();
                         dbLock.relockWithMode(MODE_X);
-                        if (!fromRepl &&
-                            !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
+                        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
                                 dbname)) {
                             return appendCommandStatus(
                                 result,
@@ -256,7 +245,6 @@ namespace mongo {
                 dbLock.relockWithMode(MODE_X);
                 uassert(ErrorCodes::NotMaster,
                         str::stream() << "Not primary while completing index build in " << dbname,
-                        fromRepl ||
                         repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
                             dbname));
 
@@ -271,13 +259,11 @@ namespace mongo {
 
                 indexer.commit();
 
-                if ( !fromRepl ) {
-                    for ( size_t i = 0; i < specs.size(); i++ ) {
-                        std::string systemIndexes = ns.getSystemIndexesCollection();
-                        getGlobalEnvironment()->getOpObserver()->onCreateIndex(txn,
-                                                                               systemIndexes,
-                                                                               specs[i]);
-                    }
+                for ( size_t i = 0; i < specs.size(); i++ ) {
+                    std::string systemIndexes = ns.getSystemIndexesCollection();
+                    getGlobalServiceContext()->getOpObserver()->onCreateIndex(txn,
+                                                                           systemIndexes,
+                                                                           specs[i]);
                 }
 
                 wunit.commit();

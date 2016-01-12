@@ -31,7 +31,11 @@
 #include <boost/thread/thread.hpp>
 
 #include "mongo/base/init.h"
+#include "mongo/db/client.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_noop.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -66,13 +70,14 @@ namespace mongo {
             while (Listener::getElapsedTimeMillis() == 0) {
                 sleepmillis(10);
             }
-
             return Status::OK();
         }
 
         // Long operation + short timeout => time should expire.
         TEST(TimeHasExpired, PosSimple) {
-            CurOp curOp(NULL);
+            auto service = stdx::make_unique<ServiceContextNoop>();
+            auto client = service->makeClient("CurOpTest");
+            CurOp curOp(client.get());
             curOp.setMaxTimeMicros(intervalShort);
             curOp.ensureStarted();
             sleepmicros(intervalLong);
@@ -81,7 +86,9 @@ namespace mongo {
 
         // Short operation + long timeout => time should not expire.
         TEST(TimeHasExpired, NegSimple) {
-            CurOp curOp(NULL);
+            auto service = stdx::make_unique<ServiceContextNoop>();
+            auto client = service->makeClient("CurOpTest");
+            CurOp curOp(client.get());
             curOp.setMaxTimeMicros(intervalLong);
             curOp.ensureStarted();
             sleepmicros(intervalShort);

@@ -49,9 +49,10 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/copydb.h"
 #include "mongo/db/commands/rename_collection.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
@@ -131,7 +132,7 @@ namespace mongo {
             uassert(ErrorCodes::NotMaster,
                     str::stream() << "Not primary while cloning collection " << from_collection.ns()
                                   << " to " << to_collection.ns(),
-                    !logForRepl ||
+                    !txn->writesAreReplicated() ||
                     repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(_dbName));
 
             // Make sure database still exists after we resume from the temp release
@@ -147,17 +148,12 @@ namespace mongo {
                          << "collection dropped during clone ["
                          << to_collection.ns() << "]",
                          !createdCollection );
-                WriteUnitOfWork wunit(txn);
-                collection = db->createCollection(txn, to_collection.ns());
-                verify(collection);
-
-                if (logForRepl) {
-                    getGlobalEnvironment()->getOpObserver()->onCreateCollection(
-                            txn,
-                            to_collection,
-                            CollectionOptions());
-                }
-                wunit.commit();
+                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                    WriteUnitOfWork wunit(txn);
+                    collection = db->createCollection(txn, to_collection.ns(), CollectionOptions());
+                    verify(collection);
+                    wunit.commit();
+                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createCollection", to_collection.ns());
             }
 
             while( i.moreInCurrentBatch() ) {
@@ -184,7 +180,7 @@ namespace mongo {
                         globalWriteLock.reset(new Lock::GlobalWrite(txn->lockState()));
 
                         // Check if everything is still all right.
-                        if (logForRepl) {
+                        if (txn->writesAreReplicated()) {
                             uassert(28592,
                                     str::stream() << "Cannot write to db: " << _dbName
                                                   << " after yielding",
@@ -223,21 +219,18 @@ namespace mongo {
                 }
 
                 ++numSeen;
-                WriteUnitOfWork wunit(txn);
+                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                    WriteUnitOfWork wunit(txn);
 
-                BSONObj js = tmp;
-
-                StatusWith<RecordId> loc = collection->insertDocument( txn, js, true );
-                if ( !loc.isOK() ) {
-                    error() << "error: exception cloning object in " << from_collection
-                            << ' ' << loc.getStatus() << " obj:" << js;
-                }
-                uassertStatusOK( loc.getStatus() );
-                if (logForRepl)
-                    getGlobalEnvironment()->getOpObserver()->onInsert(txn, to_collection.ns(), js);
-
-                wunit.commit();
-
+                    BSONObj doc = tmp;
+                    StatusWith<RecordId> loc = collection->insertDocument( txn, doc, true );
+                    if ( !loc.isOK() ) {
+                        error() << "error: exception cloning object in " << from_collection
+                                << ' ' << loc.getStatus() << " obj:" << doc;
+                    }
+                    uassertStatusOK( loc.getStatus() );
+                    wunit.commit();
+                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "cloner insert", to_collection.ns());
                 RARELY if ( time( 0 ) - saveLast > 60 ) {
                     log() << numSeen << " objects cloned so far from collection " << from_collection;
                     saveLast = time( 0 );
@@ -253,7 +246,6 @@ namespace mongo {
         NamespaceString from_collection;
         NamespaceString to_collection;
         time_t saveLast;
-        bool logForRepl;
         bool _mayYield;
         bool _mayBeInterrupted;
     };
@@ -264,7 +256,6 @@ namespace mongo {
                       const string& toDBName,
                       const NamespaceString& from_collection,
                       const NamespaceString& to_collection,
-                      bool logForRepl,
                       bool masterSameProcess,
                       bool slaveOk,
                       bool mayYield,
@@ -277,7 +268,6 @@ namespace mongo {
         f.from_collection = from_collection;
         f.to_collection = to_collection;
         f.saveLast = time( 0 );
-        f.logForRepl = logForRepl;
         f._mayYield = mayYield;
         f._mayBeInterrupted = mayBeInterrupted;
 
@@ -292,7 +282,7 @@ namespace mongo {
                 str::stream() << "Not primary while cloning collection " << from_collection.ns()
                               << " to " << to_collection.ns() << " with filter "
                               << query.toString(),
-                !logForRepl ||
+                !txn->writesAreReplicated() ||
                 repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(toDBName));
     }
 
@@ -300,7 +290,6 @@ namespace mongo {
                              const string& toDBName,
                              const NamespaceString& from_collection,
                              const NamespaceString& to_collection,
-                             bool logForRepl,
                              bool masterSameProcess,
                              bool slaveOk,
                              bool mayYield,
@@ -324,7 +313,7 @@ namespace mongo {
         uassert(ErrorCodes::NotMaster,
                 str::stream() << "Not primary while copying indexes from " << from_collection.ns()
                               << " to " << to_collection.ns() << " (Cloner)",
-                !logForRepl ||
+                !txn->writesAreReplicated() ||
                 repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(toDBName));
 
 
@@ -337,15 +326,12 @@ namespace mongo {
 
         Collection* collection = db->getCollection( to_collection );
         if ( !collection ) {
-            WriteUnitOfWork wunit(txn);
-            collection = db->createCollection( txn, to_collection.ns() );
-            invariant(collection);
-            if (logForRepl) {
-                getGlobalEnvironment()->getOpObserver()->onCreateCollection(txn,
-                                                                            to_collection,
-                                                                            CollectionOptions());
-            }
-            wunit.commit();
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                WriteUnitOfWork wunit(txn);
+                collection = db->createCollection(txn, to_collection.ns(), CollectionOptions());
+                invariant(collection);
+                wunit.commit();
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createCollection", to_collection.ns());
         }
 
         // TODO pass the MultiIndexBlock when inserting into the collection rather than building the
@@ -366,13 +352,13 @@ namespace mongo {
 
         WriteUnitOfWork wunit(txn);
         indexer.commit();
-        if (logForRepl) {
+        if (txn->writesAreReplicated()) {
             const string targetSystemIndexesCollectionName =
                 to_collection.getSystemIndexesCollection();
             const char* createIndexNs = targetSystemIndexesCollectionName.c_str();
             for (vector<BSONObj>::const_iterator it = indexesToBuild.begin();
                     it != indexesToBuild.end(); ++it) {
-                getGlobalEnvironment()->getOpObserver()->onInsert(txn, createIndexNs, *it);
+                getGlobalServiceContext()->getOpObserver()->onCreateIndex(txn, createIndexNs, *it);
             }
         }
         wunit.commit();
@@ -384,8 +370,7 @@ namespace mongo {
                                 string& errmsg,
                                 bool mayYield,
                                 bool mayBeInterrupted,
-                                bool shouldCopyIndexes,
-                                bool logForRepl) {
+                                bool shouldCopyIndexes) {
 
         const NamespaceString nss(ns);
         const string dbname = nss.db().toString();
@@ -395,7 +380,7 @@ namespace mongo {
 
         uassert(ErrorCodes::NotMaster,
                 str::stream() << "Not primary while copying collection " << ns << " (Cloner)",
-                !logForRepl ||
+                !txn->writesAreReplicated() ||
                 repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname));
 
         Database* db = dbHolder().openDb(txn, dbname);
@@ -407,20 +392,22 @@ namespace mongo {
             invariant(collList.size() <= 1);
             BSONObj col = collList.front();
             if (col["options"].isABSONObj()) {
-                WriteUnitOfWork wunit(txn);
-                Status status = userCreateNS(txn, db, ns, col["options"].Obj(), logForRepl, 0);
-                if ( !status.isOK() ) {
-                    errmsg = status.toString();
-                    return false;
-                }
-                wunit.commit();
+                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                    WriteUnitOfWork wunit(txn);
+                    Status status = userCreateNS(txn, db, ns, col["options"].Obj(), 0);
+                    if ( !status.isOK() ) {
+                        errmsg = status.toString();
+                        return false;
+                    }
+                    wunit.commit();
+                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createUser", ns);
             }
         }
 
         // main data
         copy(txn, dbname,
              nss, nss,
-             logForRepl, false, true, mayYield, mayBeInterrupted,
+             false, true, mayYield, mayBeInterrupted,
              Query(query).snapshot());
 
         /* TODO : copyIndexes bool does not seem to be implemented! */
@@ -431,7 +418,7 @@ namespace mongo {
         // indexes
         copyIndexes(txn, dbname,
                     NamespaceString(ns), NamespaceString(ns),
-                    logForRepl, false, true, mayYield,
+                    false, true, mayYield,
                     mayBeInterrupted);
 
         return true;
@@ -448,7 +435,9 @@ namespace mongo {
         if ( errCode ) {
             *errCode = 0;
         }
-        massert( 10289 ,  "useReplAuth is not written to replication log", !opts.useReplAuth || !opts.logForRepl );
+        massert(10289,
+                "useReplAuth is not written to replication log",
+                !opts.useReplAuth || !txn->writesAreReplicated());
 
         const ConnectionString cs = ConnectionString::parse(masterHost, errmsg);
         if (!cs.isValid()) {
@@ -569,7 +558,7 @@ namespace mongo {
         uassert(ErrorCodes::NotMaster,
                 str::stream() << "Not primary while cloning database " << opts.fromDB
                               << " (after getting list of collections to clone)",
-                !opts.logForRepl ||
+                !txn->writesAreReplicated() ||
                 repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(toDBName));
 
         if ( opts.syncData ) {
@@ -585,24 +574,20 @@ namespace mongo {
                 Database* db = dbHolder().openDb(txn, toDBName);
 
                 {
-                    WriteUnitOfWork wunit(txn);
+                    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                        WriteUnitOfWork wunit(txn);
 
-                    // we defer building id index for performance - building it in batch is much
-                    // faster
-                    Status createStatus = userCreateNS(txn,
-                                                       db,
-                                                       to_name.ns(),
-                                                       options,
-                                                       opts.logForRepl,
-                                                       false);
-                    if ( !createStatus.isOK() ) {
-                        errmsg = str::stream() << "failed to create collection \""
-                                               << to_name.ns() << "\": "
-                                               << createStatus.reason();
-                        return false;
-                    }
-
-                    wunit.commit();
+                        // we defer building id index for performance - building it in batch is much
+                        // faster
+                        Status createStatus = userCreateNS(txn, db, to_name.ns(), options, false);
+                        if ( !createStatus.isOK() ) {
+                            errmsg = str::stream() << "failed to create collection \""
+                                                   << to_name.ns() << "\": "
+                                                   << createStatus.reason();
+                            return false;
+                        }
+                        wunit.commit();
+                    } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createUser", to_name.ns());
                 }
 
                 LOG(1) << "\t\t cloning " << from_name << " -> " << to_name << endl;
@@ -614,7 +599,6 @@ namespace mongo {
                      toDBName,
                      from_name,
                      to_name,
-                     opts.logForRepl,
                      masterSameProcess,
                      opts.slaveOk,
                      opts.mayYield,
@@ -649,11 +633,11 @@ namespace mongo {
                         WriteUnitOfWork wunit(txn);
                         BSONObj id;
 
-                        c->deleteDocument(txn, *it, true, true, opts.logForRepl ? &id : NULL);
-                        if (opts.logForRepl)
-                            getGlobalEnvironment()->getOpObserver()->onDelete(txn,
-                                                                              c->ns().ns(),
-                                                                              id);
+                        c->deleteDocument(txn,
+                                          *it,
+                                          true,
+                                          true,
+                                          txn->writesAreReplicated() ? &id : nullptr);
                         wunit.commit();
                     }
 
@@ -663,8 +647,8 @@ namespace mongo {
 
                     WriteUnitOfWork wunit(txn);
                     indexer.commit();
-                    if (opts.logForRepl) {
-                        getGlobalEnvironment()->getOpObserver()->onCreateIndex(
+                    if (txn->writesAreReplicated()) {
+                        getGlobalServiceContext()->getOpObserver()->onCreateIndex(
                                 txn,
                                 c->ns().getSystemIndexesCollection().c_str(),
                                 c->getIndexCatalog()->getDefaultIdIndexSpec());
@@ -689,7 +673,6 @@ namespace mongo {
                             toDBName,
                             from_name,
                             to_name,
-                            opts.logForRepl,
                             masterSameProcess,
                             opts.slaveOk,
                             opts.mayYield,

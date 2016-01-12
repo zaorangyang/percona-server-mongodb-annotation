@@ -78,6 +78,7 @@
 #include <boost/shared_ptr.hpp>
 #include <boost/thread/thread.hpp>
 #include <iomanip>
+#include <utility>
 
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
@@ -206,8 +207,6 @@ namespace {
         DurableImpl() { }
 
         // DurableInterface virtual methods
-        virtual void* writingPtr(void *x, unsigned len);
-        virtual void declareWriteIntent(void *, unsigned);
         virtual void declareWriteIntents(const std::vector<std::pair<void*, unsigned> >& intents);
         virtual void createdFile(const std::string& filename, unsigned long long len);
         virtual bool awaitCommit();
@@ -532,16 +531,6 @@ namespace {
         commitJob.noteOp(op);
     }
 
-    void* DurableImpl::writingPtr(void* x, unsigned len) {
-        declareWriteIntent(x, len);
-        return x;
-    }
-
-    void DurableImpl::declareWriteIntent(void *p, unsigned len) {
-        privateViews.makeWritable(p, len);
-        SimpleMutex::scoped_lock lk(commitJob.groupCommitMutex);
-        commitJob.note(p, len);
-    }
 
     void DurableImpl::declareWriteIntents(
         const std::vector<std::pair<void*, unsigned> >& intents) {
@@ -769,10 +758,20 @@ namespace {
                     // would wipe out their changes without ever being committed.
                     commitJob.committingReset();
 
+                    double systemMemoryPressurePercentage =
+                        ProcessInfo::getSystemMemoryPressurePercentage();
+
                     // Now that the in-memory modifications have been collected, we can potentially
                     // release the flush lock if remap is not necessary.
+                    // When we remap due to memory pressure, we look at two criteria
+                    // 1. If the amount of 4k pages touched exceeds 512 MB,
+                    //    a reasonable estimate of memory pressure on Linux.
+                    // 2. Check if the amount of free memory on the machine is running low,
+                    //    since #1 is underestimates the memory pressure on Windows since
+                    //    commits in 64MB chunks.
                     const bool shouldRemap =
                         (estimatedPrivateMapSize >= UncommittedBytesLimit) ||
+                        (systemMemoryPressurePercentage > 0.0) ||
                         (commitCounter % NumCommitsBeforeRemap == 0) ||
                         (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalAlwaysRemap);
 
@@ -794,11 +793,12 @@ namespace {
                         }
                         else {
                             // We don't want to get close to the UncommittedBytesLimit
-                            const double f =
+                            const double remapMemFraction =
                                 estimatedPrivateMapSize / ((double)UncommittedBytesLimit);
-                            if (f > remapFraction) {
-                                remapFraction = f;
-                            }
+
+                            remapFraction = std::max(remapMemFraction, remapFraction);
+
+                            remapFraction = std::max(systemMemoryPressurePercentage, remapFraction);
                         }
                     }
                     else {
@@ -878,8 +878,6 @@ namespace {
         journalWriter.shutdown();
 
         log() << "Durability thread stopped";
-
-        cc().shutdown();
     }
 
 

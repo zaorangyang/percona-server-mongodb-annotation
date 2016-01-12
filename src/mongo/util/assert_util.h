@@ -250,6 +250,14 @@ namespace mongo {
         return std::move(sw.getValue());
     }
 
+    template<typename T>
+    inline T fassertStatusOK(int msgid, StatusWith<T> sw) {
+        if (MONGO_unlikely(!sw.isOK())) {
+            fassertFailedWithStatus(msgid, sw.getStatus());
+        }
+        return std::move(sw.getValue());
+    }
+
     /* warning only - keeps going */
 #define MONGO_wassert(_Expression) do {                                 \
         if (MONGO_unlikely(!(_Expression))) {                               \
@@ -323,6 +331,26 @@ namespace mongo {
     enum { ASSERT_ID_DUPKEY = 11000 };
 
     std::string demangleName( const std::type_info& typeinfo );
+
+    /**
+     * A utility function that converts an exception to a Status.
+     * Only call this function when there is an active exception
+     * (e.g. in a catch block).
+     *
+     * Note: this technique was created by Lisa Lippincott.
+     *
+     * Example usage:
+     *
+     *   Status myFunc() {
+     *       try {
+     *           funcThatThrows();
+     *           return Status::OK();
+     *       } catch (...) {
+     *           return exceptionToStatus();
+     *       }
+     *   }
+     */
+    Status exceptionToStatus();
 
 } // namespace mongo
 

@@ -42,8 +42,9 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/op_observer.h"
@@ -113,12 +114,14 @@ namespace {
     void ReplicationCoordinatorExternalStateImpl::initiateOplog(OperationContext* txn) {
         createOplog(txn);
 
-        ScopedTransaction scopedXact(txn, MODE_X);
-        Lock::GlobalWrite globalWrite(txn->lockState());
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            ScopedTransaction scopedXact(txn, MODE_X);
+            Lock::GlobalWrite globalWrite(txn->lockState());
 
-        WriteUnitOfWork wuow(txn);
-        getGlobalEnvironment()->getOpObserver()->onOpMessage(txn, BSON("msg" << "initiating set"));
-        wuow.commit();
+            WriteUnitOfWork wuow(txn);
+            getGlobalServiceContext()->getOpObserver()->onOpMessage(txn, BSON("msg" << "initiating set"));
+            wuow.commit();
+        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "initiate oplog entry", "local.oplog.rs");
     }
 
     void ReplicationCoordinatorExternalStateImpl::forwardSlaveProgress() {
@@ -134,6 +137,7 @@ namespace {
 
             BSONObj me;
             // local.me is an identifier for a server for getLastError w:2+
+            // TODO: handle WriteConflictExceptions below
             if (!Helpers::getSingleton(txn, meCollectionName, me) ||
                     !me.hasField("host") ||
                     me["host"].String() != myname) {
@@ -158,14 +162,18 @@ namespace {
     StatusWith<BSONObj> ReplicationCoordinatorExternalStateImpl::loadLocalConfigDocument(
             OperationContext* txn) {
         try {
-            BSONObj config;
-            if (!Helpers::getSingleton(txn, configCollectionName, config)) {
-                return StatusWith<BSONObj>(
-                        ErrorCodes::NoMatchingDocument,
-                        str::stream() << "Did not find replica set configuration document in " <<
-                        configCollectionName);
-            }
-            return StatusWith<BSONObj>(config);
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                BSONObj config;
+                if (!Helpers::getSingleton(txn, configCollectionName, config)) {
+                    return StatusWith<BSONObj>(
+                            ErrorCodes::NoMatchingDocument,
+                            str::stream() << "Did not find replica set configuration document in "
+                                          << configCollectionName);
+                }
+                return StatusWith<BSONObj>(config);
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn,
+                                                  "load replica set config",
+                                                  configCollectionName);
         }
         catch (const DBException& ex) {
             return StatusWith<BSONObj>(ex.toStatus());
@@ -176,48 +184,54 @@ namespace {
             OperationContext* txn,
             const BSONObj& config) {
         try {
-            ScopedTransaction transaction(txn, MODE_IX);
-            Lock::DBLock dbWriteLock(txn->lockState(), configDatabaseName, MODE_X);
-            Helpers::putSingleton(txn, configCollectionName, config);
-            return Status::OK();
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                ScopedTransaction transaction(txn, MODE_IX);
+                Lock::DBLock dbWriteLock(txn->lockState(), configDatabaseName, MODE_X);
+                Helpers::putSingleton(txn, configCollectionName, config);
+                return Status::OK();
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn,
+                                                  "save replica set config",
+                                                  configCollectionName);
         }
         catch (const DBException& ex) {
             return ex.toStatus();
         }
+
     }
 
-    void ReplicationCoordinatorExternalStateImpl::setGlobalOpTime(const OpTime& newTime) {
+    void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(const Timestamp& newTime) {
         setNewOptime(newTime);
     }
 
-    StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
+    StatusWith<Timestamp> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
             OperationContext* txn) {
 
+        // TODO: handle WriteConflictExceptions below
         try {
             BSONObj oplogEntry;
             if (!Helpers::getLast(txn, rsOplogName.c_str(), oplogEntry)) {
-                return StatusWith<OpTime>(
+                return StatusWith<Timestamp>(
                         ErrorCodes::NoMatchingDocument,
                         str::stream() << "Did not find any entries in " << rsOplogName);
             }
             BSONElement tsElement = oplogEntry[tsFieldName];
             if (tsElement.eoo()) {
-                return StatusWith<OpTime>(
+                return StatusWith<Timestamp>(
                         ErrorCodes::NoSuchKey,
                         str::stream() << "Most recent entry in " << rsOplogName << " missing \"" <<
                         tsFieldName << "\" field");
             }
-            if (tsElement.type() != Timestamp) {
-                return StatusWith<OpTime>(
+            if (tsElement.type() != bsonTimestamp) {
+                return StatusWith<Timestamp>(
                         ErrorCodes::TypeMismatch,
                         str::stream() << "Expected type of \"" << tsFieldName <<
                         "\" in most recent " << rsOplogName <<
                         " entry to have type Timestamp, but found " << typeName(tsElement.type()));
             }
-            return StatusWith<OpTime>(tsElement._opTime());
+            return StatusWith<Timestamp>(tsElement.timestamp());
         }
         catch (const DBException& ex) {
-            return StatusWith<OpTime>(ex.toStatus());
+            return StatusWith<Timestamp>(ex.toStatus());
         }
     }
 
@@ -237,7 +251,7 @@ namespace {
     }
 
     void ReplicationCoordinatorExternalStateImpl::killAllUserOperations(OperationContext* txn) {
-        GlobalEnvironmentExperiment* environment = getGlobalEnvironment();
+        ServiceContext* environment = getGlobalServiceContext();
         environment->killAllUserOperations(txn);
     }
 
@@ -257,7 +271,7 @@ namespace {
 
     void ReplicationCoordinatorExternalStateImpl::dropAllTempCollections(OperationContext* txn) {
         std::vector<std::string> dbNames;
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         storageEngine->listDatabases(&dbNames);
 
         for (std::vector<std::string>::iterator it = dbNames.begin(); it != dbNames.end(); ++it) {

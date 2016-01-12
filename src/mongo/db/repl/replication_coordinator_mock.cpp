@@ -81,7 +81,7 @@ namespace repl {
 
     ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorMock::awaitReplication(
             const OperationContext* txn,
-            const OpTime& ts,
+            const Timestamp& ts,
             const WriteConcernOptions& writeConcern) {
         // TODO
         return StatusAndDuration(Status::OK(), Milliseconds(0));
@@ -123,7 +123,7 @@ namespace repl {
         return false;
     }
 
-    Status ReplicationCoordinatorMock::setLastOptimeForSlave(const OID& rid, const OpTime& ts) {
+    Status ReplicationCoordinatorMock::setLastOptimeForSlave(const OID& rid, const Timestamp& ts) {
         return Status::OK();
     }
     
@@ -131,13 +131,13 @@ namespace repl {
         // TODO
     }
 
-    void ReplicationCoordinatorMock::setMyLastOptime(const OpTime& ts) {}
+    void ReplicationCoordinatorMock::setMyLastOptime(const Timestamp& ts) {}
 
     void ReplicationCoordinatorMock::resetMyLastOptime() {}
 
-    OpTime ReplicationCoordinatorMock::getMyLastOptime() const {
+    Timestamp ReplicationCoordinatorMock::getMyLastOptime() const {
         // TODO
-        return OpTime();
+        return Timestamp();
     }
 
 
@@ -256,7 +256,7 @@ namespace repl {
         return true;
     }
 
-    std::vector<HostAndPort> ReplicationCoordinatorMock::getHostsWrittenTo(const OpTime& op) {
+    std::vector<HostAndPort> ReplicationCoordinatorMock::getHostsWrittenTo(const Timestamp& op) {
         return std::vector<HostAndPort>();
     }
 
@@ -293,6 +293,33 @@ namespace repl {
 
     bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& currentSource) {
         invariant(false);
+    }
+
+    Timestamp ReplicationCoordinatorMock::getLastCommittedOpTime() const {
+        return Timestamp();
+    }
+
+    Status ReplicationCoordinatorMock::processReplSetRequestVotes(
+        const ReplSetRequestVotesArgs& args,
+        ReplSetRequestVotesResponse* response) {
+        return Status::OK();
+    }
+
+    Status ReplicationCoordinatorMock::processReplSetDeclareElectionWinner(
+            const ReplSetDeclareElectionWinnerArgs& args,
+            ReplSetDeclareElectionWinnerResponse* response) {
+        return Status::OK();
+    }
+
+    void ReplicationCoordinatorMock::prepareCursorResponseInfo(BSONObjBuilder* objBuilder) {}
+
+    Status ReplicationCoordinatorMock::processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
+                                                          ReplSetHeartbeatResponseV1* response) {
+        return Status::OK();
+    }
+
+    bool ReplicationCoordinatorMock::isV1ElectionProtocol() {
+        return true;
     }
 
 } // namespace repl

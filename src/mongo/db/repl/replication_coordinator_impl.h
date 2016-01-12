@@ -35,9 +35,10 @@
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/bson/optime.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/data_replicator.h"
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
@@ -60,6 +61,8 @@ namespace repl {
     class HandshakeArgs;
     class HeartbeatResponseAction;
     class OplogReader;
+    class ReplSetDeclareElectionWinnerArgs;
+    class ReplSetRequestVotesArgs;
     class ReplicaSetConfig;
     class SyncSourceFeedback;
     class TopologyCoordinator;
@@ -75,6 +78,12 @@ namespace repl {
                                    ReplicationCoordinatorExternalState* externalState,
                                    ReplicationExecutor::NetworkInterface* network,
                                    TopologyCoordinator* topoCoord,
+                                   int64_t prngSeed);
+        // Takes ownership of the "externalState" and "topCoord" objects.
+        ReplicationCoordinatorImpl(const ReplSettings& settings,
+                                   ReplicationCoordinatorExternalState* externalState,
+                                   TopologyCoordinator* topoCoord,
+                                   ReplicationExecutor* replExec,
                                    int64_t prngSeed);
         virtual ~ReplicationCoordinatorImpl();
 
@@ -110,7 +119,7 @@ namespace repl {
 
         virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
                 const OperationContext* txn,
-                const OpTime& ts,
+                const Timestamp& ts,
                 const WriteConcernOptions& writeConcern);
 
         virtual ReplicationCoordinator::StatusAndDuration awaitReplicationOfLastOpForClient(
@@ -135,15 +144,15 @@ namespace repl {
 
         virtual bool shouldIgnoreUniqueIndex(const IndexDescriptor* idx);
 
-        virtual Status setLastOptimeForSlave(const OID& rid, const OpTime& ts);
+        virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
 
-        virtual void setMyLastOptime(const OpTime& ts);
+        virtual void setMyLastOptime(const Timestamp& ts);
 
         virtual void resetMyLastOptime();
 
         virtual void setMyHeartbeatMessage(const std::string& msg);
 
-        virtual OpTime getMyLastOptime() const;
+        virtual Timestamp getMyLastOptime() const;
 
         virtual OID getElectionId();
 
@@ -208,7 +217,7 @@ namespace repl {
 
         virtual bool buildsIndexes();
 
-        virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op);
+        virtual std::vector<HostAndPort> getHostsWrittenTo(const Timestamp& op);
 
         virtual std::vector<HostAndPort> getOtherNodesInReplSet() const;
 
@@ -226,6 +235,21 @@ namespace repl {
 
         virtual bool shouldChangeSyncSource(const HostAndPort& currentSource);
 
+        virtual Timestamp getLastCommittedOpTime() const;
+
+        virtual Status processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
+                                                  ReplSetRequestVotesResponse* response);
+
+        virtual Status processReplSetDeclareElectionWinner(
+                const ReplSetDeclareElectionWinnerArgs& args,
+                ReplSetDeclareElectionWinnerResponse* response);
+
+        virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder);
+
+        virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
+                                          ReplSetHeartbeatResponseV1* response);
+
+        virtual bool isV1ElectionProtocol();
 
         // ================== Test support API ===================
 
@@ -243,10 +267,15 @@ namespace repl {
         /**
          * Simple wrapper around _setLastOptime_inlock to make it easier to test.
          */
-        Status setLastOptime_forTest(long long cfgVer, long long memberId, const OpTime& ts);
+        Status setLastOptime_forTest(long long cfgVer, long long memberId, const Timestamp& ts);
 
     private:
-
+        ReplicationCoordinatorImpl(const ReplSettings& settings,
+                                   ReplicationCoordinatorExternalState* externalState,
+                                   TopologyCoordinator* topCoord,
+                                   int64_t prngSeed,
+                                   ReplicationExecutor::NetworkInterface* network,
+                                   ReplicationExecutor* replExec);
         /**
          * Configuration states for a replica set node.
          *
@@ -284,7 +313,7 @@ namespace repl {
         enum PostMemberStateUpdateAction {
             kActionNone,
             kActionCloseAllConnections,  // Also indicates that we should clear sharding state.
-            kActionChooseNewSyncSource,
+            kActionFollowerModeStateChange,
             kActionWinElection
         };
 
@@ -294,7 +323,7 @@ namespace repl {
         // Struct that holds information about nodes in this replication group, mainly used for
         // tracking replication progress for write concern satisfaction.
         struct SlaveInfo {
-            OpTime opTime; // Our last known OpTime that this slave has replicated to.
+            Timestamp opTime; // Our last known OpTime that this slave has replicated to.
             HostAndPort hostAndPort; // Client address of the slave.
             int memberId; // Id of the node in the replica set config, or -1 if we're not a replSet.
             OID rid; // RID of the node.
@@ -329,7 +358,7 @@ namespace repl {
          * and wakes up any threads waiting for replication that now have their write concern
          * satisfied.
          */
-        void _updateSlaveInfoOptime_inlock(SlaveInfo* slaveInfo, OpTime ts);
+        void _updateSlaveInfoOptime_inlock(SlaveInfo* slaveInfo, Timestamp ts);
 
         /**
          * Returns the index into _slaveInfo where data corresponding to ourself is stored.
@@ -428,25 +457,25 @@ namespace repl {
                 const Timer* timer,
                 boost::unique_lock<boost::mutex>* lock,
                 const OperationContext* txn,
-                const OpTime& ts,
+                const Timestamp& ts,
                 const WriteConcernOptions& writeConcern);
 
         /*
          * Returns true if the given writeConcern is satisfied up to "optime" or is unsatisfiable.
          */
-        bool _doneWaitingForReplication_inlock(const OpTime& opTime,
+        bool _doneWaitingForReplication_inlock(const Timestamp& opTime,
                                                const WriteConcernOptions& writeConcern);
 
         /**
          * Helper for _doneWaitingForReplication_inlock that takes an integer write concern.
          */
-        bool _haveNumNodesReachedOpTime_inlock(const OpTime& opTime, int numNodes);
+        bool _haveNumNodesReachedOpTime_inlock(const Timestamp& opTime, int numNodes);
 
         /**
          * Helper for _doneWaitingForReplication_inlock that takes a tag pattern representing a
          * named write concern mode.
          */
-        bool _haveTaggedNodesReachedOpTime_inlock(const OpTime& opTime,
+        bool _haveTaggedNodesReachedOpTime_inlock(const Timestamp& opTime,
                                                   const ReplicaSetTagPattern& tagPattern);
 
         Status _checkIfWriteConcernCanBeSatisfied_inlock(
@@ -477,7 +506,7 @@ namespace repl {
 
         int _getMyId_inlock() const;
 
-        OpTime _getMyLastOptime_inlock() const;
+        Timestamp _getMyLastOptime_inlock() const;
 
 
         /**
@@ -512,7 +541,7 @@ namespace repl {
          * "isRollbackAllowed" is true.
          */
         void _setMyLastOptime_inlock(boost::unique_lock<boost::mutex>* lock,
-                                     const OpTime& ts,
+                                     const Timestamp& ts,
                                      bool isRollbackAllowed);
 
         /**
@@ -539,7 +568,7 @@ namespace repl {
          *
          * Updates the optime associated with the member at "memberIndex" in our config.
          */
-        void _updateOpTimeFromHeartbeat_inlock(int memberIndex, OpTime optime);
+        void _updateOpTimeFromHeartbeat_inlock(int memberIndex, Timestamp optime);
 
         /**
          * Starts a heartbeat for each member in the current config.  Called within the executor
@@ -567,12 +596,6 @@ namespace repl {
         MemberState _getMemberState_inlock() const;
 
         /**
-         * Returns the current replication mode. This method requires the caller to be holding
-         * "_mutex" to be called safely.
-         */
-        Mode _getReplicationMode_inlock() const;
-
-        /**
          * Starts loading the replication configuration from local storage, and if it is valid,
          * schedules a callback (of _finishLoadLocalConfig) to set it as the current replica set
          * config (sets _rsConfig and _thisMembersConfigIndex).
@@ -589,7 +612,7 @@ namespace repl {
          */
         void _finishLoadLocalConfig(const ReplicationExecutor::CallbackData& cbData,
                                     const ReplicaSetConfig& localConfig,
-                                    const StatusWith<OpTime>& lastOpTimeStatus);
+                                    const StatusWith<Timestamp>& lastOpTimeStatus);
 
         /**
          * Callback that finishes the work of processReplSetInitiate() inside the replication
@@ -749,6 +772,12 @@ namespace repl {
                                      ReplSetHeartbeatResponse* response,
                                      Status* outStatus);
 
+        /**
+         * Scan the SlaveInfoVector and determine the highest OplogEntry present on a majority of
+         * servers; set _lastCommittedOpTime to this new entry, if greater than the current entry.
+         */
+        void _updateLastCommittedOpTime_inlock();
+
         //
         // All member variables are labeled with one of the following codes indicating the
         // synchronization rules for accessing them.
@@ -787,8 +816,11 @@ namespace repl {
         // Pointer to the TopologyCoordinator owned by this ReplicationCoordinator.
         boost::scoped_ptr<TopologyCoordinator> _topCoord;                                 // (X)
 
+        // If the executer is owned then this will be set, but should not be used.
+        // This is only used to clean up and destroy the replExec if owned
+        std::unique_ptr<ReplicationExecutor> _replExecutorIfOwned;                        // (S)
         // Executor that drives the topology coordinator.
-        ReplicationExecutor _replExecutor;                                                // (S)
+        ReplicationExecutor& _replExecutor;                                               // (S)
 
         // Pointer to the ReplicationCoordinatorExternalState owned by this ReplicationCoordinator.
         boost::scoped_ptr<ReplicationCoordinatorExternalState> _externalState;            // (PS)
@@ -878,6 +910,12 @@ namespace repl {
         // providing the prior value for a limited period of time is acceptable.  Also unlike
         // _canAcceptNonLocalWrites, its value is only meaningful on replica set secondaries.
         AtomicUInt32 _canServeNonLocalReads;                                              // (S)
+
+        // OpTime of the latest committed operation. Matches the concurrency level of _slaveInfo.
+        Timestamp _lastCommittedOpTime;                                                   // (M)
+
+        // Data Replicator used to replicate data
+        DataReplicator _dr;                                                               // (S)
     };
 
 } // namespace repl

@@ -6,25 +6,43 @@ env.Library(
     target='sharding_client',
     source=[
         'dbclient_multi_command.cpp',
+        'shard.cpp',
         'shard_connection.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/clientdriver',
+        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/s/catalog/catalog_manager',
     ]
 )
+
+env.Library(
+    target='sharding_connection_hook',
+    source=[
+        'multi_host_query.cpp',
+        'scc_fast_query_handler.cpp',
+        'sharding_connection_hook.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/client/clientdriver',
+    ]
+)
+
 
 env.CppUnitTest(
     target='sharding_client_test',
     source=[
-        'shard_connection_test.cpp'
+        'multi_host_query_test.cpp',
+        'shard_connection_test.cpp',
+        'shard_test.cpp',
     ],
     LIBDEPS=[
         'sharding_client',
+        'sharding_connection_hook',
         '$BUILD_DIR/mongo/coredb',
         '$BUILD_DIR/mongo/coreserver',
         '$BUILD_DIR/mongo/coreshard',
-        '$BUILD_DIR/mongo/mongoscore',
-        '$BUILD_DIR/mongo/mongocommon',
         '$BUILD_DIR/mongo/mocklib',
+        '$BUILD_DIR/mongo/mongocommon',
+        '$BUILD_DIR/mongo/mongoscore',
     ]
 )

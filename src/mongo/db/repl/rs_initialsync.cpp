@@ -32,7 +32,7 @@
 
 #include "mongo/db/repl/rs_initialsync.h"
 
-#include "mongo/bson/optime.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
@@ -40,8 +40,9 @@
 #include "mongo/db/client.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/operation_context_impl.h"
@@ -50,6 +51,7 @@
 #include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -64,12 +66,12 @@ namespace {
 
     /**
      * Truncates the oplog (removes any documents) and resets internal variables that were
-     * originally initialized or affected by using values from the oplog at startup time.  These 
+     * originally initialized or affected by using values from the oplog at startup time.  These
      * include the last applied optime, the last fetched optime, and the sync source blacklist.
      * Also resets the bgsync thread so that it reconnects its sync source after the oplog has been
      * truncated.
      */
-    void truncateAndResetOplog(OperationContext* txn, 
+    void truncateAndResetOplog(OperationContext* txn,
                                ReplicationCoordinator* replCoord,
                                BackgroundSync* bgsync) {
         AutoGetDb autoDb(txn, "local", MODE_X);
@@ -89,10 +91,12 @@ namespace {
         // Truncate the oplog in case there was a prior initial sync that failed.
         Collection* collection = autoDb.getDb()->getCollection(rsOplogName);
         fassert(28565, collection);
-        WriteUnitOfWork wunit(txn);
-        Status status = collection->truncate(txn);
-        fassert(28564, status);
-        wunit.commit();
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            WriteUnitOfWork wunit(txn);
+            Status status = collection->truncate(txn);
+            fassert(28564, status);
+            wunit.commit();
+        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "truncate", collection->ns().ns());
     }
 
     /**
@@ -158,7 +162,7 @@ namespace {
             const string db = *i;
             if ( db == "local" )
                 continue;
-            
+
             if ( dataPass )
                 log() << "initial sync cloning db: " << db;
             else
@@ -168,7 +172,6 @@ namespace {
             int errCode;
             CloneOptions options;
             options.fromDB = db;
-            options.logForRepl = false;
             options.slaveOk = true;
             options.useReplAuth = true;
             options.snapshot = false;
@@ -206,7 +209,7 @@ namespace {
     bool _initialSyncApplyOplog( OperationContext* ctx,
                                  repl::SyncTail& syncer,
                                  OplogReader* r) {
-        const OpTime startOpTime = getGlobalReplicationCoordinator()->getMyLastOptime();
+        const Timestamp startOpTime = getGlobalReplicationCoordinator()->getMyLastOptime();
         BSONObj lastOp;
         try {
             // It may have been a long time since we last used this connection to
@@ -217,7 +220,7 @@ namespace {
             lastOp = r->getLastOp(rsOplogName);
         } catch ( SocketException & ) {
             HostAndPort host = r->getHost();
-            log() << "connection lost to " << host.toString() << 
+            log() << "connection lost to " << host.toString() <<
                 "; is your tcp keepalive interval set appropriately?";
             if ( !r->connect(host) ) {
                 error() << "initial sync couldn't connect to " << host.toString();
@@ -233,7 +236,7 @@ namespace {
             return false;
         }
 
-        OpTime stopOpTime = lastOp["ts"]._opTime();
+        Timestamp stopOpTime = lastOp["ts"].timestamp();
 
         // If we already have what we need then return.
         if (stopOpTime == startOpTime)
@@ -261,7 +264,7 @@ namespace {
             sleepsecs(5);
             return false;
         }
-        
+
         return true;
     }
 
@@ -327,12 +330,13 @@ namespace {
 
         BackgroundSync* bgsync(BackgroundSync::get());
         OperationContextImpl txn;
+        txn.setReplicatedWrites(false);
         ReplicationCoordinator* replCoord(getGlobalReplicationCoordinator());
 
         truncateAndResetOplog(&txn, replCoord, bgsync);
 
         OplogReader r;
-        OpTime now(Milliseconds(curTimeMillis64()).total_seconds(), 0);
+        Timestamp now(Milliseconds(curTimeMillis64()).total_seconds(), 0);
 
         while (r.getHost().empty()) {
             // We must prime the sync source selector so that it considers all candidates regardless
@@ -389,7 +393,11 @@ namespace {
         _tryToApplyOpWithRetry(&txn, &init, lastOp);
         std::deque<BSONObj> ops;
         ops.push_back(lastOp);
-        writeOpsToOplog(&txn, ops);
+
+        Timestamp lastOptime = writeOpsToOplog(&txn, ops);
+        ReplClientInfo::forClient(txn.getClient()).setLastOp(lastOptime);
+        replCoord->setMyLastOptime(lastOptime);
+        setNewOptime(lastOptime);
 
         std::string msg = "oplog sync 1 of 3";
         log() << msg;
@@ -424,7 +432,7 @@ namespace {
             return Status(ErrorCodes::InitialSyncFailure,
                           str::stream() << "initial sync failed: " << msg);
         }
-        
+
         // ---------
 
         Status status = getGlobalAuthorizationManager()->initialize(&txn);
@@ -438,18 +446,16 @@ namespace {
         {
             ScopedTransaction scopedXact(&txn, MODE_IX);
             AutoGetDb autodb(&txn, "local", MODE_X);
-            OpTime lastOpTimeWritten(getGlobalReplicationCoordinator()->getMyLastOptime());
+            Timestamp lastOpTimeWritten(getGlobalReplicationCoordinator()->getMyLastOptime());
             log() << "set minValid=" << lastOpTimeWritten;
 
             // Initial sync is now complete.  Flag this by setting minValid to the last thing
             // we synced.
-            WriteUnitOfWork wunit(&txn);
             setMinValid(&txn, lastOpTimeWritten);
 
             // Clear the initial sync flag.
             clearInitialSyncFlag(&txn);
             BackgroundSync::get()->setInitialSyncRequestedFlag(false);
-            wunit.commit();
         }
 
         // If we just cloned & there were no ops applied, we still want the primary to know where

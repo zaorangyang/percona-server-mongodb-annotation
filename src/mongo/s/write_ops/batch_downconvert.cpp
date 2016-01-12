@@ -133,29 +133,6 @@ namespace mongo {
             errors->wcError->setErrMessage( jNote );
         }
 
-        // See if we had a version error reported as a writeback id - this is the only kind of
-        // write error where the write concern may still be enforced.
-        // The actual version that was stale is lost in the writeback itself.
-        const int opsSinceWriteback = gleResponse["writebackSince"].numberInt();
-        const bool hadWriteback = !gleResponse["writeback"].eoo();
-
-        if ( hadWriteback && opsSinceWriteback == 0 ) {
-
-            // We shouldn't have a previous write error
-            dassert( !errors->writeError.get() );
-            if ( errors->writeError.get() ) {
-                // Somehow there was a write error *and* a writeback from the last write
-                warning() << "both a write error and a writeback were reported "
-                          << "when processing a legacy write: " << errors->writeError->toBSON()
-                          << endl;
-            }
-
-            errors->writeError.reset( new WriteErrorDetail );
-            errors->writeError->setErrCode( ErrorCodes::StaleShardVersion );
-            errors->writeError->setErrInfo( BSON( "downconvert" << true ) ); // For debugging
-            errors->writeError->setErrMessage( "shard version was stale" );
-        }
-
         return Status::OK();
     }
 
@@ -223,7 +200,7 @@ namespace mongo {
 
     // Adds a wOpTime and a wElectionId field to a set of gle options
     static BSONObj buildGLECmdWithOpTime( const BSONObj& gleOptions,
-                                          const OpTime& opTime,
+                                          const Timestamp& opTime,
                                           const OID& electionId ) {
         BSONObjBuilder builder;
         BSONObjIterator it( gleOptions );
@@ -241,7 +218,7 @@ namespace mongo {
 
             builder.append( el );
         }
-        builder.appendTimestamp( "wOpTime", opTime.asDate() );
+        builder.append( "wOpTime", opTime );
         builder.appendOID( "wElectionId", const_cast<OID*>(&electionId) );
         return builder.obj();
     }
@@ -261,7 +238,7 @@ namespace mongo {
 
             const ConnectionString& shardEndpoint = it->first;
             const HostOpTime hot = it->second;
-            const OpTime& opTime = hot.opTime;
+            const Timestamp& opTime = hot.opTime;
             const OID& electionId = hot.electionId;
 
             LOG( 3 ) << "enforcing write concern " << options << " on " << shardEndpoint.toString()

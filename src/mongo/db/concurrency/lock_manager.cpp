@@ -28,14 +28,13 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/config.h"
-
 #include "mongo/platform/basic.h"
 
 #include <vector>
 
 #include "mongo/db/concurrency/lock_manager.h"
 
+#include "mongo/config.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -679,6 +678,7 @@ namespace {
     }
 
     void LockManager::cleanupUnusedLocks() {
+        size_t deletedLockHeads = 0;
         for (unsigned i = 0; i < _numLockBuckets; i++) {
             LockBucket* bucket = &_lockBuckets[i];
             SimpleMutex::scoped_lock scopedLock(bucket->mutex);
@@ -700,6 +700,7 @@ namespace {
                     invariant(lock->compatibleFirstCount == 0);
 
                     bucket->data.erase(it++);
+                    deletedLockHeads++;
                     delete lock;
                 }
                 else {

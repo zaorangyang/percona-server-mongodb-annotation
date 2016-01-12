@@ -31,7 +31,6 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/client_info.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
@@ -72,7 +71,7 @@ namespace mongo {
         Status checkAuthForCommand( ClientBasic* client,
                                     const std::string& dbname,
                                     const BSONObj& cmdObj ) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
     
             if (authzSession->isAuthorizedForActionsOnResource(pattern,
@@ -88,8 +87,7 @@ namespace mongo {
                   BSONObj& cmdObj,
                   int options,
                   std::string& errmsg,
-                  BSONObjBuilder& result,
-                  bool fromRepl );
+                  BSONObjBuilder& result);
 
     public:
 
@@ -114,8 +112,7 @@ namespace mongo {
                                BSONObj& cmdObj,
                                int options,
                                std::string& errMsg,
-                               BSONObjBuilder& result,
-                               bool ) {
+                               BSONObjBuilder& result) {
         const std::string fullns = parseNs(dbName, cmdObj);
         NamespaceString nss(fullns);
 

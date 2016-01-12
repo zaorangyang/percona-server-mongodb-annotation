@@ -32,20 +32,24 @@
 
 #include "mongo/db/auth/authz_manager_external_state_s.h"
 
-#include <boost/thread/mutex.hpp>
 #include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
+#include <boost/thread/mutex.hpp>
 #include <string>
 
+#include "mongo/client/connpool.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authz_session_external_state_s.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/config.h"
-#include "mongo/s/distlock.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -53,20 +57,18 @@
 namespace mongo {
 
     using boost::scoped_ptr;
+    using boost::shared_ptr;
     using std::endl;
     using std::vector;
 
 namespace {
 
-    ScopedDbConnection* getConnectionForAuthzCollection(const NamespaceString& ns) {
-        //
+    ScopedDbConnection* getConnectionForAuthzCollection(const NamespaceString& nss) {
         // Note: The connection mechanism here is *not* ideal, and should not be used elsewhere.
         // If the primary for the collection moves, this approach may throw rather than handle
         // version exceptions.
-        //
-
-        DBConfigPtr config = grid.getDBConfig(ns.ns());
-        Shard s = config->getShard(ns.ns());
+        auto config = uassertStatusOK(grid.catalogCache()->getDatabase(nss.db().toString()));
+        Shard s = config->getShard(nss.ns());
 
         return new ScopedDbConnection(s.getConnString(), 30.0);
     }
@@ -110,6 +112,13 @@ namespace {
 
     Status AuthzManagerExternalStateMongos::initialize(OperationContext* txn) {
         return Status::OK();
+    }
+
+    std::unique_ptr<AuthzSessionExternalState>
+    AuthzManagerExternalStateMongos::makeAuthzSessionExternalState(
+            AuthorizationManager* authzManager) {
+
+        return stdx::make_unique<AuthzSessionExternalStateMongos>(authzManager);
     }
 
     Status AuthzManagerExternalStateMongos::getStoredAuthorizationVersion(
@@ -330,20 +339,19 @@ namespace {
             return false;
         }
 
-        // Temporarily put into an auto_ptr just in case there is an exception thrown during
-        // lock acquisition.
-        std::auto_ptr<ScopedDistributedLock> lockHolder(new ScopedDistributedLock(
-                configServer.getConnectionString(), "authorizationData"));
-        lockHolder->setLockMessage(why.toString());
+        auto timeout = stdx::chrono::milliseconds(_authzUpdateLockAcquisitionTimeoutMillis);
+        auto scopedDistLock = grid.catalogManager()->getDistLockManager()->lock(
+                "authorizationData", why, timeout);
 
-        Status acquisitionStatus = lockHolder->acquire(_authzUpdateLockAcquisitionTimeoutMillis);
-        if (!acquisitionStatus.isOK()) {
-            warning() <<
-                    "Error while attempting to acquire distributed lock for user modification: " <<
-                    acquisitionStatus.toString() << endl;
+        if (!scopedDistLock.isOK()) {
+            warning() << "Error while attempting to acquire distributed lock for "
+                      << "user modification: " << scopedDistLock.getStatus().toString();
             return false;
         }
-        _authzDataUpdateLock.reset(lockHolder.release());
+
+        _authzDataUpdateLock = stdx::make_unique<DistLockManager::ScopedDistLock>(
+                std::move(scopedDistLock.getValue()));
+
         return true;
     }
 

@@ -26,8 +26,15 @@
  *    then also delete it in the license file.
  */
 
+#include <exception>
+#include <stdexcept>
+#include <string>
+
+#include <boost/exception/exception.hpp>
+
 #include "mongo/base/status.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
 namespace {
 
@@ -196,6 +203,57 @@ namespace {
         ASSERT_EQUALS(ErrorCodes::UnknownError, ErrorCodes::fromInt(ErrorCodes::UnknownError));
         ASSERT_EQUALS(ErrorCodes::MaxError, ErrorCodes::fromInt(ErrorCodes::MaxError));
         ASSERT_EQUALS(ErrorCodes::OK, ErrorCodes::fromInt(0));
+    }
+
+    TEST(Transformers, ExceptionToStatus) {
+        using mongo::DBException;
+        using mongo::exceptionToStatus;
+
+        auto reason = "oh no";
+
+        Status fromDBExcept = [=](){
+            try {
+                throw DBException(reason, ErrorCodes::TypeMismatch);
+            }
+            catch (...) {
+                return exceptionToStatus();
+            }
+        }();
+
+        ASSERT_NOT_OK(fromDBExcept);
+        ASSERT_EQUALS(fromDBExcept.reason(), reason);
+        ASSERT_EQUALS(fromDBExcept.code(), ErrorCodes::TypeMismatch);
+
+        Status fromStdExcept = [=]() {
+            try {
+                throw std::out_of_range(reason);
+            }
+            catch (...) {
+                return exceptionToStatus();
+            }
+        }();
+
+        ASSERT_NOT_OK(fromStdExcept);
+        // we don't check the exact error message because the type name of the exception
+        // isn't demangled on windows.
+        ASSERT_TRUE(fromStdExcept.reason().find(reason) != std::string::npos);
+        ASSERT_EQUALS(fromStdExcept.code(), ErrorCodes::UnknownError);
+
+        class bar : public boost::exception {};
+
+        Status fromBoostExcept = [=]() {
+            try {
+                throw bar();
+            }
+            catch (...) {
+                return exceptionToStatus();
+            }
+        }();
+
+        ASSERT_NOT_OK(fromBoostExcept);
+        ASSERT_EQUALS(fromBoostExcept, ErrorCodes::UnknownError);
+        // Reason should include that it was a boost::exception
+        ASSERT_TRUE(fromBoostExcept.reason().find("boost::exception") != std::string::npos);
     }
 
 } // unnamed namespace

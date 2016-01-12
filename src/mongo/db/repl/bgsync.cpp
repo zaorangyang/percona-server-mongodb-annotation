@@ -37,6 +37,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/oplog.h"
@@ -146,7 +147,7 @@ namespace {
 
     void BackgroundSync::producerThread() {
         Client::initThread("rsBackgroundSync");
-        cc().getAuthorizationSession()->grantInternalAuthorization();
+        AuthorizationSession::get(cc())->grantInternalAuthorization();
 
         while (!inShutdown()) {
             try {
@@ -162,8 +163,6 @@ namespace {
                 fassertFailed(28546);
             }
         }
-
-        cc().shutdown();
     }
 
     void BackgroundSync::_producerThread() {
@@ -228,7 +227,7 @@ namespace {
 
 
         // find a target to sync from the last optime fetched
-        OpTime lastOpTimeFetched;
+        Timestamp lastOpTimeFetched;
         {
             boost::unique_lock<boost::mutex> lock(_mutex);
             lastOpTimeFetched = _lastOpTimeFetched;
@@ -354,7 +353,7 @@ namespace {
             {
                 boost::unique_lock<boost::mutex> lock(_mutex);
                 _lastFetchedHash = o["h"].numberLong();
-                _lastOpTimeFetched = o["ts"]._opTime();
+                _lastOpTimeFetched = o["ts"].timestamp();
                 LOG(3) << "lastOpTimeFetched: " << _lastOpTimeFetched.toStringPretty();
             }
         }
@@ -402,7 +401,7 @@ namespace {
                     sleepsecs(2);
                     return true;
                 }
-                OpTime theirTS = theirLastOp["ts"]._opTime();
+                Timestamp theirTS = theirLastOp["ts"].timestamp();
                 if (theirTS < _lastOpTimeFetched) {
                     log() << "we are ahead of the sync source, will try to roll back";
                     syncRollback(txn, _replCoord->getMyLastOptime(), &r, _replCoord);
@@ -420,7 +419,7 @@ namespace {
         }
 
         BSONObj o = r.nextSafe();
-        OpTime ts = o["ts"]._opTime();
+        Timestamp ts = o["ts"].timestamp();
         long long hash = o["h"].numberLong();
         if( ts != _lastOpTimeFetched || hash != _lastFetchedHash ) {
             log() << "our last op time fetched: " << _lastOpTimeFetched.toStringPretty();
@@ -447,7 +446,7 @@ namespace {
 
         _pause = true;
         _syncSourceHost = HostAndPort();
-        _lastOpTimeFetched = OpTime(0,0);
+        _lastOpTimeFetched = Timestamp(0,0);
         _lastFetchedHash = 0;
         _appliedBufferCondition.notify_all();
         _pausedCondition.notify_all();
@@ -495,14 +494,16 @@ namespace {
     long long BackgroundSync::_readLastAppliedHash(OperationContext* txn) {
         BSONObj oplogEntry;
         try {
-            ScopedTransaction transaction(txn, MODE_IX);
-            Lock::DBLock lk(txn->lockState(), "local", MODE_X);
-            bool success = Helpers::getLast(txn, rsOplogName.c_str(), oplogEntry);
-            if (!success) {
-                // This can happen when we are to do an initial sync.  lastHash will be set
-                // after the initial sync is complete.
-                return 0;
-            }
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                ScopedTransaction transaction(txn, MODE_IX);
+                Lock::DBLock lk(txn->lockState(), "local", MODE_X);
+                bool success = Helpers::getLast(txn, rsOplogName.c_str(), oplogEntry);
+                if (!success) {
+                    // This can happen when we are to do an initial sync.  lastHash will be set
+                    // after the initial sync is complete.
+                    return 0;
+                }
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "readLastAppliedHash", rsOplogName);
         }
         catch (const DBException& ex) {
             severe() << "Problem reading " << rsOplogName << ": " << ex.toStatus();

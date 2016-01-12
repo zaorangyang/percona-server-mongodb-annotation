@@ -124,8 +124,12 @@ namespace mongo {
           helpText(helpText),
           actionType(actionType) { }
 
-    bool PlanCacheCommand::run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int options,
-                               string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+    bool PlanCacheCommand::run(OperationContext* txn,
+                               const string& dbname,
+                               BSONObj& cmdObj,
+                               int options,
+                               string& errmsg,
+                               BSONObjBuilder& result) {
         string ns = parseNs(dbname, cmdObj);
 
         Status status = runPlanCacheCommand(txn, ns, cmdObj, &result);
@@ -155,7 +159,7 @@ namespace mongo {
     Status PlanCacheCommand::checkAuthForCommand(ClientBasic* client,
                                                  const std::string& dbname,
                                                  const BSONObj& cmdObj) {
-        AuthorizationSession* authzSession = client->getAuthorizationSession();
+        AuthorizationSession* authzSession = AuthorizationSession::get(client);
         ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
         if (authzSession->isAuthorizedForActionsOnResource(pattern, actionType)) {
@@ -420,14 +424,10 @@ namespace mongo {
             statsBob.doneFast();
             reasonBob.doneFast();
 
-            // BSON object for 'feedback' field is created from query executions
-            // and shows number of executions since this cached solution was
-            // created as well as score data (average and standard deviation).
+            // BSON object for 'feedback' field shows scores from historical executions of the plan.
             BSONObjBuilder feedbackBob(planBob.subobjStart("feedback"));
             if (i == 0U) {
                 feedbackBob.append("nfeedback", int(entry->feedback.size()));
-                feedbackBob.append("averageScore", entry->averageScore.get_value_or(0));
-                feedbackBob.append("stdDevScore",entry->stddevScore.get_value_or(0));
                 BSONArrayBuilder scoresBob(feedbackBob.subarrayStart("scores"));
                 for (size_t i = 0; i < entry->feedback.size(); ++i) {
                     BSONObjBuilder scoreBob(scoresBob.subobjStart());

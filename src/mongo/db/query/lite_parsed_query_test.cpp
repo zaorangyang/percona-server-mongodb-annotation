@@ -284,7 +284,7 @@ namespace {
                                    "filter: {a: 3},"
                                    "sort: {a: 1},"
                                    "projection: {_id: 0, a: 1},"
-                                   "showDiskLoc: true,"
+                                   "showRecordId: true,"
                                    "maxScan: 1000}}");
 
         LiteParsedQuery* rawLpq;
@@ -294,7 +294,7 @@ namespace {
         scoped_ptr<LiteParsedQuery> lpq(rawLpq);
 
         // Make sure the values from the command BSON are reflected in the LPQ.
-        ASSERT(lpq->showDiskLoc());
+        ASSERT(lpq->showRecordId());
         ASSERT_EQUALS(1000, lpq->getMaxScan());
     }
 
@@ -342,7 +342,6 @@ namespace {
                                    "oplogReplay: true,"
                                    "noCursorTimeout: true,"
                                    "awaitData: true,"
-                                   "exhaust: true,"
                                    "partial: true}");
 
         LiteParsedQuery* rawLpq;
@@ -357,7 +356,6 @@ namespace {
         ASSERT(lpq->isOplogReplay());
         ASSERT(lpq->isNoCursorTimeout());
         ASSERT(lpq->isAwaitData());
-        ASSERT(lpq->isExhaust());
         ASSERT(lpq->isPartial());
     }
 
@@ -552,10 +550,10 @@ namespace {
     }
 
 
-    TEST(LiteParsedQueryTest, ParseFromCommandShowDiskLocWrongType) {
+    TEST(LiteParsedQueryTest, ParseFromCommandShowRecordIdWrongType) {
         BSONObj cmdObj = fromjson("{find: 'testns',"
                                    "filter:  {a: 1},"
-                                   "showDiskLoc: 3}");
+                                   "showRecordId: 3}");
 
         LiteParsedQuery* rawLpq;
         bool isExplain = false;
@@ -737,7 +735,6 @@ namespace {
         status = LiteParsedQuery::make("testns", cmdObj, isExplain, &rawLpq);
         ASSERT_NOT_OK(status);
 
-
         cmdObj = fromjson("{find: 'testns',"
                            "projection: {a: {$meta: 'textScore'}},"
                            "sort: {b: 1}}");
@@ -762,6 +759,15 @@ namespace {
                            "projection: {b: 1},"
                            "sort: {a: {$meta: 'textScore'}}}");
         status = LiteParsedQuery::make("testns", cmdObj, isExplain, &rawLpq);
+        ASSERT_NOT_OK(status);
+    }
+
+    TEST(LiteParsedQueryTest, ParseCommandForbidExhaust) {
+        BSONObj cmdObj = fromjson("{find: 'testns', exhaust: true}");
+
+        LiteParsedQuery* rawLpq;
+        const bool isExplain = false;
+        Status status = LiteParsedQuery::make("testns", cmdObj, isExplain, &rawLpq);
         ASSERT_NOT_OK(status);
     }
 

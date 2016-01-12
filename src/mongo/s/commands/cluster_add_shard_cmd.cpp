@@ -34,9 +34,9 @@
 
 #include "mongo/db/audit.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/catalog/legacy/catalog_manager_legacy.h"
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/type_shard.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -79,8 +79,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             // get replica set component hosts
             ConnectionString servers = ConnectionString::parse(

@@ -36,6 +36,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/server_options.h"
 #include "mongo/util/log.h"
+#include "mongo/util/text.h"
 #include "mongo/util/options_parser/startup_options.h"
 
 namespace mongo {
@@ -74,6 +75,10 @@ namespace mongo {
         options->addOptionChaining("net.ssl.sslCipherConfig", "sslCipherConfig", moe::String,
                 "OpenSSL cipher configuration string")
                                    .hidden();
+
+        options->addOptionChaining("net.ssl.disabledProtocols", "sslDisabledProtocols", moe::String,
+                "Comma separated list of disabled protocols")
+                                    .hidden();
 
         options->addOptionChaining("net.ssl.weakCertificateValidation",
                 "sslWeakCertificateValidation", moe::Switch, "allow client to connect without "
@@ -115,6 +120,11 @@ namespace mongo {
                 "Certificate Revocation List file for SSL")
                                   .requires("ssl")
                                   .requires("ssl.CAFile");
+
+        options->addOptionChaining("net.ssl.disabledProtocols", "sslDisabledProtocols", moe::String,
+                "Comma separated list of disabled protocols")
+                                  .requires("ssl")
+                                  .hidden();
 
         options->addOptionChaining("net.ssl.allowInvalidHostnames", "sslAllowInvalidHostnames",
                     moe::Switch, "allow connections to servers with non-matching hostnames")
@@ -187,16 +197,16 @@ namespace mongo {
         if (params.count("net.ssl.mode")) {
             std::string sslModeParam = params["net.ssl.mode"].as<string>();
             if (sslModeParam == "disabled") {
-                sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_disabled);
+                sslGlobalParams.sslMode.store(SSLParams::SSLMode_disabled);
             }
             else if (sslModeParam == "allowSSL") {
-                sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_allowSSL);
+                sslGlobalParams.sslMode.store(SSLParams::SSLMode_allowSSL);
             }
             else if (sslModeParam == "preferSSL") {
-                sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_preferSSL);
+                sslGlobalParams.sslMode.store(SSLParams::SSLMode_preferSSL);
             }
             else if (sslModeParam == "requireSSL") {
-                sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_requireSSL);
+                sslGlobalParams.sslMode.store(SSLParams::SSLMode_requireSSL);
             }
             else {
                 return Status(ErrorCodes::BadValue,
@@ -237,6 +247,26 @@ namespace mongo {
             sslGlobalParams.sslCipherConfig = params["net.ssl.sslCipherConfig"].as<string>();
         }
 
+        if (params.count("net.ssl.disabledProtocols")) {
+            std::vector<std::string> tokens = StringSplitter::split(
+                    params["net.ssl.disabledProtocols"].as<string>(), ",");
+
+            const std::map<std::string, SSLParams::Protocols> validConfigs {
+                {"noTLS1_0", SSLParams::Protocols::TLS1_0},
+                {"noTLS1_1", SSLParams::Protocols::TLS1_1},
+                {"noTLS1_2", SSLParams::Protocols::TLS1_2}
+            };
+            for (const std::string& token : tokens) {
+                auto mappedToken = validConfigs.find(token);
+                if (mappedToken != validConfigs.end()) {
+                    sslGlobalParams.sslDisabledProtocols.push_back(mappedToken->second);
+                } else {
+                    return Status(ErrorCodes::BadValue,
+                                  "Unrecognized disabledProtocols '" + token +"'");
+                }
+            }
+        }
+
         if (params.count("net.ssl.weakCertificateValidation")) {
             sslGlobalParams.sslWeakCertificateValidation =
                 params["net.ssl.weakCertificateValidation"].as<bool>();
@@ -258,7 +288,7 @@ namespace mongo {
         }
 
         int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
-        if (sslGlobalParams.sslMode.load() != SSLGlobalParams::SSLMode_disabled) {
+        if (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled) {
             if (sslGlobalParams.sslPEMKeyFile.size() == 0) {
                 return Status(ErrorCodes::BadValue,
                               "need sslPEMKeyFile when SSL is enabled");
@@ -290,6 +320,7 @@ namespace mongo {
                  sslGlobalParams.sslCAFile.size() ||
                  sslGlobalParams.sslCRLFile.size() ||
                  sslGlobalParams.sslCipherConfig.size() ||
+                 sslGlobalParams.sslDisabledProtocols.size() ||
                  sslGlobalParams.sslWeakCertificateValidation ||
                  sslGlobalParams.sslFIPSMode) {
             return Status(ErrorCodes::BadValue,
@@ -299,11 +330,11 @@ namespace mongo {
         if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendKeyFile ||
             clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509 ||
             clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509) {
-            if (sslGlobalParams.sslMode.load() == SSLGlobalParams::SSLMode_disabled) {
+            if (sslGlobalParams.sslMode.load() == SSLParams::SSLMode_disabled) {
                 return Status(ErrorCodes::BadValue, "need to enable SSL via the sslMode flag");
             } 
         }
-        if (sslGlobalParams.sslMode.load() == SSLGlobalParams::SSLMode_allowSSL) {
+        if (sslGlobalParams.sslMode.load() == SSLParams::SSLMode_allowSSL) {
             if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509 ||
                 clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509) {
                     return Status(ErrorCodes::BadValue,
@@ -315,7 +346,7 @@ namespace mongo {
 
     Status storeSSLClientOptions(const moe::Environment& params) {
         if (params.count("ssl") && params["ssl"].as<bool>() == true) {
-            sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_requireSSL);
+            sslGlobalParams.sslMode.store(SSLParams::SSLMode_requireSSL);
         }
         if (params.count("ssl.PEMKeyFile")) {
             sslGlobalParams.sslPEMKeyFile = params["ssl.PEMKeyFile"].as<std::string>();

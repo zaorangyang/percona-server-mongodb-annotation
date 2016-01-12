@@ -39,13 +39,12 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/matcher/matcher.h"
@@ -56,9 +55,10 @@
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/range_preserver.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/collection_metadata.h"
+#include "mongo/s/config.h"
 #include "mongo/s/d_state.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -70,6 +70,7 @@
 namespace mongo {
 
     using boost::scoped_ptr;
+    using boost::shared_ptr;
     using std::auto_ptr;
     using std::endl;
     using std::set;
@@ -338,13 +339,16 @@ namespace mongo {
          * Clean up the temporary and incremental collections
          */
         void State::dropTempCollections() {
-            // Dropping the tempNamespace must be logged as that collection is replicated.
             _db.dropCollection(_config.tempNamespace);
             // Always forget about temporary namespaces, so we don't cache lots of them
             ShardConnection::forgetNS( _config.tempNamespace );
             if (_useIncremental) {
                 // We don't want to log the deletion of incLong as it isn't replicated. While
                 // harmless, this would lead to a scary looking warning on the secondaries.
+                bool shouldReplicateWrites = _txn->writesAreReplicated();
+                _txn->setReplicatedWrites(false);
+                ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, _txn, shouldReplicateWrites);
+
                 ScopedTransaction scopedXact(_txn, MODE_IX);
                 Lock::DBLock lk(_txn->lockState(),
                                 nsToDatabaseSubstring(_config.incLong),
@@ -371,6 +375,10 @@ namespace mongo {
             if (_useIncremental) {
                 // Create the inc collection and make sure we have index on "0" key.
                 // Intentionally not replicating the inc collection to secondaries.
+                bool shouldReplicateWrites = _txn->writesAreReplicated();
+                _txn->setReplicatedWrites(false);
+                ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, _txn, shouldReplicateWrites);
+
                 OldClientWriteContext incCtx(_txn, _config.incLong);
                 WriteUnitOfWork wuow(_txn);
                 Collection* incColl = incCtx.getCollection();
@@ -436,16 +444,6 @@ namespace mongo {
                 options.temp = true;
                 tempColl = tempCtx.db()->createCollection(_txn, _config.tempNamespace, options);
 
-                // Log the createCollection operation.
-                BSONObjBuilder b;
-                b.append( "create", nsToCollectionSubstring( _config.tempNamespace ));
-                b.appendElements( options.toBSON() );
-                string logNs = nsToDatabase( _config.tempNamespace ) + ".$cmd";
-                getGlobalEnvironment()->getOpObserver()->onCreateCollection(
-                        _txn,
-                        NamespaceString(_config.tempNamespace),
-                        options);
-
                 for ( vector<BSONObj>::iterator it = indexesToInsert.begin();
                         it != indexesToInsert.end(); ++it ) {
                     Status status =
@@ -458,7 +456,7 @@ namespace mongo {
                     }
                     // Log the createIndex operation.
                     string logNs = nsToDatabase( _config.tempNamespace ) + ".system.indexes";
-                    getGlobalEnvironment()->getOpObserver()->onInsert(_txn, logNs, *it);
+                    getGlobalServiceContext()->getOpObserver()->onCreateIndex(_txn, logNs, *it);
                 }
                 wuow.commit();
             }
@@ -695,7 +693,6 @@ namespace mongo {
             BSONObj bo = b.obj();
 
             uassertStatusOK( coll->insertDocument( _txn, bo, true ).getStatus() );
-            getGlobalEnvironment()->getOpObserver()->onInsert(_txn, ns, bo);
             wuow.commit();
         }
 
@@ -708,7 +705,10 @@ namespace mongo {
             OldClientWriteContext ctx(_txn,  _config.incLong );
             WriteUnitOfWork wuow(_txn);
             Collection* coll = getCollectionOrUassert(ctx.db(), _config.incLong);
-            uassertStatusOK( coll->insertDocument( _txn, o, true ).getStatus() );
+            bool shouldReplicateWrites = _txn->writesAreReplicated();
+            _txn->setReplicatedWrites(false);
+            ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, _txn, shouldReplicateWrites);
+            uassertStatusOK(coll->insertDocument(_txn, o, true, false).getStatus());
             wuow.commit();
         }
 
@@ -760,7 +760,7 @@ namespace mongo {
          */
         void State::init() {
             // setup js
-            const string userToken = ClientBasic::getCurrent()->getAuthorizationSession()
+            const string userToken = AuthorizationSession::get(ClientBasic::getCurrent())
                                                               ->getAuthenticatedUserNamesToken();
             _scope.reset(globalScriptEngine->getPooledScope(
                             _txn, _config.dbname, "mapreduce" + userToken).release());
@@ -1273,8 +1273,20 @@ namespace mongo {
                 addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
             }
 
-            bool run(OperationContext* txn, const string& dbname , BSONObj& cmd, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+            bool run(OperationContext* txn,
+                     const string& dbname,
+                     BSONObj& cmd,
+                     int,
+                     string& errmsg,
+                     BSONObjBuilder& result) {
                 Timer t;
+
+                if (txn->getClient()->isInDirectClient()) {
+                    return appendCommandStatus(result,
+                                               Status(ErrorCodes::IllegalOperation,
+                                                      "Cannot run mapReduce command from eval()"));
+                }
+
                 CurOp* op = txn->getCurOp();
 
                 Config config( dbname , cmd );
@@ -1545,7 +1557,12 @@ namespace mongo {
                 actions.addAction(ActionType::internal);
                 out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
             }
-            bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn,
+                     const string& dbname,
+                     BSONObj& cmdObj,
+                     int,
+                     string& errmsg,
+                     BSONObjBuilder& result) {
                 ShardedConnectionInfo::addHook();
                 // legacy name
                 string shardedOutputCollection = cmdObj["shardedOutputCollection"].valuestrsafe();
@@ -1573,15 +1590,14 @@ namespace mongo {
 
                 ProgressMeterHolder pm(op->setMessage("m/r: merge sort and reduce",
                                                       "M/R Merge Sort and Reduce Progress"));
-                set<ServerAndQuery> servers;
+                set<string> servers;
 
                 {
                     // parse per shard results
-                    BSONObjIterator i( shardCounts );
-                    while ( i.more() ) {
+                    BSONObjIterator i(shardCounts);
+                    while (i.more()) {
                         BSONElement e = i.next();
-                        string shard = e.fieldName();
-                        servers.insert( shard );
+                        servers.insert(e.fieldName());
                     }
                 }
 
@@ -1602,25 +1618,28 @@ namespace mongo {
                         result.append( "result" , config.outputOptions.collectionName );
                 }
 
-                // fetch result from other shards 1 chunk at a time
-                // it would be better to do just one big $or query, but then the sorting would not be efficient
-                string shardName = shardingState.getShardName();
-                DBConfigPtr confOut = grid.getDBConfig( dbname , false );
-
-                if (!confOut) {
-                    log() << "Sharding metadata for output database: " << dbname
-                          << " does not exist";
-                    return false;
+                auto status = grid.catalogCache()->getDatabase(dbname);
+                if (!status.isOK()) {
+                    return appendCommandStatus(result, status.getStatus());
                 }
+
+                shared_ptr<DBConfig> confOut = status.getValue();
 
                 vector<ChunkPtr> chunks;
                 if ( confOut->isSharded(config.outputOptions.finalNamespace) ) {
                     ChunkManagerPtr cm = confOut->getChunkManager(
                             config.outputOptions.finalNamespace);
+
+                    // Fetch result from other shards 1 chunk at a time. It would be better to do
+                    // just one big $or query, but then the sorting would not be efficient.
+                    const string shardName = shardingState.getShardName();
                     const ChunkMap& chunkMap = cm->getChunkMap();
+
                     for ( ChunkMap::const_iterator it = chunkMap.begin(); it != chunkMap.end(); ++it ) {
                         ChunkPtr chunk = it->second;
-                        if (chunk->getShard().getName() == shardName) chunks.push_back(chunk);
+                        if (chunk->getShard().getName() == shardName) {
+                            chunks.push_back(chunk);
+                        }
                     }
                 }
 

@@ -36,6 +36,7 @@ MongoRunner.stopMongod(mongod26.port);
 //
 
 options = {
+    sync: true, // Old clusters can't use replsets for config servers
     mongosOptions: {binVersion: "2.6"},
     configOptions: {binVersion: "2.6"},
     shardOptions: {binVersion: "2.6"}
@@ -79,6 +80,7 @@ st.stop();
 //
 
 options = {
+    sync: true, // Mixed version clusters can't use replsets for config servers
     mongosOptions: {binVersion: "2.8"},
     configOptions: {binVersion: "2.8"},
     shardOptions: {binVersion: "2.6"}
@@ -122,6 +124,7 @@ st.stop();
 //
 
 options = {
+    sync: true, // Mixed version clusters can't use replsets for config servers
     mongosOptions: {binVersion: "2.8"},
     configOptions: {binVersion: "2.8"},
     shardOptions: {binVersion: ["2.6", "2.8"]}
@@ -135,6 +138,8 @@ coll = testDb.standalone;
 coll.drop();
 
 assert.commandWorked(testDb.adminCommand({enableSharding: testDb.getName()}));
+var res = testDb.adminCommand({movePrimary: testDb.getName(), to: 'shard0001'});
+assert(res.ok || res.errmsg == "it is already the primary");
 testDb.adminCommand({shardCollection: coll.getFullName(), key: {_id: 1}});
 
 // Disable the balancer and pre-split in order to ensure chunks on both shards.

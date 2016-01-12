@@ -1,36 +1,32 @@
-// server.cpp
-
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2008-2015 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
-#include "mongo/config.h"
 
 #include "mongo/platform/basic.h"
 
@@ -45,6 +41,7 @@
 #include "mongo/base/status.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/config.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
@@ -52,26 +49,29 @@
 #include "mongo/db/auth/user_cache_invalidator_job.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/dbwebserver.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/global_environment_noop.h"
 #include "mongo/db/initialize_server_global_state.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_noop.h"
 #include "mongo/db/startup_warnings_common.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balance.h"
+#include "mongo/s/catalog/legacy/catalog_manager_legacy.h"
+#include "mongo/s/catalog/legacy/config_upgrade.h"
+#include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/client_info.h"
 #include "mongo/s/config.h"
 #include "mongo/s/config_server_checker_service.h"
-#include "mongo/s/config_upgrade.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/legacy_dist_lock_manager.h"
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/request.h"
 #include "mongo/s/version_mongos.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/admin_access.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
 #include "mongo/util/concurrency/task.h"
@@ -138,8 +138,8 @@ namespace mongo {
     public:
         virtual ~ShardedMessageHandler() {}
 
-        virtual void connected( AbstractMessagingPort* p ) {
-            ClientInfo::create(p);
+        virtual void connected(AbstractMessagingPort* p) {
+            Client::initThread("conn", getGlobalServiceContext(), p);
         }
 
         virtual void process( Message& m , AbstractMessagingPort* p , LastError * le) {
@@ -184,10 +184,6 @@ namespace mongo {
 
             // Release connections back to pool, if any still cached
             ShardConnection::releaseMyConnections();
-        }
-
-        virtual void disconnected( AbstractMessagingPort* p ) {
-            // all things are thread local
         }
     };
 
@@ -239,10 +235,15 @@ static ExitCode runMongosServer( bool doUpgrade ) {
         dbexit(EXIT_BADOPTIONS);
     }
 
-    if (!grid.initCatalogManager(mongosGlobalParams.configdbs)) {
-        mongo::log(LogComponent::kSharding) << "couldn't initialize catalog manager";
+    auto catalogManager = stdx::make_unique<CatalogManagerLegacy>();
+    Status statusCatalogManagerInit = catalogManager->init(mongosGlobalParams.configdbs);
+    if (!statusCatalogManagerInit.isOK()) {
+        mongo::log(LogComponent::kSharding) << "couldn't initialize catalog manager "
+                                            << statusCatalogManagerInit;
         return EXIT_SHARDING_ERROR;
     }
+
+    grid.setCatalogManager(std::move(catalogManager));
 
     if (!configServer.init(mongosGlobalParams.configdbs)) {
         mongo::log(LogComponent::kSharding) << "couldn't resolve config db address" << endl;
@@ -346,26 +347,20 @@ static int _main() {
     startSignalProcessingThread();
 
     // we either have a setting where all processes are in localhost or none are
-    for (std::vector<std::string>::const_iterator it = mongosGlobalParams.configdbs.begin();
-         it != mongosGlobalParams.configdbs.end(); ++it) {
-        try {
+    std::vector<HostAndPort> configServers = mongosGlobalParams.configdbs.getServers();
+    for (std::vector<HostAndPort>::const_iterator it = configServers.begin();
+            it != configServers.end(); ++it) {
 
-            HostAndPort configAddr( *it );  // will throw if address format is invalid
+        const HostAndPort& configAddr = *it;
 
-            if (it == mongosGlobalParams.configdbs.begin()) {
-                grid.setAllowLocalHost( configAddr.isLocalHost() );
-            }
-
-            if ( configAddr.isLocalHost() != grid.allowLocalHost() ) {
-                mongo::log(LogComponent::kDefault)
-                    << "cannot mix localhost and ip addresses in configdbs" << endl;
-                return 10;
-            }
-
+        if (it == configServers.begin()) {
+            grid.setAllowLocalHost( configAddr.isLocalHost() );
         }
-        catch ( DBException& e) {
-            mongo::log(LogComponent::kDefault) << "configdb: " << e.what() << endl;
-            return 9;
+
+        if ( configAddr.isLocalHost() != grid.allowLocalHost() ) {
+            mongo::log(LogComponent::kDefault)
+                << "cannot mix localhost and ip addresses in configdbs" << endl;
+            return 10;
         }
     }
 
@@ -403,17 +398,21 @@ namespace mongo {
 #endif
 
 MONGO_INITIALIZER_GENERAL(CreateAuthorizationManager,
-                          ("SetupInternalSecurityUser", "OIDGeneration"),
+                          ("SetupInternalSecurityUser",
+                           "OIDGeneration",
+                           "SetGlobalEnvironment",
+                           "EndStartupOptionStorage"),
                           MONGO_NO_DEPENDENTS)
         (InitializerContext* context) {
-    AuthorizationManager* authzManager =
-                new AuthorizationManager(new AuthzManagerExternalStateMongos());
-    setGlobalAuthorizationManager(authzManager);
+    auto authzManager = stdx::make_unique<AuthorizationManager>(
+            new AuthzManagerExternalStateMongos());
+    authzManager->setAuthEnabled(serverGlobalParams.isAuthEnabled);
+    AuthorizationManager::set(getGlobalServiceContext(), std::move(authzManager));
     return Status::OK();
 }
 
 MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-    setGlobalEnvironment(new GlobalEnvironmentNoop());
+    setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
     return Status::OK();
 }
 
@@ -495,6 +494,7 @@ void mongo::signalShutdown() {
 
 void mongo::exitCleanly(ExitCode code) {
     // TODO: do we need to add anything?
+    grid.catalogManager()->shutDown();
     mongo::dbexit( code );
 }
 

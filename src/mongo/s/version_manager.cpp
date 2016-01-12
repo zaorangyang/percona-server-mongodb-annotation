@@ -34,16 +34,22 @@
 
 #include "mongo/s/version_manager.h"
 
+#include <boost/shared_ptr.hpp>
+
+#include "mongo/db/namespace_string.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/stale_exception.h" // for SendStaleConfigException
+#include "mongo/s/mongos_options.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
+    using boost::shared_ptr;
     using std::endl;
     using std::map;
     using std::string;
@@ -107,7 +113,12 @@ namespace mongo {
         connectionShardStatus.reset( conn );
     }
 
-    bool VersionManager::isVersionableCB( DBClientBase* conn ){
+    bool VersionManager::isVersionableCB(DBClientBase* conn) {
+        // We do not version shard connections when issued from mongod
+        if (!isMongos()) {
+            return false;
+        }
+
         return conn->type() == ConnectionString::MASTER || conn->type() == ConnectionString::SET;
     }
 
@@ -137,17 +148,28 @@ namespace mongo {
         return NULL;
     }
 
-    bool VersionManager::forceRemoteCheckShardVersionCB( const string& ns ){
+    bool VersionManager::forceRemoteCheckShardVersionCB(const string& ns) {
+        const NamespaceString nss(ns);
 
-        DBConfigPtr conf = grid.getDBConfig( ns );
-        if ( ! conf ) return false;
-        conf->reload();
+        // This will force the database catalog entry to be reloaded
+        grid.catalogCache()->invalidate(nss.db().toString());
+
+        auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+        if (!status.isOK()) {
+            return false;
+        }
+
+        shared_ptr<DBConfig> conf = status.getValue();
 
         // If we don't have a collection, don't refresh the chunk manager
-        if( nsGetCollection( ns ).size() == 0 ) return false;
+        if (nsGetCollection(ns).size() == 0) {
+            return false;
+        }
 
-        ChunkManagerPtr manager = conf->getChunkManagerIfExists( ns, true, true );
-        if( ! manager ) return false;
+        ChunkManagerPtr manager = conf->getChunkManagerIfExists(ns, true, true);
+        if (!manager) {
+            return false;
+        }
 
         return true;
 
@@ -247,7 +269,12 @@ namespace mongo {
      *
      * @return true if we contacted the remote host
      */
-    bool checkShardVersion( DBClientBase * conn_in , const string& ns , ChunkManagerPtr refManager, bool authoritative , int tryNumber ) {
+    bool checkShardVersion(DBClientBase* conn_in,
+                           const string& ns,
+                           ChunkManagerPtr refManager,
+                           bool authoritative,
+                           int tryNumber) {
+
         // TODO: cache, optimize, etc...
 
         // Empty namespaces are special - we require initialization but not versioning
@@ -255,9 +282,13 @@ namespace mongo {
             return initShardVersionEmptyNS(conn_in);
         }
 
-        DBConfigPtr conf = grid.getDBConfig( ns );
-        if ( ! conf )
+        const NamespaceString nss(ns);
+        auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+        if (!status.isOK()) {
             return false;
+        }
+
+        shared_ptr<DBConfig> conf = status.getValue();
 
         DBClientBase* conn = getVersionable( conn_in );
         verify(conn); // errors thrown above

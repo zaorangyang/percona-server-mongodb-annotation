@@ -34,7 +34,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/s/client/shard_connection.h"
-#include "mongo/s/client_info.h"
 
 namespace mongo {
 namespace {
@@ -67,8 +66,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             errmsg += "getpreverror not supported for sharded environments";
             return false;

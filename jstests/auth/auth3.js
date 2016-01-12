@@ -9,11 +9,11 @@ print("make sure curop, killop, and unlock fail");
 
 var x = admin.$cmd.sys.inprog.findOne();
 assert(!("inprog" in x), tojson(x));
-assert.eq(x.err, "unauthorized", tojson(x));
+assert.eq(x.code, errorCodeUnauthorized, tojson(x));
 
 x = admin.killOp(123);
 assert(!("info" in x), tojson(x));
-assert.eq(x.err, "unauthorized", tojson(x));
+assert.eq(x.code, errorCodeUnauthorized, tojson(x));
 
 x = admin.fsyncUnlock();
 assert(x.errmsg != "not locked", tojson(x));

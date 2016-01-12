@@ -37,7 +37,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/shard.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/version_manager.h"
 #include "mongo/util/concurrency/spin_lock.h"
@@ -107,8 +107,7 @@ namespace {
                          mongo::BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         mongo::BSONObjBuilder& result,
-                         bool fromRepl) {
+                         mongo::BSONObjBuilder& result) {
 
             // Base pool info
             shardConnectionPool.appendInfo(result);
@@ -492,7 +491,9 @@ namespace {
 
     void ShardConnection::kill() {
         if ( _conn ) {
-            if( versionManager.isVersionableCB( _conn ) ) versionManager.resetShardVersionCB( _conn );
+            if (versionManager.isVersionableCB(_conn)) {
+                versionManager.resetShardVersionCB(_conn);
+            }
 
             if (_conn->isFailed()) {
                 // Let the pool know about the bad connection and also delegate disposal to it.

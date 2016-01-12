@@ -51,9 +51,11 @@
 
 namespace mongo {
 
+    class AuthorizationSession;
     class AuthzManagerExternalState;
-    class UserDocumentParser;
     class OperationContext;
+    class ServiceContext;
+    class UserDocumentParser;
 
     /**
      * Internal secret key info.
@@ -69,6 +71,10 @@ namespace mongo {
     class AuthorizationManager {
         MONGO_DISALLOW_COPYING(AuthorizationManager);
     public:
+        static AuthorizationManager* get(ServiceContext* service);
+        static AuthorizationManager* get(ServiceContext& service);
+        static void set(ServiceContext* service,
+                        std::unique_ptr<AuthorizationManager> authzManager);
 
         // The newly constructed AuthorizationManager takes ownership of "externalState"
         explicit AuthorizationManager(AuthzManagerExternalState* externalState);
@@ -154,6 +160,10 @@ namespace mongo {
                                      const RoleName& roleName,
                                      mutablebson::Element result);
 
+        /**
+         * Returns a new AuthorizationSession for use with this AuthorizationManager.
+         */
+        std::unique_ptr<AuthorizationSession> makeAuthorizationSession();
 
         /**
          * Sets whether or not access control enforcement is enabled for this manager.

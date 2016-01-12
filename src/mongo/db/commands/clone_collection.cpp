@@ -85,7 +85,7 @@ namespace mongo {
             actions.addAction(ActionType::insert);
             actions.addAction(ActionType::createIndex); // SERVER-11418
 
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forExactNamespace(NamespaceString(ns)), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
@@ -104,8 +104,7 @@ namespace mongo {
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             string fromhost = cmdObj.getStringField("from");
             if ( fromhost.empty() ) {

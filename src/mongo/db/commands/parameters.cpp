@@ -28,8 +28,6 @@
 *    it in the license file.
 */
 
-#include "mongo/config.h"
-
 #include "mongo/platform/basic.h"
 
 #include <set>
@@ -37,6 +35,7 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/sasl_client_authenticate.h"
+#include "mongo/config.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/commands.h"
@@ -81,7 +80,12 @@ namespace mongo {
             appendParameterNames( help );
             help << "{ getParameter:'*' } to get everything\n";
         }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             bool all = *cmdObj.firstElement().valuestrsafe() == '*';
 
             int before = result.len();
@@ -119,7 +123,12 @@ namespace mongo {
             help << "{ setParameter:1, <param>:<value> }\n";
             appendParameterNames( help );
         }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             int numSet = 0;
             bool found = false;
 
@@ -425,13 +434,13 @@ namespace mongo {
 
             std::string sslModeStr() {
                 switch (sslGlobalParams.sslMode.load()) {
-                    case SSLGlobalParams::SSLMode_disabled:
+                    case SSLParams::SSLMode_disabled:
                         return "disabled";
-                    case SSLGlobalParams::SSLMode_allowSSL:
+                    case SSLParams::SSLMode_allowSSL:
                         return "allowSSL";
-                    case SSLGlobalParams::SSLMode_preferSSL:
+                    case SSLParams::SSLMode_preferSSL:
                         return "preferSSL";
-                    case SSLGlobalParams::SSLMode_requireSSL:
+                    case SSLParams::SSLMode_requireSSL:
                         return "requireSSL";
                     default:
                         return "undefined";
@@ -468,11 +477,11 @@ namespace mongo {
                 }
 
                 int oldMode = sslGlobalParams.sslMode.load();
-                if (str == "preferSSL" && oldMode == SSLGlobalParams::SSLMode_allowSSL) {
-                    sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_preferSSL);
+                if (str == "preferSSL" && oldMode == SSLParams::SSLMode_allowSSL) {
+                    sslGlobalParams.sslMode.store(SSLParams::SSLMode_preferSSL);
                 }
-                else if (str == "requireSSL" && oldMode == SSLGlobalParams::SSLMode_preferSSL) {
-                    sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_requireSSL);
+                else if (str == "requireSSL" && oldMode == SSLParams::SSLMode_preferSSL) {
+                    sslGlobalParams.sslMode.store(SSLParams::SSLMode_requireSSL);
                 }
                 else {
                     return Status(ErrorCodes::BadValue, mongoutils::str::stream() <<
@@ -540,8 +549,8 @@ namespace mongo {
                 int sslMode = sslGlobalParams.sslMode.load();
                 if (str == "sendX509" && 
                     oldMode == ServerGlobalParams::ClusterAuthMode_sendKeyFile) {
-                    if (sslMode == SSLGlobalParams::SSLMode_disabled ||
-                        sslMode == SSLGlobalParams::SSLMode_allowSSL) {
+                    if (sslMode == SSLParams::SSLMode_disabled ||
+                        sslMode == SSLParams::SSLMode_allowSSL) {
                         return Status(ErrorCodes::BadValue, mongoutils::str::stream() <<
                                     "Illegal state transition for clusterAuthMode, " <<
                                     "need to enable SSL for outgoing connections");

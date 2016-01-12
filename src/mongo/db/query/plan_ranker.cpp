@@ -114,14 +114,6 @@ namespace mongo {
         std::stable_sort(scoresAndCandidateindices.begin(), scoresAndCandidateindices.end(),
                          scoreComparator);
 
-        // Determine whether plans tied for the win.
-        if (scoresAndCandidateindices.size() > 1) {
-            double bestScore = scoresAndCandidateindices[0].first;
-            double runnerUpScore = scoresAndCandidateindices[1].first;
-            static const double epsilon = 1e-10;
-            why->tieForBest = fabs(bestScore - runnerUpScore) < epsilon;
-        }
-
         // Update results in 'why'
         // Stats and scores in 'why' are sorted in descending order by score.
         why->stats.clear();
@@ -206,9 +198,9 @@ namespace mongo {
         double productivity = static_cast<double>(stats->common.advanced)
                             / static_cast<double>(workUnits);
 
-        // Just enough to break a tie.
-        static const double epsilon = 1.0 /
-            static_cast<double>(internalQueryPlanEvaluationWorks);
+        // Just enough to break a tie. Must be small enough to ensure that a more productive
+        // plan doesn't lose to a less productive plan due to tie breaking.
+        static const double epsilon = std::min(1.0 / static_cast<double>(10 * workUnits), 1e-4);
 
         // We prefer covered projections.
         //

@@ -13,10 +13,8 @@
 # This file, SConstruct, configures the build environment, and then delegates to
 # several, subordinate SConscript files, which describe specific build rules.
 
-import buildscripts
 import copy
 import datetime
-import imp
 import os
 import re
 import shlex
@@ -24,9 +22,6 @@ import shutil
 import stat
 import sys
 import textwrap
-import types
-import urllib
-import urllib2
 import uuid
 from buildscripts import utils
 from buildscripts import moduleconfig
@@ -34,11 +29,6 @@ from buildscripts import moduleconfig
 import libdeps
 
 EnsureSConsVersion( 2, 3, 0 )
-
-def findSettingsSetup():
-    sys.path.append( "." )
-    sys.path.append( ".." )
-    sys.path.append( "../../" )
 
 def versiontuple(v):
     return tuple(map(int, (v.split("."))))
@@ -226,10 +216,6 @@ add_option( "dynamic-windows", "dynamically link on Windows", 0, True)
 add_option( "endian" , "endianness of target platform" , 1 , False , "endian",
             type="choice", choices=["big", "little", "auto"], default="auto" )
 
-add_option( "cxx", "compiler to use" , 1 , True )
-add_option( "cc", "compiler to use for c" , 1 , True )
-add_option( "cc-use-shell-environment", "use $CC from shell for C compiler" , 0 , False )
-add_option( "cxx-use-shell-environment", "use $CXX from shell for C++ compiler" , 0 , False )
 add_option( "disable-minimum-compiler-version-enforcement",
             "allow use of unsupported older compilers (NEVER for production builds)",
             0, False )
@@ -269,9 +255,6 @@ add_option( "opt", "Enable compile-time optimization", "?", True, "opt",
 
 add_option( "sanitize", "enable selected sanitizers", 1, True, metavar="san1,san2,...sanN" )
 add_option( "llvm-symbolizer", "name of (or path to) the LLVM symbolizer", 1, False, default="llvm-symbolizer" )
-
-add_option( "durableDefaultOn" , "have durable default to on" , 0 , True )
-add_option( "durableDefaultOff" , "have durable default to off" , 0 , True )
 
 # debugging/profiling help
 if is_running_os('linux'):
@@ -329,10 +312,6 @@ add_option('build-fast-and-loose', "looser dependency checking, ignored for --re
 
 add_option('disable-warnings-as-errors', "Don't add -Werror to compiler command line", 0, False)
 
-add_option('propagate-shell-environment',
-           "Pass shell environment to sub-processes (NEVER for production builds)",
-           0, False)
-
 add_option('skip-buildinfo',
            "skip generating buildinfo",
            0, False)
@@ -343,12 +322,11 @@ add_option('variables-help',
 add_option("osx-version-min", "minimum OS X version to support", 1, True)
 
 win_version_min_choices = {
-    'xpsp3'   : ('0501', '0300'),
-    'ws03sp2' : ('0502', '0200'),
     'vista'   : ('0600', '0000'),
-    'ws08r2'  : ('0601', '0000'),
     'win7'    : ('0601', '0000'),
+    'ws08r2'  : ('0601', '0000'),
     'win8'    : ('0602', '0000'),
+    'win81'   : ('0603', '0000'),
 }
 
 add_option("win-version-min", "minimum Windows version to support", 1, True,
@@ -363,12 +341,20 @@ add_option('cache-dir',
            "Specify the directory to use for caching objects if --cache is in use",
            1, False, default="$BUILD_ROOT/scons/cache")
 
+add_option('variables-files',
+           "Specify variables files to load",
+           1, False, default="")
+
 variable_parse_mode_choices=['auto', 'posix', 'other']
 add_option('variable-parse-mode',
            "Select which parsing mode is used to interpret command line variables",
            1, False,
            type='choice', default=variable_parse_mode_choices[0],
            choices=variable_parse_mode_choices)
+
+add_option('modules',
+           "Comma-separated list of modules to build. Empty means none. Default is all.",
+           1, False)
 
 # Setup the command-line variables
 def variable_shlex_converter(val):
@@ -418,11 +404,17 @@ def variable_tools_converter(val):
     tool_list = shlex.split(val)
     return tool_list + ["jsheader", "mergelib", "mongo_unittest", "textfile"]
 
-env_vars = Variables()
+env_vars = Variables(
+    files=variable_shlex_converter(get_option('variables-files')),
+    args=ARGUMENTS
+)
 
 env_vars.Add('ARFLAGS',
     help='Sets flags for the archiver',
     converter=variable_shlex_converter)
+
+env_vars.Add('CC',
+    help='Select the C compiler to use')
 
 env_vars.Add('CCFLAGS',
     help='Sets flags for the C and C++ compiler',
@@ -441,9 +433,17 @@ env_vars.Add('CPPPATH',
     help='Adds paths to the preprocessor search path',
     converter=variable_shlex_converter)
 
+env_vars.Add('CXX',
+    help='Select the C++ compiler to use')
+
 env_vars.Add('CXXFLAGS',
     help='Sets flags for the C++ compiler',
     converter=variable_shlex_converter)
+
+# Note: This probably is only really meaningful when configured via a variables file. It will
+# also override whatever the SCons platform defaults would be.
+env_vars.Add('ENV',
+    help='Sets the environment for subprocesses')
 
 env_vars.Add('HOST_ARCH',
     help='Sets the native architecture of the compiler',
@@ -495,8 +495,7 @@ env_vars.Add('TARGET_ARCH',
 
 env_vars.Add('TARGET_OS',
     help='Sets the target OS to build for',
-    default=get_running_os_name()
-)
+    default=get_running_os_name())
 
 env_vars.Add('TOOLS',
     help='Sets the list of SCons tools to add to the environment',
@@ -506,6 +505,26 @@ env_vars.Add('TOOLS',
 # don't run configure if user calls --help
 if GetOption('help'):
     Return()
+
+# -- Validate user provided options --
+
+# A dummy environment that should *only* have the variables we have set. In practice it has
+# some other things because SCons isn't quite perfect about keeping variable initialization
+# scoped to Tools, but it should be good enough to do validation on any Variable values that
+# came from the command line or from loaded files.
+variables_only_env = Environment(
+    # Disable platform specific variable injection
+    platform=(lambda x: ()),
+    # But do *not* load any tools, since those might actually set variables. Note that this
+    # causes the value of our TOOLS variable to have no effect.
+    tools=[],
+    # Use the Variables specified above.
+    variables=env_vars,
+)
+
+if ('CC' in variables_only_env) != ('CXX' in variables_only_env):
+    print('Cannot customize C compiler without customizing C++ compiler, and vice versa')
+    Exit(1)
 
 # --- environment setup ---
 
@@ -565,7 +584,7 @@ if releaseBuild and (debugBuild or not optBuild):
     print("Error: A --release build may not have debugging, and must have optimization")
     Exit(1)
 
-noshell = has_option( "noshell" ) 
+noshell = has_option( "noshell" )
 
 jsEngine = get_option( "js-engine")
 
@@ -608,7 +627,6 @@ envDict = dict(BUILD_ROOT=buildDir,
                # TODO: Move unittests.txt to $BUILD_DIR, but that requires
                # changes to MCI.
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
-               PCRE_VERSION='8.36',
                CONFIGUREDIR=sconsDataDir.Dir('sconf_temp'),
                CONFIGURELOG=sconsDataDir.File('config.log'),
                INSTALL_DIR=installDir,
@@ -635,29 +653,6 @@ if unknown_vars:
 def set_config_header_define(env, varname, varval = 1):
     env['CONFIG_HEADER_DEFINES'][varname] = varval
 env.AddMethod(set_config_header_define, 'SetConfigHeaderDefine')
-
-if has_option( "cc-use-shell-environment" ) and has_option( "cc" ):
-    print("Cannot specify both --cc-use-shell-environment and --cc")
-    Exit(1)
-elif has_option( "cxx-use-shell-environment" ) and has_option( "cxx" ):
-    print("Cannot specify both --cxx-use-shell-environment and --cxx")
-    Exit(1)
-
-if has_option( "cxx-use-shell-environment" ):
-    env["CXX"] = os.getenv("CXX");
-if has_option( "cc-use-shell-environment" ):
-    env["CC"] = os.getenv("CC");
-
-if has_option( "cxx" ):
-    if not has_option( "cc" ):
-        print "Must specify C compiler when specifying C++ compiler"
-        Exit(1)
-    env["CXX"] = get_option( "cxx" )
-if has_option( "cc" ):
-    if not has_option( "cxx" ):
-        print "Must specify C++ compiler when specifying C compiler"
-        Exit(1)
-    env["CC"] = get_option( "cc" )
 
 detectEnv = env.Clone()
 
@@ -834,9 +829,6 @@ if has_option("cache"):
 if optBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")
 
-if has_option("propagate-shell-environment"):
-    env['ENV'] = dict(os.environ);
-
 # Ignore requests to build fast and loose for release builds.
 if get_option('build-fast-and-loose') == "on" and not has_option('release'):
     # See http://www.scons.org/wiki/GoFastButton for details
@@ -892,19 +884,7 @@ elif env.TargetOSIs('solaris'):
     env['LINK_LIBGROUP_START'] = '-z rescan'
     env['LINK_LIBGROUP_END'] = ''
 
-if has_option( "durableDefaultOn" ):
-    env.Append( CPPDEFINES=[ "_DURABLEDEFAULTON" ] )
-
-if has_option( "durableDefaultOff" ):
-    env.Append( CPPDEFINES=[ "_DURABLEDEFAULTOFF" ] )
-
 # ---- other build setup -----
-dontReplacePackage = False
-isBuildingLatest = False
-
-def filterExists(paths):
-    return filter(os.path.exists, paths)
-
 if debugBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_DEBUG_BUILD")
 
@@ -976,6 +956,10 @@ elif env.TargetOSIs('windows'):
                          "/wd4290", "/wd4068", "/wd4351"] )
 
     # some warnings we should treat as errors:
+    # c4013
+    #  'function' undefined; assuming extern returning int
+    #    This warning occurs when files compiled for the C language use functions not defined
+    #    in a header file.
     # c4099
     #  identifier' : type name first seen using 'objecttype1' now seen using 'objecttype2'
     #    This warning occurs when classes and structs are declared with a mix of struct and class
@@ -986,7 +970,7 @@ elif env.TargetOSIs('windows'):
     #     was probably intended as a variable definition.  A common example is accidentally
     #     declaring a function called lock that takes a mutex when one meant to create a guard
     #     object called lock on the stack.
-    env.Append( CCFLAGS=["/we4099", "/we4930"] )
+    env.Append( CCFLAGS=["/we4013", "/we4099", "/we4930"] )
 
     env.Append( CPPDEFINES=["_CONSOLE","_CRT_SECURE_NO_WARNINGS"] )
 
@@ -1022,13 +1006,6 @@ elif env.TargetOSIs('windows'):
 
     env.Append(CCFLAGS=[winRuntimeLibMap[(dynamicCRT, debugBuild)]])
 
-    # With VS 2012 and later we need to specify 5.01 as the target console
-    # so that our 32-bit builds run on Windows XP
-    # See https://software.intel.com/en-us/articles/linking-applications-using-visual-studio-2012-to-run-on-windows-xp
-    #
-    if env["TARGET_ARCH"] == "i386":
-        env.Append( LINKFLAGS=["/SUBSYSTEM:CONSOLE,5.01"])
-
     if optBuild:
         # /O2:  optimize for speed (as opposed to size)
         # /Oy-: disable frame pointer optimization (overrides /O2, only affects 32-bit)
@@ -1059,6 +1036,10 @@ elif env.TargetOSIs('windows'):
     # v8 calls timeGetTime()
     if usev8:
         env.Append(LIBS=['winmm.lib'])
+
+# When building on visual studio, this sets the name of the debug symbols file
+if env.ToolchainIs('msvc'):
+    env['PDB'] = '${TARGET.base}.pdb'
 
 env['STATIC_AND_SHARED_OBJECTS_ARE_THE_SAME'] = 1
 if env.TargetOSIs('posix'):
@@ -1157,11 +1138,7 @@ if env['TARGET_ARCH'] == 'i386':
     if env.ToolchainIs('GCC', 'clang'):
         env.Append( CCFLAGS=['-march=nocona', '-mtune=generic'] )
 
-try:
-    umask = os.umask(022)
-except OSError:
-    pass
-
+# Needed for auth tests since key files are stored in git with mode 644.
 if not env.TargetOSIs('windows'):
     for keysuffix in [ "1" , "2" ]:
         keyfile = "jstests/libs/key%s" % keysuffix
@@ -1189,7 +1166,7 @@ if not use_system_version_of_library("boost"):
     boostSuffix = "-%s.0" % get_option( "internal-boost")
 
 # discover modules, and load the (python) module for each module's build.py
-mongo_modules = moduleconfig.discover_modules('src/mongo/db/modules')
+mongo_modules = moduleconfig.discover_modules('src/mongo/db/modules', get_option('modules'))
 env['MONGO_MODULES'] = [m.name for m in mongo_modules]
 
 # --- check system ---
@@ -1203,14 +1180,14 @@ def doConfigure(myenv):
     # bare compilers, and we should re-check at the very end that TryCompile and TryLink still
     # work with the flags we have selected.
     if myenv.ToolchainIs('msvc'):
-        compiler_minimum_string = "Microsoft Visual Studio 2013 Update 2"
+        compiler_minimum_string = "Microsoft Visual Studio 2013 Update 4"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(_MSC_VER)
         #error
         #endif
 
-        #if _MSC_VER < 1800 || (_MSC_VER == 1800 && _MSC_FULL_VER < 180030501)
+        #if _MSC_VER < 1800 || (_MSC_VER == 1800 && _MSC_FULL_VER < 180031101)
         #error %s or newer is required to build MongoDB
         #endif
 
@@ -1289,19 +1266,13 @@ def doConfigure(myenv):
         print("WARNING: The build may fail, binaries may crash, or may run but corrupt data...")
 
     # Figure out what our minimum windows version is. If the user has specified, then use
-    # that. Otherwise, if they have explicitly selected between 32 bit or 64 bit, choose XP or
-    # Vista respectively. Finally, if they haven't done either of these, try invoking the
-    # compiler to figure out whether we are doing a 32 or 64 bit build and select as
-    # appropriate.
+    # that.
     if env.TargetOSIs('windows'):
-        win_version_min = None
         if has_option('win-version-min'):
             win_version_min = get_option('win-version-min')
-        # If no minimum version has beeen specified, use our defaults for 32-bit/64-bit windows.
-        elif env['TARGET_ARCH'] == 'x86_64':
-            win_version_min = 'ws03sp2'
-        elif env['TARGET_ARCH'] == 'i386':
-            win_version_min = 'xpsp3'
+        else:
+            # If no minimum version has beeen specified, use our default
+            win_version_min = 'vista'
 
         env['WIN_VERSION_MIN'] = win_version_min
         win_version_min = win_version_min_choices[win_version_min]
@@ -1481,7 +1452,7 @@ def doConfigure(myenv):
     # We appear to have C++11, or at least a flag to enable it. Check that the declared C++
     # language level is not less than C++11, and that we can at least compile an 'auto'
     # expression. We don't check the __cplusplus macro when using MSVC because as of our
-    # current required MS compiler version (MSVS 2013 Update 2), they don't set it. If
+    # current required MS compiler version (MSVS 2013 Update 4), they don't set it. If
     # MSFT ever decides (in MSVS 2015?) to define __cplusplus >= 201103L, remove the exception
     # here for _MSC_VER
     def CheckCxx11(context):
@@ -1555,6 +1526,33 @@ def doConfigure(myenv):
             print("--use-glibcxx-debug not compatible with system versions of C++ libraries.")
             Exit(1)
         myenv.Append(CPPDEFINES=["_GLIBCXX_DEBUG"]);
+
+    # Check if we have a modern Windows SDK
+    if env.TargetOSIs('windows'):
+        def CheckWindowsSDKVersion(context):
+
+            test_body = """
+            #include <windows.h>
+            #if !defined(NTDDI_WINBLUE)
+            #error Need Windows SDK Version 8.1 or higher
+            #endif
+            """
+
+            context.Message('Checking Windows SDK is 8.1 or newer... ')
+            ret = context.TryCompile(textwrap.dedent(test_body), ".c")
+            context.Result(ret)
+            return ret
+
+        conf = Configure(myenv, help=False, custom_tests = {
+            'CheckWindowsSDKVersion' : CheckWindowsSDKVersion,
+        })
+
+        if not conf.CheckWindowsSDKVersion():
+            print( 'Windows SDK Version 8.1 or higher is required to build MongoDB' )
+            Exit(1)
+
+
+        conf.Finish()
 
     # Check if we are on a POSIX system by testing if _POSIX_VERSION is defined.
     def CheckPosixSystem(context):
@@ -1989,6 +1987,48 @@ def doConfigure(myenv):
         print "Invalid --allocator parameter: \"%s\"" % get_option('allocator')
         Exit(1)
 
+    def CheckStdAtomic(context, base_type, extra_message):
+        test_body = """
+        #include <atomic>
+
+        int main() {{
+            std::atomic<{0}> x;
+
+            x.store(0);
+            {0} y = 1;
+            x.fetch_add(y);
+            x.fetch_sub(y);
+            x.exchange(y);
+            x.compare_exchange_strong(y, x);
+            return x.load();
+        }}
+        """.format(base_type)
+
+        context.Message(
+            "Checking if std::atomic<{0}> works{1}... ".format(
+                base_type, extra_message
+            )
+        )
+
+        ret = context.TryLink(textwrap.dedent(test_body), ".cpp")
+        context.Result(ret)
+        return ret
+    conf.AddTest("CheckStdAtomic", CheckStdAtomic)
+
+    def check_all_atomics(extra_message=''):
+        for t in ('int64_t', 'uint64_t', 'int32_t', 'uint32_t'):
+            if not conf.CheckStdAtomic(t, extra_message):
+                return False
+        return True
+
+    if not check_all_atomics():
+        if not conf.CheckLib('atomic', symbol=None, header=None, language='C', autoadd=1):
+            print "Some atomic ops are not intrinsically supported, but no libatomic found"
+            Exit(1)
+        if not check_all_atomics(' with libatomic'):
+            print "The toolchain does not support std::atomic, cannot continue"
+            Exit(1)
+
     # ask each module to configure itself and the build environment.
     moduleconfig.configure_modules(mongo_modules, conf)
 
@@ -1996,7 +2036,9 @@ def doConfigure(myenv):
 
 env = doConfigure( env )
 
-env['PDB'] = '${TARGET.base}.pdb'
+# Load the compilation_db tool. We want to do this after configure so we don't end up with
+# compilation database entries for the configure tests, which is weird.
+env.Tool("compilation_db")
 
 def checkErrorCodes():
     import buildscripts.errorcodes as x
@@ -2006,31 +2048,7 @@ def checkErrorCodes():
 
 checkErrorCodes()
 
-#  ---- astyle ----
-
-def doStyling( env , target , source ):
-
-    res = utils.execsys( "astyle --version" )
-    res = " ".join(res)
-    if res.count( "2." ) == 0:
-        print( "astyle 2.x needed, found:" + res )
-        Exit(-1)
-
-    files = utils.getAllSourceFiles() 
-    files = filter( lambda x: not x.endswith( ".c" ) , files )
-
-    cmd = "astyle --options=mongo_astyle " + " ".join( files )
-    res = utils.execsys( cmd )
-    print( res[0] )
-    print( res[1] )
-
-
-env.Alias( "style" , [] , [ doStyling ] )
-env.AlwaysBuild( "style" )
-
 # --- lint ----
-
-
 
 def doLint( env , target , source ):
     import buildscripts.lint
@@ -2049,19 +2067,9 @@ def getSystemInstallName():
     n = env.GetTargetOSName() + "-" + arch_name
     if has_option("nostrip"):
         n += "-debugsymbols"
-    if env.TargetOSIs('posix') and os.uname()[2].startswith("8."):
-        n += "-tiger"
 
     if len(mongo_modules):
             n += "-" + "-".join(m.name for m in mongo_modules)
-
-    try:
-        findSettingsSetup()
-        import settings
-        if "distmod" in dir(settings):
-            n = n + "-" + str(settings.distmod)
-    except:
-        pass
 
     dn = GetOption("distmod")
     if dn and len(dn) > 0:
@@ -2076,95 +2084,12 @@ if mongoCodeVersion == None:
 if has_option('distname'):
     distName = GetOption( "distname" )
 elif mongoCodeVersion[-1] not in ("+", "-"):
-    dontReplacePackage = True
     distName = mongoCodeVersion
 else:
-    isBuildingLatest = True
     distName = utils.getGitBranchString("" , "-") + datetime.date.today().strftime("%Y-%m-%d")
 
 
 env['SERVER_DIST_BASENAME'] = 'mongodb-%s-%s' % (getSystemInstallName(), distName)
-
-distFile = "${SERVER_ARCHIVE}"
-
-#  ---- CONVENIENCE ----
-
-def tabs( env, target, source ):
-    from subprocess import Popen, PIPE
-    from re import search, match
-    diff = Popen( [ "git", "diff", "-U0", "origin", "master" ], stdout=PIPE ).communicate()[ 0 ]
-    sourceFile = False
-    for line in diff.split( "\n" ):
-        if match( "diff --git", line ):
-            sourceFile = not not search( "\.(h|hpp|c|cpp)\s*$", line )
-        if sourceFile and match( "\+ *\t", line ):
-            return True
-    return False
-env.Alias( "checkSource", [], [ tabs ] )
-env.AlwaysBuild( "checkSource" )
-
-def gitPush( env, target, source ):
-    import subprocess
-    return subprocess.call( [ "git", "push" ] )
-env.Alias( "push", [ ".", "smoke", "checkSource" ], gitPush )
-env.AlwaysBuild( "push" )
-
-
-# ---- deploying ---
-
-def s3push(localName, remoteName=None, platformDir=True):
-    localName = str( localName )
-
-    if isBuildingLatest:
-        remotePrefix = utils.getGitBranchString("-") + "-latest"
-    else:
-        remotePrefix = "-" + distName
-
-    findSettingsSetup()
-
-    import simples3
-    import settings
-
-    s = simples3.S3Bucket( settings.bucket , settings.id , settings.key )
-
-    if remoteName is None:
-        remoteName = localName
-
-    name = '%s-%s%s' % (remoteName , getSystemInstallName(), remotePrefix)
-    lastDotIndex = localName.rfind('.')
-    if lastDotIndex != -1:
-        name += localName[lastDotIndex:]
-    name = name.lower()
-
-    if platformDir:
-        name = platform + "/" + name
-
-    print( "uploading " + localName + " to http://s3.amazonaws.com/" + s.name + "/" + name )
-    if dontReplacePackage:
-        for ( key , modify , etag , size ) in s.listdir( prefix=name ):
-            print( "error: already a file with that name, not uploading" )
-            Exit(2)
-    s.put( name  , open( localName , "rb" ).read() , acl="public-read" );
-    print( "  done uploading!" )
-
-def s3shellpush( env , target , source ):
-    s3push( "mongo" , "mongo-shell" )
-
-env.Alias( "s3shell" , [ "mongo" ] , [ s3shellpush ] )
-env.AlwaysBuild( "s3shell" )
-
-def s3dist( env , target , source ):
-    s3push( str(source[0]) , "mongodb" )
-
-env.AlwaysBuild(env.Alias( "s3dist" , [ '$SERVER_ARCHIVE' ] , [ s3dist ] ))
-
-# --- an uninstall target ---
-if len(COMMAND_LINE_TARGETS) > 0 and 'uninstall' in COMMAND_LINE_TARGETS:
-    SetOption("clean", 1)
-    # By inspection, changing COMMAND_LINE_TARGETS here doesn't do
-    # what we want, but changing BUILD_TARGETS does.
-    BUILD_TARGETS.remove("uninstall")
-    BUILD_TARGETS.append("install")
 
 module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 
@@ -2185,29 +2110,15 @@ Export("v8version v8suffix")
 Export("boostSuffix")
 Export('module_sconscripts')
 Export("debugBuild optBuild")
-Export("s3push")
 Export("wiredtiger")
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
 env.AddMethod(injectMongoIncludePaths, 'InjectMongoIncludePaths')
 
+env.Alias("compiledb", env.CompilationDatabase('compile_commands.json'))
+
 env.SConscript('src/SConscript', variant_dir='$BUILD_DIR', duplicate=False)
 env.SConscript('SConscript.smoke')
 
-def clean_old_dist_builds(env, target, source):
-    prefix = "mongodb-%s-%s" % (platform, processor)
-    filenames = sorted(os.listdir("."))
-    filenames = [x for x in filenames if x.startswith(prefix)]
-    to_keep = [x for x in filenames if x.endswith(".tgz") or x.endswith(".zip")][-2:]
-    for filename in [x for x in filenames if x not in to_keep]:
-        print "removing %s" % filename
-        try:
-            shutil.rmtree(filename)
-        except:
-            os.remove(filename)
-
-env.Alias("dist_clean", [], [clean_old_dist_builds])
-env.AlwaysBuild("dist_clean")
-
-env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'file_allocator_bench'])
+env.Alias('all', ['core', 'tools', 'dbtest', 'unittests'])

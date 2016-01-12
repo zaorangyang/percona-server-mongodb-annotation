@@ -46,12 +46,13 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/prefetch.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/util/exit.h"
@@ -89,7 +90,7 @@ namespace repl {
     void initializePrefetchThread() {
         if (!ClientBasic::getCurrent()) {
             Client::initThreadIfNotAlready();
-            cc().getAuthorizationSession()->grantInternalAuthorization();
+            AuthorizationSession::get(cc())->grantInternalAuthorization();
         }
     }
     namespace {
@@ -198,8 +199,10 @@ namespace repl {
 
                 // For non-initial-sync, we convert updates to upserts
                 // to suppress errors when replaying oplog entries.
+                txn->setReplicatedWrites(false);
+
                 Status status =
-                    applyOperation_inlock(txn, ctx.db(), op, true, convertUpdateToUpsert);
+                    applyOperation_inlock(txn, ctx.db(), op, convertUpdateToUpsert);
                 opsAppliedStats.increment();
                 return status.isOK();
             }
@@ -265,15 +268,17 @@ namespace repl {
     }
 
     // Doles out all the work to the writer pool threads and waits for them to complete
-    OpTime SyncTail::multiApply(OperationContext* txn, std::deque<BSONObj>& ops) {
+    Timestamp SyncTail::multiApply(OperationContext* txn, std::deque<BSONObj>& ops) {
 
-        if (getGlobalEnvironment()->getGlobalStorageEngine()->isMmapV1()) {
+        if (getGlobalServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
             // Use a ThreadPool to prefetch all the operations in a batch.
             prefetchOps(ops);
         }
         
         std::vector< std::vector<BSONObj> > writerVectors(replWriterThreadCount);
-        fillWriterVectors(ops, &writerVectors);
+        bool mustAwaitCommit = false;
+
+        fillWriterVectors(ops, &writerVectors, &mustAwaitCommit);
         LOG(2) << "replication batch size is " << ops.size() << endl;
         // We must grab this because we're going to grab write locks later.
         // We hold this mutex the entire time we're writing; it doesn't matter
@@ -294,10 +299,20 @@ namespace repl {
         applyOps(writerVectors);
 
         if (inShutdown()) {
-            return OpTime();
+            return Timestamp();
         }
 
-        OpTime lastOpTime = writeOpsToOplog(txn, ops);
+        if (supportsAwaitingCommit() && mustAwaitCommit) {
+            txn->recoveryUnit()->goingToAwaitCommit();
+        }
+        Timestamp lastOpTime = writeOpsToOplog(txn, ops);
+        // Wait for journal before setting last op time if any op in batch had j:true
+        if (supportsAwaitingCommit() && mustAwaitCommit) {
+            txn->recoveryUnit()->awaitCommit();
+        }
+        ReplClientInfo::forClient(txn->getClient()).setLastOp(lastOpTime);
+        replCoord->setMyLastOptime(lastOpTime);
+        setNewOptime(lastOpTime);
 
         BackgroundSync::get()->notify(txn);
 
@@ -305,7 +320,8 @@ namespace repl {
     }
 
     void SyncTail::fillWriterVectors(const std::deque<BSONObj>& ops,
-                                     std::vector< std::vector<BSONObj> >* writerVectors) {
+                                     std::vector< std::vector<BSONObj> >* writerVectors,
+                                     bool* mustAwaitCommit) {
 
         for (std::deque<BSONObj>::const_iterator it = ops.begin();
              it != ops.end();
@@ -319,7 +335,13 @@ namespace repl {
 
             const char* opType = it->getField( "op" ).valuestrsafe();
 
-            if (getGlobalEnvironment()->getGlobalStorageEngine()->supportsDocLocking() &&
+            // Check if any entry needs journaling, and if so return the need
+            const bool foundJournal = it->getField("j").trueValue();
+            if (foundJournal) {
+                *mustAwaitCommit = true;
+            }
+
+            if (getGlobalServiceContext()->getGlobalStorageEngine()->supportsDocLocking() &&
                 isCrudOpType(opType)) {
                 BSONElement id;
                 switch (opType[0]) {
@@ -339,12 +361,12 @@ namespace repl {
             (*writerVectors)[hash % writerVectors->size()].push_back(*it);
         }
     }
-    void SyncTail::oplogApplication(OperationContext* txn, const OpTime& endOpTime) {
+    void SyncTail::oplogApplication(OperationContext* txn, const Timestamp& endOpTime) {
         _applyOplogUntil(txn, endOpTime);
     }
 
     /* applies oplog from "now" until endOpTime using the applier threads for initial sync*/
-    void SyncTail::_applyOplogUntil(OperationContext* txn, const OpTime& endOpTime) {
+    void SyncTail::_applyOplogUntil(OperationContext* txn, const Timestamp& endOpTime) {
         unsigned long long bytesApplied = 0;
         unsigned long long entriesApplied = 0;
         while (true) {
@@ -356,7 +378,7 @@ namespace repl {
 
                 // Check if we reached the end
                 const BSONObj currentOp = ops.back();
-                const OpTime currentOpTime = currentOp["ts"]._opTime();
+                const Timestamp currentOpTime = currentOp["ts"].timestamp();
 
                 // When we reach the end return this batch
                 if (currentOpTime == endOpTime) {
@@ -386,7 +408,7 @@ namespace repl {
             bytesApplied += ops.getSize();
             entriesApplied += ops.getDeque().size();
 
-            const OpTime lastOpTime = multiApply(txn, ops.getDeque());
+            const Timestamp lastOpTime = multiApply(txn, ops.getDeque());
 
             if (inShutdown()) {
                 return;
@@ -422,7 +444,7 @@ namespace {
             return;
         }
 
-        OpTime minvalid = getMinValid(txn);
+        Timestamp minvalid = getMinValid(txn);
         if (minvalid > replCoord->getMyLastOptime()) {
             return;
         }
@@ -475,7 +497,7 @@ namespace {
                 const int slaveDelaySecs = replCoord->getSlaveDelaySecs().total_seconds();
                 if (!ops.empty() && slaveDelaySecs > 0) {
                     const BSONObj& lastOp = ops.getDeque().back();
-                    const unsigned int opTimestampSecs = lastOp["ts"]._opTime().getSecs();
+                    const unsigned int opTimestampSecs = lastOp["ts"].timestamp().getSecs();
 
                     // Stop the batch as the lastOp is too new to be applied. If we continue
                     // on, we can get ops that are way ahead of the delay and this will
@@ -507,7 +529,7 @@ namespace {
             // Set minValid to the last op to be applied in this next batch.
             // This will cause this node to go into RECOVERING state
             // if we should crash and restart before updating the oplog
-            OpTime minValid = lastOp["ts"]._opTime();
+            Timestamp minValid = lastOp["ts"].timestamp();
             setMinValid(&txn, minValid);
             multiApply(&txn, ops.getDeque());
         }
@@ -597,7 +619,7 @@ namespace {
         // ignore slaveDelay if the box is still initializing. once
         // it becomes secondary we can worry about it.
         if( slaveDelaySecs > 0 && replCoord->getMemberState().secondary() ) {
-            const OpTime ts = lastOp["ts"]._opTime();
+            const Timestamp ts = lastOp["ts"].timestamp();
             long long a = ts.getSecs();
             long long b = time(0);
             long long lag = b - a;
@@ -631,7 +653,7 @@ namespace {
         // Only do this once per thread
         if (!ClientBasic::getCurrent()) {
             Client::initThreadIfNotAlready();
-            cc().getAuthorizationSession()->grantInternalAuthorization();
+            AuthorizationSession::get(cc())->grantInternalAuthorization();
         }
     }
 
@@ -640,6 +662,7 @@ namespace {
         initializeWriterThread();
 
         OperationContextImpl txn;
+        txn.setReplicatedWrites(false);
 
         // allow us to get through the magic barrier
         txn.lockState()->setIsBatchWriter(true);
@@ -672,6 +695,7 @@ namespace {
         initializeWriterThread();
 
         OperationContextImpl txn;
+        txn.setReplicatedWrites(false);
 
         // allow us to get through the magic barrier
         txn.lockState()->setIsBatchWriter(true);

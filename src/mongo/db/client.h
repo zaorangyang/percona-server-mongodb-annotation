@@ -39,78 +39,47 @@
 #include <boost/scoped_ptr.hpp>
 #include <boost/thread/thread.hpp>
 
-#include "mongo/bson/optime.h"
 #include "mongo/db/client_basic.h"
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/concurrency/threadlocal.h"
 
 namespace mongo {
 
-    class CurOp;
     class Collection;
     class AbstractMessagingPort;
-    class Locker;
-
-    TSP_DECLARE(Client, currentClient)
 
     typedef long long ConnectionId;
-
-    typedef unordered_set<Client*> ClientSet;
 
     /** the database's concept of an outside "client" */
     class Client : public ClientBasic {
     public:
-        // A set of currently active clients along with a mutex to protect the list
-        static boost::mutex clientsMutex;
-        static ClientSet clients;
-
-        ~Client();
-
         /** each thread which does db operations has a Client object in TLS.
          *  call this when your thread starts.
         */
         static void initThread(const char *desc, AbstractMessagingPort *mp = 0);
+        static void initThread(const char* desc,
+                               ServiceContext* serviceContext,
+                               AbstractMessagingPort* mp);
 
         /**
          * Inits a thread if that thread has not already been init'd, setting the thread name to
          * "desc".
          */
-        static void initThreadIfNotAlready(const char* desc) {
-            if (currentClient.get())
-                return;
-            initThread(desc);
-        }
+        static void initThreadIfNotAlready(const char* desc);
 
         /**
          * Inits a thread if that thread has not already been init'd, using the existing thread name
          */
-        static void initThreadIfNotAlready() {
-            if (currentClient.get())
-                return;
-            initThread(getThreadName().c_str());
-        }
-
-        /** this has to be called as the client goes away, but before thread termination
-         *  @return true if anything was done
-         */
-        bool shutdown();
+        static void initThreadIfNotAlready();
 
         std::string clientAddress(bool includePort = false) const;
-        CurOp* curop() const { return _curOp; }
         const std::string& desc() const { return _desc; }
-        void setLastOp(OpTime op) { _lastOp = op; }
-        OpTime getLastOp() const { return _lastOp; }
 
-        // Return a reference to the Locker for this client. Client retains ownership.
-        Locker* getLocker();
-
-        /* report what the last operation was.  used by getlasterror */
-        void appendLastOp(BSONObjBuilder& b) const;
         void reportState(BSONObjBuilder& builder);
 
         // Ensures stability of the client's OperationContext. When the client is locked,
@@ -128,17 +97,14 @@ namespace mongo {
         bool isInDirectClient() const { return _inDirectClient; }
         void setInDirectClient(bool newVal) { _inDirectClient = newVal; }
 
-        // Only used for master/slave
-        void setRemoteID(const OID& rid) { _remoteId = rid; }
-        OID getRemoteID() const { return _remoteId; }
-
         ConnectionId getConnectionId() const { return _connectionId; }
         bool isFromUserConnection() const { return _connectionId > 0; }
 
     private:
-        friend class CurOp;
-
-        Client(const std::string& desc, AbstractMessagingPort *p = 0);
+        friend class ServiceContext;
+        Client(std::string desc,
+               ServiceContext* serviceContext,
+               AbstractMessagingPort *p = 0);
 
 
         // Description for the client (e.g. conn8)
@@ -154,35 +120,15 @@ namespace mongo {
         mutable SpinLock _lock;
 
         // Whether this client is running as DBDirectClient
-        bool _inDirectClient;
+        bool _inDirectClient = false;
 
         // If != NULL, then contains the currently active OperationContext
-        OperationContext* _txn;
-
-        // Changes, based on what operation is running. Some of this should be in OperationContext.
-        CurOp* _curOp;
-
-        // By having Client, rather than the OperationContext, own the Locker, setup cost such as
-        // allocating OS resources can be amortized over multiple operations.
-        boost::scoped_ptr<Locker> _locker;
-
-        // Used by replication
-        OpTime _lastOp;
-
-        // Only used by master-slave
-        OID _remoteId;
-
-        // Tracks if Client::shutdown() gets called (TODO: Is this necessary?)
-        bool _shutdown;
+        OperationContext* _txn = nullptr;
     };
 
     /** get the Client object for this thread. */
-    inline Client& cc() {
-        Client * c = currentClient.get();
-        verify( c );
-        return *c;
-    }
+    Client& cc();
 
-    inline bool haveClient() { return currentClient.get() != NULL; }
+    bool haveClient();
 
 };

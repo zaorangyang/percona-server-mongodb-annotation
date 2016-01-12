@@ -35,7 +35,7 @@
 
 namespace mongo {
 
-    class ClientInfo;
+    class Client;
 
     class Request {
         MONGO_DISALLOW_COPYING(Request);
@@ -70,10 +70,8 @@ namespace mongo {
 
         void init();
 
-        void reset();
-
     private:
-        ClientInfo* const _clientInfo;
+        Client* const _clientInfo;
 
         Message& _m;
         DbMessage _d;

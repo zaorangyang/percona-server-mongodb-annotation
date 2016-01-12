@@ -37,11 +37,11 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/currentop_command.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/dbwebserver.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/dbwebserver.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/stats/fill_locker_info.h"
 #include "mongo/util/mongoutils/html.h"
 #include "mongo/util/stringutils.h"
 
@@ -76,21 +76,19 @@ namespace {
 
                << "</tr>\n";
             
-            _processAllClients(ss);
+            _processAllClients(txn->getClient()->getServiceContext(), ss);
             
             ss << "</table>\n";
         }
 
     private:
 
-        static void _processAllClients(std::stringstream& ss) {
+        static void _processAllClients(ServiceContext* service, std::stringstream& ss) {
             using namespace html;
 
-            boost::lock_guard<boost::mutex> scopedLock(Client::clientsMutex);
+            for (ServiceContext::LockedClientsCursor cursor(service);
+                 Client* client = cursor.next();) {
 
-            ClientSet::const_iterator it = Client::clients.begin();
-            for (; it != Client::clients.end(); it++) {
-                Client* client = *it;
                 invariant(client);
 
                 // Make the client stable
@@ -159,7 +157,7 @@ namespace {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            if ( client->getAuthorizationSession()
+            if ( AuthorizationSession::get(client)
                  ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
                                                     ActionType::inprog) ) {
                 return Status::OK();
@@ -174,8 +172,7 @@ namespace {
                   BSONObj& cmdObj,
                   int,
                   string& errmsg,
-                  BSONObjBuilder& result,
-                  bool fromRepl) {
+                  BSONObjBuilder& result) {
 
             scoped_ptr<MatchExpression> filter;
             if ( cmdObj["filter"].isABSONObj() ) {
@@ -187,7 +184,9 @@ namespace {
                 filter.reset( res.getValue() );
             }
 
-            result.appendArray("operations", _processAllClients(filter.get()));
+            result.appendArray(
+                    "operations",
+                    _processAllClients(txn->getClient()->getServiceContext(), filter.get()));
 
             return true;
         }
@@ -195,14 +194,12 @@ namespace {
 
     private:
 
-        static BSONArray _processAllClients(MatchExpression* matcher) {
+        static BSONArray _processAllClients(ServiceContext* service, MatchExpression* matcher) {
             BSONArrayBuilder array;
 
-            boost::lock_guard<boost::mutex> scopedLock(Client::clientsMutex);
+            for (ServiceContext::LockedClientsCursor cursor(service);
+                 Client* client = cursor.next();) {
 
-            ClientSet::const_iterator it = Client::clients.begin();
-            for (; it != Client::clients.end(); it++) {
-                Client* client = *it;
                 invariant(client);
 
                 BSONObjBuilder b;

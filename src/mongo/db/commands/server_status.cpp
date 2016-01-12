@@ -30,8 +30,6 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/config.h"
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/action_set.h"
@@ -40,6 +38,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/client_basic.h"
+#include "mongo/config.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/server_status_internal.h"
@@ -82,15 +81,19 @@ namespace mongo {
             actions.addAction(ActionType::serverStatus);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             
             _runCalled = true;
 
             long long start = Listener::getElapsedTimeMillis();
             BSONObjBuilder timeBuilder(256);
 
-            const ClientBasic* myClientBasic = ClientBasic::getCurrent();
-            AuthorizationSession* authSession = myClientBasic->getAuthorizationSession();
+            const auto authSession = AuthorizationSession::get(ClientBasic::getCurrent());
             
             // --- basic fields that are global
 

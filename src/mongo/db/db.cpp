@@ -30,8 +30,6 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
-#include "mongo/config.h"
-
 #include "mongo/platform/basic.h"
 
 #include <boost/thread/thread.hpp>
@@ -46,6 +44,7 @@
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
+#include "mongo/config.h"
 #include "mongo/db/auth/auth_index_d.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
@@ -63,8 +62,8 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/dbwebserver.h"
-#include "mongo/db/global_environment_d.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index_rebuilder.h"
 #include "mongo/db/initialize_server_global_state.h"
@@ -152,47 +151,6 @@ namespace mongo {
 
     QueryResult::View emptyMoreResult(long long);
 
-
-    /* todo: make this a real test.  the stuff in dbtests/ seem to do all dbdirectclient which exhaust doesn't support yet. */
-// QueryOption_Exhaust
-#define TESTEXHAUST 0
-#if( TESTEXHAUST )
-    void testExhaust() {
-        sleepsecs(1);
-        unsigned n = 0;
-        auto f = [&n](const BSONObj& o) {
-            verify( o.valid() );
-            //cout << o << endl;
-            n++;
-            bool testClosingSocketOnError = false;
-            if( testClosingSocketOnError )
-                verify(false);
-        };
-        DBClientConnection db(false);
-        db.connect("localhost");
-        const char *ns = "local.foo";
-        if( db.count(ns) < 10000 )
-            for( int i = 0; i < 20000; i++ )
-                db.insert(ns, BSON("aaa" << 3 << "b" << "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-
-        try {
-            db.query(f, ns, Query() );
-        }
-        catch(...) {
-            cout << "hmmm" << endl;
-        }
-
-        try {
-            db.query(f, ns, Query() );
-        }
-        catch(...) {
-            cout << "caught" << endl;
-        }
-
-        cout << n << endl;
-    };
-#endif
-
     class MyMessageHandler : public MessageHandler {
     public:
         virtual void connected( AbstractMessagingPort* p ) {
@@ -241,12 +199,6 @@ namespace mongo {
                 break;
             }
         }
-
-        virtual void disconnected( AbstractMessagingPort* p ) {
-            Client * c = currentClient.get();
-            if( c ) c->shutdown();
-        }
-
     };
 
     static void logStartup() {
@@ -280,7 +232,10 @@ namespace mongo {
         WriteUnitOfWork wunit(&txn);
         if (!collection) {
             BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
-            uassertStatusOK(userCreateNS(&txn, db, ns, options, true));
+            bool shouldReplicateWrites = txn.writesAreReplicated();
+            txn.setReplicatedWrites(false);
+            ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, &txn, shouldReplicateWrites);
+            uassertStatusOK(userCreateNS(&txn, db, ns, options));
             collection = db->getCollection(ns);
         }
         invariant(collection);
@@ -348,7 +303,7 @@ namespace mongo {
 
         vector<string> dbNames;
 
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         storageEngine->listDatabases( &dbNames );
 
         // Repair all databases first, so that we do not try to open them if they are in bad shape
@@ -480,7 +435,7 @@ namespace mongo {
                 }
 
                 // Warn if field name matches non-active registered storage engine.
-                if (getGlobalEnvironment()->isRegisteredStorageEngine(e.fieldName())) {
+                if (getGlobalServiceContext()->isRegisteredStorageEngine(e.fieldName())) {
                     warning() << "Detected configuration for non-active storage engine "
                               << e.fieldName()
                               << " when current storage engine is "
@@ -489,8 +444,8 @@ namespace mongo {
             }
         }
 
-        getGlobalEnvironment()->setGlobalStorageEngine(storageGlobalParams.engine);
-        getGlobalEnvironment()->setOpObserver(stdx::make_unique<OpObserver>());
+        getGlobalServiceContext()->setGlobalStorageEngine(storageGlobalParams.engine);
+        getGlobalServiceContext()->setOpObserver(stdx::make_unique<OpObserver>());
 
         const repl::ReplSettings& replSettings =
                 repl::getGlobalReplicationCoordinator()->getSettings();
@@ -555,7 +510,6 @@ namespace mongo {
 
         if (storageGlobalParams.upgrade) {
             log() << "finished checking dbs" << endl;
-            cc().shutdown();
             exitCleanly(EXIT_CLEAN);
         }
 
@@ -642,10 +596,6 @@ namespace mongo {
         PeriodicTask::startRunningPeriodicTasks();
 
         logStartup();
-
-#if(TESTEXHAUST)
-        boost::thread thr(testExhaust);
-#endif
 
         // MessageServer::run will return when exit code closes its socket
         server->run();
@@ -800,12 +750,16 @@ static void startupConfigActions(const std::vector<std::string>& args) {
 }
 
 MONGO_INITIALIZER_GENERAL(CreateAuthorizationManager,
-                          ("SetupInternalSecurityUser", "OIDGeneration"),
+                          ("SetupInternalSecurityUser",
+                           "OIDGeneration",
+                           "SetGlobalEnvironment",
+                           "EndStartupOptionStorage"),
                           MONGO_NO_DEPENDENTS)
         (InitializerContext* context) {
-    AuthorizationManager* authzManager =
-            new AuthorizationManager(new AuthzManagerExternalStateMongod());
-    setGlobalAuthorizationManager(authzManager);
+    auto authzManager = stdx::make_unique<AuthorizationManager>(
+            new AuthzManagerExternalStateMongod());
+    authzManager->setAuthEnabled(serverGlobalParams.isAuthEnabled);
+    AuthorizationManager::set(getGlobalServiceContext(), std::move(authzManager));
     return Status::OK();
 }
 
@@ -819,7 +773,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager, ("SetGlobalEnviro
             static_cast<int64_t>(curTimeMillis64()));
     repl::setGlobalReplicationCoordinator(replCoord);
     repl::setOplogCollectionName();
-    getGlobalEnvironment()->registerKillOpListener(replCoord);
+    getGlobalServiceContext()->registerKillOpListener(replCoord);
     return Status::OK();
 }
 

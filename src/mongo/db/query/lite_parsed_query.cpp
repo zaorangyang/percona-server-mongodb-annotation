@@ -45,7 +45,7 @@ namespace mongo {
     const string LiteParsedQuery::metaTextScore("textScore");
     const string LiteParsedQuery::metaGeoNearDistance("geoNearDistance");
     const string LiteParsedQuery::metaGeoNearPoint("geoNearPoint");
-    const string LiteParsedQuery::metaDiskLoc("diskloc");
+    const string LiteParsedQuery::metaRecordId("recordId");
     const string LiteParsedQuery::metaIndexKey("indexKey");
 
     namespace {
@@ -56,7 +56,7 @@ namespace mongo {
                 ss << "Failed to parse: " << el.toString() << ". "
                    << "'" << el.fieldName() << "' field must be of BSON type "
                    << typeName(type) << ".";
-                return Status(ErrorCodes::BadValue, ss);
+                return Status(ErrorCodes::FailedToParse, ss);
             }
 
             return Status::OK();
@@ -122,7 +122,7 @@ namespace mongo {
                     hintObj = el.wrap("$hint");
                 }
                 else {
-                    return Status(ErrorCodes::BadValue,
+                    return Status(ErrorCodes::FailedToParse,
                                   "hint must be either a string or nested object");
                 }
 
@@ -133,7 +133,7 @@ namespace mongo {
                     mongoutils::str::stream ss;
                     ss << "Failed to parse: " << cmdObj.toString() << ". "
                        << "'skip' field must be numeric.";
-                    return Status(ErrorCodes::BadValue, ss);
+                    return Status(ErrorCodes::FailedToParse, ss);
                 }
 
                 int skip = el.numberInt();
@@ -148,7 +148,7 @@ namespace mongo {
                     mongoutils::str::stream ss;
                     ss << "Failed to parse: " << cmdObj.toString() << ". "
                        << "'limit' field must be numeric.";
-                    return Status(ErrorCodes::BadValue, ss);
+                    return Status(ErrorCodes::FailedToParse, ss);
                 }
 
                 int limit = el.numberInt();
@@ -163,7 +163,7 @@ namespace mongo {
                     mongoutils::str::stream ss;
                     ss << "Failed to parse: " << cmdObj.toString() << ". "
                        << "'batchSize' field must be numeric.";
-                    return Status(ErrorCodes::BadValue, ss);
+                    return Status(ErrorCodes::FailedToParse, ss);
                 }
 
                 int batchSize = el.numberInt();
@@ -194,7 +194,7 @@ namespace mongo {
                     mongoutils::str::stream ss;
                     ss << "Failed to parse: " << cmdObj.toString() << ". "
                        << "'maxScan' field must be numeric.";
-                    return Status(ErrorCodes::BadValue, ss);
+                    return Status(ErrorCodes::FailedToParse, ss);
                 }
 
                 int maxScan = el.numberInt();
@@ -236,13 +236,13 @@ namespace mongo {
 
                 pq->_returnKey = el.boolean();
             }
-            else if (mongoutils::str::equals(fieldName, "showDiskLoc")) {
+            else if (mongoutils::str::equals(fieldName, "showRecordId")) {
                 Status status = checkFieldType(el, Bool);
                 if (!status.isOK()) {
                     return status;
                 }
 
-                pq->_showDiskLoc = el.boolean();
+                pq->_showRecordId = el.boolean();
             }
             else if (mongoutils::str::equals(fieldName, "snapshot")) {
                 Status status = checkFieldType(el, Bool);
@@ -295,14 +295,6 @@ namespace mongo {
 
                 pq->_awaitData = el.boolean();
             }
-            else if (mongoutils::str::equals(fieldName, "exhaust")) {
-                Status status = checkFieldType(el, Bool);
-                if (!status.isOK()) {
-                    return status;
-                }
-
-                pq->_exhaust = el.boolean();
-            }
             else if (mongoutils::str::equals(fieldName, "partial")) {
                 Status status = checkFieldType(el, Bool);
                 if (!status.isOK()) {
@@ -318,7 +310,7 @@ namespace mongo {
                 //
                 // TODO: Remove for 3.4.
                 if (!pq->isExplain()) {
-                    return Status(ErrorCodes::BadValue,
+                    return Status(ErrorCodes::FailedToParse,
                                   "Field 'options' is only allowed for explain.");
                 }
 
@@ -329,7 +321,7 @@ namespace mongo {
 
                 BSONObj optionsObj = el.Obj();
                 if (!optionsObj.isEmpty()) {
-                    return Status(ErrorCodes::BadValue,
+                    return Status(ErrorCodes::FailedToParse,
                                   str::stream() << "Failed to parse options: "
                                                 << optionsObj.toString() << ". "
                                                 << "You may need to update your shell or driver.");
@@ -339,7 +331,7 @@ namespace mongo {
                 mongoutils::str::stream ss;
                 ss << "Failed to parse: " << cmdObj.toString() << ". "
                    << "Unrecognized field '" << fieldName << "'.";
-                return Status(ErrorCodes::BadValue, ss);
+                return Status(ErrorCodes::FailedToParse, ss);
             }
         }
 
@@ -347,8 +339,8 @@ namespace mongo {
         if (pq->returnKey()) {
             pq->addReturnKeyMetaProj();
         }
-        if (pq->showDiskLoc()) {
-            pq->addShowDiskLocMetaProj();
+        if (pq->showRecordId()) {
+            pq->addShowRecordIdMetaProj();
         }
 
         Status validateStatus = pq->validate();
@@ -371,12 +363,12 @@ namespace mongo {
         _proj = projBob.obj();
     }
 
-    void LiteParsedQuery::addShowDiskLocMetaProj() {
+    void LiteParsedQuery::addShowRecordIdMetaProj() {
         BSONObjBuilder projBob;
         projBob.appendElements(_proj);
-        BSONObj metaDiskLoc = BSON("$diskLoc" <<
-                                   BSON("$meta" << LiteParsedQuery::metaDiskLoc));
-        projBob.append(metaDiskLoc.firstElement());
+        BSONObj metaRecordId = BSON("$recordId" <<
+                                    BSON("$meta" << LiteParsedQuery::metaRecordId));
+        projBob.append(metaRecordId.firstElement());
         _proj = projBob.obj();
     }
 
@@ -493,8 +485,8 @@ namespace mongo {
     }
 
     // static
-    bool LiteParsedQuery::isDiskLocMeta(BSONElement elt) {
-        // elt must be foo: {$meta: "diskloc"}
+    bool LiteParsedQuery::isRecordIdMeta(BSONElement elt) {
+        // elt must be foo: {$meta: "recordId"}
         if (mongo::Object != elt.type()) {
             return false;
         }
@@ -511,7 +503,7 @@ namespace mongo {
         if (mongo::String != metaElt.type()) {
             return false;
         }
-        if (LiteParsedQuery::metaDiskLoc != metaElt.valuestr()) {
+        if (LiteParsedQuery::metaRecordId != metaElt.valuestr()) {
             return false;
         }
         // must have exactly 1 element
@@ -564,7 +556,7 @@ namespace mongo {
         _maxScan(0),
         _maxTimeMS(0),
         _returnKey(false),
-        _showDiskLoc(false),
+        _showRecordId(false),
         _snapshot(false),
         _hasReadPref(false),
         _tailable(false),
@@ -763,8 +755,8 @@ namespace mongo {
                 else if (str::equals("showDiskLoc", name)) {
                     // Won't throw.
                     if (e.trueValue()) {
-                        _showDiskLoc = true;
-                        addShowDiskLocMetaProj();
+                        _showRecordId = true;
+                        addShowRecordIdMetaProj();
                     }
                 }
                 else if (str::equals("maxTimeMS", name)) {

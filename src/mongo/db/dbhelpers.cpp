@@ -43,12 +43,11 @@
 #include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/index/btree_access_method.h"
 #include "mongo/db/json.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
@@ -58,6 +57,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/range_arithmetic.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/write_concern.h"
@@ -65,6 +65,7 @@
 #include "mongo/s/d_state.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -246,7 +247,6 @@ namespace mongo {
         request.setQuery(id);
         request.setUpdates(o);
         request.setUpsert();
-        request.setUpdateOpLog();
         request.setFromMigration(fromMigrate);
         UpdateLifecycleImpl updateLifecycle(true, requestNs);
         request.setLifecycle(&updateLifecycle);
@@ -263,13 +263,12 @@ namespace mongo {
 
         request.setUpdates(obj);
         request.setUpsert();
-        request.setUpdateOpLog();
         UpdateLifecycleImpl updateLifecycle(true, requestNs);
         request.setLifecycle(&updateLifecycle);
 
         update(txn, context.db(), request, &debug);
 
-        txn->getClient()->curop()->done();
+        CurOp::get(txn->getClient())->done();
     }
 
     BSONObj Helpers::toKeyFormat( const BSONObj& o ) {
@@ -448,8 +447,6 @@ namespace mongo {
 
                 BSONObj deletedId;
                 collection->deleteDocument( txn, rloc, false, false, &deletedId );
-                // The above throws on failure, and so is not logged
-                getGlobalEnvironment()->getOpObserver()->onDelete(txn, ns, deletedId, fromMigrate);
                 wuow.commit();
                 numDeleted++;
             }
@@ -459,9 +456,10 @@ namespace mongo {
 
             if (writeConcern.shouldWaitForOtherNodes() && numDeleted > 0) {
                 repl::ReplicationCoordinator::StatusAndDuration replStatus =
-                        repl::getGlobalReplicationCoordinator()->awaitReplication(txn,
-                                                                                  txn->getClient()->getLastOp(),
-                                                                                  writeConcern);
+                        repl::getGlobalReplicationCoordinator()->awaitReplication(
+                                txn,
+                                repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
+                                writeConcern);
                 if (replStatus.status.code() == ErrorCodes::ExceededTimeLimit) {
                     warning(LogComponent::kSharding)
                             << "replication to secondaries for removeRange at "
@@ -580,6 +578,9 @@ namespace mongo {
 
     void Helpers::emptyCollection(OperationContext* txn, const char *ns) {
         OldClientContext context(txn, ns);
+        bool shouldReplicateWrites = txn->writesAreReplicated();
+        txn->setReplicatedWrites(false);
+        ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, txn, shouldReplicateWrites);
         deleteObjects(txn, context.db(), ns, BSONObj(), PlanExecutor::YIELD_MANUAL, false);
     }
 

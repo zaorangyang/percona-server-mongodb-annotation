@@ -48,10 +48,6 @@ namespace mongo {
     class StringData;
     class UserName;
 
-namespace mutablebson {
-    class Document;
-}  // namespace mutablebson
-
 namespace audit {
 
     /**
@@ -89,27 +85,12 @@ namespace audit {
             ErrorCodes::Error result);
 
     /**
-     * Logs the result of an authorization check for the "unlock" pseudo-command.
-     */
-    void logFsyncUnlockAuthzCheck(
-            ClientBasic* client,
-            ErrorCodes::Error result);
-
-    /**
      * Logs the result of an authorization check for an OP_GET_MORE wire protocol message.
      */
     void logGetMoreAuthzCheck(
             ClientBasic* client,
             const NamespaceString& ns,
             long long cursorId,
-            ErrorCodes::Error result);
-
-    /**
-     * Logs the result of an authorization check for an "inprog" pseudo-command.
-     */
-    void logInProgAuthzCheck(
-            ClientBasic* client,
-            const BSONObj& filter,
             ErrorCodes::Error result);
 
     /**
@@ -128,14 +109,6 @@ namespace audit {
             ClientBasic* client,
             const NamespaceString& ns,
             long long cursorId,
-            ErrorCodes::Error result);
-
-    /**
-     * Logs the result of an authorization check for a "killop" pseudo-command.
-     */
-    void logKillOpAuthzCheck(
-            ClientBasic* client,
-            const BSONObj& filter,
             ErrorCodes::Error result);
 
     /**

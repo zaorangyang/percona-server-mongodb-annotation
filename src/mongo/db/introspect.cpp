@@ -41,6 +41,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -96,7 +97,7 @@ namespace {
         b.appendDate("ts", jsTime());
         b.append("client", txn->getClient()->clientAddress());
 
-        AuthorizationSession * authSession = txn->getClient()->getAuthorizationSession();
+        AuthorizationSession * authSession = AuthorizationSession::get(txn->getClient());
         _appendUserInfo(*txn->getCurOp(), b, authSession);
 
         const BSONObj p = b.done();
@@ -184,6 +185,9 @@ namespace {
         collectionOptions.cappedSize = 1024 * 1024;
 
         WriteUnitOfWork wunit(txn);
+        bool shouldReplicateWrites = txn->writesAreReplicated();
+        txn->setReplicatedWrites(false);
+        ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, txn, shouldReplicateWrites);
         invariant(db->createCollection(txn, dbProfilingNS, collectionOptions));
         wunit.commit();
 

@@ -154,7 +154,7 @@ namespace mongo {
         BSONObjBuilder& appendObject(StringData fieldName, const char * objdata , int size = 0 ) {
             verify( objdata );
             if ( size == 0 ) {
-                size = ConstDataView(objdata).readLE<int>();
+                size = ConstDataView(objdata).read<LittleEndian<int>>();
             }
 
             verify( size > 4 && size < 100000000 );
@@ -458,40 +458,16 @@ namespace mongo {
             return *this;
         }
 
-        // Append a Timestamp field -- will be updated to next OpTime on db insert.
-        BSONObjBuilder& appendTimestamp( StringData fieldName ) {
-            _b.appendNum( (char) Timestamp );
-            _b.appendStr( fieldName );
-            _b.appendNum( (unsigned long long) 0 );
-            return *this;
-        }
+        // Append a Timestamp field -- will be updated to next server Timestamp
+        BSONObjBuilder& appendTimestamp( StringData fieldName );
+
+        BSONObjBuilder& appendTimestamp( StringData fieldName , unsigned long long val );
 
         /**
-         * To store an OpTime in BSON, use this function.
+         * To store a Timestamp in BSON, use this function.
          * This captures both the secs and inc fields.
          */
-        BSONObjBuilder& append(StringData fieldName, OpTime optime);
-
-        /**
-         * Alternative way to store an OpTime in BSON. Pass the OpTime as a Date, as follows:
-         *
-         *     builder.appendTimestamp("field", optime.asDate());
-         *
-         * This captures both the secs and inc fields.
-         */
-        BSONObjBuilder& appendTimestamp( StringData fieldName , unsigned long long val ) {
-            _b.appendNum( (char) Timestamp );
-            _b.appendStr( fieldName );
-            _b.appendNum( val );
-            return *this;
-        }
-
-        /**
-        Timestamps are a special BSON datatype that is used internally for replication.
-        Append a timestamp element to the object being ebuilt.
-        @param time - in millis (but stored in seconds)
-        */
-        BSONObjBuilder& appendTimestamp( StringData fieldName , unsigned long long time , unsigned int inc );
+        BSONObjBuilder& append(StringData fieldName, Timestamp timestamp);
 
         /*
         Append an element of the deprecated DBRef type.
@@ -723,7 +699,7 @@ namespace mongo {
 
             char *data = _b.buf() + _offset;
             int size = _b.len() - _offset;
-            DataView(data).writeLE(size);
+            DataView(data).write(tagLittleEndian(size));
             if ( _tracker )
                 _tracker->got( size );
             return data;
@@ -795,11 +771,6 @@ namespace mongo {
         // These two just use next position
         BufBuilder &subobjStart() { return _b.subobjStart( num() ); }
         BufBuilder &subarrayStart() { return _b.subarrayStart( num() ); }
-
-        BSONArrayBuilder& appendTimestamp(unsigned int sec, unsigned int inc) {
-            _b.appendTimestamp(num(), sec, inc);
-            return *this;
-        }
 
         BSONArrayBuilder& appendRegex(StringData regex, StringData options = "") {
             _b.appendRegex(num(), regex, options);
@@ -933,5 +904,63 @@ namespace mongo {
     { return BSON( "$or" << BSON_ARRAY(a << b << c << d << e) ); }
     inline BSONObj OR(const BSONObj& a, const BSONObj& b, const BSONObj& c, const BSONObj& d, const BSONObj& e, const BSONObj& f)
     { return BSON( "$or" << BSON_ARRAY(a << b << c << d << e << f) ); }
+
+    inline BSONObjBuilder& BSONObjBuilderValueStream::operator<<(const DateNowLabeler& id) {
+        _builder->appendDate(_fieldName, jsTime());
+        _fieldName = StringData();
+        return *_builder;
+    }
+
+    inline BSONObjBuilder& BSONObjBuilderValueStream::operator<<(const NullLabeler& id) {
+        _builder->appendNull(_fieldName);
+        _fieldName = StringData();
+        return *_builder;
+    }
+
+    inline BSONObjBuilder& BSONObjBuilderValueStream::operator<<(const UndefinedLabeler& id) {
+        _builder->appendUndefined(_fieldName);
+        _fieldName = StringData();
+        return *_builder;
+    }
+
+
+    inline BSONObjBuilder& BSONObjBuilderValueStream::operator<<(const MinKeyLabeler& id) {
+        _builder->appendMinKey(_fieldName);
+        _fieldName = StringData();
+        return *_builder;
+    }
+
+    inline BSONObjBuilder& BSONObjBuilderValueStream::operator<<(const MaxKeyLabeler& id) {
+        _builder->appendMaxKey(_fieldName);
+        _fieldName = StringData();
+        return *_builder;
+    }
+
+    template<class T> inline
+    BSONObjBuilder& BSONObjBuilderValueStream::operator<<( T value ) {
+        _builder->append(_fieldName, value);
+        _fieldName = StringData();
+        return *_builder;
+    }
+
+    template<class T>
+    BSONObjBuilder& Labeler::operator<<( T value ) {
+        s_->subobj()->append( l_.l_, value );
+        return *s_->_builder;
+    }
+
+    inline BSONObjBuilder& BSONObjBuilder::append(StringData fieldName, Timestamp optime) {
+        optime.append(_b, fieldName);
+        return *this;
+    }
+
+    inline BSONObjBuilder& BSONObjBuilder::appendTimestamp( StringData fieldName ) {
+        return append(fieldName, Timestamp());
+    }
+
+    inline BSONObjBuilder& BSONObjBuilder::appendTimestamp( StringData fieldName,
+                                                            unsigned long long val ) {
+        return append(fieldName, Timestamp(val));
+    }
 
 }

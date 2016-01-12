@@ -7,14 +7,9 @@ Import("env")
 #
 
 env.Library('base', ['mongo_version_range.cpp',
-                     'type_actionlog.cpp',
-                     'type_chunk.cpp',
-                     'type_collection.cpp',
                      'type_database.cpp',
                      'type_locks.cpp',
                      'type_lockpings.cpp',
-                     'type_settings.cpp',
-                     'type_shard.cpp',
                      'type_config_version.cpp',
                      'type_mongos.cpp',
                      'type_tags.cpp'],
@@ -28,14 +23,6 @@ env.CppUnitTest('chunk_version_test', 'chunk_version_test.cpp',
 env.CppUnitTest('mongo_version_range_test', 'mongo_version_range_test.cpp', 
                 LIBDEPS=['base',
                          '$BUILD_DIR/mongo/bson',
-                         '$BUILD_DIR/mongo/db/common'])
-
-env.CppUnitTest('type_chunk_test', 'type_chunk_test.cpp',
-                LIBDEPS=['base',
-                         '$BUILD_DIR/mongo/db/common'])
-
-env.CppUnitTest('type_collection_test', 'type_collection_test.cpp',
-                LIBDEPS=['base',
                          '$BUILD_DIR/mongo/db/common'])
 
 env.CppUnitTest('type_config_version_test', 'type_config_version_test.cpp',
@@ -54,14 +41,6 @@ env.CppUnitTest('type_lockpings_test', 'type_lockpings_test.cpp',
                 LIBDEPS=['base',
                          '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_settings_test', 'type_settings_test.cpp',
-                LIBDEPS=['base',
-                         '$BUILD_DIR/mongo/db/common'])
-
-env.CppUnitTest('type_shard_test', 'type_shard_test.cpp',
-                LIBDEPS=['base',
-                         '$BUILD_DIR/mongo/db/common'])
-
 env.CppUnitTest('type_mongos_test', 'type_mongos_test.cpp',
                 LIBDEPS=['base',
                          '$BUILD_DIR/mongo/db/common'])
@@ -71,53 +50,43 @@ env.CppUnitTest('type_tags_test', 'type_tags_test.cpp',
                          '$BUILD_DIR/mongo/db/common'])
 
 #
-# Upgrade library for config database
-# Built only on 'mongocommon' because clientandshell pulls in 'defaultversion'
-#
-
-env.Library('upgrade', ['cluster_client_internal.cpp',
-                        'config_upgrade.cpp',
-                        'config_upgrade_helpers.cpp',
-                        'config_upgrade_v0_to_v7.cpp',
-                        'config_upgrade_v6_to_v7.cpp'],
-            LIBDEPS=['base',
-                     '$BUILD_DIR/mongo/mongocommon'])
-
-# TODO: config upgrade tests are currently in dbtests
-
-#
 # Support for maintaining persistent sharding state and data.
 #
 
-env.Library('metadata',
-            [
-                'collection_metadata.cpp',
-                'metadata_loader.cpp'
-            ],
-            LIBDEPS=[
-                'base',
-                '$BUILD_DIR/mongo/bson',
-                '$BUILD_DIR/mongo/base/base',
-                '$BUILD_DIR/mongo/clientdriver',
-                '$BUILD_DIR/mongo/range_arithmetic'
-            ])
+env.Library(
+    target='metadata',
+    source=[
+        'collection_metadata.cpp',
+        'metadata_loader.cpp',
+    ],
+    LIBDEPS=[
+        'base',
+        'catalog/catalog_types',
+        '$BUILD_DIR/mongo/bson',
+        '$BUILD_DIR/mongo/base/base',
+        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/db/range_arithmetic',
+    ]
+)
 
-env.CppUnitTest('chunk_diff_test',
-                'chunk_diff_test.cpp',
-                LIBDEPS=['metadata',
-                         '$BUILD_DIR/mongo/db/common'])
-
-env.CppUnitTest('collection_metadata_test',
-                'collection_metadata_test.cpp',
-                LIBDEPS=['metadata',
-                         '$BUILD_DIR/mongo/mocklib',
-                         '$BUILD_DIR/mongo/db/common'])
-
-env.CppUnitTest('metadata_loader_test',
-                'metadata_loader_test.cpp',
-                LIBDEPS=['metadata',
-                         '$BUILD_DIR/mongo/mocklib',
-                         '$BUILD_DIR/mongo/db/common'])
+env.CppUnitTest(
+    target='metadata_test',
+    source=[
+        'chunk_diff_test.cpp',
+        'metadata_loader_test.cpp',
+        'collection_metadata_test.cpp',
+    ],
+    LIBDEPS=[
+        'catalog/legacy/catalog_manager_legacy',
+        'metadata',
+        '$BUILD_DIR/mongo/coredb',
+        '$BUILD_DIR/mongo/coreserver',
+        '$BUILD_DIR/mongo/coreshard',
+        '$BUILD_DIR/mongo/mocklib',
+        '$BUILD_DIR/mongo/mongocommon',
+        '$BUILD_DIR/mongo/mongoscore',
+        '$BUILD_DIR/mongo/db/common',
+    ])
 
 #
 # Write Operations
@@ -173,13 +142,12 @@ env.Library(
         'write_ops/write_op.cpp',
         'write_ops/batch_write_op.cpp',
         'write_ops/batch_write_exec.cpp',
-        'multi_host_query.cpp'
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/bson',
-        '$BUILD_DIR/mongo/clientdriver',
+        '$BUILD_DIR/mongo/client/clientdriver',
         'batch_write_types',
-        '$BUILD_DIR/mongo/synchronization'
+        '$BUILD_DIR/mongo/util/concurrency/synchronization'
     ],
 )
 
@@ -193,21 +161,8 @@ env.CppUnitTest(
     LIBDEPS=[
         'cluster_ops',
         '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/range_arithmetic',
+        '$BUILD_DIR/mongo/db/range_arithmetic',
     ]
-)
-
-env.CppUnitTest(
-    target='multi_host_query_test',
-    source=[
-        'multi_host_query_test.cpp',
-    ],
-    LIBDEPS=[
-        'base',
-        'cluster_ops',
-        '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/clientdriver',
-    ],
 )
 
 # Upconvert/Downconvert write functionality for mongos
@@ -234,8 +189,7 @@ env.CppUnitTest(
         'cluster_ops',
         'cluster_write_op_conversion',
         '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/server_options', # DbMessage needs server options
-        "$BUILD_DIR/mongo/clientdriver",
+        '$BUILD_DIR/mongo/client/clientdriver',
     ]
 )
 
@@ -252,11 +206,9 @@ env.Library(
         'cluster_explain.cpp',
         'cluster_write.cpp',
         'dbclient_shard_resolver.cpp',
-        'scc_fast_query_handler.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/bson',
-        '$BUILD_DIR/mongo/s/catalog/legacy/catalog_manager_legacy',
         '$BUILD_DIR/mongo/s/client/sharding_client',
         'cluster_ops',
         'cluster_write_op_conversion',
@@ -275,5 +227,17 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/mongocommon',
         '$BUILD_DIR/mongo/mongoscore',
     ]
+)
+
+env.Library(
+    target='dist_lock',
+    source=[
+        'dist_lock_manager.cpp',
+        'legacy_dist_lock_manager.cpp',
+        'legacy_dist_lock_pinger.cpp',
+    ],
+    LIBDEPS=[
+        'base',
+    ],
 )
 

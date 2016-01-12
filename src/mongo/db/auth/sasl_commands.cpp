@@ -74,8 +74,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& ignored,
-                         BSONObjBuilder& result,
-                         bool fromRepl);
+                         BSONObjBuilder& result);
 
         virtual void help(stringstream& help) const;
         virtual bool isWriteCommandForConfigServer() const { return false; }
@@ -97,8 +96,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& ignored,
-                         BSONObjBuilder& result,
-                         bool fromRepl);
+                         BSONObjBuilder& result);
 
         virtual void help(stringstream& help) const;
         virtual bool isWriteCommandForConfigServer() const { return false; }
@@ -273,11 +271,10 @@ namespace {
                            BSONObj& cmdObj,
                            int options,
                            std::string& ignored,
-                           BSONObjBuilder& result,
-                           bool fromRepl) {
+                           BSONObjBuilder& result) {
 
         ClientBasic* client = ClientBasic::getCurrent();
-        client->resetAuthenticationSession(NULL);
+        AuthenticationSession::set(client, std::unique_ptr<AuthenticationSession>());
 
         std::string mechanism;
         if (!extractMechanism(cmdObj, &mechanism).isOK()) {
@@ -285,9 +282,9 @@ namespace {
         }
 
         SaslAuthenticationSession* session =
-            SaslAuthenticationSession::create(client->getAuthorizationSession(), mechanism);
+            SaslAuthenticationSession::create(AuthorizationSession::get(client), mechanism);
 
-        boost::scoped_ptr<AuthenticationSession> sessionGuard(session);
+        std::unique_ptr<AuthenticationSession> sessionGuard(session);
 
         session->setOpCtxt(txn);
 
@@ -302,7 +299,7 @@ namespace {
                     status.code());
         }
         else {
-            client->swapAuthenticationSession(sessionGuard);
+            AuthenticationSession::swap(client, sessionGuard);
         }
         return status.isOK();
     }
@@ -319,12 +316,11 @@ namespace {
                               BSONObj& cmdObj,
                               int options,
                               std::string& ignored,
-                              BSONObjBuilder& result,
-                              bool fromRepl) {
+                              BSONObjBuilder& result) {
 
         ClientBasic* client = ClientBasic::getCurrent();
-        boost::scoped_ptr<AuthenticationSession> sessionGuard(NULL);
-        client->swapAuthenticationSession(sessionGuard);
+        std::unique_ptr<AuthenticationSession> sessionGuard;
+        AuthenticationSession::swap(client, sessionGuard);
 
         if (!sessionGuard || sessionGuard->getType() != AuthenticationSession::SESSION_TYPE_SASL) {
             addStatus(Status(ErrorCodes::ProtocolError, "No SASL session state found"), &result);
@@ -356,7 +352,7 @@ namespace {
                     status.code());
         }
         else {
-            client->swapAuthenticationSession(sessionGuard);
+            AuthenticationSession::swap(client, sessionGuard);
         }
 
         return status.isOK();

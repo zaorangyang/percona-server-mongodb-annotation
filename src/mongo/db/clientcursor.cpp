@@ -44,9 +44,9 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/util/exit.h"
@@ -181,15 +181,15 @@ namespace mongo {
         _idleAgeMillis = millis;
     }
 
-    void ClientCursor::updateSlaveLocation(OperationContext* txn, CurOp& curop) {
+    void ClientCursor::updateSlaveLocation(OperationContext* txn) {
         if (_slaveReadTill.isNull())
             return;
 
         verify(str::startsWith(_ns.c_str(), "local.oplog."));
 
-        Client* c = curop.getClient();
+        Client* c = txn->getClient();
         verify(c);
-        OID rid = c->getRemoteID();
+        OID rid = repl::ReplClientInfo::forClient(c).getRemoteID();
         if (!rid.isSet())
             return;
 
@@ -290,7 +290,6 @@ namespace mongo {
 
         void run() {
             Client::initThread("clientcursormon");
-            Client& client = cc();
             Timer t;
             const int Secs = 4;
             while (!inShutdown()) {
@@ -299,7 +298,6 @@ namespace mongo {
                     CursorManager::timeoutCursorsGlobal(&txn, t.millisReset()));
                 sleepsecs(Secs);
             }
-            client.shutdown();
         }
     };
 
@@ -339,8 +337,12 @@ namespace mongo {
             actions.addAction(ActionType::cursorInfo);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result,
-                 bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& jsobj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             _appendCursorStats( result );
             return true;
         }

@@ -25,9 +25,10 @@ env.Library(
         "index_bounds",
         "lite_parsed_query",
         "$BUILD_DIR/mongo/bson",
-        "$BUILD_DIR/mongo/expressions",
-        "$BUILD_DIR/mongo/expressions_text",
-        "$BUILD_DIR/mongo/index_names",
+        "$BUILD_DIR/mongo/db/matcher/expression_algo",
+        "$BUILD_DIR/mongo/db/matcher/expressions",
+        "$BUILD_DIR/mongo/db/matcher/expressions_text",
+        "$BUILD_DIR/mongo/db/index_names",
         "$BUILD_DIR/mongo/server_parameters",
     ],
 )
@@ -45,6 +46,7 @@ env.Library(
         "stage_builder.cpp",
     ],
     LIBDEPS=[
+        "internal_plans",
         "query_planner",
         "query_planner_test_lib",
         "$BUILD_DIR/mongo/db/exec/exec"
@@ -78,9 +80,9 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/bson",
-        "$BUILD_DIR/mongo/expressions_geo",
-        "$BUILD_DIR/mongo/index_names",
-        "$BUILD_DIR/mongo/mongohasher",
+        "$BUILD_DIR/mongo/db/matcher/expressions_geo",
+        "$BUILD_DIR/mongo/db/index_names",
+        "$BUILD_DIR/mongo/db/mongohasher",
         "$BUILD_DIR/mongo/server_parameters",
     ],
 )
@@ -116,12 +118,32 @@ env.CppUnitTest(
 )
 
 env.Library(
+    target="internal_plans",
+    source=[
+        "internal_plans.cpp"
+    ],
+    LIBDEPS=[
+    ],
+)
+
+env.Library(
     target="lite_parsed_query",
     source=[
         "lite_parsed_query.cpp"
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/bson",
+    ],
+)
+
+env.Library(
+    target="query_planner_test_fixture",
+    source=[
+        "query_planner_test_fixture.cpp",
+    ],
+    LIBDEPS=[
+        "query_planner_test_lib",
+        "$BUILD_DIR/mongo/unittest/unittest",
     ],
 )
 
@@ -142,7 +164,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "query_planner",
-        "$BUILD_DIR/mongo/expressions_text",
+        "$BUILD_DIR/mongo/db/matcher/expressions_text",
     ],
 )
 
@@ -211,7 +233,7 @@ env.CppUnitTest(
         "plan_cache_test.cpp"
     ],
     LIBDEPS=[
-        "query_planner_test_lib",
+        "query_planner_test_fixture",
     ],
 )
 
@@ -241,7 +263,27 @@ env.CppUnitTest(
         "query_planner_test.cpp"
     ],
     LIBDEPS=[
-        "query_planner_test_lib",
+        "query_planner_test_fixture",
+    ],
+)
+
+env.CppUnitTest(
+    target="query_planner_array_test",
+    source=[
+        "query_planner_array_test.cpp"
+    ],
+    LIBDEPS=[
+        "query_planner_test_fixture",
+    ],
+)
+
+env.CppUnitTest(
+    target="query_planner_geo_test",
+    source=[
+        "query_planner_geo_test.cpp"
+    ],
+    LIBDEPS=[
+        "query_planner_test_fixture",
     ],
 )
 
@@ -253,7 +295,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "query",
-        "query_planner_test_lib",
+        "query_planner_test_fixture",
         "$BUILD_DIR/mongo/serveronly",
         "$BUILD_DIR/mongo/coreserver",
         "$BUILD_DIR/mongo/coredb",

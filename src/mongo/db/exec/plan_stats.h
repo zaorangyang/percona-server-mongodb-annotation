@@ -364,7 +364,6 @@ namespace mongo {
         IndexScanStats() : indexVersion(0),
                            direction(1),
                            isMultiKey(false),
-                           yieldMovedCursor(0),
                            dupsTested(0),
                            dupsDropped(0),
                            seenInvalidated(0),
@@ -402,7 +401,6 @@ namespace mongo {
         // Whether this index is over a field that contain array values.
         bool isMultiKey;
 
-        size_t yieldMovedCursor;
         size_t dupsTested;
         size_t dupsDropped;
 
@@ -636,13 +634,6 @@ namespace mongo {
 
         // The object that was inserted. This is an empty document if no insert was performed.
         BSONObj objInserted;
-
-        // The document resulting from the update (or the document inserted for an upsert). This is
-        // an empty document if no existing doc was modified and no insert happened, or if this is
-        // a multi-update.
-        //
-        // Only set if requested via UpdateRequest::setStoreResultDoc().
-        BSONObj newObj;
 
         // Invalidated documents can be force-fetched, causing the now invalid RecordId to
         // be thrown out. The update stage skips over any results which do not have the

@@ -1,169 +1,177 @@
-var myShardingTest = new ShardingTest("sharding_passthrough", 2, 0, 1);
-myShardingTest.adminCommand({ enablesharding : "test" });
+var db;
 
-var db = myShardingTest.getDB("test");
-db.getMongo().forceWriteMode("commands");
-_useWriteCommandsDefault = function() { return true; }; // for tests launching parallel shells.
+(function() {
+     "use strict"
 
-var res = db.adminCommand({ setParameter: 1, useClusterWriteCommands: true });
-var files = listFiles("jstests/core");
+     var myShardingTest = new ShardingTest("sharding_passthrough", 1, 0, 1);
+     myShardingTest.adminCommand({ enablesharding : "test" });
 
-var runnerStart = new Date();
+     db = myShardingTest.getDB("test");
+     db.getMongo().forceWriteMode("commands");
+     _useWriteCommandsDefault = function() { return true; }; // for tests launching parallel shells.
 
-files.forEach(function(x) {
-    if (/[\/\\]_/.test(x.name) || ! /\.js$/.test(x.name)) {
-        print(" >>>>>>>>>>>>>>> skipping " + x.name);
-        return;
-    }
+     var res = db.adminCommand({ setParameter: 1, useClusterWriteCommands: true });
+     var files = listFiles("jstests/core");
 
-    // Notes:
+     var runnerStart = new Date();
 
-    // apply_ops1, apply_ops2: nothing works, dunno why yet. SERVER-1439.
+     files.forEach(
+         function(x) {
+             if (/[\/\\]_/.test(x.name) || ! /\.js$/.test(x.name)) {
+                 print(" >>>>>>>>>>>>>>> skipping " + x.name);
+                 return;
+             }
 
-    // copydb, copydb2: copyDatabase seems not to work at all in
-    //                  the ShardingTest setup.  SERVER-1440.
+             // Notes:
 
-    // cursor8: cursorInfo different/meaningless(?) in mongos.
-    //          deal with cursorInfo in mongos SERVER-1442.
+             // apply_ops1, apply_ops2: nothing works, dunno why yet. SERVER-1439.
 
-    // dbcase: Database names are case-insensitive under ShardingTest?
-    //         SERVER-1443.
+             // copydb, copydb2: copyDatabase seems not to work at all in
+             //                  the ShardingTest setup.  SERVER-1440.
 
-    // These are all SERVER-1444
-    // count5: limit() and maybe skip() may be unreliable.
-    // geo3: limit() not working, I think.
-    // or4: skip() not working?
+             // cursor8: cursorInfo different/meaningless(?) in mongos.
+             //          deal with cursorInfo in mongos SERVER-1442.
 
-    // shellkillop: dunno yet.  SERVER-1445
+             // dbcase: Database names are case-insensitive under ShardingTest?
+             //         SERVER-1443.
 
-    // update_setOnInsert: db.setPrifilingLevel is not working. SERVER-8653
+             // These are all SERVER-1444
+             // count5: limit() and maybe skip() may be unreliable.
+             // geo3: limit() not working, I think.
+             // or4: skip() not working?
 
-    // These should simply not be run under sharding:
-    // dbadmin: Uncertain  Cut-n-pasting its contents into mongo worked.
-    // error1: getpreverror not supported under sharding.
-    // fsync, fsync2: isn't supported through mongos.
-    // remove5: getpreverror, I think. don't run.
-    // update4: getpreverror don't run.
+             // shellkillop: dunno yet.  SERVER-1445
 
-    // Around July 20, command passthrough went away, and these
-    // commands weren't implemented:
-    // clean cloneCollectionAsCapped copydbgetnonce dataSize
-    // datasize dbstats deleteIndexes dropIndexes forceerror
-    // getnonce logout medianKey profile reIndex repairDatabase
-    // reseterror splitVector validate top
+             // update_setOnInsert: db.setPrifilingLevel is not working. SERVER-8653
 
-    /* missing commands :
-     * forceerror and switchtoclienterrors
-     * cloneCollectionAsCapped
-     * splitvector
-     * profile (apitest_db, cursor6, evalb)
-     * copydbgetnonce
-     * dbhash
-     * medianKey
-     * logout and getnonce
-     */
+             // These should simply not be run under sharding:
+             // dbadmin: Uncertain  Cut-n-pasting its contents into mongo worked.
+             // error1: getpreverror not supported under sharding.
+             // fsync, fsync2: isn't supported through mongos.
+             // remove5: getpreverror, I think. don't run.
+             // update4: getpreverror don't run.
 
-    var failsInShardingPattern = new RegExp('[\\/\\\\](' +
-        'error3|' +
-        'capped.*|' +
-        'apitest_db|' +
-        'cursor6|' +
-        'copydb-auth|' +
-        'profile\\d*|' +
-        'dbhash|' +
-        'dbhash2|' +
-        'median|' +
-        'evalb|' +
-        'evald|' +
-        'eval_nolock|' +
-        'auth1|' +
-        'auth2|' +
-        'dropdb_race|' +
-        'unix_socket\\d*' +
-        ')\.js$');
+             // Around July 20, command passthrough went away, and these
+             // commands weren't implemented:
+             // clean cloneCollectionAsCapped copydbgetnonce dataSize
+             // datasize dbstats deleteIndexes dropIndexes forceerror
+             // getnonce logout medianKey profile reIndex repairDatabase
+             // reseterror splitVector validate top
 
-    // These are bugs (some might be fixed now):
-    var mightBeFixedPattern = new RegExp('[\\/\\\\](' +
-        'apply_ops[12]|' +
-        'count5|' +
-        'cursor8|' +
-        'or4|' +
-        'shellkillop|' +
-        'update4|' +
-        'update_setOnInsert|' +
-        'profile\\d*|' +
-        'max_time_ms|' + // Will be fixed when SERVER-2212 is resolved.
-        'fts_querylang|' + // Will be fixed when SERVER-9063 is resolved.
-        'fts_projection' +
-        ')\.js$');
+             /* missing commands :
+              * forceerror and switchtoclienterrors
+              * cloneCollectionAsCapped
+              * splitvector
+              * profile (apitest_db, cursor6, evalb)
+              * copydbgetnonce
+              * dbhash
+              * medianKey
+              * logout and getnonce
+              */
 
-    // These aren't supposed to get run under sharding:
-    var notForShardingPattern = new RegExp('[\\/\\\\](' +
-        'dbadmin|' +
-        'error1|' +
-        'fsync|' +
-        'fsync2|' +
-        'geo.*|' +
-        'indexh|' +
-        'index_bigkeys_nofail|' +
-        'remove5|' +
-        'update4|' +
-        'loglong|' +
-        'logpath|' +
-        'notablescan|' +
-        'collection_truncate|' + // relies on emptycapped test command which isn't in mongos
-        'compact.*|' +
-        'check_shard_index|' +
-        'bench_test.*|' +
-        'mr_replaceIntoDB|' +
-        'mr_auth|' +
-        'queryoptimizera|' +
-        'indexStatsCommand|' +
-        'storageDetailsCommand|' +
-        'reversecursor|' +
-        'stages.*|' +
-        'top|' +
-        'repair_cursor1|' +
-        'touch1|' +
-        'query_oplogreplay|' + // no local db on mongos
-        'dbcase|' + // undo after fixing SERVER-11735
-        'dbcase2|' + // undo after fixing SERVER-11735
-        'stats' + // tests db.stats().dataFileVersion, which doesn't appear in sharded db.stats()
-        ')\.js$');
+             var failsInShardingPattern = new RegExp('[\\/\\\\](' +
+                                                     'error3|' +
+                                                     'capped.*|' +
+                                                     'apitest_db|' +
+                                                     'cursor6|' +
+                                                     'copydb-auth|' +
+                                                     'profile\\d*|' +
+                                                     'dbhash|' +
+                                                     'dbhash2|' +
+                                                     'explain_missing_database|' +
+                                                     'median|' +
+                                                     'evalb|' +
+                                                     'evald|' +
+                                                     'eval_nolock|' +
+                                                     'auth1|' +
+                                                     'auth2|' +
+                                                     'dropdb_race|' +
+                                                     'unix_socket\\d*' +
+                                                     ')\.js$');
 
-    if (failsInShardingPattern.test(x.name)) {
-        print(" >>>>>>>>>>>>>>> skipping test that would correctly fail under sharding: " + x.name);
-        return;
-    }
+             // These are bugs (some might be fixed now):
+             var mightBeFixedPattern = new RegExp('[\\/\\\\](' +
+                                                  'apply_ops[12]|' +
+                                                  'count5|' +
+                                                  'cursor8|' +
+                                                  'or4|' +
+                                                  'shellkillop|' +
+                                                  'update4|' +
+                                                  'update_setOnInsert|' +
+                                                  'profile\\d*|' +
+                                                  'max_time_ms|' + // Will be fixed when SERVER-2212 is resolved.
+                                                  'fts_querylang|' + // Will be fixed when SERVER-9063 is resolved.
+                                                  'fts_projection' +
+                                                  ')\.js$');
 
-    if (mightBeFixedPattern.test(x.name)) {
-        print(" !!!!!!!!!!!!!!! skipping test that has failed under sharding: " +
-              "but might not anymore " + x.name);
-        return;
-    }
+             // These aren't supposed to get run under sharding:
+             var notForShardingPattern = new RegExp('[\\/\\\\](' +
+                                                    'dbadmin|' +
+                                                    'error1|' +
+                                                    'fsync|' +
+                                                    'fsync2|' +
+                                                    'geo.*|' +
+                                                    'indexh|' +
+                                                    'index_bigkeys_nofail|' +
+                                                    'remove5|' +
+                                                    'update4|' +
+                                                    'loglong|' +
+                                                    'logpath|' +
+                                                    'notablescan|' +
+                                                    'collection_truncate|' + // relies on emptycapped test command which isn't in mongos
+                                                    'compact.*|' +
+                                                    'check_shard_index|' +
+                                                    'bench_test.*|' +
+                                                    'mr_replaceIntoDB|' +
+                                                    'mr_auth|' +
+                                                    'queryoptimizera|' +
+                                                    'indexStatsCommand|' +
+                                                    'storageDetailsCommand|' +
+                                                    'reversecursor|' +
+                                                    'stages.*|' +
+                                                    'top|' +
+                                                    'repair_cursor1|' +
+                                                    'touch1|' +
+                                                    'query_oplogreplay|' + // no local db on mongos
+                                                    'dbcase|' + // undo after fixing SERVER-11735
+                                                    'dbcase2|' + // undo after fixing SERVER-11735
+                                                    'stats' + // tests db.stats().dataFileVersion, which doesn't appear in sharded db.stats()
+                                                    ')\.js$');
 
-    if (notForShardingPattern.test(x.name)) {
-        print(" !!!!!!!!!!!!!!! skipping test that should not run under sharding: " + x.name);
-        return;
-    }
+             if (failsInShardingPattern.test(x.name)) {
+                 print(" >>>>>>>>>>>>>>> skipping test that would correctly fail under sharding: " + x.name);
+                 return;
+             }
 
-    print(" *******************************************");
-    print("         Test : " + x.name + " ...");
-    print("                " +
-        Date.timeFunc(function() {
-            load(x.name);
-        }, 1) + "ms");
+             if (mightBeFixedPattern.test(x.name)) {
+                 print(" !!!!!!!!!!!!!!! skipping test that has failed under sharding: " +
+                       "but might not anymore " + x.name);
+                 return;
+             }
 
-    gc(); // TODO SERVER-8683: remove gc() calls once resolved
-    
-    // Reset "db" variable, just in case someone broke the rules and used it themselves 
-    db = myShardingTest.getDB("test");
-});
+             if (notForShardingPattern.test(x.name)) {
+                 print(" !!!!!!!!!!!!!!! skipping test that should not run under sharding: " + x.name);
+                 return;
+             }
+
+             print(" *******************************************");
+             print("         Test : " + x.name + " ...");
+             print("                " +
+                   Date.timeFunc(function() {
+                                     load(x.name);
+                                 }, 1) + "ms");
+
+             gc(); // TODO SERVER-8683: remove gc() calls once resolved
+             
+             // Reset "db" variable, just in case someone broke the rules and used it themselves 
+             db = myShardingTest.getDB("test");
+         });
 
 
-myShardingTest.stop();
+     myShardingTest.stop();
 
-var runnerEnd = new Date();
+     var runnerEnd = new Date();
 
-print("total runner time: " + ((runnerEnd.getTime() - runnerStart.getTime()) / 1000) + "secs");
+     print("total runner time: " + ((runnerEnd.getTime() - runnerStart.getTime()) / 1000) + "secs");
 
+}());

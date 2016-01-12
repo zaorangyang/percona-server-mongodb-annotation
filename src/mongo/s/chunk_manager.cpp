@@ -35,16 +35,17 @@
 #include <map>
 #include <set>
 
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/chunk_diff.h"
 #include "mongo/s/client/shard_connection.h"
-#include "mongo/s/cluster_write.h"
-#include "mongo/s/distlock.h"
+#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/type_collection.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
@@ -124,31 +125,17 @@ namespace {
         //
     }
 
-    ChunkManager::ChunkManager( const BSONObj& collDoc ) :
-        // Need the ns early, to construct the lock
-        // TODO: Construct lock on demand?  Not sure why we need to keep it around
-        _ns(collDoc[CollectionType::ns()].type() == String ?
-                                                        collDoc[CollectionType::ns()].String() :
-                                                        ""),
-        _keyPattern(collDoc[CollectionType::keyPattern()].type() == Object ?
-                                                        collDoc[CollectionType::keyPattern()].Obj().getOwned() :
-                                                        BSONObj()),
-        _unique(collDoc[CollectionType::unique()].trueValue()),
-        _chunkRanges(),
-        // The shard versioning mechanism hinges on keeping track of the number of times we reloaded ChunkManager's.
-        // Increasing this number here will prompt checkShardVersion() to refresh the connection-level versions to
-        // the most up to date value.
-        _sequenceNumber(NextSequenceNumber.addAndFetch(1))
-    {
+    ChunkManager::ChunkManager(const CollectionType& coll)
+        : _ns(coll.getNs()),
+          _keyPattern(coll.getKeyPattern()),
+          _unique(coll.getUnique()),
+          _chunkRanges(),
+          // The shard versioning mechanism hinges on keeping track of the number of times we
+          // reload ChunkManagers. Increasing this number here will prompt checkShardVersion to
+          // refresh the connection-level versions to the most up to date value.
+          _sequenceNumber(NextSequenceNumber.addAndFetch(1)) {
 
-        //
-        // Sets up a chunk manager from an existing sharded collection document
-        //
-
-        verify( _ns != ""  );
-        verify( ! _keyPattern.toBSON().isEmpty() );
-
-        _version = ChunkVersion::fromBSON( collDoc );
+        _version = ChunkVersion::fromBSON(coll.toBSON());
     }
 
     void ChunkManager::loadExistingRanges( const string& config, const ChunkManager* oldManager ) {
@@ -309,7 +296,11 @@ namespace {
     }
 
     ChunkManagerPtr ChunkManager::reload(bool force) const {
-        return grid.getDBConfig(getns())->getChunkManager(getns(), force);
+        const NamespaceString nss(_ns);
+        auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+        shared_ptr<DBConfig> config = uassertStatusOK(status);
+
+        return config->getChunkManager(getns(), force);
     }
 
     bool ChunkManager::_isValid(const ChunkMap& chunkMap) {
@@ -670,104 +661,6 @@ namespace {
         return other.getVersion(shardName).equals(getVersion(shardName));
     }
 
-    void ChunkManager::drop() const {
-        boost::lock_guard<boost::mutex> lk(_mutex);
-
-        grid.catalogManager()->logChange(NULL,
-                                         "dropCollection.start",
-                                         _ns,
-                                         BSONObj());
-
-        ScopedDistributedLock nsLock(configServer.getConnectionString(), _ns);
-        nsLock.setLockMessage("drop");
-
-        Status lockStatus = nsLock.tryAcquire();
-        if (!lockStatus.isOK()) {
-            uasserted(14022, str::stream() << "Error locking distributed lock for chunk drop"
-                                           << causedBy(lockStatus));
-        }
-
-        uassert(10174, "config servers not all up", configServer.allUp(false));
-
-        set<Shard> seen;
-
-        LOG(1) << "ChunkManager::drop : " << _ns ;
-
-        // lock all shards so no one can do a split/migrate
-        for ( ChunkMap::const_iterator i=_chunkMap.begin(); i!=_chunkMap.end(); ++i ) {
-            ChunkPtr c = i->second;
-            seen.insert( c->getShard() );
-        }
-
-        LOG(1) << "ChunkManager::drop : " << _ns << "\t all locked";
-
-        map<string,BSONObj> errors;
-        // delete data from mongod
-        for ( set<Shard>::iterator i=seen.begin(); i!=seen.end(); i++ ) {
-            ScopedDbConnection conn(i->getConnString());
-            BSONObj info;
-            if ( !conn->dropCollection( _ns, &info ) ) {
-                errors[ i->getConnString() ] = info;
-            }
-            conn.done();
-        }
-        if ( !errors.empty() ) {
-            StringBuilder sb;
-            sb << "Dropping collection failed on the following hosts: ";
-
-            for (map<string, BSONObj>::const_iterator it = errors.begin(); it != errors.end();) {
-                sb << it->first << ": " << it->second;
-                ++it;
-                if (it != errors.end()) {
-                    sb << ", ";
-                }
-            }
-
-            uasserted(16338, sb.str());
-        }
-
-        LOG(1) << "ChunkManager::drop : " << _ns << "\t removed shard data";
-
-        // remove chunk data
-        Status result = grid.catalogManager()->remove(ChunkType::ConfigNS,
-                                                      BSON(ChunkType::ns(_ns)),
-                                                      0,
-                                                      NULL);
-        if (!result.isOK()) {
-            uasserted(17001,
-                      str::stream() << "could not drop chunks for " << _ns
-                                    << ": " << result.reason());
-        }
-
-        LOG(1) << "ChunkManager::drop : " << _ns << "\t removed chunk data";
-
-        for ( set<Shard>::iterator i=seen.begin(); i!=seen.end(); i++ ) {
-            ScopedDbConnection conn(i->getConnString());
-            BSONObj res;
-
-            // this is horrible
-            // we need a special command for dropping on the d side
-            // this hack works for the moment
-
-            if (!setShardVersion(conn.conn(),
-                                 _ns,
-                                 configServer.modelServer(),
-                                 ChunkVersion(0, 0, OID()),
-                                 NULL,
-                                 true,
-                                 res)) {
-
-                uasserted(8071, str::stream() << "cleaning up after drop failed: " << res);
-            }
-
-            conn->simpleCommand( "admin", 0, "unsetSharding" );
-            conn.done();
-        }
-
-        LOG(1) << "ChunkManager::drop : " << _ns << "\t DONE";
-        grid.catalogManager()->logChange(NULL, "dropCollection", _ns, BSONObj());
-    }
-
     ChunkVersion ChunkManager::getVersion(const std::string& shardName) const {
         ShardVersionMap::const_iterator i = _shardVersions.find(shardName);
         if ( i == _shardVersions.end() ) {
@@ -782,12 +675,6 @@ namespace {
 
     ChunkVersion ChunkManager::getVersion() const {
         return _version;
-    }
-
-    void ChunkManager::getInfo( BSONObjBuilder& b ) const {
-        b.append(CollectionType::keyPattern(), _keyPattern.toBSON());
-        b.appendBool(CollectionType::unique(), _unique);
-        _version.addEpochToBSON(b, CollectionType::DEPRECATED_lastmod());
     }
 
     string ChunkManager::toString() const {

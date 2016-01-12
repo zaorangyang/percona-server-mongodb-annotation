@@ -33,10 +33,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
-#include "mongo/db/curop.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/util/log.h"
@@ -65,7 +66,12 @@ namespace mongo {
             help << "reset error state (used with getpreverror)";
         }
         CmdResetError() : Command("resetError", false, "reseterror") {}
-        bool run(OperationContext* txn, const string& db, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string& db,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             LastError *le = lastError.get();
             verify( le );
             le->reset();
@@ -96,8 +102,7 @@ namespace mongo {
                   BSONObj& cmdObj,
                   int,
                   string& errmsg,
-                  BSONObjBuilder& result,
-                  bool fromRepl ) {
+                  BSONObjBuilder& result) {
 
             //
             // Correct behavior here is very finicky.
@@ -127,13 +132,19 @@ namespace mongo {
 
             // Always append lastOp and connectionId
             Client& c = *txn->getClient();
-            c.appendLastOp( result );
+            if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
+                repl::ReplicationCoordinator::modeReplSet) {
+                const Timestamp lastOp = repl::ReplClientInfo::forClient(c).getLastOp();
+                if (!lastOp.isNull()) {
+                    result.append("lastOp", lastOp);
+                }
+            }
 
             // for sharding; also useful in general for debugging
             result.appendNumber( "connectionId" , c.getConnectionId() );
 
-            OpTime lastOpTime;
-            BSONField<OpTime> wOpTimeField("wOpTime");
+            Timestamp lastOpTime;
+            BSONField<Timestamp> wOpTimeField("wOpTime");
             FieldParser::FieldState extracted = FieldParser::extract(cmdObj, wOpTimeField, 
                                                                      &lastOpTime, &errmsg);
             if (!extracted) {
@@ -144,7 +155,7 @@ namespace mongo {
             bool lastOpTimePresent = extracted != FieldParser::FIELD_NONE;
             if (!lastOpTimePresent) {
                 // Use the client opTime if no wOpTime is specified
-                lastOpTime = c.getLastOp();
+                lastOpTime = repl::ReplClientInfo::forClient(c).getLastOp();
             }
             
             OID electionId;
@@ -164,7 +175,6 @@ namespace mongo {
             if ( !lastOpTimePresent ) {
                 if ( le->nPrev != 1 ) {
                     errorOccurred = LastError::noError.appendSelf( result, false );
-                    le->appendSelfStatus( result );
                 }
                 else {
                     errorOccurred = le->appendSelf( result, false );
@@ -268,7 +278,12 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
         CmdGetPrevError() : Command("getPrevError", false, "getpreverror") {}
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             LastError *le = lastError.disableForCommand();
             le->appendSelf( result );
             if ( le->valid )

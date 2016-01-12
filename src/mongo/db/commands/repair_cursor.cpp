@@ -34,6 +34,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/cursor_responses.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/multi_iterator.h"
 
@@ -54,14 +55,17 @@ namespace mongo {
             ActionSet actions;
             actions.addAction(ActionType::find);
             Privilege p(parseResourcePattern(dbname, cmdObj), actions);
-            if (client->getAuthorizationSession()->isAuthorizedForPrivilege(p))
+            if (AuthorizationSession::get(client)->isAuthorizedForPrivilege(p))
                 return Status::OK();
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
-        virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int options,
-                          string& errmsg, BSONObjBuilder& result,
-                          bool fromRepl = false ) {
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int options,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
 
             NamespaceString ns(parseNs(dbname, cmdObj));
 

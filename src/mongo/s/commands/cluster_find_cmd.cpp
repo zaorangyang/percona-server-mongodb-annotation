@@ -72,7 +72,7 @@ namespace mongo {
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
 
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
             if (authzSession->isAuthorizedForActionsOnResource(pattern, ActionType::find)) {
@@ -127,8 +127,7 @@ namespace mongo {
                          const std::string& dbname,
                          BSONObj& cmdObj, int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             // Currently only explains of finds run through the find command. Queries that are not
             // explained use the legacy OP_QUERY path.
