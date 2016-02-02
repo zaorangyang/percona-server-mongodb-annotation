@@ -432,6 +432,8 @@ Status Database::renameCollection(OperationContext* txn,
                                   bool stayTemp) {
     audit::logRenameCollection(currentClient.get(), fromNS, toNS);
     invariant(txn->lockState()->isDbLockedForMode(name(), MODE_X));
+    BackgroundOperation::assertNoBgOpInProgForNs(fromNS);
+    BackgroundOperation::assertNoBgOpInProgForNs(toNS);
 
     {  // remove anything cached
         Collection* coll = getCollection(fromNS);
@@ -487,6 +489,7 @@ Collection* Database::createCollection(OperationContext* txn,
 
     NamespaceString nss(ns);
     uassert(17316, "cannot create a blank collection", nss.coll() > 0);
+    uassert(28838, "cannot create a non-capped oplog collection", options.capped || !nss.isOplog());
 
     audit::logCreateCollection(currentClient.get(), ns);
 

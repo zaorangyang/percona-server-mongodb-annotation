@@ -38,6 +38,7 @@
 #include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclient_rs.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/shard.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -78,7 +79,7 @@ class DBConfig {
             _cm.reset(cm);
         }
 
-        void shard(ChunkManager* cm);
+        void shard(std::unique_ptr<ChunkManager> manager);
         void unshard();
 
         bool isDirty() const {
@@ -200,6 +201,8 @@ public:
     void getAllShardedCollections(std::set<std::string>& namespaces) const;
 
 protected:
+    typedef AtomicUInt64::WordType Counter;
+
     /**
         lockless
     */
@@ -207,8 +210,14 @@ protected:
 
     bool _dropShardedCollections(int& num, std::set<Shard>& allServers, std::string& errmsg);
 
-    bool _load();
-    bool _reload();
+    /**
+     * Returns true if it is successful at loading the DBConfig, false if the database is not found,
+     * and throws on all other errors.
+     * Also returns true without reloading if reloadIteration is not equal to the _reloadCount.
+     * This is to avoid multiple threads attempting to reload do duplicate work.
+     */
+    bool _loadIfNeeded(Counter reloadIteration);
+
     void _save(bool db = true, bool coll = true);
 
     std::string _name;  // e.g. "alleyinsider"
@@ -224,6 +233,11 @@ protected:
 
     mutable mongo::mutex _lock;  // TODO: change to r/w lock ??
     mutable mongo::mutex _hitConfigServerLock;
+
+    // Increments every time this performs a full reload. Since a full reload can take a very
+    // long time for very large clusters, this can be used to minimize duplicate work when multiple
+    // threads tries to perform full reload at roughly the same time.
+    AtomicUInt64 _reloadCount;  // (S)
 };
 
 class ConfigServer : public DBConfig {
