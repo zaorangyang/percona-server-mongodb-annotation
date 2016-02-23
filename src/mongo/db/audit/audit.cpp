@@ -741,7 +741,10 @@ namespace audit {
                << "db" << username.getDB() 
                << "password" << password 
                << "customData" << (customData ? *customData : BSONObj());
-        appendRoles(params, *roles);
+        if (roles) {
+            appendRoles(params, *roles);
+        }
+
         _auditEvent(client, "updateUser", params.done());
     }
 
