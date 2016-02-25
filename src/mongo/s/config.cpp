@@ -80,15 +80,16 @@ DBConfig::CollectionInfo::CollectionInfo(const BSONObj& in) {
     _dropped = in[CollectionType::dropped()].trueValue();
 
     if (in[CollectionType::keyPattern()].isABSONObj()) {
-        shard(new ChunkManager(in));
+        std::unique_ptr<ChunkManager> newManager(new ChunkManager(in));
+        shard(std::move(newManager));
     }
 
     _dirty = false;
 }
 
-void DBConfig::CollectionInfo::shard(ChunkManager* manager) {
+void DBConfig::CollectionInfo::shard(std::unique_ptr<ChunkManager> manager) {
     // Do this *first* so we're invisible to everyone else
-    manager->loadExistingRanges(configServer.getPrimary().getConnString(), NULL);
+    manager->loadExistingRanges(configServer.getPrimary().getConnString(), nullptr);
 
     //
     // Collections with no chunks are unsharded, no matter what the collections entry says
@@ -96,14 +97,14 @@ void DBConfig::CollectionInfo::shard(ChunkManager* manager) {
     //
 
     if (manager->numChunks() != 0) {
-        _cm = ChunkManagerPtr(manager);
-        _key = manager->getShardKeyPattern().toBSON().getOwned();
-        _unqiue = manager->isUnique();
+        _cm.reset(manager.release());
+        _key = _cm->getShardKeyPattern().toBSON().getOwned();
+        _unqiue = _cm->isUnique();
         _dirty = true;
         _dropped = false;
     } else {
-        warning() << "no chunks found for collection " << manager->getns() << ", assuming unsharded"
-                  << endl;
+        warning() << "no chunks found for collection " << manager->getns()
+                  << ", assuming unsharded";
         unshard();
     }
 }
@@ -235,10 +236,12 @@ ChunkManagerPtr DBConfig::shardCollection(const string& ns,
         collectionDetail.append("numChunks", (int)(initPoints->size() + 1));
         configServer.logChange("shardCollection.start", ns, collectionDetail.obj());
 
-        ChunkManager* cm = new ChunkManager(ns, fieldsAndOrder, unique);
-        cm->createFirstChunks(
-            configServer.getPrimary().getConnString(), getPrimary(), initPoints, initShards);
-        ci.shard(cm);
+        {
+            std::unique_ptr<ChunkManager> cm(new ChunkManager(ns, fieldsAndOrder, unique));
+            cm->createFirstChunks(
+                configServer.getPrimary().getConnString(), getPrimary(), initPoints, initShards);
+            ci.shard(std::move(cm));
+        }
 
         _save();
 
@@ -364,13 +367,15 @@ ChunkManagerPtr DBConfig::getChunkManager(const string& ns, bool shouldReload, b
     ChunkVersion oldVersion;
     ChunkManagerPtr oldManager;
 
+    const auto currentReloadIteration = _reloadCount.load();
+
     {
         scoped_lock lk(_lock);
 
         bool earlyReload = !_collections[ns].isSharded() && (shouldReload || forceReload);
         if (earlyReload) {
-            // this is to catch cases where there this is a new sharded collection
-            _reload();
+            // This is to catch cases where there this is a new sharded collection
+            _loadIfNeeded(currentReloadIteration);
         }
 
         CollectionInfo& ci = _collections[ns];
@@ -527,11 +532,16 @@ void DBConfig::unserialize(const BSONObj& from) {
 }
 
 bool DBConfig::load() {
+    const auto currentReloadIteration = _reloadCount.load();
     scoped_lock lk(_lock);
-    return _load();
+    return _loadIfNeeded(currentReloadIteration);
 }
 
-bool DBConfig::_load() {
+bool DBConfig::_loadIfNeeded(Counter reloadIteration) {
+    if (reloadIteration != _reloadCount.load()) {
+        return true;
+    }
+
     ScopedDbConnection conn(configServer.modelServer(), 30.0);
 
     BSONObj dbObj = conn->findOne(DatabaseType::ConfigNS, BSON(DatabaseType::name(_name)));
@@ -577,6 +587,8 @@ bool DBConfig::_load() {
 
     conn.done();
 
+    _reloadCount.fetchAndAdd(1);
+
     return true;
 }
 
@@ -614,10 +626,11 @@ void DBConfig::_save(bool db, bool coll) {
 
 bool DBConfig::reload() {
     bool successful = false;
+    const auto currentReloadIteration = _reloadCount.load();
 
     {
         scoped_lock lk(_lock);
-        successful = _reload();
+        successful = _loadIfNeeded(currentReloadIteration);
     }
 
     //
@@ -629,11 +642,6 @@ bool DBConfig::reload() {
         grid.removeDBIfExists(*this);
 
     return successful;
-}
-
-bool DBConfig::_reload() {
-    // TODO: i don't think is 100% correct
-    return _load();
 }
 
 bool DBConfig::dropDatabase(string& errmsg) {

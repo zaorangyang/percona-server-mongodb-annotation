@@ -37,6 +37,9 @@
 #include <deque>
 #include <vector>
 
+#include <boost/thread/recursive_mutex.hpp>
+
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -182,6 +185,42 @@ private:
     BSONObj _oField;
 };
 
+namespace {
+boost::recursive_mutex oplogSerialization;  // for OplogIntentWriteLock
+
+/**
+ *  This implements a critical section that extends until commit/rollback.
+ *  Used to avoid the condvar overhead of using a MODE_X lock on this critical path.
+ */
+class OplogSerialization : public RecoveryUnit::Change {
+public:
+    OplogSerialization() {
+        oplogSerialization.lock();
+        _locked = true;
+    }
+
+    ~OplogSerialization() {
+        invariant(!_locked);
+    }
+
+    virtual void commit() {
+        // use explicit unlock here rather than using a lock_guard, as we want to unlock ASAP
+        oplogSerialization.unlock();
+        _locked = false;
+    }
+
+    virtual void rollback() {
+        oplogSerialization.unlock();
+        _locked = false;
+        log() << "rolling back insert into oplog, as transaction aborted";
+    }
+
+private:
+    bool _locked;
+};
+}  // namespace
+
+
 /* we write to local.oplog.rs:
      { ts : ..., h: ..., v: ..., op: ..., etc }
    ts: an OpTime timestamp
@@ -234,7 +273,12 @@ void _logOpRS(OperationContext* txn,
         fassertFailed(17405);
     }
 
-    oplogLk.serializeIfNeeded();
+
+    // Need to be in a critical section until commit or rollback on non-doc-locking engines
+    if (!supportsDocLocking()) {
+        txn->recoveryUnit()->registerChange(new OplogSerialization);
+    }
+
     std::pair<OpTime, long long> slot =
         getNextOpTime(txn, localOplogRSCollection, ns, replCoord, opstr);
 
@@ -347,13 +391,14 @@ void logOpInitiate(OperationContext* txn, const BSONObj& obj) {
       d delete / remove
       u update
 */
-void logOp(OperationContext* txn,
-           const char* opstr,
-           const char* ns,
-           const BSONObj& obj,
-           BSONObj* patt,
-           bool* b,
-           bool fromMigrate) {
+static void logOpInternal(OperationContext* txn,
+                          const char* opstr,
+                          const char* ns,
+                          const BSONObj& obj,
+                          BSONObj* patt,
+                          bool* b,
+                          bool fromMigrate,
+                          bool isDeleteInMigratingChunk) {
     if (getGlobalReplicationCoordinator()->isReplEnabled()) {
         _logOp(txn, opstr, ns, 0, obj, patt, b, fromMigrate);
     }
@@ -363,11 +408,34 @@ void logOp(OperationContext* txn,
     // rollback-safe logOp listeners
     //
     getGlobalAuthorizationManager()->logOp(txn, opstr, ns, obj, patt, b);
-    logOpForSharding(txn, opstr, ns, obj, patt, fromMigrate);
+    logOpForSharding(txn, opstr, ns, obj, patt, fromMigrate || !isDeleteInMigratingChunk);
     logOpForDbHash(txn, ns);
     if (strstr(ns, ".system.js")) {
         Scope::storedFuncMod(txn);
     }
+}
+
+void logOp(OperationContext* txn,
+           const char* opstr,
+           const char* ns,
+           const BSONObj& obj,
+           BSONObj* patt,
+           bool* b,
+           bool fromMigrate) {
+    if (MONGO_unlikely(opstr[0] == 'd' && opstr[1] == '\0')) {
+        severe() << "logOp called with opstr == 'd'; use logDeleteOp instead";
+        invariant(*opstr != 'd');
+    }
+    logOpInternal(txn, opstr, ns, obj, patt, b, fromMigrate, false);
+}
+
+void logDeleteOp(OperationContext* txn,
+                 const char* ns,
+                 const BSONObj& idDoc,
+                 bool fromMigrate,
+                 bool isInMigratingChunk) {
+    bool justOne = true;
+    logOpInternal(txn, "d", ns, idDoc, NULL, &justOne, fromMigrate, isInMigratingChunk);
 }
 
 OpTime writeOpsToOplog(OperationContext* txn, const std::deque<BSONObj>& ops) {
@@ -566,13 +634,40 @@ bool applyOperation_inlock(OperationContext* txn,
 
         const char* p = strchr(ns, '.');
         if (p && nsToCollectionSubstring(p) == "system.indexes") {
+            uassert(ErrorCodes::NoSuchKey,
+                    str::stream() << "Missing expected index spec in field 'o': " << op,
+                    !fieldO.eoo());
+            uassert(ErrorCodes::TypeMismatch,
+                    str::stream() << "Expected object for index spec in field 'o': " << op,
+                    fieldO.isABSONObj());
+
+            std::string indexNs;
+            uassertStatusOK(bsonExtractStringField(o, "ns", &indexNs));
+            const NamespaceString indexNss(indexNs);
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << "Invalid namespace in index spec: " << op,
+                    indexNss.isValid());
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << "Database name mismatch for database ("
+                                  << nsToDatabaseSubstring(ns) << ") while creating index: " << op,
+                    nsToDatabaseSubstring(ns) == indexNss.db());
+
             if (o["background"].trueValue()) {
-                IndexBuilder* builder = new IndexBuilder(o);
-                // This spawns a new thread and returns immediately.
-                builder->go();
-                // Wait for thread to start and register itself
                 Lock::TempRelease release(txn->lockState());
-                IndexBuilder::waitForBgIndexStarting();
+                if (txn->lockState()->isLocked()) {
+                    // If TempRelease fails, background index build will deadlock.
+                    LOG(3) << "apply op: building background index " << o
+                           << " in the foreground because temp release failed";
+                    IndexBuilder builder(o);
+                    Status status = builder.buildInForeground(txn, db);
+                    uassertStatusOK(status);
+                } else {
+                    IndexBuilder* builder = new IndexBuilder(o);
+                    // This spawns a new thread and returns immediately.
+                    builder->go();
+                    // Wait for thread to start and register itself
+                    IndexBuilder::waitForBgIndexStarting();
+                }
             } else {
                 IndexBuilder builder(o);
                 Status status = builder.buildInForeground(txn, db);
