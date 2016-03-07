@@ -112,7 +112,7 @@ namespace mongo {
         }
     }
 
-#define invariantKVOK(s, expr) massert(28633, expr, s.isOK())
+#define invariantKVOK(s, expr) massert(28733, expr, s.isOK())
 
     long long KVRecordStore::dataSize( OperationContext* txn ) const {
         if (_sizeStorer) {
@@ -185,7 +185,7 @@ namespace mongo {
                 return RecordData(nullptr, 0);
             } else {
                 log() << "storage engine get() failed, operation will fail: " << status.toString();
-                uasserted(28622, status.toString());
+                uasserted(28722, status.toString());
             }
         }
 
@@ -196,7 +196,7 @@ namespace mongo {
     RecordData KVRecordStore::dataFor( OperationContext* txn, const RecordId& loc) const {
         RecordData rd;
         bool found = findRecord(txn, loc, &rd);
-        massert(28623, "Didn't find RecordId in record store", found);
+        massert(28723, "Didn't find RecordId in record store", found);
         return rd;
     }
 

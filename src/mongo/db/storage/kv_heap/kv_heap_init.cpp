@@ -23,7 +23,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/base/error_codes.h"
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage/kv_heap/kv_heap_engine.h"
 #include "mongo/db/storage_options.h"
@@ -78,7 +78,7 @@ namespace mongo {
     MONGO_INITIALIZER_WITH_PREREQUISITES(KVHeapEngineInit,
                                          ("SetGlobalEnvironment"))
                                          (InitializerContext* context) {
-        getGlobalEnvironment()->registerStorageEngine("kv_heap", new KVHeapEngineFactory());
+        getGlobalServiceContext()->registerStorageEngine("kv_heap", new KVHeapEngineFactory());
         return Status::OK();
     }
 

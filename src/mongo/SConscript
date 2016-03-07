@@ -47,6 +47,8 @@ env.SConscript(
         'db/storage/devnull',
         'db/storage/in_memory',
         'db/storage/kv',
+        'db/storage/kv/dictionary',
+        'db/storage/kv_heap',
         'db/storage/mmap_v1',
         'db/storage/tokuft',
         'db/storage/wiredtiger',

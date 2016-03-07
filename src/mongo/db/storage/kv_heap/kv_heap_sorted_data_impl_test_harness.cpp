@@ -28,19 +28,19 @@ namespace mongo {
 
     class KVSortedDataImplHarness : public HarnessHelper {
     public:
-        virtual SortedDataInterface* newSortedDataInterface(bool unqiue) {
-            std::auto_ptr<OperationContext> opCtx(newOperationContext());
+        virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unqiue) {
+            std::unique_ptr<OperationContext> opCtx(newOperationContext());
             IndexEntryComparison iec(Ordering::make(BSONObj()));
             std::auto_ptr<KVDictionary> db(new KVHeapDictionary(KVDictionary::Encoding::forIndex(Ordering::make(BSONObj()))));
-            return new KVSortedDataImpl(db.release(), opCtx.get(), NULL);
+            return std::unique_ptr<SortedDataInterface>(new KVSortedDataImpl(db.release(), opCtx.get(), NULL));
         }
 
-        virtual RecoveryUnit* newRecoveryUnit() {
-            return new KVHeapRecoveryUnit();
+        virtual std::unique_ptr<RecoveryUnit> newRecoveryUnit() {
+            return std::unique_ptr<RecoveryUnit>(new KVHeapRecoveryUnit());
         }
     };
 
-    HarnessHelper* newHarnessHelper() {
-        return new KVSortedDataImplHarness();
+    std::unique_ptr<HarnessHelper> newHarnessHelper() {
+        return std::unique_ptr<HarnessHelper>(new KVSortedDataImplHarness());
     }
 }

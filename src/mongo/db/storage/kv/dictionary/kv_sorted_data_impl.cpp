@@ -121,7 +121,6 @@ namespace mongo {
                                     bool dupsAllowed) {
         invariant(loc.isNormal());
         dassert(!hasFieldNames(key));
-
         Status s = checkKeySize(key);
         if (!s.isOK()) {
             return s;
@@ -159,21 +158,6 @@ namespace mongo {
         invariant(loc.isNormal());
         dassert(!hasFieldNames(key));
         _db->remove(txn, Slice::of(KeyString(key, _ordering, loc)));
-    }
-
-    Status KVSortedDataImpl::dupKeyCheck(OperationContext* txn,
-                                         const BSONObj& key,
-                                         const RecordId& loc) {
-        boost::scoped_ptr<SortedDataInterface::Cursor> cursor(newCursor(txn, 1));
-        cursor->locate(key, RecordId());
-
-        if (cursor->isEOF() || cursor->getKey() != key) {
-            return Status::OK();
-        } else if (cursor->getRecordId() == loc) {
-            return Status::OK();
-        } else {
-            return Status(ErrorCodes::DuplicateKey, dupKeyError(key));
-        }
     }
 
     void KVSortedDataImpl::fullValidate(OperationContext* txn, bool full, long long* numKeysOut,
@@ -215,6 +199,203 @@ namespace mongo {
     // ---------------------------------------------------------------------- //
 
     class KVSortedDataInterfaceCursor : public SortedDataInterface::Cursor {
+    public:
+
+        void setEndPosition(const BSONObj& key, bool inclusive) {
+            if (key.isEmpty()) {
+                this->unsetEndPosition();
+            } else {
+                if (inclusive) {
+                    this->setInclusiveStoppingPositionForScans(key);
+                } else {
+                    this->setExclusiveStoppingPositionForScans(key);
+                }
+            }
+        }
+
+        boost::optional<IndexKeyEntry> next(RequestedInfo parts = kKeyAndLoc) {
+            this->invalidateCache();
+            if (this->wasRestoredToPositionThatNoLongerExists()) {
+                this->initializeRestoredState();
+            } else {
+                this->moveToNextPosition();
+            }
+
+            this->removeSavedKey();
+            if (this->isEOF()) {
+                return boost::none;
+            }
+
+            if (this->isPastOrAtEndPosition()) {
+                this->unsetEndPosition();
+                this->resetUnderlyingCursor();
+                return boost::none;
+            }
+
+            return { {this->getKey(), this->getRecordId()} };
+        }
+
+        boost::optional<IndexKeyEntry> seek(const BSONObj& key,
+                                            bool inclusive,
+                                            RequestedInfo parts = kKeyAndLoc) {
+            this->removeSavedKey();
+            struct IndexSeekResult result;
+            const auto discriminator = this->isForward() == inclusive ? KeyString::kExclusiveBefore 
+                                                                      : KeyString::kExclusiveAfter;
+            KeyString ks;
+            ks.resetToKey(stripFieldNames(key), _ordering, discriminator);
+            result = this->_seekToKeyString(ks);
+            return this->getOptionalKeyUsingSeekResult(result);
+        }
+
+        boost::optional<IndexKeyEntry> seek(const IndexSeekPoint& seekPoint,
+                                            RequestedInfo parts = kKeyAndLoc) {
+            this->removeSavedKey();
+            BSONObj key = IndexEntryComparison::makeQueryObject(seekPoint, this->isForward());
+            struct IndexSeekResult result = this->seekUsingDiscriminator(key);
+            return this->getOptionalKeyUsingSeekResult(result);
+        }
+
+    private:
+	bool isForward() {
+	    return _dir > 0 ? true : false;
+	}
+
+        bool isReverse() {
+            return _dir < 0 ? true : false;
+        }
+
+        void unsetEndPosition() {
+            _endPositionIsSet = false;
+        }
+
+        void setInclusiveStoppingPositionForScans(const BSONObj &key) {
+            auto discriminator = KeyString::kExclusiveAfter;
+            if (this->isReverse()) {
+                discriminator = KeyString::kExclusiveBefore;
+            }
+
+            _endKeyString.resetToKey(stripFieldNames(key), _ordering, discriminator);
+            _endPositionIsSet = true;
+        }
+
+        void setExclusiveStoppingPositionForScans(const BSONObj &key) {
+            auto discriminator = KeyString::kExclusiveBefore;
+            if (this->isReverse()) {
+                discriminator = KeyString::kExclusiveAfter;
+            }
+
+            _endKeyString.resetToKey(stripFieldNames(key), _ordering, discriminator);
+            _endPositionIsSet = true;
+        }
+
+        bool wasRestoredToPositionThatNoLongerExists() const {
+            return _wasRestored && !_restoredPositionFound;
+        }
+
+        void initializeRestoredState() {
+            _wasRestored = false;
+        }
+
+        void removeSavedKey() {
+            _keyStringWasSaved = false;
+        }
+
+        void moveToNextPosition() {
+            _initialize();
+            if (!this->isEOF()) {
+                invalidateCache();
+                _cursor->advance(_txn);
+            }
+        }
+
+        void resetUnderlyingCursor() {
+            _cursor.reset();
+        }
+
+        struct IndexSeekResult {
+            bool cursorIsPointingToAKey;
+            bool cursorIsPointingToAnExactMatch;
+        };
+
+        struct IndexSeekResult _seekToKey(const BSONObj &key) {
+            RecordId id = this->isForward() ? RecordId::min() : RecordId::max();
+            struct IndexSeekResult result;
+            result.cursorIsPointingToAnExactMatch = this->locate(key, id);
+            const bool pastEnd = this->isPastOrAtEndPosition();
+            result.cursorIsPointingToAKey = !(this->isEOF()) && !pastEnd;
+            return result;
+        }
+
+        struct IndexSeekResult _seekToKeyString(const KeyString &ks) {
+            struct IndexSeekResult result;
+            result.cursorIsPointingToAnExactMatch = this->_locate(ks);
+            const bool pastEnd = this->isPastOrAtEndPosition();
+            result.cursorIsPointingToAKey = !(this->isEOF()) && !pastEnd;
+            return result;
+        }
+
+        boost::optional<IndexKeyEntry> getOptionalKeyUsingSeekResult(const struct IndexSeekResult result) {
+            if (!result.cursorIsPointingToAKey) {
+                return boost::none;
+            }
+
+            if (this->isPastOrAtEndPosition()) {
+                this->unsetEndPosition();
+                this->resetUnderlyingCursor();
+                return boost::none;
+            }
+
+            return { {this->getKey(), this->getRecordId()} };
+        }
+
+        struct IndexSeekResult seekUsingDiscriminator(const BSONObj& key) {
+            const auto discriminator = this->isForward() ? KeyString::kExclusiveBefore 
+                                                         : KeyString::kExclusiveAfter;
+            KeyString ks;
+            ks.resetToKey(key, _ordering, discriminator);
+            return this->_seekToKeyString(ks);
+        }
+
+	bool cursorPositionMatchesGivenKey(const KeyString &ks) {
+            if (!isEOF()) {
+		const int keySize = ks.getSize();
+		const int keyFromCursorSize = _cursor->currKey().size();
+		if (keySize == keyFromCursorSize) {
+		    const char* keyBuffer = ks.getBuffer();
+		    const char * keyBufferFromCursor = _cursor->currKey().data();
+                    const int r = memcmp(keyBuffer, keyBufferFromCursor, keySize);
+                    if (r == 0) {
+			return true;
+		    }
+		}
+	    }
+
+	    return false;
+	}
+
+        bool endKeyStringIsSurpassedByCurrentKeySting() {
+            const int cmp = _keyString.compare(_endKeyString);
+            if (this->isForward() && cmp > 0) {
+                return true;
+            } else if (!this->isForward() && cmp < 0) {
+                return true;
+            }
+
+            return false;
+        }
+
+        bool isPastOrAtEndPosition() {
+            if (!isEOF() && _endPositionIsSet) {
+                this->loadKeyIfNeeded();
+                if (this->endKeyStringIsSurpassedByCurrentKeySting()) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         KVDictionary *_db;
         const int _dir;
         OperationContext *_txn;
@@ -230,6 +411,12 @@ namespace mongo {
         mutable RecordId _savedLoc;
 
         mutable bool _initialized;
+        mutable KeyString _endKeyString;
+        mutable bool _endPositionIsSet;
+        mutable KeyString _savedKeyString;
+        mutable bool _wasRestored;
+        mutable bool _restoredPositionFound;
+        mutable bool _keyStringWasSaved;
 
         void _initialize() const {
             if (_initialized) {
@@ -278,12 +465,19 @@ namespace mongo {
             return _typeBits;
         }
 
+        bool _locateWhilePreservingCache(const KeyString &ks) {
+	    KVDictionary::Cursor * c = _db->getCursor(_txn, Slice::of(ks), _dir);
+            _cursor.reset(c);
+	    const bool result = cursorPositionMatchesGivenKey(ks);
+	    return result;
+        }
+
         bool _locate(const KeyString &ks) {
             invalidateCache();
-            _cursor.reset(_db->getCursor(_txn, Slice::of(ks), _dir));
-            return !isEOF() &&
-                    ks.getSize() == _cursor->currKey().size() &&
-                    memcmp(ks.getBuffer(), _cursor->currKey().data(), ks.getSize()) == 0;
+	    KVDictionary::Cursor * c = _db->getCursor(_txn, Slice::of(ks), _dir);
+            _cursor.reset(c);
+	    const bool result = cursorPositionMatchesGivenKey(ks);
+	    return result;
         }
 
         bool _locate(const BSONObj &key, const RecordId &loc) {
@@ -303,7 +497,13 @@ namespace mongo {
               _isTypeBitsValid(false),
               _typeBits(),
               _savedLoc(),
-              _initialized(false)
+              _initialized(false),
+              _endKeyString(),
+              _endPositionIsSet(false),
+              _savedKeyString(),
+              _wasRestored(false),
+              _restoredPositionFound(false),
+              _keyStringWasSaved(false)
         {}
 
         virtual ~KVSortedDataInterfaceCursor() {}
@@ -314,7 +514,13 @@ namespace mongo {
 
         bool isEOF() const {
             _initialize();
-            return !_cursor || !_cursor->ok();
+	    const bool cursorIsSet = !!_cursor;
+            if (!cursorIsSet) {
+                return true;
+            }
+
+	    const bool cursorIsOK = _cursor->ok();
+	    return !cursorIsOK;
         }
 
         bool pointsToSamePlaceAs(const Cursor& genOther) const {
@@ -425,6 +631,7 @@ namespace mongo {
             return _savedLoc;
         }
 
+
         void advance() {
             _initialize();
             if (!isEOF()) {
@@ -433,22 +640,26 @@ namespace mongo {
             }
         }
 
-        void savePosition() {
+        void savePositioned() {
             _initialize();
-            if (!isEOF()) {
-                loadKeyIfNeeded();
+            if (!isEOF() && !_keyStringWasSaved) {
+                Slice key = _cursor->currKey();
+                _savedKeyString.resetFromBuffer(key.data(), key.size());
+                _keyStringWasSaved = true;
             }
+
             _savedLoc = getRecordId();
             _cursor.reset();
             _txn = NULL;
         }
 
-        void restorePosition(OperationContext* txn) {
-            invariant(!_txn && !_cursor);
+        void restore(OperationContext* txn) {
+            invariant(!_txn);
             _txn = txn;
             _initialized = true;
-            if (!_savedLoc.isNull()) {
-                _locate(_keyString);
+            if (_keyStringWasSaved) {
+                _restoredPositionFound = this->_locateWhilePreservingCache(_savedKeyString);
+                _wasRestored = true;
             } else {
                 invariant(isEOF()); // this is the whole point!
             }
@@ -460,4 +671,29 @@ namespace mongo {
         return new KVSortedDataInterfaceCursor(_db.get(), txn, direction, _ordering);
     }
 
+    std::unique_ptr<SortedDataInterface::Cursor>
+    KVSortedDataImpl::newCursor(OperationContext* txn, bool isForward) const {
+	const int direction = isForward ? 1 : -1;
+	KVSortedDataInterfaceCursor *c = NULL;
+	c = new KVSortedDataInterfaceCursor(_db.get(), txn, direction, _ordering);
+	return std::unique_ptr<KVSortedDataInterfaceCursor>(c);
+    }
+
+    Status KVSortedDataImpl::dupKeyCheck(OperationContext* txn,
+                                         const BSONObj& key,
+                                         const RecordId& loc) {
+	const int direction = 1; // <-- Forward.
+	boost::scoped_ptr<KVSortedDataInterfaceCursor>
+	    cursor(new KVSortedDataInterfaceCursor(_db.get(), txn, direction, _ordering));
+        cursor->locate(key, RecordId());
+	if (cursor->isEOF() || cursor->getKey() != key) {
+	    return Status::OK();
+	} else if (cursor->getRecordId() == loc) {
+	    return Status::OK();
+	} else {
+	    return Status(ErrorCodes::DuplicateKey, dupKeyError(key));
+	}
+
+	return Status::OK();
+    }
 } // namespace mongo

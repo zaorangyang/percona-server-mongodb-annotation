@@ -21,7 +21,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
 #include "mongo/base/init.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
@@ -62,12 +62,12 @@ namespace mongo {
             if (params.directoryperdb) {
                 severe() << "PerconaFT: directoryPerDB not yet supported.  This option is incompatible with PerconaFT.";
                 severe() << "PerconaFT: The following server crash is intentional.";
-                fassertFailedNoTrace(28628);
+                fassertFailedNoTrace(28728);
             }
             if (tokuftGlobalOptions.engineOptions.directoryForIndexes) {
                 severe() << "PerconaFT: directoryForIndexes not yet supported.  This option is incompatible with PerconaFT.";
                 severe() << "PerconaFT: The following server crash is intentional.";
-                fassertFailedNoTrace(28629);
+                fassertFailedNoTrace(28729);
             }
 
             KVStorageEngineOptions options;
@@ -113,7 +113,7 @@ namespace mongo {
     MONGO_INITIALIZER_WITH_PREREQUISITES(TokuFTStorageEngineInit,
                                          ("SetGlobalEnvironment"))
                                          (InitializerContext *context) {
-        getGlobalEnvironment()->registerStorageEngine("PerconaFT", new TokuFTFactory());
+        getGlobalServiceContext()->registerStorageEngine("PerconaFT", new TokuFTFactory());
         return Status::OK();
     }
 

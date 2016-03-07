@@ -125,6 +125,13 @@ namespace mongo {
             return 0;
         }
 
+	virtual void setReplicatedWrites(bool writesAreReplicated = true) {
+	}
+
+	virtual bool writesAreReplicated() const {
+	    return false;
+	}
+
     private:
         std::auto_ptr<RecoveryUnit> _recoveryUnit;
         ProgressMeter _pm;

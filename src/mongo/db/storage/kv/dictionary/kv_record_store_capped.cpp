@@ -284,7 +284,7 @@ namespace mongo {
     }
 
     Status KVRecordStoreCapped::oplogDiskLocRegister(OperationContext* txn,
-                                                     const OpTime& opTime) {
+						     const Timestamp& opTime) {
         if (!_engineSupportsDocLocking) {
             return Status::OK();
         }

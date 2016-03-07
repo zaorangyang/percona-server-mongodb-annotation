@@ -83,7 +83,7 @@ namespace mongo {
                                                          const RecordId& startingPosition) const;
 
         virtual Status oplogDiskLocRegister(OperationContext* txn,
-                                            const OpTime& opTime);
+                                            const Timestamp& opTime);
 
     private:
         bool needsDelete(OperationContext *txn) const;

@@ -86,6 +86,8 @@ namespace mongo {
 
         virtual Cursor* newCursor(OperationContext* txn, int direction = 1) const;
 
+        virtual std::unique_ptr<Cursor> newCursor(OperationContext* txn, bool isForward = true) const;
+
         virtual Status initAsEmpty(OperationContext* txn);
 
         virtual long long getSpaceUsedBytes( OperationContext* txn ) const;
