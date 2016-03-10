@@ -32,7 +32,10 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/db/repl/read_after_optime_args.h"
+#include "mongo/db/repl/read_after_optime_response.h"
 #include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -81,7 +84,7 @@ namespace repl {
 
     ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorMock::awaitReplication(
             const OperationContext* txn,
-            const Timestamp& ts,
+            const OpTime& opTime,
             const WriteConcernOptions& writeConcern) {
         // TODO
         return StatusAndDuration(Status::OK(), Milliseconds(0));
@@ -131,13 +134,19 @@ namespace repl {
         // TODO
     }
 
-    void ReplicationCoordinatorMock::setMyLastOptime(const Timestamp& ts) {}
+    void ReplicationCoordinatorMock::setMyLastOptime(const OpTime& opTime) {}
 
     void ReplicationCoordinatorMock::resetMyLastOptime() {}
 
-    Timestamp ReplicationCoordinatorMock::getMyLastOptime() const {
+    OpTime ReplicationCoordinatorMock::getMyLastOptime() const {
         // TODO
-        return Timestamp();
+        return OpTime();
+    }
+
+    ReadAfterOpTimeResponse ReplicationCoordinatorMock::waitUntilOpTime(
+            const OperationContext* txn,
+            const ReadAfterOpTimeArgs& settings) {
+        return ReadAfterOpTimeResponse();
     }
 
 
@@ -256,7 +265,7 @@ namespace repl {
         return true;
     }
 
-    std::vector<HostAndPort> ReplicationCoordinatorMock::getHostsWrittenTo(const Timestamp& op) {
+    std::vector<HostAndPort> ReplicationCoordinatorMock::getHostsWrittenTo(const OpTime& op) {
         return std::vector<HostAndPort>();
     }
 
@@ -295,19 +304,20 @@ namespace repl {
         invariant(false);
     }
 
-    Timestamp ReplicationCoordinatorMock::getLastCommittedOpTime() const {
-        return Timestamp();
+    OpTime ReplicationCoordinatorMock::getLastCommittedOpTime() const {
+        return OpTime();
     }
 
     Status ReplicationCoordinatorMock::processReplSetRequestVotes(
-        const ReplSetRequestVotesArgs& args,
-        ReplSetRequestVotesResponse* response) {
+            OperationContext* txn,
+            const ReplSetRequestVotesArgs& args,
+            ReplSetRequestVotesResponse* response) {
         return Status::OK();
     }
 
     Status ReplicationCoordinatorMock::processReplSetDeclareElectionWinner(
             const ReplSetDeclareElectionWinnerArgs& args,
-            ReplSetDeclareElectionWinnerResponse* response) {
+            long long* responseTerm) {
         return Status::OK();
     }
 
@@ -321,6 +331,8 @@ namespace repl {
     bool ReplicationCoordinatorMock::isV1ElectionProtocol() {
         return true;
     }
+
+    void ReplicationCoordinatorMock::summarizeAsHtml(ReplSetHtmlSummary* output) {}
 
 } // namespace repl
 } // namespace mongo

@@ -163,8 +163,7 @@ namespace mongo {
         virtual bool supportsDocLocking() const = 0;
 
         /**
-         * Returns if the engine supports a journalling concept.
-         * This controls whether awaitCommit gets called or fsync to ensure data is on disk.
+         * Returns whether the engine supports a journalling concept or not.
          */
         virtual bool isDurable() const = 0;
 
@@ -204,6 +203,7 @@ namespace mongo {
          * override this method if they have clean-up to do that is different from unclean shutdown.
          * MongoDB will not call into the storage subsystem after calling this function.
          *
+         * On error, the storage engine should assert and crash.
          * There is intentionally no uncleanShutdown().
          */
         virtual void cleanShutdown() = 0;

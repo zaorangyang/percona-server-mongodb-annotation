@@ -215,6 +215,10 @@ __wt_lsm_work_bloom(WT_SESSION_IMPL *session, WT_LSM_TREE *lsm_tree)
 		    chunk->count == 0)
 			continue;
 
+		/* Never create a bloom filter on the oldest chunk */
+		if (chunk == lsm_tree->chunk[0] &&
+		    !FLD_ISSET(lsm_tree->bloom, WT_LSM_BLOOM_OLDEST))
+			continue;
 		/*
 		 * See if we win the race to switch on the "busy" flag and
 		 * recheck that the chunk still needs a Bloom filter.
@@ -281,7 +285,7 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 	}
 
 	/* Stop if a running transaction needs the chunk. */
-	__wt_txn_update_oldest(session);
+	__wt_txn_update_oldest(session, 1);
 	if (chunk->switch_txn == WT_TXN_NONE ||
 	    !__wt_txn_visible_all(session, chunk->switch_txn)) {
 		WT_RET(__wt_verbose(session, WT_VERB_LSM,
@@ -307,7 +311,7 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 	if ((ret = __wt_session_get_btree(
 	    session, chunk->uri, NULL, NULL, 0)) == 0) {
 		saved_isolation = session->txn.isolation;
-		session->txn.isolation = TXN_ISO_EVICTION;
+		session->txn.isolation = WT_ISO_EVICTION;
 		ret = __wt_cache_op(session, NULL, WT_SYNC_WRITE_LEAVES);
 		session->txn.isolation = saved_isolation;
 		WT_TRET(__wt_session_release_btree(session));

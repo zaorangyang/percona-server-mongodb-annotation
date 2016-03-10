@@ -77,16 +77,17 @@ namespace mongo {
     class TempRecoveryUnitSwap {
         OperationContext *_txn;
         KVRecoveryUnit *_oldRecoveryUnit;
+        OperationContext::RecoveryUnitState _oldState;
 
     public:
         TempRecoveryUnitSwap(OperationContext *txn)
             : _txn(txn),
               _oldRecoveryUnit(checked_cast<KVRecoveryUnit *>(_txn->releaseRecoveryUnit())) {
-            _txn->setRecoveryUnit(_oldRecoveryUnit->newRecoveryUnit());
+            _oldState = _txn->setRecoveryUnit(_oldRecoveryUnit->newRecoveryUnit(), OperationContext::kNotInUnitOfWork);
         }
         ~TempRecoveryUnitSwap() {
             boost::scoped_ptr<RecoveryUnit> deleting(_txn->releaseRecoveryUnit());
-            _txn->setRecoveryUnit(_oldRecoveryUnit);
+            _txn->setRecoveryUnit(_oldRecoveryUnit, _oldState);
         }
     };
 

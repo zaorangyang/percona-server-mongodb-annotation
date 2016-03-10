@@ -30,6 +30,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/commands/user_management_commands.h"
+
+#include <boost/thread/mutex.hpp>
 #include <string>
 #include <vector>
 
@@ -44,7 +47,6 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authz_documents_update_guard.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -54,14 +56,18 @@
 #include "mongo/db/auth/user.h"
 #include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/sequence_util.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -72,249 +78,14 @@ namespace mongo {
     using std::stringstream;
     using std::vector;
 
-    static void redactPasswordData(mutablebson::Element parent) {
-        namespace mmb = mutablebson;
-        const StringData pwdFieldName("pwd", StringData::LiteralTag());
-        for (mmb::Element pwdElement = mmb::findFirstChildNamed(parent, pwdFieldName);
-             pwdElement.ok();
-             pwdElement = mmb::findElementNamed(pwdElement.rightSibling(), pwdFieldName)) {
+namespace {
 
-            pwdElement.setValueString("xxx");
-        }
-    }
+    // Used to obtain mutex that guards modifications to persistent authorization data
+    const auto getAuthzDataMutex = ServiceContext::declareDecoration<boost::timed_mutex>();
 
-    static BSONArray roleSetToBSONArray(const unordered_set<RoleName>& roles) {
-        BSONArrayBuilder rolesArrayBuilder;
-        for (unordered_set<RoleName>::const_iterator it = roles.begin(); it != roles.end(); ++it) {
-            const RoleName& role = *it;
-            rolesArrayBuilder.append(
-                    BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME << role.getRole() <<
-                         AuthorizationManager::ROLE_DB_FIELD_NAME << role.getDB()));
-        }
-        return rolesArrayBuilder.arr();
-    }
+    const Seconds authzDataMutexAcquisitionTimeout{5};
 
-    static BSONArray rolesVectorToBSONArray(const std::vector<RoleName>& roles) {
-        BSONArrayBuilder rolesArrayBuilder;
-        for (std::vector<RoleName>::const_iterator it = roles.begin(); it != roles.end(); ++it) {
-            const RoleName& role = *it;
-            rolesArrayBuilder.append(
-                    BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME << role.getRole() <<
-                         AuthorizationManager::ROLE_DB_FIELD_NAME << role.getDB()));
-        }
-        return rolesArrayBuilder.arr();
-    }
-
-    static Status privilegeVectorToBSONArray(const PrivilegeVector& privileges, BSONArray* result) {
-        BSONArrayBuilder arrBuilder;
-        for (PrivilegeVector::const_iterator it = privileges.begin();
-                it != privileges.end(); ++it) {
-            const Privilege& privilege = *it;
-
-            ParsedPrivilege parsedPrivilege;
-            std::string errmsg;
-            if (!ParsedPrivilege::privilegeToParsedPrivilege(privilege,
-                                                             &parsedPrivilege,
-                                                             &errmsg)) {
-                return Status(ErrorCodes::FailedToParse, errmsg);
-            }
-            if (!parsedPrivilege.isValid(&errmsg)) {
-                return Status(ErrorCodes::FailedToParse, errmsg);
-            }
-            arrBuilder.append(parsedPrivilege.toBSON());
-        }
-        *result = arrBuilder.arr();
-        return Status::OK();
-    }
-
-    static Status getCurrentUserRoles(OperationContext* txn,
-                                      AuthorizationManager* authzManager,
-                                      const UserName& userName,
-                                      unordered_set<RoleName>* roles) {
-        User* user;
-        authzManager->invalidateUserByName(userName); // Need to make sure cache entry is up to date
-        Status status = authzManager->acquireUser(txn, userName, &user);
-        if (!status.isOK()) {
-            return status;
-        }
-        RoleNameIterator rolesIt = user->getRoles();
-        while (rolesIt.more()) {
-            roles->insert(rolesIt.next());
-        }
-        authzManager->releaseUser(user);
-        return Status::OK();
-    }
-
-    static Status checkAuthorizedToGrantRoles(AuthorizationSession* authzSession,
-                                              const std::vector<RoleName>& roles) {
-        for (size_t i = 0; i < roles.size(); ++i) {
-            if (!authzSession->isAuthorizedToGrantRole(roles[i])) {
-                return Status(ErrorCodes::Unauthorized,
-                              str::stream() << "Not authorized to grant role: " <<
-                                      roles[i].getFullName());
-            }
-        }
-        return Status::OK();
-    }
-
-    static Status checkAuthorizedToRevokeRoles(AuthorizationSession* authzSession,
-                                               const std::vector<RoleName>& roles) {
-        for (size_t i = 0; i < roles.size(); ++i) {
-            if (!authzSession->isAuthorizedToRevokeRole(roles[i])) {
-                return Status(ErrorCodes::Unauthorized,
-                              str::stream() << "Not authorized to revoke role: " <<
-                                      roles[i].getFullName());
-            }
-        }
-        return Status::OK();
-    }
-
-    static Status checkAuthorizedToGrantPrivileges(AuthorizationSession* authzSession,
-                                                   const PrivilegeVector& privileges) {
-        for (PrivilegeVector::const_iterator it = privileges.begin();
-                it != privileges.end(); ++it) {
-            Status status = authzSession->checkAuthorizedToGrantPrivilege(*it);
-            if (!status.isOK()) {
-                return status;
-            }
-        }
-
-        return Status::OK();
-    }
-
-    static Status checkAuthorizedToRevokePrivileges(AuthorizationSession* authzSession,
-                                                    const PrivilegeVector& privileges) {
-        for (PrivilegeVector::const_iterator it = privileges.begin();
-                it != privileges.end(); ++it) {
-            Status status = authzSession->checkAuthorizedToRevokePrivilege(*it);
-            if (!status.isOK()) {
-                return status;
-            }
-        }
-
-        return Status::OK();
-    }
-
-    /*
-     * Checks that every role in "rolesToAdd" exists, that adding each of those roles to "role"
-     * will not result in a cycle to the role graph, and that every role being added comes from the
-     * same database as the role it is being added to (or that the role being added to is from the
-     * "admin" database.
-     */
-    static Status checkOkayToGrantRolesToRole(const RoleName& role,
-                                              const std::vector<RoleName> rolesToAdd,
-                                              AuthorizationManager* authzManager) {
-        for (vector<RoleName>::const_iterator it = rolesToAdd.begin();
-                it != rolesToAdd.end(); ++it) {
-            const RoleName& roleToAdd = *it;
-            if (roleToAdd == role) {
-                return Status(ErrorCodes::InvalidRoleModification,
-                              mongoutils::str::stream() << "Cannot grant role " <<
-                                      role.getFullName() << " to itself.");
-            }
-
-            if (role.getDB() != "admin" && roleToAdd.getDB() != role.getDB()) {
-                return Status(ErrorCodes::InvalidRoleModification,
-                              str::stream() << "Roles on the \'" << role.getDB() <<
-                                      "\' database cannot be granted roles from other databases");
-            }
-
-            BSONObj roleToAddDoc;
-            Status status = authzManager->getRoleDescription(roleToAdd, false, &roleToAddDoc);
-            if (status == ErrorCodes::RoleNotFound) {
-                return Status(ErrorCodes::RoleNotFound,
-                              "Cannot grant nonexistent role " + roleToAdd.toString());
-            }
-            if (!status.isOK()) {
-                return status;
-            }
-            std::vector<RoleName> indirectRoles;
-            status = auth::parseRoleNamesFromBSONArray(
-                    BSONArray(roleToAddDoc["inheritedRoles"].Obj()),
-                    role.getDB(),
-                    &indirectRoles);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            if (sequenceContains(indirectRoles, role)) {
-                return Status(ErrorCodes::InvalidRoleModification,
-                              mongoutils::str::stream() << "Granting " <<
-                                      roleToAdd.getFullName() << " to " << role.getFullName()
-                                      << " would introduce a cycle in the role graph.");
-            }
-        }
-        return Status::OK();
-    }
-
-    /**
-     * Checks that every privilege being granted targets just the database the role is from, or that
-     * the role is from the "admin" db.
-     */
-    static Status checkOkayToGrantPrivilegesToRole(const RoleName& role,
-                                                   const PrivilegeVector& privileges) {
-
-        if (role.getDB() == "admin") {
-            return Status::OK();
-        }
-
-        for (PrivilegeVector::const_iterator it = privileges.begin();
-                it != privileges.end(); ++it) {
-            const ResourcePattern& resource = (*it).getResourcePattern();
-            if ((resource.isDatabasePattern() || resource.isExactNamespacePattern()) &&
-                    (resource.databaseToMatch() == role.getDB())) {
-                continue;
-            }
-
-            return Status(ErrorCodes::InvalidRoleModification,
-                          str::stream() << "Roles on the \'" << role.getDB() <<
-                                  "\' database cannot be granted privileges that target other "
-                                  "databases or the cluster");
-        }
-
-        return Status::OK();
-    }
-
-    static Status requireAuthSchemaVersion26Final(OperationContext* txn,
-                                                  AuthorizationManager* authzManager) {
-        int foundSchemaVersion;
-        Status status = authzManager->getAuthorizationVersion(txn, &foundSchemaVersion);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        if (foundSchemaVersion < AuthorizationManager::schemaVersion26Final) {
-            return Status(
-                    ErrorCodes::AuthSchemaIncompatible,
-                    str::stream() << "User and role management commands require auth data to have "
-                    "at least schema version " << AuthorizationManager::schemaVersion26Final <<
-                    " but found " << foundSchemaVersion);
-        }
-        return authzManager->writeAuthSchemaVersionIfNeeded(txn, foundSchemaVersion);
-    }
-
-    static Status requireAuthSchemaVersion26UpgradeOrFinal(OperationContext* txn,
-                                                           AuthorizationManager* authzManager) {
-        int foundSchemaVersion;
-        Status status = authzManager->getAuthorizationVersion(txn, &foundSchemaVersion);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        if (foundSchemaVersion < AuthorizationManager::schemaVersion26Upgrade) {
-            return Status(
-                    ErrorCodes::AuthSchemaIncompatible,
-                    str::stream() << "The usersInfo and rolesInfo commands require auth data to "
-                    "have at least schema version " <<
-                    AuthorizationManager::schemaVersion26Upgrade <<
-                    " but found " << foundSchemaVersion);
-        }
-        return Status::OK();
-    }
-
-    static void appendBSONObjToBSONArrayBuilder(BSONArrayBuilder* array, const BSONObj& obj) {
-        array->append(obj);
-    }
+} // namespace
 
     class CmdCreateUser : public Command {
     public:
@@ -325,7 +96,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Adds a user to the system" << endl;
@@ -334,28 +105,11 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            auth::CreateOrUpdateUserArgs args;
-            Status status = auth::parseCreateOrUpdateUserCommands(cmdObj,
-                                                                  "createUser",
-                                                                  dbname,
-                                                                  &args);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forDatabaseName(args.userName.getDB()),
-                    ActionType::createUser)) {
-                return Status(ErrorCodes::Unauthorized,
-                              str::stream() << "Not authorized to create users on db: " <<
-                                      args.userName.getDB());
-            }
-
-            return checkAuthorizedToGrantRoles(authzSession, args.roles);
+            return auth::checkAuthForCreateUserCommand(client, dbname, cmdObj);
         }
 
-        bool run(OperationContext* txn, const string& dbname,
+        bool run(OperationContext* txn,
+                 const string& dbname,
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
@@ -421,7 +175,8 @@ namespace mongo {
             userObjBuilder.append(AuthorizationManager::USER_DB_FIELD_NAME,
                                   args.userName.getDB());
 
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
             int authzVersion;
             status = authzManager->getAuthorizationVersion(txn, &authzVersion);
             if (!status.isOK()) {
@@ -450,7 +205,7 @@ namespace mongo {
             if (args.hasCustomData) {
                 userObjBuilder.append("customData", args.customData);
             }
-            userObjBuilder.append("roles", rolesVectorToBSONArray(args.roles));
+            userObjBuilder.append("roles", auth::rolesVectorToBSONArray(args.roles));
 
             BSONObj userObj = userObjBuilder.obj();
             V2UserDocumentParser parser;
@@ -459,14 +214,15 @@ namespace mongo {
                 return appendCommandStatus(result, status);
             }
 
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Create user")) {
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            status = requireAuthSchemaVersion26Final(txn, authzManager);
+            status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -493,7 +249,7 @@ namespace mongo {
         }
 
         virtual void redactForLogging(mutablebson::Document* cmdObj) {
-            redactPasswordData(cmdObj->root());
+            auth::redactPasswordData(cmdObj->root());
         }
 
     } cmdCreateUser;
@@ -507,7 +263,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Used to update a user, for example to change its password" << endl;
@@ -516,51 +272,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            auth::CreateOrUpdateUserArgs args;
-            Status status = auth::parseCreateOrUpdateUserCommands(cmdObj,
-                                                                  "updateUser",
-                                                                  dbname,
-                                                                  &args);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            if (args.hasHashedPassword) {
-                if (!authzSession->isAuthorizedToChangeOwnPasswordAsUser(args.userName) &&
-                        !authzSession->isAuthorizedForActionsOnResource(
-                                ResourcePattern::forDatabaseName(args.userName.getDB()),
-                                ActionType::changePassword)) {
-                    return Status(ErrorCodes::Unauthorized,
-                                  str::stream() << "Not authorized to change password of user: " <<
-                                          args.userName.getFullName());
-                }
-            }
-
-            if (args.hasCustomData) {
-                if (!authzSession->isAuthorizedToChangeOwnCustomDataAsUser(args.userName) &&
-                        !authzSession->isAuthorizedForActionsOnResource(
-                                ResourcePattern::forDatabaseName(args.userName.getDB()),
-                                ActionType::changeCustomData)) {
-                    return Status(ErrorCodes::Unauthorized,
-                                  str::stream() << "Not authorized to change customData of user: "
-                                          << args.userName.getFullName());
-                }
-            }
-
-            if (args.hasRoles) {
-                // You don't know what roles you might be revoking, so require the ability to
-                // revoke any role in the system.
-                if (!authzSession->isAuthorizedForActionsOnResource(
-                        ResourcePattern::forAnyNormalResource(), ActionType::revokeRole)) {
-                    return Status(ErrorCodes::Unauthorized,
-                                  "In order to use updateUser to set roles array, must be "
-                                  "authorized to revoke any role in the system");
-                }
-
-                return checkAuthorizedToGrantRoles(authzSession, args.roles);
-            }
-            return Status::OK();
+            return auth::checkAuthForUpdateUserCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -619,18 +331,20 @@ namespace mongo {
                 updateSetBuilder.append("customData", args.customData);
             }
             if (args.hasRoles) {
-                updateSetBuilder.append("roles", rolesVectorToBSONArray(args.roles));
+                updateSetBuilder.append("roles", auth::rolesVectorToBSONArray(args.roles));
             }
 
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Update user")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -663,7 +377,7 @@ namespace mongo {
         }
 
         virtual void redactForLogging(mutablebson::Document* cmdObj) {
-            redactPasswordData(cmdObj->root());
+            auth::redactPasswordData(cmdObj->root());
         }
 
     } cmdUpdateUser;
@@ -677,7 +391,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Drops a single user." << endl;
@@ -686,24 +400,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            UserName userName;
-            BSONObj unusedWriteConcern;
-            Status status = auth::parseAndValidateDropUserCommand(cmdObj,
-                                                                  dbname,
-                                                                  &userName,
-                                                                  &unusedWriteConcern);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forDatabaseName(userName.getDB()), ActionType::dropUser)) {
-                return Status(ErrorCodes::Unauthorized,
-                              str::stream() << "Not authorized to drop users from the " <<
-                                      userName.getDB() << " database");
-            }
-            return Status::OK();
+            return auth::checkAuthForDropUserCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -711,15 +408,17 @@ namespace mongo {
                  int options,
                  string& errmsg,
                  BSONObjBuilder& result) {
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Drop user")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            Status status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            Status status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -773,7 +472,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Drops all users for a single database." << endl;
@@ -782,14 +481,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forDatabaseName(dbname), ActionType::dropUser)) {
-                return Status(ErrorCodes::Unauthorized,
-                              str::stream() << "Not authorized to drop users from the " <<
-                                      dbname << " database");
-            }
-            return Status::OK();
+            return auth::checkAuthForDropAllUsersFromDatabaseCommand(client, dbname);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -797,15 +489,17 @@ namespace mongo {
                  int options,
                  string& errmsg,
                  BSONObjBuilder& result) {
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Drop all users from database")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            Status status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            Status status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -848,7 +542,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Grants roles to a user." << endl;
@@ -857,21 +551,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            std::vector<RoleName> roles;
-            std::string unusedUserNameString;
-            BSONObj unusedWriteConcern;
-            Status status = auth::parseRolePossessionManipulationCommands(cmdObj,
-                                                                          "grantRolesToUser",
-                                                                          dbname,
-                                                                          &unusedUserNameString,
-                                                                          &roles,
-                                                                          &unusedWriteConcern);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            return checkAuthorizedToGrantRoles(authzSession, roles);
+            return auth::checkAuthForGrantRolesToUserCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -879,15 +559,17 @@ namespace mongo {
                  int options,
                  string& errmsg,
                  BSONObjBuilder& result) {
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Grant roles to user")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            Status status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            Status status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -907,7 +589,7 @@ namespace mongo {
 
             UserName userName(userNameString, dbname);
             unordered_set<RoleName> userRoles;
-            status = getCurrentUserRoles(txn, authzManager, userName, &userRoles);
+            status = auth::getCurrentUserRoles(txn, authzManager, userName, &userRoles);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -926,7 +608,7 @@ namespace mongo {
             audit::logGrantRolesToUser(ClientBasic::getCurrent(),
                                        userName,
                                        roles);
-            BSONArray newRolesBSONArray = roleSetToBSONArray(userRoles);
+            BSONArray newRolesBSONArray = auth::roleSetToBSONArray(userRoles);
             status = authzManager->updatePrivilegeDocument(
                     txn, userName, BSON("$set" << BSON("roles" << newRolesBSONArray)), writeConcern);
             // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
@@ -945,7 +627,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Revokes roles from a user." << endl;
@@ -954,21 +636,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            std::vector<RoleName> roles;
-            std::string unusedUserNameString;
-            BSONObj unusedWriteConcern;
-            Status status = auth::parseRolePossessionManipulationCommands(cmdObj,
-                                                                          "revokeRolesFromUser",
-                                                                          dbname,
-                                                                          &unusedUserNameString,
-                                                                          &roles,
-                                                                          &unusedWriteConcern);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            return checkAuthorizedToRevokeRoles(authzSession, roles);
+            return auth::checkAuthForRevokeRolesFromUserCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -976,15 +644,17 @@ namespace mongo {
                  int options,
                  string& errmsg,
                  BSONObjBuilder& result) {
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Revoke roles from user")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            Status status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            Status status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1004,7 +674,7 @@ namespace mongo {
 
             UserName userName(userNameString, dbname);
             unordered_set<RoleName> userRoles;
-            status = getCurrentUserRoles(txn, authzManager, userName, &userRoles);
+            status = auth::getCurrentUserRoles(txn, authzManager, userName, &userRoles);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1023,7 +693,7 @@ namespace mongo {
             audit::logRevokeRolesFromUser(ClientBasic::getCurrent(),
                                           userName,
                                           roles);
-            BSONArray newRolesBSONArray = roleSetToBSONArray(userRoles);
+            BSONArray newRolesBSONArray = auth::roleSetToBSONArray(userRoles);
             status = authzManager->updatePrivilegeDocument(
                     txn, userName, BSON("$set" << BSON("roles" << newRolesBSONArray)), writeConcern);
             // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
@@ -1055,35 +725,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            auth::UsersInfoArgs args;
-            Status status = auth::parseUsersInfoCommand(cmdObj, dbname, &args);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            if (args.allForDB) {
-                if (!authzSession->isAuthorizedForActionsOnResource(
-                        ResourcePattern::forDatabaseName(dbname), ActionType::viewUser)) {
-                    return Status(ErrorCodes::Unauthorized,
-                                  str::stream() << "Not authorized to view users from the " <<
-                                          dbname << " database");
-                }
-            } else {
-                for (size_t i = 0; i < args.userNames.size(); ++i) {
-                    if (authzSession->lookupUser(args.userNames[i])) {
-                        continue; // Can always view users you are logged in as
-                    }
-                    if (!authzSession->isAuthorizedForActionsOnResource(
-                            ResourcePattern::forDatabaseName(args.userNames[i].getDB()),
-                            ActionType::viewUser)) {
-                        return Status(ErrorCodes::Unauthorized,
-                                      str::stream() << "Not authorized to view users from the " <<
-                                              dbname << " database");
-                    }
-                }
-            }
-            return Status::OK();
+            return auth::checkAuthForUsersInfoCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -1098,8 +740,9 @@ namespace mongo {
                 return appendCommandStatus(result, status);
             }
 
-            status = requireAuthSchemaVersion26UpgradeOrFinal(txn,
-                                                              getGlobalAuthorizationManager());
+            status =
+                auth::requireAuthSchemaVersion26UpgradeOrFinal(txn,
+                                                               getGlobalAuthorizationManager());
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1161,7 +804,7 @@ namespace mongo {
                     projection.append("credentials", 0);
                 }
                 const stdx::function<void(const BSONObj&)> function = stdx::bind(
-                        appendBSONObjToBSONArrayBuilder,
+                        auth::appendBSONObjToBSONArrayBuilder,
                         &usersArrayBuilder,
                         stdx::placeholders::_1);
                 authzManager->queryAuthzDocument(txn,
@@ -1185,7 +828,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Adds a role to the system" << endl;
@@ -1194,30 +837,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            auth::CreateOrUpdateRoleArgs args;
-            Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj,
-                                                                  "createRole",
-                                                                  dbname,
-                                                                  &args);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forDatabaseName(args.roleName.getDB()),
-                    ActionType::createRole)) {
-                return Status(ErrorCodes::Unauthorized,
-                              str::stream() << "Not authorized to create roles on db: " <<
-                                      args.roleName.getDB());
-            }
-
-            status = checkAuthorizedToGrantRoles(authzSession, args.roles);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            return checkAuthorizedToGrantPrivileges(authzSession, args.privileges);
+            return auth::checkAuthForCreateRoleCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -1277,34 +897,36 @@ namespace mongo {
                                   args.roleName.getDB());
 
             BSONArray privileges;
-            status = privilegeVectorToBSONArray(args.privileges, &privileges);
+            status = auth::privilegeVectorToBSONArray(args.privileges, &privileges);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
             roleObjBuilder.append("privileges", privileges);
 
-            roleObjBuilder.append("roles", rolesVectorToBSONArray(args.roles));
+            roleObjBuilder.append("roles", auth::rolesVectorToBSONArray(args.roles));
 
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Create role")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
 
             // Role existence has to be checked after acquiring the update lock
-            status = checkOkayToGrantRolesToRole(args.roleName, args.roles, authzManager);
+            status = auth::checkOkayToGrantRolesToRole(args.roleName, args.roles, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
 
-            status = checkOkayToGrantPrivilegesToRole(args.roleName, args.privileges);
+            status = auth::checkOkayToGrantPrivilegesToRole(args.roleName, args.privileges);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1329,7 +951,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Used to update a role" << endl;
@@ -1338,31 +960,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            auth::CreateOrUpdateRoleArgs args;
-            Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj,
-                                                                  "updateRole",
-                                                                  dbname,
-                                                                  &args);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            // You don't know what roles or privileges you might be revoking, so require the ability
-            // to revoke any role (or privilege) in the system.
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forAnyNormalResource(), ActionType::revokeRole)) {
-                return Status(ErrorCodes::Unauthorized,
-                              "updateRole command required the ability to revoke any role in the "
-                              "system");
-            }
-
-            status = checkAuthorizedToGrantRoles(authzSession, args.roles);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            return checkAuthorizedToGrantPrivileges(authzSession, args.privileges);
+            return auth::checkAuthForUpdateRoleCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -1390,7 +988,7 @@ namespace mongo {
 
             if (args.hasPrivileges) {
                 BSONArray privileges;
-                status = privilegeVectorToBSONArray(args.privileges, &privileges);
+                status = auth::privilegeVectorToBSONArray(args.privileges, &privileges);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }
@@ -1398,18 +996,20 @@ namespace mongo {
             }
 
             if (args.hasRoles) {
-                updateSetBuilder.append("roles", rolesVectorToBSONArray(args.roles));
+                updateSetBuilder.append("roles", auth::rolesVectorToBSONArray(args.roles));
             }
 
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Update role")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1422,14 +1022,14 @@ namespace mongo {
             }
 
             if (args.hasRoles) {
-                status = checkOkayToGrantRolesToRole(args.roleName, args.roles, authzManager);
+                status = auth::checkOkayToGrantRolesToRole(args.roleName, args.roles, authzManager);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }
             }
 
             if (args.hasPrivileges) {
-                status = checkOkayToGrantPrivilegesToRole(args.roleName, args.privileges);
+                status = auth::checkOkayToGrantPrivilegesToRole(args.roleName, args.privileges);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }
@@ -1459,7 +1059,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Grants privileges to a role" << endl;
@@ -1468,22 +1068,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            PrivilegeVector privileges;
-            RoleName unusedRoleName;
-            BSONObj unusedWriteConcern;
-            Status status = auth::parseAndValidateRolePrivilegeManipulationCommands(
-                    cmdObj,
-                    "grantPrivilegesToRole",
-                    dbname,
-                    &unusedRoleName,
-                    &privileges,
-                    &unusedWriteConcern);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            return checkAuthorizedToGrantPrivileges(authzSession, privileges);
+            return auth::checkAuthForGrantPrivilegesToRoleCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -1491,15 +1076,17 @@ namespace mongo {
                  int options,
                  string& errmsg,
                  BSONObjBuilder& result) {
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Grant privileges to role")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            Status status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            Status status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1526,7 +1113,7 @@ namespace mongo {
                                " is a built-in role and cannot be modified."));
             }
 
-            status = checkOkayToGrantPrivilegesToRole(roleName, privilegesToAdd);
+            status = auth::checkOkayToGrantPrivilegesToRole(roleName, privilegesToAdd);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1595,7 +1182,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Revokes privileges from a role" << endl;
@@ -1604,22 +1191,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            PrivilegeVector privileges;
-            RoleName unusedRoleName;
-            BSONObj unusedWriteConcern;
-            Status status = auth::parseAndValidateRolePrivilegeManipulationCommands(
-                    cmdObj,
-                    "revokePrivilegesFromRole",
-                    dbname,
-                    &unusedRoleName,
-                    &privileges,
-                    &unusedWriteConcern);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            return checkAuthorizedToRevokePrivileges(authzSession, privileges);
+            return auth::checkAuthForRevokePrivilegesFromRoleCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -1627,15 +1199,17 @@ namespace mongo {
                  int options,
                  string& errmsg,
                  BSONObjBuilder& result) {
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Revoke privileges from role")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            Status status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            Status status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1733,7 +1307,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Grants roles to another role." << endl;
@@ -1742,21 +1316,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            std::vector<RoleName> roles;
-            std::string unusedUserNameString;
-            BSONObj unusedWriteConcern;
-            Status status = auth::parseRolePossessionManipulationCommands(cmdObj,
-                                                                          "grantRolesToRole",
-                                                                          dbname,
-                                                                          &unusedUserNameString,
-                                                                          &roles,
-                                                                          &unusedWriteConcern);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            return checkAuthorizedToGrantRoles(authzSession, roles);
+            return auth::checkAuthForGrantRolesToRoleCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -1787,15 +1347,17 @@ namespace mongo {
                                " is a built-in role and cannot be modified."));
             }
 
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Grant roles to role")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1808,7 +1370,7 @@ namespace mongo {
             }
 
             // Check for cycles
-            status = checkOkayToGrantRolesToRole(roleName, rolesToAdd, authzManager);
+            status = auth::checkOkayToGrantRolesToRole(roleName, rolesToAdd, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1834,7 +1396,7 @@ namespace mongo {
             status = authzManager->updateRoleDocument(
                     txn,
                     roleName,
-                    BSON("$set" << BSON("roles" << rolesVectorToBSONArray(directRoles))),
+                    BSON("$set" << BSON("roles" << auth::rolesVectorToBSONArray(directRoles))),
                     writeConcern);
             // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
             authzManager->invalidateUserCache();
@@ -1852,7 +1414,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Revokes roles from another role." << endl;
@@ -1861,21 +1423,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            std::vector<RoleName> roles;
-            std::string unusedUserNameString;
-            BSONObj unusedWriteConcern;
-            Status status = auth::parseRolePossessionManipulationCommands(cmdObj,
-                                                                          "revokeRolesFromRole",
-                                                                          dbname,
-                                                                          &unusedUserNameString,
-                                                                          &roles,
-                                                                          &unusedWriteConcern);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            return checkAuthorizedToRevokeRoles(authzSession, roles);
+            return auth::checkAuthForRevokeRolesFromRoleCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -1883,15 +1431,17 @@ namespace mongo {
                  int options,
                  string& errmsg,
                  BSONObjBuilder& result) {
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Revoke roles from role")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            Status status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            Status status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1947,7 +1497,7 @@ namespace mongo {
             status = authzManager->updateRoleDocument(
                     txn,
                     roleName,
-                    BSON("$set" << BSON("roles" << rolesVectorToBSONArray(roles))),
+                    BSON("$set" << BSON("roles" << auth::rolesVectorToBSONArray(roles))),
                     writeConcern);
             // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
             authzManager->invalidateUserCache();
@@ -1965,7 +1515,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Drops a single role.  Before deleting the role completely it must remove it "
@@ -1977,24 +1527,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            RoleName roleName;
-            BSONObj unusedWriteConcern;
-            Status status = auth::parseDropRoleCommand(cmdObj,
-                                                         dbname,
-                                                         &roleName,
-                                                         &unusedWriteConcern);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forDatabaseName(roleName.getDB()), ActionType::dropRole)) {
-                return Status(ErrorCodes::Unauthorized,
-                              str::stream() << "Not authorized to drop roles from the " <<
-                                      roleName.getDB() << " database");
-            }
-            return Status::OK();
+            return auth::checkAuthForDropRoleCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -2002,15 +1535,17 @@ namespace mongo {
                  int options,
                  string& errmsg,
                  BSONObjBuilder& result) {
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Drop role")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            Status status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            Status status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -2144,7 +1679,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual void help(stringstream& ss) const {
             ss << "Drops all roles from the given database.  Before deleting the roles completely "
@@ -2157,14 +1692,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forDatabaseName(dbname), ActionType::dropRole)) {
-                return Status(ErrorCodes::Unauthorized,
-                              str::stream() << "Not authorized to drop roles from the " <<
-                                      dbname << " database");
-            }
-            return Status::OK();
+            return auth::checkAuthForDropAllRolesFromDatabaseCommand(client, dbname);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -2180,15 +1708,17 @@ namespace mongo {
                 return appendCommandStatus(result, status);
             }
 
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("Drop roles from database")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -2291,37 +1821,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            auth::RolesInfoArgs args;
-            Status status = auth::parseRolesInfoCommand(cmdObj, dbname, &args);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            if (args.allForDB) {
-                if (!authzSession->isAuthorizedForActionsOnResource(
-                        ResourcePattern::forDatabaseName(dbname), ActionType::viewRole)) {
-                    return Status(ErrorCodes::Unauthorized,
-                                  str::stream() << "Not authorized to view roles from the " <<
-                                          dbname << " database");
-                }
-            } else {
-                for (size_t i = 0; i < args.roleNames.size(); ++i) {
-                    if (authzSession->isAuthenticatedAsUserWithRole(args.roleNames[i])) {
-                        continue; // Can always see roles that you are a member of
-                    }
-
-                    if (!authzSession->isAuthorizedForActionsOnResource(
-                            ResourcePattern::forDatabaseName(args.roleNames[i].getDB()),
-                            ActionType::viewRole)) {
-                        return Status(ErrorCodes::Unauthorized,
-                                      str::stream() << "Not authorized to view roles from the " <<
-                                              args.roleNames[i].getDB() << " database");
-                    }
-                }
-            }
-
-            return Status::OK();
+            return auth::checkAuthForRolesInfoCommand(client, dbname, cmdObj);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -2336,8 +1836,9 @@ namespace mongo {
                 return appendCommandStatus(result, status);
             }
 
-            status = requireAuthSchemaVersion26UpgradeOrFinal(txn,
-                                                              getGlobalAuthorizationManager());
+            status =
+                auth::requireAuthSchemaVersion26UpgradeOrFinal(txn,
+                                                               getGlobalAuthorizationManager());
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -2396,12 +1897,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forClusterResource(), ActionType::invalidateUserCache)) {
-                return Status(ErrorCodes::Unauthorized, "Not authorized to invalidate user cache");
-            }
-            return Status::OK();
+            return auth::checkAuthForInvalidateUserCacheCommand(client);
         }
 
         bool run(OperationContext* txn, const string& dbname,
@@ -2439,12 +1935,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forClusterResource(), ActionType::internal)) {
-                return Status(ErrorCodes::Unauthorized, "Not authorized to get cache generation");
-            }
-            return Status::OK();
+            return auth::checkAuthForGetUserCacheGenerationCommand(client);
         }
 
         bool run(OperationContext* txn,
@@ -2480,7 +1971,7 @@ namespace mongo {
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool isWriteCommandForConfigServer() const { return true; }
 
         virtual bool adminOnly() const {
             return true;
@@ -2493,45 +1984,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            auth::MergeAuthzCollectionsArgs args;
-            Status status = auth::parseMergeAuthzCollectionsCommand(cmdObj, &args);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            AuthorizationSession* authzSession = AuthorizationSession::get(client);
-            ActionSet actions;
-            actions.addAction(ActionType::createUser);
-            actions.addAction(ActionType::createRole);
-            actions.addAction(ActionType::grantRole);
-            actions.addAction(ActionType::revokeRole);
-            if (args.drop) {
-                actions.addAction(ActionType::dropUser);
-                actions.addAction(ActionType::dropRole);
-            }
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forAnyNormalResource(), actions)) {
-                return Status(ErrorCodes::Unauthorized,
-                              "Not authorized to update user/role data using _mergeAuthzCollections"
-                              " command");
-            }
-            if (!args.usersCollName.empty() &&
-                    !authzSession->isAuthorizedForActionsOnResource(
-                            ResourcePattern::forExactNamespace(NamespaceString(args.usersCollName)),
-                            ActionType::find)) {
-                return Status(ErrorCodes::Unauthorized,
-                              mongoutils::str::stream() << "Not authorized to read " <<
-                                      args.usersCollName);
-            }
-            if (!args.rolesCollName.empty() &&
-                    !authzSession->isAuthorizedForActionsOnResource(
-                            ResourcePattern::forExactNamespace(NamespaceString(args.rolesCollName)),
-                            ActionType::find)) {
-                return Status(ErrorCodes::Unauthorized,
-                              mongoutils::str::stream() << "Not authorized to read " <<
-                                      args.rolesCollName);
-            }
-            return Status::OK();
+            return auth::checkAuthForMergeAuthzCollectionsCommand(client, cmdObj);
         }
 
         static UserName extractUserNameFromBSON(const BSONObj& userObj) {
@@ -2908,15 +2361,17 @@ namespace mongo {
                                        "\"tempRolescollection\""));
             }
 
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            AuthzDocumentsUpdateGuard updateGuard(authzManager);
-            if (!updateGuard.tryLock("_mergeAuthzCollections")) {
+            ServiceContext* serviceContext = txn->getClient()->getServiceContext();
+            boost::unique_lock<boost::timed_mutex> lk(getAuthzDataMutex(serviceContext),
+                                                      authzDataMutexAcquisitionTimeout);
+            if (!lk) {
                 return appendCommandStatus(
                         result,
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            status = requireAuthSchemaVersion26Final(txn, authzManager);
+            AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
+            status = auth::requireAuthSchemaVersion26Final(txn, authzManager);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }

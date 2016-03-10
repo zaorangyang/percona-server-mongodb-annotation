@@ -74,13 +74,13 @@ namespace mongo {
         explicit Value(double value)              : _storage(NumberDouble, value) {}
         explicit Value(const Timestamp& value)    : _storage(bsonTimestamp, value) {}
         explicit Value(const OID& value)          : _storage(jstOID, value) {}
-        explicit Value(StringData value)   : _storage(String, value) {}
-        explicit Value(const std::string& value)       : _storage(String, StringData(value)) {}
+        explicit Value(StringData value)          : _storage(String, value) {}
+        explicit Value(const std::string& value)  : _storage(String, StringData(value)) {}
         explicit Value(const char* value)         : _storage(String, StringData(value)) {}
         explicit Value(const Document& doc)       : _storage(Object, doc) {}
         explicit Value(const BSONObj& obj);
         explicit Value(const BSONArray& arr);
-        explicit Value(const std::vector<Value>& vec)  : _storage(Array, new RCVector(vec)) {}
+        explicit Value(std::vector<Value> vec)    : _storage(Array, new RCVector(std::move(vec))) {}
         explicit Value(const BSONBinData& bd)     : _storage(BinData, bd) {}
         explicit Value(const BSONRegEx& re)       : _storage(RegEx, re) {}
         explicit Value(const BSONCodeWScope& cws) : _storage(CodeWScope, cws) {}
@@ -91,9 +91,7 @@ namespace mongo {
         explicit Value(const UndefinedLabeler&)   : _storage(Undefined) {} // BSONUndefined
         explicit Value(const MinKeyLabeler&)      : _storage(MinKey) {}    // MINKEY
         explicit Value(const MaxKeyLabeler&)      : _storage(MaxKey) {}    // MAXKEY
-        explicit Value(const Date_t& date)
-            : _storage(Date, static_cast<long long>(date.millis)) // millis really signed
-        {}
+        explicit Value(const Date_t& date) : _storage(Date, date.toMillisSinceEpoch()) {}
 
         // TODO: add an unsafe version that can share storage with the BSONElement
         /// Deep-convert from BSONElement to Value
@@ -106,16 +104,6 @@ namespace mongo {
          *  will be an int if value fits, otherwise it will be a long.
         */
         static Value createIntOrLong(long long value);
-
-        /** Construct an Array-typed Value from consumed without copying the vector.
-         *  consumed is replaced with an empty vector.
-         *  In C++11 this would be spelled Value(std::move(consumed)).
-         */
-        static Value consume(std::vector<Value>& consumed) {
-            RCVector* vec = new RCVector();
-            std::swap(vec->vec, consumed);
-            return Value(ValueStorage(Array, vec));
-        }
 
         /** A "missing" value indicates the lack of a Value.
          *  This is similar to undefined/null but should not appear in output to BSON.
@@ -176,7 +164,6 @@ namespace mongo {
         friend BSONObjBuilder& operator << (BSONObjBuilderValueStream& builder, const Value& val);
 
         /** Coerce a value to a bool using BSONElement::trueValue() rules.
-         *  Some types unsupported.  SERVER-6120
          */
         bool coerceToBool() const;
 
@@ -328,7 +315,7 @@ namespace mongo {
 
     inline Timestamp Value::getTimestamp() const {
         verify(getType() == bsonTimestamp);
-        return Date_t(_storage.timestampValue);
+        return Timestamp(_storage.timestampValue);
     }
 
     inline const char* Value::getRegex() const {

@@ -73,11 +73,20 @@ namespace mongo {
                                              << aggOutCounter.addAndFetch(1)
                                              ));
 
+        // Create output collection, copying options from existing collection if any.
         {
+            const auto infos = conn->getCollectionInfos(_outputNs.db().toString(),
+                                                        BSON("name" << _outputNs.coll()));
+            const auto options = infos.empty() ? BSONObj()
+                                               : infos.front().getObjectField("options");
+
+            BSONObjBuilder cmd;
+            cmd << "create" << _tempNs.coll();
+            cmd << "temp" << true;
+            cmd.appendElementsUnique(options);
+
             BSONObj info;
-            bool ok =conn->runCommand(_outputNs.db().toString(),
-                                      BSON("create" << _tempNs.coll() << "temp" << true),
-                                      info);
+            bool ok = conn->runCommand(_outputNs.db().toString(), cmd.done(), info);
             uassert(16994, str::stream() << "failed to create temporary $out collection '"
                                          << _tempNs.ns() << "': " << info.toString(),
                     ok);
@@ -100,9 +109,8 @@ namespace mongo {
         }
     }
 
-    void DocumentSourceOut::spill(DBClientBase* conn, const vector<BSONObj>& toInsert) {
-        conn->insert(_tempNs.ns(), toInsert);
-        BSONObj err = conn->getLastErrorDetailed();
+    void DocumentSourceOut::spill(const vector<BSONObj>& toInsert) {
+        BSONObj err = _mongod->insert(_tempNs, toInsert);
         uassert(16996, str::stream() << "insert for $out failed: " << err,
                 DBClientWithCommands::getLastErrorString(err).empty());
     }
@@ -127,7 +135,7 @@ namespace mongo {
             BSONObj toInsert = next->toBson();
             bufferedBytes += toInsert.objsize();
             if (!bufferedObjects.empty() && bufferedBytes > BSONObjMaxUserSize) {
-                spill(conn, bufferedObjects);
+                spill(bufferedObjects);
                 bufferedObjects.clear();
                 bufferedBytes = toInsert.objsize();
             }
@@ -135,7 +143,7 @@ namespace mongo {
         }
 
         if (!bufferedObjects.empty())
-            spill(conn, bufferedObjects);
+            spill(bufferedObjects);
 
         // Checking again to make sure we didn't become sharded while running.
         uassert(17018, str::stream() << "namespace '" << _outputNs.ns()

@@ -37,6 +37,7 @@
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/topology_coordinator.h"
+#include "mongo/db/repl/last_vote.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -125,6 +126,7 @@ namespace repl {
         virtual HostAndPort getSyncSourceAddress() const;
         virtual std::vector<HostAndPort> getMaybeUpHostAndPorts() const;
         virtual int getMaintenanceCount() const;
+        virtual long long getTerm() const;
         virtual void setForceSyncSourceIndex(int index);
         virtual HostAndPort chooseNewSyncSource(Date_t now, 
                                                 const Timestamp& lastOpApplied);
@@ -187,8 +189,16 @@ namespace repl {
         virtual bool stepDownIfPending();
         virtual Date_t getStepDownTime() const;
         virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder,
-                                               const Timestamp& lastCommitttedOpTime) const;
+                                               const OpTime& lastCommitttedOpTime) const;
+        Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
+                                                   long long* responseTerm);
+        virtual void processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
+                                                ReplSetRequestVotesResponse* response,
+                                                const OpTime& lastAppliedOpTime);
 
+        virtual void summarizeAsHtml(ReplSetHtmlSummary* output);
+
+        virtual void loadLastVote(const LastVote& lastVote);
 
         ////////////////////////////////////////////////////////////
         //
@@ -332,7 +342,7 @@ namespace repl {
 
         // This node's election term.  The term is used as part of the consensus algorithm to elect
         // and maintain one primary (leader) node in the cluster.
-        long long _term;
+        long long _term = -1;
 
         // the index of the member we currently believe is primary, if one exists, otherwise -1
         int _currentPrimaryIndex;
@@ -390,15 +400,17 @@ namespace repl {
         PingMap _pings;
 
         // Last vote info from the election
-        struct LastVote {
+        struct VoteLease {
 
             static const Seconds leaseTime;
 
-            LastVote() : when(0), whoId(-1) { }
             Date_t when;
-            int whoId;
+            int whoId = -1;
             HostAndPort whoHostAndPort;
-        } _lastVote;
+        } _voteLease;
+
+        // V1 last vote info for elections
+        LastVote _lastVote;
 
     };
 

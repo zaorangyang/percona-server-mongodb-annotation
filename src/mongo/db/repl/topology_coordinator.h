@@ -40,7 +40,6 @@
 
 namespace mongo {
 
-    class OperationContext;
     class Timestamp;
 
 namespace repl {
@@ -49,6 +48,7 @@ namespace repl {
     class ReplSetHeartbeatArgs;
     class ReplicaSetConfig;
     class TagSubgroup;
+    class LastVote;
     struct MemberState;
 
     /**
@@ -102,6 +102,12 @@ namespace repl {
          * Gets the current value of the maintenance mode counter.
          */
         virtual int getMaintenanceCount() const = 0;
+
+        /**
+         * Gets the latest term this member is aware of. If this member is the primary,
+         * it's the current term of the replica set.
+         */
+        virtual long long getTerm() const = 0;
 
         ////////////////////////////////////////////////////////////
         //
@@ -359,7 +365,37 @@ namespace repl {
          * Prepares a BSONObj describing the current term, primary, and lastOp information.
          */
         virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder,
-                                               const Timestamp& lastCommittedOpTime) const = 0;
+                                               const OpTime& lastCommittedOpTime) const = 0;
+
+        /**
+         * Writes into 'output' all the information needed to generate a summary of the current
+         * replication state for use by the web interface.
+         */
+        virtual void summarizeAsHtml(ReplSetHtmlSummary* output) = 0;
+
+        /**
+         * Prepares a ReplSetRequestVotesResponse.
+         */
+        virtual void processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
+                                                ReplSetRequestVotesResponse* response,
+                                                const OpTime& lastAppliedOpTime) = 0;
+
+        /**
+         * Determines whether or not the newly elected primary is valid from our perspective.
+         * If it is, sets the _currentPrimaryIndex and term to the received values.
+         * If it is not, return ErrorCode::BadValue and the current term from our perspective.
+         * Populate responseTerm with the current term from our perspective.
+         */
+        virtual Status processReplSetDeclareElectionWinner(
+                const ReplSetDeclareElectionWinnerArgs& args,
+                long long* responseTerm) = 0;
+
+        /**
+         * Loads an initial LastVote document, which was read from local storage.
+         *
+         * Called only during replication startup. All other updates are done internally.
+         */
+        virtual void loadLastVote(const LastVote& lastVote) = 0;
 
     protected:
         TopologyCoordinator() {}

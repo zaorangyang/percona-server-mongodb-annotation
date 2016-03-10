@@ -216,13 +216,11 @@ namespace QueryTests {
     class ClientBase {
     public:
         ClientBase() : _client(&_txn) {
-            _prevError = mongo::lastError._get( false );
-            mongo::lastError.release();
-            mongo::lastError.reset( new LastError() );
+            mongo::LastError::get(_txn.getClient()).reset();
             _txn.getCurOp()->reset();
         }
         virtual ~ClientBase() {
-            mongo::lastError.reset( _prevError );
+            mongo::LastError::get(_txn.getClient()).reset();
         }
 
     protected:
@@ -238,9 +236,6 @@ namespace QueryTests {
 
         OperationContextImpl _txn;
         DBDirectClient _client;
-
-    private:
-        LastError* _prevError;
     };
 
     class BoundedKey : public ClientBase {
@@ -665,9 +660,9 @@ namespace QueryTests {
                                      "capped" << true << "size" << 8192 ),
                                 info );
 
-            Date_t one = getNextGlobalTimestamp().asULL();
-            Date_t two = getNextGlobalTimestamp().asULL();
-            Date_t three = getNextGlobalTimestamp().asULL();
+            Date_t one = Date_t::fromMillisSinceEpoch(getNextGlobalTimestamp().asLL());
+            Date_t two = Date_t::fromMillisSinceEpoch(getNextGlobalTimestamp().asLL());
+            Date_t three = Date_t::fromMillisSinceEpoch(getNextGlobalTimestamp().asLL());
             insert( ns, BSON( "ts" << one ) );
             insert( ns, BSON( "ts" << two ) );
             insert( ns, BSON( "ts" << three ) );
@@ -680,7 +675,7 @@ namespace QueryTests {
             
             ClientCursorPin clientCursor( ctx.db()->getCollection( ns )->getCursorManager(),
                                           cursorId );
-            ASSERT_EQUALS( three.millis, clientCursor.c()->getSlaveReadTill().asULL() );
+            ASSERT_EQUALS( three.toULL(), clientCursor.c()->getSlaveReadTill().asULL() );
         }
     };
 

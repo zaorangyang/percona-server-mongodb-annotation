@@ -29,8 +29,8 @@
 #pragma once
 
 #include "mongo/bson/oid.h"
-#include "mongo/bson/timestamp.h"
 #include "mongo/db/client.h"
+#include "mongo/db/repl/optime.h"
 
 namespace mongo {
 
@@ -43,15 +43,15 @@ namespace repl {
     public:
         static const Client::Decoration<ReplClientInfo> forClient;
 
-        void setLastOp(Timestamp op) { _lastOp = op; }
-        Timestamp getLastOp() const { return _lastOp; }
+        void setLastOp(const OpTime& op) { _lastOp = op; }
+        OpTime getLastOp() const { return _lastOp; }
 
         // Only used for master/slave
         void setRemoteID(OID rid) { _remoteId = rid; }
         OID getRemoteID() const { return _remoteId; }
 
     private:
-        Timestamp _lastOp = Timestamp();
+        OpTime _lastOp = OpTime();
         OID _remoteId = OID();
     };
 

@@ -120,9 +120,9 @@ namespace {
 
 
         invariant(_rsConfig.getMemberAt(_selfIndex).isElectable());
-        Timestamp lastOpTimeApplied(_getMyLastOptime_inlock());
+        OpTime lastOpTimeApplied(_getMyLastOptime_inlock());
 
-        if (lastOpTimeApplied == Timestamp()) {
+        if (lastOpTimeApplied.isNull()) {
             log() << "not trying to elect self, "
                 "do not yet have a complete set of data from any point in time";
             return;
@@ -137,7 +137,7 @@ namespace {
 
         StatusWith<ReplicationExecutor::EventHandle> nextPhaseEvh = _freshnessChecker->start(
                 &_replExecutor,
-                lastOpTimeApplied,
+                lastOpTimeApplied.getTimestamp(),
                 _rsConfig,
                 _selfIndex,
                 _topCoord->getMaybeUpHostAndPorts(),
@@ -173,9 +173,9 @@ namespace {
                 break;
             case FreshnessChecker::FreshnessTie:
                 if ((_selfIndex != 0) && !_sleptLastElection) {
-                    const long long ms = _replExecutor.nextRandomInt64(1000) + 50;
+                    const auto ms = Milliseconds(_replExecutor.nextRandomInt64(1000) + 50);
                     const Date_t nextCandidateTime = now + ms;
-                    log() << "possible election tie; sleeping " << ms << "ms until " <<
+                    log() << "possible election tie; sleeping " << ms.count() << "ms until " <<
                         dateToISOStringLocal(nextCandidateTime);
                     _topCoord->setElectionSleepUntil(nextCandidateTime);
                     _replExecutor.scheduleWorkAt(
@@ -241,7 +241,7 @@ namespace {
                 " votes, but needed at least " << _rsConfig.getMajorityVoteCount();
             // Suppress ourselves from standing for election again, giving other nodes a chance 
             // to win their elections.
-            const long long ms = _replExecutor.nextRandomInt64(1000) + 50;
+            const auto ms = Milliseconds(_replExecutor.nextRandomInt64(1000) + 50);
             const Date_t now(_replExecutor.now());
             const Date_t nextCandidateTime = now + ms;
             log() << "waiting until " << nextCandidateTime << " before standing for election again";
@@ -273,7 +273,9 @@ namespace {
         if (!cbData.status.isOK()) {
             return;
         }
-        if (_topCoord->checkShouldStandForElection(_replExecutor.now(), getMyLastOptime())) {
+        if (_topCoord->checkShouldStandForElection(_replExecutor.now(),
+                                                   getMyLastOptime().getTimestamp()))
+        {
             _startElectSelf();
         }
     }

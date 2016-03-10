@@ -57,7 +57,6 @@
 #include "mongo/util/mongoutils/html.h"
 #include "mongo/util/ramlog.h"
 #include "mongo/util/version.h"
-#include "mongo/util/version_reporting.h"
 
 
 namespace mongo {
@@ -76,7 +75,6 @@ namespace {
         ss << mongodVersion() << '\n';
         ss << "git hash: " << gitVersion() << '\n';
         ss << openSSLVersion("OpenSSL version: ", "\n");
-        ss << "sys info: " << sysInfo() << '\n';
         ss << "uptime: " << time(0) - serverGlobalParams.started << " seconds\n";
         ss << "</pre>";
     }
@@ -376,7 +374,8 @@ namespace {
         }
 
         ss << start(dbname) << h2(dbname);
-        ss << "<p><a href=\"/_commands\">List all commands</a></p>\n";
+        ss << "<p><a href=\"/_commands\">List all commands</a> | \n";
+        ss << "<a href=\"/_replSet\">Replica set status</a></p>\n";
 
         {
             const Command::CommandMap* m = Command::webCommands();

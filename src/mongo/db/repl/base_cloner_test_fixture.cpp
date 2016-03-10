@@ -131,7 +131,7 @@ namespace repl {
         boost::unique_lock<boost::mutex> lk(_mutex);
         if (_status == getDefaultStatus()) {
             try {
-                _setStatusCondition.timed_wait(lk, ReplicationExecutor::Milliseconds(1000));
+                _setStatusCondition.wait_for(lk, Milliseconds(1000));
             }
             catch (const boost::thread_interrupted&) {
             }
@@ -142,8 +142,8 @@ namespace repl {
     void BaseClonerTest::scheduleNetworkResponse(NetworkOperationIterator noi,
                                                     const BSONObj& obj) {
         auto net = getNet();
-        ReplicationExecutor::Milliseconds millis(0);
-        ReplicationExecutor::RemoteCommandResponse response(obj, millis);
+        Milliseconds millis(0);
+        RemoteCommandResponse response(obj, millis);
         ReplicationExecutor::ResponseStatus responseStatus(response);
         net->scheduleResponse(noi, net->now(), responseStatus);
     }

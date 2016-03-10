@@ -30,8 +30,11 @@
 
 #include <map>
 #include <boost/scoped_ptr.hpp>
+#include <boost/thread/barrier.hpp>
 #include <boost/thread/thread.hpp>
 
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/network_interface_mock.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/replication_executor_test_fixture.h"
@@ -45,15 +48,15 @@ namespace repl {
 
 namespace {
 
-    bool operator==(const ReplicationExecutor::RemoteCommandRequest lhs,
-                    const ReplicationExecutor::RemoteCommandRequest rhs) {
+    bool operator==(const RemoteCommandRequest lhs,
+                    const RemoteCommandRequest rhs) {
         return lhs.target == rhs.target &&
             lhs.dbname == rhs.dbname &&
             lhs.cmdObj == rhs.cmdObj;
     }
 
-    bool operator!=(const ReplicationExecutor::RemoteCommandRequest lhs,
-                    const ReplicationExecutor::RemoteCommandRequest rhs) {
+    bool operator!=(const RemoteCommandRequest lhs,
+                    const RemoteCommandRequest rhs) {
         return !(lhs == rhs);
     }
 
@@ -281,22 +284,22 @@ namespace {
         Status status3(ErrorCodes::InternalError, "Not mutated");
         const Date_t now = net->now();
         const ReplicationExecutor::CallbackHandle cb1 =
-            unittest::assertGet(executor.scheduleWorkAt(Date_t(now.millis + 100),
+            unittest::assertGet(executor.scheduleWorkAt(now + Milliseconds(100),
                                                         stdx::bind(setStatus,
                                                                    stdx::placeholders::_1,
                                                                    &status1)));
-        unittest::assertGet(executor.scheduleWorkAt(Date_t(now.millis + 5000),
+        unittest::assertGet(executor.scheduleWorkAt(now + Milliseconds(5000),
                                                     stdx::bind(setStatus,
                                                                stdx::placeholders::_1,
                                                                &status3)));
         const ReplicationExecutor::CallbackHandle cb2 =
-            unittest::assertGet(executor.scheduleWorkAt(Date_t(now.millis + 200),
+            unittest::assertGet(executor.scheduleWorkAt(now + Milliseconds(200),
                                                         stdx::bind(setStatusAndShutdown,
                                                                    stdx::placeholders::_1,
                                                                    &status2)));
         const Date_t startTime = net->now();
-        net->runUntil(startTime + 200 /*ms*/);
-        ASSERT_EQUALS(startTime + 200, net->now());
+        net->runUntil(startTime + Milliseconds(200));
+        ASSERT_EQUALS(startTime + Milliseconds(200), net->now());
         executor.wait(cb1);
         executor.wait(cb2);
         ASSERT_OK(status1);
@@ -306,14 +309,14 @@ namespace {
         ASSERT_EQUALS(status3, ErrorCodes::CallbackCanceled);
     }
 
-    std::string getRequestDescription(const ReplicationExecutor::RemoteCommandRequest& request) {
+    std::string getRequestDescription(const RemoteCommandRequest& request) {
         return mongoutils::str::stream() << "Request(" << request.target.toString() << ", " <<
             request.dbname << ", " << request.cmdObj << ')';
     }
 
     static void setStatusOnRemoteCommandCompletion(
             const ReplicationExecutor::RemoteCommandCallbackData& cbData,
-            const ReplicationExecutor::RemoteCommandRequest& expectedRequest,
+            const RemoteCommandRequest& expectedRequest,
             Status* outStatus) {
 
         if (cbData.request != expectedRequest) {
@@ -332,7 +335,7 @@ namespace {
         ReplicationExecutor& executor = getExecutor();
         launchExecutorThread();
         Status status1(ErrorCodes::InternalError, "Not mutated");
-        const ReplicationExecutor::RemoteCommandRequest request(
+        const RemoteCommandRequest request(
                 HostAndPort("localhost", 27017),
                 "mydb",
                 BSON("whatsUp" << "doc"));
@@ -359,7 +362,7 @@ namespace {
     TEST_F(ReplicationExecutorTest, ScheduleAndCancelRemoteCommand) {
         ReplicationExecutor& executor = getExecutor();
         Status status1(ErrorCodes::InternalError, "Not mutated");
-        const ReplicationExecutor::RemoteCommandRequest request(
+        const RemoteCommandRequest request(
                 HostAndPort("localhost", 27017),
                 "mydb",
                 BSON("whatsUp" << "doc"));
@@ -379,15 +382,70 @@ namespace {
         ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status1);
     }
 
+    TEST_F(ReplicationExecutorTest, ScheduleDBWorkAndExclusiveWorkConcurrently) {
+        boost::barrier barrier(2U);
+        NamespaceString nss("mydb", "mycoll");
+        ReplicationExecutor& executor = getExecutor();
+        Status status1(ErrorCodes::InternalError, "Not mutated");
+        OperationContext* txn = nullptr;
+        using CallbackData = ReplicationExecutor::CallbackData;
+        ASSERT_OK(executor.scheduleDBWork([&](const CallbackData& cbData) {
+            status1 = cbData.status;
+            txn = cbData.txn;
+            barrier.count_down_and_wait();
+            if (cbData.status != ErrorCodes::CallbackCanceled) {
+                cbData.executor->shutdown();
+            }
+        }).getStatus());
+        ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock([&](const CallbackData& cbData) {
+            barrier.count_down_and_wait();
+        }).getStatus());
+        executor.run();
+        ASSERT_OK(status1);
+        ASSERT(txn);
+    }
+
+    TEST_F(ReplicationExecutorTest, ScheduleDBWorkWithCollectionLock) {
+        NamespaceString nss("mydb", "mycoll");
+        ReplicationExecutor& executor = getExecutor();
+        Status status1(ErrorCodes::InternalError, "Not mutated");
+        OperationContext* txn = nullptr;
+        bool collectionIsLocked = false;
+        using CallbackData = ReplicationExecutor::CallbackData;
+        ASSERT_OK(executor.scheduleDBWork([&](const CallbackData& cbData) {
+            status1 = cbData.status;
+            txn = cbData.txn;
+            collectionIsLocked = txn ?
+                txn->lockState()->isCollectionLockedForMode(nss.ns(), MODE_X) :
+                false;
+            if (cbData.status != ErrorCodes::CallbackCanceled) {
+                cbData.executor->shutdown();
+            }
+        }, nss, MODE_X).getStatus());
+        executor.run();
+        ASSERT_OK(status1);
+        ASSERT(txn);
+        ASSERT_TRUE(collectionIsLocked);
+    }
+
     TEST_F(ReplicationExecutorTest, ScheduleExclusiveLockOperation) {
         ReplicationExecutor& executor = getExecutor();
         Status status1(ErrorCodes::InternalError, "Not mutated");
-        ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock(
-                          stdx::bind(setStatusAndShutdown,
-                                     stdx::placeholders::_1,
-                                     &status1)).getStatus());
+        OperationContext* txn = nullptr;
+        bool lockIsW = false;
+        using CallbackData = ReplicationExecutor::CallbackData;
+        ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock([&](const CallbackData& cbData) {
+            status1 = cbData.status;
+            txn = cbData.txn;
+            lockIsW = txn ? txn->lockState()->isW() : false;
+            if (cbData.status != ErrorCodes::CallbackCanceled) {
+                cbData.executor->shutdown();
+            }
+        }).getStatus());
         executor.run();
         ASSERT_OK(status1);
+        ASSERT(txn);
+        ASSERT_TRUE(lockIsW);
     }
 
     TEST_F(ReplicationExecutorTest, RemoteCommandWithTimeout) {
@@ -395,11 +453,11 @@ namespace {
         ReplicationExecutor& executor = getExecutor();
         Status status(ErrorCodes::InternalError, "");
         launchExecutorThread();
-        const ReplicationExecutor::RemoteCommandRequest request(
+        const RemoteCommandRequest request(
                 HostAndPort("lazy", 27017),
                 "admin",
                 BSON("sleep" << 1),
-                ReplicationExecutor::Milliseconds(1));
+                Milliseconds(1));
         ReplicationExecutor::CallbackHandle cbHandle = unittest::assertGet(
                 executor.scheduleRemoteCommand(
                         request,
@@ -411,10 +469,10 @@ namespace {
         const Date_t startTime = net->now();
         NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
-                              startTime + 2,
+                              startTime + Milliseconds(2),
                               ResponseStatus(ErrorCodes::ExceededTimeLimit, "I took too long"));
-        net->runUntil(startTime + 2);
-        ASSERT_EQUALS(startTime + 2, net->now());
+        net->runUntil(startTime + Milliseconds(2));
+        ASSERT_EQUALS(startTime + Milliseconds(2), net->now());
         executor.wait(cbHandle);
         ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit, status);
     }
@@ -422,7 +480,7 @@ namespace {
     TEST_F(ReplicationExecutorTest, CallbackHandleComparison) {
         ReplicationExecutor& executor = getExecutor();
         Status status(ErrorCodes::InternalError, "");
-        const ReplicationExecutor::RemoteCommandRequest request(
+        const RemoteCommandRequest request(
                 HostAndPort("lazy", 27017),
                 "admin",
                 BSON("cmd" << 1));

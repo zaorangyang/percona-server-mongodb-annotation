@@ -41,12 +41,14 @@ namespace mongo {
     class BatchedCommandResponse;
     struct BSONArray;
     class BSONObj;
+    class BSONObjBuilder;
     class ChunkType;
     class CollectionType;
     class ConnectionString;
     class DatabaseType;
     class DistLockManager;
     class OperationContext;
+    class Query;
     class SettingsType;
     class Shard;
     class ShardKeyPattern;
@@ -218,11 +220,17 @@ namespace mongo {
                                           std::vector<std::string>* dbs) = 0;
 
         /**
-         * Gets all chunks (of type ChunkType) for a shard.
+         * Gets the requested number of chunks (of type ChunkType) that satisfy a query.
+         *
+         * @param query The query to filter out the results.
+         * @param nToReturn The number of chunk entries to return. 0 means all.
+         * @param chunks Vector entry to receive the results
+         *
          * Returns a !OK status if an error occurs.
          */
-        virtual Status getChunksForShard(const std::string& shardName,
-                                         std::vector<ChunkType>* chunks) = 0;
+        virtual Status getChunks(const Query& query,
+                                 int nToReturn,
+                                 std::vector<ChunkType>* chunks) = 0;
 
         /**
          * Retrieves all shards in this sharded cluster.
@@ -241,6 +249,26 @@ namespace mongo {
          * Otherwise, returns false.
          */
         virtual bool doShardsExist() = 0;
+
+        /**
+         * Runs a user management command on the config servers.
+         * @param commandName: name of command
+         * @param dbname: database for which the user management command is invoked
+         * @param cmdObj: command obj
+         * @param result: contains data returned from config servers
+         * Returns true on success.
+         */
+        virtual bool runUserManagementWriteCommand(const std::string& commandName,
+                                                   const std::string& dbname,
+                                                   const BSONObj& cmdObj,
+                                                   BSONObjBuilder* result) = 0;
+
+        /**
+         * Runs a read-only user management command on a single config server.
+         */
+        virtual bool runUserManagementReadCommand(const std::string& dbname,
+                                                  const BSONObj& cmdObj,
+                                                  BSONObjBuilder* result) = 0;
 
         /**
          * Applies oplog entries to the config servers.
@@ -277,9 +305,7 @@ namespace mongo {
          * Returns global settings for a certain key.
          * @param key: key for SettingsType::ConfigNS document.
          *
-         * NOTE: If no document with such a key exists, an empty SettingsType object will
-         *       will be returned. It is up to the caller to check if the SettingsType
-         *       is non-empty (via the keySet() method on the SettingsType).
+         * Returns NoSuchKey if no SettingsType::ConfigNS document with such key exists.
          */
         virtual StatusWith<SettingsType> getGlobalSettings(const std::string& key) = 0;
 

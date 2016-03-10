@@ -54,10 +54,10 @@ namespace {
             _numResponses(0),
             _maxResponses(maxResponses) {}
 
-        virtual std::vector<ReplicationExecutor::RemoteCommandRequest> getRequests() const {
-            std::vector<ReplicationExecutor::RemoteCommandRequest> requests;
+        virtual std::vector<RemoteCommandRequest> getRequests() const {
+            std::vector<RemoteCommandRequest> requests;
             for (int i = 0; i < 3; i++) {
-                requests.push_back(ReplicationExecutor::RemoteCommandRequest(
+                requests.push_back(RemoteCommandRequest(
                             HostAndPort("hostname", i),
                             "admin",
                             BSONObj(),
@@ -67,7 +67,7 @@ namespace {
         }
 
         virtual void processResponse(
-                const ReplicationExecutor::RemoteCommandRequest& request,
+                const RemoteCommandRequest& request,
                 const ResponseStatus& response) {
             _numResponses++;
         }
@@ -186,29 +186,29 @@ namespace {
         net->enterNetwork();
         NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
-                              net->now()+2000,
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              net->now() + Seconds(2),
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
-                                    boost::posix_time::milliseconds(10))));
+                                    Milliseconds(10))));
         ASSERT_FALSE(ranCompletion);
 
         noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
-                              net->now()+2000,
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              net->now() + Seconds(2),
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
-                                    boost::posix_time::milliseconds(10))));
+                                    Milliseconds(10))));
         ASSERT_FALSE(ranCompletion);
 
         noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
-                              net->now()+5000,
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              net->now() + Seconds(5),
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
-                                    boost::posix_time::milliseconds(10))));
+                                    Milliseconds(10))));
         ASSERT_FALSE(ranCompletion);
 
-        net->runUntil(net->now()+2000);
+        net->runUntil(net->now() + Seconds(2));
         ASSERT_TRUE(ranCompletion);
 
         delete sga;
@@ -290,31 +290,30 @@ namespace {
         net->enterNetwork();
         NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
-                              net->now()+2000,
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              net->now() + Seconds(2),
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
-                                    boost::posix_time::milliseconds(10))));
+                                    Milliseconds(10))));
         ASSERT_FALSE(ranCompletion);
 
         noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
-                              net->now()+2000,
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              net->now() + Seconds(2),
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
-                                    boost::posix_time::milliseconds(10))));
+                                    Milliseconds(10))));
         ASSERT_FALSE(ranCompletion);
 
         noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
-                              net->now()+5000,
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              net->now() + Seconds(5),
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
-                                    boost::posix_time::milliseconds(10))));
+                                    Milliseconds(10))));
         ASSERT_FALSE(ranCompletion);
 
-        net->runUntil(net->now()+2000);
+        net->runUntil(net->now() + Seconds(2));
         ASSERT_TRUE(ranCompletion);
-
 
         net->runReadyNetworkOperations();
         // the third resposne should not be processed, so the count should not increment
@@ -359,7 +358,7 @@ namespace {
         NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
                               net->now(),
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
                                     boost::posix_time::milliseconds(10))));
         net->runReadyNetworkOperations();
@@ -368,7 +367,7 @@ namespace {
         noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
                               net->now(),
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
                                     boost::posix_time::milliseconds(10))));
         net->runReadyNetworkOperations();
@@ -377,7 +376,7 @@ namespace {
         noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
                               net->now(),
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
                                     boost::posix_time::milliseconds(10))));
         net->runReadyNetworkOperations();
@@ -398,9 +397,9 @@ namespace {
         NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
                               net->now(),
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
-                                    boost::posix_time::milliseconds(10))));
+                                    Milliseconds(10))));
         net->runReadyNetworkOperations();
 
         noi = net->getNextReadyRequest();
@@ -410,9 +409,9 @@ namespace {
         noi = net->getNextReadyRequest();
         net->scheduleResponse(noi,
                               net->now(),
-                              ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                              ResponseStatus(RemoteCommandResponse(
                                     BSON("ok" << 1),
-                                    boost::posix_time::milliseconds(10))));
+                                    Milliseconds(10))));
         net->runReadyNetworkOperations();
         net->exitNetwork();
 

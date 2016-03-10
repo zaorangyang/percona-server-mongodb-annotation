@@ -48,7 +48,6 @@
 #include "mongo/db/auth/auth_index_d.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/auth/authz_manager_external_state_d.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
@@ -70,7 +69,6 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/json.h"
-#include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/op_observer.h"
@@ -116,7 +114,7 @@
 #include "mongo/util/startup_test.h"
 #include "mongo/util/text.h"
 #include "mongo/util/time_support.h"
-#include "mongo/util/version_reporting.h"
+#include "mongo/util/version.h"
 
 #if !defined(_WIN32)
 # include <sys/file.h>
@@ -157,15 +155,13 @@ namespace mongo {
             Client::initThread("conn", p);
         }
 
-        virtual void process( Message& m , AbstractMessagingPort* port , LastError * le) {
+        virtual void process(Message& m , AbstractMessagingPort* port) {
             OperationContextImpl txn;
             while ( true ) {
                 if ( inShutdown() ) {
                     log() << "got request after shutdown()" << endl;
                     break;
                 }
-
-                lastError.startRequest( m , le );
 
                 DbResponse dbresponse;
                 assembleResponse(&txn, m, dbresponse, port->remote());
@@ -209,7 +205,7 @@ namespace mongo {
         toLog.append( "hostname", getHostNameCached() );
 
         toLog.appendTimeT( "startTime", time(0) );
-        toLog.append( "startTimeLocal", dateToCtimeString(curTimeMillis64()) );
+        toLog.append( "startTimeLocal", dateToCtimeString(Date_t::now()) );
 
         toLog.append("cmdLine", serverGlobalParams.parsedOpts);
         toLog.append( "pid", ProcessId::getCurrent().asLongLong() );
@@ -217,6 +213,7 @@ namespace mongo {
 
         BSONObjBuilder buildinfo( toLog.subobjStart("buildinfo"));
         appendBuildInfo(buildinfo);
+        appendStorageEngineList(&buildinfo);
         buildinfo.doneFast();
 
         BSONObj o = toLog.obj();
@@ -747,20 +744,6 @@ static void startupConfigActions(const std::vector<std::string>& args) {
         quickExit(EXIT_SUCCESS);
     }
 #endif
-}
-
-MONGO_INITIALIZER_GENERAL(CreateAuthorizationManager,
-                          ("SetupInternalSecurityUser",
-                           "OIDGeneration",
-                           "SetGlobalEnvironment",
-                           "EndStartupOptionStorage"),
-                          MONGO_NO_DEPENDENTS)
-        (InitializerContext* context) {
-    auto authzManager = stdx::make_unique<AuthorizationManager>(
-            new AuthzManagerExternalStateMongod());
-    authzManager->setAuthEnabled(serverGlobalParams.isAuthEnabled);
-    AuthorizationManager::set(getGlobalServiceContext(), std::move(authzManager));
-    return Status::OK();
 }
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager, ("SetGlobalEnvironment"))

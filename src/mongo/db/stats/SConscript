@@ -8,7 +8,7 @@ env.Library(
         'top.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/service_context',
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 
@@ -19,5 +19,14 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'top',
+    ],
+)
+
+env.Library(
+    target='counters',
+    source=[
+        'counters.cpp',
+    ],
+    LIBDEPS=[
     ],
 )

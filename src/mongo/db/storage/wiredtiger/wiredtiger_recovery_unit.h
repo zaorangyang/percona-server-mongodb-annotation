@@ -57,21 +57,19 @@ namespace mongo {
 
         virtual void reportState( BSONObjBuilder* b ) const;
 
-        virtual void beginUnitOfWork(OperationContext* opCtx);
+        void beginUnitOfWork(OperationContext* opCtx) final;
+        void commitUnitOfWork() final;
+        void abortUnitOfWork() final;
 
-        virtual void commitUnitOfWork();
-
-        virtual void endUnitOfWork();
-
-        virtual bool awaitCommit();
-        virtual void goingToAwaitCommit();
+        virtual bool waitUntilDurable();
+        virtual void goingToWaitUntilDurable();
 
         virtual void registerChange(Change *);
 
         virtual void beingReleasedFromOperationContext();
         virtual void beingSetOnOperationContext();
 
-        virtual void commitAndRestart();
+        virtual void abandonSnapshot();
 
         // un-used API
         virtual void* writingPtr(void* data, size_t len) { invariant(!"don't call writingPtr"); }
@@ -88,7 +86,6 @@ namespace mongo {
         void assertInActiveTxn() const;
 
         bool everStartedWrite() const { return _everStartedWrite; }
-        int depth() const { return _depth; }
 
         void setOplogReadTill( const RecordId& loc );
         RecordId getOplogReadTill() const { return _oplogReadTill; }
@@ -109,7 +106,7 @@ namespace mongo {
         WiredTigerSessionCache* _sessionCache; // not owned
         WiredTigerSession* _session; // owned, but from pool
         bool _defaultCommit;
-        int _depth;
+        bool _inUnitOfWork;
         bool _active;
         uint64_t _myTransactionCount;
         bool _everStartedWrite;

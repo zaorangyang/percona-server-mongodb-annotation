@@ -101,10 +101,14 @@ namespace {
         return _recovery.release();
     }
 
-    void OperationContextImpl::setRecoveryUnit(RecoveryUnit* unit) {
+    OperationContext::RecoveryUnitState OperationContextImpl::setRecoveryUnit(RecoveryUnit* unit,
+                                                                         RecoveryUnitState state) {
         _recovery.reset(unit);
+        RecoveryUnitState oldState = _ruState;
+        _ruState = state;
         if ( unit )
             unit->beingSetOnOperationContext();
+        return oldState;
     }
 
     Locker* OperationContextImpl::lockState() const {
@@ -132,6 +136,10 @@ namespace {
 
     unsigned int OperationContextImpl::getOpID() const {
         return getCurOp()->opNum();
+    }
+
+    uint64_t OperationContextImpl::getRemainingMaxTimeMicros() const {
+        return getCurOp()->getRemainingMaxTimeMicros();
     }
 
     // Enabling the checkForInterruptFail fail point will start a game of random chance on the

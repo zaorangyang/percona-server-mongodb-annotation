@@ -127,7 +127,7 @@ namespace mongo {
         pSource->dispose();
     }
 
-    void DocumentSourceGroup::optimize() {
+    intrusive_ptr<DocumentSource> DocumentSourceGroup::optimize() {
         // TODO if all _idExpressions are ExpressionConstants after optimization, then we know there
         // will only be one group. We should take advantage of that to avoid going through the hash
         // table.
@@ -138,6 +138,8 @@ namespace mongo {
         for (size_t i = 0; i < vFieldName.size(); i++) {
              vpExpression[i] = vpExpression[i]->optimize();
         }
+
+        return this;
     }
 
     Value DocumentSourceGroup::serialize(bool explain) const {
@@ -492,7 +494,7 @@ namespace mongo {
                 for (size_t j=0; j < ptrs[i]->second.size(); j++) {
                     accums.push_back(ptrs[i]->second[j]->getValue(/*toBeMerged=*/true));
                 }
-                writer.addAlreadySorted(ptrs[i]->first, Value::consume(accums));
+                writer.addAlreadySorted(ptrs[i]->first, Value(std::move(accums)));
             }
             break;
         }
@@ -547,7 +549,7 @@ namespace mongo {
         for (size_t i = 0; i < _idExpressions.size(); i++) {
             vals.push_back(_idExpressions[i]->evaluate(vars));
         }
-        return Value::consume(vals);
+        return Value(std::move(vals));
     }
 
     Value DocumentSourceGroup::expandId(const Value& val) {

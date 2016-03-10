@@ -39,6 +39,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -69,6 +70,7 @@ namespace {
         } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "setInitialSyncFlags", minvalidNS);
     }
 
+    // TODO(siyuan) Change minValid to OpTime
     void setMinValid(OperationContext* ctx, Timestamp ts) {
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
             ScopedTransaction transaction(ctx, MODE_IX);
@@ -92,6 +94,8 @@ namespace {
             }
             return false;
         } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(&txn, "getInitialSyncFlags", minvalidNS);
+
+        MONGO_UNREACHABLE;
     }
 
     Timestamp getMinValid(OperationContext* txn) {

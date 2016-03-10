@@ -49,8 +49,8 @@
 namespace mongo {
 
     namespace {
-        struct AwaitCommitData {
-            AwaitCommitData() :
+        struct WaitUntilDurableData {
+            WaitUntilDurableData() :
                 numWaitingForSync(0),
                 lastSyncTime(0) {
             }
@@ -62,7 +62,7 @@ namespace mongo {
             }
 
             // return true if happened
-            bool awaitCommit() {
+            bool waitUntilDurable() {
                 boost::unique_lock<boost::mutex> lk( mutex );
                 long long start = lastSyncTime;
                 numWaitingForSync.fetchAndAdd(1);
@@ -76,13 +76,13 @@ namespace mongo {
             boost::mutex mutex; // this just protects lastSyncTime
             boost::condition condvar;
             long long lastSyncTime;
-        } awaitCommitData;
+        } waitUntilDurableData;
     }
 
     WiredTigerRecoveryUnit::WiredTigerRecoveryUnit(WiredTigerSessionCache* sc) :
         _sessionCache( sc ),
         _session( NULL ),
-        _depth(0),
+        _inUnitOfWork(false),
         _active( false ),
         _myTransactionCount( 1 ),
         _everStartedWrite( false ),
@@ -92,7 +92,7 @@ namespace mongo {
     }
 
     WiredTigerRecoveryUnit::~WiredTigerRecoveryUnit() {
-        invariant( _depth == 0 );
+        invariant(!_inUnitOfWork);
         _abort();
         if ( _session ) {
             _sessionCache->releaseSession( _session );
@@ -101,7 +101,7 @@ namespace mongo {
     }
 
     void WiredTigerRecoveryUnit::reportState( BSONObjBuilder* b ) const {
-        b->append("wt_depth", _depth);
+        b->append("wt_inUnitOfWork", _inUnitOfWork);
         b->append("wt_active", _active);
         b->append("wt_everStartedWrite", _everStartedWrite);
         b->append("wt_hasTicket", _ticket.hasTicket());
@@ -151,26 +151,26 @@ namespace mongo {
     }
 
     void WiredTigerRecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {
-        invariant( !_currentlySquirreled );
-        _depth++;
+        invariant(!_inUnitOfWork);
+        invariant(!_currentlySquirreled);
+        _inUnitOfWork = true;
         _everStartedWrite = true;
         _getTicket(opCtx);
     }
 
     void WiredTigerRecoveryUnit::commitUnitOfWork() {
-        if (_depth > 1)
-            return; // only outermost WUOW gets committed.
+        invariant(_inUnitOfWork);
+        _inUnitOfWork = false;
         _commit();
     }
 
-    void WiredTigerRecoveryUnit::endUnitOfWork() {
-        _depth--;
-        if ( _depth == 0 ) {
-            _abort();
-        }
+    void WiredTigerRecoveryUnit::abortUnitOfWork() {
+        invariant(_inUnitOfWork);
+        _inUnitOfWork = false;
+        _abort();
     }
 
-    void WiredTigerRecoveryUnit::goingToAwaitCommit() {
+    void WiredTigerRecoveryUnit::goingToWaitUntilDurable() {
         if ( _active ) {
             // too late, can't change config
             return;
@@ -179,17 +179,17 @@ namespace mongo {
         _syncing = true;
     }
 
-    bool WiredTigerRecoveryUnit::awaitCommit() {
+    bool WiredTigerRecoveryUnit::waitUntilDurable() {
         if ( _syncing && _everStartedWrite ) {
             // we did a sync, so we're good
             return true;
         }
-        awaitCommitData.awaitCommit();
+        waitUntilDurableData.waitUntilDurable();
         return true;
     }
 
     void WiredTigerRecoveryUnit::registerChange(Change* change) {
-        invariant(_depth > 0);
+        invariant(_inUnitOfWork);
         _changes.push_back(change);
     }
 
@@ -213,8 +213,8 @@ namespace mongo {
         return _session;
     }
 
-    void WiredTigerRecoveryUnit::commitAndRestart() {
-        invariant(_depth == 0);
+    void WiredTigerRecoveryUnit::abandonSnapshot() {
+        invariant(!_inUnitOfWork);
         if (_active) {
             // Can't be in a WriteUnitOfWork, so safe to rollback
             _txnClose(false);
@@ -307,7 +307,7 @@ namespace mongo {
             invariantWTOK( s->commit_transaction(s, NULL) );
             LOG(2) << "WT commit_transaction";
             if ( _syncing )
-                awaitCommitData.syncHappend();
+                waitUntilDurableData.syncHappend();
         }
         else {
             invariantWTOK( s->rollback_transaction(s, NULL) );
@@ -360,7 +360,7 @@ namespace mongo {
         _getTicket(opCtx);
 
         WT_SESSION *s = _session->getSession();
-        _syncing = _syncing || awaitCommitData.numWaitingForSync.load() > 0;
+        _syncing = _syncing || waitUntilDurableData.numWaitingForSync.load() > 0;
         invariantWTOK( s->begin_transaction(s, _syncing ? "sync=true" : NULL) );
         LOG(2) << "WT begin_transaction";
         _timer.reset();

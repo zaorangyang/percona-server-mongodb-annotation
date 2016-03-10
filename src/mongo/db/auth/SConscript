@@ -12,7 +12,6 @@ env.Library('authcore', ['action_set.cpp',
                          'action_type.cpp',
                          'authorization_manager.cpp',
                          'authorization_session.cpp',
-                         'authz_documents_update_guard.cpp',
                          'authz_manager_external_state.cpp',
                          'authz_manager_external_state_local.cpp',
                          'authz_session_external_state.cpp',
@@ -30,18 +29,24 @@ env.Library('authcore', ['action_set.cpp',
                          'user_set.cpp'],
             LIBDEPS=['sasl_options',
                      '$BUILD_DIR/mongo/base/base',
-                     '$BUILD_DIR/mongo/bson',
+                     '$BUILD_DIR/mongo/bson/bson',
+                     '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
+                     '$BUILD_DIR/mongo/bson/util/bson_extract',
                      '$BUILD_DIR/mongo/crypto/scramauth',
                      '$BUILD_DIR/mongo/db/common',
                      '$BUILD_DIR/mongo/db/ops/update_driver',
-                     '$BUILD_DIR/mongo/namespace_string',
-                     '$BUILD_DIR/mongo/signal_handlers_synchronous',
+                     '$BUILD_DIR/mongo/db/namespace_string',
+                     '$BUILD_DIR/mongo/util/signal_handlers_synchronous',
                      '$BUILD_DIR/mongo/util/stringutils',
                      '$BUILD_DIR/mongo/util/md5'])
 
 env.Library('authcommon',
             ['internal_user_auth.cpp'],
-            LIBDEPS=['$BUILD_DIR/mongo/bson'])
+            LIBDEPS=[
+                '$BUILD_DIR/mongo/bson/bson',
+                '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
+                '$BUILD_DIR/mongo/bson/util/bson_extract',
+            ])
 
 env.Library('authorization_manager_global',
             [
@@ -50,7 +55,16 @@ env.Library('authorization_manager_global',
             ],
             LIBDEPS=[
                 'authcore',
-                '$BUILD_DIR/mongo/service_context',
+                '$BUILD_DIR/mongo/db/service_context',
+            ])
+
+env.Library('authorization_manager_mock_init',
+            [
+                'authorization_manager_mock_init.cpp'
+            ],
+            LIBDEPS=[
+                'authcore',
+                '$BUILD_DIR/mongo/db/service_context',
             ])
 
 env.Library('authservercommon',
@@ -86,13 +100,19 @@ env.Library('authmongod',
             ['authz_manager_external_state_d.cpp',
              'authz_session_external_state_d.cpp',
              'auth_index_d.cpp'],
-            LIBDEPS=['authservercommon', '$BUILD_DIR/mongo/server_parameters'])
+
+            LIBDEPS=[
+                'authservercommon',
+                '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
+                '$BUILD_DIR/mongo/db/server_parameters',
+            ])
 
 env.Library('authmongos',
             ['authz_manager_external_state_s.cpp',
              'authz_session_external_state_s.cpp',
              'user_cache_invalidator_job.cpp'],
-            LIBDEPS=['authservercommon'])
+            LIBDEPS=['authservercommon',
+                     '$BUILD_DIR/mongo/s/catalog/dist_lock_manager'])
 
 env.Library('authmocks',
             ['authz_manager_external_state_mock.cpp'],

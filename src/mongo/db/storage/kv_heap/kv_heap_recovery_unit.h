@@ -106,11 +106,11 @@ namespace mongo {
 
         virtual void commitUnitOfWork();
 
-        virtual void commitAndRestart();
+        virtual void abandonSnapshot();
 
-        virtual void endUnitOfWork();
+        virtual void abortUnitOfWork();
 
-        virtual bool awaitCommit() {
+        virtual bool waitUntilDurable() {
             return true;
         }
 

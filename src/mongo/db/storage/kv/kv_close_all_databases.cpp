@@ -88,8 +88,11 @@ namespace mongo {
             return _recoveryUnit.release();
         }
 
-        virtual void setRecoveryUnit(RecoveryUnit* unit) {
+        virtual RecoveryUnitState setRecoveryUnit(RecoveryUnit* unit, RecoveryUnitState state) {
             _recoveryUnit.reset(unit);
+            RecoveryUnitState oldState = _ruState;
+            _ruState = state;
+            return oldState;
         }
 
         virtual Locker* lockState() const {
@@ -131,6 +134,10 @@ namespace mongo {
 	virtual bool writesAreReplicated() const {
 	    return false;
 	}
+
+        virtual uint64_t getRemainingMaxTimeMicros() const {
+            return 0;
+        }
 
     private:
         std::auto_ptr<RecoveryUnit> _recoveryUnit;

@@ -49,26 +49,26 @@
 #include <mutex>
 
 #include "mongo/config.h"
+#include "mongo/db/client.h"
 #include "mongo/db/db.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/mmap_v1/btree/key.h"
+#include "mongo/db/storage/mmap_v1/compress.h"
 #include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
-#include "mongo/db/storage/mmap_v1/btree/key.h"
+#include "mongo/db/storage/mmap_v1/mmap.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework_options.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/checksum.h"
-#include "mongo/util/compress.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mmap.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/version.h"
-#include "mongo/util/version_reporting.h"
 #include "mongo/db/concurrency/lock_state.h"
 
 namespace PerfTests {
@@ -91,12 +91,10 @@ namespace PerfTests {
     class ClientBase {
     public:
         ClientBase() : _client(&_txn) {
-            _prevError = mongo::lastError._get( false );
-            mongo::lastError.release();
-            mongo::lastError.reset( new LastError() );
+            mongo::LastError::get(_txn.getClient()).reset();
         }
         virtual ~ClientBase() {
-            mongo::lastError.reset( _prevError );
+            mongo::LastError::get(_txn.getClient()).reset();
         }
 
     protected:
@@ -114,7 +112,6 @@ namespace PerfTests {
         OperationContext* txn() { return &_txn; }
 
     private:
-        LastError* _prevError;
         OperationContextImpl _txn;
         DBDirectClient _client;
     };
@@ -157,7 +154,7 @@ namespace PerfTests {
                     }
                 }
 
-                boost::shared_ptr<DBClientConnection> c(new DBClientConnection(false, 0, 60));
+                boost::shared_ptr<DBClientConnection> c(new DBClientConnection(false, 60));
                 string err;
                 if( c->connect(HostAndPort("perfdb.10gen.cc"), err) ) {
                     if( !c->auth("perf", "perf", pwd, err) ) {

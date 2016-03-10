@@ -37,6 +37,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -125,8 +126,9 @@ namespace repl {
                                                              Query().sort( BSON( "$natural" << -1 ) ) );
                         bb.appendDate( "masterFirst" , first["ts"].timestampTime() );
                         bb.appendDate( "masterLast" , last["ts"].timestampTime() );
-                        double lag = (double) (last["ts"].timestampTime() - s["syncedTo"].timestampTime());
-                        bb.append( "lagSeconds" , lag / 1000 );
+                        const auto lag =
+                            (last["ts"].timestampTime() - s["syncedTo"].timestampTime());
+                        bb.append("lagSeconds", durationCount<Milliseconds>(lag) / 1000.0);
                     }
                     conn.done();
                 }
@@ -177,7 +179,8 @@ namespace repl {
             }
 
             BSONObjBuilder result;
-            result.append("latestOptime", replCoord->getMyLastOptime());
+            // TODO(siyuan) Output term of OpTime
+            result.append("latestOptime", replCoord->getMyLastOptime().getTimestamp());
 
             const std::string& oplogNS =
                 replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet ?
@@ -216,7 +219,7 @@ namespace repl {
                authenticated.
             */
             if ( cmdObj["forShell"].trueValue() )
-                lastError.disableForCommand();
+                LastError::get(txn->getClient()).disable();
 
             appendReplicationInfo(txn, result, 0);
 

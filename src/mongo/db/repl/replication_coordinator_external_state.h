@@ -32,6 +32,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -44,6 +45,8 @@ namespace mongo {
     template <typename T> class StatusWith;
 
 namespace repl {
+
+    class LastVote;
 
     /**
      * This class represents the interface the ReplicationCoordinator uses to interact with the
@@ -112,6 +115,17 @@ namespace repl {
         virtual Status storeLocalConfigDocument(OperationContext* txn, const BSONObj& config) = 0;
 
         /**
+         * Gets the replica set lastVote document from local storage, or returns an error.
+         */
+        virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* txn) = 0;
+
+        /**
+         * Stores the replica set lastVote document in local storage, or returns an error.
+         */
+        virtual Status storeLocalLastVoteDocument(OperationContext* txn,
+                                                  const LastVote& lastVote) = 0;
+
+        /**
          * Sets the global opTime to be 'newTime'.
          */
         virtual void setGlobalTimestamp(const Timestamp& newTime) = 0;
@@ -120,7 +134,7 @@ namespace repl {
          * Gets the last optime of an operation performed on this host, from stable
          * storage.
          */
-        virtual StatusWith<Timestamp> loadLastOpTime(OperationContext* txn) = 0;
+        virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn) = 0;
 
         /**
          * Returns the HostAndPort of the remote client connected to us that initiated the operation

@@ -35,6 +35,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/dbhash.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/matcher/matcher.h"
@@ -125,26 +126,20 @@ namespace mongo {
                 invariant(!txn->lockState()->saveLockStateAndUnlock(&lockSnapshot));
             };
 
-            OldClientContext ctx(txn, ns);
-
             Status status(ErrorCodes::InternalError, "");
-            while (true) {
-                try {
-                    // We assume that in the WriteConflict retry case, either the op rolls back
-                    // any changes it makes or is otherwise safe to rerun.
-                    status =
-                        repl::applyOperation_inlock(txn,
-                                                    ctx.db(),
-                                                    temp,
-                                                    alwaysUpsert);
+
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                if (*opType == 'c') {
+                    status = repl::applyCommand_inlock(txn, temp);
                     break;
                 }
-                catch (const WriteConflictException& wce) {
-                    LOG(2) << "WriteConflictException in applyOps command, retrying.";
-                    txn->recoveryUnit()->commitAndRestart();
-                    continue;
+                else {
+                    OldClientContext ctx(txn, ns);
+
+                    status = repl::applyOperation_inlock(txn, ctx.db(), temp, alwaysUpsert);
+                    break;
                 }
-            }
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "applyOps", ns);
 
             ab.append(status.isOK());
             if (!status.isOK()) {
@@ -170,14 +165,13 @@ namespace mongo {
 
             // TODO: possibly use mutable BSON to remove preCondition field
             // once it is available
-            BSONObjIterator iter(applyOpCmd);
             BSONObjBuilder cmdBuilder;
 
-            while (iter.more()) {
-                BSONElement elem(iter.next());
-                if (strcmp(elem.fieldName(), "preCondition") != 0) {
-                    cmdBuilder.append(elem);
-                }
+            for (auto elem : applyOpCmd) {
+                auto name = elem.fieldNameStringData();
+                if (name == "preCondition") continue;
+                if (name == "bypassDocumentValidation") continue;
+                cmdBuilder.append(elem);
             }
 
             const BSONObj cmdRewritten = cmdBuilder.done();
@@ -198,7 +192,7 @@ namespace mongo {
                 catch (const WriteConflictException& wce) {
                     LOG(2) <<
                         "WriteConflictException while logging applyOps command, retrying.";
-                    txn->recoveryUnit()->commitAndRestart();
+                    txn->recoveryUnit()->abandonSnapshot();
                     continue;
                 }
             }

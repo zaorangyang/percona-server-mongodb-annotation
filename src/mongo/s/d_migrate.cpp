@@ -53,6 +53,7 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -81,7 +82,7 @@
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
 #include "mongo/s/d_state.h"
-#include "mongo/s/dist_lock_manager.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/util/assert_util.h"
@@ -102,6 +103,7 @@ namespace {
     using boost::scoped_ptr;
     using mongo::WriteConcernOptions;
     using mongo::repl::ReplicationCoordinator;
+    using mongo::repl::OpTime;
 
     const int kDefaultWTimeoutMs = 60 * 1000;
     const WriteConcernOptions DefaultWriteConcern(2, WriteConcernOptions::NONE, kDefaultWTimeoutMs);
@@ -491,9 +493,9 @@ namespace mongo {
             // Therefore, any multi-key index prefixed by shard key cannot be multikey over
             // the shard key fields.
             IndexDescriptor *idx =
-                collection->getIndexCatalog()->findIndexByPrefix(txn,
-                                                                 _shardKeyPattern ,
-                                                                 false);  /* allow multi key */
+                collection->getIndexCatalog()->findShardKeyPrefixedIndex(txn,
+                                                                         _shardKeyPattern ,
+                                                                         false); // requireSingleKey
 
             if (idx == NULL) {
                 errmsg = str::stream() << "can't find index with prefix " << _shardKeyPattern
@@ -589,7 +591,7 @@ namespace mongo {
 
             log() << "moveChunk number of documents: " << cloneLocsRemaining() << migrateLog;
 
-            txn->recoveryUnit()->commitAndRestart();
+            txn->recoveryUnit()->abandonSnapshot();
             return true;
         }
 
@@ -1686,31 +1688,34 @@ namespace mongo {
                     warning() << "moveChunk commit outcome ongoing" << migrateLog;
                     sleepsecs( 10 );
 
+                    // look for the chunk in this shard whose version got bumped
+                    // we assume that if that mod made it to the config, the applyOps was successful
                     try {
-                        ScopedDbConnection conn(shardingState.getConfigServer(), 10.0);
-
-                        // look for the chunk in this shard whose version got bumped
-                        // we assume that if that mod made it to the config, the applyOps was successful
-                        BSONObj doc = conn->findOne(ChunkType::ConfigNS,
+                        std::vector<ChunkType> newestChunk;
+                        Status status = grid.catalogManager()->getChunks(
                                                     Query(BSON(ChunkType::ns(ns)))
-                                                        .sort(BSON(ChunkType::DEPRECATED_lastmod() << -1)));
+                                                        .sort(ChunkType::DEPRECATED_lastmod(), -1),
+                                                    1,
+                                                    &newestChunk);
+                        uassertStatusOK(status);
 
+                        ChunkVersion checkVersion;
+                        if (!newestChunk.empty()) {
+                            invariant(newestChunk.size() == 1);
+                            checkVersion = newestChunk[0].getVersion();
+                        }
 
-                        ChunkVersion checkVersion(ChunkVersion::fromBSON(doc));
-                        if ( checkVersion.equals( nextVersion ) ) {
+                        if (checkVersion.equals(nextVersion)) {
                             log() << "moveChunk commit confirmed" << migrateLog;
                             errmsg.clear();
 
                         }
                         else {
                             error() << "moveChunk commit failed: version is at "
-                                            << checkVersion << " instead of " << nextVersion << migrateLog;
+                                    << checkVersion << " instead of " << nextVersion << migrateLog;
                             error() << "TERMINATING" << migrateLog;
                             dbexit( EXIT_SHARDING_ERROR );
                         }
-
-                        conn.done();
-
                     }
                     catch ( ... ) {
                         error() << "moveChunk failed to get confirmation of commit" << migrateLog;
@@ -1936,6 +1941,8 @@ namespace mongo {
             verify( getState() == READY );
             verify( ! min.isEmpty() );
             verify( ! max.isEmpty() );
+
+            DisableDocumentValidation validationDisabler(txn);
 
             log() << "starting receiving-end of migration of chunk " << min << " -> " << max <<
                     " for collection " << ns << " from " << fromShard
@@ -2218,7 +2225,7 @@ namespace mongo {
 
             // if running on a replicated system, we'll need to flush the docs we cloned to the secondaries
 
-            Timestamp lastOpApplied = repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
+            OpTime lastOpApplied = repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
 
             {
                 // 4. do bulk of mods
@@ -2389,8 +2396,8 @@ namespace mongo {
                    BSONObj max,
                    BSONObj shardKeyPattern,
                    const BSONObj& xfer,
-                   Timestamp* lastOpApplied) {
-            Timestamp dummy;
+                   OpTime* lastOpApplied) {
+            OpTime dummy;
             if ( lastOpApplied == NULL ) {
                 lastOpApplied = &dummy;
             }
@@ -2504,11 +2511,11 @@ namespace mongo {
          * writeConcern (if not empty) have applied till the specified lastOp.
          */
         bool opReplicatedEnough(const OperationContext* txn,
-                                const Timestamp& lastOpApplied,
+                                const OpTime& lastOpApplied,
                                 const WriteConcernOptions& writeConcern) {
             WriteConcernOptions majorityWriteConcern;
             majorityWriteConcern.wTimeout = -1;
-            majorityWriteConcern.wMode = "majority";
+            majorityWriteConcern.wMode = WriteConcernOptions::kMajority;
             Status majorityStatus = repl::getGlobalReplicationCoordinator()->awaitReplication(
                     txn, lastOpApplied, majorityWriteConcern).status;
 
@@ -2531,10 +2538,10 @@ namespace mongo {
                                 const std::string& ns,
                                 BSONObj min,
                                 BSONObj max,
-                                const Timestamp& lastOpApplied,
+                                const OpTime& lastOpApplied,
                                 const WriteConcernOptions& writeConcern) {
             if (!opReplicatedEnough(txn, lastOpApplied, writeConcern)) {
-                Timestamp op( lastOpApplied );
+                OpTime op( lastOpApplied );
                 OCCASIONALLY warning() << "migrate commit waiting for a majority of slaves for '"
                                        << ns << "' " << min << " -> " << max
                                        << " waiting for: " << op

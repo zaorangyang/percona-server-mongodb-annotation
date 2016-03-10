@@ -39,13 +39,13 @@
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/legacy/cluster_client_internal.h"
 #include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/dist_lock_manager.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongo_version_range.h"
 #include "mongo/s/type_config_version.h"
-#include "mongo/s/type_database.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -303,22 +303,14 @@ namespace mongo {
     }
 
     // Returns true if we can confirm the balancer is stopped
-    bool _isBalancerStopped(const ConnectionString& configLoc, string* errMsg) {
-        
-        // Get the balancer information
-        BSONObj balancerDoc;
-        try {
-            ScopedDbConnection conn(configLoc, 30);
-            balancerDoc = conn->findOne(SettingsType::ConfigNS,
-                                        BSON(SettingsType::key("balancer")));
-            conn.done();
-        }
-        catch (const DBException& e) {
-            *errMsg = e.toString();
+    bool _isBalancerStopped() {
+        auto balSettingsResult =
+            grid.catalogManager()->getGlobalSettings(SettingsType::BalancerDocKey);
+        if (!balSettingsResult.isOK()) {
             return false;
         }
-        
-        return balancerDoc[SettingsType::balancerStopped()].trueValue();
+        SettingsType balSettings = balSettingsResult.getValue();
+        return balSettings.getBalancerStopped();
     }
 
     // Checks that all config servers are online
@@ -479,7 +471,7 @@ namespace mongo {
 
         // Check whether or not the balancer is online, if it is online we will not upgrade
         // (but we will initialize the config server)
-        if (!isEmptyVersion && !_isBalancerStopped(configLoc, errMsg)) {
+        if (!isEmptyVersion && !_isBalancerStopped()) {
             
             *errMsg = stream() << "balancer must be stopped for config upgrade"
                                << causedBy(errMsg);

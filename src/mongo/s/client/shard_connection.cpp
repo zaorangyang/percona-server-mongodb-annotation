@@ -282,7 +282,7 @@ namespace {
             Shard::getAllShards( all );
 
             // Don't report exceptions here as errors in GetLastError
-            LastError::Disabled ignoreForGLE(lastError.get(false));
+            LastError::Disabled ignoreForGLE(&LastError::get(cc()));
 
             // Now only check top-level shard connections
             for ( unsigned i=0; i<all.size(); i++ ) {
@@ -409,22 +409,6 @@ namespace {
     // Different between mongos and mongod
     void usingAShardConnection(const string& addr);
 
-
-    ShardConnection::ShardConnection(const Shard * s, const string& ns, ChunkManagerPtr manager)
-        : _addr(s->getConnString()),
-          _ns(ns),
-          _manager(manager) {
-
-        _init();
-    }
-
-    ShardConnection::ShardConnection(const Shard& s, const string& ns, ChunkManagerPtr manager)
-        : _addr(s.getConnString()),
-          _ns(ns),
-          _manager( manager ) {
-
-        _init();
-    }
 
     ShardConnection::ShardConnection(const string& addr, const string& ns, ChunkManagerPtr manager)
         : _addr(addr),

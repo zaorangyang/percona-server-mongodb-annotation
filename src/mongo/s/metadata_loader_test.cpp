@@ -56,7 +56,6 @@ namespace {
     using std::vector;
 
     const std::string CONFIG_HOST_PORT = "$dummy_config:27017";
-    const ConnectionString CONFIG_LOC((HostAndPort(CONFIG_HOST_PORT)));
 
     // TODO: Test config server down
     // TODO: Test read of chunks with new epoch
@@ -84,16 +83,16 @@ namespace {
         MockConnRegistry::get()->addServer( &dummyConfig );
 
         CollectionType collInfo;
-        collInfo.setNs( "test.foo" );
+        collInfo.setNs(NamespaceString{"test.foo"});
         collInfo.setKeyPattern(BSON("a" << 1));
-        collInfo.setUpdatedAt( 0 );
+        collInfo.setUpdatedAt( Date_t() );
         collInfo.setEpoch( OID() );
         collInfo.setDropped( true );
         ASSERT_OK(collInfo.validate());
 
         dummyConfig.insert( CollectionType::ConfigNS, collInfo.toBSON() );
 
-        MetadataLoader loader( CONFIG_LOC );
+        MetadataLoader loader;
 
         string errmsg;
         CollectionMetadata metadata;
@@ -114,7 +113,7 @@ namespace {
         mongo::ConnectionString::setConnectionHook( MockConnRegistry::get()->getConnStrHook() );
         MockConnRegistry::get()->addServer( &dummyConfig );
 
-        MetadataLoader loader( CONFIG_LOC );
+        MetadataLoader loader;
 
         string errmsg;
         CollectionMetadata metadata;
@@ -137,7 +136,7 @@ namespace {
 
         dummyConfig.insert(CollectionType::ConfigNS, BSON(CollectionType::fullNs("test.foo")));
 
-        MetadataLoader loader( CONFIG_LOC );
+        MetadataLoader loader;
 
         string errmsg;
         CollectionMetadata metadata;
@@ -159,8 +158,8 @@ namespace {
         MockConnRegistry::get()->addServer( &dummyConfig );
 
         CollectionType collInfo;
-        collInfo.setNs( "test.foo" );
-        collInfo.setUpdatedAt(1ULL);
+        collInfo.setNs(NamespaceString{"test.foo"});
+        collInfo.setUpdatedAt(Date_t::fromMillisSinceEpoch(1));
         collInfo.setKeyPattern( BSON("a" << 1) );
         collInfo.setEpoch( OID::gen() );
         ASSERT_OK(collInfo.validate());
@@ -168,13 +167,13 @@ namespace {
         dummyConfig.insert( CollectionType::ConfigNS, collInfo.toBSON() );
 
         ChunkType chunkInfo;
-        chunkInfo.setNS( "test.foo" );
+        chunkInfo.setNS(NamespaceString{"test.foo"});
         chunkInfo.setVersion( ChunkVersion( 1, 0, collInfo.getEpoch() ) );
         ASSERT(!chunkInfo.validate().isOK());
 
         dummyConfig.insert( ChunkType::ConfigNS, chunkInfo.toBSON() );
 
-        MetadataLoader loader( CONFIG_LOC );
+        MetadataLoader loader;
 
         string errmsg;
         CollectionMetadata metadata;
@@ -184,10 +183,7 @@ namespace {
                                                       NULL, /* no old metadata */
                                                       &metadata);
 
-        // For now, since the differ doesn't have parsing errors, we get this kind of status
-        // NamespaceNotFound since we aren't refreshing off known metadata
-        // TODO: Make the differ do parse errors
-        ASSERT_EQUALS( status.code(), ErrorCodes::NamespaceNotFound );
+        ASSERT_EQUALS(status.code(), ErrorCodes::FailedToParse);
 
         MockConnRegistry::get()->clear();
         ScopedDbConnection::clearPool();
@@ -205,10 +201,10 @@ namespace {
             OID epoch = OID::gen();
 
             CollectionType collType;
-            collType.setNs("test.foo");
+            collType.setNs(NamespaceString{"test.foo"});
             collType.setKeyPattern(BSON("a" << 1));
             collType.setUnique(false);
-            collType.setUpdatedAt(1ULL);
+            collType.setUpdatedAt(Date_t::fromMillisSinceEpoch(1));
             collType.setEpoch(epoch);
             _dummyConfig->insert(CollectionType::ConfigNS, collType.toBSON());
         }
@@ -223,7 +219,7 @@ namespace {
     };
 
     TEST_F(NoChunkFixture, NoChunksIsDropped) {
-        MetadataLoader loader( CONFIG_LOC );
+        MetadataLoader loader;
 
         CollectionMetadata metadata;
         Status status = loader.makeCollectionMetadata(catalogManager(),
@@ -248,10 +244,10 @@ namespace {
             OID epoch = OID::gen();
 
             CollectionType collType;
-            collType.setNs( "test.foo" );
+            collType.setNs(NamespaceString{"test.foo"});
             collType.setKeyPattern( BSON("a" << 1) );
             collType.setUnique( false );
-            collType.setUpdatedAt( 1ULL );
+            collType.setUpdatedAt( Date_t::fromMillisSinceEpoch(1) );
             collType.setEpoch( epoch );
             ASSERT_OK(collType.validate());
 
@@ -285,7 +281,7 @@ namespace {
     };
 
     TEST_F(NoChunkHereFixture, CheckNumChunk) {
-        MetadataLoader loader(CONFIG_LOC);
+        MetadataLoader loader;
 
         CollectionMetadata metadata;
         Status status = loader.makeCollectionMetadata(catalogManager(),
@@ -302,41 +298,6 @@ namespace {
         ASSERT_NOT_EQUALS( OID(), metadata.getShardVersion().epoch() );
     }
 
-    TEST_F(NoChunkHereFixture, BadChunkNotDropped) {
-        MetadataLoader loader(CONFIG_LOC);
-
-        CollectionMetadata metadata;
-        Status status = loader.makeCollectionMetadata(catalogManager(),
-                                                      "test.foo",
-                                                      "shard0000",
-                                                      NULL, /* no old metadata */
-                                                      &metadata);
-
-        ASSERT( status.isOK() );
-
-        ChunkType chunkInfo;
-        chunkInfo.setNS( "test.foo" );
-        chunkInfo.setVersion( ChunkVersion( 1, 0, OID() ) );
-        ASSERT(!chunkInfo.validate().isOK());
-
-        // Replace the chunk with a bad chunk
-        getDummyConfig()->remove( ChunkType::ConfigNS, BSONObj() );
-        getDummyConfig()->insert( ChunkType::ConfigNS, chunkInfo.toBSON() );
-
-        CollectionMetadata nextMetadata;
-        status = loader.makeCollectionMetadata(catalogManager(),
-                                               "test.foo",
-                                               "shard0000",
-                                               &metadata, /* using old metadata */
-                                               &nextMetadata);
-
-        // Remote change error, since there's not an epoch change and we reloaded no chunks
-        ASSERT_EQUALS( status.code(), ErrorCodes::RemoteChangeDetected );
-
-        MockConnRegistry::get()->clear();
-        ScopedDbConnection::clearPool();
-    }
-
     class ConfigServerFixture : public MetadataLoaderFixture {
     protected:
         void setUp() {
@@ -350,18 +311,20 @@ namespace {
             _maxCollVersion = ChunkVersion( 1, 0, epoch );
 
             CollectionType collType;
-            collType.setNs("test.foo");
+            collType.setNs(NamespaceString{"test.foo"});
             collType.setKeyPattern(BSON("a" << 1));
             collType.setUnique(false);
-            collType.setUpdatedAt(1ULL);
+            collType.setUpdatedAt(Date_t::fromMillisSinceEpoch(1));
             collType.setEpoch(epoch);
             _dummyConfig->insert(CollectionType::ConfigNS, collType.toBSON());
 
-            BSONObj fooSingle = BSON(ChunkType::name("test.foo-a_MinKey") <<
+            BSONObj fooSingle = BSON(
+                    ChunkType::name("test.foo-a_MinKey") <<
                     ChunkType::ns("test.foo") <<
                     ChunkType::min(BSON("a" << MINKEY)) <<
                     ChunkType::max(BSON("a" << MAXKEY)) <<
-                    ChunkType::DEPRECATED_lastmod(_maxCollVersion.toLong()) <<
+                    ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(
+                                                          _maxCollVersion.toLong())) <<
                     ChunkType::DEPRECATED_epoch(epoch) <<
                     ChunkType::shard("shard0000"));
             _dummyConfig->insert( ChunkType::ConfigNS, fooSingle );
@@ -389,7 +352,7 @@ namespace {
     };
 
     TEST_F(ConfigServerFixture, SingleChunkCheckNumChunk) {
-        MetadataLoader loader(CONFIG_LOC);
+        MetadataLoader loader;
         CollectionMetadata metadata;
         Status status = loader.makeCollectionMetadata(catalogManager(),
                                                       "test.foo",
@@ -401,9 +364,7 @@ namespace {
     }
 
     TEST_F(ConfigServerFixture, SingleChunkGetNext) {
-        ConnectionString confServerStr((HostAndPort(CONFIG_HOST_PORT)));
-        ConnectionString configLoc( confServerStr );
-        MetadataLoader loader( configLoc );
+        MetadataLoader loader;
         CollectionMetadata metadata;
         loader.makeCollectionMetadata(catalogManager(),
                                       "test.foo",
@@ -415,7 +376,7 @@ namespace {
     }
 
     TEST_F(ConfigServerFixture, SingleChunkGetShardKey) {
-        MetadataLoader loader(CONFIG_LOC);
+        MetadataLoader loader;
         CollectionMetadata metadata;
         loader.makeCollectionMetadata(catalogManager(),
                                       "test.foo",
@@ -426,7 +387,7 @@ namespace {
     }
 
     TEST_F(ConfigServerFixture, SingleChunkGetMaxCollVersion) {
-        MetadataLoader loader(CONFIG_LOC);
+        MetadataLoader loader;
         CollectionMetadata metadata;
         loader.makeCollectionMetadata(catalogManager(),
                                       "test.foo",
@@ -438,7 +399,7 @@ namespace {
     }
 
     TEST_F(ConfigServerFixture, SingleChunkGetMaxShardVersion) {
-        MetadataLoader loader(CONFIG_LOC);
+        MetadataLoader loader;
         CollectionMetadata metadata;
         loader.makeCollectionMetadata(catalogManager(),
                                       "test.foo",
@@ -452,7 +413,7 @@ namespace {
     TEST_F(ConfigServerFixture, NoChunks) {
         getConfigServer()->remove( ChunkType::ConfigNS, BSONObj() );
 
-        MetadataLoader loader(CONFIG_LOC);
+        MetadataLoader loader;
         CollectionMetadata metadata;
         Status status = loader.makeCollectionMetadata(catalogManager(),
                                                       "test.foo",
@@ -475,7 +436,7 @@ namespace {
 
             ConnectionString confServerStr((HostAndPort(CONFIG_HOST_PORT)));
             ConnectionString configLoc( confServerStr );
-            _loader.reset( new MetadataLoader( configLoc ) );
+            _loader.reset(new MetadataLoader);
         }
 
         MetadataLoader& loader() {
@@ -487,9 +448,10 @@ namespace {
 
             // Infer namespace, shard, epoch, keypattern from first chunk
             const ChunkType* firstChunk = *( chunks.vector().begin() );
-            string ns = firstChunk->isNSSet() ? firstChunk->getNS() : "foo.bar";
-            string shardName = firstChunk->isShardSet() ? firstChunk->getShard() : "shard0000";
-            OID epoch = firstChunk->getVersion().epoch();
+
+            const string ns = firstChunk->getNS();
+            const string shardName = firstChunk->getShard();
+            const OID epoch = firstChunk->getVersion().epoch();
 
             BSONObjBuilder keyPatternB;
             BSONObjIterator keyPatternIt( firstChunk->getMin() );
@@ -501,31 +463,27 @@ namespace {
             _dummyConfig->remove( ChunkType::ConfigNS, BSONObj() );
 
             CollectionType coll;
-            coll.setNs( ns );
+            coll.setNs(NamespaceString{ns});
             coll.setKeyPattern( BSON( "a" << 1 ) );
-            coll.setUpdatedAt( 1ULL );
+            coll.setUpdatedAt( Date_t::fromMillisSinceEpoch(1) );
             coll.setEpoch( epoch );
             ASSERT_OK(coll.validate());
 
             _dummyConfig->insert( CollectionType::ConfigNS, coll.toBSON() );
 
             ChunkVersion version( 1, 0, epoch );
-            for ( vector<ChunkType*>::const_iterator it = chunks.vector().begin();
-                    it != chunks.vector().end(); ++it ) {
+            for (const auto chunkVal : chunks.vector()) {
+                ChunkType chunk(*chunkVal);
 
-                ChunkType chunk;
-                ( *it )->cloneTo( &chunk );
-                chunk.setName( OID::gen().toString() );
-                if ( !chunk.isShardSet() ) chunk.setShard( shardName );
-                if ( !chunk.isNSSet() ) chunk.setNS( ns );
-                if ( !chunk.isVersionSet() ) {
-                    chunk.setVersion( version );
+                chunk.setName(OID::gen().toString());
+                if (!chunk.isVersionSet()) {
+                    chunk.setVersion(version);
                     version.incMajor();
                 }
 
                 ASSERT(chunk.validate().isOK());
 
-                _dummyConfig->insert( ChunkType::ConfigNS, chunk.toBSON() );
+                _dummyConfig->insert(ChunkType::ConfigNS, chunk.toBSON());
             }
 
             Status status = loader().makeCollectionMetadata(catalogManager(),
@@ -547,6 +505,8 @@ namespace {
 
     TEST_F(MultipleMetadataFixture, PromotePendingNA) {
         auto_ptr<ChunkType> chunk( new ChunkType() );
+        chunk->setNS("foo.bar");
+        chunk->setShard("shard0000");
         chunk->setMin( BSON( "x" << MINKEY ) );
         chunk->setMax( BSON( "x" << 0 ) );
         chunk->setVersion( ChunkVersion( 1, 0, OID::gen() ) );
@@ -581,7 +541,10 @@ namespace {
 
     TEST_F(MultipleMetadataFixture, PromotePendingNAVersion) {
         OID epoch = OID::gen();
+
         auto_ptr<ChunkType> chunk( new ChunkType() );
+        chunk->setNS("foo.bar");
+        chunk->setShard("shard0000");
         chunk->setMin( BSON( "x" << MINKEY ) );
         chunk->setMax( BSON( "x" << 0 ) );
         chunk->setVersion( ChunkVersion( 1, 1, epoch ) );
@@ -625,17 +588,23 @@ namespace {
         OwnedPointerVector<ChunkType> chunks;
 
         auto_ptr<ChunkType> chunk( new ChunkType() );
+        chunk->setNS("foo.bar");
+        chunk->setShard("shard0000");
         chunk->setMin( BSON( "x" << MINKEY ) );
         chunk->setMax( BSON( "x" << 0 ) );
         chunk->setVersion( ChunkVersion( 1, 0, epoch ) );
         chunks.mutableVector().push_back( chunk.release() );
 
         chunk.reset( new ChunkType() );
+        chunk->setNS("foo.bar");
+        chunk->setShard("shard0000");
         chunk->setMin( BSON( "x" << 10 ) );
         chunk->setMax( BSON( "x" << 20 ) );
         chunks.mutableVector().push_back( chunk.release() );
 
         chunk.reset( new ChunkType() );
+        chunk->setNS("foo.bar");
+        chunk->setShard("shard0000");
         chunk->setMin( BSON( "x" << 30 ) );
         chunk->setMax( BSON( "x" << MAXKEY ) );\
         chunks.mutableVector().push_back( chunk.release() );
@@ -648,7 +617,10 @@ namespace {
         //
 
         chunks.clear();
+
         chunk.reset( new ChunkType() );
+        chunk->setNS("foo.bar");
+        chunk->setShard("shard0000");
         chunk->setMin( BSON( "x" << 0 ) );
         chunk->setMax( BSON( "x" << 10 ) );
         chunk->setVersion( ChunkVersion( 1, 0, epoch ) );
@@ -701,6 +673,8 @@ namespace {
         OwnedPointerVector<ChunkType> chunks;
 
         auto_ptr<ChunkType> chunk( new ChunkType() );
+        chunk->setNS("foo.bar");
+        chunk->setShard("shard0000");
         chunk->setMin( BSON( "x" << MINKEY ) );
         chunk->setMax( BSON( "x" << 0 ) );
         chunk->setVersion( ChunkVersion( 1, 0, epoch ) );
@@ -715,7 +689,10 @@ namespace {
         //
 
         chunks.clear();
+
         chunk.reset( new ChunkType() );
+        chunk->setNS("foo.bar");
+        chunk->setShard("shard0000");
         chunk->setMin( BSON( "x" << 15 ) );
         chunk->setMax( BSON( "x" << MAXKEY ) );
         chunk->setVersion( ChunkVersion( 1, 0, epoch ) );
@@ -744,9 +721,7 @@ namespace {
     // TODO: MockServer functionality does not support selective query - consider
     // inserting nothing at all to chunk/collections collection
     TEST_F(ConfigServerFixture, EmptyDataForNS) {
-        ConnectionString confServerStr(HostAndPort(CONFIG_HOST_PORT));
-        ConnectionString configLoc( confServerStr );
-        MetadataLoader loader( configLoc );
+        MetadataLoader loader;
         CollectionMetadata metadata;
         Status status = loader.makeCollectionMetadata( "not.sharded",
                                                        "shard0000",
@@ -784,9 +759,7 @@ namespace {
                     ChunkType::shard("shard0000"));
             _dummyConfig->insert( ChunkType::ConfigNS, fooSingle );
 
-            ConnectionString confServerStr(HostAndPort(CONFIG_HOST_PORT));
-            ConnectionString configLoc( confServerStr );
-            MetadataLoader loader( configLoc );
+            MetadataLoader loader;
             Status status = loader.makeCollectionMetadata( "not.sharded",
                                                            "shard0000",
                                                            NULL, /* no old metadata */
@@ -880,9 +853,7 @@ namespace {
                     ChunkType::shard("shard0000"));
             _dummyConfig->insert( ChunkType::ConfigNS, fooSingle );
 
-            ConnectionString confServerStr(HostAndPort(CONFIG_HOST_PORT));
-            ConnectionString configLoc( confServerStr );
-            MetadataLoader loader( configLoc );
+            MetadataLoader loader;
             CollectionMetadata metadata;
             Status status = loader.makeCollectionMetadata( "not.sharded",
                                                            "shard0000",

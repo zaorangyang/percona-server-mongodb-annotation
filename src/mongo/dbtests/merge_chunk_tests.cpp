@@ -64,10 +64,10 @@ namespace mongo {
             ASSERT_GREATER_THAN( ranges.size(), 0u );
 
             CollectionType coll;
-            coll.setNs( nss.ns() );
+            coll.setNs(nss);
             coll.setKeyPattern( ranges.begin()->keyPattern );
             coll.setEpoch( startVersion.epoch() );
-            coll.setUpdatedAt( 1ULL );
+            coll.setUpdatedAt( Date_t::fromMillisSinceEpoch(1) );
             ASSERT_OK(coll.validate());
 
             DBDirectClient client(&_txn);

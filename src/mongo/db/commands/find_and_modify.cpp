@@ -38,14 +38,17 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/lasterror.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete_request.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
@@ -301,6 +304,10 @@ namespace {
                        ExplainCommon::Verbosity verbosity,
                        BSONObjBuilder* out) const override {
             const std::string fullNs = parseNsCollectionRequired(dbName, cmdObj);
+            Status allowedWriteStatus = userAllowedWriteNS(fullNs);
+            if (!allowedWriteStatus.isOK()) {
+                return allowedWriteStatus;
+            }
 
             StatusWith<FindAndModifyRequest> parseStatus =
                 FindAndModifyRequest::parseFromBSON(fullNs, cmdObj);
@@ -399,6 +406,10 @@ namespace {
             // findAndModify command is not replicated directly.
             invariant(txn->writesAreReplicated());
             const std::string fullNs = parseNsCollectionRequired(dbName, cmdObj);
+            Status allowedWriteStatus = userAllowedWriteNS(fullNs);
+            if (!allowedWriteStatus.isOK()) {
+                return appendCommandStatus(result, allowedWriteStatus);
+            }
 
             StatusWith<FindAndModifyRequest> parseStatus =
                 FindAndModifyRequest::parseFromBSON(fullNs, cmdObj);
@@ -415,6 +426,10 @@ namespace {
             }
             txn->setWriteConcern(wcResult.getValue());
             setupSynchronousCommit(txn);
+
+            boost::optional<DisableDocumentValidation> maybeDisableValidation;
+            if (shouldBypassDocumentValidationForCommand(cmdObj))
+                maybeDisableValidation.emplace(txn);
 
             // We may encounter a WriteConflictException when creating a collection during an
             // upsert, even when holding the exclusive lock on the database (due to other load on

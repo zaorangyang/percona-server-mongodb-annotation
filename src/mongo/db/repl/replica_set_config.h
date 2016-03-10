@@ -139,6 +139,12 @@ namespace repl {
         const int findMemberIndexByHostAndPort(const HostAndPort& hap) const;
 
         /**
+         * Returns a MemberConfig index position corresponding to the member with the given
+         * _id in the config, or -1 if there is no member with that address.
+         */
+        const int findMemberIndexByConfigId(long long configId) const;
+
+        /**
          * Gets the default write concern for the replica set described by this configuration.
          */
         const WriteConcernOptions& getDefaultWriteConcern() const { return _defaultWriteConcern; }
@@ -155,7 +161,7 @@ namespace repl {
          * Seconds object.
          */
         Milliseconds getHeartbeatTimeoutPeriodMillis() const {
-            return Milliseconds(_heartbeatTimeoutPeriod.total_milliseconds());
+            return _heartbeatTimeoutPeriod;
         }
 
         /**

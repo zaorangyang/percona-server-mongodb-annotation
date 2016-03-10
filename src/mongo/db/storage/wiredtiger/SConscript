@@ -20,16 +20,17 @@ if wiredtiger:
             'wiredtiger_util.cpp',
             ],
         LIBDEPS= [
-            '$BUILD_DIR/mongo/bson',
+            '$BUILD_DIR/mongo/bson/bson',
+            '$BUILD_DIR/mongo/db/namespace_string',
             '$BUILD_DIR/mongo/db/catalog/collection_options',
             '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
             '$BUILD_DIR/mongo/db/index/index_descriptor',
             '$BUILD_DIR/mongo/db/storage/index_entry_comparison',
             '$BUILD_DIR/mongo/db/storage/key_string',
             '$BUILD_DIR/mongo/db/storage/oplog_hack',
-            '$BUILD_DIR/mongo/elapsed_tracker',
+            '$BUILD_DIR/mongo/util/elapsed_tracker',
             '$BUILD_DIR/mongo/util/foundation',
-            '$BUILD_DIR/mongo/processinfo',
+            '$BUILD_DIR/mongo/util/processinfo',
             '$BUILD_DIR/mongo/util/concurrency/ticketholder',
             '$BUILD_DIR/third_party/shim_wiredtiger',
             '$BUILD_DIR/third_party/shim_snappy',
@@ -85,10 +86,9 @@ if wiredtiger:
         source=['wiredtiger_init_test.cpp',
                 ],
         LIBDEPS=[
-            '$BUILD_DIR/mongo/serveronly',
-            '$BUILD_DIR/mongo/coreserver',
-            '$BUILD_DIR/mongo/coredb',
-            '$BUILD_DIR/mongo/ntservice_mock',
+            '$BUILD_DIR/mongo/db/serveronly',
+            '$BUILD_DIR/mongo/db/coredb',
+            '$BUILD_DIR/mongo/util/ntservice_mock',
             ],
         NO_CRUTCH=True,
         )
@@ -108,6 +108,7 @@ if wiredtiger:
         source=['wiredtiger_util_test.cpp',
                 ],
         LIBDEPS=[
+            '$BUILD_DIR/mongo/db/service_context',
             'storage_wiredtiger_mock',
             ],
         )

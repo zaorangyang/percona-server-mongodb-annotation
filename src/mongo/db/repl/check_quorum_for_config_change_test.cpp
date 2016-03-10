@@ -62,8 +62,6 @@ namespace mongo {
 namespace repl {
 namespace {
 
-    typedef ReplicationExecutor::RemoteCommandRequest RemoteCommandRequest;
-
     class CheckQuorumTest : public mongo::unittest::Test {
     protected:
         CheckQuorumTest();
@@ -192,12 +190,12 @@ namespace {
         const int numCommandsExpected = config.getNumMembers() - 1;
         for (int i = 0; i < numCommandsExpected; ++i) {
             _net->scheduleResponse(_net->getNextReadyRequest(),
-                                   startDate + 10,
+                                   startDate + Milliseconds(10),
                                    ResponseStatus(ErrorCodes::NoSuchKey, "No reply"));
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         Status status = waitForQuorumCheck();
         ASSERT_EQUALS(ErrorCodes::NodeNotFound, status);
         ASSERT_REASON_CONTAINS(
@@ -244,17 +242,17 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
                 "Already saw " << request.target.toString();
             _net->scheduleResponse(noi,
-                                   startDate + 10,
-                                   ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                   startDate + Milliseconds(10),
+                                   ResponseStatus(RemoteCommandResponse(
                                                           BSON("ok" << 1), Milliseconds(8))));
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         ASSERT_OK(waitForQuorumCheck());
     }
@@ -286,24 +284,24 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
                 "Already saw " << request.target.toString();
             if (request.target == HostAndPort("h2", 1)) {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
+                                       startDate + Milliseconds(10),
                                        ResponseStatus(ErrorCodes::NoSuchKey, "No response"));
             }
             else {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 1), Milliseconds(8))));
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         Status status = waitForQuorumCheck();
         ASSERT_EQUALS(ErrorCodes::NodeNotFound, status);
@@ -341,26 +339,26 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
                 "Already saw " << request.target.toString();
             if (request.target == HostAndPort("h4", 1)) {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 0 << "mismatch" << true),
                                                               Milliseconds(8))));
             }
             else {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 1), Milliseconds(8))));
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         Status status = waitForQuorumCheck();
         ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible, status);
@@ -397,15 +395,15 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
                 "Already saw " << request.target.toString();
             if (request.target == HostAndPort("h5", 1)) {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 0 <<
                                                                    "set" << "rs0" <<
                                                                    "v" << 1),
@@ -413,12 +411,12 @@ namespace {
             }
             else {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 1), Milliseconds(8))));
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         Status status = waitForQuorumCheck();
         ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible, status);
@@ -458,15 +456,15 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
                 "Already saw " << request.target.toString();
             if (request.target == HostAndPort("h5", 1)) {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 0 <<
                                                                    "set" << "rs0" <<
                                                                    "v" << 1),
@@ -476,7 +474,7 @@ namespace {
                 _net->blackHole(noi);
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         Status status = waitForQuorumCheck();
         ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible, status);
@@ -514,7 +512,7 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
@@ -524,8 +522,8 @@ namespace {
             hbResp.noteHasData();
             if (request.target == HostAndPort("h5", 1)) {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               hbResp.toBSON(),
                                                               Milliseconds(8))));
             }
@@ -533,7 +531,7 @@ namespace {
                 _net->blackHole(noi);
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         Status status = waitForQuorumCheck();
         ASSERT_EQUALS(ErrorCodes::CannotInitializeNodeWithData, status);
@@ -566,15 +564,15 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
                 "Already saw " << request.target.toString();
             if (request.target == HostAndPort("h1", 1)) {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 0 <<
                                                                    "set" << "rs0" <<
                                                                    "v" << 5),
@@ -584,7 +582,7 @@ namespace {
                 _net->blackHole(noi);
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         Status status = waitForQuorumCheck();
         ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible, status);
@@ -618,25 +616,25 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
                 "Already saw " << request.target.toString();
             if (request.target == HostAndPort("h2", 1)) {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 0 << "mismatch" << true),
                                                               Milliseconds(8))));
             }
             else {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
+                                       startDate + Milliseconds(10),
                                        ResponseStatus(ErrorCodes::NoSuchKey, "No response"));
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         Status status = waitForQuorumCheck();
         ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible, status);
@@ -672,25 +670,25 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
                 "Already saw " << request.target.toString();
             if (request.target == HostAndPort("h1", 1) || request.target == HostAndPort("h5", 1)) {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 1),
                                                               Milliseconds(8))));
             }
             else {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
+                                       startDate + Milliseconds(10),
                                        ResponseStatus(ErrorCodes::NoSuchKey, "No response"));
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         Status status = waitForQuorumCheck();
         ASSERT_EQUALS(ErrorCodes::NodeNotFound, status);
@@ -725,25 +723,25 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
                 "Already saw " << request.target.toString();
             if (request.target == HostAndPort("h5", 1)) {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 1),
                                                               Milliseconds(8))));
             }
             else {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
+                                       startDate + Milliseconds(10),
                                        ResponseStatus(ErrorCodes::NoSuchKey, "No response"));
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         Status status = waitForQuorumCheck();
         ASSERT_EQUALS(ErrorCodes::NodeNotFound, status);
@@ -774,15 +772,15 @@ namespace {
         _net->enterNetwork();
         for (int i = 0; i < numCommandsExpected; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             ASSERT_EQUALS("admin", request.dbname);
             ASSERT_EQUALS(hbRequest, request.cmdObj);
             ASSERT(seenHosts.insert(request.target).second) <<
                 "Already saw " << request.target.toString();
             if (request.target == HostAndPort("h1", 1) || request.target == HostAndPort("h2", 1)) {
                 _net->scheduleResponse(noi,
-                                       startDate + 10,
-                                       ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                                       startDate + Milliseconds(10),
+                                       ResponseStatus(RemoteCommandResponse(
                                                               BSON("ok" << 1),
                                                               Milliseconds(8))));
             }
@@ -790,7 +788,7 @@ namespace {
                 _net->blackHole(noi);
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
         ASSERT_OK(waitForQuorumCheck());
     }

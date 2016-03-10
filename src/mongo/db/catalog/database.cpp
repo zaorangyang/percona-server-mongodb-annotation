@@ -221,27 +221,20 @@ namespace mongo {
             duplicates->clear();
         }
 
-        vector<string> others;
-        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
-        storageEngine->listDatabases(&others);
-
         set<string> allShortNames;
         dbHolder().getAllShortNames(allShortNames);
 
-        others.insert( others.end(), allShortNames.begin(), allShortNames.end() );
-
-        for ( unsigned i=0; i<others.size(); i++ ) {
-
-            if ( strcasecmp( others[i].c_str() , name.c_str() ) )
+        for (const auto& dbname : allShortNames) {
+            if (strcasecmp(dbname.c_str(), name.c_str()))
                 continue;
 
-            if ( strcmp( others[i].c_str() , name.c_str() ) == 0 )
+            if (strcmp(dbname.c_str(), name.c_str()) == 0)
                 continue;
 
             if ( duplicates ) {
-                duplicates->insert( others[i] );
+                duplicates->insert(dbname);
             } else {
-                return others[i];
+                return dbname;
             }
         }
         if ( duplicates ) {
@@ -278,7 +271,7 @@ namespace mongo {
             catch (const WriteConflictException& exp) {
                 warning() << "could not drop temp collection '" << ns << "' due to "
                     "WriteConflictException";
-                txn->recoveryUnit()->commitAndRestart();
+                txn->recoveryUnit()->abandonSnapshot();
             }
         }
     }
@@ -369,8 +362,9 @@ namespace mongo {
             if (nss.isSystem()) {
                 if (nss.isSystemDotProfile()) {
                     if ( _profile != 0 )
-                        return Status( ErrorCodes::IllegalOperation,
-                                       "turn off profiling before dropping system.profile collection" );
+                        return Status(
+                            ErrorCodes::IllegalOperation,
+                            "turn off profiling before dropping system.profile collection");
                 }
                 else {
                     return Status( ErrorCodes::IllegalOperation, "can't drop system ns" );
@@ -396,7 +390,8 @@ namespace mongo {
 
         s = _dbEntry->dropCollection( txn, fullns );
 
-        _clearCollectionCache( txn, fullns ); // we want to do this always
+         // we want to do this always
+        _clearCollectionCache(txn, fullns, "collection dropped");
 
         if ( !s.isOK() )
             return s;
@@ -420,7 +415,9 @@ namespace mongo {
         return Status::OK();
     }
 
-    void Database::_clearCollectionCache(OperationContext* txn, StringData fullns ) {
+    void Database::_clearCollectionCache(OperationContext* txn, 
+                                         StringData fullns,
+                                         const std::string& reason) {
         verify( _name == nsToDatabaseSubstring( fullns ) );
         CollectionMap::const_iterator it = _collections.find( fullns.toString() );
         if ( it == _collections.end() )
@@ -429,7 +426,7 @@ namespace mongo {
         // Takes ownership of the collection
         txn->recoveryUnit()->registerChange(new RemoveCollectionChange(this, it->second));
 
-        it->second->_cursorManager.invalidateAll(false);
+        it->second->_cursorManager.invalidateAll(false, reason);
         _collections.erase( it );
     }
 
@@ -456,15 +453,18 @@ namespace mongo {
         { // remove anything cached
             Collection* coll = getCollection( fromNS );
             if ( !coll )
-                return Status( ErrorCodes::NamespaceNotFound, "collection not found to rename" );
-            IndexCatalog::IndexIterator ii = coll->getIndexCatalog()->getIndexIterator( txn, true );
+                return Status(ErrorCodes::NamespaceNotFound, "collection not found to rename");
+
+            string clearCacheReason = str::stream() << "renamed collection '" << fromNS
+                                                    << "' to '" << toNS << "'";
+            IndexCatalog::IndexIterator ii = coll->getIndexCatalog()->getIndexIterator(txn, true);
             while ( ii.more() ) {
                 IndexDescriptor* desc = ii.next();
-                _clearCollectionCache( txn, desc->indexNamespace() );
+                _clearCollectionCache(txn, desc->indexNamespace(), clearCacheReason);
             }
 
-            _clearCollectionCache( txn, fromNS );
-            _clearCollectionCache( txn, toNS );
+            _clearCollectionCache(txn, fromNS, clearCacheReason);
+            _clearCollectionCache(txn, toNS, clearCacheReason);
 
             Top::get(txn->getClient()->getServiceContext()).collectionDropped(fromNS.toString());
         }

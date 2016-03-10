@@ -37,11 +37,13 @@
 #include <fstream>
 #include <memory>
 
+#include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/authz_manager_external_state_d.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/clientcursor.h"
@@ -152,6 +154,15 @@ namespace mongo {
     MONGO_FP_DECLARE(rsStopGetMore);
 
 namespace {
+
+    std::unique_ptr<AuthzManagerExternalState> createAuthzManagerExternalStateMongod() {
+        return stdx::make_unique<AuthzManagerExternalStateMongod>();
+    }
+
+    MONGO_INITIALIZER(CreateAuthorizationExternalStateFactory) (InitializerContext* context) {
+        AuthzManagerExternalState::create = &createAuthzManagerExternalStateMongod;
+        return Status::OK();
+    }
 
     void generateErrorResponse(const AssertionException* exception,
                                const QueryMessage& queryMessage,
@@ -391,6 +402,7 @@ namespace {
 
         Client& c = *txn->getClient();
         if (!c.isInDirectClient()) {
+            LastError::get(c).startRequest();
             AuthorizationSession::get(c)->startRequest(txn);
 
             // We should not be holding any locks at this point
@@ -558,14 +570,14 @@ namespace {
                 }
              }
             catch (const UserException& ue) {
-                setLastError(ue.getCode(), ue.getInfo().msg.c_str());
+                LastError::get(c).setLastError(ue.getCode(), ue.getInfo().msg);
                 MONGO_LOG_COMPONENT(3, responseComponent)
                        << " Caught Assertion in " << opToString(op) << ", continuing "
                        << ue.toString() << endl;
                 debug.exceptionInfo = ue.getInfo();
             }
             catch (const AssertionException& e) {
-                setLastError(e.getCode(), e.getInfo().msg.c_str());
+                LastError::get(c).setLastError(e.getCode(), e.getInfo().msg);
                 MONGO_LOG_COMPONENT(3, responseComponent)
                        << " Caught Assertion in " << opToString(op) << ", continuing "
                        << e.toString() << endl;
@@ -606,6 +618,7 @@ namespace {
     }
 
     void receivedKillCursors(OperationContext* txn, Message& m) {
+        LastError::get(txn->getClient()).disable();
         DbMessage dbmessage(m);
         int n = dbmessage.pullInt();
 
@@ -702,7 +715,8 @@ namespace {
                     UpdateResult res = UpdateStage::makeUpdateResult(exec.get(), &op.debug());
 
                     // for getlasterror
-                    lastError.getSafe()->recordUpdate( res.existing , res.numMatched , res.upserted );
+                    LastError::get(txn->getClient()).recordUpdate(
+                            res.existing, res.numMatched, res.upserted);
                     return;
                 }
                 break;
@@ -755,7 +769,8 @@ namespace {
             uassertStatusOK(exec->executePlan());
             UpdateResult res = UpdateStage::makeUpdateResult(exec.get(), &op.debug());
 
-            lastError.getSafe()->recordUpdate( res.existing , res.numMatched , res.upserted );
+            LastError::get(txn->getClient()).recordUpdate(
+                    res.existing, res.numMatched, res.upserted);
         } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "update", nsString.ns());
     }
 
@@ -813,7 +828,7 @@ namespace {
                 // Run the plan and get the number of docs deleted.
                 uassertStatusOK(exec->executePlan());
                 long long n = DeleteStage::getNumDeleted(exec.get());
-                lastError.getSafe()->recordDelete(n);
+                LastError::get(txn->getClient()).recordDelete(n);
                 op.debug().ndeleted = n;
 
                 break;
@@ -981,7 +996,7 @@ namespace {
             }
             catch( const WriteConflictException& e ) {
                 txn->getCurOp()->debug().writeConflicts++;
-                txn->recoveryUnit()->commitAndRestart();
+                txn->recoveryUnit()->abandonSnapshot();
                 WriteConflictException::logAndBackoff( attempt++, "insert", ns);
             }
         }
@@ -1003,7 +1018,7 @@ namespace {
                     globalOpCounters.incInsertInWriteLock(i);
                     throw;
                 }
-                setLastError(ex.getCode(), ex.getInfo().msg.c_str());
+                LastError::get(txn->getClient()).setLastError(ex.getCode(), ex.getInfo().msg);
                 // otherwise ignore and keep going
             }
         }
@@ -1057,7 +1072,7 @@ namespace {
             convertSystemIndexInsertsToCommands(d, &allCmdsBuilder);
         }
         catch (const DBException& ex) {
-            setLastError(ex.getCode(), ex.getInfo().msg.c_str());
+            LastError::get(txn->getClient()).setLastError(ex.getCode(), ex.getInfo().msg);
             curOp.debug().exceptionInfo = ex.getInfo();
             return;
         }
@@ -1079,7 +1094,7 @@ namespace {
                 uassertStatusOK(Command::getStatusFromCommandResult(resultBuilder.done()));
             }
             catch (const DBException& ex) {
-                setLastError(ex.getCode(), ex.getInfo().msg.c_str());
+                LastError::get(txn->getClient()).setLastError(ex.getCode(), ex.getInfo().msg);
                 curOp.debug().exceptionInfo = ex.getInfo();
                 if (!keepGoing) {
                     return;

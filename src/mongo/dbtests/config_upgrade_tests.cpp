@@ -57,8 +57,9 @@ namespace mongo {
             // DBDirectClient
             DBDirectClient client(&_txn);
             client.update(SettingsType::ConfigNS,
-                          BSON(SettingsType::key("balancer")),
-                          BSON(SettingsType::key("balancer") << SettingsType::balancerStopped(true)),
+                          BSON(SettingsType::key(SettingsType::BalancerDocKey)),
+                          BSON(SettingsType::key(SettingsType::BalancerDocKey) <<
+                               SettingsType::balancerStopped(true)),
                           true, false);
         }
 
@@ -137,7 +138,7 @@ namespace mongo {
                 ping.setConfigVersion(CURRENT_CONFIG_VERSION);
 
                 if (i % 2 == 0) {
-                    ping.setPing(ping.getPing() - 10 * 60 * 1000);
+                    ping.setPing(ping.getPing() - Minutes(10));
                 }
 
                 client.insert(MongosType::ConfigNS, ping.toBSON());

@@ -36,6 +36,7 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
@@ -88,6 +89,8 @@ namespace {
                             const NamespaceString& target,
                             bool dropTarget,
                             bool stayTemp) {
+        DisableDocumentValidation validationDisabler(txn);
+
         ScopedTransaction transaction(txn, MODE_X);
         Lock::GlobalWrite globalWriteLock(txn->lockState());
         // We stay in source context the whole time. This is mostly to set the CurOp namespace.
@@ -186,24 +189,15 @@ namespace {
         // TODO use a temp collection and unset the temp flag on success.
         Collection* targetColl = nullptr;
         {
-            CollectionOptions options;
-            options.setNoIdIndex();
-
-            if (sourceColl->isCapped()) {
-                const CollectionOptions sourceOpts =
-                    sourceColl->getCatalogEntry()->getCollectionOptions(txn);
-
-                options.capped = true;
-                options.cappedSize = sourceOpts.cappedSize;
-                options.cappedMaxDocs = sourceOpts.cappedMaxDocs;
-            }
+            CollectionOptions options = sourceColl->getCatalogEntry()->getCollectionOptions(txn);
 
             WriteUnitOfWork wunit(txn);
 
             // No logOp necessary because the entire renameCollection command is one logOp.
             bool shouldReplicateWrites = txn->writesAreReplicated();
             txn->setReplicatedWrites(false);
-            targetColl = targetDB->createCollection(txn, target.ns(), options);
+            targetColl = targetDB->createCollection(txn, target.ns(), options,
+                                                    false); // _id index build with others later.
             txn->setReplicatedWrites(shouldReplicateWrites);
             if (!targetColl) {
                 return Status(ErrorCodes::OutOfDiskSpace, "Failed to create target collection.");

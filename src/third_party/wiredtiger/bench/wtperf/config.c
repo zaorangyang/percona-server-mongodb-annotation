@@ -113,10 +113,8 @@ config_free(CONFIG *cfg)
 		    config_opts[i].type == CONFIG_STRING_TYPE) {
 			pstr = (char **)
 			    ((unsigned char *)cfg + config_opts[i].offset);
-			if (*pstr != NULL) {
-				free(*pstr);
-				*pstr = NULL;
-			}
+			free(*pstr);
+			*pstr = NULL;
 		}
 	if (cfg->uris != NULL) {
 		for (i = 0; i < cfg->table_count; i++)
@@ -513,8 +511,7 @@ config_opt_file(CONFIG *cfg, const char *filename)
 
 err:	if (fd != -1)
 		(void)close(fd);
-	if (file_buf != NULL)
-		free(file_buf);
+	free(file_buf);
 	return (ret);
 }
 
@@ -598,6 +595,12 @@ config_sanity(CONFIG *cfg)
 	if (cfg->database_count < 1 || cfg->database_count > 99) {
 		fprintf(stderr,
 		    "invalid database count, less than 1 or greater than 99\n");
+		return (EINVAL);
+	}
+
+	if (cfg->pareto > 100) {
+		fprintf(stderr,
+		    "Invalid pareto distribution - should be a percentage\n");
 		return (EINVAL);
 	}
 	return (0);

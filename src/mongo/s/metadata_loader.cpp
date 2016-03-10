@@ -32,9 +32,8 @@
 
 #include "mongo/s/metadata_loader.h"
 
-#include "mongo/client/connpool.h"
-#include "mongo/client/dbclientcursor.h"
-#include "mongo/client/dbclientmockcursor.h"
+#include <vector>
+
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -65,19 +64,16 @@ namespace mongo {
         {
         }
 
-        virtual bool isTracked( const BSONObj& chunkDoc ) const {
-            return chunkDoc["shard"].type() == String && chunkDoc["shard"].String() == _currShard;
+        virtual bool isTracked(const ChunkType& chunk) const {
+            return chunk.getShard() == _currShard;
         }
 
         virtual BSONObj maxFrom( const BSONObj& val ) const {
             return val;
         }
 
-        virtual pair<BSONObj, BSONObj> rangeFor( const BSONObj& chunkDoc,
-                                                 const BSONObj& min,
-                                                 const BSONObj& max ) const
-        {
-            return make_pair( min, max );
+        virtual pair<BSONObj, BSONObj> rangeFor(const ChunkType& chunk) const {
+            return make_pair(chunk.getMin(), chunk.getMax());
         }
 
         virtual string shardFor( const string& name ) const {
@@ -95,13 +91,9 @@ namespace mongo {
     // MetadataLoader implementation
     //
 
-    MetadataLoader::MetadataLoader( const ConnectionString& configLoc ) :
-            _configLoc( configLoc )
-    {
-    }
+    MetadataLoader::MetadataLoader() { }
 
-    MetadataLoader::~MetadataLoader() {
-    }
+    MetadataLoader::~MetadataLoader() { }
 
     Status MetadataLoader::makeCollectionMetadata(CatalogManager* catalogManager,
                                                   const string& ns,
@@ -114,7 +106,7 @@ namespace mongo {
             return status;
         }
 
-        return initChunks( ns, shard, oldMetadata, metadata );
+        return initChunks(catalogManager, ns, shard, oldMetadata, metadata );
     }
 
     Status MetadataLoader::_initCollection(CatalogManager* catalogManager,
@@ -142,10 +134,11 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status MetadataLoader::initChunks( const string& ns,
-                                       const string& shard,
-                                       const CollectionMetadata* oldMetadata,
-                                       CollectionMetadata* metadata ) const
+    Status MetadataLoader::initChunks(CatalogManager* catalogManager,
+                                      const string& ns,
+                                      const string& shard,
+                                      const CollectionMetadata* oldMetadata,
+                                      CollectionMetadata* metadata) const
     {
         map<string, ChunkVersion> versionMap;
 
@@ -188,21 +181,15 @@ namespace mongo {
         differ.attach( ns, metadata->_chunksMap, metadata->_collVersion, versionMap );
 
         try {
-
-            ScopedDbConnection conn( _configLoc.toString(), 30 );
-
-            auto_ptr<DBClientCursor> cursor = conn->query( ChunkType::ConfigNS,
-                                                           differ.configDiffQuery() );
-
-            if ( !cursor.get() ) {
-
-                // Make our metadata invalid
-                metadata->_collVersion = ChunkVersion( 0, 0, OID() );
-                metadata->_chunksMap.clear();
-                conn.done();
-
-                return Status( ErrorCodes::HostUnreachable,
-                               "problem opening chunk metadata cursor" );
+            std::vector<ChunkType> chunks;
+            Status status = catalogManager->getChunks(differ.configDiffQuery(), 0, &chunks);
+            if (!status.isOK()) {
+                if (status == ErrorCodes::HostUnreachable) {
+                    // Make our metadata invalid
+                    metadata->_collVersion = ChunkVersion( 0, 0, OID() );
+                    metadata->_chunksMap.clear();
+                }
+                return status;
             }
 
             //
@@ -210,8 +197,7 @@ namespace mongo {
             // last time).  If not, something has changed on the config server (potentially between
             // when we read the collection data and when we read the chunks data).
             //
-
-            int diffsApplied = differ.calculateConfigDiff( *cursor );
+            int diffsApplied = differ.calculateConfigDiff(chunks);
             if ( diffsApplied > 0 ) {
 
                 // Chunks found, return ok
@@ -221,7 +207,6 @@ namespace mongo {
 
                 metadata->_shardVersion = versionMap[shard];
                 metadata->fillRanges();
-                conn.done();
 
                 invariant( metadata->isValid() );
                 return Status::OK();
@@ -243,7 +228,6 @@ namespace mongo {
 
                 metadata->_collVersion = ChunkVersion( 0, 0, OID() );
                 metadata->_chunksMap.clear();
-                conn.done();
 
                 return fullReload ? Status( ErrorCodes::NamespaceNotFound, errMsg ) :
                                     Status( ErrorCodes::RemoteChangeDetected, errMsg );
@@ -263,7 +247,6 @@ namespace mongo {
 
                 metadata->_collVersion = ChunkVersion( 0, 0, OID() );
                 metadata->_chunksMap.clear();
-                conn.done();
 
                 return Status( ErrorCodes::RemoteChangeDetected, errMsg );
             }

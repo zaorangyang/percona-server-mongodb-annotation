@@ -35,14 +35,18 @@
 
 #include <boost/shared_ptr.hpp>
 
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
@@ -145,7 +149,8 @@ namespace {
         // collections to drop
         set<string> toDrop;
 
-        set<string> collectionsToResync;
+        set<string> collectionsToResyncData;
+        set<string> collectionsToResyncMetadata;
 
         Timestamp commonPoint;
         RecordId commonPointOurDiskloc;
@@ -203,7 +208,7 @@ namespace {
             }
             else if (cmdname == "drop") {
                 string ns = nss.db().toString() + '.' + first.valuestr();
-                fixUpInfo.collectionsToResync.insert(ns);
+                fixUpInfo.collectionsToResyncData.insert(ns);
                 return;
             }
             else if (cmdname == "dropIndexes" || cmdname == "deleteIndexes") {
@@ -212,7 +217,7 @@ namespace {
                 warning() << "rollback of dropIndexes is slow in this version of "
                           << "mongod";
                 string ns = nss.db().toString() + '.' + first.valuestr();
-                fixUpInfo.collectionsToResync.insert(ns);
+                fixUpInfo.collectionsToResyncData.insert(ns);
                 return;
             }
             else if (cmdname == "renameCollection") {
@@ -221,8 +226,8 @@ namespace {
                           << "mongod";
                 string from = first.valuestr();
                 string to = obj["to"].String();
-                fixUpInfo.collectionsToResync.insert(from);
-                fixUpInfo.collectionsToResync.insert(to);
+                fixUpInfo.collectionsToResyncData.insert(from);
+                fixUpInfo.collectionsToResyncData.insert(to);
                 return;
             }
             else if (cmdname == "dropDatabase") {
@@ -232,10 +237,20 @@ namespace {
                 throw RSFatalException();
             }
             else if (cmdname == "collMod") {
-                if (obj.nFields() == 2 && obj["usePowerOf2Sizes"].type() == Bool) {
-                    log() << "not rolling back change of usePowerOf2Sizes: " << obj;
-                }
-                else {
+                const auto ns = NamespaceString(cmd->parseNs(nss.db().toString(), obj));
+                for (auto field : obj) {
+                    const auto modification = field.fieldNameStringData();
+                    if (modification == cmdname) {
+                        continue; // Skipping command name.
+                    }
+
+                    if (modification == "validator"
+                            || modification == "usePowerOf2Sizes"
+                            || modification == "noPadding") {
+                        fixUpInfo.collectionsToResyncMetadata.insert(ns);
+                        continue;
+                    }
+
                     severe() << "cannot rollback a collMod command: " << obj;
                     throw RSFatalException();
                 }
@@ -258,10 +273,10 @@ namespace {
         fixUpInfo.toRefetch.insert(doc);
     }
 
-    void syncRollbackFindCommonPoint(OperationContext* txn, 
-                                     DBClientConnection* them, 
-                                     FixUpInfo& fixUpInfo) {
+    StatusWith<FixUpInfo> syncRollbackFindCommonPoint(OperationContext* txn,
+                                                      DBClientConnection* them) {
         OldClientContext ctx(txn, rsOplogName);
+        FixUpInfo fixUpInfo;
 
         boost::scoped_ptr<PlanExecutor> exec(
                 InternalPlanner::collectionScan(txn,
@@ -273,7 +288,7 @@ namespace {
         RecordId ourLoc;
 
         if (PlanExecutor::ADVANCED != exec->getNext(&ourObj, &ourLoc)) {
-            throw RSFatalException("our oplog empty or unreadable");
+            return StatusWith<FixUpInfo>(ErrorCodes::OplogStartMissing, "no oplog during initsync");
         }
 
         const Query query = Query().sort(reverseNaturalObj);
@@ -316,7 +331,7 @@ namespace {
                     log() << "rollback findcommonpoint scanned : " << scanned;
                     fixUpInfo.commonPoint = ourTime;
                     fixUpInfo.commonPointOurDiskloc = ourLoc;
-                    return;
+                    break;
                 }
 
                 refetch(fixUpInfo, ourObj);
@@ -365,6 +380,8 @@ namespace {
                 ourTime = ourObj["ts"].timestamp();
             }
         }
+
+        return StatusWith<FixUpInfo>(fixUpInfo);
     }
 
     bool copyCollectionFromRemote(OperationContext* txn,
@@ -455,12 +472,13 @@ namespace {
         setMinValid(txn, minValid);
 
         // any full collection resyncs required?
-        if (!fixUpInfo.collectionsToResync.empty()) {
-            for (set<string>::iterator it = fixUpInfo.collectionsToResync.begin();
-                    it != fixUpInfo.collectionsToResync.end();
-                    it++) {
-                string ns = *it;
-                log() << "rollback 4.1 coll resync " << ns;
+        if (!fixUpInfo.collectionsToResyncData.empty()
+                || !fixUpInfo.collectionsToResyncMetadata.empty()) {
+
+            for (const string& ns : fixUpInfo.collectionsToResyncData) {
+                log() << "rollback 4.1.1 coll resync " << ns;
+
+                fixUpInfo.collectionsToResyncMetadata.erase(ns);
 
                 const NamespaceString nss(ns);
 
@@ -487,6 +505,60 @@ namespace {
                     uassert(15909, str::stream() << "replSet rollback error resyncing collection "
                                                  << ns << ' ' << errmsg, ok);
                 }
+            }
+
+            for (const string& ns : fixUpInfo.collectionsToResyncMetadata) {
+                log() << "rollback 4.1.2 coll metadata resync " << ns;
+
+                const NamespaceString nss(ns);
+                auto db = dbHolder().openDb(txn, nss.db().toString());
+                invariant(db);
+                auto collection = db->getCollection(ns);
+                invariant(collection);
+                auto cce = collection->getCatalogEntry();
+
+                const std::list<BSONObj> info =
+                    them->getCollectionInfos(nss.db().toString(), BSON("name" << nss.coll()));
+
+                if (info.empty()) {
+                    // Collection dropped by "them" so we should drop it too.
+                    log() << ns << " not found on remote host, dropping";
+                    fixUpInfo.toDrop.insert(ns);
+                    continue;
+                }
+
+                invariant(info.size() == 1);
+
+                CollectionOptions options;
+                if (auto optionsField = info.front()["options"]) {
+                    if (optionsField.type() != Object) {
+                        throw RSFatalException(str::stream() << "Failed to parse options "
+                                               << info.front() << ": expected 'options' to be an "
+                                               << "Object, got " << typeName(optionsField.type()));
+                    }
+
+                    auto status = options.parse(optionsField.Obj());
+                    if (!status.isOK()) {
+                        throw RSFatalException(str::stream() << "Failed to parse options "
+                                                             << info.front() << ": "
+                                                             << status.toString());
+                    }
+                }
+                else {
+                    // Use default options.
+                }
+
+                WriteUnitOfWork wuow(txn);
+                if (options.flagsSet || cce->getCollectionOptions(txn).flagsSet) {
+                    cce->updateFlags(txn, options.flags);
+                }
+
+                auto status = collection->setValidator(txn, options.validator);
+                if (!status.isOK()) {
+                    throw RSFatalException(str::stream() << "Failed to set validator: "
+                                                         << status.toString());
+                }
+                wuow.commit();
             }
 
             // we did more reading from primary, so check it again for a rollback (which would mess
@@ -524,6 +596,8 @@ namespace {
             log() << "rollback 4.3";
         }
 
+        map<string,shared_ptr<Helpers::RemoveSaver> > removeSavers;
+
         log() << "rollback 4.6";
         // drop collections to drop before doing individual fixups - that might make things faster
         // below actually if there were subsequent inserts to rollback
@@ -535,6 +609,37 @@ namespace {
             Database* db = dbHolder().get(txn, nsToDatabaseSubstring(*it));
             if (db) {
                 WriteUnitOfWork wunit(txn);
+
+                shared_ptr<Helpers::RemoveSaver>& removeSaver = removeSavers[*it];
+                if (!removeSaver)
+                    removeSaver.reset(new Helpers::RemoveSaver("rollback", "", *it));
+
+                // perform a collection scan and write all documents in the collection to disk
+                boost::scoped_ptr<PlanExecutor> exec(
+                        InternalPlanner::collectionScan(txn,
+                                                        *it,
+                                                        db->getCollection(*it)));
+                BSONObj curObj;
+                PlanExecutor::ExecState execState;
+                while (PlanExecutor::ADVANCED == (execState = exec->getNext(&curObj, NULL))) {
+                    removeSaver->goingToDelete(curObj);
+                }
+                if (execState != PlanExecutor::IS_EOF) {
+                    if (execState == PlanExecutor::FAILURE &&
+                            WorkingSetCommon::isValidStatusMemberObject(curObj)) {
+                        Status errorStatus = WorkingSetCommon::getMemberObjectStatus(curObj);
+                        severe() << "rolling back createCollection on " << *it
+                                 << " failed with " << errorStatus
+                                 << ". A full resync is necessary.";
+                    }
+                    else {
+                        severe() << "rolling back createCollection on " << *it
+                                 << " failed. A full resync is necessary.";
+                    }
+                            
+                    throw RSFatalException();
+                }
+
                 db->dropCollection(txn, *it);
                 wunit.commit();
             }
@@ -546,8 +651,6 @@ namespace {
         uassert(13423,
                 str::stream() << "replSet error in rollback can't find " << rsOplogName,
                 oplogCollection);
-
-        map<string,shared_ptr<Helpers::RemoveSaver> > removeSavers;
 
         unsigned deletes = 0, updates = 0;
         time_t lastProgressUpdate = time(0);
@@ -566,7 +669,7 @@ namespace {
             BSONObj pattern = doc._id.wrap(); // { _id : ... }
             try {
                 verify(doc.ns && *doc.ns);
-                if (fixUpInfo.collectionsToResync.count(doc.ns)) {
+                if (fixUpInfo.collectionsToResyncData.count(doc.ns)) {
                     // we just synced this entire collection
                     continue;
                 }
@@ -581,13 +684,20 @@ namespace {
 
                 // Add the doc to our rollback file
                 BSONObj obj;
-                bool found = Helpers::findOne(txn, ctx.db()->getCollection(doc.ns), pattern, obj, false);
-                if (found) {
-                    removeSaver->goingToDelete(obj);
-                }
-                else {
-                    error() << "rollback cannot find object: " << pattern
-                            << " in namespace " << doc.ns;
+                Collection* collection = ctx.db()->getCollection(doc.ns);
+
+                // Do not log an error when undoing an insert on a no longer existent collection.
+                // It is likely that the collection was dropped as part of rolling back a
+                // createCollection command and regardless, the document no longer exists.
+                if (collection) {
+                    bool found = Helpers::findOne(txn, collection, pattern, obj, false);
+                    if (found) {
+                        removeSaver->goingToDelete(obj);
+                    }
+                    else {
+                        error() << "rollback cannot find object: " << pattern
+                                << " in namespace " << doc.ns;
+                    }
                 }
 
                 if (it->second.isEmpty()) {
@@ -595,7 +705,6 @@ namespace {
                     // TODO 1.6 : can't delete from a capped collection.  need to handle that here.
                     deletes++;
 
-                    Collection* collection = ctx.db()->getCollection(doc.ns);
                     if (collection) {
                         if (collection->isCapped()) {
                             // can't delete from a capped collection - so we truncate instead. if
@@ -754,7 +863,18 @@ namespace {
 
             log() << "rollback 2 FindCommonPoint";
             try {
-                syncRollbackFindCommonPoint(txn, oplogreader->conn(), how);
+                StatusWith<FixUpInfo> res = syncRollbackFindCommonPoint(txn, oplogreader->conn());
+                if (!res.isOK()) {
+                    switch (res.getStatus().code()) {
+                        case ErrorCodes::OplogStartMissing:
+                            return 1;
+                        default:
+                            throw new RSFatalException(res.getStatus().toString());
+                    }
+                }
+                else {
+                    how  = res.getValue();
+                }
             }
             catch (RSFatalException& e) {
                 error() << string(e.what());
@@ -830,6 +950,7 @@ namespace {
 
         log() << "beginning rollback" << rsLog;
 
+        DisableDocumentValidation validationDisabler(txn);
         txn->setReplicatedWrites(false);
         unsigned s = _syncRollback(txn, oplogreader, replCoord);
         if (s)

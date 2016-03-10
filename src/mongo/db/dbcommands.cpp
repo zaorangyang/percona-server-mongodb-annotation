@@ -82,6 +82,9 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repair_database.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/read_after_optime_args.h"
+#include "mongo/db/repl/read_after_optime_response.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -133,8 +136,8 @@ namespace mongo {
             Status status = repl::getGlobalReplicationCoordinator()->stepDown(
                                     txn,
                                     force,
-                                    repl::ReplicationCoordinator::Milliseconds(timeoutSecs * 1000),
-                                    repl::ReplicationCoordinator::Milliseconds(120 * 1000));
+                                    Seconds(timeoutSecs),
+                                    Seconds(120));
             if (!status.isOK() && status.code() != ErrorCodes::NotMaster) { // ignore not master
                 return appendCommandStatus(result, status);
             }
@@ -472,7 +475,6 @@ namespace mongo {
                 return false;
             }
 
-            result.append("ns", nsToDrop);
             return appendCommandStatus(result,
                                        dropCollection(txn, NamespaceString(nsToDrop), result));
         }
@@ -604,7 +606,6 @@ namespace mongo {
                 // We drop and re-acquire these locks every document because md5'ing is expensive
                 scoped_ptr<AutoGetCollectionForRead> ctx(new AutoGetCollectionForRead(txn, ns));
                 Collection* coll = ctx->getCollection();
-                const ChunkVersion shardVersionAtStart = shardingState.getVersion(ns);
 
                 PlanExecutor* rawExec;
                 if (!getExecutor(txn, coll, cq, PlanExecutor::YIELD_MANUAL, &rawExec,
@@ -766,8 +767,10 @@ namespace mongo {
                     keyPattern = Helpers::inferKeyPattern( min );
                 }
 
-                IndexDescriptor *idx =
-                    collection->getIndexCatalog()->findIndexByPrefix( txn, keyPattern, true );  /* require single key */
+                IndexDescriptor* idx = collection->getIndexCatalog()->findShardKeyPrefixedIndex(
+                        txn,
+                        keyPattern,
+                        true ); // requireSingleKey
 
                 if ( idx == NULL ) {
                     errmsg = "couldn't find valid index containing key pattern";
@@ -1185,14 +1188,14 @@ namespace mongo {
         bool _impersonation;
     };
 
-    namespace {
-        void appendGLEHelperData(BSONObjBuilder& bob, const Timestamp& opTime, const OID& oid) {
-            BSONObjBuilder subobj(bob.subobjStart(kGLEStatsFieldName));
-            subobj.append(kGLEStatsLastOpTimeFieldName, opTime);
-            subobj.appendOID(kGLEStatsElectionIdFieldName, const_cast<OID*>(&oid));
-            subobj.done();
-        }
+namespace {
+    void appendGLEHelperData(BSONObjBuilder& bob, const Timestamp& opTime, const OID& oid) {
+        BSONObjBuilder subobj(bob.subobjStart(kGLEStatsFieldName));
+        subobj.append(kGLEStatsLastOpTimeFieldName, opTime);
+        subobj.appendOID(kGLEStatsElectionIdFieldName, const_cast<OID*>(&oid));
+        subobj.done();
     }
+} // namespace
 
     /**
      * this handles
@@ -1333,6 +1336,25 @@ namespace mongo {
 
         c->_commandsExecuted.increment();
 
+        {
+            // Handle read after opTime.
+
+            repl::ReadAfterOpTimeArgs readAfterOptimeSettings;
+            auto readAfterParseStatus = readAfterOptimeSettings.initialize(cmdObj);
+            if (!readAfterParseStatus.isOK()) {
+                appendCommandStatus(result, readAfterParseStatus);
+                return;
+            }
+
+            auto readAfterResult = replCoord->waitUntilOpTime(txn, readAfterOptimeSettings);
+            readAfterResult.appendInfo(&result);
+
+            if (!readAfterResult.getStatus().isOK()) {
+                appendCommandStatus(result, readAfterResult.getStatus());
+                return;
+            }
+        }
+
         retval = _execCommand(txn, c, dbname, cmdObj, queryOptions, errmsg, result);
 
         if ( !retval ){
@@ -1346,7 +1368,7 @@ namespace mongo {
                 shardingState.enabled()) {
             appendGLEHelperData(
                     result,
-                    repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
+                    repl::ReplClientInfo::forClient(txn->getClient()).getLastOp().getTimestamp(),
                     replCoord->getElectionId());
         }
         return;

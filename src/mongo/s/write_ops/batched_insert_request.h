@@ -36,7 +36,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/bson_serializable.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/write_ops/batched_request_metadata.h"
 
 namespace mongo {
@@ -111,6 +110,9 @@ namespace mongo {
         bool isOrderedSet() const;
         bool getOrdered() const;
 
+        void setShouldBypassValidation(bool newVal) { _shouldBypassValidation = newVal; }
+        bool shouldBypassValidation() const { return _shouldBypassValidation; }
+
         /*
          * metadata ownership will be transferred to this.
          */
@@ -143,6 +145,9 @@ namespace mongo {
 
         // (O)  cached copied of target ns
         NamespaceString _targetNSS;
+
+        // (O)  should document validation be bypassed (default false)
+        bool _shouldBypassValidation;
     };
 
 } // namespace mongo

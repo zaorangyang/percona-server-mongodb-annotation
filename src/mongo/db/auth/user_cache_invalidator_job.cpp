@@ -41,7 +41,8 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/s/config.h"
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/grid.h"
 #include "mongo/util/background.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -90,19 +91,15 @@ namespace {
 
     StatusWith<OID> getCurrentCacheGeneration() {
         try {
-            ConnectionString config = configServer.getConnectionString();
-            ScopedDbConnection conn(config.toString(), 30);
-
-            BSONObj result;
-            conn->runCommand("admin", BSON("_getUserCacheGeneration" << 1), result);
-            conn.done();
-
-            Status status = Command::getStatusFromCommandResult(result);
-            if (!status.isOK()) {
-                return StatusWith<OID>(status);
+            BSONObjBuilder result;
+            const bool ok = grid.catalogManager()->runUserManagementReadCommand(
+                    "admin",
+                    BSON("_getUserCacheGeneration" << 1),
+                    &result);
+            if (!ok) {
+                return Command::getStatusFromCommandResult(result.obj());
             }
-
-            return StatusWith<OID>(result["cacheGeneration"].OID());
+            return result.obj()["cacheGeneration"].OID();
         } catch (const DBException& e) {
             return StatusWith<OID>(e.toStatus());
         } catch (const std::exception& e) {
@@ -134,19 +131,16 @@ namespace {
 
     void UserCacheInvalidator::run() {
         Client::initThread("UserCacheInvalidator");
-        lastInvalidationTime = Date_t(curTimeMillis64());
+        lastInvalidationTime = Date_t::now();
 
         while (true) {
             boost::unique_lock<boost::mutex> lock(invalidationIntervalMutex);
-            Date_t sleepUntil = Date_t(
-                    lastInvalidationTime.millis + userCacheInvalidationIntervalSecs * 1000);
-            Date_t now(curTimeMillis64());
-            while (now.millis < sleepUntil.millis) {
-                invalidationIntervalChangedCondition.timed_wait(lock,
-                                                                Milliseconds(sleepUntil - now));
-                sleepUntil = Date_t(
-                        lastInvalidationTime.millis + (userCacheInvalidationIntervalSecs * 1000));
-                now = Date_t(curTimeMillis64());
+            Date_t sleepUntil = lastInvalidationTime + Seconds(userCacheInvalidationIntervalSecs);
+            Date_t now = Date_t::now();
+            while (now < sleepUntil) {
+                invalidationIntervalChangedCondition.wait_for(lock, sleepUntil - now);
+                sleepUntil = lastInvalidationTime + Seconds(userCacheInvalidationIntervalSecs);
+                now = Date_t::now();
             }
             lastInvalidationTime = now;
             lock.unlock();

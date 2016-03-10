@@ -9,7 +9,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/util/foundation',
-        '$BUILD_DIR/mongo/server_options_core',
+        '$BUILD_DIR/mongo/db/server_options_core',
     ],
 )
 
@@ -37,9 +37,9 @@ env.Library(
         "ssl_options.cpp",
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/background_job',
-        '$BUILD_DIR/mongo/fail_point',
-        '$BUILD_DIR/mongo/server_options_core',
+        '$BUILD_DIR/mongo/util/background_job',
+        '$BUILD_DIR/mongo/util/fail_point',
+        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/util/concurrency/ticketholder',
         '$BUILD_DIR/mongo/util/foundation',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
@@ -55,5 +55,24 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/util/concurrency/synchronization',
         'network',
+    ],
+)
+
+env.Library(
+    target="message_server_port",
+    source=[
+        "message_server_port.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/stats/counters',
+    ],
+)
+
+env.Library(
+    target='miniwebserver',
+    source=[
+        'miniwebserver.cpp',
+    ],
+    LIBDEPS=[
     ],
 )

@@ -33,7 +33,6 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/ops/update_request.h"
-#include "mongo/db/write_concern_options.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/batched_delete_document.h"
@@ -44,12 +43,11 @@ namespace mongo {
 
     class BSONObjBuilder;
     class CurOp;
+    class LastError;
     class OpCounters;
     class OperationContext;
-    struct LastError;
-
-    struct WriteOpStats;
     class WriteBatchStats;
+    struct WriteOpStats;
 
     /**
      * An instance of WriteBatchExecutor is an object capable of issuing a write batch.
@@ -96,7 +94,6 @@ namespace mongo {
          * times.
          */
         void execInserts( const BatchedCommandRequest& request,
-                          const WriteConcernOptions& originalWC,
                           std::vector<WriteErrorDetail*>* errors );
 
         /**

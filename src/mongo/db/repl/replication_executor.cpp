@@ -32,6 +32,7 @@
 
 #include <limits>
 
+#include "mongo/db/repl/database_task.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -42,17 +43,20 @@ namespace {
     stdx::function<void ()> makeNoExcept(const stdx::function<void ()> &fn);
 }  // namespace
 
-    const ReplicationExecutor::Milliseconds ReplicationExecutor::kNoTimeout(-1);
-    const Date_t ReplicationExecutor::kNoExpirationDate(-1);
-
     ReplicationExecutor::ReplicationExecutor(NetworkInterface* netInterface, int64_t prngSeed) :
         _random(prngSeed),
         _networkInterface(netInterface),
         _totalEventWaiters(0),
         _inShutdown(false),
         _dblockWorkers(threadpool::ThreadPool::DoNotStartThreadsTag(),
-                       1,
+                       3,
                        "replCallbackWithGlobalLock-"),
+        _dblockTaskRunner(
+            &_dblockWorkers,
+            stdx::bind(&NetworkInterface::createOperationContext, netInterface)),
+        _dblockExclusiveLockTaskRunner(
+            &_dblockWorkers,
+            stdx::bind(&NetworkInterface::createOperationContext, netInterface)),
         _nextId(0) {
     }
 
@@ -67,6 +71,7 @@ namespace {
         str::stream output;
         output << "ReplicationExecutor";
         output << " networkInProgress:" << _networkInProgressQueue.size();
+        output << " dbWorkInProgress:" << _dbWorkInProgressQueue.size();
         output << " exclusiveInProgress:" << _exclusiveLockInProgressQueue.size();
         output << " sleeperQueue:" << _sleepersQueue.size();
         output << " ready:" << _readyQueue.size();
@@ -111,6 +116,7 @@ namespace {
         boost::lock_guard<boost::mutex> lk(_mutex);
         _inShutdown = true;
 
+        _readyQueue.splice(_readyQueue.end(), _dbWorkInProgressQueue);
         _readyQueue.splice(_readyQueue.end(), _exclusiveLockInProgressQueue);
         _readyQueue.splice(_readyQueue.end(), _networkInProgressQueue);
         _readyQueue.splice(_readyQueue.end(), _sleepersQueue);
@@ -130,9 +136,12 @@ namespace {
     }
 
     void ReplicationExecutor::finishShutdown() {
+        _dblockExclusiveLockTaskRunner.cancel();
+        _dblockTaskRunner.cancel();
         _dblockWorkers.join();
         boost::unique_lock<boost::mutex> lk(_mutex);
         invariant(_inShutdown);
+        invariant(_dbWorkInProgressQueue.empty());
         invariant(_exclusiveLockInProgressQueue.empty());
         invariant(_readyQueue.empty());
         invariant(_sleepersQueue.empty());
@@ -146,6 +155,7 @@ namespace {
         while (_totalEventWaiters > 0)
             _noMoreWaitingThreads.wait(lk);
 
+        invariant(_dbWorkInProgressQueue.empty());
         invariant(_exclusiveLockInProgressQueue.empty());
         invariant(_readyQueue.empty());
         invariant(_sleepersQueue.empty());
@@ -223,7 +233,7 @@ namespace {
     static void remoteCommandFinished(
             const ReplicationExecutor::CallbackData& cbData,
             const ReplicationExecutor::RemoteCommandCallbackFn& cb,
-            const ReplicationExecutor::RemoteCommandRequest& request,
+            const RemoteCommandRequest& request,
             const ResponseStatus& response) {
 
         if (cbData.status.isOK()) {
@@ -242,7 +252,7 @@ namespace {
     static void remoteCommandFailedEarly(
             const ReplicationExecutor::CallbackData& cbData,
             const ReplicationExecutor::RemoteCommandCallbackFn& cb,
-            const ReplicationExecutor::RemoteCommandRequest& request) {
+            const RemoteCommandRequest& request) {
 
         invariant(!cbData.status.isOK());
         cb(ReplicationExecutor::RemoteCommandCallbackData(
@@ -279,12 +289,11 @@ namespace {
             const RemoteCommandRequest& request,
             const RemoteCommandCallbackFn& cb) {
         RemoteCommandRequest scheduledRequest = request;
-        if (request.timeout == kNoTimeout) {
-            scheduledRequest.expirationDate = kNoExpirationDate;
+        if (request.timeout == RemoteCommandRequest::kNoTimeout) {
+            scheduledRequest.expirationDate = RemoteCommandRequest::kNoExpirationDate;
         }
         else {
-            scheduledRequest.expirationDate =
-                _networkInterface->now() + scheduledRequest.timeout.total_milliseconds();
+            scheduledRequest.expirationDate = _networkInterface->now() + scheduledRequest.timeout;
         }
         boost::lock_guard<boost::mutex> lk(_mutex);
         StatusWith<CallbackHandle> handle = enqueueWork_inlock(
@@ -333,9 +342,47 @@ namespace {
         return cbHandle;
     }
 
-    void ReplicationExecutor::doOperationWithGlobalExclusiveLock(
-            OperationContext* txn,
-            const CallbackHandle& cbHandle) {
+    StatusWith<ReplicationExecutor::CallbackHandle>
+    ReplicationExecutor::scheduleDBWork(const CallbackFn& work) {
+        return scheduleDBWork(work, NamespaceString(), MODE_NONE);
+    }
+
+    StatusWith<ReplicationExecutor::CallbackHandle>
+    ReplicationExecutor::scheduleDBWork(const CallbackFn& work,
+                                        const NamespaceString& nss,
+                                        LockMode mode) {
+
+        boost::lock_guard<boost::mutex> lk(_mutex);
+        StatusWith<CallbackHandle> handle = enqueueWork_inlock(&_dbWorkInProgressQueue,
+                                                               work);
+        if (handle.isOK()) {
+            auto doOp = stdx::bind(
+                    &ReplicationExecutor::_doOperation,
+                    this,
+                    stdx::placeholders::_1,
+                    stdx::placeholders::_2,
+                    handle.getValue(),
+                    &_dbWorkInProgressQueue,
+                    nullptr);
+            auto task = [doOp](OperationContext* txn, const Status& status) {
+                makeNoExcept(stdx::bind(doOp, txn, status))();
+                return TaskRunner::NextAction::kDisposeOperationContext;
+            };
+            if (mode == MODE_NONE && nss.ns().empty()) {
+                _dblockTaskRunner.schedule(task);
+            }
+            else {
+                _dblockTaskRunner.schedule(DatabaseTask::makeCollectionLockTask(task, nss, mode));
+            }
+        }
+        return handle;
+    }
+
+    void ReplicationExecutor::_doOperation(OperationContext* txn,
+                                           const Status& taskRunnerStatus,
+                                           const CallbackHandle& cbHandle,
+                                           WorkQueue* workQueue,
+                                           boost::mutex* terribleExLockSyncMutex) {
         boost::unique_lock<boost::mutex> lk(_mutex);
         if (_inShutdown)
             return;
@@ -344,13 +391,17 @@ namespace {
         invariant(generation == cbHandle._generation);
         WorkItem work = *iter;
         iter->callback = CallbackFn();
-        _freeQueue.splice(_freeQueue.begin(), _exclusiveLockInProgressQueue, iter);
+        _freeQueue.splice(_freeQueue.begin(), *workQueue, iter);
         lk.unlock();
         {
-            boost::lock_guard<boost::mutex> terribleLock(_terribleExLockSyncMutex);
+            std::unique_ptr<boost::lock_guard<boost::mutex> > terribleLock(
+                terribleExLockSyncMutex ?
+                new boost::lock_guard<boost::mutex>(*terribleExLockSyncMutex) :
+                nullptr);
+            // Only possible task runner error status is CallbackCanceled.
             work.callback(CallbackData(this,
                                        cbHandle,
-                                       (work.isCanceled ?
+                                       (work.isCanceled || !taskRunnerStatus.isOK() ?
                                         Status(ErrorCodes::CallbackCanceled, "Callback canceled") :
                                         Status::OK()),
                                        txn));
@@ -367,16 +418,20 @@ namespace {
         StatusWith<CallbackHandle> handle = enqueueWork_inlock(&_exclusiveLockInProgressQueue,
                                                                work);
         if (handle.isOK()) {
-            const stdx::function<void (OperationContext*)> doOp = stdx::bind(
-                    &ReplicationExecutor::doOperationWithGlobalExclusiveLock,
+            auto doOp = stdx::bind(
+                    &ReplicationExecutor::_doOperation,
                     this,
                     stdx::placeholders::_1,
-                    handle.getValue());
-            _dblockWorkers.schedule(
-                    makeNoExcept(stdx::bind(
-                                         &NetworkInterface::runCallbackWithGlobalExclusiveLock,
-                                         _networkInterface.get(),
-                                         doOp)));
+                    stdx::placeholders::_2,
+                    handle.getValue(),
+                    &_exclusiveLockInProgressQueue,
+                    &_terribleExLockSyncMutex);
+            _dblockExclusiveLockTaskRunner.schedule(
+                DatabaseTask::makeGlobalExclusiveLockTask(
+                    [doOp](OperationContext* txn, const Status& status) {
+                makeNoExcept(stdx::bind(doOp, txn, status))();
+                return TaskRunner::NextAction::kDisposeOperationContext;
+            }));
         }
         return handle;
     }
@@ -410,7 +465,7 @@ namespace {
                 return std::make_pair(WorkItem(), CallbackHandle());
             }
             lk.unlock();
-            if (nextWakeupDate == Date_t(~0ULL)) {
+            if (nextWakeupDate == Date_t::max()) {
                 _networkInterface->waitForWork();
             }
             else {
@@ -437,7 +492,7 @@ namespace {
         _readyQueue.splice(_readyQueue.end(), _sleepersQueue, _sleepersQueue.begin(), iter);
         if (iter == _sleepersQueue.end()) {
             // indicate no sleeper to wait for
-            return Date_t(~0ULL);
+            return Date_t::max();
         }
         return iter->readyDate;
     }
@@ -484,35 +539,6 @@ namespace {
         txn(theTxn) {
     }
 
-    ReplicationExecutor::RemoteCommandRequest::RemoteCommandRequest() :
-        timeout(kNoTimeout),
-        expirationDate(kNoExpirationDate) {
-    }
-
-    ReplicationExecutor::RemoteCommandRequest::RemoteCommandRequest(
-            const HostAndPort& theTarget,
-            const std::string& theDbName,
-            const BSONObj& theCmdObj,
-            const Milliseconds timeoutMillis) :
-        target(theTarget),
-        dbname(theDbName),
-        cmdObj(theCmdObj),
-        timeout(timeoutMillis) {
-        if (timeoutMillis == kNoTimeout) {
-            expirationDate = kNoExpirationDate;
-        }
-    }
-
-    std::string ReplicationExecutor::RemoteCommandRequest::getDiagnosticString() {
-        str::stream out;
-        out << "RemoteCommand -- target:" << target.toString() << " db:" << dbname;
-
-        if (expirationDate  != kNoExpirationDate)
-            out << " expDate:" << expirationDate.toString();
-
-        out << " cmd:" << cmdObj.getOwned().toString();
-        return out;
-    }
 
     ReplicationExecutor::RemoteCommandCallbackData::RemoteCommandCallbackData(
             ReplicationExecutor* theExecutor,

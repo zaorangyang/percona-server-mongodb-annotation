@@ -36,7 +36,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/bson_serializable.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/write_ops/batched_delete_document.h"
 #include "mongo/s/write_ops/batched_request_metadata.h"
 
@@ -124,6 +123,13 @@ namespace mongo {
         void unsetMetadata();
         bool isMetadataSet() const;
         BatchedRequestMetadata* getMetadata() const;
+
+        /**
+         * These are no-ops since delete never validates documents. They only exist to fulfill the
+         * unified API.
+         */
+        void setShouldBypassValidation(bool newVal) {}
+        bool shouldBypassValidation() const { return false; }
 
     private:
         // Convention: (M)andatory, (O)ptional

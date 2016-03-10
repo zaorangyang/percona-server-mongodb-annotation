@@ -32,6 +32,7 @@
 
 #include <boost/scoped_ptr.hpp>
 #include <boost/thread.hpp>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <set>
@@ -42,6 +43,9 @@
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/network_interface_mock.h"
 #include "mongo/db/repl/operation_context_repl_mock.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/read_after_optime_args.h"
+#include "mongo/db/repl/read_after_optime_response.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replica_set_config.h"
@@ -57,12 +61,23 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 namespace repl {
 namespace {
 
     typedef ReplicationCoordinator::ReplSetReconfigArgs ReplSetReconfigArgs;
+    Status kInterruptedStatus(ErrorCodes::Interrupted, "operation was interrupted");
+
+    // Helper class to wrap Timestamp as an OpTime with term 0.
+    struct OpTimeWithTermZero {
+        OpTimeWithTermZero(unsigned int sec, unsigned int i) : timestamp(sec, i) { }
+        operator OpTime() const { return OpTime(timestamp, 0); }
+
+        Timestamp timestamp;
+    };
 
     TEST_F(ReplCoordTest, StartupWithValidLocalConfig) {
         assertStartSuccess(
@@ -100,7 +115,7 @@ namespace {
         startCapturingLogMessages();
         start();
         stopCapturingLogMessages();
-        ASSERT_EQUALS(1, countLogLinesContaining("Did not find local "));
+        ASSERT_EQUALS(2, countLogLinesContaining("Did not find local "));
         ASSERT_EQUALS(MemberState::RS_STARTUP, getReplCoord()->getMemberState().s);
     }
 
@@ -234,11 +249,11 @@ namespace {
         ASSERT_EQUALS(HostAndPort("node2", 54321), noi->getRequest().target);
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
         ASSERT_EQUALS(hbArgs.toBSON(), noi->getRequest().cmdObj);
-        getNet()->scheduleResponse(noi, startDate + 10, ResponseStatus(ErrorCodes::NoSuchKey,
-                                                                       "No response"));
-        getNet()->runUntil(startDate + 10);
+        getNet()->scheduleResponse(noi, startDate + Milliseconds(10),
+                                   ResponseStatus(ErrorCodes::NoSuchKey, "No response"));
+        getNet()->runUntil(startDate + Milliseconds(10));
         getNet()->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, getNet()->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), getNet()->now());
         prsiThread.join();
         ASSERT_EQUALS(ErrorCodes::NodeNotFound, status);
         ASSERT_EQUALS(MemberState::RS_STARTUP, getReplCoord()->getMemberState().s);
@@ -269,12 +284,11 @@ namespace {
         hbResp.setVersion(0);
         getNet()->scheduleResponse(
                 noi,
-                startDate + 10,
-                ResponseStatus(ReplicationExecutor::RemoteCommandResponse(hbResp.toBSON(),
-                                                                          Milliseconds(8))));
-        getNet()->runUntil(startDate + 10);
+                startDate + Milliseconds(10),
+                ResponseStatus(RemoteCommandResponse(hbResp.toBSON(), Milliseconds(8))));
+        getNet()->runUntil(startDate + Milliseconds(10));
         getNet()->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, getNet()->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), getNet()->now());
         prsiThread.join();
         ASSERT_OK(status);
         ASSERT_EQUALS(ReplicationCoordinator::modeReplSet, getReplCoord()->getReplicationMode());
@@ -325,7 +339,7 @@ namespace {
         ASSERT_EQUALS(MemberState::RS_STARTUP, getReplCoord()->getMemberState().s);
 
         BSONObjBuilder result1;
-        getExternalState()->setStoreLocalConfigDocumentStatus(Status(ErrorCodes::OutOfDiskSpace, 
+        getExternalState()->setStoreLocalConfigDocumentStatus(Status(ErrorCodes::OutOfDiskSpace,
                                                                      "The test set this"));
         ASSERT_EQUALS(
                 ErrorCodes::OutOfDiskSpace,
@@ -406,7 +420,7 @@ namespace {
     TEST_F(ReplCoordTest, AwaitReplicationNoReplEnabled) {
         init("");
         OperationContextNoop txn;
-        Timestamp time(100, 1);
+        OpTimeWithTermZero time(100, 1);
 
         WriteConcernOptions writeConcern;
         writeConcern.wTimeout = WriteConcernOptions::kNoWaiting;
@@ -424,7 +438,7 @@ namespace {
         settings.master = true;
         init(settings);
         OperationContextNoop txn;
-        Timestamp time(100, 1);
+        OpTimeWithTermZero time(100, 1);
 
         WriteConcernOptions writeConcern;
         writeConcern.wTimeout = WriteConcernOptions::kNoWaiting;
@@ -432,7 +446,7 @@ namespace {
 
 
         writeConcern.wNumNodes = 0;
-        writeConcern.wMode = "majority";
+        writeConcern.wMode = WriteConcernOptions::kMajority;
         // w:majority always works on master/slave
         ReplicationCoordinator::StatusAndDuration statusAndDur = getReplCoord()->awaitReplication(
                 &txn, time, writeConcern);
@@ -449,7 +463,7 @@ namespace {
                 HostAndPort("node1", 12345));
 
         OperationContextNoop txn;
-        Timestamp time(100, 1);
+        OpTimeWithTermZero time(100, 1);
 
         WriteConcernOptions writeConcern;
         writeConcern.wTimeout = WriteConcernOptions::kNoWaiting;
@@ -462,7 +476,7 @@ namespace {
         ASSERT_EQUALS(ErrorCodes::NotMaster, statusAndDur.status);
 
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 0));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
         simulateSuccessfulElection();
 
         statusAndDur = getReplCoord()->awaitReplication(&txn, time, writeConcern);
@@ -480,11 +494,11 @@ namespace {
                                              BSON("host" << "node4:12345" << "_id" << 3))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 0));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
         simulateSuccessfulElection();
 
-        Timestamp time1(100, 1);
-        Timestamp time2(100, 2);
+        OpTimeWithTermZero time1(100, 1);
+        OpTimeWithTermZero time2(100, 2);
 
         WriteConcernOptions writeConcern;
         writeConcern.wTimeout = WriteConcernOptions::kNoWaiting;
@@ -555,11 +569,11 @@ namespace {
                                              "multiDCAndRack" << BSON("dc" << 2 << "rack" << 3)))),
                 HostAndPort("node0"));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 0));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
         simulateSuccessfulElection();
 
-        Timestamp time1(100, 1);
-        Timestamp time2(100, 2);
+        OpTimeWithTermZero time1(100, 1);
+        OpTimeWithTermZero time2(100, 2);
 
         // Test invalid write concern
         WriteConcernOptions invalidWriteConcern;
@@ -574,7 +588,7 @@ namespace {
         // Set up valid write concerns for the rest of the test
         WriteConcernOptions majorityWriteConcern;
         majorityWriteConcern.wTimeout = WriteConcernOptions::kNoWaiting;
-        majorityWriteConcern.wMode = "majority";
+        majorityWriteConcern.wMode = WriteConcernOptions::kMajority;
 
         WriteConcernOptions multiDCWriteConcern;
         multiDCWriteConcern.wTimeout = WriteConcernOptions::kNoWaiting;
@@ -641,9 +655,9 @@ namespace {
         ReplicationAwaiter(ReplicationCoordinatorImpl* replCoord, OperationContext* txn) :
             _replCoord(replCoord), _finished(false),
             _result(ReplicationCoordinator::StatusAndDuration(
-                    Status::OK(), ReplicationCoordinator::Milliseconds(0))) {}
+                    Status::OK(), Milliseconds(0))) {}
 
-        void setOpTime(const Timestamp& ot) {
+        void setOpTime(const OpTime& ot) {
             _optime = ot;
         }
 
@@ -669,7 +683,7 @@ namespace {
             ASSERT(_finished);
             _finished = false;
             _result = ReplicationCoordinator::StatusAndDuration(
-                    Status::OK(), ReplicationCoordinator::Milliseconds(0));
+                    Status::OK(), Milliseconds(0));
         }
 
     private:
@@ -681,7 +695,7 @@ namespace {
 
         ReplicationCoordinatorImpl* _replCoord;
         bool _finished;
-        Timestamp _optime;
+        OpTime _optime;
         WriteConcernOptions _writeConcern;
         ReplicationCoordinator::StatusAndDuration _result;
         boost::scoped_ptr<boost::thread> _thread;
@@ -697,13 +711,13 @@ namespace {
                                              BSON("host" << "node3:12345" << "_id" << 2))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 0));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
         simulateSuccessfulElection();
 
         ReplicationAwaiter awaiter(getReplCoord(), &txn);
 
-        Timestamp time1(100, 1);
-        Timestamp time2(100, 2);
+        OpTimeWithTermZero time1(100, 1);
+        OpTimeWithTermZero time2(100, 2);
 
         WriteConcernOptions writeConcern;
         writeConcern.wTimeout = WriteConcernOptions::kNoTimeout;
@@ -748,13 +762,13 @@ namespace {
                                              BSON("host" << "node3:12345" << "_id" << 2))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 0));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
         simulateSuccessfulElection();
 
         ReplicationAwaiter awaiter(getReplCoord(), &txn);
 
-        Timestamp time1(100, 1);
-        Timestamp time2(100, 2);
+        OpTimeWithTermZero time1(100, 1);
+        OpTimeWithTermZero time2(100, 2);
 
         WriteConcernOptions writeConcern;
         writeConcern.wTimeout = 50;
@@ -781,13 +795,13 @@ namespace {
                                              BSON("host" << "node3:12345" << "_id" << 2))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 0));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
         simulateSuccessfulElection();
 
         ReplicationAwaiter awaiter(getReplCoord(), &txn);
 
-        Timestamp time1(100, 1);
-        Timestamp time2(100, 2);
+        OpTimeWithTermZero time1(100, 1);
+        OpTimeWithTermZero time2(100, 2);
 
         WriteConcernOptions writeConcern;
         writeConcern.wTimeout = WriteConcernOptions::kNoTimeout;
@@ -817,13 +831,13 @@ namespace {
                                              BSON("host" << "node3:12345" << "_id" << 2))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 0));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
         simulateSuccessfulElection();
 
         ReplicationAwaiter awaiter(getReplCoord(), &txn);
 
-        Timestamp time1(100, 1);
-        Timestamp time2(100, 2);
+        OpTimeWithTermZero time1(100, 1);
+        OpTimeWithTermZero time2(100, 2);
 
         WriteConcernOptions writeConcern;
         writeConcern.wTimeout = WriteConcernOptions::kNoTimeout;
@@ -841,50 +855,9 @@ namespace {
         awaiter.reset();
     }
 
-    class OperationContextNoopWithInterrupt : public OperationContextReplMock {
-    public:
-
-        OperationContextNoopWithInterrupt() : _opID(0), _interruptOp(false) {}
-
-        virtual unsigned int getOpID() const {
-            return _opID;
-        }
-
-        /**
-         * Can only be called before any multi-threaded access to this object has begun.
-         */
-        void setOpID(unsigned int opID) {
-            _opID = opID;
-        }
-
-        virtual void checkForInterrupt() const {
-            if (_interruptOp) {
-                uasserted(ErrorCodes::Interrupted, "operation was interrupted");
-            }
-        }
-
-        virtual Status checkForInterruptNoAssert() const {
-            if (_interruptOp) {
-                return Status(ErrorCodes::Interrupted, "operation was interrupted");
-            }
-            return Status::OK();
-        }
-
-        /**
-         * Can only be called before any multi-threaded access to this object has begun.
-         */
-        void setInterruptOp(bool interrupt) {
-            _interruptOp = interrupt;
-        }
-
-    private:
-        unsigned int _opID;
-        bool _interruptOp;
-    };
-
     TEST_F(ReplCoordTest, AwaitReplicationInterrupt) {
         // Tests that a thread blocked in awaitReplication can be killed by a killOp operation
-        OperationContextNoopWithInterrupt txn;
+        OperationContextReplMock txn;
         assertStartSuccess(
                 BSON("_id" << "mySet" <<
                      "version" << 2 <<
@@ -893,13 +866,13 @@ namespace {
                                              BSON("_id" << 2 << "host" << "node3"))),
                 HostAndPort("node1"));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 0));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
         simulateSuccessfulElection();
 
         ReplicationAwaiter awaiter(getReplCoord(), &txn);
 
-        Timestamp time1(100, 1);
-        Timestamp time2(100, 2);
+        OpTimeWithTermZero time1(100, 1);
+        OpTimeWithTermZero time2(100, 2);
 
         WriteConcernOptions writeConcern;
         writeConcern.wTimeout = WriteConcernOptions::kNoTimeout;
@@ -915,7 +888,7 @@ namespace {
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 1, time1));
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 2, time1));
 
-        txn.setInterruptOp(true);
+        txn.setCheckForInterruptStatus(kInterruptedStatus);
         getReplCoord()->interrupt(opID);
         ReplicationCoordinator::StatusAndDuration statusAndDur = awaiter.getResult();
         ASSERT_EQUALS(ErrorCodes::Interrupted, statusAndDur.status);
@@ -947,7 +920,7 @@ namespace {
 
     TEST_F(StepDownTest, StepDownNotPrimary) {
         OperationContextReplMock txn;
-        Timestamp optime1(100, 1);
+        OpTimeWithTermZero optime1(100, 1);
         // All nodes are caught up
         getReplCoord()->setMyLastOptime(optime1);
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(1, 1, optime1));
@@ -960,7 +933,7 @@ namespace {
 
     TEST_F(StepDownTest, StepDownTimeoutAcquiringGlobalLock) {
         OperationContextReplMock txn;
-        Timestamp optime1(100, 1);
+        OpTimeWithTermZero optime1(100, 1);
         // All nodes are caught up
         getReplCoord()->setMyLastOptime(optime1);
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(1, 1, optime1));
@@ -978,7 +951,7 @@ namespace {
 
     TEST_F(StepDownTest, StepDownNoWaiting) {
         OperationContextReplMock txn;
-        Timestamp optime1(100, 1);
+        OpTimeWithTermZero optime1(100, 1);
         // All nodes are caught up
         getReplCoord()->setMyLastOptime(optime1);
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(1, 1, optime1));
@@ -987,10 +960,10 @@ namespace {
         simulateSuccessfulElection();
 
         enterNetwork();
-        getNet()->runUntil(getNet()->now() + 2000);
+        getNet()->runUntil(getNet()->now() + Seconds(2));
         ASSERT(getNet()->hasReadyRequests());
         NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
-        ReplicationExecutor::RemoteCommandRequest request = noi->getRequest();
+        RemoteCommandRequest request = noi->getRequest();
         log() << request.target.toString() << " processing " << request.cmdObj;
         ReplSetHeartbeatArgs hbArgs;
         if (hbArgs.initialize(request.cmdObj).isOK()) {
@@ -998,7 +971,7 @@ namespace {
             hbResp.setSetName(hbArgs.getSetName());
             hbResp.setState(MemberState::RS_SECONDARY);
             hbResp.setVersion(hbArgs.getConfigVersion());
-            hbResp.setOpTime(optime1);
+            hbResp.setOpTime(optime1.timestamp);
             BSONObjBuilder respObj;
             respObj << "ok" << 1;
             hbResp.addToBSON(&respObj);
@@ -1014,7 +987,7 @@ namespace {
         ASSERT_TRUE(getReplCoord()->getMemberState().primary());
         ASSERT_OK(getReplCoord()->stepDown(&txn, false, Milliseconds(0), Milliseconds(1000)));
         enterNetwork(); // So we can safely inspect the topology coordinator
-        ASSERT_EQUALS(Date_t(getNet()->now().millis + 1000), getTopoCoord().getStepDownTime());
+        ASSERT_EQUALS(getNet()->now() + Seconds(1), getTopoCoord().getStepDownTime());
         ASSERT_TRUE(getTopoCoord().getMemberState().secondary());
         exitNetwork();
         ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
@@ -1034,7 +1007,7 @@ namespace {
         ASSERT_TRUE(getReplCoord()->getMemberState().primary());
         ASSERT_OK(getReplCoord()->stepDown(&txn, true, Milliseconds(0), Milliseconds(1000)));
         getNet()->enterNetwork(); // Must do this before inspecting the topocoord
-        Date_t stepdownUntil = Date_t(getNet()->now().millis + 1000);
+        Date_t stepdownUntil = getNet()->now() + Seconds(1);
         ASSERT_EQUALS(stepdownUntil, getTopoCoord().getStepDownTime());
         ASSERT_TRUE(getTopoCoord().getMemberState().secondary());
         ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
@@ -1114,8 +1087,8 @@ namespace {
 
     TEST_F(StepDownTest, StepDownNotCaughtUp) {
         OperationContextReplMock txn;
-        Timestamp optime1(100, 1);
-        Timestamp optime2(100, 2);
+        OpTimeWithTermZero optime1(100, 1);
+        OpTimeWithTermZero optime2(100, 2);
         // No secondary is caught up
         getReplCoord()->setMyLastOptime(optime2);
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(1, 1, optime1));
@@ -1138,11 +1111,11 @@ namespace {
         runner.reset();
         getNet()->enterNetwork();
         const Date_t startDate = getNet()->now();
-        while (startDate + 1000 < getNet()->now()) {
+        while (startDate + Milliseconds(1000) < getNet()->now()) {
             while (getNet()->hasReadyRequests()) {
                 getNet()->blackHole(getNet()->getNextReadyRequest());
             }
-            getNet()->runUntil(startDate + 1000);
+            getNet()->runUntil(startDate + Milliseconds(1000));
         }
         getNet()->exitNetwork();
         ASSERT_TRUE(getReplCoord()->getMemberState().primary());
@@ -1156,8 +1129,8 @@ namespace {
 
     TEST_F(StepDownTest, StepDownCatchUp) {
         OperationContextReplMock txn;
-        Timestamp optime1(100, 1);
-        Timestamp optime2(100, 2);
+        OpTimeWithTermZero optime1(100, 1);
+        OpTimeWithTermZero optime2(100, 2);
         // No secondary is caught up
         getReplCoord()->setMyLastOptime(optime2);
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(1, 1, optime1));
@@ -1175,10 +1148,10 @@ namespace {
 
         // Make a secondary actually catch up
         enterNetwork();
-        getNet()->runUntil(getNet()->now() + 2000);
+        getNet()->runUntil(getNet()->now() + Milliseconds(2000));
         ASSERT(getNet()->hasReadyRequests());
         NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
-        ReplicationExecutor::RemoteCommandRequest request = noi->getRequest();
+        RemoteCommandRequest request = noi->getRequest();
         log() << request.target.toString() << " processing " << request.cmdObj;
         ReplSetHeartbeatArgs hbArgs;
         if (hbArgs.initialize(request.cmdObj).isOK()) {
@@ -1186,7 +1159,7 @@ namespace {
             hbResp.setSetName(hbArgs.getSetName());
             hbResp.setState(MemberState::RS_SECONDARY);
             hbResp.setVersion(hbArgs.getConfigVersion());
-            hbResp.setOpTime(optime2);
+            hbResp.setOpTime(optime2.timestamp);
             BSONObjBuilder respObj;
             respObj << "ok" << 1;
             hbResp.addToBSON(&respObj);
@@ -1203,9 +1176,9 @@ namespace {
     }
 
     TEST_F(StepDownTest, InterruptStepDown) {
-        OperationContextNoopWithInterrupt txn;
-        Timestamp optime1(100, 1);
-        Timestamp optime2(100, 2);
+        OperationContextReplMock txn;
+        OpTimeWithTermZero optime1(100, 1);
+        OpTimeWithTermZero optime2(100, 2);
         // No secondary is caught up
         getReplCoord()->setMyLastOptime(optime2);
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(1, 1, optime1));
@@ -1224,7 +1197,7 @@ namespace {
 
         unsigned int opID = 100;
         txn.setOpID(opID);
-        txn.setInterruptOp(true);
+        txn.setCheckForInterruptStatus(kInterruptedStatus);
         getReplCoord()->interrupt(opID);
 
         ASSERT_EQUALS(ErrorCodes::Interrupted, runner.getResult());
@@ -1278,9 +1251,9 @@ namespace {
                                              BSON("_id" << 1 << "host" << "test2:1234") <<
                                              BSON("_id" << 2 << "host" << "test3:1234"))),
                 HostAndPort("test1", 1234));
-        Timestamp optime1(100, 1);
-        Timestamp optime2(100, 2);
-        Timestamp optime3(2, 1);
+        OpTimeWithTermZero optime1(100, 1);
+        OpTimeWithTermZero optime2(100, 2);
+        OpTimeWithTermZero optime3(2, 1);
         getReplCoord()->setMyLastOptime(optime1);
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(1, 1, optime2));
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(1, 2, optime3));
@@ -1299,12 +1272,13 @@ namespace {
             long long memberId = entry["memberId"].Number();
             memberIds.insert(memberId);
             if (memberId == 0) {
-                ASSERT_EQUALS(optime1, entry["optime"].timestamp());
+                // TODO(siyuan) Update when we change replSetUpdatePosition format
+                ASSERT_EQUALS(optime1.timestamp, entry["optime"].timestamp());
             } else if (memberId == 1) {
-                ASSERT_EQUALS(optime2, entry["optime"].timestamp());
+                ASSERT_EQUALS(optime2.timestamp, entry["optime"].timestamp());
             } else {
                 ASSERT_EQUALS(2, memberId);
-                ASSERT_EQUALS(optime3, entry["optime"].timestamp());
+                ASSERT_EQUALS(optime3.timestamp, entry["optime"].timestamp());
             }
         }
         ASSERT_EQUALS(3U, memberIds.size()); // Make sure we saw all 3 nodes
@@ -1321,7 +1295,7 @@ namespace {
                 HostAndPort("test2", 1234));
         OperationContextNoop txn;
         getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY);
-        getReplCoord()->setMyLastOptime(Timestamp(100, 0));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
 
         // Can't unset maintenance mode if it was never set to begin with.
         Status status = getReplCoord()->setMaintenanceMode(false);
@@ -1404,8 +1378,8 @@ namespace {
                 HostAndPort("node1", 12345));
         OperationContextNoop txn;
 
-        Timestamp time1(100, 1);
-        Timestamp time2(100, 2);
+        OpTimeWithTermZero time1(100, 1);
+        OpTimeWithTermZero time2(100, 2);
 
         getReplCoord()->setMyLastOptime(time2);
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 1, time1));
@@ -1434,8 +1408,8 @@ namespace {
         OperationContextNoop txn;
 
         OID client = OID::gen();
-        Timestamp time1(100, 1);
-        Timestamp time2(100, 2);
+        OpTimeWithTermZero time1(100, 1);
+        OpTimeWithTermZero time2(100, 2);
 
         getExternalState()->setClientHostAndPort(clientHost);
         HandshakeArgs handshake;
@@ -1443,12 +1417,12 @@ namespace {
         ASSERT_OK(getReplCoord()->processHandshake(&txn, handshake));
 
         getReplCoord()->setMyLastOptime(time2);
-        ASSERT_OK(getReplCoord()->setLastOptimeForSlave(client, time1));
+        ASSERT_OK(getReplCoord()->setLastOptimeForSlave(client, time1.timestamp));
 
         std::vector<HostAndPort> caughtUpHosts = getReplCoord()->getHostsWrittenTo(time2);
         ASSERT_EQUALS(0U, caughtUpHosts.size()); // self doesn't get included in master-slave
 
-        ASSERT_OK(getReplCoord()->setLastOptimeForSlave(client, time2));
+        ASSERT_OK(getReplCoord()->setLastOptimeForSlave(client, time2.timestamp));
         caughtUpHosts = getReplCoord()->getHostsWrittenTo(time2);
         ASSERT_EQUALS(1U, caughtUpHosts.size());
         ASSERT_EQUALS(clientHost, caughtUpHosts[0]);
@@ -1532,7 +1506,7 @@ namespace {
         ASSERT_TRUE(response.isPassive());
         ASSERT_FALSE(response.isHidden());
         ASSERT_TRUE(response.shouldBuildIndexes());
-        ASSERT_EQUALS(0, response.getSlaveDelay().total_seconds());
+        ASSERT_EQUALS(Seconds(0), response.getSlaveDelay());
         ASSERT_EQUALS(h4, response.getMe());
 
         std::vector<HostAndPort> hosts = response.getHosts();
@@ -1559,7 +1533,7 @@ namespace {
         IsMasterResponse roundTripped;
         ASSERT_OK(roundTripped.initialize(response.toBSON()));
     }
-         
+
     TEST_F(ReplCoordTest, ShutDownBeforeStartUpFinished) {
         init();
         startCapturingLogMessages();
@@ -1579,12 +1553,12 @@ namespace {
                                              BSON("host" << "node3:12345" << "_id" << 2))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 0));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
         simulateSuccessfulElection();
 
-        Timestamp time1(100, 1);
-        Timestamp time2(100, 2);
-        Timestamp staleTime(10, 0);
+        OpTimeWithTermZero time1(100, 1);
+        OpTimeWithTermZero time2(100, 2);
+        OpTimeWithTermZero staleTime(10, 0);
         getReplCoord()->setMyLastOptime(time1);
 
         WriteConcernOptions writeConcern;
@@ -1600,7 +1574,7 @@ namespace {
                                        "optimes" << BSON_ARRAY(
                                            BSON("cfgver" << 2 <<
                                                 "memberId" << 0 <<
-                                                "optime" << time2)))));
+                                                "optime" << time2.timestamp)))));
 
         ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, 0));
         ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit,
@@ -1612,7 +1586,7 @@ namespace {
                                         "optimes" << BSON_ARRAY(
                                             BSON("cfgver" << 3 <<
                                                  "memberId" << 1 <<
-                                                 "optime" << time2)))));
+                                                 "optime" << time2.timestamp)))));
 
         long long cfgver;
         ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
@@ -1626,7 +1600,7 @@ namespace {
                                         "optimes" << BSON_ARRAY(
                                             BSON("cfgver" << 2 <<
                                                  "memberId" << 9 <<
-                                                 "optime" << time2)))));
+                                                 "optime" << time2.timestamp)))));
 
         ASSERT_EQUALS(ErrorCodes::NodeNotFound,
                       getReplCoord()->processReplSetUpdatePosition(args3, 0));
@@ -1640,10 +1614,10 @@ namespace {
                                         "optimes" << BSON_ARRAY(
                                             BSON("cfgver" << 2 <<
                                                  "memberId" << 1 <<
-                                                 "optime" << time2) <<
+                                                 "optime" << time2.timestamp) <<
                                             BSON("cfgver" << 2 <<
                                                  "memberId" << 2 <<
-                                                 "optime" << time2)))));
+                                                 "optime" << time2.timestamp)))));
 
         ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args4, 0));
         ASSERT_OK(getReplCoord()->awaitReplication(&txn, time2, writeConcern).status);
@@ -1678,10 +1652,10 @@ namespace {
                                              BSON("host" << "node3:12345" << "_id" << 2))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 2));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 2));
         simulateSuccessfulElection();
 
-        Timestamp time(100, 2);
+        OpTimeWithTermZero time(100, 2);
 
         // 3 nodes waiting for time
         WriteConcernOptions writeConcern;
@@ -1700,7 +1674,7 @@ namespace {
         NetworkInterfaceMock* net = getNet();
         getNet()->enterNetwork();
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-        const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+        const RemoteCommandRequest& request = noi->getRequest();
         repl::ReplSetHeartbeatArgs hbArgs;
         ASSERT_OK(hbArgs.initialize(request.cmdObj));
         repl::ReplSetHeartbeatResponse hbResp;
@@ -1748,10 +1722,10 @@ namespace {
                                              BSON("host" << "node3:12345" << "_id" << 2))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 2));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 2));
         simulateSuccessfulElection();
 
-        Timestamp time(100, 2);
+        OpTimeWithTermZero time(100, 2);
 
         // 3 nodes waiting for time
         WriteConcernOptions writeConcern;
@@ -1770,7 +1744,7 @@ namespace {
         NetworkInterfaceMock* net = getNet();
         getNet()->enterNetwork();
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-        const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+        const RemoteCommandRequest& request = noi->getRequest();
         repl::ReplSetHeartbeatArgs hbArgs;
         ASSERT_OK(hbArgs.initialize(request.cmdObj));
         repl::ReplSetHeartbeatResponse hbResp;
@@ -1805,10 +1779,10 @@ namespace {
                                              BSON("host" << "node5:12345" << "_id" << 4))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100, 1));
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 1));
         simulateSuccessfulElection();
 
-        Timestamp time(100, 2);
+        OpTimeWithTermZero time(100, 2);
 
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 1, time));
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 2, time));
@@ -1817,7 +1791,7 @@ namespace {
         // majority nodes waiting for time
         WriteConcernOptions writeConcern;
         writeConcern.wTimeout = WriteConcernOptions::kNoTimeout;
-        writeConcern.wMode = "majority";
+        writeConcern.wMode = WriteConcernOptions::kMajority;
 
         ReplicationAwaiter awaiter(getReplCoord(), &txn);
         awaiter.setOpTime(time);
@@ -1827,7 +1801,7 @@ namespace {
         // demonstrate that majority cannot currently be satisfied
         WriteConcernOptions writeConcern2;
         writeConcern2.wTimeout = WriteConcernOptions::kNoWaiting;
-        writeConcern2.wMode = "majority";
+        writeConcern2.wMode = WriteConcernOptions::kMajority;
         ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit,
                       getReplCoord()->awaitReplication(&txn, time, writeConcern2).status);
 
@@ -1838,7 +1812,7 @@ namespace {
         NetworkInterfaceMock* net = getNet();
         getNet()->enterNetwork();
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-        const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+        const RemoteCommandRequest& request = noi->getRequest();
         repl::ReplSetHeartbeatArgs hbArgs;
         ASSERT_OK(hbArgs.initialize(request.cmdObj));
         repl::ReplSetHeartbeatResponse hbResp;
@@ -1878,13 +1852,13 @@ namespace {
                                                   "arbiterOnly" << true))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        Timestamp time(100, 0);
+        OpTimeWithTermZero time(100, 0);
         getReplCoord()->setMyLastOptime(time);
         simulateSuccessfulElection();
 
         WriteConcernOptions majorityWriteConcern;
         majorityWriteConcern.wTimeout = WriteConcernOptions::kNoWaiting;
-        majorityWriteConcern.wMode = "majority";
+        majorityWriteConcern.wMode = WriteConcernOptions::kMajority;
 
         ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit,
                       getReplCoord()->awaitReplication(&txn, time, majorityWriteConcern).status);
@@ -1919,31 +1893,197 @@ namespace {
                                                   "arbiterOnly" << true))),
                 HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        Timestamp zero(0, 0);
-        Timestamp time(100, 0);
+        OpTimeWithTermZero zero(0, 0);
+        OpTimeWithTermZero time(100, 0);
         getReplCoord()->setMyLastOptime(time);
         simulateSuccessfulElection();
 
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 1, time));
-        ASSERT_EQUALS(zero, getReplCoord()->getLastCommittedOpTime());
+        ASSERT_EQUALS((OpTime)zero, getReplCoord()->getLastCommittedOpTime());
 
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 3, time));
-        ASSERT_EQUALS(zero, getReplCoord()->getLastCommittedOpTime());
+        ASSERT_EQUALS((OpTime)zero, getReplCoord()->getLastCommittedOpTime());
 
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 2, time));
-        ASSERT_EQUALS(time, getReplCoord()->getLastCommittedOpTime());
+        ASSERT_EQUALS((OpTime)time, getReplCoord()->getLastCommittedOpTime());
 
 
         // Set a new, later OpTime.
-        Timestamp newTime = Timestamp(100, 1);
+        OpTimeWithTermZero newTime = OpTimeWithTermZero(100, 1);
         getReplCoord()->setMyLastOptime(newTime);
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 3, newTime));
-        ASSERT_EQUALS(time, getReplCoord()->getLastCommittedOpTime());
+        ASSERT_EQUALS((OpTime)time, getReplCoord()->getLastCommittedOpTime());
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 2, newTime));
         // Reached majority of voting nodes with newTime.
-        ASSERT_EQUALS(newTime, getReplCoord()->getLastCommittedOpTime());
+        ASSERT_EQUALS((OpTime)newTime, getReplCoord()->getLastCommittedOpTime());
         ASSERT_OK(getReplCoord()->setLastOptime_forTest(2, 1, newTime));
-        ASSERT_EQUALS(newTime, getReplCoord()->getLastCommittedOpTime());
+        ASSERT_EQUALS((OpTime)newTime, getReplCoord()->getLastCommittedOpTime());
+    }
+
+    TEST_F(ReplCoordTest, CantUseReadAfterIfNotReplSet) {
+        init(ReplSettings());
+        OperationContextNoop txn;
+        auto result = getReplCoord()->waitUntilOpTime(&txn,
+                ReadAfterOpTimeArgs(OpTimeWithTermZero(50, 0),
+                                    Milliseconds(0)));
+
+        ASSERT_FALSE(result.didWait());
+        ASSERT_EQUALS(ErrorCodes::NotAReplicaSet, result.getStatus());
+    }
+
+    TEST_F(ReplCoordTest, ReadAfterWhileShutdown) {
+        OperationContextNoop txn;
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0))),
+                HostAndPort("node1", 12345));
+
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(10, 0));
+
+        shutdown();
+
+        auto result = getReplCoord()->waitUntilOpTime(&txn,
+                ReadAfterOpTimeArgs(OpTimeWithTermZero(50, 0),
+                                    Milliseconds(0)));
+
+        ASSERT_TRUE(result.didWait());
+        ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, result.getStatus());
+    }
+
+    TEST_F(ReplCoordTest, ReadAfterInterrupted) {
+        OperationContextReplMock txn;
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0))),
+                HostAndPort("node1", 12345));
+
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(10, 0));
+
+        txn.setCheckForInterruptStatus(Status(ErrorCodes::Interrupted, "test"));
+
+        auto result = getReplCoord()->waitUntilOpTime(&txn,
+                ReadAfterOpTimeArgs(OpTimeWithTermZero(50, 0),
+                                    Milliseconds(0)));
+
+        ASSERT_TRUE(result.didWait());
+        ASSERT_EQUALS(ErrorCodes::Interrupted, result.getStatus());
+    }
+
+    TEST_F(ReplCoordTest, ReadAfterNoOpTime) {
+        OperationContextNoop txn;
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0))),
+                HostAndPort("node1", 12345));
+
+        auto result = getReplCoord()->waitUntilOpTime(&txn, ReadAfterOpTimeArgs());
+
+        ASSERT_FALSE(result.didWait());
+        ASSERT_OK(result.getStatus());
+    }
+
+    TEST_F(ReplCoordTest, ReadAfterGreaterOpTime) {
+        OperationContextNoop txn;
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0))),
+                HostAndPort("node1", 12345));
+
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
+        auto result = getReplCoord()->waitUntilOpTime(&txn,
+                ReadAfterOpTimeArgs(OpTimeWithTermZero(50, 0),
+                                    Milliseconds(100)));
+
+        ASSERT_TRUE(result.didWait());
+        ASSERT_OK(result.getStatus());
+    }
+
+    TEST_F(ReplCoordTest, ReadAfterEqualOpTime) {
+        OperationContextNoop txn;
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0))),
+                HostAndPort("node1", 12345));
+
+
+        OpTimeWithTermZero time(100, 0);
+        getReplCoord()->setMyLastOptime(time);
+        auto result = getReplCoord()->waitUntilOpTime(&txn,
+                ReadAfterOpTimeArgs(time, Milliseconds(100)));
+
+        ASSERT_TRUE(result.didWait());
+        ASSERT_OK(result.getStatus());
+    }
+
+    TEST_F(ReplCoordTest, ReadAfterDeferredGreaterOpTime) {
+        OperationContextNoop txn;
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0))),
+                HostAndPort("node1", 12345));
+
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(0, 0));
+
+        auto pseudoLogOp = std::async(std::launch::async, [this]() {
+            // Not guaranteed to be scheduled after waitUnitl blocks...
+            getReplCoord()->setMyLastOptime(OpTimeWithTermZero(200, 0));
+        });
+
+        auto result = getReplCoord()->waitUntilOpTime(&txn,
+                ReadAfterOpTimeArgs(OpTimeWithTermZero(100, 0),
+                                    Milliseconds(0)));
+        pseudoLogOp.get();
+
+        ASSERT_TRUE(result.didWait());
+        ASSERT_OK(result.getStatus());
+    }
+
+    TEST_F(ReplCoordTest, ReadAfterDeferredEqualOpTime) {
+        OperationContextNoop txn;
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0))),
+                HostAndPort("node1", 12345));
+
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(0, 0));
+
+        OpTimeWithTermZero opTimeToWait(100, 0);
+
+        auto pseudoLogOp = std::async(std::launch::async, [this, &opTimeToWait]() {
+            // Not guaranteed to be scheduled after waitUnitl blocks...
+            getReplCoord()->setMyLastOptime(opTimeToWait);
+        });
+
+        auto result = getReplCoord()->waitUntilOpTime(&txn,
+                ReadAfterOpTimeArgs(opTimeToWait, Milliseconds(0)));
+        pseudoLogOp.get();
+
+        ASSERT_TRUE(result.didWait());
+        ASSERT_OK(result.getStatus());
+    }
+
+    TEST_F(ReplCoordTest, ReadAfterOpTimeTimeoutNoMaxTimeMS) {
+        OperationContextNoop txn;
+        assertStartSuccess(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0))),
+                HostAndPort("node1", 12345));
+
+        getReplCoord()->setMyLastOptime(OpTimeWithTermZero(100, 0));
+
+        auto result = getReplCoord()->waitUntilOpTime(&txn,
+                ReadAfterOpTimeArgs(OpTimeWithTermZero(200, 0), Milliseconds(10)));
+
+        ASSERT_TRUE(result.didWait());
+        ASSERT_EQUALS(ErrorCodes::ReadAfterOptimeTimeout, result.getStatus());
     }
 
     // TODO(schwerin): Unit test election id updating

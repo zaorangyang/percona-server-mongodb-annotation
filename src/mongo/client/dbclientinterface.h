@@ -1,9 +1,5 @@
-/** @file dbclientinterface.h
-
-    Core MongoDB C++ driver interfaces are defined here.
-*/
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2008-2015 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -32,17 +28,14 @@
 
 #pragma once
 
-#include <boost/thread/lock_guard.hpp>
 #include <boost/noncopyable.hpp>
 #include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/string_data.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/config.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/logger/log_severity.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/cstdint.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/message.h"
@@ -137,10 +130,6 @@ namespace mongo {
         RemoveOption_Broadcast = 1 << 1
     };
 
-
-    /**
-     * need to put in DbMesssage::ReservedOptions as well
-     */
     enum InsertOptions {
         /** With muli-insert keep processing inserts if one fails */
         InsertOption_ContinueOnError = 1 << 0
@@ -165,53 +154,6 @@ namespace mongo {
         Reserved_FromWriteback = 1 << 1
     };
 
-    enum ReadPreference {
-        /**
-         * Read from primary only. All operations produce an error (throw an
-         * exception where applicable) if primary is unavailable. Cannot be
-         * combined with tags.
-         */
-        ReadPreference_PrimaryOnly = 0,
-
-        /**
-         * Read from primary if available, otherwise a secondary. Tags will
-         * only be applied in the event that the primary is unavailable and
-         * a secondary is read from. In this event only secondaries matching
-         * the tags provided would be read from.
-         */
-        ReadPreference_PrimaryPreferred,
-
-        /**
-         * Read from secondary if available, otherwise error.
-         */
-        ReadPreference_SecondaryOnly,
-
-        /**
-         * Read from a secondary if available, otherwise read from the primary.
-         */
-        ReadPreference_SecondaryPreferred,
-
-        /**
-         * Read from any member.
-         */
-        ReadPreference_Nearest,
-    };
-
-    class DBClientBase;
-    class DBClientConnection;
-
-    /**
-     * controls how much a clients cares about writes
-     * default is NORMAL
-     */
-    enum WriteConcern {
-        W_NONE = 0 , // TODO: not every connection type fully supports this
-        W_NORMAL = 1
-        // TODO SAFE = 2
-    };
-
-    class BSONObj;
-    class ScopedDbConnection;
     class DBClientCursor;
     class DBClientCursorBatchIterator;
 
@@ -471,7 +413,6 @@ namespace mongo {
        Basically just invocations of connection.$cmd.findOne({...});
     */
     class DBClientWithCommands : public DBClientInterface {
-        std::set<std::string> _seenIndexes;
     public:
         /** controls how chatty the client is about network errors & such.  See log.h */
         logger::LogSeverity _logLevel;
@@ -649,7 +590,6 @@ namespace mongo {
             }
 
             bool res = runCommand( db.c_str() , BSON( "drop" << coll ) , *info );
-            resetIndexCache();
             return res;
         }
 
@@ -680,56 +620,6 @@ namespace mongo {
            returns true if successful
         */
         bool copyDatabase(const std::string &fromdb, const std::string &todb, const std::string &fromhost = "", BSONObj *info = 0);
-
-        /** The Mongo database provides built-in performance profiling capabilities.  Uset setDbProfilingLevel()
-           to enable.  Profiling information is then written to the system.profile collection, which one can
-           then query.
-        */
-        enum ProfilingLevel {
-            ProfileOff = 0,
-            ProfileSlow = 1, // log very slow (>100ms) operations
-            ProfileAll = 2
-
-        };
-        bool setDbProfilingLevel(const std::string &dbname, ProfilingLevel level, BSONObj *info = 0);
-        bool getDbProfilingLevel(const std::string &dbname, ProfilingLevel& level, BSONObj *info = 0);
-
-        /** This implicitly converts from char*, string, and BSONObj to be an argument to mapreduce
-            You shouldn't need to explicitly construct this
-         */
-        struct MROutput {
-            MROutput(const char* collection) : out(BSON("replace" << collection)) {}
-            MROutput(const std::string& collection) : out(BSON("replace" << collection)) {}
-            MROutput(const BSONObj& obj) : out(obj) {}
-
-            BSONObj out;
-        };
-        static MROutput MRInline;
-
-        /** Run a map/reduce job on the server.
-
-            See http://dochub.mongodb.org/core/mapreduce
-
-            ns        namespace (db+collection name) of input data
-            jsmapf    javascript map function code
-            jsreducef javascript reduce function code.
-            query     optional query filter for the input
-            output    either a std::string collection name or an object representing output type
-                      if not specified uses inline output type
-
-            returns a result object which contains:
-             { result : <collection_name>,
-               numObjects : <number_of_objects_scanned>,
-               timeMillis : <job_time>,
-               ok : <1_if_ok>,
-               [, err : <errmsg_if_error>]
-             }
-
-             For example one might call:
-               result.getField("ok").trueValue()
-             on the result to check if ok.
-        */
-        BSONObj mapreduce(const std::string &ns, const std::string &jsmapf, const std::string &jsreducef, BSONObj query = BSONObj(), MROutput output = MRInline);
 
         /** Run javascript code on the database server.
            dbname    database SavedContext in which the code runs. The javascript variable 'db' will be assigned
@@ -809,31 +699,21 @@ namespace mongo {
         bool exists( const std::string& ns );
 
         /** Create an index if it does not already exist.
-            ensureIndex calls are remembered so it is safe/fast to call this function many
-            times in your code.
            @param ns collection to be indexed
            @param keys the "key pattern" for the index.  e.g., { name : 1 }
            @param unique if true, indicates that key uniqueness should be enforced for this index
            @param name if not specified, it will be created from the keys automatically (which is recommended)
-           @param cache if set to false, the index cache for the connection won't remember this call
            @param background build index in the background (see mongodb docs for details)
            @param v index version. leave at default value. (unit tests set this parameter.)
            @param ttl. The value of how many seconds before data should be removed from a collection.
-           @return whether or not sent message to db.
-             should be true on first call, false on subsequent unless resetIndexCache was called
          */
-        virtual bool ensureIndex( const std::string &ns,
+        virtual void ensureIndex( const std::string &ns,
                                   BSONObj keys,
                                   bool unique = false,
                                   const std::string &name = "",
-                                  bool cache = true,
                                   bool background = false,
                                   int v = -1,
                                   int ttl = 0 );
-        /**
-           clears the index cache, so the subsequent call to ensureIndex for any index will go to the server
-         */
-        virtual void resetIndexCache();
 
         virtual std::list<BSONObj> getIndexSpecs( const std::string &ns, int options = 0 );
 
@@ -851,9 +731,7 @@ namespace mongo {
 
         /** Erase / drop an entire database */
         virtual bool dropDatabase(const std::string &dbname, BSONObj *info = 0) {
-            bool ret = simpleCommand(dbname, info, "dropDatabase");
-            resetIndexCache();
-            return ret;
+            return simpleCommand(dbname, info, "dropDatabase");
         }
 
         virtual std::string toString() const = 0;
@@ -958,22 +836,17 @@ namespace mongo {
     protected:
         static AtomicInt64 ConnectionIdSequence;
         long long _connectionId; // unique connection id for this connection
-        WriteConcern _writeConcern;
         int _minWireVersion;
         int _maxWireVersion;
     public:
         static const uint64_t INVALID_SOCK_CREATION_TIME;
 
         DBClientBase() {
-            _writeConcern = W_NORMAL;
             _connectionId = ConnectionIdSequence.fetchAndAdd(1);
             _minWireVersion = _maxWireVersion = 0;
         }
 
         long long getConnectionId() const { return _connectionId; }
-
-        WriteConcern getWriteConcern() const { return _writeConcern; }
-        void setWriteConcern( WriteConcern w ) { _writeConcern = w; }
 
         void setWireVersions( int minWireVersion, int maxWireVersion ){
             _minWireVersion = minWireVersion;
@@ -1067,7 +940,6 @@ namespace mongo {
         virtual void killCursor( long long cursorID ) = 0;
 
         virtual bool callRead( Message& toSend , Message& response ) = 0;
-        // virtual bool callWrite( Message& toSend , Message& response ) = 0; // TODO: add this if needed
 
         virtual ConnectionString::ConnectionType type() const = 0;
 
@@ -1080,8 +952,6 @@ namespace mongo {
         virtual void reset() {}
 
     }; // DBClientBase
-
-    class DBClientReplicaSet;
 
     class ConnectException : public UserException {
     public:
@@ -1098,14 +968,10 @@ namespace mongo {
 
         /**
            @param _autoReconnect if true, automatically reconnect on a connection failure
-           @param cp used by DBClientReplicaSet.  You do not need to specify this parameter
            @param timeout tcp timeout in seconds - this is for read/write, not connect.
            Connect timeout is fixed, but short, at 5 seconds.
          */
-        DBClientConnection(bool _autoReconnect=false, DBClientReplicaSet* cp=0, double so_timeout=0) :
-            clientSet(cp), _failed(false), autoReconnect(_autoReconnect), autoReconnectBackoff(1000, 2000), _so_timeout(so_timeout) {
-            _numConnections.fetchAndAdd(1);
-        }
+        DBClientConnection(bool _autoReconnect = false, double so_timeout = 0);
 
         virtual ~DBClientConnection() {
             _numConnections.fetchAndAdd(-1);
@@ -1200,16 +1066,10 @@ namespace mongo {
         }
 
         /**
-         * Primarily used for notifying the replica set client that the server
-         * it is talking to is not primary anymore.
-         *
-         * @param rsClient caller is responsible for managing the life of rsClient
-         * and making sure that it lives longer than this object.
-         *
-         * Warning: This is only for internal use and will eventually be removed in
-         * the future.
+         * Set the name of the replica set that this connection is associated to.
+         * Note: There is no validation on replSetName.
          */
-        void setReplSetClientCallback(DBClientReplicaSet* rsClient);
+        void setParentReplSetName(const std::string& replSetName);
 
         static void setLazyKillCursor( bool lazy ) { _lazyKillCursor = lazy; }
         static bool getLazyKillCursor() { return _lazyKillCursor; }
@@ -1221,7 +1081,6 @@ namespace mongo {
         virtual void _auth(const BSONObj& params);
         virtual void sayPiggyBack( Message &toSend );
 
-        DBClientReplicaSet *clientSet;
         boost::scoped_ptr<MessagingPort> p;
         boost::scoped_ptr<SockAddr> server;
         bool _failed;
@@ -1242,14 +1101,19 @@ namespace mongo {
         static AtomicInt32 _numConnections;
         static bool _lazyKillCursor; // lazy means we piggy back kill cursors on next op
 
-#ifdef MONGO_CONFIG_SSL
-        SSLManagerInterface* sslManager();
-#endif
-    };
+    private:
 
-    /** pings server to check if it's up
-     */
-    bool serverAlive( const std::string &uri );
+        /**
+         * Checks the BSONElement for the 'not master' keyword and if it does exist,
+         * try to inform the replica set monitor that the host this connects to is
+         * no longer primary.
+         */
+        void handleNotMasterResponse(const BSONElement& elemToCheck);
+
+        // Contains the string for the replica set name of the host this is connected to.
+        // Should be empty if this connection is not pointing to a replica set member.
+        std::string _parentReplSetName;
+    };
 
     BSONElement getErrField( const BSONObj& result );
     bool hasErrField( const BSONObj& result );

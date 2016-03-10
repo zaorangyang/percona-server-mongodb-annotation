@@ -274,7 +274,7 @@ namespace {
         if (_heartbeatTimeoutPeriod < Seconds(0)) {
             return Status(ErrorCodes::BadValue, str::stream() << kSettingsFieldName << '.' <<
                           kHeartbeatTimeoutFieldName << " field value must be non-negative, "
-                          "but found " << _heartbeatTimeoutPeriod.total_seconds());
+                          "but found " << _heartbeatTimeoutPeriod.count());
         }
         if (_members.size() > kMaxMembers || _members.empty()) {
             return Status(ErrorCodes::BadValue, str::stream() <<
@@ -359,7 +359,7 @@ namespace {
             }
         }
         else {
-            if ("majority" != _defaultWriteConcern.wMode &&
+            if (WriteConcernOptions::kMajority != _defaultWriteConcern.wMode &&
                     !findCustomWriteMode(_defaultWriteConcern.wMode).isOK()) {
                 return Status(ErrorCodes::BadValue, str::stream() <<
                               "Default write concern requires undefined write mode " <<
@@ -377,7 +377,7 @@ namespace {
 
     Status ReplicaSetConfig::checkIfWriteConcernCanBeSatisfied(
             const WriteConcernOptions& writeConcern) const {
-        if (!writeConcern.wMode.empty() && writeConcern.wMode != "majority") {
+        if (!writeConcern.wMode.empty() && writeConcern.wMode != WriteConcernOptions::kMajority) {
             StatusWith<ReplicaSetTagPattern> tagPatternStatus =
                     findCustomWriteMode(writeConcern.wMode);
             if (!tagPatternStatus.isOK()) {
@@ -435,6 +435,18 @@ namespace {
                 it != _members.end(); ++it) {
 
             if (it->getHostAndPort() == hap) {
+                return x;
+            }
+            ++x;
+        }
+        return -1;
+    }
+
+    const int ReplicaSetConfig::findMemberIndexByConfigId(long long configId) const {
+        int x = 0;
+        for (const auto& member : _members) {
+
+            if (member.getId() == configId) {
                 return x;
             }
             ++x;
@@ -527,7 +539,7 @@ namespace {
 
         BSONObjBuilder settingsBuilder(configBuilder.subobjStart(kSettingsFieldName));
         settingsBuilder.append(kChainingAllowedFieldName, _chainingAllowed);
-        settingsBuilder.append(kHeartbeatTimeoutFieldName, _heartbeatTimeoutPeriod.total_seconds());
+        settingsBuilder.appendIntOrLL(kHeartbeatTimeoutFieldName, _heartbeatTimeoutPeriod.count());
 
         BSONObjBuilder gleModes(settingsBuilder.subobjStart(kGetLastErrorModesFieldName));
         for (StringMap<ReplicaSetTagPattern>::const_iterator mode =

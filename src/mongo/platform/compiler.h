@@ -118,6 +118,7 @@
  *    shared libraries.
  *
  *    Same correct/incorrect usage as for MONGO_COMPILER_API_EXPORT.
+ *
  */
 
 #if defined(_MSC_VER)

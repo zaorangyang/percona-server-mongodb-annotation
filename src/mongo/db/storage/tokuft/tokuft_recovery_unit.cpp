@@ -77,7 +77,7 @@ namespace mongo {
         _txn = ftcxx::DBTxn();
     }
 
-    void TokuFTRecoveryUnit::commitAndRestart() {
+    void TokuFTRecoveryUnit::abandonSnapshot() {
         invariant(_depth == 0);
         invariant(_changes.size() == 0);
 
@@ -87,7 +87,7 @@ namespace mongo {
         _txn = ftcxx::DBTxn();
     }
 
-    void TokuFTRecoveryUnit::endUnitOfWork() {
+    void TokuFTRecoveryUnit::abortUnitOfWork() {
         invariant(_depth > 0);
 
         if (--_depth > 0) {
@@ -109,7 +109,7 @@ namespace mongo {
         _txn = ftcxx::DBTxn();
     }
 
-    bool TokuFTRecoveryUnit::awaitCommit() {
+    bool TokuFTRecoveryUnit::waitUntilDurable() {
         invariant(_env.env() != NULL);
 
         // The underlying transaction needs to have been committed to

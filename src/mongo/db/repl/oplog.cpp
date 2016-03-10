@@ -70,6 +70,7 @@
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/stats/counters.h"
@@ -159,7 +160,8 @@ namespace {
             hashNew = 0;
         }
 
-        replCoord->setMyLastOptime(ts);
+        // TODO(siyuan) Use current term
+        replCoord->setMyLastOptime(OpTime(ts, 0));
         return std::pair<Timestamp,long long>(ts, hashNew);
     }
 
@@ -302,12 +304,6 @@ namespace {
             b.appendBool("fromMigrate", true);
         }
 
-        if (txn->getWriteConcern().shouldWaitForOtherNodes()
-            && txn->getWriteConcern().syncMode == WriteConcernOptions::JOURNAL)
-        {
-            b.appendBool("j", true);
-        }
-
         if ( o2 ) {
             b.append("o2", *o2);
         }
@@ -316,13 +312,14 @@ namespace {
         OplogDocWriter writer( partial, obj );
         checkOplogInsert( _localOplogCollection->insertDocument( txn, &writer, false ) );
 
-        ReplClientInfo::forClient(txn->getClient()).setLastOp( slot.first );
+        // TODO(siyuan) set term when logging ops.
+        ReplClientInfo::forClient(txn->getClient()).setLastOp( OpTime(slot.first, 0) );
     }
 
-    Timestamp writeOpsToOplog(OperationContext* txn, const std::deque<BSONObj>& ops) {
+    OpTime writeOpsToOplog(OperationContext* txn, const std::deque<BSONObj>& ops) {
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
 
-        Timestamp lastOptime;
+        OpTime lastOptime;
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
             lastOptime = replCoord->getMyLastOptime();
             invariant(!ops.empty());
@@ -348,16 +345,18 @@ namespace {
                  ++it) {
                 const BSONObj& op = *it;
                 const Timestamp ts = op["ts"].timestamp();
+                // TODO(siyuan) Parse "term" and fill this out
+                const OpTime optime = OpTime(ts, 0);
 
                 checkOplogInsert(_localOplogCollection->insertDocument(txn, op, false));
 
-                if (!(lastOptime < ts)) {
+                if (!(lastOptime < optime)) {
                     severe() << "replication oplog stream went back in time. "
-                        "previous timestamp: " << lastOptime << " newest timestamp: " << ts
+                        "previous timestamp: " << lastOptime << " newest timestamp: " << optime
                              << ". Op being applied: " << op;
                     fassertFailedNoTrace(18905);
                 }
-                lastOptime = ts;
+                lastOptime = optime;
             }
             wunit.commit();
         } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "writeOps", _localOplogCollection->ns().ns());
@@ -637,6 +636,7 @@ namespace {
 
         // operation type -- see logOp() comments for types
         const char *opType = fieldOp.valuestrsafe();
+        invariant(*opType != 'c'); // commands are processed in applyCommand_inlock()
 
         if ( *opType == 'i' ) {
             opCounters->gotInsert();
@@ -765,60 +765,6 @@ namespace {
             else
                 verify( opType[1] == 'b' ); // "db" advertisement
         }
-        else if ( *opType == 'c' ) {
-            // Applying commands in repl is done under Global W-lock, so it is safe to not
-            // perform the current DB checks after reacquiring the lock.
-            invariant(txn->lockState()->isW());
-            
-            bool done = false;
-
-            while (!done) {
-                ApplyOpMetadata curOpToApply = opsMap.find(o.firstElementFieldName())->second;
-                Status status = Status::OK();
-                try {
-                    status = curOpToApply.applyFunc(txn, ns, o);
-                }
-                catch (...) {
-                    status = exceptionToStatus();
-                }
-                switch (status.code()) {
-                case ErrorCodes::WriteConflict: {
-                    // Need to throw this up to a higher level where it will be caught and the
-                    // operation retried.
-                    throw WriteConflictException();
-                }
-                case ErrorCodes::BackgroundOperationInProgressForDatabase: {
-                    Lock::TempRelease release(txn->lockState());
-
-                    BackgroundOperation::awaitNoBgOpInProgForDb(nsToDatabaseSubstring(ns));
-                    break;
-                }
-                case ErrorCodes::BackgroundOperationInProgressForNamespace: {
-                    Lock::TempRelease release(txn->lockState());
-
-                    Command* cmd = Command::findCommand(o.firstElement().fieldName());
-                    invariant(cmd);
-                    BackgroundOperation::awaitNoBgOpInProgForNs(cmd->parseNs(nsToDatabase(ns), o));
-                    break;
-                }
-                default:
-                    if (_oplogCollectionName == masterSlaveOplogName) {
-                        error() << "Failed command " << o << " on " << nsToDatabaseSubstring(ns)
-                                << " with status " << status << " during oplog application";
-                    }
-                    else if (curOpToApply.acceptableErrors.find(status.code())
-                            == curOpToApply.acceptableErrors.end()) {
-                        error() << "Failed command " << o << " on " << nsToDatabaseSubstring(ns)
-                                << " with status " << status << " during oplog application";
-                        return status;
-                    }
-                    // fallthrough
-                case ErrorCodes::OK:
-                    done = true;
-                    break;
-                }
-            }
-        }
         else if ( *opType == 'n' ) {
             // no op
         }
@@ -840,6 +786,86 @@ namespace {
         return Status::OK();
     }
 
+    Status applyCommand_inlock(OperationContext* txn, const BSONObj& op) {
+        const char *names[] = { "o", "ns", "op" };
+        BSONElement fields[3];
+        op.getFields(3, names, fields);
+        BSONElement& fieldO = fields[0];
+        BSONElement& fieldNs = fields[1];
+        BSONElement& fieldOp = fields[2];
+
+        const char* opType = fieldOp.valuestrsafe();
+        invariant(*opType == 'c'); // only commands are processed here
+
+        BSONObj o;
+        if (fieldO.isABSONObj()) {
+            o = fieldO.embeddedObject();
+        }
+
+        const char* ns = fieldNs.valuestrsafe();
+
+        // Applying commands in repl is done under Global W-lock, so it is safe to not
+        // perform the current DB checks after reacquiring the lock.
+        invariant(txn->lockState()->isW());
+        
+        bool done = false;
+
+        while (!done) {
+            ApplyOpMetadata curOpToApply = opsMap.find(o.firstElementFieldName())->second;
+            Status status = Status::OK();
+            try {
+                status = curOpToApply.applyFunc(txn, ns, o);
+            }
+            catch (...) {
+                status = exceptionToStatus();
+            }
+            switch (status.code()) {
+            case ErrorCodes::WriteConflict: {
+                // Need to throw this up to a higher level where it will be caught and the
+                // operation retried.
+                throw WriteConflictException();
+            }
+            case ErrorCodes::BackgroundOperationInProgressForDatabase: {
+                Lock::TempRelease release(txn->lockState());
+
+                BackgroundOperation::awaitNoBgOpInProgForDb(nsToDatabaseSubstring(ns));
+                break;
+            }
+            case ErrorCodes::BackgroundOperationInProgressForNamespace: {
+                Lock::TempRelease release(txn->lockState());
+
+                Command* cmd = Command::findCommand(o.firstElement().fieldName());
+                invariant(cmd);
+                BackgroundOperation::awaitNoBgOpInProgForNs(cmd->parseNs(nsToDatabase(ns), o));
+                break;
+            }
+            default:
+                if (_oplogCollectionName == masterSlaveOplogName) {
+                    error() << "Failed command " << o << " on " << nsToDatabaseSubstring(ns)
+                            << " with status " << status << " during oplog application";
+                }
+                else if (curOpToApply.acceptableErrors.find(status.code())
+                        == curOpToApply.acceptableErrors.end()) {
+                    error() << "Failed command " << o << " on " << nsToDatabaseSubstring(ns)
+                            << " with status " << status << " during oplog application";
+                    return status;
+                }
+                // fallthrough
+            case ErrorCodes::OK:
+                done = true;
+                break;
+            }
+        }
+
+        // AuthorizationManager's logOp method registers a RecoveryUnit::Change
+        // and to do so we need to have begun a UnitOfWork
+        WriteUnitOfWork wuow(txn);
+        getGlobalAuthorizationManager()->logOp(txn, opType, ns, o, nullptr);
+        wuow.commit();
+
+        return Status::OK();
+    }
+
     void waitUpToOneSecondForTimestampChange(const Timestamp& referenceTime) {
         boost::unique_lock<boost::mutex> lk(newOpMutex);
 
@@ -850,6 +876,7 @@ namespace {
         }
     }
 
+    // TODO(siyuan) Change to OpTime after adding term to oplog.
     void setNewOptime(const Timestamp& newTime) {
         boost::lock_guard<boost::mutex> lk(newOpMutex);
         setGlobalTimestamp(newTime);
@@ -865,7 +892,7 @@ namespace {
 
         if (!lastOp.isEmpty()) {
             LOG(1) << "replSet setting last OpTime";
-            setNewOptime(lastOp[ "ts" ].date());
+            setNewOptime(lastOp[ "ts" ].timestamp());
         }
     }
 

@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/shared_ptr.hpp>
 #include <boost/thread/condition_variable.hpp>
 #include <boost/thread/mutex.hpp>
@@ -38,7 +37,9 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/client/remote_command_executor.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/repl/task_runner.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/platform/random.h"
 #include "mongo/stdx/functional.h"
@@ -49,6 +50,7 @@
 
 namespace mongo {
 
+    class NamespaceString;
     class OperationContext;
 
 namespace repl {
@@ -107,18 +109,12 @@ namespace repl {
     class ReplicationExecutor {
         MONGO_DISALLOW_COPYING(ReplicationExecutor);
     public:
-        typedef boost::posix_time::milliseconds Milliseconds;
         struct CallbackData;
         class CallbackHandle;
         class EventHandle;
         class NetworkInterface;
         struct RemoteCommandCallbackData;
-        struct RemoteCommandRequest;
-        struct RemoteCommandResponse;
         typedef StatusWith<RemoteCommandResponse> ResponseStatus;
-
-        static const Milliseconds kNoTimeout;
-        static const Date_t kNoExpirationDate;
 
         /**
          * Type of a regular callback function.
@@ -237,7 +233,51 @@ namespace repl {
         StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, const CallbackFn& work);
 
         /**
+         * Schedules DB "work" to be run by the executor..
+         *
+         * Takes no locks for caller - global, database or collection.
+         *
+         * The "work" will run exclusively with other DB work items. All DB work items
+         * are run the in order they are scheduled.
+         *
+         * The "work" may run concurrently with other non-DB work items,
+         * but there are no ordering guarantees provided with respect to
+         * any other work item.
+         *
+         * Returns a handle for waiting on or canceling the callback, or
+         * ErrorCodes::ShutdownInProgress.
+         *
+         * May be called by client threads or callbacks running in the executor.
+         */
+        StatusWith<CallbackHandle> scheduleDBWork(const CallbackFn& work);
+
+        /**
+         * Schedules DB "work" to be run by the executor while holding the collection lock.
+         *
+         * Takes collection lock in specified mode (and slightly more permissive lock for the
+         * database lock) but not the global exclusive lock.
+         *
+         * The "work" will run exclusively with other DB work items. All DB work items
+         * are run the in order they are scheduled.
+         *
+         * The "work" may run concurrently with other non-DB work items,
+         * but there are no ordering guarantees provided with respect to
+         * any other work item.
+         *
+         * Returns a handle for waiting on or canceling the callback, or
+         * ErrorCodes::ShutdownInProgress.
+         *
+         * May be called by client threads or callbacks running in the executor.
+         */
+        StatusWith<CallbackHandle> scheduleDBWork(const CallbackFn& work,
+                                                  const NamespaceString& nss,
+                                                  LockMode mode);
+
+        /**
          * Schedules "work" to be run by the executor while holding the global exclusive lock.
+         *
+         * Takes collection lock in specified mode (and slightly more permissive lock for the
+         * database lock) but not the global exclusive lock.
          *
          * The "work" will run exclusively, as though it were executed by the main
          * run loop, but there are no ordering guarantees provided with respect to
@@ -363,13 +403,21 @@ namespace repl {
 
         /**
          * Executes the callback referenced by "cbHandle", and moves the underlying
-         * WorkQueue::iterator into the _freeQueue.  "txn" is a pointer to the OperationContext
-         * owning the global exclusive lock.
+         * WorkQueue::iterator from "workQueue" into the _freeQueue.
          *
-         * Serializes execution of "cbHandle" with the execution of other callbacks.
+         * "txn" is a pointer to the OperationContext.
+         *
+         * "status" is the callback status from the task runner. Only possible values are
+         * Status::OK and ErrorCodes::CallbackCanceled (when task runner is canceled).
+         *
+         * If "terribleExLockSyncMutex" is not null, serializes execution of "cbHandle" with the
+         * execution of other callbacks.
          */
-        void doOperationWithGlobalExclusiveLock(OperationContext* txn,
-                                                const CallbackHandle& cbHandle);
+        void _doOperation(OperationContext* txn,
+                          const Status& taskRunnerStatus,
+                          const CallbackHandle& cbHandle,
+                          WorkQueue* workQueue,
+                          boost::mutex* terribleExLockSyncMutex);
 
         // PRNG; seeded at class construction time.
         PseudoRandom _random;
@@ -380,6 +428,7 @@ namespace repl {
         boost::condition_variable _noMoreWaitingThreads;
         WorkQueue _freeQueue;
         WorkQueue _readyQueue;
+        WorkQueue _dbWorkInProgressQueue;
         WorkQueue _exclusiveLockInProgressQueue;
         WorkQueue _networkInProgressQueue;
         WorkQueue _sleepersQueue;
@@ -388,6 +437,8 @@ namespace repl {
         int64_t _totalEventWaiters;
         bool _inShutdown;
         threadpool::ThreadPool _dblockWorkers;
+        TaskRunner _dblockTaskRunner;
+        TaskRunner _dblockExclusiveLockTaskRunner;
         uint64_t _nextId;
     };
 
@@ -456,36 +507,6 @@ namespace repl {
         CallbackHandle myHandle;
         Status status;
         OperationContext* txn;
-    };
-
-    /**
-     * Type of object describing a command to execute against a remote MongoDB node.
-     */
-    struct ReplicationExecutor::RemoteCommandRequest {
-        RemoteCommandRequest();
-        RemoteCommandRequest(const HostAndPort& theTarget,
-                             const std::string& theDbName,
-                             const BSONObj& theCmdObj,
-                             const Milliseconds timeoutMillis = kNoTimeout);
-
-        // Returns diagnostic info.
-        std::string getDiagnosticString();
-
-        HostAndPort target;
-        std::string dbname;
-        BSONObj cmdObj;
-        Milliseconds timeout;
-        Date_t expirationDate;  // Set by scheduleRemoteCommand.
-    };
-
-    struct ReplicationExecutor::RemoteCommandResponse {
-        RemoteCommandResponse() : data(), elapsedMillis(Milliseconds(0)) {}
-        RemoteCommandResponse(BSONObj obj, Milliseconds millis)
-            : data(obj),
-              elapsedMillis(millis) {}
-
-        BSONObj data;
-        Milliseconds elapsedMillis;
     };
 
     /**
@@ -563,10 +584,9 @@ namespace repl {
         virtual void cancelCommand(const CallbackHandle& cbHandle) = 0;
 
         /**
-         * Runs the given callback while holding the global exclusive lock.
+         * Creates an operation context for running database operations.
          */
-        virtual void runCallbackWithGlobalExclusiveLock(
-                const stdx::function<void (OperationContext*)>& callback) = 0;
+        virtual OperationContext* createOperationContext() = 0;
 
     protected:
         NetworkInterface();

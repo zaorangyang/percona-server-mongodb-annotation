@@ -34,7 +34,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/namespace_string.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -62,7 +61,7 @@ namespace mongo {
             Status status = bsonExtractStringField(source, fullNs.name(), &collFullNs);
             if (!status.isOK()) return status;
 
-            coll._fullNs = collFullNs;
+            coll._fullNs = NamespaceString{collFullNs};
         }
 
         {
@@ -141,13 +140,12 @@ namespace mongo {
 
     Status CollectionType::validate() const {
         // These fields must always be set
-        if (!_fullNs.is_initialized() || _fullNs->empty()) {
+        if (!_fullNs.is_initialized()) {
             return Status(ErrorCodes::NoSuchKey, "missing ns");
         }
 
-        const NamespaceString nss(_fullNs.get());
-        if (!nss.isValid()) {
-            return Status(ErrorCodes::BadValue, "invalid namespace " + nss.toString());
+        if (!_fullNs->isValid()) {
+            return Status(ErrorCodes::BadValue, "invalid namespace " + _fullNs->toString());
         }
 
         if (!_epoch.is_initialized()) {
@@ -163,7 +161,7 @@ namespace mongo {
                 return Status(ErrorCodes::BadValue, "invalid epoch");
             }
 
-            if (!_updatedAt.get()) {
+            if (Date_t() == _updatedAt.get()) {
                 return Status(ErrorCodes::BadValue, "invalid updated at timestamp");
             }
 
@@ -181,9 +179,11 @@ namespace mongo {
     BSONObj CollectionType::toBSON() const {
         BSONObjBuilder builder;
 
-        builder.append(fullNs.name(), _fullNs.get_value_or(""));
+        if (_fullNs) {
+            builder.append(fullNs.name(), _fullNs->toString());
+        }
         builder.append(epoch.name(), _epoch.get_value_or(OID()));
-        builder.append(updatedAt.name(), _updatedAt.get_value_or(0));
+        builder.append(updatedAt.name(), _updatedAt.get_value_or(Date_t()));
 
         // These fields are optional, so do not include them in the metadata for the purposes of
         // consuming less space on the config servers.
@@ -221,8 +221,8 @@ namespace mongo {
         return toBSON().toString();
     }
 
-    void CollectionType::setNs(const std::string& fullNs) {
-        invariant(!fullNs.empty());
+    void CollectionType::setNs(const NamespaceString& fullNs) {
+        invariant(fullNs.isValid());
         _fullNs = fullNs;
     }
 

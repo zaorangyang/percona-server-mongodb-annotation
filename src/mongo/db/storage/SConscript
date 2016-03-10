@@ -1,5 +1,18 @@
 Import("env")
 
+env.SConscript(
+    dirs=[
+        'devnull',
+        'in_memory',
+        'kv',
+        'kv/dictionary',
+        'kv_heap',
+        'mmap_v1',
+        'wiredtiger',
+    ],
+)
+
+
 env.Library(
     target='index_entry_comparison',
     source=[
@@ -33,9 +46,18 @@ env.Library(
         'oplog_hack.cpp',
         ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/bson',
+        '$BUILD_DIR/mongo/bson/bson',
         ]
     )
+
+env.Library(
+    target='paths',
+    source=[
+        'paths.cpp',
+    ],
+    LIBDEPS=[
+    ],
+)
 
 env.Library(
     target='sorted_data_interface_test_harness',
@@ -58,6 +80,7 @@ env.Library(
         'sorted_data_interface_test_unindex.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context',
         'index_entry_comparison',
     ],
 )
@@ -81,7 +104,9 @@ env.Library(
         'record_store_test_updatewithdamages.cpp',
         'record_store_test_validate.cpp',
         ],
-    LIBDEPS=[]
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context',
+        ]
     )
 
 env.Library(
@@ -90,6 +115,7 @@ env.Library(
         'storage_engine_lock_file_${TARGET_OS_FAMILY}.cpp',
         ],
     LIBDEPS=[
+        'paths',
         ]
     )
 
@@ -98,7 +124,6 @@ env.CppUnitTest(
     source = 'storage_engine_lock_file_test.cpp',
     LIBDEPS=[
         'storage_engine_lock_file',
-        '$BUILD_DIR/mongo/mongocommon',
     ],
 )
 
@@ -108,7 +133,7 @@ env.Library(
         'storage_engine_metadata.cpp',
         ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/bson',
+        '$BUILD_DIR/mongo/bson/bson',
         ]
     )
 
@@ -125,6 +150,6 @@ env.CppUnitTest(
     source='key_string_test.cpp',
     LIBDEPS=[
         'key_string',
-        '$BUILD_DIR/mongo/bson',
+        '$BUILD_DIR/mongo/bson/bson',
         ]
 )

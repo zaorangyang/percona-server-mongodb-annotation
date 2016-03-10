@@ -447,7 +447,9 @@ namespace {
             checked_cast<WiredTigerRecoveryUnit*>( txn->releaseRecoveryUnit() );
         invariant( realRecoveryUnit );
         WiredTigerSessionCache* sc = realRecoveryUnit->getSessionCache();
-        txn->setRecoveryUnit( new WiredTigerRecoveryUnit( sc ) );
+        OperationContext::RecoveryUnitState const realRUstate =
+            txn->setRecoveryUnit(new WiredTigerRecoveryUnit(sc),
+                                 OperationContext::kNotInUnitOfWork);
 
         WiredTigerRecoveryUnit::get(txn)->markNoTicketRequired(); // realRecoveryUnit already has
         WT_SESSION* session = WiredTigerRecoveryUnit::get(txn)->getSession(txn)->getSession();
@@ -531,18 +533,18 @@ namespace {
         }
         catch ( const WriteConflictException& wce ) {
             delete txn->releaseRecoveryUnit();
-            txn->setRecoveryUnit( realRecoveryUnit );
+            txn->setRecoveryUnit(realRecoveryUnit, realRUstate);
             log() << "got conflict truncating capped, ignoring";
             return 0;
         }
         catch ( ... ) {
             delete txn->releaseRecoveryUnit();
-            txn->setRecoveryUnit( realRecoveryUnit );
+            txn->setRecoveryUnit(realRecoveryUnit, realRUstate);
             throw;
         }
 
         delete txn->releaseRecoveryUnit();
-        txn->setRecoveryUnit( realRecoveryUnit );
+        txn->setRecoveryUnit(realRecoveryUnit, realRUstate);
         return docsRemoved;
     }
 
@@ -716,12 +718,19 @@ namespace {
     }
 
     Status WiredTigerRecordStore::truncate( OperationContext* txn ) {
-        // TODO: use a WiredTiger fast truncate
-        boost::scoped_ptr<RecordIterator> iter( getIterator( txn ) );
-        while( !iter->isEOF() ) {
-            RecordId loc = iter->getNext();
-            deleteRecord( txn, loc );
+        WiredTigerCursor startWrap( _uri, _instanceId, true, txn);
+        WT_CURSOR* start = startWrap.get();
+        int ret = WT_OP_CHECK(start->next(start));
+        //Empty collections don't have anything to truncate.
+        if (ret == WT_NOTFOUND) {
+            return Status::OK();
         }
+        invariantWTOK(ret);
+
+        WT_SESSION* session = WiredTigerRecoveryUnit::get(txn)->getSession(txn)->getSession();
+        invariantWTOK(WT_OP_CHECK(session->truncate(session, NULL, start, NULL, NULL)));
+        _changeNumRecords(txn, -numRecords(txn));
+        _increaseDataSize(txn, -dataSize(txn));
 
         return Status::OK();
     }

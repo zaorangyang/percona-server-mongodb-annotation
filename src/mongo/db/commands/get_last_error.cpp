@@ -72,9 +72,7 @@ namespace mongo {
                  int,
                  string& errmsg,
                  BSONObjBuilder& result) {
-            LastError *le = lastError.get();
-            verify( le );
-            le->reset();
+            LastError::get(txn->getClient()).reset();
             return true;
         }
     } cmdResetError;
@@ -88,7 +86,7 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
         virtual void help( stringstream& help ) const {
-            lastError.disableForCommand(); // SERVER-11492
+            LastError::get(cc()).disable(); // SERVER-11492
             help << "return error status of the last operation on this connection\n"
                  << "options:\n"
                  << "  { fsync:true } - fsync before returning, or wait for journal commit if running with --journal\n"
@@ -128,34 +126,42 @@ namespace mongo {
             // err is null.
             //
 
-            LastError *le = lastError.disableForCommand();
+            LastError *le = &LastError::get(txn->getClient());
+            le->disable();
 
             // Always append lastOp and connectionId
             Client& c = *txn->getClient();
             if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
                 repl::ReplicationCoordinator::modeReplSet) {
-                const Timestamp lastOp = repl::ReplClientInfo::forClient(c).getLastOp();
+                const repl::OpTime lastOp = repl::ReplClientInfo::forClient(c).getLastOp();
                 if (!lastOp.isNull()) {
-                    result.append("lastOp", lastOp);
+                    result.append("lastOp", lastOp.getTimestamp());
+                    // TODO(siyuan) Add "lastOpTerm"
                 }
             }
 
             // for sharding; also useful in general for debugging
             result.appendNumber( "connectionId" , c.getConnectionId() );
 
-            Timestamp lastOpTime;
+            Timestamp lastTimestamp;
             BSONField<Timestamp> wOpTimeField("wOpTime");
             FieldParser::FieldState extracted = FieldParser::extract(cmdObj, wOpTimeField, 
-                                                                     &lastOpTime, &errmsg);
+                                                                     &lastTimestamp, &errmsg);
             if (!extracted) {
                 result.append("badGLE", cmdObj);
                 appendCommandStatus(result, false, errmsg);
                 return false;
             }
+
+            repl::OpTime lastOpTime;
             bool lastOpTimePresent = extracted != FieldParser::FIELD_NONE;
             if (!lastOpTimePresent) {
                 // Use the client opTime if no wOpTime is specified
                 lastOpTime = repl::ReplClientInfo::forClient(c).getLastOp();
+                // TODO(siyuan) Fix mongos to supply wOpTimeTerm, then parse out that value here
+            } else {
+                // TODO(siyuan) Don't use the default term after fixing mongos.
+                lastOpTime = repl::OpTime(lastTimestamp, repl::OpTime::kDefaultTerm);
             }
             
             OID electionId;
@@ -173,7 +179,7 @@ namespace mongo {
 
             // Errors aren't reported when wOpTime is used
             if ( !lastOpTimePresent ) {
-                if ( le->nPrev != 1 ) {
+                if ( le->getNPrev() != 1 ) {
                     errorOccurred = LastError::noError.appendSelf( result, false );
                 }
                 else {
@@ -284,12 +290,13 @@ namespace mongo {
                  int,
                  string& errmsg,
                  BSONObjBuilder& result) {
-            LastError *le = lastError.disableForCommand();
-            le->appendSelf( result );
-            if ( le->valid )
-                result.append( "nPrev", le->nPrev );
+            LastError *le = &LastError::get(txn->getClient());
+            le->disable();
+            le->appendSelf(result, true);
+            if (le->isValid())
+                result.append("nPrev", le->getNPrev());
             else
-                result.append( "nPrev", -1 );
+                result.append("nPrev", -1);
             return true;
         }
     } cmdGetPrevError;

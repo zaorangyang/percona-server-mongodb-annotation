@@ -36,7 +36,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/bson_serializable.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/write_ops/batched_request_metadata.h"
 #include "mongo/s/write_ops/batched_update_document.h"
 
@@ -117,6 +116,9 @@ namespace mongo {
         bool isOrderedSet() const;
         bool getOrdered() const;
 
+        void setShouldBypassValidation(bool newVal) { _shouldBypassValidation = newVal; }
+        bool shouldBypassValidation() const { return _shouldBypassValidation; }
+
         /*
         * metadata ownership will be transferred to this.
         */
@@ -143,6 +145,9 @@ namespace mongo {
         // (O)  whether batch is issued in parallel or not
         bool _ordered;
         bool _isOrderedSet;
+
+        // (O)  should document validation be bypassed (default false)
+        bool _shouldBypassValidation;
 
         // (O)  metadata associated with this request for internal use.
         boost::scoped_ptr<BatchedRequestMetadata> _metadata;

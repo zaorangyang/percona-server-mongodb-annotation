@@ -44,11 +44,11 @@ namespace mongo {
 
         void commitUnitOfWork();
 
-        void endUnitOfWork();
+        void abortUnitOfWork();
 
-        bool awaitCommit();
+        bool waitUntilDurable();
 
-        void commitAndRestart();
+        void abandonSnapshot();
 
         void registerChange(Change* change);
 

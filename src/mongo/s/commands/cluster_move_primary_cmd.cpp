@@ -38,12 +38,13 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/dist_lock_manager.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
@@ -91,7 +92,7 @@ namespace {
         }
 
         virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-            return cmdObj.firstElement().valuestrsafe();
+            return cmdObj.firstElement().str();
         }
 
         virtual bool run(OperationContext* txn,
@@ -101,15 +102,15 @@ namespace {
                          std::string& errmsg,
                          BSONObjBuilder& result) {
 
-            const string dbname = parseNs("admin", cmdObj);
+            const string dbname = parseNs("", cmdObj);
 
-            if (dbname.size() == 0) {
-                errmsg = "no db";
+            if (dbname.empty() || !nsIsDbOnly(dbname)) {
+                errmsg = "invalid db name specified: " + dbname;
                 return false;
             }
 
-            if (dbname == "config") {
-                errmsg = "can't move config db";
+            if (dbname == "admin" || dbname == "config" || dbname == "local") {
+                errmsg = "can't move primary for " + dbname + " database";
                 return false;
             }
 
@@ -182,7 +183,8 @@ namespace {
             BSONObj cloneRes;
             bool worked = toconn->runCommand(dbname.c_str(),
                                              BSON("clone" << config->getPrimary().getConnString()
-                                                          << "collsToIgnore" << barr.arr()),
+                                               << "collsToIgnore" << barr.arr()
+                                               << bypassDocumentValidationCommandOption() << true),
                                              cloneRes);
             toconn.done();
 

@@ -35,6 +35,7 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/stats/timer_stats.h"
@@ -44,6 +45,7 @@
 namespace mongo {
 
     using std::string;
+    using repl::OpTime;
 
     static TimerStats gleWtimeStats;
     static ServerStatusMetricField<TimerStats> displayGleLatency("getLastError.wtime",
@@ -58,9 +60,21 @@ namespace mongo {
 
         if ( writeConcern.syncMode == WriteConcernOptions::JOURNAL ||
              writeConcern.syncMode == WriteConcernOptions::FSYNC ) {
-            txn->recoveryUnit()->goingToAwaitCommit();
+            txn->recoveryUnit()->goingToWaitUntilDurable();
         }
     }
+
+    namespace {
+        // The consensus protocol requires that w: majority implies j: true on all nodes.
+        void addJournalSyncForWMajority(WriteConcernOptions* writeConcern) {
+            if (repl::getGlobalReplicationCoordinator()->isV1ElectionProtocol()
+                && writeConcern->wMode == WriteConcernOptions::kMajority
+                && writeConcern->syncMode == WriteConcernOptions::NONE)
+            {
+                writeConcern->syncMode = WriteConcernOptions::JOURNAL;
+            }
+        }
+    } // namespace
 
     StatusWith<WriteConcernOptions> extractWriteConcern(const BSONObj& cmdObj) {
         // The default write concern if empty is w : 1
@@ -70,6 +84,8 @@ namespace mongo {
         if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
             writeConcern.wNumNodes = 1;
         }
+        // Upgrade default write concern if necessary.
+        addJournalSyncForWMajority(&writeConcern);
 
         BSONElement writeConcernElement;
         Status wcStatus = bsonExtractTypedField(cmdObj,
@@ -99,6 +115,9 @@ namespace mongo {
         if (!wcStatus.isOK()) {
             return wcStatus;
         }
+
+        // Upgrade parsed write concern if necessary.
+        addJournalSyncForWMajority(&writeConcern);
 
         return writeConcern;
     }
@@ -130,7 +149,7 @@ namespace mongo {
 
         if ( replMode != repl::ReplicationCoordinator::modeReplSet &&
                 !writeConcern.wMode.empty() &&
-                writeConcern.wMode != "majority" ) {
+                writeConcern.wMode != WriteConcernOptions::kMajority ) {
             return Status( ErrorCodes::BadValue,
                            string( "cannot use non-majority 'w' mode " ) + writeConcern.wMode
                            + " when a host is not a member of a replica set" );
@@ -191,7 +210,7 @@ namespace mongo {
     }
 
     Status waitForWriteConcern( OperationContext* txn,
-                                const Timestamp& replOpTime,
+                                const OpTime& replOpTime,
                                 WriteConcernResult* result ) {
 
         const WriteConcernOptions& writeConcern = txn->getWriteConcern();
@@ -213,12 +232,12 @@ namespace mongo {
             }
             else {
                 // We only need to commit the journal if we're durable
-                txn->recoveryUnit()->awaitCommit();
+                txn->recoveryUnit()->waitUntilDurable();
             }
             break;
         }
         case WriteConcernOptions::JOURNAL:
-            txn->recoveryUnit()->awaitCommit();
+            txn->recoveryUnit()->waitUntilDurable();
             break;
         }
 
@@ -252,8 +271,8 @@ namespace mongo {
         }
         // Add stats
         result->writtenTo = repl::getGlobalReplicationCoordinator()->getHostsWrittenTo(replOpTime);
-        gleWtimeStats.recordMillis(replStatus.duration.total_milliseconds());
-        result->wTime = replStatus.duration.total_milliseconds();
+        gleWtimeStats.recordMillis(replStatus.duration.count());
+        result->wTime = replStatus.duration.count();
 
         return replStatus.status;
     }

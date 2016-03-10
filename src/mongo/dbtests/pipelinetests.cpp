@@ -45,6 +45,91 @@ namespace PipelineTests {
     namespace Optimizations {
         using namespace mongo;
 
+        namespace Local {
+            class Base {
+            public:
+                // These both return json arrays of pipeline operators
+                virtual string inputPipeJson() = 0;
+                virtual string outputPipeJson() = 0;
+
+                BSONObj pipelineFromJsonArray(const string& array) {
+                    return fromjson("{pipeline: " + array + "}");
+                }
+                virtual void run() {
+                    const BSONObj inputBson = pipelineFromJsonArray(inputPipeJson());
+                    const BSONObj outputPipeExpected = pipelineFromJsonArray(outputPipeJson());
+
+                    intrusive_ptr<ExpressionContext> ctx =
+                        new ExpressionContext(&_opCtx, NamespaceString("a.collection"));
+                    string errmsg;
+                    intrusive_ptr<Pipeline> outputPipe =
+                        Pipeline::parseCommand(errmsg, inputBson, ctx);
+                    ASSERT_EQUALS(errmsg, "");
+                    ASSERT(outputPipe != NULL);
+
+                    ASSERT_EQUALS(outputPipe->serialize()["pipeline"],
+                                  Value(outputPipeExpected["pipeline"]));
+                }
+
+                virtual ~Base() {}
+
+            private:
+                OperationContextImpl _opCtx;
+            };
+
+            class RemoveSkipZero : public Base {
+                string inputPipeJson() override {
+                    return "[{$skip: 0}]";
+                }
+
+                string outputPipeJson() override {
+                    return "[]";
+                }
+            };
+
+            class DoNotRemoveSkipOne : public Base {
+                string inputPipeJson() override {
+                    return "[{$skip: 1}]";
+                }
+
+                string outputPipeJson() override {
+                    return "[{$skip: 1}]";
+                }
+            };
+
+            class RemoveEmptyMatch : public Base {
+                string inputPipeJson() override {
+                    return "[{$match: {}}]";
+                }
+
+                string outputPipeJson() override {
+                    return "[]";
+                }
+            };
+
+            class RemoveMultipleEmptyMatches : public Base {
+                string inputPipeJson() override {
+                    return "[{$match: {}}, {$match: {}}]";
+                }
+
+                string outputPipeJson() override {
+                    // TODO: The desired behavior here is to end up with an empty array.
+                    return "[{$match: {$and: [{}, {}]}}]";
+                }
+            };
+
+            class DoNotRemoveNonEmptyMatch : public Base {
+                string inputPipeJson() override {
+                    return "[{$match: {_id: 1}}]";
+                }
+
+                string outputPipeJson() override {
+                    return "[{$match: {_id: 1}}]";
+                }
+            };
+
+        } // namespace Local
+
         namespace Sharded {
             class Base {
             public:
@@ -78,7 +163,7 @@ namespace PipelineTests {
                                   Value(mergePipeExpected["pipeline"]));
                 }
 
-                virtual ~Base() {};
+                virtual ~Base() {}
 
             private:
                 OperationContextImpl _opCtx;
@@ -212,6 +297,11 @@ namespace PipelineTests {
         All() : Suite( "pipeline" ) {
         }
         void setupTests() {
+            add<Optimizations::Local::RemoveSkipZero>();
+            add<Optimizations::Local::DoNotRemoveSkipOne>();
+            add<Optimizations::Local::RemoveEmptyMatch>();
+            add<Optimizations::Local::RemoveMultipleEmptyMatches>();
+            add<Optimizations::Local::DoNotRemoveNonEmptyMatch>();
             add<Optimizations::Sharded::Empty>();
             add<Optimizations::Sharded::moveFinalUnwindFromShardsToMerger::OneUnwind>();
             add<Optimizations::Sharded::moveFinalUnwindFromShardsToMerger::TwoUnwind>();

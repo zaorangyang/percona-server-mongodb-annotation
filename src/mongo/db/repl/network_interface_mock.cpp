@@ -30,7 +30,7 @@
 
 #include "mongo/db/repl/network_interface_mock.h"
 
-#include "mongo/db/operation_context_noop.h"
+#include "mongo/db/repl/operation_context_repl_mock.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/time_support.h"
@@ -41,13 +41,10 @@ namespace repl {
     NetworkInterfaceMock::NetworkInterfaceMock()
         : _waitingToRunMask(0),
           _currentlyRunning(kNoThread),
+          _now(fassertStatusOK(18653, dateFromISOString("2014-08-01T00:00:00Z"))),
           _hasStarted(false),
           _inShutdown(false),
-          _executorNextWakeupDate(~0ULL) {
-
-        StatusWith<Date_t> initialNow = dateFromISOString("2014-08-01T00:00:00Z");
-        fassert(18653, initialNow.getStatus());
-        _now = initialNow.getValue();
+          _executorNextWakeupDate(Date_t::max()) {
     }
 
     NetworkInterfaceMock::~NetworkInterfaceMock() {
@@ -67,16 +64,13 @@ namespace repl {
         return _now_inlock();
     }
 
-    void NetworkInterfaceMock::runCallbackWithGlobalExclusiveLock(
-            const stdx::function<void (OperationContext* txn)>& callback) {
-
-        OperationContextNoop txn;
-        callback(&txn);
+    OperationContext* NetworkInterfaceMock::createOperationContext() {
+        return new OperationContextReplMock();
     }
 
     void NetworkInterfaceMock::startCommand(
             const ReplicationExecutor::CallbackHandle& cbHandle,
-            const ReplicationExecutor::RemoteCommandRequest& request,
+            const RemoteCommandRequest& request,
             const RemoteCommandCompletionFn& onFinish) {
 
         boost::lock_guard<boost::mutex> lk(_mutex);
@@ -356,7 +350,7 @@ namespace repl {
         return _waitingToRunMask & kExecutorThread;
     }
 
-    static const StatusWith<ReplicationExecutor::RemoteCommandResponse> kUnsetResponse(
+    static const StatusWith<RemoteCommandResponse> kUnsetResponse(
             ErrorCodes::InternalError,
             "NetworkOperation::_response never set");
 
@@ -371,7 +365,7 @@ namespace repl {
 
     NetworkInterfaceMock::NetworkOperation::NetworkOperation(
             const ReplicationExecutor::CallbackHandle& cbHandle,
-            const ReplicationExecutor::RemoteCommandRequest& theRequest,
+            const RemoteCommandRequest& theRequest,
             Date_t theRequestDate,
             const RemoteCommandCompletionFn& onFinish)
         : _requestDate(theRequestDate),

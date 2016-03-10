@@ -314,7 +314,7 @@ namespace mongo {
             implementation, and should not be deleted
             and should not
         */
-        virtual const char *getOpName() const = 0;
+        virtual const char* getOpName() const = 0;
 
         /// Allow subclasses the opportunity to validate arguments at parse time.
         virtual void validateArguments(const ExpressionVector& args) const {}
@@ -366,7 +366,7 @@ namespace mongo {
     public:
         // virtuals from Expression
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
         virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
@@ -375,7 +375,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -384,7 +384,7 @@ namespace mongo {
         // virtuals from Expression
         virtual boost::intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
         virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
@@ -393,7 +393,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -434,7 +434,7 @@ namespace mongo {
 
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         static boost::intrusive_ptr<Expression> parse(
             BSONElement bsonExpr,
@@ -452,7 +452,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -461,7 +461,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         static boost::intrusive_ptr<Expression> parse(
             BSONElement expr,
@@ -475,7 +475,7 @@ namespace mongo {
         virtual boost::intrusive_ptr<Expression> optimize();
         virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const;
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
         virtual Value serialize(bool explain) const;
 
         static boost::intrusive_ptr<ExpressionConstant> create(const Value& pValue);
@@ -531,7 +531,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         static inline int extract(const tm& tm) { return tm.tm_mday; }
     };
@@ -541,7 +541,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         // MySQL uses 1-7, tm uses 0-6
         static inline int extract(const tm& tm) { return tm.tm_wday + 1; }
@@ -552,7 +552,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         // MySQL uses 1-366, tm uses 0-365
         static inline int extract(const tm& tm) { return tm.tm_yday + 1; }
@@ -563,7 +563,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -623,11 +623,41 @@ namespace mongo {
     };
 
 
+    class ExpressionFilter final : public Expression {
+    public:
+        // virtuals from Expression
+        boost::intrusive_ptr<Expression> optimize() final;
+        Value serialize(bool explain) const final;
+        Value evaluateInternal(Variables* vars) const final;
+        void addDependencies(DepsTracker* deps,
+                             std::vector<std::string>* path=NULL) const final;
+
+        static boost::intrusive_ptr<Expression> parse(
+            BSONElement expr,
+            const VariablesParseState& vps);
+
+    private:
+        ExpressionFilter(std::string varName,
+                         Variables::Id varId,
+                         boost::intrusive_ptr<Expression> input,
+                         boost::intrusive_ptr<Expression> filter);
+
+        // The name of the variable to set to each element in the array.
+        std::string _varName;
+        // The id of the variable to set.
+        Variables::Id _varId;
+        // The array to iterate over.
+        boost::intrusive_ptr<Expression> _input;
+        // The expression determining whether each element should be present in the result array.
+        boost::intrusive_ptr<Expression> _filter;
+    };
+
+
     class ExpressionHour : public ExpressionFixedArity<ExpressionHour, 1> {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         static inline int extract(const tm& tm) { return tm.tm_hour; }
     };
@@ -637,7 +667,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -724,7 +754,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         static int extract(const tm& tm) { return tm.tm_min; }
     };
@@ -734,7 +764,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
     
 
@@ -742,7 +772,7 @@ namespace mongo {
     public:
         // virtuals from Expression
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
         virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
@@ -751,7 +781,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         // MySQL uses 1-12, tm uses 0-11
         static inline int extract(const tm& tm) { return tm.tm_mon + 1; }
@@ -762,7 +792,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -881,7 +911,7 @@ namespace mongo {
         // virtuals from Expression
         virtual boost::intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
         virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
@@ -890,7 +920,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         static inline int extract(const tm& tm) { return tm.tm_sec; }
     };
@@ -900,7 +930,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -908,7 +938,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
         virtual void validateArguments(const ExpressionVector& args) const;
     };
 
@@ -917,7 +947,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
         virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
@@ -927,7 +957,7 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual boost::intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     private:
         class Optimized;
     };
@@ -938,8 +968,16 @@ namespace mongo {
         // virtuals from ExpressionNary
         // virtual intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
         virtual bool isAssociativeAndCommutative() const { return true; }
+    };
+
+
+    class ExpressionIsArray : public ExpressionFixedArity<ExpressionIsArray, 1> {
+    public:
+        // virtuals from ExpressionNary
+        virtual Value evaluateInternal(Variables* vars) const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -947,7 +985,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -955,7 +993,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -963,7 +1001,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -971,7 +1009,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -979,7 +1017,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -987,7 +1025,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
     };
 
 
@@ -995,7 +1033,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         static int extract(const tm& tm);
     };
@@ -1005,7 +1043,7 @@ namespace mongo {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual const char *getOpName() const;
+        virtual const char* getOpName() const;
 
         // tm_year is years since 1990
         static int extract(const tm& tm) { return tm.tm_year + 1900; }

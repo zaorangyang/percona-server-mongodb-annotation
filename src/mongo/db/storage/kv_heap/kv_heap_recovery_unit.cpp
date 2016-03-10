@@ -36,11 +36,11 @@ namespace mongo {
         _ops.clear();
     }
 
-    void KVHeapRecoveryUnit::commitAndRestart() {
+    void KVHeapRecoveryUnit::abandonSnapshot() {
         commitUnitOfWork();
     }
 
-    void KVHeapRecoveryUnit::endUnitOfWork() {
+    void KVHeapRecoveryUnit::abortUnitOfWork() {
         for (std::vector< std::shared_ptr<Change> >::reverse_iterator it = _ops.rbegin();
              it != _ops.rend(); ++it) {
             Change *op = it->get();

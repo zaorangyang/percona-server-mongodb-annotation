@@ -160,7 +160,7 @@ namespace {
 
     ResponseStatus ReplCoordTest::makeResponseStatus(const BSONObj& doc, Milliseconds millis) {
         log() << "Responding with " << doc;
-        return ResponseStatus(ReplicationExecutor::RemoteCommandResponse(doc, millis));
+        return ResponseStatus(RemoteCommandResponse(doc, millis));
     }
 
     void ReplCoordTest::simulateSuccessfulElection() {
@@ -174,7 +174,7 @@ namespace {
             log() << "Waiting on network in state " << replCoord->getMemberState();
             getNet()->enterNetwork();
             const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             log() << request.target.toString() << " processing " << request.cmdObj;
             ReplSetHeartbeatArgs hbArgs;
             if (hbArgs.initialize(request.cmdObj).isOK()) {
@@ -191,7 +191,7 @@ namespace {
                 net->scheduleResponse(noi, net->now(), makeResponseStatus(
                                               BSON("ok" << 1 <<
                                                    "fresher" << false <<
-                                                   "opTime" << Date_t(Timestamp(0, 0).asULL()) <<
+                                                   "opTime" << Date_t() <<
                                                    "veto" << false)));
             }
             else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetElect") {
@@ -234,9 +234,9 @@ namespace {
         while (replCoord->getMemberState().primary()) {
             log() << "Waiting on network in state " << replCoord->getMemberState();
             getNet()->enterNetwork();
-            net->runUntil(net->now() + 10000);
+            net->runUntil(net->now() + Seconds(10));
             const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             log() << request.target.toString() << " processing " << request.cmdObj;
             ReplSetHeartbeatArgs hbArgs;
             if (hbArgs.initialize(request.cmdObj).isOK()) {

@@ -38,10 +38,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/type_database.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -138,7 +136,10 @@ namespace {
                 break;
             case ShardDrainingStatus::ONGOING: {
                 vector<ChunkType> chunks;
-                Status status = grid.catalogManager()->getChunksForShard(s.getName(), &chunks);
+                Status status = grid.catalogManager()->getChunks(
+                                            Query(BSON(ChunkType::shard(s.getName()))),
+                                            0,  // return all
+                                            &chunks);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }

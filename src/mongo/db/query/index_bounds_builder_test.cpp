@@ -271,7 +271,7 @@ namespace {
 
     TEST(IndexBoundsBuilderTest, TranslateLtDate) {
         IndexEntry testIndex = IndexEntry(BSONObj());
-        BSONObj obj = BSON("a" << LT << Date_t(5000));
+        BSONObj obj = BSON("a" << LT << Date_t::fromMillisSinceEpoch(5000));
         auto_ptr<MatchExpression> expr(parseMatchExpression(obj));
         BSONElement elt = obj.firstElement();
         OrderedIntervalList oil;
@@ -570,6 +570,7 @@ namespace {
                                           true, // sparse
                                           false, // unique
                                           "exists_true_sparse",
+                                          nullptr, // filterExpr
                                           BSONObj());
         BSONObj obj = fromjson("{a: {$exists: true}}");
         auto_ptr<MatchExpression> expr(parseMatchExpression(obj));

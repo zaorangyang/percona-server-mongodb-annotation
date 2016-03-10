@@ -51,8 +51,6 @@ namespace {
 
     using unittest::assertGet;
 
-    typedef ReplicationExecutor::RemoteCommandRequest RemoteCommandRequest;
-
     bool stringContains(const std::string &haystack, const std::string& needle) {
         return haystack.find(needle) != std::string::npos;
     }
@@ -125,7 +123,7 @@ namespace {
         const MemberConfig& myConfig = rsConfig.getMemberAt(selfIndex);
         return BSON("replSetFresh" << 1 <<
                     "set" << rsConfig.getReplSetName() <<
-                    "opTime" << Date_t(lastOpTimeApplied.asULL()) <<
+                    "opTime" << Date_t::fromMillisSinceEpoch(lastOpTimeApplied.asLL()) <<
                     "who" << myConfig.getHostAndPort().toString() <<
                     "cfgver" << rsConfig.getConfigVersion() <<
                     "id" << myConfig.getId());
@@ -188,19 +186,19 @@ namespace {
             ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
             _net->scheduleResponse(
                     noi,
-                    startDate + 10,
-                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                    startDate + Milliseconds(10),
+                    ResponseStatus(RemoteCommandResponse(
                                            BSON("ok" << 1 <<
                                                 "id" << 2 <<
                                                 "set" << "rs0" <<
                                                 "who" << "h1" <<
                                                 "cfgver" << 1 <<
-                                                "opTime" << Date_t(Timestamp(0,0).asULL())),
+                                                "opTime" << Date_t()),
                                            Milliseconds(8))));
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         waitOnChecker();
         ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FreshnessTie);
     }
@@ -256,20 +254,20 @@ namespace {
             ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
             _net->scheduleResponse(
                     noi,
-                    startDate + 10,
-                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                    startDate + Milliseconds(10),
+                    ResponseStatus(RemoteCommandResponse(
                                            BSON("ok" << 1 <<
                                                 "id" << 2 <<
                                                 "set" << "rs0" <<
                                                 "who" << "h1" <<
                                                 "cfgver" << 1 <<
                                                 "fresher" << true <<
-                                                "opTime" << Date_t(Timestamp(0,0).asULL())),
+                                                "opTime" << Date_t()),
                                            Milliseconds(8))));
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         waitOnChecker();
 
         stopCapturingLogMessages();
@@ -302,19 +300,20 @@ namespace {
             ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
             _net->scheduleResponse(
                     noi,
-                    startDate + 10,
-                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                    startDate + Milliseconds(10),
+                    ResponseStatus(RemoteCommandResponse(
                                            BSON("ok" << 1 <<
                                                 "id" << 2 <<
                                                 "set" << "rs0" <<
                                                 "who" << "h1" <<
                                                 "cfgver" << 1 <<
-                                                "opTime" << Date_t(Timestamp(10,0).asULL())),
+                                                "opTime" << Date_t::fromMillisSinceEpoch(
+                                                        Timestamp(10,0).asLL())),
                                            Milliseconds(8))));
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         waitOnChecker();
 
         stopCapturingLogMessages();
@@ -346,8 +345,8 @@ namespace {
             ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
             _net->scheduleResponse(
                     noi,
-                    startDate + 10,
-                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                    startDate + Milliseconds(10),
+                    ResponseStatus(RemoteCommandResponse(
                                            BSON("ok" << 1 <<
                                                 "id" << 2 <<
                                                 "set" << "rs0" <<
@@ -356,9 +355,9 @@ namespace {
                                                 "opTime" << 3),
                                            Milliseconds(8))));
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         waitOnChecker();
 
         stopCapturingLogMessages();
@@ -393,8 +392,8 @@ namespace {
             ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
             _net->scheduleResponse(
                     noi,
-                    startDate + 10,
-                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                    startDate + Milliseconds(10),
+                    ResponseStatus(RemoteCommandResponse(
                                            BSON("ok" << 1 <<
                                                 "id" << 2 <<
                                                 "set" << "rs0" <<
@@ -402,12 +401,13 @@ namespace {
                                                 "cfgver" << 1 <<
                                                 "veto" << true <<
                                                 "errmsg" << "I'd rather you didn't" <<
-                                                "opTime" << Date_t(Timestamp(0,0).asULL())),
+                                                "opTime" << Date_t::fromMillisSinceEpoch(
+                                                        Timestamp(0,0).asLL())),
                                            Milliseconds(8))));
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         waitOnChecker();
 
         stopCapturingLogMessages();
@@ -462,20 +462,20 @@ namespace {
                 "set" << "rs0" <<
                 "who" << target.toString() <<
                 "cfgver" << 1 <<
-                "opTime" << Date_t(Timestamp(0,0).asULL());
+                "opTime" << Date_t::fromMillisSinceEpoch(Timestamp(0,0).asLL());
             if (target.host() == "h1") {
                 responseBuilder << "fresher" << true;
             }
             _net->scheduleResponse(
                     noi,
-                    startDate + 10,
-                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                    startDate + Milliseconds(10),
+                    ResponseStatus(RemoteCommandResponse(
                                            responseBuilder.obj(),
                                            Milliseconds(8))));
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         waitOnChecker();
         stopCapturingLogMessages();
         ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
@@ -526,11 +526,11 @@ namespace {
                     "set" << "rs0" <<
                     "who" << target.toString() <<
                     "cfgver" << 1 <<
-                    "opTime" << Date_t(Timestamp(20,0).asULL());
+                    "opTime" << Date_t::fromMillisSinceEpoch(Timestamp(20,0).asLL());
                 _net->scheduleResponse(
                         noi,
-                        startDate + 20,
-                        ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                        startDate + Milliseconds(20),
+                        ResponseStatus(RemoteCommandResponse(
                                                responseBuilder.obj(),
                                                Milliseconds(8))));
             }
@@ -541,20 +541,20 @@ namespace {
                     "set" << "rs0" <<
                     "who" << target.toString() <<
                     "cfgver" << 1 <<
-                    "opTime" << Date_t(Timestamp(10,0).asULL());
+                    "opTime" << Date_t::fromMillisSinceEpoch(Timestamp(10,0).asLL());
                 _net->scheduleResponse(
                         noi,
-                        startDate + 10,
-                        ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                        startDate + Milliseconds(10),
+                        ResponseStatus(RemoteCommandResponse(
                                                responseBuilder.obj(),
                                                Milliseconds(8))));
             }
         }
-        _net->runUntil(startDate + 10);
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        _net->runUntil(startDate + Milliseconds(10));
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         ASSERT_EQUALS(0, countLogLinesContaining("not electing self, we are not freshest"));
-        _net->runUntil(startDate + 20);
-        ASSERT_EQUALS(startDate + 20, _net->now());
+        _net->runUntil(startDate + Milliseconds(20));
+        ASSERT_EQUALS(startDate + Milliseconds(20), _net->now());
         _net->exitNetwork();
         waitOnChecker();
         stopCapturingLogMessages();
@@ -604,18 +604,18 @@ namespace {
                 responseBuilder << "opTime" << 3;
             }
             else {
-                responseBuilder << "opTime" << Date_t(Timestamp(0,0).asULL());
+                responseBuilder << "opTime" << Date_t::fromMillisSinceEpoch(Timestamp(0,0).asLL());
             }
             _net->scheduleResponse(
                     noi,
-                    startDate + 10,
-                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                    startDate + Milliseconds(10),
+                    ResponseStatus(RemoteCommandResponse(
                                            responseBuilder.obj(),
                                            Milliseconds(8))));
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         waitOnChecker();
         stopCapturingLogMessages();
         ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
@@ -662,20 +662,20 @@ namespace {
                 "set" << "rs0" <<
                 "who" << target.toString() <<
                 "cfgver" << 1 <<
-                "opTime" << Date_t(Timestamp(0,0).asULL());
+                "opTime" << Date_t::fromMillisSinceEpoch(Timestamp(0,0).asLL());
             if (target.host() == "h1") {
                 responseBuilder << "veto" << true << "errmsg" << "I'd rather you didn't";
             }
             _net->scheduleResponse(
                     noi,
-                    startDate + 10,
-                    ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                    startDate + Milliseconds(10),
+                    ResponseStatus(RemoteCommandResponse(
                                            responseBuilder.obj(),
                                            Milliseconds(8))));
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         waitOnChecker();
         stopCapturingLogMessages();
         ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
@@ -729,11 +729,11 @@ namespace {
                     "cfgver" << 1 <<
                     "veto" << true <<
                     "errmsg" << "I'd rather you didn't" <<
-                    "opTime" << Date_t(Timestamp(10,0).asULL());
+                    "opTime" << Date_t::fromMillisSinceEpoch(Timestamp(10,0).asLL());
                 _net->scheduleResponse(
                         noi,
-                        startDate + 20,
-                        ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                        startDate + Milliseconds(20),
+                        ResponseStatus(RemoteCommandResponse(
                                                responseBuilder.obj(),
                                                Milliseconds(8))));
             }
@@ -744,21 +744,21 @@ namespace {
                     "set" << "rs0" <<
                     "who" << target.toString() <<
                     "cfgver" << 1 <<
-                    "opTime" << Date_t(Timestamp(10,0).asULL());
+                    "opTime" << Date_t::fromMillisSinceEpoch(Timestamp(10,0).asLL());
                 _net->scheduleResponse(
                         noi,
-                        startDate + 10,
-                        ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                        startDate + Milliseconds(10),
+                        ResponseStatus(RemoteCommandResponse(
                                                responseBuilder.obj(),
                                                Milliseconds(8))));
             }
         }
-        _net->runUntil(startDate + 10);
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        _net->runUntil(startDate + Milliseconds(10));
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         ASSERT_EQUALS(0, countLogLinesContaining("not electing self, h4:27017 would veto with '"
                                                  "errmsg: \"I'd rather you didn't\"'"));
-        _net->runUntil(startDate + 20);
-        ASSERT_EQUALS(startDate + 20, _net->now());
+        _net->runUntil(startDate + Milliseconds(20));
+        ASSERT_EQUALS(startDate + Milliseconds(20), _net->now());
         _net->exitNetwork();
         waitOnChecker();
         stopCapturingLogMessages();
@@ -801,7 +801,7 @@ namespace {
             if (target.host() == "h2" || target.host() == "h3") {
                 _net->scheduleResponse(
                         noi,
-                        startDate + 10,
+                        startDate + Milliseconds(10),
                         ResponseStatus(ErrorCodes::NoSuchKey, "No response"));
             }
             else {
@@ -812,18 +812,18 @@ namespace {
                     "set" << "rs0" <<
                     "who" << target.toString() <<
                     "cfgver" << 1 <<
-                    "opTime" << Date_t(Timestamp(0,0).asULL());
+                    "opTime" << Date_t::fromMillisSinceEpoch(Timestamp(0,0).asLL());
                 _net->scheduleResponse(
                         noi,
-                        startDate + 10,
-                        ResponseStatus(ReplicationExecutor::RemoteCommandResponse(
+                        startDate + Milliseconds(10),
+                        ResponseStatus(RemoteCommandResponse(
                                                responseBuilder.obj(),
                                                Milliseconds(8))));
             }
         }
-        _net->runUntil(startDate + 10);
+        _net->runUntil(startDate + Milliseconds(10));
         _net->exitNetwork();
-        ASSERT_EQUALS(startDate + 10, _net->now());
+        ASSERT_EQUALS(startDate + Milliseconds(10), _net->now());
         waitOnChecker();
         ASSERT_EQUALS(shouldAbortElection(),FreshnessChecker::None);
     }
@@ -876,14 +876,14 @@ namespace {
         ResponseStatus lessFresh() {
             BSONObjBuilder bb;
             bb.append("ok", 1.0);
-            bb.appendDate("opTime", Timestamp(10, 0).asULL());
+            bb.appendDate("opTime", Date_t::fromMillisSinceEpoch(Timestamp(10, 0).asLL()));
             return ResponseStatus(NetworkInterfaceMock::Response(bb.obj(), Milliseconds(10)));
         }
 
         ResponseStatus moreFreshViaOpTime() {
             BSONObjBuilder bb;
             bb.append("ok", 1.0);
-            bb.appendDate("opTime", Timestamp(110, 0).asULL());
+            bb.appendDate("opTime", Date_t::fromMillisSinceEpoch(Timestamp(110, 0).asLL()));
             return ResponseStatus(NetworkInterfaceMock::Response(bb.obj(), Milliseconds(10)));
         }
 
@@ -905,7 +905,7 @@ namespace {
         ResponseStatus tiedForFreshness() {
             BSONObjBuilder bb;
             bb.append("ok", 1.0);
-            bb.appendDate("opTime", Timestamp(100, 0).asULL());
+            bb.appendDate("opTime", Date_t::fromMillisSinceEpoch(Timestamp(100, 0).asLL()));
             return ResponseStatus(NetworkInterfaceMock::Response(bb.obj(), Milliseconds(10)));
         }
 

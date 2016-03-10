@@ -582,7 +582,7 @@ __evict_clear_walk(WT_SESSION_IMPL *session)
 	 * assert we never try to evict the current eviction walk point).
 	 */
 	btree->evict_ref = NULL;
-	return (__wt_page_release(session, ref, 0));
+	return (__wt_page_release(session, ref, WT_READ_NO_EVICT));
 }
 
 /*
@@ -681,17 +681,17 @@ __wt_evict_page(WT_SESSION_IMPL *session, WT_REF *ref)
 	 * before evicting, using a special "eviction" isolation level, where
 	 * only globally visible updates can be evicted.
 	 */
-	__wt_txn_update_oldest(session);
+	__wt_txn_update_oldest(session, 1);
 	txn = &session->txn;
 	saved_iso = txn->isolation;
-	txn->isolation = TXN_ISO_EVICTION;
+	txn->isolation = WT_ISO_EVICTION;
 
 	/*
 	 * Sanity check: if a transaction has updates, its updates should not
 	 * be visible to eviction.
 	 */
-	WT_ASSERT(session,
-	    !F_ISSET(txn, TXN_HAS_ID) || !__wt_txn_visible(session, txn->id));
+	WT_ASSERT(session, !F_ISSET(txn, WT_TXN_HAS_ID) ||
+	    !__wt_txn_visible(session, txn->id));
 
 	ret = __wt_evict(session, ref, 0);
 	txn->isolation = saved_iso;
@@ -941,7 +941,7 @@ __evict_walk(WT_SESSION_IMPL *session, uint32_t flags)
 	 * after a long-running transaction (such as a checkpoint) completes,
 	 * we may never start evicting again.
 	 */
-	__wt_txn_update_oldest(session);
+	__wt_txn_update_oldest(session, 1);
 
 	if (cache->evict_current == NULL)
 		WT_STAT_FAST_CONN_INCR(session, cache_eviction_queue_empty);
@@ -1232,7 +1232,8 @@ __evict_walk_file(WT_SESSION_IMPL *session, u_int *slotp, uint32_t flags)
 		}
 
 fast:		/* If the page can't be evicted, give up. */
-		if (!__wt_page_can_evict(session, page, 1))
+		if (!__wt_page_can_evict(
+		    session, page, WT_EVICT_CHECK_SPLITS, NULL))
 			continue;
 
 		/*
@@ -1286,7 +1287,7 @@ fast:		/* If the page can't be evicted, give up. */
 	if ((ref = btree->evict_ref) != NULL && (__wt_ref_is_root(ref) ||
 	    ref->page->read_gen == WT_READGEN_OLDEST)) {
 		btree->evict_ref = NULL;
-		__wt_page_release(session, ref, 0);
+		__wt_page_release(session, ref, WT_READ_NO_EVICT);
 	}
 
 	/* If the walk was interrupted by a locked page, that's okay. */
@@ -1522,7 +1523,7 @@ __wt_cache_wait(WT_SESSION_IMPL *session, int full)
 		 * are not busy.
 		 */
 		if (busy) {
-			__wt_txn_update_oldest(session);
+			__wt_txn_update_oldest(session, 0);
 			if (txn_state->id == txn_global->oldest_id ||
 			    txn_state->snap_min == txn_global->oldest_id)
 				return (0);

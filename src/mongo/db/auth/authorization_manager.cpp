@@ -46,7 +46,6 @@
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/authz_documents_update_guard.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/role_graph.h"
@@ -252,10 +251,11 @@ namespace mongo {
         boost::unique_lock<boost::mutex> _lock;
     };
 
-    AuthorizationManager::AuthorizationManager(AuthzManagerExternalState* externalState) :
+    AuthorizationManager::AuthorizationManager(
+        std::unique_ptr<AuthzManagerExternalState> externalState) :
             _authEnabled(false),
             _privilegeDocsExist(false),
-            _externalState(externalState),
+            _externalState(std::move(externalState)),
             _version(schemaVersionInvalid),
             _isFetchPhaseBusy(false) {
         _updateCacheGeneration_inlock();
@@ -749,14 +749,6 @@ namespace mongo {
         return Status::OK();
     }
 
-    bool AuthorizationManager::tryAcquireAuthzUpdateLock(StringData why) {
-        return _externalState->tryAcquireAuthzUpdateLock(why);
-    }
-
-    void AuthorizationManager::releaseAuthzUpdateLock() {
-        return _externalState->releaseAuthzUpdateLock();
-    }
-
 namespace {
 
     /**
@@ -971,7 +963,7 @@ namespace {
                     mongoutils::str::stream() << "_id entries for user documents must be of "
                             "the form <dbname>.<username>.  Found: " << idstr);
         }
-        return StatusWith<UserName>(UserName(idstr.substr(splitPoint),
+        return StatusWith<UserName>(UserName(idstr.substr(splitPoint + 1),
                                              idstr.substr(0, splitPoint)));
     }
 

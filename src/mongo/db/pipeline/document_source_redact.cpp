@@ -97,7 +97,7 @@ namespace mongo {
                     newArr.push_back(arr[i]);
                 }
             }
-            return Value::consume(newArr);
+            return Value(std::move(newArr));
         }
         else {
             return in;
@@ -137,8 +137,9 @@ namespace mongo {
         }
     }
 
-    void DocumentSourceRedact::optimize() {
+    intrusive_ptr<DocumentSource> DocumentSourceRedact::optimize() {
         _expression = _expression->optimize();
+        return this;
     }
 
     Value DocumentSourceRedact::serialize(bool explain) const {

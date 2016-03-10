@@ -440,14 +440,14 @@ namespace {
 
         _catalog->_collection->getCatalogEntry()->indexBuildSuccess( _txn, _indexName );
 
-        _catalog->_collection->infoCache()->addedIndex( _txn );
-
         IndexDescriptor* desc = _catalog->findIndexByName( _txn, _indexName, true );
         fassert( 17330, desc );
         IndexCatalogEntry* entry = _catalog->_entries.find( desc );
         fassert( 17331, entry && entry == _entry );
 
         entry->setIsReady( true );
+
+        _catalog->_collection->infoCache()->addedIndex( _txn );
     }
 
     namespace {
@@ -561,25 +561,12 @@ namespace {
                                          << keyStatus.reason() );
         }
 
-        if ( IndexDescriptor::isIdIndexPattern( key ) ) {
-            BSONElement uniqueElt = spec["unique"];
-            if ( !uniqueElt.eoo() && !uniqueElt.trueValue() ) {
-                return Status( ErrorCodes::CannotCreateIndex, "_id index cannot be non-unique" );
-            }
-        }
-        else {
-            // for non _id indexes, we check to see if replication has turned off all indexes
-            // we _always_ created _id index
-            if (!repl::getGlobalReplicationCoordinator()->buildsIndexes()) {
-                // this is not exactly the right error code, but I think will make the most sense
-                return Status( ErrorCodes::IndexAlreadyExists, "no indexes per repl" );
-            }
-        }
+        const bool isSparse = spec["sparse"].trueValue();
 
         // Ensure if there is a filter, its valid.
         BSONElement filterElement = spec.getField("filter");
-        if ( filterElement.type() ) {
-            if ( spec["sparse"].trueValue() ) {
+        if ( filterElement ) {
+            if ( isSparse ) {
                 return Status( ErrorCodes::CannotCreateIndex,
                                "cannot mix \"filter\" and \"sparse\" options" );
             }
@@ -597,6 +584,29 @@ namespace {
             Status status = _checkValidFilterExpressions( filterExpr.get() );
             if (!status.isOK()) {
                 return status;
+            }
+        }
+
+        if ( IndexDescriptor::isIdIndexPattern( key ) ) {
+            BSONElement uniqueElt = spec["unique"];
+            if ( uniqueElt && !uniqueElt.trueValue() ) {
+                return Status( ErrorCodes::CannotCreateIndex, "_id index cannot be non-unique" );
+            }
+
+            if ( filterElement ) {
+                return Status( ErrorCodes::CannotCreateIndex, "_id index cannot be partial" );
+            }
+
+            if ( isSparse ) {
+                return Status( ErrorCodes::CannotCreateIndex, "_id index cannot be sparse" );
+            }
+        }
+        else {
+            // for non _id indexes, we check to see if replication has turned off all indexes
+            // we _always_ created _id index
+            if (!repl::getGlobalReplicationCoordinator()->buildsIndexes()) {
+                // this is not exactly the right error code, but I think will make the most sense
+                return Status( ErrorCodes::IndexAlreadyExists, "no indexes per repl" );
             }
         }
 
@@ -724,7 +734,7 @@ namespace {
 
         // there may be pointers pointing at keys in the btree(s).  kill them.
         // TODO: can this can only clear cursors on this index?
-        _collection->getCursorManager()->invalidateAll( false );
+        _collection->getCursorManager()->invalidateAll(false, "all indexes on collection dropped");
 
         // make sure nothing in progress
         massert( 17348,
@@ -852,15 +862,19 @@ namespace {
         if ( !status.isOK() )
             return status;
 
+        // Pulling indexName/indexNamespace out as they are needed post descriptor release.
+        string indexName = entry->descriptor()->indexName();
+        string indexNamespace = entry->descriptor()->indexNamespace();
+
         // there may be pointers pointing at keys in the btree(s).  kill them.
         // TODO: can this can only clear cursors on this index?
-        _collection->getCursorManager()->invalidateAll( false );
+        _collection->getCursorManager()->invalidateAll(false, str::stream() << "index '" 
+                                                                            << indexName 
+                                                                            << "' dropped");
 
         // wipe out stats
         _collection->infoCache()->reset(txn);
 
-        string indexNamespace = entry->descriptor()->indexNamespace();
-        string indexName = entry->descriptor()->indexName();
 
         // --------- START REAL WORK ----------
 
@@ -1031,16 +1045,19 @@ namespace {
         return NULL;
     }
 
-    IndexDescriptor* IndexCatalog::findIndexByPrefix( OperationContext* txn,
-                                                      const BSONObj &keyPattern,
-                                                      bool requireSingleKey ) const {
+    IndexDescriptor* IndexCatalog::findShardKeyPrefixedIndex( OperationContext* txn,
+                                                              const BSONObj& shardKey,
+                                                              bool requireSingleKey ) const {
         IndexDescriptor* best = NULL;
 
         IndexIterator ii = getIndexIterator( txn, false );
         while ( ii.more() ) {
             IndexDescriptor* desc = ii.next();
 
-            if ( !keyPattern.isPrefixOf( desc->keyPattern() ) )
+            if ( desc->isPartial() )
+                continue;
+
+            if ( !shardKey.isPrefixOf( desc->keyPattern() ) )
                 continue;
 
             if( !desc->isMultikey( txn ) )
@@ -1092,7 +1109,9 @@ namespace {
 
         // Notify other users of the IndexCatalog that we're about to invalidate 'oldDesc'.
         const bool collectionGoingAway = false;
-        _collection->getCursorManager()->invalidateAll( collectionGoingAway );
+        _collection->getCursorManager()->invalidateAll(collectionGoingAway,
+                                                       str::stream() << "definition of index '" 
+                                                                     << indexName << "' changed");
 
         // Delete the IndexCatalogEntry that owns this descriptor.  After deletion, 'oldDesc' is
         // invalid and should not be dereferenced.

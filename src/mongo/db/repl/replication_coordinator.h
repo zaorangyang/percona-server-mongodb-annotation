@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
@@ -37,6 +36,7 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/reporter.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -54,12 +54,16 @@ namespace repl {
     class HandshakeArgs;
     class IsMasterResponse;
     class OplogReader;
+    class OpTime;
+    class ReadAfterOpTimeArgs;
+    class ReadAfterOpTimeResponse;
     class ReplSetDeclareElectionWinnerArgs;
     class ReplSetDeclareElectionWinnerResponse;
     class ReplSetHeartbeatArgs;
     class ReplSetHeartbeatArgsV1;
     class ReplSetHeartbeatResponse;
     class ReplSetHeartbeatResponseV1;
+    class ReplSetHtmlSummary;
     class ReplSetRequestVotesArgs;
     class ReplSetRequestVotesResponse;
     class ReplicaSetConfig;
@@ -84,8 +88,6 @@ namespace repl {
         MONGO_DISALLOW_COPYING(ReplicationCoordinator);
 
     public:
-
-        typedef boost::posix_time::milliseconds Milliseconds;
 
         struct StatusAndDuration {
         public:
@@ -166,9 +168,9 @@ namespace repl {
         virtual void clearSyncSourceBlacklist() = 0;
 
         /**
-         * Blocks the calling thread for up to writeConcern.wTimeout millis, or until "ts" has been
-         * replicated to at least a set of nodes that satisfies the writeConcern, whichever comes
-         * first. A writeConcern.wTimeout of 0 indicates no timeout (block forever) and a
+         * Blocks the calling thread for up to writeConcern.wTimeout millis, or until "opTime" has
+         * been replicated to at least a set of nodes that satisfies the writeConcern, whichever
+         * comes first. A writeConcern.wTimeout of 0 indicates no timeout (block forever) and a
          * writeConcern.wTimeout of -1 indicates return immediately after checking. Return codes:
          * ErrorCodes::ExceededTimeLimit if the writeConcern.wTimeout is reached before
          *     the data has been sufficiently replicated
@@ -179,7 +181,7 @@ namespace repl {
          * ErrorCodes::Interrupted if the operation was killed with killop()
          */
         virtual StatusAndDuration awaitReplication(const OperationContext* txn,
-                                                   const Timestamp& ts,
+                                                   const OpTime& opTime,
                                                    const WriteConcernOptions& writeConcern) = 0;
 
         /**
@@ -216,8 +218,8 @@ namespace repl {
          * a standalone, or is writing to the local database.
          *
          * If a node was started with the replSet argument, but has not yet received a config, it
-         * will not be able to receive writes to a database other than local (it will not be treated
-         * as standalone node).
+         * will not be able to receive writes to a database other than local (it will not be
+         * treated as standalone node).
          *
          * NOTE: This function can only be meaningfully called while the caller holds the global
          * lock in some mode other than MODE_NONE.
@@ -258,12 +260,13 @@ namespace repl {
         /**
          * Updates our internal tracking of the last OpTime applied to this node.
          *
-         * The new value of "ts" must be no less than any prior value passed to this method, and it
-         * is the caller's job to properly synchronize this behavior.  The exception to this rule is
-         * that after calls to resetLastOpTimeFromOplog(), the minimum acceptable value for "ts" is
-         * reset based on the contents of the oplog, and may go backwards due to rollback.
+         * The new value of "opTime" must be no less than any prior value passed to this method, and
+         * it is the caller's job to properly synchronize this behavior.  The exception to this rule
+         * is that after calls to resetLastOpTimeFromOplog(), the minimum acceptable value for
+         * "opTime" is reset based on the contents of the oplog, and may go backwards due to
+         * rollback.
          */
-        virtual void setMyLastOptime(const Timestamp& ts) = 0;
+        virtual void setMyLastOptime(const OpTime& opTime) = 0;
 
         /**
          * Same as above, but used during places we need to zero our last optime.
@@ -278,7 +281,24 @@ namespace repl {
         /**
          * Returns the last optime recorded by setMyLastOptime.
          */
-        virtual Timestamp getMyLastOptime() const = 0;
+        virtual OpTime getMyLastOptime() const = 0;
+
+        /**
+         * Waits until the optime of the current node is at least the opTime specified in
+         * 'settings'.
+         *
+         * The returned ReadAfterOpTimeResponse object's didWait() method returns true if
+         * an attempt was made to wait for the specified opTime. Cases when this can be
+         * false could include:
+         *
+         * 1. No read after opTime was specified.
+         * 2. Attempting to do read after opTime when node is not a replica set member.
+         *
+         * Note: getDuration() on the returned ReadAfterOpTimeResponse will only be valid if
+         * its didWait() method returns true.
+         */
+        virtual ReadAfterOpTimeResponse waitUntilOpTime(const OperationContext* txn,
+                                                        const ReadAfterOpTimeArgs& settings) = 0;
 
         /**
          * Retrieves and returns the current election id, which is a unique id that is local to
@@ -512,7 +532,7 @@ namespace repl {
         /**
          * Returns a vector of members that have applied the operation with OpTime 'op'.
          */
-        virtual std::vector<HostAndPort> getHostsWrittenTo(const Timestamp& op) = 0;
+        virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op) = 0;
 
         /**
          * Returns a vector of the members other than ourself in the replica set, as specified in
@@ -563,22 +583,24 @@ namespace repl {
          * Committed means a majority of the voting nodes of the config are known to have the
          * operation in their oplogs.  This implies such ops will never be rolled back.
          */
-        virtual Timestamp getLastCommittedOpTime() const = 0;
+        virtual OpTime getLastCommittedOpTime() const = 0;
 
         /*
         * Handles an incoming replSetRequestVotes command.
         * Adds BSON to 'resultObj'; returns a Status with either OK or an error message.
         */
-        virtual Status processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
+        virtual Status processReplSetRequestVotes(OperationContext* txn,
+                                                  const ReplSetRequestVotesArgs& args,
                                                   ReplSetRequestVotesResponse* response) = 0;
 
         /*
         * Handles an incoming replSetDeclareElectionWinner command.
         * Returns a Status with either OK or an error message.
+        * Populates responseTerm with the current term from our perspective.
         */
         virtual Status processReplSetDeclareElectionWinner(
                 const ReplSetDeclareElectionWinnerArgs& args,
-                ReplSetDeclareElectionWinnerResponse* response) = 0;
+                long long* responseTerm) = 0;
 
         /**
          * Prepares a BSONObj describing the current term, primary, and lastOp information.
@@ -589,6 +611,12 @@ namespace repl {
          * Returns true if the V1 election protocol is being used and false otherwise.
          */ 
         virtual bool isV1ElectionProtocol() = 0;
+
+        /**
+         * Writes into 'output' all the information needed to generate a summary of the current
+         * replication state for use by the web interface.
+         */
+        virtual void summarizeAsHtml(ReplSetHtmlSummary* output) = 0;
 
     protected:
 

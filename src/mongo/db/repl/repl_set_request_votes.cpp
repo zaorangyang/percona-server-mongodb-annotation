@@ -59,7 +59,8 @@ namespace repl {
             }
 
             ReplSetRequestVotesResponse response;
-            status = getGlobalReplicationCoordinator()->processReplSetRequestVotes(parsedArgs,
+            status = getGlobalReplicationCoordinator()->processReplSetRequestVotes(txn,
+                                                                                   parsedArgs,
                                                                                    &response);
             response.addToBSON(&result);
             return appendCommandStatus(result, status);

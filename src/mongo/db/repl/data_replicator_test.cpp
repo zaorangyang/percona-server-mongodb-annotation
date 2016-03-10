@@ -84,8 +84,8 @@ namespace {
         void scheduleNetworkResponse(const BSONObj& obj) {
             NetworkInterfaceMock* net = getNet();
             ASSERT_TRUE(net->hasReadyRequests());
-            ReplicationExecutor::Milliseconds millis(0);
-            ReplicationExecutor::RemoteCommandResponse response(obj, millis);
+            Milliseconds millis(0);
+            RemoteCommandResponse response(obj, millis);
             ReplicationExecutor::ResponseStatus responseStatus(response);
             net->scheduleResponse(net->getNextReadyRequest(), net->now(), responseStatus);
         }

@@ -60,11 +60,11 @@ namespace repl {
 
     ElectCmdRunner::Algorithm::~Algorithm() {}
 
-    std::vector<ReplicationExecutor::RemoteCommandRequest>
+    std::vector<RemoteCommandRequest>
     ElectCmdRunner::Algorithm::getRequests() const {
 
         const MemberConfig& selfConfig = _rsConfig.getMemberAt(_selfIndex);
-        std::vector<ReplicationExecutor::RemoteCommandRequest> requests;
+        std::vector<RemoteCommandRequest> requests;
         BSONObjBuilder electCmdBuilder;
         electCmdBuilder.append("replSetElect", 1);
         electCmdBuilder.append("set", _rsConfig.getReplSetName());
@@ -80,7 +80,7 @@ namespace repl {
              ++it) {
 
             invariant(*it != selfConfig.getHostAndPort());
-            requests.push_back(ReplicationExecutor::RemoteCommandRequest(
+            requests.push_back(RemoteCommandRequest(
                         *it,
                         "admin",
                         replSetElectCmd,
@@ -107,14 +107,15 @@ namespace repl {
     }
 
     void ElectCmdRunner::Algorithm::processResponse(
-            const ReplicationExecutor::RemoteCommandRequest& request,
+            const RemoteCommandRequest& request,
             const ResponseStatus& response) {
 
         ++_actualResponses;
 
         if (response.isOK()) {
             BSONObj res = response.getValue().data;
-            LOG(1) << "elect res: " << res.toString();
+            log() << "received " << res["vote"] << " votes from " << request.target;
+            LOG(1) << "full elect res: " << res.toString();
             BSONElement vote(res["vote"]); 
             if (vote.type() != mongo::NumberInt) {
                 error() << "wrong type for vote argument in replSetElect command: " << 

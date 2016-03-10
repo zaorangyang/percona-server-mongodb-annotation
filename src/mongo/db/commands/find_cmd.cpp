@@ -333,10 +333,11 @@ namespace mongo {
                 if (!(pq.isTailable() && state == PlanExecutor::IS_EOF)) {
                     // We stash away the RecoveryUnit in the ClientCursor. It's used for
                     // subsequent getMore requests. The calling OpCtx gets a fresh RecoveryUnit.
-                    txn->recoveryUnit()->commitAndRestart();
+                    txn->recoveryUnit()->abandonSnapshot();
                     cursor->setOwnedRecoveryUnit(txn->releaseRecoveryUnit());
                     StorageEngine* engine = getGlobalServiceContext()->getGlobalStorageEngine();
-                    txn->setRecoveryUnit(engine->newRecoveryUnit());
+                    txn->setRecoveryUnit(engine->newRecoveryUnit(),
+                                         OperationContext::kNotInUnitOfWork);
                 }
             }
             else {

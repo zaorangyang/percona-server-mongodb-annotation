@@ -66,10 +66,10 @@ namespace {
             OID epoch = OID::gen();
 
             CollectionType collType;
-            collType.setNs( "test.foo" );
+            collType.setNs(NamespaceString{"test.foo"});
             collType.setKeyPattern( BSON("a" << 1) );
             collType.setUnique( false );
-            collType.setUpdatedAt( 1ULL );
+            collType.setUpdatedAt( Date_t::fromMillisSinceEpoch(1) );
             collType.setEpoch( epoch );
             ASSERT_OK(collType.validate());
 
@@ -78,7 +78,7 @@ namespace {
             // Need a chunk on another shard, otherwise the chunks are invalid in general and we
             // can't load metadata
             ChunkType chunkType;
-            chunkType.setNS( "test.foo");
+            chunkType.setNS(NamespaceString{"test.foo"});
             chunkType.setShard( "shard0001" );
             chunkType.setMin( BSON( "a" << MINKEY ) );
             chunkType.setMax( BSON( "a" << MAXKEY ) );
@@ -93,7 +93,7 @@ namespace {
             CatalogManagerLegacy catalogManager;
             catalogManager.init(configLoc);
 
-            MetadataLoader loader(configLoc);
+            MetadataLoader loader;
             Status status = loader.makeCollectionMetadata(&catalogManager,
                                                           "test.foo",
                                                           "shard0000",
@@ -474,10 +474,10 @@ namespace {
             ChunkVersion chunkVersion = ChunkVersion( 1, 0, epoch );
 
             CollectionType collType;
-            collType.setNs("test.foo");
+            collType.setNs(NamespaceString{"test.foo"});
             collType.setKeyPattern(BSON("a" << 1));
             collType.setUnique(false);
-            collType.setUpdatedAt(1ULL);
+            collType.setUpdatedAt(Date_t::fromMillisSinceEpoch(1));
             collType.setEpoch(epoch);
             _dummyConfig->insert(CollectionType::ConfigNS, collType.toBSON());
 
@@ -485,7 +485,8 @@ namespace {
                     ChunkType::ns("test.foo") <<
                     ChunkType::min(BSON("a" << 10)) <<
                     ChunkType::max(BSON("a" << 20)) <<
-                    ChunkType::DEPRECATED_lastmod(chunkVersion.toLong()) <<
+                    ChunkType::DEPRECATED_lastmod(
+                            Date_t::fromMillisSinceEpoch(chunkVersion.toLong())) <<
                     ChunkType::DEPRECATED_epoch(epoch) <<
                     ChunkType::shard("shard0000"));
             _dummyConfig->insert( ChunkType::ConfigNS, fooSingle );
@@ -495,7 +496,7 @@ namespace {
             CatalogManagerLegacy catalogManager;
             catalogManager.init(configLoc);
 
-            MetadataLoader loader(configLoc);
+            MetadataLoader loader;
             Status status = loader.makeCollectionMetadata(&catalogManager,
                                                           "test.foo",
                                                           "shard0000",
@@ -676,7 +677,6 @@ namespace {
         ASSERT_EQUALS( version.majorVersion(), newVersion.majorVersion() );
         ASSERT_EQUALS( version.minorVersion() + 1, newVersion.minorVersion() );
 
-        chunk.clear();
         ASSERT( cloned->getNextChunk(BSON("a" << MINKEY), &chunk) );
         ASSERT( chunk.getMin().woCompare( BSON("a" << 10) ) == 0 );
         ASSERT( chunk.getMax().woCompare( BSON("a" << 14) ) == 0 );
@@ -822,18 +822,20 @@ namespace {
             ChunkVersion chunkVersion = ChunkVersion( 1, 0, epoch );
 
             CollectionType collType;
-            collType.setNs("test.foo");
+            collType.setNs(NamespaceString{"test.foo"});
             collType.setKeyPattern(BSON("a" << 1));
             collType.setUnique(false);
-            collType.setUpdatedAt(1ULL);
+            collType.setUpdatedAt(Date_t::fromMillisSinceEpoch(1));
             collType.setEpoch(epoch);
             _dummyConfig->insert(CollectionType::ConfigNS, collType.toBSON());
 
-            BSONObj fooSingle = BSON(ChunkType::name("test.foo-a_MinKey") <<
+            BSONObj fooSingle = BSON(
+                    ChunkType::name("test.foo-a_MinKey") <<
                     ChunkType::ns("test.foo") <<
                     ChunkType::min(BSON("a" << MINKEY << "b" << MINKEY)) <<
                     ChunkType::max(BSON("a" << MAXKEY << "b" << MAXKEY)) <<
-                    ChunkType::DEPRECATED_lastmod(chunkVersion.toLong()) <<
+                    ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(
+                                                          chunkVersion.toLong())) <<
                     ChunkType::DEPRECATED_epoch(epoch) <<
                     ChunkType::shard("shard0000"));
             _dummyConfig->insert( ChunkType::ConfigNS, fooSingle );
@@ -843,7 +845,7 @@ namespace {
             CatalogManagerLegacy catalogManager;
             catalogManager.init(configLoc);
 
-            MetadataLoader loader(configLoc);
+            MetadataLoader loader;
             Status status = loader.makeCollectionMetadata(&catalogManager,
                                                           "test.foo",
                                                           "shard0000",
@@ -890,35 +892,41 @@ namespace {
             ChunkVersion chunkVersion = ChunkVersion( 1, 0, epoch );
 
             CollectionType collType;
-            collType.setNs("test.foo");
+            collType.setNs(NamespaceString{"test.foo"});
             collType.setKeyPattern(BSON("a" << 1));
             collType.setUnique(false);
-            collType.setUpdatedAt(1ULL);
+            collType.setUpdatedAt(Date_t::fromMillisSinceEpoch(1));
             collType.setEpoch(epoch);
             _dummyConfig->insert(CollectionType::ConfigNS, collType.toBSON());
 
-            _dummyConfig->insert( ChunkType::ConfigNS, BSON(ChunkType::name("test.foo-a_10") <<
-                    ChunkType::ns("test.foo") <<
-                    ChunkType::min(BSON("a" << 10 << "b" << 0)) <<
-                    ChunkType::max(BSON("a" << 20 << "b" << 0)) <<
-                    ChunkType::DEPRECATED_lastmod(chunkVersion.toLong()) <<
-                    ChunkType::DEPRECATED_epoch(epoch) <<
-                    ChunkType::shard("shard0000")) );
+            _dummyConfig->insert(
+                    ChunkType::ConfigNS,
+                    BSON(ChunkType::name("test.foo-a_10") <<
+                         ChunkType::ns("test.foo") <<
+                         ChunkType::min(BSON("a" << 10 << "b" << 0)) <<
+                         ChunkType::max(BSON("a" << 20 << "b" << 0)) <<
+                         ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(
+                                                               chunkVersion.toLong())) <<
+                         ChunkType::DEPRECATED_epoch(epoch) <<
+                         ChunkType::shard("shard0000")) );
 
-            _dummyConfig->insert( ChunkType::ConfigNS, BSON(ChunkType::name("test.foo-a_10") <<
-                    ChunkType::ns("test.foo") <<
-                    ChunkType::min(BSON("a" << 30 << "b" << 0)) <<
-                    ChunkType::max(BSON("a" << 40 << "b" << 0)) <<
-                    ChunkType::DEPRECATED_lastmod(chunkVersion.toLong()) <<
-                    ChunkType::DEPRECATED_epoch(epoch) <<
-                    ChunkType::shard("shard0000")) );
+            _dummyConfig->insert(
+                    ChunkType::ConfigNS,
+                    BSON(ChunkType::name("test.foo-a_10") <<
+                         ChunkType::ns("test.foo") <<
+                         ChunkType::min(BSON("a" << 30 << "b" << 0)) <<
+                         ChunkType::max(BSON("a" << 40 << "b" << 0)) <<
+                         ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(
+                                                               chunkVersion.toLong())) <<
+                         ChunkType::DEPRECATED_epoch(epoch) <<
+                         ChunkType::shard("shard0000")) );
 
             ConnectionString configLoc = ConnectionString(HostAndPort(CONFIG_HOST_PORT));
             ASSERT(configLoc.isValid());
             CatalogManagerLegacy catalogManager;
             catalogManager.init(configLoc);
 
-            MetadataLoader loader(configLoc);
+            MetadataLoader loader;
             Status status = loader.makeCollectionMetadata(&catalogManager,
                                                           "test.foo",
                                                           "shard0000",
@@ -1162,10 +1170,10 @@ namespace {
 
             {
                 CollectionType collType;
-                collType.setNs("x.y");
+                collType.setNs(NamespaceString{"x.y"});
                 collType.setKeyPattern(BSON("a" << 1));
                 collType.setUnique(false);
-                collType.setUpdatedAt(1ULL);
+                collType.setUpdatedAt(Date_t::fromMillisSinceEpoch(1));
                 collType.setEpoch(epoch);
                 _dummyConfig->insert(CollectionType::ConfigNS, collType.toBSON());
             }
@@ -1176,7 +1184,8 @@ namespace {
                         ChunkType::ns("x.y") <<
                         ChunkType::min(BSON("a" << MINKEY)) <<
                         ChunkType::max(BSON("a" << 10)) <<
-                        ChunkType::DEPRECATED_lastmod(version.toLong()) <<
+                        ChunkType::DEPRECATED_lastmod(
+                                Date_t::fromMillisSinceEpoch(version.toLong())) <<
                         ChunkType::DEPRECATED_epoch(version.epoch()) <<
                         ChunkType::shard("shard0000")) );
             }
@@ -1187,7 +1196,8 @@ namespace {
                         ChunkType::ns("x.y") <<
                         ChunkType::min(BSON("a" << 10)) <<
                         ChunkType::max(BSON("a" << 20)) <<
-                        ChunkType::DEPRECATED_lastmod(version.toLong()) <<
+                        ChunkType::DEPRECATED_lastmod(
+                                Date_t::fromMillisSinceEpoch(version.toLong())) <<
                         ChunkType::DEPRECATED_epoch(version.epoch()) <<
                         ChunkType::shard("shard0000")) );
             }
@@ -1198,7 +1208,8 @@ namespace {
                         ChunkType::ns("x.y") <<
                         ChunkType::min(BSON("a" << 30)) <<
                         ChunkType::max(BSON("a" << MAXKEY)) <<
-                        ChunkType::DEPRECATED_lastmod(version.toLong()) <<
+                        ChunkType::DEPRECATED_lastmod(
+                                Date_t::fromMillisSinceEpoch(version.toLong())) <<
                         ChunkType::DEPRECATED_epoch(version.epoch()) <<
                         ChunkType::shard("shard0000")) );
             }
@@ -1208,7 +1219,7 @@ namespace {
             CatalogManagerLegacy catalogManager;
             catalogManager.init(configLoc);
 
-            MetadataLoader loader(configLoc);
+            MetadataLoader loader;
             Status status = loader.makeCollectionMetadata(&catalogManager,
                                                           "test.foo",
                                                           "shard0000",

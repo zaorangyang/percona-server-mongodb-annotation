@@ -48,8 +48,6 @@ namespace mongo {
 namespace repl {
 namespace {
 
-    typedef ReplicationExecutor::RemoteCommandRequest RemoteCommandRequest;
-
     class ReplCoordElectTest : public ReplCoordTest {
     protected:
         void simulateEnoughHeartbeatsForElectability();
@@ -63,7 +61,7 @@ namespace {
         net->enterNetwork();
         for (int i = 0; i < rsConfig.getNumMembers() - 1; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             log() << request.target.toString() << " processing " << request.cmdObj;
             ReplSetHeartbeatArgs hbArgs;
             if (hbArgs.initialize(request.cmdObj).isOK()) {
@@ -93,13 +91,14 @@ namespace {
         net->enterNetwork();
         for (int i = 0; i < rsConfig.getNumMembers() - 1; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             log() << request.target.toString() << " processing " << request.cmdObj;
             if (request.cmdObj.firstElement().fieldNameStringData() == "replSetFresh") {
                 net->scheduleResponse(noi, net->now(), makeResponseStatus(
                                               BSON("ok" << 1 <<
                                                    "fresher" << false <<
-                                                   "opTime" << Date_t(Timestamp(0, 0).asULL()) <<
+                                                   "opTime" << Date_t::fromMillisSinceEpoch(
+                                                           Timestamp(0, 0).asLL()) <<
                                                    "veto" << false)));
             }
             else {
@@ -149,12 +148,19 @@ namespace {
         ASSERT(getReplCoord()->getMemberState().secondary()) <<
                                                       getReplCoord()->getMemberState().toString();
 
-        getReplCoord()->setMyLastOptime(Timestamp(10,0));
+        getReplCoord()->setMyLastOptime(OpTime(Timestamp(10,0), 0));
 
         NetworkInterfaceMock* net = getNet();
         net->enterNetwork();
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
+        // blackhole heartbeat
         net->scheduleResponse(noi,
+                              net->now(),
+                              ResponseStatus(ErrorCodes::OperationFailed, "timeout"));
+        net->runReadyNetworkOperations();
+        // blackhole freshness
+        const NetworkInterfaceMock::NetworkOperationIterator noi2 = net->getNextReadyRequest();
+        net->scheduleResponse(noi2,
                               net->now(),
                               ResponseStatus(ErrorCodes::OperationFailed, "timeout"));
         net->runReadyNetworkOperations();
@@ -210,7 +216,7 @@ namespace {
                                 ));
         assertStartSuccess(configObj, HostAndPort("node1", 12345));
         OperationContextNoop txn;
-        getReplCoord()->setMyLastOptime(Timestamp (100, 1));
+        getReplCoord()->setMyLastOptime(OpTime(Timestamp (100, 1), 0));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
         startCapturingLogMessages();
         simulateSuccessfulElection();
@@ -231,7 +237,7 @@ namespace {
         ReplicaSetConfig config = assertMakeRSConfig(configObj);
 
         OperationContextNoop txn;
-        Timestamp time1(100, 1);
+        OpTime time1(Timestamp(100, 1), 0);
         getReplCoord()->setMyLastOptime(time1);
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
@@ -241,7 +247,7 @@ namespace {
         net->enterNetwork();
         while (net->hasReadyRequests()) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             log() << request.target.toString() << " processing " << request.cmdObj;
             if (request.target != HostAndPort("node2", 12345)) {
                 net->blackHole(noi);
@@ -278,7 +284,7 @@ namespace {
         ReplicaSetConfig config = assertMakeRSConfig(configObj);
 
         OperationContextNoop txn;
-        Timestamp time1(100, 1);
+        OpTime time1(Timestamp(100, 1), 0);
         getReplCoord()->setMyLastOptime(time1);
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
@@ -288,7 +294,7 @@ namespace {
         net->enterNetwork();
         while (net->hasReadyRequests()) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             log() << request.target.toString() << " processing " << request.cmdObj;
             if (request.target != HostAndPort("node2", 12345)) {
                 net->blackHole(noi);
@@ -326,7 +332,7 @@ namespace {
                                          BSON("_id" << 5 << "host" << "node5:12345") )),
             HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(Timestamp(100,0));
+        getReplCoord()->setMyLastOptime(OpTime(Timestamp(100,0), 0));
 
         // set hbreconfig to hang while in progress
         getExternalState()->setStoreLocalConfigDocumentToHang(true);
@@ -349,7 +355,7 @@ namespace {
         BSONObjBuilder respObj2;
         respObj2 << "ok" << 1;
         hbResp2.addToBSON(&respObj2);
-        net->runUntil(net->now() + 10*1000); // run until we've sent a heartbeat request
+        net->runUntil(net->now() + Seconds(10)); // run until we've sent a heartbeat request
         const NetworkInterfaceMock::NetworkOperationIterator noi2 = net->getNextReadyRequest();
         net->scheduleResponse(noi2, net->now(), makeResponseStatus(respObj2.obj()));
         net->runReadyNetworkOperations();
@@ -372,7 +378,7 @@ namespace {
         net->enterNetwork();
         for (int i = 0; i < 2; ++i) {
             const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-            const ReplicationExecutor::RemoteCommandRequest& request = noi->getRequest();
+            const RemoteCommandRequest& request = noi->getRequest();
             log() << request.target.toString() << " processing " << request.cmdObj;
             ReplSetHeartbeatArgs hbArgs;
             if (hbArgs.initialize(request.cmdObj).isOK()) {

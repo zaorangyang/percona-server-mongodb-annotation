@@ -41,6 +41,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -53,6 +54,7 @@
 #include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/util/exit.h"
@@ -135,19 +137,20 @@ namespace repl {
         const char *ns = op.getStringField("ns");
         verify(ns);
 
+        const char* opType = op["op"].valuestrsafe();
+
+        bool isCommand(opType[0] == 'c');
+        bool isNoOp(opType[0] == 'n');
+
         if ( (*ns == '\0') || (*ns == '.') ) {
             // this is ugly
             // this is often a no-op
             // but can't be 100% sure
-            if( *op.getStringField("op") != 'n' ) {
+            if (!isNoOp) {
                 error() << "skipping bad op in oplog: " << op.toString();
             }
             return true;
         }
-
-        const char* opType = op["op"].valuestrsafe();
-
-        bool isCommand(opType[0] == 'c');
 
         for ( int createCollection = 0; createCollection < 2; createCollection++ ) {
             try {
@@ -164,6 +167,11 @@ namespace repl {
                     // a command may need a global write lock. so we will conservatively go
                     // ahead and grab one here. suboptimal. :-(
                     globalWriteLock.reset(new Lock::GlobalWrite(txn->lockState()));
+                    
+                    // special case apply for commands to avoid implicit database creation
+                    Status status = applyCommand_inlock(txn, op);
+                    opsAppliedStats.increment();
+                    return status.isOK();
                 }
                 else if (isIndexBuild) {
                     dbLock.reset(new Lock::DBLock(txn->lockState(),
@@ -180,10 +188,14 @@ namespace repl {
                         continue;
                     }
                 }
-                else {
-                    // Unknown op?
+                else if (isNoOp) {
                     dbLock.reset(new Lock::DBLock(txn->lockState(),
                                                   nsToDatabaseSubstring(ns), MODE_X));
+                }
+                else {
+                    // unknown opType
+                    error() << "bad opType '" << opType << "' in oplog entry: " << op.toString();
+                    return false;
                 }
 
                 OldClientContext ctx(txn, ns);
@@ -200,9 +212,9 @@ namespace repl {
                 // For non-initial-sync, we convert updates to upserts
                 // to suppress errors when replaying oplog entries.
                 txn->setReplicatedWrites(false);
+                DisableDocumentValidation validationDisabler(txn);
 
-                Status status =
-                    applyOperation_inlock(txn, ctx.db(), op, convertUpdateToUpsert);
+                Status status = applyOperation_inlock(txn, ctx.db(), op, convertUpdateToUpsert);
                 opsAppliedStats.increment();
                 return status.isOK();
             }
@@ -276,9 +288,8 @@ namespace repl {
         }
         
         std::vector< std::vector<BSONObj> > writerVectors(replWriterThreadCount);
-        bool mustAwaitCommit = false;
 
-        fillWriterVectors(ops, &writerVectors, &mustAwaitCommit);
+        fillWriterVectors(ops, &writerVectors);
         LOG(2) << "replication batch size is " << ops.size() << endl;
         // We must grab this because we're going to grab write locks later.
         // We hold this mutex the entire time we're writing; it doesn't matter
@@ -286,7 +297,7 @@ namespace repl {
         SimpleMutex::scoped_lock fsynclk(filesLockedFsync);
 
         // stop all readers until we're done
-        Lock::ParallelBatchWriterMode pbwm;
+        Lock::ParallelBatchWriterMode pbwm(txn->lockState());
 
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
         if (replCoord->getMemberState().primary() &&
@@ -302,26 +313,27 @@ namespace repl {
             return Timestamp();
         }
 
-        if (supportsAwaitingCommit() && mustAwaitCommit) {
-            txn->recoveryUnit()->goingToAwaitCommit();
+        const bool mustWaitUntilDurable = replCoord->isV1ElectionProtocol() && supportsWaitingUntilDurable();
+        if (mustWaitUntilDurable) {
+            txn->recoveryUnit()->goingToWaitUntilDurable();
         }
-        Timestamp lastOpTime = writeOpsToOplog(txn, ops);
-        // Wait for journal before setting last op time if any op in batch had j:true
-        if (supportsAwaitingCommit() && mustAwaitCommit) {
-            txn->recoveryUnit()->awaitCommit();
+
+        OpTime lastOpTime = writeOpsToOplog(txn, ops);
+
+        if (mustWaitUntilDurable) {
+            txn->recoveryUnit()->waitUntilDurable();
         }
         ReplClientInfo::forClient(txn->getClient()).setLastOp(lastOpTime);
         replCoord->setMyLastOptime(lastOpTime);
-        setNewOptime(lastOpTime);
+        setNewOptime(lastOpTime.getTimestamp());
 
         BackgroundSync::get()->notify(txn);
 
-        return lastOpTime;
+        return lastOpTime.getTimestamp();
     }
 
     void SyncTail::fillWriterVectors(const std::deque<BSONObj>& ops,
-                                     std::vector< std::vector<BSONObj> >* writerVectors,
-                                     bool* mustAwaitCommit) {
+                                     std::vector< std::vector<BSONObj> >* writerVectors) {
 
         for (std::deque<BSONObj>::const_iterator it = ops.begin();
              it != ops.end();
@@ -334,12 +346,6 @@ namespace repl {
             MurmurHash3_x86_32( ns, len, 0, &hash);
 
             const char* opType = it->getField( "op" ).valuestrsafe();
-
-            // Check if any entry needs journaling, and if so return the need
-            const bool foundJournal = it->getField("j").trueValue();
-            if (foundJournal) {
-                *mustAwaitCommit = true;
-            }
 
             if (getGlobalServiceContext()->getGlobalStorageEngine()->supportsDocLocking() &&
                 isCrudOpType(opType)) {
@@ -445,7 +451,7 @@ namespace {
         }
 
         Timestamp minvalid = getMinValid(txn);
-        if (minvalid > replCoord->getMyLastOptime()) {
+        if (minvalid > replCoord->getMyLastOptime().getTimestamp()) {
             return;
         }
 
@@ -494,7 +500,7 @@ namespace {
                     tryToGoLiveAsASecondary(&txn, replCoord);
                 }
 
-                const int slaveDelaySecs = replCoord->getSlaveDelaySecs().total_seconds();
+                const int slaveDelaySecs = replCoord->getSlaveDelaySecs().count();
                 if (!ops.empty() && slaveDelaySecs > 0) {
                     const BSONObj& lastOp = ops.getDeque().back();
                     const unsigned int opTimestampSecs = lastOp["ts"].timestamp().getSecs();
@@ -614,7 +620,7 @@ namespace {
 
     void SyncTail::handleSlaveDelay(const BSONObj& lastOp) {
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-        int slaveDelaySecs = replCoord->getSlaveDelaySecs().total_seconds();
+        int slaveDelaySecs = replCoord->getSlaveDelaySecs().count();
 
         // ignore slaveDelay if the box is still initializing. once
         // it becomes secondary we can worry about it.
@@ -639,7 +645,7 @@ namespace {
                         sleepsecs(6);
 
                         // Handle reconfigs that changed the slave delay
-                        if (replCoord->getSlaveDelaySecs().total_seconds() != slaveDelaySecs)
+                        if (replCoord->getSlaveDelaySecs().count() != slaveDelaySecs)
                             break;
                     }
                 }
@@ -663,6 +669,7 @@ namespace {
 
         OperationContextImpl txn;
         txn.setReplicatedWrites(false);
+        DisableDocumentValidation validationDisabler(&txn);
 
         // allow us to get through the magic barrier
         txn.lockState()->setIsBatchWriter(true);
@@ -696,6 +703,7 @@ namespace {
 
         OperationContextImpl txn;
         txn.setReplicatedWrites(false);
+        DisableDocumentValidation validationDisabler(&txn);
 
         // allow us to get through the magic barrier
         txn.lockState()->setIsBatchWriter(true);

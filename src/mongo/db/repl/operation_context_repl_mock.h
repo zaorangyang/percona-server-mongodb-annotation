@@ -40,16 +40,36 @@ namespace repl {
 
     /**
      * Mock implementation of OperationContext that can be used with real instances of LockManager.
+     * Note this is not thread safe and the setter methods should only be called in the context
+     * where access to this object is guaranteed to be serialized.
      */
     class OperationContextReplMock : public OperationContextNoop {
     public:
         OperationContextReplMock();
         virtual ~OperationContextReplMock();
 
-        virtual Locker* lockState() const { return _lockState.get(); }
+        virtual Locker* lockState() const override;
+
+        virtual unsigned int getOpID() const override;
+
+        void setOpID(unsigned int opID);
+
+        virtual void checkForInterrupt() const override;
+
+        virtual Status checkForInterruptNoAssert() const override;
+
+        void setCheckForInterruptStatus(Status status);
+
+        virtual uint64_t getRemainingMaxTimeMicros() const override;
+
+        void setRemainingMaxTimeMicros(uint64_t micros);
 
     private:
         boost::scoped_ptr<Locker> _lockState;
+        unsigned int _opID;
+
+        Status _checkForInterruptStatus;
+        uint64_t _maxTimeMicrosRemaining;
     };
 
 }  // namespace repl

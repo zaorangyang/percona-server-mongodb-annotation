@@ -79,7 +79,7 @@ namespace repl {
             return true;
         }
         log() << "setting syncSourceFeedback to " << host.toString();
-        _connection.reset(new DBClientConnection(false, 0, OplogReader::tcp_timeout));
+        _connection.reset(new DBClientConnection(false, OplogReader::tcp_timeout));
         string errmsg;
         try {
             if (!_connection->connect(host, errmsg) ||
@@ -127,8 +127,7 @@ namespace repl {
         catch (const DBException& e) {
             log() << "SyncSourceFeedback error sending update: " << e.what() << endl;
             // blacklist sync target for .5 seconds and find a new one
-            replCoord->blacklistSyncSource(_syncTarget,
-                                           Date_t(curTimeMillis64() + 500));
+            replCoord->blacklistSyncSource(_syncTarget, Date_t::now() + Milliseconds(500));
             BackgroundSync::get()->clearSyncTarget();
             _resetConnection();
             return e.toStatus();
@@ -141,8 +140,7 @@ namespace repl {
             // to the syncsource having a newer config
             if (status != ErrorCodes::InvalidReplicaSetConfig || res["cfgver"].eoo() ||
                     res["cfgver"].numberLong() < replCoord->getConfig().getConfigVersion()) {
-                replCoord->blacklistSyncSource(_syncTarget,
-                                               Date_t(curTimeMillis64() + 500));
+                replCoord->blacklistSyncSource(_syncTarget, Date_t::now() + Milliseconds(500));
                 BackgroundSync::get()->clearSyncTarget();
                 _resetConnection();
             }

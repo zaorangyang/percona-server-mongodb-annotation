@@ -404,7 +404,7 @@ namespace {
                 Timestamp theirTS = theirLastOp["ts"].timestamp();
                 if (theirTS < _lastOpTimeFetched) {
                     log() << "we are ahead of the sync source, will try to roll back";
-                    syncRollback(txn, _replCoord->getMyLastOptime(), &r, _replCoord);
+                    syncRollback(txn, _replCoord->getMyLastOptime().getTimestamp(), &r, _replCoord);
                     return true;
                 }
                 /* we're not ahead?  maybe our new query got fresher data.  best to come back and try again */
@@ -424,7 +424,7 @@ namespace {
         if( ts != _lastOpTimeFetched || hash != _lastFetchedHash ) {
             log() << "our last op time fetched: " << _lastOpTimeFetched.toStringPretty();
             log() << "source's GTE: " << ts.toStringPretty();
-            syncRollback(txn, _replCoord->getMyLastOptime(), &r, _replCoord);
+            syncRollback(txn, _replCoord->getMyLastOptime().getTimestamp(), &r, _replCoord);
             return true;
         }
 
@@ -461,7 +461,7 @@ namespace {
 
         // reset _last fields with current oplog data
         _lastAppliedHash = updatedLastAppliedHash;
-        _lastOpTimeFetched = _replCoord->getMyLastOptime();
+        _lastOpTimeFetched = _replCoord->getMyLastOptime().getTimestamp();
         _lastFetchedHash = _lastAppliedHash;
 
         LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched <<
@@ -478,6 +478,10 @@ namespace {
     long long BackgroundSync::getLastAppliedHash() const {
         boost::lock_guard<boost::mutex> lck(_mutex);
         return _lastAppliedHash;
+    }
+
+    void BackgroundSync::clearBuffer() {
+        _buffer.clear();
     }
 
     void BackgroundSync::setLastAppliedHash(long long newHash) {
@@ -532,6 +536,11 @@ namespace {
     void BackgroundSync::setInitialSyncRequestedFlag(bool value) {
         boost::lock_guard<boost::mutex> lock(_initialSyncMutex);
         _initialSyncRequestedFlag = value;
+    }
+
+    void BackgroundSync::pushTestOpToBuffer(const BSONObj& op) {
+        boost::lock_guard<boost::mutex> lock(_mutex);
+        _buffer.push(op);
     }
 
 

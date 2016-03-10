@@ -37,6 +37,7 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/db_raii.h"
@@ -54,6 +55,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -63,6 +65,9 @@ namespace {
 
     using std::list;
     using std::string;
+
+    // Failpoint which fails initial sync and leaves on oplog entry in the buffer.
+    MONGO_FP_DECLARE(failInitSyncWithBufferedEntriesLeft);
 
     /**
      * Truncates the oplog (removes any documents) and resets internal variables that were
@@ -74,6 +79,9 @@ namespace {
     void truncateAndResetOplog(OperationContext* txn,
                                ReplicationCoordinator* replCoord,
                                BackgroundSync* bgsync) {
+        // Clear minvalid
+        setMinValid(txn, Timestamp());
+
         AutoGetDb autoDb(txn, "local", MODE_X);
         massert(28585, "no local database found", autoDb.getDb());
         invariant(txn->lockState()->isCollectionLockedForMode(rsOplogName, MODE_X));
@@ -86,6 +94,9 @@ namespace {
         // because the bgsync thread, while running, may update the blacklist.
         replCoord->resetMyLastOptime();
         bgsync->stop();
+        bgsync->setLastAppliedHash(0);
+        bgsync->clearBuffer();
+
         replCoord->clearSyncSourceBlacklist();
 
         // Truncate the oplog in case there was a prior initial sync that failed.
@@ -209,8 +220,19 @@ namespace {
     bool _initialSyncApplyOplog( OperationContext* ctx,
                                  repl::SyncTail& syncer,
                                  OplogReader* r) {
-        const Timestamp startOpTime = getGlobalReplicationCoordinator()->getMyLastOptime();
+        // TODO(siyuan) Change to OpTime after adding term to op logs.
+        const Timestamp startOpTime = getGlobalReplicationCoordinator()->getMyLastOptime()
+                .getTimestamp();
         BSONObj lastOp;
+
+        // If the fail point is set, exit failing.
+        if (MONGO_FAIL_POINT(failInitSyncWithBufferedEntriesLeft)) {
+            log() << "adding fake oplog entry to buffer.";
+            BackgroundSync::get()->pushTestOpToBuffer(
+                                            BSON("ts" << startOpTime << "v" << 1 << "op" << "n"));
+            return false;
+        }
+
         try {
             // It may have been a long time since we last used this connection to
             // query the oplog, depending on the size of the databases we needed to clone.
@@ -257,10 +279,6 @@ namespace {
         }
         catch (const DBException&) {
             warning() << "initial sync failed during oplog application phase, and will retry";
-
-            getGlobalReplicationCoordinator()->resetMyLastOptime();
-            BackgroundSync::get()->setLastAppliedHash(0);
-
             sleepsecs(5);
             return false;
         }
@@ -331,12 +349,14 @@ namespace {
         BackgroundSync* bgsync(BackgroundSync::get());
         OperationContextImpl txn;
         txn.setReplicatedWrites(false);
+        DisableDocumentValidation validationDisabler(&txn);
         ReplicationCoordinator* replCoord(getGlobalReplicationCoordinator());
 
+        // reset state for initial sync
         truncateAndResetOplog(&txn, replCoord, bgsync);
 
         OplogReader r;
-        Timestamp now(Milliseconds(curTimeMillis64()).total_seconds(), 0);
+        Timestamp now(duration_cast<Seconds>(Milliseconds(curTimeMillis64())), 0);
 
         while (r.getHost().empty()) {
             // We must prime the sync source selector so that it considers all candidates regardless
@@ -394,10 +414,10 @@ namespace {
         std::deque<BSONObj> ops;
         ops.push_back(lastOp);
 
-        Timestamp lastOptime = writeOpsToOplog(&txn, ops);
+        OpTime lastOptime = writeOpsToOplog(&txn, ops);
         ReplClientInfo::forClient(txn.getClient()).setLastOp(lastOptime);
         replCoord->setMyLastOptime(lastOptime);
-        setNewOptime(lastOptime);
+        setNewOptime(lastOptime.getTimestamp());
 
         std::string msg = "oplog sync 1 of 3";
         log() << msg;
@@ -446,7 +466,9 @@ namespace {
         {
             ScopedTransaction scopedXact(&txn, MODE_IX);
             AutoGetDb autodb(&txn, "local", MODE_X);
-            Timestamp lastOpTimeWritten(getGlobalReplicationCoordinator()->getMyLastOptime());
+            // TODO(siyuan) Change to OpTime after adding term to op logs.
+            Timestamp lastOpTimeWritten(
+                getGlobalReplicationCoordinator()->getMyLastOptime().getTimestamp());
             log() << "set minValid=" << lastOpTimeWritten;
 
             // Initial sync is now complete.  Flag this by setting minValid to the last thing

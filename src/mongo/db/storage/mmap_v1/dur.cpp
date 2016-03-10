@@ -189,7 +189,7 @@ namespace {
 
         }
         virtual void createdFile(const std::string& filename, unsigned long long len) { }
-        virtual bool awaitCommit() { return false; }
+        virtual bool waitUntilDurable() { return false; }
         virtual bool commitNow(OperationContext* txn) { return false; }
         virtual bool commitIfNeeded() { return false; }
         virtual void syncDataAndTruncateJournal(OperationContext* txn) {}
@@ -209,7 +209,7 @@ namespace {
         // DurableInterface virtual methods
         virtual void declareWriteIntents(const std::vector<std::pair<void*, unsigned> >& intents);
         virtual void createdFile(const std::string& filename, unsigned long long len);
-        virtual bool awaitCommit();
+        virtual bool waitUntilDurable();
         virtual bool commitNow(OperationContext* txn);
         virtual bool commitIfNeeded();
         virtual void syncDataAndTruncateJournal(OperationContext* txn);
@@ -521,7 +521,7 @@ namespace {
         return true;
     }
 
-    bool DurableImpl::awaitCommit() {
+    bool DurableImpl::waitUntilDurable() {
         commitNotify.awaitBeyondNow();
         return true;
     }
@@ -701,7 +701,8 @@ namespace {
                 boost::unique_lock<boost::mutex> lock(flushMutex);
 
                 for (unsigned i = 0; i <= 2; i++) {
-                    if (flushRequested.timed_wait(lock, Milliseconds(oneThird))) {
+                    if (boost::cv_status::no_timeout == flushRequested.wait_for(
+                                lock, Milliseconds(oneThird))) {
                         // Someone forced a flush
                         break;
                     }

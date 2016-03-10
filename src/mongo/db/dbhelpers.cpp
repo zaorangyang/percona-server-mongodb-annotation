@@ -302,9 +302,9 @@ namespace mongo {
         // Therefore, any multi-key index prefixed by shard key cannot be multikey over
         // the shard key fields.
         const IndexDescriptor* idx =
-            collection->getIndexCatalog()->findIndexByPrefix(txn,
-                                                             shardKeyPattern,
-                                                             false /* allow multi key */);
+            collection->getIndexCatalog()->findShardKeyPrefixedIndex(txn,
+                                                                     shardKeyPattern,
+                                                                     false); // requireSingleKey
 
         if ( idx == NULL )
             return false;
@@ -355,7 +355,7 @@ namespace mongo {
 
         long long numDeleted = 0;
         
-        long long millisWaitingForReplication = 0;
+        Milliseconds millisWaitingForReplication{0};
 
         while ( 1 ) {
             // Scoping for write lock.
@@ -468,14 +468,14 @@ namespace mongo {
                 else {
                     massertStatusOK(replStatus.status);
                 }
-                millisWaitingForReplication += replStatus.duration.total_milliseconds();
+                millisWaitingForReplication += replStatus.duration;
             }
         }
         
         if (writeConcern.shouldWaitForOtherNodes())
             log(LogComponent::kSharding)
                   << "Helpers::removeRangeUnlocked time spent waiting for replication: "
-                  << millisWaitingForReplication << "ms" << endl;
+                  << durationCount<Milliseconds>(millisWaitingForReplication) << "ms" << endl;
         
         MONGO_LOG_COMPONENT(1, LogComponent::kSharding)
                << "end removal of " << min << " to " << max << " in " << ns
@@ -509,7 +509,7 @@ namespace mongo {
 
         // Require single key
         IndexDescriptor *idx =
-            collection->getIndexCatalog()->findIndexByPrefix( txn, range.keyPattern, true );
+            collection->getIndexCatalog()->findShardKeyPrefixedIndex( txn, range.keyPattern, true );
 
         if ( idx == NULL ) {
             return Status( ErrorCodes::IndexNotFound, range.keyPattern.toString() );

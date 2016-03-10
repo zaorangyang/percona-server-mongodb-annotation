@@ -108,6 +108,9 @@ namespace repl {
         void setLastAppliedHash(long long oldH);
         void loadLastAppliedHash(OperationContext* txn);
 
+        // Clears any fetched and buffered oplog entries.
+        void clearBuffer();
+
         bool getInitialSyncRequestedFlag();
         void setInitialSyncRequestedFlag(bool value);
 
@@ -119,6 +122,9 @@ namespace repl {
             return _indexPrefetchConfig;
         }
 
+
+        // Testing related stuff
+        void pushTestOpToBuffer(const BSONObj& op);
     private:
         static BackgroundSync *s_instance;
         // protects creation of s_instance
@@ -131,6 +137,7 @@ namespace repl {
         // _mutex protects all of the class variables except _syncSourceReader and _buffer
         mutable boost::mutex _mutex;
 
+        // TODO(siyuan) Change to OpTime after adding term to oplogs.
         Timestamp _lastOpTimeFetched;
 
         // lastAppliedHash is used to generate a new hash for the following op, when primary.

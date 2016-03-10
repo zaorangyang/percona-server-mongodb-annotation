@@ -38,6 +38,7 @@
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/copydb.h"
@@ -50,6 +51,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/util/log.h"
 
@@ -84,6 +86,9 @@ namespace mongo {
             ActionSet actions;
             actions.addAction(ActionType::insert);
             actions.addAction(ActionType::createIndex); // SERVER-11418
+            if (shouldBypassDocumentValidationForCommand(cmdObj)) {
+                actions.addAction(ActionType::bypassDocumentValidation);
+            }
 
             if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forExactNamespace(NamespaceString(ns)), actions)) {
@@ -106,6 +111,10 @@ namespace mongo {
                          string& errmsg,
                          BSONObjBuilder& result) {
 
+            boost::optional<DisableDocumentValidation> maybeDisableValidation;
+            if (shouldBypassDocumentValidationForCommand(cmdObj))
+                maybeDisableValidation.emplace(txn);
+
             string fromhost = cmdObj.getStringField("from");
             if ( fromhost.empty() ) {
                 errmsg = "missing 'from' parameter";
@@ -121,10 +130,11 @@ namespace mongo {
             }
 
             string collection = parseNs(dbname, cmdObj);
-            if ( collection.empty() ) {
-                errmsg = "bad 'cloneCollection' value";
-                return false;
+            Status allowedWriteStatus = userAllowedWriteNS(dbname, collection);
+            if (!allowedWriteStatus.isOK()) {
+                return appendCommandStatus(result, allowedWriteStatus);
             }
+
             BSONObj query = cmdObj.getObjectField("query");
             if ( query.isEmpty() )
                 query = BSONObj();

@@ -125,17 +125,14 @@ namespace mongo {
 
         // Atomically returns *either* the chunk manager *or* the primary shard for the collection,
         // neither if the collection doesn't exist.
-        void getChunkManagerOrPrimary(const std::string& ns, boost::shared_ptr<ChunkManager>& manager, ShardPtr& primary);
+        void getChunkManagerOrPrimary(const std::string& ns,
+                                      boost::shared_ptr<ChunkManager>& manager,
+                                      boost::shared_ptr<Shard>& primary);
 
         boost::shared_ptr<ChunkManager> getChunkManager(const std::string& ns, bool reload = false, bool forceReload = false);
         boost::shared_ptr<ChunkManager> getChunkManagerIfExists(const std::string& ns, bool reload = false, bool forceReload = false);
 
         const Shard& getShard( const std::string& ns );
-        /**
-         * @return the correct for shard for the ns
-         * if the namespace is sharded, will return NULL
-         */
-        ShardPtr getShardIfExists( const std::string& ns );
 
         void setPrimary( const std::string& s );
 
@@ -214,13 +211,6 @@ namespace mongo {
         void replicaSetChange(const std::string& setName, const std::string& newConnectionString);
 
         static int VERSION;
-
-
-        /**
-         * check to see if all config servers have the same state
-         * will try tries time to make sure not catching in a bad state
-         */
-        bool checkConfigServersConsistent( std::string& errmsg , int tries = 4 ) const;
 
     private:
         std::string getHost( const std::string& name , bool withPort );

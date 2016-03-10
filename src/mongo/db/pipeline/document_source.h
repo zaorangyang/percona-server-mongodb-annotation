@@ -121,16 +121,17 @@ namespace mongo {
         virtual bool coalesce(const boost::intrusive_ptr<DocumentSource> &pNextSource);
 
         /**
-          Optimize the pipeline operation, if possible.  This is a local
-          optimization that only looks within this DocumentSource.  For best
-          results, first coalesce compatible sources using coalesce().
-
-          This is intended for any operations that include expressions, and
-          provides a hook for those to optimize those operations.
-
-          The default implementation is to do nothing.
+         * Returns an optimized DocumentSource that is semantically equivalent to this one, or
+         * nullptr if this stage is a no-op. Implementations are allowed to modify themselves
+         * in-place and return a pointer to themselves. For best results, first coalesce compatible
+         * sources using coalesce().
+         *
+         * This is intended for any operations that include expressions, and provides a hook for
+         * those to optimize those operations.
+         *
+         * The default implementation is to do nothing and return yourself.
          */
-        virtual void optimize();
+        virtual boost::intrusive_ptr<DocumentSource> optimize();
 
         enum GetDepsReturn {
             NOT_SUPPORTED = 0x0, // The full object and all metadata may be required
@@ -232,6 +233,11 @@ namespace mongo {
 
             virtual bool isCapped(const NamespaceString& ns) = 0;
 
+            /**
+             * Inserts 'objs' into 'ns' and returns the "detailed" last error object.
+             */
+            virtual BSONObj insert(const NamespaceString& ns, const std::vector<BSONObj>& objs) = 0;
+
             // Add new methods as needed.
         };
 
@@ -284,7 +290,7 @@ namespace mongo {
         BSONObjIterator arrayIterator;
     };
 
-    
+
     class DocumentSourceCommandShards :
         public DocumentSource {
     public:
@@ -434,17 +440,11 @@ namespace mongo {
         // virtuals from DocumentSource
         virtual boost::optional<Document> getNext();
         virtual const char *getSourceName() const;
-        virtual void optimize();
+        virtual boost::intrusive_ptr<DocumentSource> optimize();
         virtual GetDepsReturn getDependencies(DepsTracker* deps) const;
         virtual void dispose();
         virtual Value serialize(bool explain = false) const;
 
-        /**
-          Create a new grouping DocumentSource.
-          
-          @param pExpCtx the expression context for the pipeline
-          @returns the DocumentSource
-         */
         static boost::intrusive_ptr<DocumentSourceGroup> create(
             const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
@@ -572,6 +572,7 @@ namespace mongo {
         virtual const char *getSourceName() const;
         virtual bool coalesce(const boost::intrusive_ptr<DocumentSource>& nextSource);
         virtual Value serialize(bool explain = false) const;
+        virtual boost::intrusive_ptr<DocumentSource> optimize();
         virtual void setSource(DocumentSource* Source);
 
         /**
@@ -715,7 +716,7 @@ namespace mongo {
         // Sets _tempsNs and prepares it to receive data.
         void prepTempCollection();
 
-        void spill(DBClientBase* conn, const std::vector<BSONObj>& toInsert);
+        void spill(const std::vector<BSONObj>& toInsert);
 
         bool _done;
 
@@ -723,13 +724,13 @@ namespace mongo {
         const NamespaceString _outputNs; // output will go here after all data is processed.
     };
 
-    
+
     class DocumentSourceProject : public DocumentSource {
     public:
         // virtuals from DocumentSource
         virtual boost::optional<Document> getNext();
         virtual const char *getSourceName() const;
-        virtual void optimize();
+        virtual boost::intrusive_ptr<DocumentSource> optimize();
         virtual Value serialize(bool explain = false) const;
 
         virtual GetDepsReturn getDependencies(DepsTracker* deps) const;
@@ -768,7 +769,7 @@ namespace mongo {
     public:
         virtual boost::optional<Document> getNext();
         virtual const char* getSourceName() const;
-        virtual void optimize();
+        virtual boost::intrusive_ptr<DocumentSource> optimize();
 
         static const char redactName[];
 
@@ -970,6 +971,7 @@ namespace mongo {
         virtual const char *getSourceName() const;
         virtual bool coalesce(const boost::intrusive_ptr<DocumentSource> &pNextSource);
         virtual Value serialize(bool explain = false) const;
+        virtual boost::intrusive_ptr<DocumentSource> optimize();
 
         virtual GetDepsReturn getDependencies(DepsTracker* deps) const {
             return SEE_NEXT; // This doesn't affect needed fields

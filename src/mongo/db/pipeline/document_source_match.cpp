@@ -53,6 +53,10 @@ namespace mongo {
         return Value(DOC(getSourceName() << Document(getQuery())));
     }
 
+    intrusive_ptr<DocumentSource> DocumentSourceMatch::optimize() {
+        return getQuery().isEmpty() ? nullptr : this;
+    }
+
     boost::optional<Document> DocumentSourceMatch::getNext() {
         pExpCtx->checkForInterrupt();
 
@@ -193,7 +197,7 @@ namespace {
                     }
                 }
                 if (!matches.empty())
-                    output[field.fieldNameStringData()] = Value::consume(matches);
+                    output[field.fieldNameStringData()] = Value(std::move(matches));
 
                 break;
             }
@@ -249,7 +253,7 @@ namespace {
                     }
 
                     if (!okClauses.empty())
-                        output["$or"] = Value::consume(okClauses);
+                        output["$or"] = Value(std::move(okClauses));
                 }
                 else if (str::equals(field.fieldName(), "$and")) {
                     // $and can include subset of elements (like $all).
@@ -260,7 +264,7 @@ namespace {
                             okClauses.push_back(Value(clause));
                     }
                     if (!okClauses.empty())
-                        output["$and"] = Value::consume(okClauses);
+                        output["$and"] = Value(std::move(okClauses));
                 }
 
                 continue;

@@ -34,6 +34,7 @@
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/accumulator.h"
@@ -159,6 +160,11 @@ namespace mongo {
                                       << typeName(cmdElement.type()),
                         cmdElement.type() == Bool);
                 pCtx->extSortAllowed = cmdElement.Bool();
+                continue;
+            }
+
+            if (pFieldName == bypassDocumentValidationCommandOption()) {
+                pCtx->bypassDocumentValidation = cmdElement.trueValue();
                 continue;
             }
 
@@ -305,9 +311,13 @@ namespace mongo {
 
     void Pipeline::Optimizations::Local::optimizeEachDocumentSource(Pipeline* pipeline) {
         SourceContainer& sources = pipeline->sources;
+        SourceContainer newSources;
         for (SourceContainer::iterator it(sources.begin()); it != sources.end(); ++it) {
-            (*it)->optimize();
+            if (auto out = (*it)->optimize()) {
+                newSources.push_back(std::move(out));
+            }
         }
+        pipeline->sources = std::move(newSources);
     }
 
     void Pipeline::Optimizations::Local::duplicateMatchBeforeInitalRedact(Pipeline* pipeline) {
@@ -349,6 +359,10 @@ namespace mongo {
                 ActionSet actions;
                 actions.addAction(ActionType::remove);
                 actions.addAction(ActionType::insert);
+                if (shouldBypassDocumentValidationForCommand(cmdObj)) {
+                    actions.addAction(ActionType::bypassDocumentValidation);
+                }
+
                 out->push_back(Privilege(ResourcePattern::forExactNamespace(outputNs), actions));
             }
         }
@@ -477,6 +491,10 @@ namespace mongo {
             serialized.setField("allowDiskUse", Value(true));
         }
 
+        if (pCtx->bypassDocumentValidation) {
+            serialized.setField(bypassDocumentValidationCommandOption(), Value(true));
+        }
+
         return serialized.freeze();
     }
 
@@ -530,19 +548,6 @@ namespace mongo {
 
     void Pipeline::addInitialSource(intrusive_ptr<DocumentSource> source) {
         sources.push_front(source);
-    }
-
-    bool Pipeline::canRunInMongos() const {
-        if (pCtx->extSortAllowed)
-            return false;
-
-        if (explain)
-            return false;
-
-        if (!sources.empty() && dynamic_cast<DocumentSourceNeedsMongod*>(sources.back().get()))
-            return false;
-
-        return true;
     }
 
     DepsTracker Pipeline::getDependencies(const BSONObj& initialQuery) const {

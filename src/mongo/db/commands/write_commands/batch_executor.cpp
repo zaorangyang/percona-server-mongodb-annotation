@@ -38,6 +38,7 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -354,8 +355,8 @@ namespace mongo {
             repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
             const repl::ReplicationCoordinator::Mode replMode = replCoord->getReplicationMode();
             if (replMode != repl::ReplicationCoordinator::modeNone) {
-                response->setLastOp(
-                        repl::ReplClientInfo::forClient(_txn->getClient()).getLastOp());
+                response->setLastOp(repl::ReplClientInfo::forClient(_txn->getClient()).getLastOp()
+                        .getTimestamp());
                 if (replMode == repl::ReplicationCoordinator::modeReplSet) {
                     response->setElectionId(replCoord->getElectionId());
                 }
@@ -550,8 +551,10 @@ namespace mongo {
 
         if ( currWrite.getOpType() == BatchedCommandRequest::BatchType_Insert ) {
             _stats->numInserted += stats.n;
-            _le->nObjects = stats.n;
             currentOp->debug().ninserted += stats.n;
+            if (!error) {
+                _le->recordInsert(stats.n);
+            }
         }
         else if ( currWrite.getOpType() == BatchedCommandRequest::BatchType_Update ) {
             if ( stats.upsertedID.isEmpty() ) {
@@ -562,7 +565,7 @@ namespace mongo {
                 ++_stats->numUpserted;
             }
 
-            if ( !error ) {
+            if (!error) {
                 _le->recordUpdate( stats.upsertedID.isEmpty() && stats.n > 0,
                         stats.n,
                         stats.upsertedID );
@@ -577,8 +580,8 @@ namespace mongo {
             currentOp->debug().ndeleted += stats.n;
         }
 
-        if (error && !_le->disabled) {
-            _le->raiseError(error->getErrCode(), error->getErrMessage().c_str());
+        if (error) {
+            _le->setLastError(error->getErrCode(), error->getErrMessage().c_str());
         }
     }
 
@@ -732,33 +735,18 @@ namespace mongo {
     void WriteBatchExecutor::bulkExecute( const BatchedCommandRequest& request,
                                           std::vector<BatchedUpsertDetail*>* upsertedIds,
                                           std::vector<WriteErrorDetail*>* errors ) {
-
-        WriteConcernOptions originalWC = _txn->getWriteConcern();
-
-        // We adjust the write concern attached to the OperationContext to not wait for
-        // journal.  Later, the code will restore the write concern to wait for journal on
-        // the last write of the batch.
-        if (request.sizeWriteOps() > 1
-            && originalWC.syncMode == WriteConcernOptions::JOURNAL)
-        {
-            WriteConcernOptions writeConcern = originalWC;
-            writeConcern.syncMode = WriteConcernOptions::NONE;
-            _txn->setWriteConcern(writeConcern);
+        boost::optional<DisableDocumentValidation> maybeDisableValidation;
+        if (request.shouldBypassValidation()) {
+            maybeDisableValidation.emplace(_txn);
         }
 
         if ( request.getBatchType() == BatchedCommandRequest::BatchType_Insert ) {
-            execInserts( request, originalWC, errors );
+            execInserts( request, errors );
         }
         else if ( request.getBatchType() == BatchedCommandRequest::BatchType_Update ) {
             for ( size_t i = 0; i < request.sizeWriteOps(); i++ ) {
 
                 if ( i + 1 == request.sizeWriteOps() ) {
-                    // For the last write in the batch, restore the write concern back to the
-                    // original provided one; this may set WriteConcernOptions::JOURNAL back
-                    // to true.
-                    _txn->setWriteConcern(originalWC);
-                    // Use the original write concern to possibly await the commit of this write,
-                    // in order to flush the journal as requested.
                     setupSynchronousCommit( _txn );
                 }
 
@@ -785,12 +773,6 @@ namespace mongo {
             for ( size_t i = 0; i < request.sizeWriteOps(); i++ ) {
 
                 if ( i + 1 == request.sizeWriteOps() ) {
-                    // For the last write in the batch, restore the write concern back to the
-                    // original provided one; this may set WriteConcernOptions::JOURNAL back
-                    // to true.
-                    _txn->setWriteConcern(originalWC);
-                    // Use the original write concern to possibly await the commit of this write,
-                    // in order to flush the journal as requested.
                     setupSynchronousCommit( _txn );
                 }
 
@@ -835,7 +817,6 @@ namespace mongo {
     }
 
     void WriteBatchExecutor::execInserts( const BatchedCommandRequest& request,
-                                          const WriteConcernOptions& originalWC,
                                           std::vector<WriteErrorDetail*>* errors ) {
 
         // Theory of operation:
@@ -880,12 +861,6 @@ namespace mongo {
              ++state.currIndex) {
 
             if (state.currIndex + 1 == state.request->sizeWriteOps()) {
-                // For the last write in the batch, restore the write concern back to the
-                // original provided one; this may set WriteConcernOptions::JOURNAL back
-                // to true.
-                _txn->setWriteConcern(originalWC);
-                // Use the original write concern to possibly await the commit of this write,
-                // in order to flush the journal as requested.
                 setupSynchronousCommit(_txn);
             }
 
@@ -899,7 +874,7 @@ namespace mongo {
                     state.unlock();
 
                     // This releases any storage engine held locks/snapshots.
-                    _txn->recoveryUnit()->commitAndRestart();
+                    _txn->recoveryUnit()->abandonSnapshot();
                 }
 
                 _txn->checkForInterrupt();
@@ -952,7 +927,7 @@ namespace mongo {
         finishCurrentOp( _txn, &currentOp, result.getError() );
 
         // End current transaction and release snapshot.
-        _txn->recoveryUnit()->commitAndRestart();
+        _txn->recoveryUnit()->abandonSnapshot();
 
         if ( result.getError() ) {
             result.getError()->setIndex( updateItem.getItemIndex() );
@@ -993,7 +968,7 @@ namespace mongo {
         finishCurrentOp( _txn, &currentOp, result.getError() );
 
         // End current transaction and release snapshot.
-        _txn->recoveryUnit()->commitAndRestart();
+        _txn->recoveryUnit()->abandonSnapshot();
 
         if ( result.getError() ) {
             result.getError()->setIndex( removeItem.getItemIndex() );
@@ -1128,7 +1103,7 @@ namespace mongo {
             catch ( const WriteConflictException& wce ) {
                 state->unlock();
                 state->txn->getCurOp()->debug().writeConflicts++;
-                state->txn->recoveryUnit()->commitAndRestart();
+                state->txn->recoveryUnit()->abandonSnapshot();
                 WriteConflictException::logAndBackoff( attempt++,
                                                        "insert",
                                                        state->getCollection() ?
@@ -1154,7 +1129,7 @@ namespace mongo {
 
         // Errors release the write lock, as a matter of policy.
         if (result->getError()) {
-            state->txn->recoveryUnit()->commitAndRestart();
+            state->txn->recoveryUnit()->abandonSnapshot();
             state->unlock();
         }
     }
@@ -1391,7 +1366,7 @@ namespace mongo {
                 createCollection = false;
                 // RESTART LOOP
                 fakeLoop = -1;
-                txn->recoveryUnit()->commitAndRestart();
+                txn->recoveryUnit()->abandonSnapshot();
 
                 WriteConflictException::logAndBackoff( attempt++, "update", nsString.ns() );
             }
