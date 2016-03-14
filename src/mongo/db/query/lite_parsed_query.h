@@ -29,6 +29,7 @@
 #pragma once
 
 #include <algorithm>
+#include <boost/optional.hpp>
 
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/jsobj.h"
@@ -117,12 +118,14 @@ namespace mongo {
         const BSONObj& getSort() const { return _sort; }
         const BSONObj& getHint() const { return _hint; }
 
+        static const int kDefaultBatchSize;
+
         int getSkip() const { return _skip; }
-        int getLimit() const { return _limit; }
-        int getBatchSize() const { return _batchSize; }
-        int getNumToReturn() const { return std::min(_limit, _batchSize); }
+        boost::optional<int> getLimit() const { return _limit; }
+        boost::optional<int> getBatchSize() const { return _batchSize; }
         bool wantMore() const { return _wantMore; }
 
+        bool fromFindCommand() const { return _fromCommand; }
         bool isExplain() const { return _explain; }
 
         const std::string& getComment() const { return _comment; }
@@ -182,7 +185,7 @@ namespace mongo {
                            LiteParsedQuery** out);
 
     private:
-        LiteParsedQuery();
+        LiteParsedQuery() = default;
 
         /**
          * Parsing code calls this after construction of the LPQ is complete. There are additional
@@ -224,34 +227,36 @@ namespace mongo {
         // {$hint: <String>}, where <String> is the index name hinted.
         BSONObj _hint;
 
-        int _skip;
-        int _limit;
-        int _batchSize;
-        bool _wantMore;
+        int _skip = 0;
+        bool _wantMore = true;
 
-        bool _explain;
+        boost::optional<int> _limit;
+        boost::optional<int> _batchSize;
+
+        bool _fromCommand = false;
+        bool _explain = false;
 
         std::string _comment;
 
-        int _maxScan;
-        int _maxTimeMS;
+        int _maxScan = 0;
+        int _maxTimeMS = 0;
 
         BSONObj _min;
         BSONObj _max;
 
-        bool _returnKey;
-        bool _showRecordId;
-        bool _snapshot;
-        bool _hasReadPref;
+        bool _returnKey = false;
+        bool _showRecordId = false;
+        bool _snapshot = false;
+        bool _hasReadPref = false;
 
         // Options that can be specified in the OP_QUERY 'flags' header.
-        bool _tailable;
-        bool _slaveOk;
-        bool _oplogReplay;
-        bool _noCursorTimeout;
-        bool _awaitData;
-        bool _exhaust;
-        bool _partial;
+        bool _tailable = false;
+        bool _slaveOk = false;
+        bool _oplogReplay = false;
+        bool _noCursorTimeout = false;
+        bool _awaitData = false;
+        bool _exhaust = false;
+        bool _partial = false;
     };
 
 } // namespace mongo

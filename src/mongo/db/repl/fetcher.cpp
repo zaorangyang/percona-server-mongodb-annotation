@@ -30,8 +30,6 @@
 
 #include "mongo/db/repl/fetcher.h"
 
-#include <boost/thread/lock_guard.hpp>
-
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/replication_executor.h"
@@ -58,11 +56,9 @@ namespace {
      */
     Status parseCursorResponse(const BSONObj& obj,
                                const std::string& batchFieldName,
-                               Fetcher::BatchData* batchData,
-                               NamespaceString* nss) {
+                               Fetcher::BatchData* batchData) {
         invariant(batchFieldName == kFirstBatchFieldName || batchFieldName == kNextBatchFieldName);
         invariant(batchData);
-        invariant(nss);
 
         BSONElement cursorElement = obj.getField(kCursorFieldName);
         if (cursorElement.eoo()) {
@@ -82,10 +78,12 @@ namespace {
                           "cursor response must contain '" << kCursorFieldName << "." <<
                           kCursorIdFieldName << "' field: " << obj);
         }
-        if (cursorIdElement.type() != mongo::NumberLong) {
+        if (!(cursorIdElement.type() == mongo::NumberLong ||
+                cursorIdElement.type() == mongo::NumberInt)) {
             return Status(ErrorCodes::FailedToParse, str::stream() <<
                           "'" << kCursorFieldName << "." << kCursorIdFieldName <<
-                          "' field must be a number of type 'long': " << obj);
+                          "' field must be a integral number of type 'int' or 'long' but was a '"
+                          << typeName(cursorIdElement.type()) << "': " << obj);
         }
         batchData->cursorId = cursorIdElement.numberLong();
 
@@ -107,7 +105,7 @@ namespace {
                           "'" << kCursorFieldName << "." << kNamespaceFieldName <<
                           "' contains an invalid namespace: " << obj);
         }
-        *nss = tempNss;
+        batchData->nss = tempNss;
 
         BSONElement batchElement = cursorObj.getField(batchFieldName);
         if (batchElement.eoo()) {
@@ -134,12 +132,17 @@ namespace {
         return Status::OK();
     }
 
+    Status parseReplResponse(const BSONObj& obj) {
+        return Status::OK();
+    }
+    
 } // namespace
 
-    Fetcher::BatchData::BatchData() : cursorId(0), documents() { }
-
-    Fetcher::BatchData::BatchData(CursorId theCursorId, Documents theDocuments)
+    Fetcher::BatchData::BatchData(CursorId theCursorId,
+                                  const NamespaceString& theNss,
+                                  Documents theDocuments)
         : cursorId(theCursorId),
+          nss(theNss),
           documents(theDocuments) { }
 
     Fetcher::Fetcher(ReplicationExecutor* executor,
@@ -161,10 +164,15 @@ namespace {
         uassert(ErrorCodes::BadValue, "callback function cannot be null", work);
     }
 
-    Fetcher::~Fetcher() { }
+    Fetcher::~Fetcher() {
+        DESTRUCTOR_GUARD(
+            cancel();
+            wait();
+        );
+    }
 
     std::string Fetcher::getDiagnosticString() const {
-        boost::lock_guard<boost::mutex> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         str::stream output;
         output << "Fetcher";
         output << " executor: " << _executor->getDiagnosticString();
@@ -176,19 +184,22 @@ namespace {
     }
 
     bool Fetcher::isActive() const {
-        boost::lock_guard<boost::mutex> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         return _active;
     }
 
     Status Fetcher::schedule() {
-        boost::lock_guard<boost::mutex> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        if (_active) {
+            return Status(ErrorCodes::IllegalOperation, "fetcher already scheduled");
+        }
         return _schedule_inlock(_cmdObj, kFirstBatchFieldName);
     }
 
     void Fetcher::cancel() {
         ReplicationExecutor::CallbackHandle remoteCommandCallbackHandle;
         {
-            boost::lock_guard<boost::mutex> lk(_mutex);
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
 
             if (!_active) {
                 return;
@@ -202,26 +213,11 @@ namespace {
     }
 
     void Fetcher::wait() {
-        ReplicationExecutor::CallbackHandle remoteCommandCallbackHandle;
-        {
-            boost::lock_guard<boost::mutex> lk(_mutex);
-
-            if (!_active) {
-                return;
-            }
-
-            remoteCommandCallbackHandle = _remoteCommandCallbackHandle;
-        }
-
-        invariant(remoteCommandCallbackHandle.isValid());
-        _executor->wait(remoteCommandCallbackHandle);
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        _condition.wait(lk, [this]() { return !_active; });
     }
 
     Status Fetcher::_schedule_inlock(const BSONObj& cmdObj, const char* batchFieldName) {
-        if (_active) {
-            return Status(ErrorCodes::IllegalOperation, "fetcher already scheduled");
-        }
-
         StatusWith<ReplicationExecutor::CallbackHandle> scheduleResult =
             _executor->scheduleRemoteCommand(
                 RemoteCommandRequest(_source, _dbname, cmdObj),
@@ -238,55 +234,68 @@ namespace {
 
     void Fetcher::_callback(const ReplicationExecutor::RemoteCommandCallbackData& rcbd,
                             const char* batchFieldName) {
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        _active = false;
+
+        if (!rcbd.response.isOK()) {
+            _work(StatusWith<Fetcher::BatchData>(rcbd.response.getStatus()), nullptr, nullptr);
+            _finishCallback();
+            return;
+        }
+
+        const BSONObj& queryResponseObj = rcbd.response.getValue().data;
+        Status status = getStatusFromCommandResult(queryResponseObj);
+        if (!status.isOK()) {
+            _work(StatusWith<Fetcher::BatchData>(status), nullptr, nullptr);
+            _finishCallback();
+            return;
+        }
+
+        status = parseReplResponse(queryResponseObj);
+        if (!status.isOK()) {
+            _work(StatusWith<Fetcher::BatchData>(status), nullptr, nullptr);
+            _finishCallback();
+            return;
+        }
+
+        BatchData batchData;
+        status = parseCursorResponse(queryResponseObj, batchFieldName, &batchData);
+        if (!status.isOK()) {
+            _work(StatusWith<Fetcher::BatchData>(status), nullptr, nullptr);
+            _finishCallback();
+            return;
+        }
 
         NextAction nextAction = NextAction::kNoAction;
 
-        if (!rcbd.response.isOK()) {
-            _work(StatusWith<Fetcher::BatchData>(rcbd.response.getStatus()), &nextAction);
-            return;
-        }
-
-        const BSONObj& cursorReponseObj = rcbd.response.getValue().data;
-        Status status = getStatusFromCommandResult(cursorReponseObj);
-        if (!status.isOK()) {
-            _work(StatusWith<Fetcher::BatchData>(status), &nextAction);
-            return;
-        }
-
-
-        BatchData batchData;
-        NamespaceString nss;
-        status = parseCursorResponse(cursorReponseObj, batchFieldName, &batchData, &nss);
-        if (!status.isOK()) {
-            _work(StatusWith<Fetcher::BatchData>(status), &nextAction);
-            return;
-        }
-
         if (batchData.cursorId) {
-            nextAction = NextAction::kContinue;
+            nextAction = NextAction::kGetMore;
         }
 
-        _work(StatusWith<BatchData>(batchData), &nextAction);
+        BSONObjBuilder bob;
+        _work(StatusWith<BatchData>(batchData), &nextAction, &bob);
 
         // Callback function _work may modify nextAction to request the fetcher
         // not to schedule a getMore command.
-        if (nextAction != NextAction::kContinue) {
+        if (!batchData.cursorId || nextAction != NextAction::kGetMore) {
+            _finishCallback();
             return;
         }
 
-        nextAction = NextAction::kNoAction;
-
-        if (batchData.cursorId) {
-            BSONObj getMoreCmdObj = BSON("getMore" << batchData.cursorId <<
-                                         "collection" << nss.coll());
-            status = _schedule_inlock(getMoreCmdObj, kNextBatchFieldName);
-            if (!status.isOK()) {
-                _work(StatusWith<Fetcher::BatchData>(status), &nextAction);
-                return;
-            }
+        {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            status = _schedule_inlock(bob.obj(), kNextBatchFieldName);
         }
+        if (!status.isOK()) {
+            nextAction = NextAction::kNoAction;
+            _work(StatusWith<Fetcher::BatchData>(status), nullptr, nullptr);
+            _finishCallback();
+            return;
+        }
+    }
+
+    void Fetcher::_finishCallback() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _active = false;
+        _condition.notify_all();
     }
 
 } // namespace repl

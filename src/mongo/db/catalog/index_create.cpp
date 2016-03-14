@@ -42,12 +42,14 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/progress_meter.h"
@@ -222,25 +224,14 @@ namespace mongo {
         return Status::OK();
     }
 
-    IndexDescriptor* MultiIndexBlock::registerIndexBuild() {
-        // Register background index build so that it can be found and killed when necessary
-        invariant(_collection);
-        invariant(_indexes.size() == 1);
-        invariant(_buildInBackground);
-        IndexDescriptor* descriptor = _indexes[0].block->getEntry()->descriptor();
-        _collection->getIndexCatalog()->registerIndexBuild(descriptor, _txn->getCurOp()->opNum());
-        return descriptor;
-    }
-
-    void MultiIndexBlock::unregisterIndexBuild(IndexDescriptor* descriptor) {
-        _collection->getIndexCatalog()->unregisterIndexBuild(descriptor);
-    }
-
     Status MultiIndexBlock::insertAllDocumentsInCollection(std::set<RecordId>* dupsOut) {
         const char* curopMessage = _buildInBackground ? "Index Build (background)" : "Index Build";
-        ProgressMeterHolder progress(*_txn->setMessage(curopMessage,
-                                                       curopMessage,
-                                                       _collection->numRecords(_txn)));
+        const auto numRecords = _collection->numRecords(_txn);
+        stdx::unique_lock<Client> lk(*_txn->getClient());
+        ProgressMeterHolder progress(*_txn->setMessage_inlock(curopMessage,
+                                                              curopMessage,
+                                                              numRecords));
+        lk.unlock();
 
         Timer t;
 
@@ -300,7 +291,7 @@ namespace mongo {
                 retries = 0;
             }
             catch (const WriteConflictException& wce) {
-                _txn->getCurOp()->debug().writeConflicts++;
+                CurOp::get(_txn)->debug().writeConflicts++;
                 retries++; // logAndBackoff expects this to be 1 on first call.
                 wce.logAndBackoff(retries, "index creation", _collection->ns().ns());
 

@@ -34,7 +34,7 @@
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/s/catalog/catalog_manager.h"
 
 namespace mongo {
@@ -57,12 +57,19 @@ namespace mongo {
         Status init(const ConnectionString& configCS);
 
         /**
+         * Updates the config server's metadata to the current version.
+         */
+        Status checkAndUpgradeConfigMetadata(bool doUpgrade);
+
+        /**
          * Starts the thread that periodically checks data consistency amongst the config servers.
          * Note: this is not thread safe and can only be called once for the lifetime.
          */
         Status startConfigServerChecker();
 
-        virtual void shutDown() override;
+        ConnectionString connectionString() const final;
+
+        void shutDown() final;
 
         virtual Status enableSharding(const std::string& dbName);
 
@@ -79,7 +86,7 @@ namespace mongo {
         virtual StatusWith<ShardDrainingStatus> removeShard(OperationContext* txn,
                                                             const std::string& name);
 
-        virtual Status createDatabase(const std::string& dbName, const Shard* shard);
+        virtual Status createDatabase(const std::string& dbName);
 
         virtual Status updateDatabase(const std::string& dbName, const DatabaseType& db);
 
@@ -94,12 +101,18 @@ namespace mongo {
 
         virtual Status dropCollection(const std::string& collectionNs);
 
-        virtual void getDatabasesForShard(const std::string& shardName,
-                                          std::vector<std::string>* dbs);
+        Status getDatabasesForShard(const std::string& shardName,
+                                    std::vector<std::string>* dbs) final;
 
         virtual Status getChunks(const Query& query,
                                  int nToReturn,
                                  std::vector<ChunkType>* chunks);
+
+        Status getTagsForCollection(const std::string& collectionNs,
+                                    std::vector<TagsType>* tags) final;
+
+        StatusWith<std::string> getTagForChunk(const std::string& collectionNs,
+                                               const ChunkType& chunk) final;
 
         virtual Status getAllShards(std::vector<ShardType>* shards);
 

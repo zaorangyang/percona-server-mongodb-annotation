@@ -2,8 +2,9 @@
 
 # This SConscript describes build rules for the "mongo" project.
 
-import os
 import itertools
+import os
+import re
 import subprocess
 import sys
 from buildscripts import utils
@@ -29,6 +30,7 @@ env.SConscript(
         'crypto',
         'db',
         'dbtests',
+        'executor',
         'installer',
         'logger',
         'platform',
@@ -86,11 +88,44 @@ if env.TargetOSIs('windows'):
 
 module_list = '{ %s }' % ', '.join([ '"{0}"'.format(x) for x in env['MONGO_MODULES'] ])
 
+# This generates a numeric representation of the version string so that
+# you can easily compare versions of MongoDB without having to parse
+# the version string.
+#
+# The rules for this are
+# {major}{minor}{release}{pre/rc/final}
+# If the version is pre-release and not an rc, the final number is 0
+# If the version is an RC, the final number of 1 + rc number
+# If the version is pre-release between RC's, the final number is 1 + rc number
+# If the version is a final release, the final number is 99
+#
+# Examples:
+# 3.1.1-123     = 3010100
+# 3.1.1-rc2     = 3010103
+# 3.1.1-rc2-123 = 3010103
+# 3.1.1         = 3010199
+#
+version_parts = [ x for x in re.match(r'^(\d+)\.(\d+)\.(\d+)-?((?:(rc)(\d+))?.*)?',
+    env['MONGO_VERSION']).groups() ]
+version_extra = version_parts[3] if version_parts[3] else ""
+if version_parts[4] == 'rc':
+    version_parts[3] = int(version_parts[5]) + -50
+elif version_parts[3]:
+    version_parts[3] = -100
+else:
+    version_parts[3] = 0
+version_parts = [ int(x) for x in version_parts[:4]]
+
 versionInfo = env.Substfile(
     'util/version.cpp.in',
     SUBST_DICT=[
-        ('@mongo_code_version@', env['MONGO_CODE_VERSION']),
-        ('@buildinfo_git_version@', env['MONGO_GIT_VERSION']),
+        ('@mongo_version@', env['MONGO_VERSION']),
+        ('@mongo_version_major@', version_parts[0]),
+        ('@mongo_version_minor@', version_parts[1]),
+        ('@mongo_version_patch@', version_parts[2]),
+        ('@mongo_version_extra@', version_parts[3]),
+        ('@mongo_version_extra_str@', version_extra),
+        ('@mongo_git_hash@', env['MONGO_GIT_HASH']),
         ('@buildinfo_js_engine@', js_engine_ver),
         ('@buildinfo_allocator@', GetOption('allocator')),
         ('@buildinfo_ccflags@', env['CCFLAGS']),
@@ -111,13 +146,13 @@ config_header_substs = (
     ('@mongo_config_have___declspec_thread@', 'MONGO_CONFIG_HAVE___DECLSPEC_THREAD'),
     ('@mongo_config_have___thread@', 'MONGO_CONFIG_HAVE___THREAD'),
     ('@mongo_config_have_execinfo_backtrace@', 'MONGO_CONFIG_HAVE_EXECINFO_BACKTRACE'),
+    ('@mongo_config_have_fips_mode_set@', 'MONGO_CONFIG_HAVE_FIPS_MODE_SET'),
     ('@mongo_config_have_header_unistd_h@', 'MONGO_CONFIG_HAVE_HEADER_UNISTD_H'),
     ('@mongo_config_have_posix_monotonic_clock@', 'MONGO_CONFIG_HAVE_POSIX_MONOTONIC_CLOCK'),
     ('@mongo_config_have_std_is_trivially_copyable@', 'MONGO_CONFIG_HAVE_STD_IS_TRIVIALLY_COPYABLE'),
     ('@mongo_config_have_std_make_unique@', 'MONGO_CONFIG_HAVE_STD_MAKE_UNIQUE'),
     ('@mongo_config_optimized_build@', 'MONGO_CONFIG_OPTIMIZED_BUILD'),
     ('@mongo_config_ssl@', 'MONGO_CONFIG_SSL'),
-    ('@mongo_config_ssl_fips@', 'MONGO_CONFIG_SSL_FIPS'),
     ('@mongo_config_use_gdbserver@', 'MONGO_CONFIG_USE_GDBSERVER'),
 )
 
@@ -142,12 +177,6 @@ env.Library('version',
                 '$BUILD_DIR/mongo/base/base'
             ])
 
-env.CppUnitTest(
-    target="util/version_test",
-    source=["util/version_test.cpp"],
-    LIBDEPS=[]
-)
-
 mongod = env.Program(
     target="mongod",
     source=[
@@ -161,6 +190,7 @@ mongod = env.Program(
         "db/mongodandmongos",
         "db/mongodwebserver",
         "db/serveronly",
+        "db/repl/storage_interface_impl",
         "util/ntservice",
     ],
 )
@@ -179,9 +209,9 @@ env.Install(
                         "client/examples/mongoperf.cpp",
                     ],
                     LIBDEPS=[
-                        "util/ntservice_mock",
-                        "db/serveronly",
                         "db/coredb",
+                        "db/serveronly",
+                        "util/ntservice_mock",
                         "util/signal_handlers_synchronous",
                     ]),
     ])

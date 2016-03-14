@@ -64,6 +64,12 @@ namespace repl {
     }
 
     ReplicationCoordinator::Mode ReplicationCoordinatorMock::getReplicationMode() const {
+        if (_settings.usingReplSets()) {
+            return modeReplSet;
+        }
+        if (_settings.master || _settings.slave) {
+            return modeMasterSlave;
+        }
         return modeNone;
     }
 
@@ -83,7 +89,7 @@ namespace repl {
     void ReplicationCoordinatorMock::clearSyncSourceBlacklist() {}
 
     ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorMock::awaitReplication(
-            const OperationContext* txn,
+            OperationContext* txn,
             const OpTime& opTime,
             const WriteConcernOptions& writeConcern) {
         // TODO
@@ -92,7 +98,7 @@ namespace repl {
 
     ReplicationCoordinator::StatusAndDuration
             ReplicationCoordinatorMock::awaitReplicationOfLastOpForClient(
-                    const OperationContext* txn,
+                    OperationContext* txn,
                     const WriteConcernOptions& writeConcern) {
         return StatusAndDuration(Status::OK(), Milliseconds(0));
     }
@@ -144,7 +150,7 @@ namespace repl {
     }
 
     ReadAfterOpTimeResponse ReplicationCoordinatorMock::waitUntilOpTime(
-            const OperationContext* txn,
+            OperationContext* txn,
             const ReadAfterOpTimeArgs& settings) {
         return ReadAfterOpTimeResponse();
     }
@@ -324,7 +330,7 @@ namespace repl {
     void ReplicationCoordinatorMock::prepareCursorResponseInfo(BSONObjBuilder* objBuilder) {}
 
     Status ReplicationCoordinatorMock::processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
-                                                          ReplSetHeartbeatResponseV1* response) {
+                                                          ReplSetHeartbeatResponse* response) {
         return Status::OK();
     }
 
@@ -333,6 +339,10 @@ namespace repl {
     }
 
     void ReplicationCoordinatorMock::summarizeAsHtml(ReplSetHtmlSummary* output) {}
+
+    long long ReplicationCoordinatorMock::getTerm() { return OpTime::kDefaultTerm; }
+
+    bool ReplicationCoordinatorMock::updateTerm(long long term) { return false; }
 
 } // namespace repl
 } // namespace mongo

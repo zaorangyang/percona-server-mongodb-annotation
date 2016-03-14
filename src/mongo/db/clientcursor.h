@@ -30,26 +30,18 @@
 
 #include <boost/noncopyable.hpp>
 #include <boost/scoped_ptr.hpp>
-#include <boost/thread/recursive_mutex.hpp>
 
 #include "mongo/db/jsobj.h"
-#include "mongo/db/keypattern.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
 #include "mongo/s/collection_metadata.h"
-#include "mongo/util/background.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
 
-    typedef boost::lock_guard<boost::recursive_mutex> recursive_scoped_lock;
     class ClientCursor;
     class Collection;
-    class CurOp;
     class CursorManager;
-    class Database;
-    class NamespaceDetails;
-    class ParsedQuery;
     class RecoveryUnit;
 
     typedef long long CursorId; /* passed to the client so it can send back on getMore */
@@ -148,6 +140,7 @@ namespace mongo {
 
         PlanExecutor* getExecutor() const { return _exec.get(); }
         int queryOptions() const { return _queryOptions; }
+        const BSONObj& getQuery() const { return _query; }
 
         // Used by ops/query.cpp to stash how many results have been returned by a query.
         int pos() const { return _pos; }
@@ -230,7 +223,9 @@ namespace mongo {
         // How many objects have been returned by the find() so far?
         int _pos;
 
-        // The query that prompted this ClientCursor.  Only used for debugging.
+        // If this cursor was created by a find operation, '_query' holds the query predicate for
+        // the find. If this cursor was created by a command (e.g. the aggregate command), then
+        // '_query' holds the command specification received from the client.
         BSONObj _query;
 
         // See the QueryOptions enum in dbclient.h

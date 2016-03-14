@@ -198,100 +198,6 @@ namespace mongo {
          */
         bool hasAnyPrivilegeDocuments(OperationContext* txn);
 
-        /**
-         * Updates the auth schema version document to reflect the current state of the system.
-         * 'foundSchemaVersion' is the authSchemaVersion to update with.
-         */
-        Status writeAuthSchemaVersionIfNeeded(OperationContext* txn,
-                                              int foundSchemaVersion);
-
-        /**
-         * Creates the given user object in the given database.
-         * 'writeConcern' contains the arguments to be passed to getLastError to block for
-         * successful completion of the write.
-         */
-        Status insertPrivilegeDocument(OperationContext* txn,
-                                       const std::string& dbname,
-                                       const BSONObj& userObj,
-                                       const BSONObj& writeConcern) const;
-
-        /**
-         * Updates the given user object with the given update modifier.
-         * 'writeConcern' contains the arguments to be passed to getLastError to block for
-         * successful completion of the write.
-         */
-        Status updatePrivilegeDocument(OperationContext* txn,
-                                       const UserName& user,
-                                       const BSONObj& updateObj,
-                                       const BSONObj& writeConcern) const;
-
-        /*
-         * Removes users for the given database matching the given query.
-         * Writes into *numRemoved the number of user documents that were modified.
-         * 'writeConcern' contains the arguments to be passed to getLastError to block for
-         * successful completion of the write.
-         */
-        Status removePrivilegeDocuments(OperationContext* txn,
-                                        const BSONObj& query,
-                                        const BSONObj& writeConcern,
-                                        int* numRemoved) const;
-
-        /**
-         * Creates the given role object in the given database.
-         * 'writeConcern' contains the arguments to be passed to getLastError to block for
-         * successful completion of the write.
-         */
-        Status insertRoleDocument(OperationContext* txn,
-                                  const BSONObj& roleObj,
-                                  const BSONObj& writeConcern) const;
-
-        /**
-         * Updates the given role object with the given update modifier.
-         * 'writeConcern' contains the arguments to be passed to getLastError to block for
-         * successful completion of the write.
-         */
-        Status updateRoleDocument(OperationContext* txn,
-                                  const RoleName& role,
-                                  const BSONObj& updateObj,
-                                  const BSONObj& writeConcern) const;
-
-        /**
-         * Updates documents matching "query" according to "updatePattern" in "collectionName".
-         * Should only be called on collections with authorization documents in them
-         * (ie admin.system.users and admin.system.roles).
-         */
-        Status updateAuthzDocuments(OperationContext* txn,
-                                    const NamespaceString& collectionName,
-                                    const BSONObj& query,
-                                    const BSONObj& updatePattern,
-                                    bool upsert,
-                                    bool multi,
-                                    const BSONObj& writeConcern,
-                                    int* nMatched) const;
-
-        /*
-         * Removes roles matching the given query.
-         * Writes into *numRemoved the number of role documents that were modified.
-         * 'writeConcern' contains the arguments to be passed to getLastError to block for
-         * successful completion of the write.
-         */
-        Status removeRoleDocuments(OperationContext* txn,
-                                   const BSONObj& query,
-                                   const BSONObj& writeConcern,
-                                   int* numRemoved) const;
-
-        /**
-         * Finds all documents matching "query" in "collectionName".  For each document returned,
-         * calls the function resultProcessor on it.
-         * Should only be called on collections with authorization documents in them
-         * (ie admin.system.users and admin.system.roles).
-         */
-        Status queryAuthzDocument(OperationContext* txn,
-                                  const NamespaceString& collectionName,
-                                  const BSONObj& query,
-                                  const BSONObj& projection,
-                                  const stdx::function<void(const BSONObj&)>& resultProcessor);
-
         // Checks to see if "doc" is a valid privilege document, assuming it is stored in the
         // "system.users" collection of database "dbname".
         //
@@ -393,37 +299,6 @@ namespace mongo {
          * public instead of private is so it can be unit tested.
          */
         Status _initializeUserFromPrivilegeDocument(User* user, const BSONObj& privDoc);
-
-        /**
-         * Performs one step in the process of upgrading the stored authorization data to the
-         * newest schema.
-         *
-         * On success, returns Status::OK(), and *isDone will indicate whether there are more
-         * steps to perform.
-         *
-         * If the authorization data is already fully upgraded, returns Status::OK and sets *isDone
-         * to true, so this is safe to call on a fully upgraded system.
-         *
-         * On failure, returns a status other than Status::OK().  In this case, is is typically safe
-         * to try again.
-         */
-        Status upgradeSchemaStep(
-                        OperationContext* txn, const BSONObj& writeConcern, bool* isDone);
-
-        /**
-         * Performs up to maxSteps steps in the process of upgrading the stored authorization data
-         * to the newest schema.  Behaves as if by repeatedly calling upgradeSchemaStep up to
-         * maxSteps times until either it completes the upgrade or returns a non-OK status.
-         *
-         * Invalidates the user cache before the first step and after each attempted step.
-         *
-         * Returns Status::OK() to indicate that the upgrade process has completed successfully.
-         * Returns ErrorCodes::OperationIncomplete to indicate that progress was made, but that more
-         * steps must be taken to complete the process.  Other returns indicate a failure to make
-         * progress performing the upgrade, and the specific code and message in the returned status
-         * may provide additional information.
-         */
-        Status upgradeSchema(OperationContext* txn, int maxSteps, const BSONObj& writeConcern);
 
         /**
          * Hook called by replication code to let the AuthorizationManager observe changes

@@ -28,9 +28,9 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/repl/network_interface_mock.h"
 #include "mongo/db/repl/replication_executor_test_fixture.h"
 #include "mongo/db/repl/reporter.h"
+#include "mongo/executor/network_interface_mock.h"
 
 #include "mongo/unittest/unittest.h"
 
@@ -38,6 +38,7 @@ namespace {
 
     using namespace mongo;
     using namespace mongo::repl;
+    using executor::NetworkInterfaceMock;
 
     class MockProgressManager : public ReplicationProgressManager {
         public:
@@ -62,7 +63,7 @@ namespace {
 
     class ReporterTest : public ReplicationExecutorTest {
     public:
-        static Status getDefaultStatus();
+        static Status getDetectableErrorStatus();
         ReporterTest();
         void setUp() override;
         void tearDown() override;
@@ -78,7 +79,7 @@ namespace {
 
     ReporterTest::ReporterTest() {}
 
-    Status ReporterTest::getDefaultStatus() {
+    Status ReporterTest::getDetectableErrorStatus() {
         return Status(ErrorCodes::InternalError, "Not mutated");
     }
 
@@ -148,7 +149,7 @@ namespace {
         ASSERT_TRUE(reporter->isActive());
         scheduleNetworkResponse(ErrorCodes::NoSuchKey, "waaaah");
         getNet()->runReadyNetworkOperations();
-        ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->previousReturnStatus());
+        ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->getStatus());
         ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->trigger());
         ASSERT_FALSE(reporter->isActive());
         ASSERT_FALSE(getNet()->hasReadyRequests());
@@ -166,7 +167,7 @@ namespace {
 
         scheduleNetworkResponse(ErrorCodes::NoSuchKey, "waaaah");
         getNet()->runReadyNetworkOperations();
-        ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->previousReturnStatus());
+        ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->getStatus());
         ASSERT_FALSE(reporter->willRunAgain());
         ASSERT_FALSE(reporter->isActive());
         ASSERT_FALSE(getNet()->hasReadyRequests());
@@ -237,7 +238,7 @@ namespace {
         ASSERT_FALSE(reporter->isActive());
         ASSERT_FALSE(reporter->willRunAgain());
         ASSERT_FALSE(getNet()->hasReadyRequests());
-        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->previousReturnStatus());
+        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->getStatus());
 
         ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->trigger());
     }
@@ -261,7 +262,7 @@ namespace {
         ASSERT_FALSE(reporter->isActive());
         ASSERT_FALSE(reporter->willRunAgain());
         ASSERT_FALSE(getNet()->hasReadyRequests());
-        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->previousReturnStatus());
+        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->getStatus());
 
         ASSERT_EQUALS(ErrorCodes::CallbackCanceled, reporter->trigger());
     }

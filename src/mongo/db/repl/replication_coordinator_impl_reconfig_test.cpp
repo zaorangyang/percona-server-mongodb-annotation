@@ -32,7 +32,6 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_noop.h"
-#include "mongo/db/repl/network_interface_mock.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replica_set_config.h"
@@ -40,6 +39,7 @@
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
 #include "mongo/db/repl/replication_coordinator.h" // ReplSetReconfigArgs
+#include "mongo/executor/network_interface_mock.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
 
@@ -47,6 +47,7 @@ namespace mongo {
 namespace repl {
 namespace {
 
+    using executor::NetworkInterfaceMock;
     typedef ReplicationCoordinator::ReplSetReconfigArgs ReplSetReconfigArgs;
 
     TEST_F(ReplCoordTest, ReconfigBeforeInitialized) {
@@ -221,10 +222,10 @@ namespace {
         repl::ReplSetHeartbeatResponse hbResp;
         hbResp.setSetName("mySet");
         hbResp.setState(MemberState::RS_SECONDARY);
-        hbResp.setVersion(5);
+        hbResp.setConfigVersion(5);
         BSONObjBuilder respObj;
         respObj << "ok" << 1;
-        hbResp.addToBSON(&respObj);
+        hbResp.addToBSON(&respObj, false);
         net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj.obj()));
         net->runReadyNetworkOperations();
         getNet()->exitNetwork();
@@ -259,10 +260,10 @@ namespace {
         repl::ReplSetHeartbeatResponse hbResp;
         hbResp.setSetName("mySet");
         hbResp.setState(MemberState::RS_SECONDARY);
-        hbResp.setVersion(2);
+        hbResp.setConfigVersion(2);
         BSONObjBuilder respObj;
         respObj << "ok" << 1;
-        hbResp.addToBSON(&respObj);
+        hbResp.addToBSON(&respObj, false);
         net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj.obj()));
         net->runReadyNetworkOperations();
         getNet()->exitNetwork();
@@ -368,10 +369,10 @@ namespace {
         repl::ReplSetHeartbeatResponse hbResp;
         hbResp.setSetName("mySet");
         hbResp.setState(MemberState::RS_SECONDARY);
-        hbResp.setVersion(2);
+        hbResp.setConfigVersion(2);
         BSONObjBuilder respObj;
         respObj << "ok" << 1;
-        hbResp.addToBSON(&respObj);
+        hbResp.addToBSON(&respObj, false);
         net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj.obj()));
         net->runReadyNetworkOperations();
         getNet()->exitNetwork();
@@ -409,12 +410,12 @@ namespace {
                                                        BSON("_id" << 2 <<
                                                             "host" << "node2:12345"))));
         hbResp2.setConfig(config);
-        hbResp2.setVersion(3);
+        hbResp2.setConfigVersion(3);
         hbResp2.setSetName("mySet");
         hbResp2.setState(MemberState::RS_SECONDARY);
         BSONObjBuilder respObj2;
         respObj2 << "ok" << 1;
-        hbResp2.addToBSON(&respObj2);
+        hbResp2.addToBSON(&respObj2, false);
         net->runUntil(net->now() + Seconds(10)); // run until we've sent a heartbeat request
         const NetworkInterfaceMock::NetworkOperationIterator noi2 = net->getNextReadyRequest();
         net->scheduleResponse(noi2, net->now(), makeResponseStatus(respObj2.obj()));
@@ -468,12 +469,12 @@ namespace {
                                                        BSON("_id" << 2 <<
                                                             "host" << "node2:12345"))));
         hbResp.setConfig(config);
-        hbResp.setVersion(4);
+        hbResp.setConfigVersion(4);
         hbResp.setSetName("mySet");
         hbResp.setState(MemberState::RS_SECONDARY);
         BSONObjBuilder respObj2;
         respObj2 << "ok" << 1;
-        hbResp.addToBSON(&respObj2);
+        hbResp.addToBSON(&respObj2, false);
         net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj2.obj()));
 
         logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));

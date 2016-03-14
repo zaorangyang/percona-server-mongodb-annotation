@@ -30,12 +30,15 @@
 
 #include "mongo/db/commands/explain_cmd.h"
 
+#include <boost/optional.hpp>
+
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -90,10 +93,18 @@ namespace mongo {
         // copied from Command::execCommand and should be abstracted. Until then, make
         // sure to keep it up to date.
         repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
-        const bool canRunHere =
-            replCoord->canAcceptWritesForDatabase(dbname) ||
-            commToExplain->slaveOk() ||
-            (commToExplain->slaveOverrideOk() && (options & QueryOption_SlaveOk));
+        bool iAmPrimary = replCoord->canAcceptWritesForDatabase(dbname);
+        bool commandCanRunOnSecondary = commToExplain->slaveOk();
+
+        bool commandIsOverriddenToRunOnSecondary = commToExplain->slaveOverrideOk() &&
+            (rpc::ServerSelectionMetadata::get(txn).isSecondaryOk() ||
+             rpc::ServerSelectionMetadata::get(txn).getReadPreference() != boost::none);
+        bool iAmStandalone = !txn->writesAreReplicated();
+
+        const bool canRunHere = iAmPrimary ||
+                                commandCanRunOnSecondary ||
+                                commandIsOverriddenToRunOnSecondary ||
+                                iAmStandalone;
 
         if (!canRunHere) {
             mongoutils::str::stream ss;

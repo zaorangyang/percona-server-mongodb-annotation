@@ -32,12 +32,13 @@
 #include <boost/thread/condition_variable.hpp>
 #include <boost/thread/mutex.hpp>
 #include <string>
+#include <thread>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/client/remote_command_executor.h"
+#include "mongo/client/remote_command_runner.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/repl/task_runner.h"
 #include "mongo/platform/compiler.h"
@@ -53,7 +54,13 @@ namespace mongo {
     class NamespaceString;
     class OperationContext;
 
+namespace executor{
+    class NetworkInterface;
+} // namespace executor
+
 namespace repl {
+
+    class StorageInterface;
 
     /**
      * Event loop for driving state machines in replication.
@@ -112,7 +119,6 @@ namespace repl {
         struct CallbackData;
         class CallbackHandle;
         class EventHandle;
-        class NetworkInterface;
         struct RemoteCommandCallbackData;
         typedef StatusWith<RemoteCommandResponse> ResponseStatus;
 
@@ -141,7 +147,9 @@ namespace repl {
          *
          * Takes ownership of the passed NetworkInterface object.
          */
-        explicit ReplicationExecutor(NetworkInterface* netInterface, int64_t pnrgSeed);
+        ReplicationExecutor(executor::NetworkInterface* netInterface,
+                            StorageInterface* storageInterface,
+                            int64_t pnrgSeed);
 
         /**
          * Destroys an executor.
@@ -328,6 +336,11 @@ namespace repl {
          */
         int64_t nextRandomInt64(int64_t limit);
 
+        /**
+         * Returns true if executing in the "run" thread, which should not block with IO
+         */
+        bool isRunThread() const;
+
     private:
         struct Event;
         struct WorkItem;
@@ -422,7 +435,8 @@ namespace repl {
         // PRNG; seeded at class construction time.
         PseudoRandom _random;
 
-        boost::scoped_ptr<NetworkInterface> _networkInterface;
+        boost::scoped_ptr<executor::NetworkInterface> _networkInterface;
+        boost::scoped_ptr<StorageInterface> _storageInterface;
         boost::mutex _mutex;
         boost::mutex _terribleExLockSyncMutex;
         boost::condition_variable _noMoreWaitingThreads;
@@ -440,6 +454,7 @@ namespace repl {
         TaskRunner _dblockTaskRunner;
         TaskRunner _dblockExclusiveLockTaskRunner;
         uint64_t _nextId;
+        std::thread::id _runThreadId;
     };
 
     /**
@@ -509,92 +524,8 @@ namespace repl {
         OperationContext* txn;
     };
 
-    /**
-     * Interface to networking and lock manager.
-     */
-    class ReplicationExecutor::NetworkInterface {
-        MONGO_DISALLOW_COPYING(NetworkInterface);
-    public:
-
-        // A flag to keep replication MessagingPorts open when all other sockets are disconnected.
-        static const unsigned int kMessagingPortKeepOpen = 1;
-
-        typedef RemoteCommandResponse Response;
-        typedef stdx::function<void (const ResponseStatus&)> RemoteCommandCompletionFn;
-
-        virtual ~NetworkInterface();
-
-        /**
-         * Returns diagnostic info.
-         */
-        virtual std::string getDiagnosticString() = 0;
-
-        /**
-         * Starts up the network interface.
-         *
-         * It is valid to call all methods except shutdown() before this method completes.  That is,
-         * implementations may not assume that startup() completes before startCommand() first
-         * executes.
-         *
-         * Called by the owning ReplicationExecutor inside its run() method.
-         */
-        virtual void startup() = 0;
-
-        /**
-         * Shuts down the network interface. Must be called before this instance gets deleted,
-         * if startup() is called.
-         *
-         * Called by the owning ReplicationExecutor inside its run() method.
-         */
-        virtual void shutdown() = 0;
-
-        /**
-         * Blocks the current thread (presumably the executor thread) until the network interface
-         * knows of work for the executor to perform.
-         */
-        virtual void waitForWork() = 0;
-
-        /**
-         * Similar to waitForWork, but only blocks until "when".
-         */
-        virtual void waitForWorkUntil(Date_t when) = 0;
-
-        /**
-         * Signals to the network interface that there is new work (such as a signaled event) for
-         * the executor to process.  Wakes the executor from waitForWork() and friends.
-         */
-        virtual void signalWorkAvailable() = 0;
-
-        /**
-         * Returns the current time.
-         */
-        virtual Date_t now() = 0;
-
-        /**
-         * Starts asynchronous execution of the command described by "request".
-         */
-        virtual void startCommand(const CallbackHandle& cbHandle,
-                                  const RemoteCommandRequest& request,
-                                  const RemoteCommandCompletionFn& onFinish) = 0;
-
-        /**
-         * Requests cancelation of the network activity associated with "cbHandle" if it has not yet
-         * completed.
-         */
-        virtual void cancelCommand(const CallbackHandle& cbHandle) = 0;
-
-        /**
-         * Creates an operation context for running database operations.
-         */
-        virtual OperationContext* createOperationContext() = 0;
-
-    protected:
-        NetworkInterface();
-    };
-
     typedef ReplicationExecutor::ResponseStatus ResponseStatus;
 
-    // Must be after NetworkInterface class
     struct ReplicationExecutor::RemoteCommandCallbackData {
         RemoteCommandCallbackData(ReplicationExecutor* theExecutor,
                                   const CallbackHandle& theHandle,

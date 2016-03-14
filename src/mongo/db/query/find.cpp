@@ -37,8 +37,10 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -116,10 +118,10 @@ namespace mongo {
      * results, or when the result set exceeds 4 MB.
      */
     bool enoughForFirstBatch(const LiteParsedQuery& pq, int numDocs, int bytesBuffered) {
-        if (0 == pq.getNumToReturn()) {
-            return (bytesBuffered > 1024 * 1024) || numDocs >= 101;
+        if (!pq.getBatchSize()) {
+            return (bytesBuffered > 1024 * 1024) || numDocs >= LiteParsedQuery::kDefaultBatchSize;
         }
-        return numDocs >= pq.getNumToReturn() || bytesBuffered > MaxBytesToReturnToClientAtOnce;
+        return numDocs >= *pq.getBatchSize() || bytesBuffered > MaxBytesToReturnToClientAtOnce;
     }
 
     bool enoughForGetMore(int ntoreturn, int numDocs, int bytesBuffered) {
@@ -129,6 +131,10 @@ namespace mongo {
 
     bool isCursorTailable(const ClientCursor* cursor) {
         return cursor->queryOptions() & QueryOption_CursorTailable;
+    }
+
+    bool isCursorAwaitData(const ClientCursor* cursor) {
+        return cursor->queryOptions() & QueryOption_AwaitData;
     }
 
     bool shouldSaveCursor(OperationContext* txn,
@@ -144,7 +150,7 @@ namespace mongo {
             return false;
         }
 
-        if (pq.getNumToReturn() == 1) {
+        if (!pq.fromFindCommand() && pq.getBatchSize() && *pq.getBatchSize() == 1) {
             return false;
         }
 
@@ -175,25 +181,27 @@ namespace mongo {
         return !exec->isEOF();
     }
 
-    void beginQueryOp(const NamespaceString& nss,
+    void beginQueryOp(OperationContext* txn,
+                      const NamespaceString& nss,
                       const BSONObj& queryObj,
                       int ntoreturn,
-                      int ntoskip,
-                      CurOp* curop) {
+                      int ntoskip) {
+        auto curop = CurOp::get(txn);
         curop->debug().ns = nss.ns();
         curop->debug().query = queryObj;
         curop->debug().ntoreturn = ntoreturn;
         curop->debug().ntoskip = ntoskip;
-        curop->setQuery(queryObj);
+        stdx::lock_guard<Client> lk(*txn->getClient());
+        curop->setQuery_inlock(queryObj);
     }
 
-    void endQueryOp(PlanExecutor* exec,
+    void endQueryOp(OperationContext* txn,
+                    PlanExecutor* exec,
                     int dbProfilingLevel,
                     int numResults,
-                    CursorId cursorId,
-                    CurOp* curop) {
+                    CursorId cursorId) {
+        auto curop = CurOp::get(txn);
         invariant(exec);
-        invariant(curop);
 
         // Fill out basic curop query exec properties.
         curop->debug().nreturned = numResults;
@@ -247,10 +255,11 @@ namespace mongo {
                               const char* ns,
                               int ntoreturn,
                               long long cursorid,
-                              CurOp& curop,
                               int pass,
                               bool& exhaust,
                               bool* isCursorAuthorized) {
+
+        CurOp& curop = *CurOp::get(txn);
 
         // For testing, we may want to fail if we receive a getmore.
         if (MONGO_FAIL_POINT(failReceivedGetmore)) {
@@ -368,6 +377,14 @@ namespace mongo {
             // time to this getmore.
             curop.setMaxTimeMicros(cc->getLeftoverMaxTimeMicros());
             txn->checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
+
+            // Ensure that the original query or command object is available in the slow query log,
+            // profiler, and currentOp.
+            curop.debug().query = cc->getQuery();
+            {
+                stdx::lock_guard<Client> lk(*txn->getClient());
+                curop.setQuery_inlock(cc->getQuery());
+            }
 
             if (0 == pass) { 
                 cc->updateSlaveLocation(txn); 
@@ -515,14 +532,14 @@ namespace mongo {
     std::string runQuery(OperationContext* txn,
                          QueryMessage& q,
                          const NamespaceString& nss,
-                         CurOp& curop,
                          Message &result) {
+        CurOp& curop = *CurOp::get(txn);
         // Validate the namespace.
         uassert(16256, str::stream() << "Invalid ns [" << nss.ns() << "]", nss.isValid());
         invariant(!nss.isCommand());
 
         // Set curop information.
-        beginQueryOp(nss, q.query, q.ntoreturn, q.ntoskip, &curop);
+        beginQueryOp(txn, nss, q.query, q.ntoreturn, q.ntoskip);
 
         // Parse the qm into a CanonicalQuery.
         std::auto_ptr<CanonicalQuery> cq;
@@ -646,7 +663,7 @@ namespace mongo {
 
             if (enoughForFirstBatch(pq, numResults, bb.len())) {
                 LOG(5) << "Enough for first batch, wantMore=" << pq.wantMore()
-                       << " numToReturn=" << pq.getNumToReturn()
+                       << " batchSize=" << pq.getBatchSize().value_or(0)
                        << " numResults=" << numResults
                        << endl;
                 break;
@@ -734,11 +751,11 @@ namespace mongo {
             // use by future getmore ops).
             cc->setLeftoverMaxTimeMicros(curop.getRemainingMaxTimeMicros());
 
-            endQueryOp(cc->getExecutor(), dbProfilingLevel, numResults, ccId, &curop);
+            endQueryOp(txn, cc->getExecutor(), dbProfilingLevel, numResults, ccId);
         }
         else {
             LOG(5) << "Not caching executor but returning " << numResults << " results.\n";
-            endQueryOp(exec.get(), dbProfilingLevel, numResults, ccId, &curop);
+            endQueryOp(txn, exec.get(), dbProfilingLevel, numResults, ccId);
         }
 
         // Add the results from the query into the output buffer.

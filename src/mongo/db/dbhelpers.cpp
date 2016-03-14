@@ -37,7 +37,6 @@
 #include <boost/filesystem/operations.hpp>
 #include <fstream>
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/db.h"
@@ -78,8 +77,6 @@ namespace mongo {
     using std::stringstream;
 
     using logger::LogComponent;
-
-    const BSONObj reverseNaturalObj = BSON( "$natural" << -1 );
 
     void Helpers::ensureIndex(OperationContext* txn,
                               Collection* collection,
@@ -206,7 +203,7 @@ namespace mongo {
         auto_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn, ns, ctx.getCollection()));
         PlanExecutor::ExecState state = exec->getNext(&result, NULL);
 
-        txn->getCurOp()->done();
+        CurOp::get(txn)->done();
 
         if (PlanExecutor::ADVANCED == state) {
             result = result.getOwned();
@@ -268,7 +265,7 @@ namespace mongo {
 
         update(txn, context.db(), request, &debug);
 
-        CurOp::get(txn->getClient())->done();
+        CurOp::get(txn)->done();
     }
 
     BSONObj Helpers::toKeyFormat( const BSONObj& o ) {

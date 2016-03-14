@@ -35,7 +35,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/base_cloner_test_fixture.h"
 #include "mongo/db/repl/collection_cloner.h"
-#include "mongo/db/repl/network_interface_mock.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -45,7 +44,6 @@ namespace {
 
     class CollectionClonerTest : public BaseClonerTest {
     public:
-        CollectionClonerTest();
 
         void setUp() override;
         void tearDown() override;
@@ -53,25 +51,18 @@ namespace {
 
     protected:
         CollectionOptions options;
-        StorageInterfaceMock* storageInterface;
         std::unique_ptr<CollectionCloner> collectionCloner;
     };
-
-    CollectionClonerTest::CollectionClonerTest()
-        : options(),
-          storageInterface(nullptr),
-          collectionCloner() { }
 
     void CollectionClonerTest::setUp() {
         BaseClonerTest::setUp();
         options.reset();
         options.storageEngine = BSON("storageEngine1" << BSONObj());
-        storageInterface = new StorageInterfaceMock();
         collectionCloner.reset(new CollectionCloner(&getExecutor(), target, nss, options,
                                                     stdx::bind(&CollectionClonerTest::setStatus,
                                                                this,
                                                                stdx::placeholders::_1),
-                                                    storageInterface));
+                                                    storageInterface.get()));
     }
 
     void CollectionClonerTest::tearDown() {
@@ -92,7 +83,7 @@ namespace {
 
         // Null executor.
         {
-            CollectionCloner::StorageInterface* si = new StorageInterfaceMock();
+            CollectionCloner::StorageInterface* si = storageInterface.get();
             ASSERT_THROWS(CollectionCloner(nullptr, target, nss, options, cb, si), UserException);
         }
 
@@ -103,7 +94,7 @@ namespace {
         // Invalid namespace.
         {
             NamespaceString badNss("db.");
-            CollectionCloner::StorageInterface* si = new StorageInterfaceMock();
+            CollectionCloner::StorageInterface* si = storageInterface.get();
             ASSERT_THROWS(CollectionCloner(&executor, target, badNss, options, cb, si),
                           UserException);
         }
@@ -112,7 +103,7 @@ namespace {
         {
             CollectionOptions invalidOptions;
             invalidOptions.storageEngine = BSON("storageEngine1" << "not a document");
-            CollectionCloner::StorageInterface* si = new StorageInterfaceMock();
+            CollectionCloner::StorageInterface* si = storageInterface.get();
             ASSERT_THROWS(CollectionCloner(&executor, target, nss, invalidOptions, cb, si),
                           UserException);
         }
@@ -120,7 +111,7 @@ namespace {
         // Callback function cannot be null.
         {
             CollectionCloner::CallbackFn nullCb;
-            CollectionCloner::StorageInterface* si = new StorageInterfaceMock();
+            CollectionCloner::StorageInterface* si = storageInterface.get();
             ASSERT_THROWS(CollectionCloner(&executor, target, nss, options, nullCb, si),
                           UserException);
         }
@@ -163,7 +154,7 @@ namespace {
         // the cloner stops the fetcher from retrieving more results.
         processNetworkResponse(createListIndexesResponse(1, BSONArray()));
 
-        ASSERT_EQUALS(getDefaultStatus(), getStatus());
+        ASSERT_EQUALS(getDetectableErrorStatus(), getStatus());
         ASSERT_TRUE(collectionCloner->isActive());
 
         ASSERT_TRUE(getNet()->hasReadyRequests());
@@ -251,7 +242,7 @@ namespace {
         processNetworkResponse(createListIndexesResponse(1, BSON_ARRAY(specs[0] << specs[1])));
 
         // 'status' should not be modified because cloning is not finished.
-        ASSERT_EQUALS(getDefaultStatus(), getStatus());
+        ASSERT_EQUALS(getDetectableErrorStatus(), getStatus());
         ASSERT_TRUE(collectionCloner->isActive());
 
         processNetworkResponse(createListIndexesResponse(0, BSON_ARRAY(specs[2]), "nextBatch"));
@@ -259,7 +250,7 @@ namespace {
         collectionCloner->waitForDbWorker();
 
         // 'status' will be set if listIndexes fails.
-        ASSERT_EQUALS(getDefaultStatus(), getStatus());
+        ASSERT_EQUALS(getDetectableErrorStatus(), getStatus());
 
         ASSERT_EQUALS(nss.ns(), collNss.ns());
         ASSERT_EQUALS(options.toBSON(), collOptions.toBSON());
@@ -479,7 +470,7 @@ namespace {
         ASSERT_EQUALS(1U, collDocuments.size());
         ASSERT_EQUALS(doc, collDocuments[0]);
 
-        ASSERT_EQUALS(getDefaultStatus(), getStatus());
+        ASSERT_EQUALS(getDetectableErrorStatus(), getStatus());
         ASSERT_TRUE(collectionCloner->isActive());
 
         const BSONObj doc2 = BSON("_id" << 1);

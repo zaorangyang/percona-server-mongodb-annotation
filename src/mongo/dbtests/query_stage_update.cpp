@@ -191,8 +191,7 @@ namespace QueryStageUpdate {
             // Run the update.
             {
                 OldClientWriteContext ctx(&_txn, ns());
-                Client& c = cc();
-                CurOp& curOp = *CurOp::get(c);
+                CurOp& curOp = *CurOp::get(_txn);
                 OpDebug* opDebug = &curOp.debug();
                 UpdateDriver driver( (UpdateDriver::Options()) );
                 Collection* collection = ctx.getCollection();
@@ -260,8 +259,7 @@ namespace QueryStageUpdate {
                 }
                 ASSERT_EQUALS(10U, count(BSONObj()));
 
-                Client& c = cc();
-                CurOp& curOp = *CurOp::get(c);
+                CurOp& curOp = *CurOp::get(_txn);
                 OpDebug* opDebug = &curOp.debug();
                 UpdateDriver driver( (UpdateDriver::Options()) );
                 Database* db = ctx.db();
@@ -372,7 +370,7 @@ namespace QueryStageUpdate {
 
             // Various variables we'll need.
             OldClientWriteContext ctx(&_txn, ns());
-            OpDebug* opDebug = &_txn.getCurOp()->debug();
+            OpDebug* opDebug = &CurOp::get(_txn)->debug();
             Collection* coll = ctx.getCollection();
             UpdateLifecycleImpl updateLifecycle(false, nsString());
             UpdateRequest request(nsString());
@@ -459,7 +457,7 @@ namespace QueryStageUpdate {
 
             // Various variables we'll need.
             OldClientWriteContext ctx(&_txn, ns());
-            OpDebug* opDebug = &_txn.getCurOp()->debug();
+            OpDebug* opDebug = &CurOp::get(_txn)->debug();
             Collection* coll = ctx.getCollection();
             UpdateLifecycleImpl updateLifecycle(false, nsString());
             UpdateRequest request(nsString());
@@ -540,7 +538,7 @@ namespace QueryStageUpdate {
         void run() {
             // Various variables we'll need.
             OldClientWriteContext ctx(&_txn, ns());
-            OpDebug* opDebug = &_txn.getCurOp()->debug();
+            OpDebug* opDebug = &CurOp::get(_txn)->debug();
             Collection* coll = ctx.getCollection();
             UpdateLifecycleImpl updateLifecycle(false, nsString());
             UpdateRequest request(nsString());

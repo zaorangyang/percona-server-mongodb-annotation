@@ -55,6 +55,7 @@ namespace mongo {
     class ShardType;
     class Status;
     template<typename T> class StatusWith;
+    class TagsType;
 
     /**
      * Used to indicate to the caller of the removeShard method whether draining of chunks for
@@ -79,6 +80,11 @@ namespace mongo {
         virtual ~CatalogManager() = default;
 
         /**
+         * Retrieves the connection string for the catalog manager's backing server.
+         */
+        virtual ConnectionString connectionString() const = 0;
+
+        /**
          * Performs necessary cleanup when shutting down cleanly.
          */
         virtual void shutDown() = 0;
@@ -90,7 +96,7 @@ namespace mongo {
          *
          * Returns Status::OK on success or any error code indicating the failure. These are some
          * of the known failures:
-         *  - DatabaseDifferCaseCode - database already exists, but with a different case
+         *  - DatabaseDifferCase - database already exists, but with a different case
          *  - ShardNotFound - could not find a shard to place the DB on
          */
         virtual Status enableSharding(const std::string& dbName) = 0;
@@ -147,16 +153,14 @@ namespace mongo {
          * metadata and sets the specified shard as primary.
          *
          * @param dbName name of the database (case sensitive)
-         * @param shard Optional shard to use as primary. If nullptr is specified, one will be
-         *      picked by the system.
          *
          * Returns Status::OK on success or any error code indicating the failure. These are some
          * of the known failures:
          *  - NamespaceExists - database already exists
-         *  - DatabaseDifferCaseCode - database already exists, but with a different case
+         *  - DatabaseDifferCase - database already exists, but with a different case
          *  - ShardNotFound - could not find a shard to place the DB on
          */
-        virtual Status createDatabase(const std::string& dbName, const Shard* shard) = 0;
+        virtual Status createDatabase(const std::string& dbName) = 0;
 
         /**
          * Updates or creates the metadata for a given database.
@@ -216,8 +220,8 @@ namespace mongo {
          *
          * Returns a !OK status if an error occurs.
          */
-        virtual void getDatabasesForShard(const std::string& shardName,
-                                          std::vector<std::string>* dbs) = 0;
+        virtual Status getDatabasesForShard(const std::string& shardName,
+                                            std::vector<std::string>* dbs) = 0;
 
         /**
          * Gets the requested number of chunks (of type ChunkType) that satisfy a query.
@@ -231,6 +235,19 @@ namespace mongo {
         virtual Status getChunks(const Query& query,
                                  int nToReturn,
                                  std::vector<ChunkType>* chunks) = 0;
+
+        /**
+         * Retrieves all tags for the specified collection.
+         */
+        virtual Status getTagsForCollection(const std::string& collectionNs,
+                                            std::vector<TagsType>* tags) = 0;
+
+        /**
+         * Retrieves the most appropriate tag, which overlaps with the specified chunk. If no tags
+         * overlap, returns an empty string.
+         */
+        virtual StatusWith<std::string> getTagForChunk(const std::string& collectionNs,
+                                                       const ChunkType& chunk) = 0;
 
         /**
          * Retrieves all shards in this sharded cluster.

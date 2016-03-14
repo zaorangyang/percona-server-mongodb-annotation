@@ -40,6 +40,8 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/client/parallel.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -65,9 +67,14 @@ namespace mongo {
     void RunOnAllShardsCommand::getShards(const std::string& db,
                                           BSONObj& cmdObj,
                                           std::set<Shard>& shards) {
-        std::vector<Shard> shardList;
-        Shard::getAllShards(shardList);
-        shards.insert(shardList.begin(), shardList.end());
+        std::vector<ShardId> shardIds;
+        grid.shardRegistry()->getAllShardIds(&shardIds);
+        for (const ShardId& shardId : shardIds) {
+            const auto& shard = grid.shardRegistry()->findIfExists(shardId);
+            if (shard) {
+                shards.insert(*shard);
+            }
+        }
     }
 
     bool RunOnAllShardsCommand::run(OperationContext* txn,
@@ -84,7 +91,7 @@ namespace mongo {
         // TODO: Future is deprecated, replace with commandOp()
         std::list< boost::shared_ptr<Future::CommandResult> > futures;
         for (std::set<Shard>::const_iterator i=shards.begin(), end=shards.end() ; i != end ; i++) {
-            futures.push_back( Future::spawnCommand( i->getConnString(),
+            futures.push_back( Future::spawnCommand( i->getConnString().toString(),
                                                      dbName,
                                                      cmdObj,
                                                      0,

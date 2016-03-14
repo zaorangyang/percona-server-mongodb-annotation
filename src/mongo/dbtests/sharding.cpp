@@ -108,7 +108,7 @@ namespace ShardingTests {
             // Since we've redirected the conns, the host doesn't matter here so long as it's
             // prefixed with a "$"
             _shard = Shard("shard0000",
-                           "$hostFooBar:27017",
+                           ConnectionString(HostAndPort("$hostFooBar:27017")),
                            0 /* maxSize */,
                            false /* draining */);
             // Need to run this to ensure the shard is in the global lookup table
@@ -116,7 +116,7 @@ namespace ShardingTests {
             // Add dummy shard to config DB
             _client.insert(ShardType::ConfigNS,
                            BSON(ShardType::name() << _shard.getName() <<
-                                ShardType::host() << _shard.getConnString()));
+                                ShardType::host() << _shard.getConnString().toString()));
 
             // Create an index so that diffing works correctly, otherwise no cursors from S&O
             ASSERT_OK(dbtests::createIndex(
@@ -317,12 +317,10 @@ namespace ShardingTests {
         // The default pass-through adapter for using config diffs
         class DefaultDiffAdapter : public ConfigDiffTracker<BSONObj,string> {
         public:
-
             DefaultDiffAdapter() {}
             virtual ~DefaultDiffAdapter() {}
 
             virtual bool isTracked(const ChunkType& chunk) const { return true; }
-            virtual BSONObj maxFrom( const BSONObj& max ) const { return max; }
 
             virtual pair<BSONObj,BSONObj> rangeFor(const ChunkType& chunk) const {
                 return make_pair(chunk.getMin(), chunk.getMax());
@@ -334,13 +332,8 @@ namespace ShardingTests {
         // Inverts the storage order for chunks from min to max
         class InverseDiffAdapter : public DefaultDiffAdapter {
         public:
-
             InverseDiffAdapter() {}
             virtual ~InverseDiffAdapter() {}
-
-            // Disable
-            virtual BSONObj maxFrom( const BSONObj& max ) const { ASSERT( false ); return max; }
-            virtual BSONObj minFrom( const BSONObj& min ) const { return min; }
 
             virtual bool isMinKeyIndexed() const { return false; }
 

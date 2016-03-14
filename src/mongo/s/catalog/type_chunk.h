@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2012-2015 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -17,13 +17,13 @@
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -44,22 +44,6 @@ namespace mongo {
      * This class represents the layout and contents of documents contained in the
      * config.chunks collection. All manipulation of documents coming from that
      * collection should be done with this class.
-     *
-     * Usage Example:
-     *
-     *     // Contact the config. 'conn' has been obtained before.
-     *     DBClientBase* conn;
-     *     BSONObj query = QUERY(ChunkType::exampleField("exampleFieldName"));
-     *     exampleDoc = conn->findOne(ChunkType::ConfigNS, query);
-     *
-     *     // Process the response.
-     *     StatusWith<ChunkType> exampleResult = ChunkType::fromBSON(exampleDoc);
-     *     if (!exampleResult.isOK()) {
-     *         // handle error -- exampleResult.getStatus()
-     *     }
-     *     ChunkType exampleType = exampleResult.getValue();
-     *     // use 'exampleType'
-     *
      */
     class ChunkType {
     public:
@@ -95,11 +79,6 @@ namespace mongo {
          * Returns the BSON representation of the entry.
          */
         BSONObj toBSON() const;
-
-        /**
-         * Clears the internal state.
-         */
-        void clear();
 
         /**
          * Returns a std::string representation of the current internal state.

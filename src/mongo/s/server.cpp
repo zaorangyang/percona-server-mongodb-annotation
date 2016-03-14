@@ -40,6 +40,7 @@
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/client/connpool.h"
+#include "mongo/client/dbclient_rs.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/audit.h"
@@ -47,7 +48,7 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authz_manager_external_state_s.h"
 #include "mongo/db/auth/user_cache_invalidator_job.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/dbwebserver.h"
 #include "mongo/db/initialize_server_global_state.h"
 #include "mongo/db/instance.h"
@@ -59,20 +60,16 @@
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balance.h"
 #include "mongo/s/catalog/legacy/catalog_manager_legacy.h"
-#include "mongo/s/catalog/legacy/config_upgrade.h"
 #include "mongo/s/client/sharding_connection_hook.h"
-#include "mongo/s/chunk_manager.h"
 #include "mongo/s/config.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/request.h"
 #include "mongo/s/version_mongos.h"
-#include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/admin_access.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
-#include "mongo/util/concurrency/task.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit.h"
@@ -84,8 +81,6 @@
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
-#include "mongo/util/ramlog.h"
-#include "mongo/util/scopeguard.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/stringutils.h"
@@ -94,8 +89,6 @@
 
 namespace mongo {
 
-    using std::cout;
-    using std::endl;
     using std::string;
     using std::vector;
 
@@ -110,7 +103,6 @@ namespace mongo {
     static ExitCode initService();
 #endif
 
-    string mongosCommand;
     bool dbexitCalled = false;
 
     bool inShutdown() {
@@ -152,7 +144,7 @@ namespace mongo {
 
                 LOG( ex.isUserAssertion() ? 1 : 0 ) << "Assertion failed"
                     << " while processing " << opToString( m.operation() ) << " op"
-                    << " for " << r.getns() << causedBy( ex ) << endl;
+                    << " for " << r.getns() << causedBy( ex );
 
                 if ( r.expectResponse() ) {
                     m.header().setId(r.id());
@@ -166,7 +158,7 @@ namespace mongo {
 
                 log() << "Exception thrown"
                       << " while processing " << opToString( m.operation() ) << " op"
-                      << " for " << r.getns() << causedBy( ex ) << endl;
+                      << " for " << r.getns() << causedBy( ex );
 
                 if ( r.expectResponse() ) {
                     m.header().setId(r.id());
@@ -219,8 +211,7 @@ static ExitCode runMongosServer( bool doUpgrade ) {
     // Mongos shouldn't lazily kill cursors, otherwise we can end up with extras from migration
     DBClientConnection::setLazyKillCursor( false );
 
-    ReplicaSetMonitor::setConfigChangeHook(
-        stdx::bind(&ConfigServer::replicaSetChange, &configServer, stdx::placeholders::_1 , stdx::placeholders::_2));
+    ReplicaSetMonitor::setConfigChangeHook(&ConfigServer::replicaSetChange);
 
     // Mongos connection pools already takes care of authenticating new connections so the
     // replica set connection shouldn't need to.
@@ -231,55 +222,37 @@ static ExitCode runMongosServer( bool doUpgrade ) {
     }
 
     auto catalogManager = stdx::make_unique<CatalogManagerLegacy>();
-    Status statusCatalogManagerInit = catalogManager->init(mongosGlobalParams.configdbs);
-    if (!statusCatalogManagerInit.isOK()) {
-        mongo::log(LogComponent::kSharding) << "couldn't initialize catalog manager "
-                                            << statusCatalogManagerInit;
-        return EXIT_SHARDING_ERROR;
+
+    {
+        Status statusCatalogManagerInit = catalogManager->init(mongosGlobalParams.configdbs);
+        if (!statusCatalogManagerInit.isOK()) {
+            error() << "couldn't initialize catalog manager " << statusCatalogManagerInit;
+            return EXIT_SHARDING_ERROR;
+        }
     }
 
-    Status statusConfigChecker = catalogManager->startConfigServerChecker();
-    if (!statusConfigChecker.isOK()) {
-        mongo::log(LogComponent::kSharding) << "unable to start config servers checker thread "
-                                            << statusConfigChecker;;
-        return EXIT_SHARDING_ERROR;
+    {
+        Status statusConfigChecker = catalogManager->startConfigServerChecker();
+        if (!statusConfigChecker.isOK()) {
+            error() << "unable to start config servers checker thread " << statusConfigChecker;
+            return EXIT_SHARDING_ERROR;
+        }
     }
+
+    {
+        Status statusCatalogUpgrade = catalogManager->checkAndUpgradeConfigMetadata(doUpgrade);
+        if (!statusCatalogUpgrade.isOK()) {
+            error() << "stale config server metadata: " << statusCatalogUpgrade;
+            return EXIT_SHARDING_ERROR;
+        }
+        else if (doUpgrade) {
+            return EXIT_CLEAN;
+        }
+    }
+
     grid.setCatalogManager(std::move(catalogManager));
 
-    if (!configServer.init(mongosGlobalParams.configdbs)) {
-        mongo::log(LogComponent::kSharding) << "couldn't resolve config db address" << endl;
-        return EXIT_SHARDING_ERROR;
-    }
-
-    VersionType initVersionInfo;
-    VersionType versionInfo;
-    string errMsg;
-    string configServerURL = configServer.getPrimary().getConnString();
-    ConnectionString configServerConnString = ConnectionString::parse(configServerURL, errMsg);
-    if (!configServerConnString.isValid()) {
-        error(LogComponent::kDefault) << "Invalid connection string for config servers: " << configServerURL << endl;
-        return EXIT_SHARDING_ERROR;
-    }
-    bool upgraded = checkAndUpgradeConfigVersion(configServerConnString,
-                                                 doUpgrade,
-                                                 &initVersionInfo,
-                                                 &versionInfo,
-                                                 &errMsg);
-
-    if (!upgraded) {
-        error(LogComponent::kDefault) << "error upgrading config database to v"
-                << CURRENT_CONFIG_VERSION
-                << causedBy(errMsg) << endl;
-        return EXIT_SHARDING_ERROR;
-    }
-
-    if ( doUpgrade ) {
-        mongo::log(LogComponent::kDefault) << "Config database is at version v"
-                << CURRENT_CONFIG_VERSION;
-        return EXIT_CLEAN;
-    }
-
-    configServer.reloadSettings();
+    ConfigServer::reloadSettings();
 
 #if !defined(_WIN32)
     mongo::signalForkSuccess();
@@ -298,7 +271,7 @@ static ExitCode runMongosServer( bool doUpgrade ) {
 
     Status status = getGlobalAuthorizationManager()->initialize(NULL);
     if (!status.isOK()) {
-        mongo::log(LogComponent::kDefault) << "Initializing authorization data failed: " << status;
+        error() << "Initializing authorization data failed: " << status;
         return EXIT_SHARDING_ERROR;
     }
 
@@ -353,7 +326,7 @@ static int _main() {
 
         if ( configAddr.isLocalHost() != grid.allowLocalHost() ) {
             mongo::log(LogComponent::kDefault)
-                << "cannot mix localhost and ip addresses in configdbs" << endl;
+                << "cannot mix localhost and ip addresses in configdbs";
             return 10;
         }
     }
@@ -380,7 +353,7 @@ static int _main() {
 namespace mongo {
     static ExitCode initService() {
         ntservice::reportStatus( SERVICE_RUNNING );
-        log() << "Service running" << endl;
+        log() << "Service running";
 
         ExitCode exitCode = runMongosServer(mongosGlobalParams.upgrade);
 
@@ -423,8 +396,6 @@ int mongoSMain(int argc, char* argv[], char** envp) {
 
     setupSignalHandlers(false);
 
-    mongosCommand = argv[0];
-
     Status status = mongo::runGlobalInitializers(argc, argv, envp);
     if (!status.isOK()) {
         severe(LogComponent::kDefault) << "Failed global initialization: " << status;
@@ -440,21 +411,19 @@ int mongoSMain(int argc, char* argv[], char** envp) {
         int exitCode = _main();
         return exitCode;
     }
-    catch(SocketException& e) {
-        cout << "uncaught SocketException in mongos main:" << endl;
-        cout << e.toString() << endl;
+    catch(const SocketException& e) {
+        error() << "uncaught SocketException in mongos main: " << e.toString();
     }
-    catch(DBException& e) {
-        cout << "uncaught DBException in mongos main:" << endl;
-        cout << e.toString() << endl;
+    catch (const DBException& e) {
+        error() << "uncaught DBException in mongos main: " << e.toString();
     }
-    catch(std::exception& e) {
-        cout << "uncaught std::exception in mongos main:" << endl;
-        cout << e.what() << endl;
+    catch (const std::exception& e) {
+        error() << "uncaught std::exception in mongos main:" << e.what();
     }
-    catch(...) {
-        cout << "uncaught unknown exception in mongos main" << endl;
+    catch (...) {
+        error() << "uncaught unknown exception in mongos main";
     }
+
     return 20;
 }
 
@@ -476,8 +445,6 @@ int main(int argc, char* argv[], char** envp) {
 }
 #endif
 
-#undef exit
-
 void mongo::signalShutdown() {
     // Notify all threads shutdown has started
     dbexitCalled = true;
@@ -489,7 +456,7 @@ void mongo::exitCleanly(ExitCode code) {
     mongo::dbexit( code );
 }
 
-void mongo::dbexit( ExitCode rc, const char *why ) {
+void mongo::dbexit(ExitCode rc, const char *why) {
     dbexitCalled = true;
     audit::logShutdown(ClientBasic::getCurrent());
 
@@ -497,13 +464,12 @@ void mongo::dbexit( ExitCode rc, const char *why ) {
     // Windows Service Controller wants to be told when we are done shutting down
     // and call quickExit itself.
     //
-    if ( rc == EXIT_WINDOWS_SERVICE_STOP ) {
-        log() << "dbexit: exiting because Windows service was stopped" << endl;
+    if (rc == EXIT_WINDOWS_SERVICE_STOP) {
+        log() << "dbexit: exiting because Windows service was stopped";
         return;
     }
 #endif
-    log() << "dbexit: " << why
-          << " rc:" << rc
-          << endl;
+
+    log() << "dbexit: " << why << " rc:" << rc;
     quickExit(rc);
 }

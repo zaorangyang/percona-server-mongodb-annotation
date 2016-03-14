@@ -35,7 +35,6 @@
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/stdx/functional.h"
 
 
@@ -65,46 +64,7 @@ namespace mongo {
                                                 bool showBuiltinRoles,
                                                 std::vector<BSONObj>* result);
 
-        /**
-         * Implements findOne of the AuthzManagerExternalState interface
-         *
-         * NOTE: The data returned from this helper may be from any config server or replica set
-         * node.  The first config server or primary node is preferred, when available.
-         */
-        virtual Status findOne(OperationContext* txn,
-                               const NamespaceString& collectionName,
-                               const BSONObj& query,
-                               BSONObj* result);
-
-        /**
-         * Implements query of the AuthzManagerExternalState interface
-         *
-         * NOTE: The data returned from this helper may be from any config server or replica set
-         * node.  The first config server or primary node is preferred, when available.
-         */
-        virtual Status query(OperationContext* txn,
-                             const NamespaceString& collectionName,
-                             const BSONObj& query,
-                             const BSONObj& projection,
-                             const stdx::function<void(const BSONObj&)>& resultProcessor);
-
-        virtual Status insert(OperationContext* txn,
-                              const NamespaceString& collectionName,
-                              const BSONObj& document,
-                              const BSONObj& writeConcern);
-        virtual Status update(OperationContext* txn,
-                              const NamespaceString& collectionName,
-                              const BSONObj& query,
-                              const BSONObj& updatePattern,
-                              bool upsert,
-                              bool multi,
-                              const BSONObj& writeConcern,
-                              int* nMatched);
-        virtual Status remove(OperationContext* txn,
-                              const NamespaceString& collectionName,
-                              const BSONObj& query,
-                              const BSONObj& writeConcern,
-                              int* numRemoved);
+        bool hasAnyPrivilegeDocuments(OperationContext* txn) override;
     };
 
 } // namespace mongo

@@ -35,10 +35,12 @@
 
 #include <boost/functional/hash.hpp>
 #include <boost/ref.hpp>
+#include <memory>
 #include "third_party/murmurhash3/MurmurHash3.h"
 
 #include "mongo/base/counter.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
@@ -60,6 +62,7 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
@@ -108,7 +111,6 @@ namespace repl {
     }
 
     SyncTail::SyncTail(BackgroundSyncInterface *q, MultiSyncApplyFunc func) :
-        Sync(""), 
         _networkQueue(q), 
         _applyFunc(func),
         _writerPool(replWriterThreadCount, "repl writer worker "),
@@ -120,19 +122,21 @@ namespace repl {
     bool SyncTail::peek(BSONObj* op) {
         return _networkQueue->peek(op);
     }
-    /* apply the log op that is in param o
-       @return bool success (true) or failure (false)
-    */
-    bool SyncTail::syncApply(OperationContext* txn,
-                             const BSONObj &op,
-                             bool convertUpdateToUpsert) {
+
+    // static
+    Status SyncTail::syncApply(OperationContext* txn,
+                               const BSONObj &op,
+                               bool convertUpdateToUpsert,
+                               ApplyOperationInLockFn applyOperationInLock,
+                               ApplyCommandInLockFn applyCommandInLock,
+                               IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
 
         if (inShutdown()) {
-            return true;
+            return Status::OK();
         }
 
         // Count each log op application as a separate operation, for reporting purposes
-        txn->getCurOp()->reset();
+        CurOp individualOp(txn);
 
         const char *ns = op.getStringField("ns");
         verify(ns);
@@ -149,89 +153,102 @@ namespace repl {
             if (!isNoOp) {
                 error() << "skipping bad op in oplog: " << op.toString();
             }
-            return true;
+            return Status::OK();
         }
 
-        for ( int createCollection = 0; createCollection < 2; createCollection++ ) {
-            try {
-                boost::scoped_ptr<Lock::GlobalWrite> globalWriteLock;
+        if (isCommand) {
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                // a command may need a global write lock. so we will conservatively go
+                // ahead and grab one here. suboptimal. :-(
+                Lock::GlobalWrite globalWriteLock(txn->lockState());
 
+                // special case apply for commands to avoid implicit database creation
+                Status status = applyCommandInLock(txn, op);
+                incrementOpsAppliedStats();
+                return status;
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "syncApply_command", ns);
+        }
+
+        auto applyOp = [&](Database* db) {
+            // For non-initial-sync, we convert updates to upserts
+            // to suppress errors when replaying oplog entries.
+            txn->setReplicatedWrites(false);
+            DisableDocumentValidation validationDisabler(txn);
+
+            Status status = applyOperationInLock(txn, db, op, convertUpdateToUpsert);
+            incrementOpsAppliedStats();
+            return status;
+        };
+
+        if (isNoOp ||
+            (opType[0] == 'i' && nsToCollectionSubstring( ns ) == "system.indexes")) {
+            auto opStr = isNoOp ? "syncApply_noop" : "syncApply_indexBuild";
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                Lock::DBLock dbLock(txn->lockState(), nsToDatabaseSubstring(ns), MODE_X);
+                OldClientContext ctx(txn, ns);
+                return applyOp(ctx.db());
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, opStr, ns);
+        }
+
+        if (isCrudOpType(opType)) {
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
                 // DB lock always acquires the global lock
-                boost::scoped_ptr<Lock::DBLock> dbLock;
-                boost::scoped_ptr<Lock::CollectionLock> collectionLock;
+                std::unique_ptr<Lock::DBLock> dbLock;
+                std::unique_ptr<Lock::CollectionLock> collectionLock;
+                std::unique_ptr<OldClientContext> ctx;
 
-                bool isIndexBuild = opType[0] == 'i' &&
-                    nsToCollectionSubstring( ns ) == "system.indexes";
+                auto dbName = nsToDatabaseSubstring(ns);
 
-                if (isCommand) {
-                    // a command may need a global write lock. so we will conservatively go
-                    // ahead and grab one here. suboptimal. :-(
-                    globalWriteLock.reset(new Lock::GlobalWrite(txn->lockState()));
-                    
-                    // special case apply for commands to avoid implicit database creation
-                    Status status = applyCommand_inlock(txn, op);
-                    opsAppliedStats.increment();
-                    return status.isOK();
-                }
-                else if (isIndexBuild) {
-                    dbLock.reset(new Lock::DBLock(txn->lockState(),
-                                                  nsToDatabaseSubstring(ns), MODE_X));
-                }
-                else if (isCrudOpType(opType)) {
-                    LockMode mode = createCollection ? MODE_X : MODE_IX;
-                    dbLock.reset(new Lock::DBLock(txn->lockState(),
-                                                  nsToDatabaseSubstring(ns), mode));
+                auto resetLocks = [&](LockMode mode) {
+                    collectionLock.reset();
+                    dbLock.reset(new Lock::DBLock(txn->lockState(), dbName, mode));
                     collectionLock.reset(new Lock::CollectionLock(txn->lockState(), ns, mode));
+                };
 
-                    if (!createCollection && !dbHolder().get(txn, nsToDatabaseSubstring(ns))) {
-                        // need to create database, try again
-                        continue;
-                    }
-                }
-                else if (isNoOp) {
-                    dbLock.reset(new Lock::DBLock(txn->lockState(),
-                                                  nsToDatabaseSubstring(ns), MODE_X));
+                resetLocks(MODE_IX);
+                if (!dbHolder().get(txn, dbName)) {
+                    // need to create database, try again
+                    resetLocks(MODE_X);
+                    ctx.reset(new OldClientContext(txn, ns));
                 }
                 else {
-                    // unknown opType
-                    error() << "bad opType '" << opType << "' in oplog entry: " << op.toString();
-                    return false;
+                    ctx.reset(new OldClientContext(txn, ns));
+                    if (!ctx->db()->getCollection(ns)) {
+                        // uh, oh, we need to create collection
+                        // try again
+                        ctx.reset();
+                        resetLocks(MODE_X);
+                        ctx.reset(new OldClientContext(txn, ns));
+                    }
                 }
 
-                OldClientContext ctx(txn, ns);
-
-                if ( createCollection == 0 &&
-                     !isIndexBuild &&
-                     isCrudOpType(opType) &&
-                     ctx.db()->getCollection(ns) == NULL ) {
-                    // uh, oh, we need to create collection
-                    // try again
-                    continue;
-                }
-
-                // For non-initial-sync, we convert updates to upserts
-                // to suppress errors when replaying oplog entries.
-                txn->setReplicatedWrites(false);
-                DisableDocumentValidation validationDisabler(txn);
-
-                Status status = applyOperation_inlock(txn, ctx.db(), op, convertUpdateToUpsert);
-                opsAppliedStats.increment();
-                return status.isOK();
-            }
-            catch (const WriteConflictException&) {
-                log() << "WriteConflictException while doing oplog application on: " << ns
-                      << ", retrying.";
-                createCollection--;
-            }
+                return applyOp(ctx->db());
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "syncApply_CRUD", ns);
         }
 
-        // Keeps the compiler warnings happy
-        invariant(false);
-        return false;
+        // unknown opType
+        str::stream ss;
+        ss << "bad opType '" << opType << "' in oplog entry: " << op.toString();
+        error() << std::string(ss);
+        return Status(ErrorCodes::BadValue, ss);
     }
 
+    Status SyncTail::syncApply(OperationContext* txn,
+                               const BSONObj &op,
+                               bool convertUpdateToUpsert) {
+        return syncApply(txn,
+                         op,
+                         convertUpdateToUpsert,
+                         applyOperation_inlock,
+                         applyCommand_inlock,
+                         stdx::bind(&Counter64::increment, &opsAppliedStats, 1ULL));
+    }
+
+
+namespace {
+
     // The pool threads call this to prefetch each op
-    void SyncTail::prefetchOp(const BSONObj& op) {
+    void prefetchOp(const BSONObj& op) {
         initializePrefetchThread();
 
         const char *ns = op.getStringField("ns");
@@ -257,83 +274,35 @@ namespace repl {
     }
 
     // Doles out all the work to the reader pool threads and waits for them to complete
-    void SyncTail::prefetchOps(const std::deque<BSONObj>& ops) {
+    void prefetchOps(const std::deque<BSONObj>& ops,
+                               threadpool::ThreadPool* prefetcherPool) {
+        invariant(prefetcherPool);
         for (std::deque<BSONObj>::const_iterator it = ops.begin();
              it != ops.end();
              ++it) {
-            _prefetcherPool.schedule(&prefetchOp, *it);
+            prefetcherPool->schedule(&prefetchOp, *it);
         }
-        _prefetcherPool.join();
+        prefetcherPool->join();
     }
-    
+
     // Doles out all the work to the writer pool threads and waits for them to complete
-    void SyncTail::applyOps(const std::vector< std::vector<BSONObj> >& writerVectors) {
+    void applyOps(const std::vector< std::vector<BSONObj> >& writerVectors,
+                            threadpool::ThreadPool* writerPool,
+                            SyncTail::MultiSyncApplyFunc func,
+                            SyncTail* sync) {
         TimerHolder timer(&applyBatchStats);
         for (std::vector< std::vector<BSONObj> >::const_iterator it = writerVectors.begin();
              it != writerVectors.end();
              ++it) {
             if (!it->empty()) {
-                _writerPool.schedule(_applyFunc, boost::cref(*it), this);
+                writerPool->schedule(func, boost::cref(*it), sync);
             }
         }
-        _writerPool.join();
+        writerPool->join();
     }
 
-    // Doles out all the work to the writer pool threads and waits for them to complete
-    Timestamp SyncTail::multiApply(OperationContext* txn, std::deque<BSONObj>& ops) {
-
-        if (getGlobalServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
-            // Use a ThreadPool to prefetch all the operations in a batch.
-            prefetchOps(ops);
-        }
-        
-        std::vector< std::vector<BSONObj> > writerVectors(replWriterThreadCount);
-
-        fillWriterVectors(ops, &writerVectors);
-        LOG(2) << "replication batch size is " << ops.size() << endl;
-        // We must grab this because we're going to grab write locks later.
-        // We hold this mutex the entire time we're writing; it doesn't matter
-        // because all readers are blocked anyway.
-        SimpleMutex::scoped_lock fsynclk(filesLockedFsync);
-
-        // stop all readers until we're done
-        Lock::ParallelBatchWriterMode pbwm(txn->lockState());
-
-        ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-        if (replCoord->getMemberState().primary() &&
-            !replCoord->isWaitingForApplierToDrain()) {
-
-            severe() << "attempting to replicate ops while primary";
-            fassertFailed(28527);
-        }
-
-        applyOps(writerVectors);
-
-        if (inShutdown()) {
-            return Timestamp();
-        }
-
-        const bool mustWaitUntilDurable = replCoord->isV1ElectionProtocol() && supportsWaitingUntilDurable();
-        if (mustWaitUntilDurable) {
-            txn->recoveryUnit()->goingToWaitUntilDurable();
-        }
-
-        OpTime lastOpTime = writeOpsToOplog(txn, ops);
-
-        if (mustWaitUntilDurable) {
-            txn->recoveryUnit()->waitUntilDurable();
-        }
-        ReplClientInfo::forClient(txn->getClient()).setLastOp(lastOpTime);
-        replCoord->setMyLastOptime(lastOpTime);
-        setNewOptime(lastOpTime.getTimestamp());
-
-        BackgroundSync::get()->notify(txn);
-
-        return lastOpTime.getTimestamp();
-    }
-
-    void SyncTail::fillWriterVectors(const std::deque<BSONObj>& ops,
-                                     std::vector< std::vector<BSONObj> >* writerVectors) {
+    void fillWriterVectors(const std::deque<BSONObj>& ops,
+                           std::vector< std::vector<BSONObj> >* writerVectors) {
 
         for (std::deque<BSONObj>::const_iterator it = ops.begin();
              it != ops.end();
@@ -367,12 +336,80 @@ namespace repl {
             (*writerVectors)[hash % writerVectors->size()].push_back(*it);
         }
     }
-    void SyncTail::oplogApplication(OperationContext* txn, const Timestamp& endOpTime) {
+
+} // namespace
+
+    // Doles out all the work to the writer pool threads and waits for them to complete
+    // static
+    OpTime SyncTail::multiApply(OperationContext* txn,
+                                const OpQueue& ops,
+                                threadpool::ThreadPool* prefetcherPool,
+                                threadpool::ThreadPool* writerPool,
+                                MultiSyncApplyFunc func,
+                                SyncTail* sync,
+                                bool supportsWaitingUntilDurable) {
+        invariant(prefetcherPool);
+        invariant(writerPool);
+        invariant(func);
+        invariant(sync);
+
+        if (getGlobalServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
+            // Use a ThreadPool to prefetch all the operations in a batch.
+            prefetchOps(ops.getDeque(), prefetcherPool);
+        }
+        
+        std::vector< std::vector<BSONObj> > writerVectors(replWriterThreadCount);
+
+        fillWriterVectors(ops.getDeque(), &writerVectors);
+        LOG(2) << "replication batch size is " << ops.getDeque().size() << endl;
+        // We must grab this because we're going to grab write locks later.
+        // We hold this mutex the entire time we're writing; it doesn't matter
+        // because all readers are blocked anyway.
+        SimpleMutex::scoped_lock fsynclk(filesLockedFsync);
+
+        // stop all readers until we're done
+        Lock::ParallelBatchWriterMode pbwm(txn->lockState());
+
+        ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
+        if (replCoord->getMemberState().primary() &&
+            !replCoord->isWaitingForApplierToDrain()) {
+
+            severe() << "attempting to replicate ops while primary";
+            fassertFailed(28527);
+        }
+
+        applyOps(writerVectors, writerPool, func, sync);
+
+        if (inShutdown()) {
+            return OpTime();
+        }
+
+        const bool mustWaitUntilDurable = replCoord->isV1ElectionProtocol() &&
+                                          supportsWaitingUntilDurable;
+        if (mustWaitUntilDurable) {
+            txn->recoveryUnit()->goingToWaitUntilDurable();
+        }
+
+        OpTime lastOpTime = writeOpsToOplog(txn, ops.getDeque());
+
+        if (mustWaitUntilDurable) {
+            txn->recoveryUnit()->waitUntilDurable();
+        }
+        ReplClientInfo::forClient(txn->getClient()).setLastOp(lastOpTime);
+        replCoord->setMyLastOptime(lastOpTime);
+        setNewTimestamp(lastOpTime.getTimestamp());
+
+        BackgroundSync::get()->notify(txn);
+
+        return lastOpTime;
+    }
+
+    void SyncTail::oplogApplication(OperationContext* txn, const OpTime& endOpTime) {
         _applyOplogUntil(txn, endOpTime);
     }
 
     /* applies oplog from "now" until endOpTime using the applier threads for initial sync*/
-    void SyncTail::_applyOplogUntil(OperationContext* txn, const Timestamp& endOpTime) {
+    void SyncTail::_applyOplogUntil(OperationContext* txn, const OpTime& endOpTime) {
         unsigned long long bytesApplied = 0;
         unsigned long long entriesApplied = 0;
         while (true) {
@@ -384,7 +421,7 @@ namespace repl {
 
                 // Check if we reached the end
                 const BSONObj currentOp = ops.back();
-                const Timestamp currentOpTime = currentOp["ts"].timestamp();
+                const OpTime currentOpTime = extractOpTime(currentOp);
 
                 // When we reach the end return this batch
                 if (currentOpTime == endOpTime) {
@@ -414,8 +451,13 @@ namespace repl {
             bytesApplied += ops.getSize();
             entriesApplied += ops.getDeque().size();
 
-            const Timestamp lastOpTime = multiApply(txn, ops.getDeque());
-
+            const OpTime lastOpTime = multiApply(txn,
+                                                 ops,
+                                                 &_prefetcherPool,
+                                                 &_writerPool,
+                                                 _applyFunc,
+                                                 this,
+                                                 supportsWaitingUntilDurable());
             if (inShutdown()) {
                 return;
             }
@@ -424,7 +466,7 @@ namespace repl {
             if (lastOpTime == endOpTime) {
                 LOG(1) << "SyncTail applied " << entriesApplied
                        << " entries (" << bytesApplied << " bytes)"
-                       << " and finished at opTime " << endOpTime.toStringPretty();
+                       << " and finished at opTime " << endOpTime;
                 return;
             }
         } // end of while (true)
@@ -450,8 +492,8 @@ namespace {
             return;
         }
 
-        Timestamp minvalid = getMinValid(txn);
-        if (minvalid > replCoord->getMyLastOptime().getTimestamp()) {
+        OpTime minvalid = getMinValid(txn);
+        if (minvalid > replCoord->getMyLastOptime()) {
             return;
         }
 
@@ -502,7 +544,7 @@ namespace {
 
                 const int slaveDelaySecs = replCoord->getSlaveDelaySecs().count();
                 if (!ops.empty() && slaveDelaySecs > 0) {
-                    const BSONObj& lastOp = ops.getDeque().back();
+                    const BSONObj lastOp = ops.back();
                     const unsigned int opTimestampSecs = lastOp["ts"].timestamp().getSecs();
 
                     // Stop the batch as the lastOp is too new to be applied. If we continue
@@ -529,15 +571,20 @@ namespace {
                 continue;
             }
 
-            const BSONObj& lastOp = ops.getDeque().back();
+            const BSONObj lastOp = ops.back();
             handleSlaveDelay(lastOp);
 
             // Set minValid to the last op to be applied in this next batch.
             // This will cause this node to go into RECOVERING state
             // if we should crash and restart before updating the oplog
-            Timestamp minValid = lastOp["ts"].timestamp();
-            setMinValid(&txn, minValid);
-            multiApply(&txn, ops.getDeque());
+            setMinValid(&txn, extractOpTime(lastOp));
+            multiApply(&txn,
+                       ops,
+                       &_prefetcherPool,
+                       &_writerPool,
+                       _applyFunc,
+                       this,
+                       supportsWaitingUntilDurable());
         }
     }
 
@@ -653,6 +700,112 @@ namespace {
         } // endif slaveDelay
     }
 
+    void SyncTail::setHostname(const std::string& hostname) {
+        _hostname = hostname;
+    }
+
+    BSONObj SyncTail::getMissingDoc(OperationContext* txn, Database* db, const BSONObj& o) {
+        OplogReader missingObjReader; // why are we using OplogReader to run a non-oplog query?
+        const char *ns = o.getStringField("ns");
+
+        // capped collections
+        Collection* collection = db->getCollection(ns);
+        if ( collection && collection->isCapped() ) {
+            log() << "missing doc, but this is okay for a capped collection (" << ns << ")";
+            return BSONObj();
+        }
+
+        const int retryMax = 3;
+        for (int retryCount = 1; retryCount <= retryMax; ++retryCount) {
+            if (retryCount != 1) {
+                // if we are retrying, sleep a bit to let the network possibly recover
+                sleepsecs(retryCount * retryCount);
+            }
+            try {
+                bool ok = missingObjReader.connect(HostAndPort(_hostname));
+                if (!ok) {
+                    warning() << "network problem detected while connecting to the "
+                              << "sync source, attempt " << retryCount << " of "
+                              << retryMax << endl;
+                        continue;  // try again
+                }
+            }
+            catch (const SocketException&) {
+                warning() << "network problem detected while connecting to the "
+                          << "sync source, attempt " << retryCount << " of "
+                          << retryMax << endl;
+                continue; // try again
+            }
+
+            // might be more than just _id in the update criteria
+            BSONObj query = BSONObjBuilder().append(o.getObjectField("o2")["_id"]).obj();
+            BSONObj missingObj;
+            try {
+                missingObj = missingObjReader.findOne(ns, query);
+            }
+            catch (const SocketException&) {
+                warning() << "network problem detected while fetching a missing document from the "
+                          << "sync source, attempt " << retryCount << " of "
+                          << retryMax << endl;
+                continue; // try again
+            }
+            catch (DBException& e) {
+                error() << "assertion fetching missing object: " << e.what() << endl;
+                throw;
+            }
+
+            // success!
+            return missingObj;
+        }
+        // retry count exceeded
+        msgasserted(15916, str::stream() <<
+                    "Can no longer connect to initial sync source: " << _hostname);
+    }
+
+    bool SyncTail::shouldRetry(OperationContext* txn, const BSONObj& o) {
+        const NamespaceString nss(o.getStringField("ns"));
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            // Take an X lock on the database in order to preclude other modifications.
+            // Also, the database might not exist yet, so create it.
+            AutoGetOrCreateDb autoDb(txn, nss.db(), MODE_X);
+            Database* const db = autoDb.getDb();
+
+            // we don't have the object yet, which is possible on initial sync.  get it.
+            log() << "adding missing object" << endl; // rare enough we can log
+
+            BSONObj missingObj = getMissingDoc(txn, db, o);
+
+            if( missingObj.isEmpty() ) {
+                log() << "missing object not found on source."
+                         " presumably deleted later in oplog";
+                log() << "o2: " << o.getObjectField("o2").toString();
+                log() << "o firstfield: " << o.getObjectField("o").firstElementFieldName();
+
+                return false;
+            }
+            else {
+                WriteUnitOfWork wunit(txn);
+
+                Collection* const coll = db->getOrCreateCollection(txn, nss.toString());
+                invariant(coll);
+
+                StatusWith<RecordId> result = coll->insertDocument(txn, missingObj, true);
+                uassert(15917,
+                        str::stream() << "failed to insert missing doc: "
+                                      << result.getStatus().toString(),
+                        result.isOK() );
+
+                LOG(1) << "inserted missing doc: " << missingObj.toString() << endl;
+
+                wunit.commit();
+                return true;
+            }
+        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "InsertRetry", nss.ns());
+
+        // fixes compile errors on GCC - see SERVER-18219 for details
+        MONGO_UNREACHABLE;
+    }
+
     static AtomicUInt32 replWriterWorkerId;
 
     static void initializeWriterThread() {
@@ -680,7 +833,7 @@ namespace {
              it != ops.end();
              ++it) {
             try {
-                if (!st->syncApply(&txn, *it, convertUpdatesToUpserts)) {
+                if (!SyncTail::syncApply(&txn, *it, convertUpdatesToUpserts).isOK()) {
                     fassertFailedNoTrace(16359);
                 }
             }
@@ -708,14 +861,16 @@ namespace {
         // allow us to get through the magic barrier
         txn.lockState()->setIsBatchWriter(true);
 
+        bool convertUpdatesToUpserts = false;
+
         for (std::vector<BSONObj>::const_iterator it = ops.begin();
              it != ops.end();
              ++it) {
             try {
-                if (!st->syncApply(&txn, *it)) {
+                if (!SyncTail::syncApply(&txn, *it, convertUpdatesToUpserts).isOK()) {
 
                     if (st->shouldRetry(&txn, *it)) {
-                        if (!st->syncApply(&txn, *it)) {
+                        if (!SyncTail::syncApply(&txn, *it, convertUpdatesToUpserts).isOK()) {
                             fassertFailedNoTrace(15915);
                         }
                     }

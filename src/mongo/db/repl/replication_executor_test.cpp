@@ -30,15 +30,16 @@
 
 #include <map>
 #include <boost/scoped_ptr.hpp>
-#include <boost/thread/barrier.hpp>
 #include <boost/thread/thread.hpp>
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/network_interface_mock.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/replication_executor_test_fixture.h"
+#include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/executor/network_interface_mock.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/map_util.h"
@@ -47,6 +48,8 @@ namespace mongo {
 namespace repl {
 
 namespace {
+
+    using executor::NetworkInterfaceMock;
 
     bool operator==(const RemoteCommandRequest lhs,
                     const RemoteCommandRequest rhs) {
@@ -155,6 +158,7 @@ namespace {
         void onGoAfterTriggered(const ReplicationExecutor::CallbackData& cbData);
 
         NetworkInterfaceMock* net;
+        StorageInterfaceMock* storage;
         ReplicationExecutor executor;
         boost::thread executorThread;
         const ReplicationExecutor::EventHandle goEvent;
@@ -176,7 +180,8 @@ namespace {
 
     EventChainAndWaitingTest::EventChainAndWaitingTest() :
         net(new NetworkInterfaceMock),
-        executor(net, prngSeed),
+        storage(new StorageInterfaceMock),
+        executor(net, storage, prngSeed),
         executorThread(stdx::bind(&ReplicationExecutor::run, &executor)),
         goEvent(unittest::assertGet(executor.makeEvent())),
         event2(unittest::assertGet(executor.makeEvent())),
@@ -383,7 +388,7 @@ namespace {
     }
 
     TEST_F(ReplicationExecutorTest, ScheduleDBWorkAndExclusiveWorkConcurrently) {
-        boost::barrier barrier(2U);
+        unittest::Barrier barrier(2U);
         NamespaceString nss("mydb", "mycoll");
         ReplicationExecutor& executor = getExecutor();
         Status status1(ErrorCodes::InternalError, "Not mutated");
@@ -392,13 +397,13 @@ namespace {
         ASSERT_OK(executor.scheduleDBWork([&](const CallbackData& cbData) {
             status1 = cbData.status;
             txn = cbData.txn;
-            barrier.count_down_and_wait();
+            barrier.countDownAndWait();
             if (cbData.status != ErrorCodes::CallbackCanceled) {
                 cbData.executor->shutdown();
             }
         }).getStatus());
         ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock([&](const CallbackData& cbData) {
-            barrier.count_down_and_wait();
+            barrier.countDownAndWait();
         }).getStatus());
         executor.run();
         ASSERT_OK(status1);
@@ -446,6 +451,31 @@ namespace {
         ASSERT_OK(status1);
         ASSERT(txn);
         ASSERT_TRUE(lockIsW);
+    }
+
+    TEST_F(ReplicationExecutorTest, ShutdownBeforeRunningSecondExclusiveLockOperation) {
+        ReplicationExecutor& executor = getExecutor();
+        using CallbackData = ReplicationExecutor::CallbackData;
+        Status status1(ErrorCodes::InternalError, "Not mutated");
+        ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock([&](const CallbackData& cbData) {
+            status1 = cbData.status;
+            if (cbData.status != ErrorCodes::CallbackCanceled) {
+                cbData.executor->shutdown();
+            }
+        }).getStatus());
+        // Second db work item is invoked by the main executor thread because the work item is
+        // moved from the exclusive lock queue to the ready work item queue when the first callback
+        // cancels the executor.
+        Status status2(ErrorCodes::InternalError, "Not mutated");
+        ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock([&](const CallbackData& cbData) {
+            status2 = cbData.status;
+            if (cbData.status != ErrorCodes::CallbackCanceled) {
+                cbData.executor->shutdown();
+            }
+        }).getStatus());
+        executor.run();
+        ASSERT_OK(status1);
+        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status2.code());
     }
 
     TEST_F(ReplicationExecutorTest, RemoteCommandWithTimeout) {

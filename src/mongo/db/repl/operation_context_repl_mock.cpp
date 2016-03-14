@@ -36,32 +36,26 @@
 namespace mongo {
 namespace repl {
 
-    OperationContextReplMock::OperationContextReplMock():
-            _lockState(new MMAPV1LockerImpl()),
-            _opID(0),
+    OperationContextReplMock::OperationContextReplMock() : OperationContextReplMock(0) {}
+
+    OperationContextReplMock::OperationContextReplMock(unsigned int opNum) :
+        OperationContextReplMock(nullptr, opNum) {
+    }
+
+    OperationContextReplMock::OperationContextReplMock(Client* client, unsigned int opNum) :
+            OperationContextNoop(client, opNum, new MMAPV1LockerImpl()),
             _checkForInterruptStatus(Status::OK()),
-            _maxTimeMicrosRemaining(0) {
+            _maxTimeMicrosRemaining(0),
+            _writesAreReplicated(true) {
     }
 
-    OperationContextReplMock::~OperationContextReplMock() {}
+    OperationContextReplMock::~OperationContextReplMock() = default;
 
-    Locker* OperationContextReplMock::lockState() const {
-        return _lockState.get();
-    }
-
-    unsigned int OperationContextReplMock::getOpID() const {
-        return _opID;
-    }
-
-    void OperationContextReplMock::setOpID(unsigned int opID) {
-        _opID = opID;
-    }
-
-    void OperationContextReplMock::checkForInterrupt() const {
+    void OperationContextReplMock::checkForInterrupt() {
         uassertStatusOK(checkForInterruptNoAssert());
     }
 
-    Status OperationContextReplMock::checkForInterruptNoAssert() const {
+    Status OperationContextReplMock::checkForInterruptNoAssert() {
         if (!_checkForInterruptStatus.isOK()) {
             return _checkForInterruptStatus;
         }
@@ -79,6 +73,14 @@ namespace repl {
 
     void OperationContextReplMock::setRemainingMaxTimeMicros(uint64_t micros) {
         _maxTimeMicrosRemaining = micros;
+    }
+
+    void OperationContextReplMock::setReplicatedWrites(bool writesAreReplicated) {
+        _writesAreReplicated = writesAreReplicated;
+    }
+
+    bool OperationContextReplMock::writesAreReplicated() const {
+        return _writesAreReplicated;
     }
 
 }  // namespace repl

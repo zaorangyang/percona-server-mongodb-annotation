@@ -46,6 +46,7 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
@@ -114,6 +115,35 @@ namespace {
         return ss.str();
     }
 
+    //
+    // CappedInsertNotifier
+    //
+
+    CappedInsertNotifier::CappedInsertNotifier()
+        : _cappedInsertCount(0) {
+    }
+
+    void CappedInsertNotifier::notifyOfInsert() {
+        stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
+        _cappedInsertCount++;
+        _cappedNewDataNotifier.notify_all();
+    }
+
+    uint64_t CappedInsertNotifier::getCount() const {
+        stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
+        return _cappedInsertCount;
+    }
+
+    void CappedInsertNotifier::waitForInsert(uint64_t referenceCount, Microseconds timeout) const {
+        stdx::unique_lock<stdx::mutex> lk(_cappedNewDataMutex);
+
+        while (referenceCount == _cappedInsertCount) {
+            if (stdx::cv_status::timeout == _cappedNewDataNotifier.wait_for(lk, timeout)) {
+                return;
+            }
+        }
+    }
+
     // ----
 
     Collection::Collection( OperationContext* txn,
@@ -129,7 +159,8 @@ namespace {
           _indexCatalog( this ),
           _validatorDoc(_details->getCollectionOptions(txn).validator.getOwned()),
           _validator(uassertStatusOK(parseValidator(_validatorDoc))),
-          _cursorManager( fullNS ) {
+          _cursorManager(fullNS),
+          _cappedNotifier(_recordStore->isCapped() ? new CappedInsertNotifier() : nullptr) {
         _magic = 1357924;
         _indexCatalog.init(txn);
         if ( isCapped() )
@@ -292,7 +323,15 @@ namespace {
                                                                  ns(),
                                                                  docToInsert,
                                                                  fromMigrate);
+
+            // If there is a notifier object and another thread is waiting on it, then we notify
+            // waiters of this document insert. Waiters keep a shared_ptr to '_cappedNotifier', so
+            // there are waiters if this Collection's shared_ptr is not unique.
+            if (_cappedNotifier && !_cappedNotifier.unique()) {
+                _cappedNotifier->notifyOfInsert();
+            }
         }
+
         return res;
     }
 
@@ -321,6 +360,13 @@ namespace {
             return StatusWith<RecordId>( status );
 
         getGlobalServiceContext()->getOpObserver()->onInsert(txn, ns(), doc);
+
+        // If there is a notifier object and another thread is waiting on it, then we notify waiters
+        // of this document insert. Waiters keep a shared_ptr to '_cappedNotifier', so there are
+        // waiters if this Collection's shared_ptr is not unique.
+        if (_cappedNotifier && !_cappedNotifier.unique()) {
+            _cappedNotifier->notifyOfInsert();
+        }
 
         return loc;
     }
@@ -598,7 +644,12 @@ namespace {
     }
 
     bool Collection::isCapped() const {
-        return _recordStore->isCapped();
+        return _cappedNotifier.get();
+    }
+
+    std::shared_ptr<CappedInsertNotifier> Collection::getCappedInsertNotifier() const {
+        invariant(isCapped());
+        return _cappedNotifier;
     }
 
     uint64_t Collection::numRecords( OperationContext* txn ) const {

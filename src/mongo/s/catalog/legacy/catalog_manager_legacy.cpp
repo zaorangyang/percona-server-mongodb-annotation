@@ -47,9 +47,9 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/s/bson_serializable.h"
 #include "mongo/s/catalog/legacy/cluster_client_internal.h"
 #include "mongo/s/catalog/legacy/config_coordinator.h"
+#include "mongo/s/catalog/legacy/config_upgrade.h"
 #include "mongo/s/catalog/type_actionlog.h"
 #include "mongo/s/catalog/type_changelog.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -57,6 +57,7 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/dbclient_multi_command.h"
 #include "mongo/s/client/shard_connection.h"
@@ -65,6 +66,7 @@
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/type_config_version.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/memory.h"
@@ -380,6 +382,25 @@ namespace {
         return Status::OK();
     }
 
+    Status CatalogManagerLegacy::checkAndUpgradeConfigMetadata(bool doUpgrade) {
+        VersionType initVersionInfo;
+        VersionType versionInfo;
+        string errMsg;
+
+        bool upgraded = checkAndUpgradeConfigVersion(this,
+                                                     doUpgrade,
+                                                     &initVersionInfo,
+                                                     &versionInfo,
+                                                     &errMsg);
+        if (!upgraded) {
+            return Status(ErrorCodes::IncompatibleShardingMetadata,
+                          str::stream() << "error upgrading config database to v"
+                                        << CURRENT_CONFIG_VERSION << causedBy(errMsg));
+        }
+
+        return Status::OK();
+    }
+
     Status CatalogManagerLegacy::startConfigServerChecker() {
         if (!_checkConfigServersConsistent()) {
             return Status(ErrorCodes::IncompatibleShardingMetadata,
@@ -390,6 +411,10 @@ namespace {
         _consistencyCheckerThread.swap(t);
 
         return Status::OK();
+    }
+
+    ConnectionString CatalogManagerLegacy::connectionString() const {
+        return _configServerConnectionString;
     }
 
     void CatalogManagerLegacy::shutDown() {
@@ -553,7 +578,7 @@ namespace {
         return Status::OK();
     }
 
-    Status CatalogManagerLegacy::createDatabase(const std::string& dbName, const Shard* shard) {
+    Status CatalogManagerLegacy::createDatabase(const std::string& dbName) {
         invariant(nsIsDbOnly(dbName));
 
         // The admin and config databases should never be explicitly created. They "just exist",
@@ -564,8 +589,8 @@ namespace {
         // Lock the database globally to prevent conflicts with simultaneous database creation.
         auto scopedDistLock = getDistLockManager()->lock(dbName,
                                                          "createDatabase",
-                                                         stdx::chrono::milliseconds(1000),
-                                                         stdx::chrono::milliseconds(500));
+                                                         Seconds{5},
+                                                         Milliseconds{500});
         if (!scopedDistLock.isOK()) {
             return scopedDistLock.getStatus();
         }
@@ -577,7 +602,7 @@ namespace {
         }
 
         // Database does not exist, pick a shard and create a new entry
-        const Shard primaryShard = (shard ? *shard : Shard::pick());
+        const Shard primaryShard = Shard::pick();
         if (!primaryShard.ok()) {
             return Status(ErrorCodes::ShardNotFound, "can't find a shard to put new db on");
         }
@@ -642,6 +667,7 @@ namespace {
             if (shardConnectionString.type() == ConnectionString::SET) {
                 ReplicaSetMonitor::remove(shardConnectionString.getSetName());
             }
+
             return Status(ErrorCodes::OperationFailed,
                           str::stream() << "couldn't connect to new shard "
                                         << e.what());
@@ -797,7 +823,7 @@ namespace {
 
             Shard::removeShard(name);
             shardConnectionPool.removeHost(name);
-            ReplicaSetMonitor::remove(name, true);
+            ReplicaSetMonitor::remove(name);
 
             Shard::reloadShardInfo();
             conn.done();
@@ -958,7 +984,8 @@ namespace {
                     conn.done();
                     continue;
                 }
-                errors[shard.getConnString()] = info;
+
+                errors[shard.getConnString().toString()] = info;
             }
 
             conn.done();
@@ -1121,7 +1148,9 @@ namespace {
             if (!settingsResult.isOK()) {
                 return settingsResult.getStatus();
             }
+
             const SettingsType& settings = settingsResult.getValue();
+
             Status validationStatus = settings.validate();
             if (!validationStatus.isOK()) {
                 return validationStatus;
@@ -1136,48 +1165,138 @@ namespace {
         }
     }
 
-    void CatalogManagerLegacy::getDatabasesForShard(const string& shardName,
-                                                    vector<string>* dbs) {
-        ScopedDbConnection conn(_configServerConnectionString, 30.0);
-        BSONObj prim = BSON(DatabaseType::primary(shardName));
-        std::unique_ptr<DBClientCursor> cursor(_safeCursor(conn->query(DatabaseType::ConfigNS,
-                                                                       prim)));
+    Status CatalogManagerLegacy::getDatabasesForShard(const string& shardName,
+                                                      vector<string>* dbs) {
+        dbs->clear();
 
-        while (cursor->more()) {
-            BSONObj shard = cursor->nextSafe();
-            dbs->push_back(shard[DatabaseType::name()].str());
+        try {
+            ScopedDbConnection conn(_configServerConnectionString, 30.0);
+            std::unique_ptr<DBClientCursor> cursor(_safeCursor(
+                                conn->query(DatabaseType::ConfigNS,
+                                            Query(BSON(DatabaseType::primary(shardName))))));
+            if (!cursor.get()) {
+                conn.done();
+                return Status(ErrorCodes::HostUnreachable, "unable to open chunk cursor");
+            }
+
+            while (cursor->more()) {
+                BSONObj shard = cursor->nextSafe();
+                dbs->push_back(shard[DatabaseType::name()].str());
+            }
+
+            conn.done();
+        }
+        catch (const DBException& ex) {
+            return ex.toStatus();
         }
 
-        conn.done();
+        return Status::OK();
     }
 
     Status CatalogManagerLegacy::getChunks(const Query& query,
                                            int nToReturn,
                                            vector<ChunkType>* chunks) {
+        chunks->clear();
 
-        ScopedDbConnection conn(_configServerConnectionString, 30.0);
-        std::unique_ptr<DBClientCursor> cursor(conn->query(ChunkType::ConfigNS, query, nToReturn));
-        if (!cursor.get()) {
-            conn.done();
-            return Status(ErrorCodes::HostUnreachable, "unable to open chunk cursor");
-        }
-
-        while (cursor->more()) {
-            BSONObj chunkObj = cursor->nextSafe();
-
-            StatusWith<ChunkType> chunkRes = ChunkType::fromBSON(chunkObj);
-            if (!chunkRes.isOK()) {
+        try {
+            ScopedDbConnection conn(_configServerConnectionString, 30.0);
+            std::unique_ptr<DBClientCursor> cursor(_safeCursor(conn->query(ChunkType::ConfigNS,
+                                                                           query,
+                                                                           nToReturn)));
+            if (!cursor.get()) {
                 conn.done();
-                return Status(ErrorCodes::FailedToParse,
-                              str::stream() << "Failed to parse chunk BSONObj: "
-                                            << chunkRes.getStatus().reason());
+                return Status(ErrorCodes::HostUnreachable, "unable to open chunk cursor");
             }
-            ChunkType chunk = chunkRes.getValue();
-            chunks->push_back(chunk);
+
+            while (cursor->more()) {
+                BSONObj chunkObj = cursor->nextSafe();
+
+                StatusWith<ChunkType> chunkRes = ChunkType::fromBSON(chunkObj);
+                if (!chunkRes.isOK()) {
+                    conn.done();
+                    return Status(ErrorCodes::FailedToParse,
+                                  str::stream() << "Failed to parse chunk BSONObj: "
+                                                << chunkRes.getStatus().reason());
+                }
+
+                chunks->push_back(chunkRes.getValue());
+            }
+
+            conn.done();
         }
-        conn.done();
+        catch (const DBException& ex) {
+            return ex.toStatus();
+        }
 
         return Status::OK();
+    }
+
+    Status CatalogManagerLegacy::getTagsForCollection(const std::string& collectionNs,
+                                                      std::vector<TagsType>* tags) {
+        tags->clear();
+
+        try {
+            ScopedDbConnection conn(_configServerConnectionString, 30);
+            std::unique_ptr<DBClientCursor> cursor(_safeCursor(
+                                conn->query(TagsType::ConfigNS,
+                                            Query(BSON(TagsType::ns(collectionNs)))
+                                                .sort(TagsType::min()))));
+            if (!cursor.get()) {
+                conn.done();
+                return Status(ErrorCodes::HostUnreachable, "unable to open tags cursor");
+            }
+
+            while (cursor->more()) {
+                BSONObj tagObj = cursor->nextSafe();
+
+                StatusWith<TagsType> tagRes = TagsType::fromBSON(tagObj);
+                if (!tagRes.isOK()) {
+                    conn.done();
+                    return Status(ErrorCodes::FailedToParse,
+                                  str::stream() << "Failed to parse tag BSONObj: "
+                                                << tagRes.getStatus().reason());
+                }
+
+                tags->push_back(tagRes.getValue());
+            }
+
+            conn.done();
+        }
+        catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+
+        return Status::OK();
+    }
+
+    StatusWith<string> CatalogManagerLegacy::getTagForChunk(const std::string& collectionNs,
+                                                            const ChunkType& chunk) {
+        BSONObj tagDoc;
+
+        try {
+            ScopedDbConnection conn(_configServerConnectionString, 30);
+
+            Query query(BSON(TagsType::ns(collectionNs) <<
+                             TagsType::min() << BSON("$lte" << chunk.getMin()) <<
+                             TagsType::max() << BSON("$gte" << chunk.getMax())));
+
+            tagDoc = conn->findOne(TagsType::ConfigNS, query);
+            conn.done();
+        }
+        catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+
+        if (tagDoc.isEmpty()) {
+            return std::string("");
+        }
+
+        auto status = TagsType::fromBSON(tagDoc);
+        if (status.isOK()) {
+            return status.getValue().getTag();
+        }
+
+        return status.getStatus();
     }
 
     Status CatalogManagerLegacy::getAllShards(vector<ShardType>* shards) {
@@ -1194,6 +1313,7 @@ namespace {
                               str::stream() << "Failed to parse chunk BSONObj: "
                                             << shardRes.getStatus().reason());
             }
+
             ShardType shard = shardRes.getValue();
             shards->push_back(shard);
         }
@@ -1222,7 +1342,7 @@ namespace {
 
         auto scopedDistLock = getDistLockManager()->lock("authorizationData",
                                                          commandName,
-                                                         stdx::chrono::milliseconds(5000));
+                                                         Seconds{5});
         if (!scopedDistLock.isOK()) {
             return Command::appendCommandStatus(*result, scopedDistLock.getStatus());
         }
@@ -1404,7 +1524,7 @@ namespace {
         }
 
         if (!dbObj.isEmpty()) {
-            return Status(static_cast<ErrorCodes::Error>(DatabaseDifferCaseCode),
+            return Status(ErrorCodes::DatabaseDifferCase,
                           str::stream() << "can't have 2 databases that just differ on case "
                                         << " have: " << dbObj[DatabaseType::name()].String()
                                         << " want to add: " << dbName);

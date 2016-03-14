@@ -38,7 +38,6 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/cursor_responses.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/pipeline_proxy.h"
@@ -50,6 +49,7 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/query/cursor_responses.h"
 #include "mongo/db/query/find_constants.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/storage_options.h"
@@ -129,7 +129,9 @@ namespace mongo {
         if (cursor) {
             // If a time limit was set on the pipeline, remaining time is "rolled over" to the
             // cursor (for use by future getmore ops).
-            cursor->setLeftoverMaxTimeMicros( txn->getCurOp()->getRemainingMaxTimeMicros() );
+            cursor->setLeftoverMaxTimeMicros( CurOp::get(txn)->getRemainingMaxTimeMicros() );
+
+            CurOp::get(txn)->debug().cursorid = cursor->cursorid();
 
             if (txn->getClient()->isInDirectClient()) {
                 cursor->setUnownedRecoveryUnit(txn->recoveryUnit());
@@ -276,7 +278,7 @@ namespace mongo {
                                                             execHolder.release(),
                                                             nss.ns(),
                                                             0,
-                                                            BSONObj(),
+                                                            cmdObj.getOwned(),
                                                             isAggCursor);
                     pin.reset(new ClientCursorPin(collection->getCursorManager(),
                                                   cursor->cursorid()));

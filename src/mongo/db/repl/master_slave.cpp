@@ -66,7 +66,7 @@
 #include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/repl/sync.h"
+#include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/util/concurrency/thread_pool.h"
@@ -473,8 +473,7 @@ namespace repl {
         {
             log() << "resync: cloning database " << db << " to get an initial copy" << endl;
             ReplInfo r("resync: cloning a database");
-            string errmsg;
-            int errCode = 0;
+
             CloneOptions cloneOptions;
             cloneOptions.fromDB = db;
             cloneOptions.slaveOk = true;
@@ -484,30 +483,28 @@ namespace repl {
             cloneOptions.mayBeInterrupted = false;
 
             Cloner cloner;
-            bool ok = cloner.go(txn,
-                                db,
-                                hostName.c_str(),
-                                cloneOptions,
-                                NULL,
-                                errmsg,
-                                &errCode);
+            Status status = cloner.copyDb(txn,
+                                          db,
+                                          hostName.c_str(),
+                                          cloneOptions,
+                                          NULL);
 
-            if ( !ok ) {
-                if ( errCode == DatabaseDifferCaseCode ) {
+            if (!status.isOK()) {
+                if (status.code() == ErrorCodes::DatabaseDifferCase) {
                     resyncDrop( txn,  db );
-                    log() << "resync: database " << db << " not valid on the master due to a name conflict, dropping." << endl;
+                    log() << "resync: database " << db
+                          << " not valid on the master due to a name conflict, dropping.";
                     return;
                 }
                 else {
-                    log() << "resync of " << db << " from " << hostName << " failed " << errmsg << endl;
+                    log() << "resync of " << db << " from " << hostName
+                          << " failed due to: " << status.toString();
                     throw SyncException();
                 }
             }
         }
 
         log() << "resync: done with initial clone for db: " << db << endl;
-
-        return;
     }
     
     static DatabaseIgnorer ___databaseIgnorer;
@@ -624,7 +621,8 @@ namespace repl {
         try {
             Status status = applyCommand_inlock(txn, op);
             if (!status.isOK()) {
-                Sync sync(hostName);
+                SyncTail sync(nullptr, SyncTail::MultiSyncApplyFunc());
+                sync.setHostname(hostName);
                 if (sync.shouldRetry(txn, op)) {
                     uassert(28639,
                             "Failure retrying initial sync update",
@@ -645,7 +643,8 @@ namespace repl {
         try {
             Status status = applyOperation_inlock( txn, db, op );
             if (!status.isOK()) {
-                Sync sync(hostName);
+                SyncTail sync(nullptr, SyncTail::MultiSyncApplyFunc());
+                sync.setHostname(hostName);
                 if (sync.shouldRetry(txn, op)) {
                     uassert(15914,
                             "Failure retrying initial sync update",
@@ -696,6 +695,9 @@ namespace repl {
         if ( !only.empty() && only != clientName )
             return;
 
+        // Push the CurOp stack for "txn" so each individual oplog entry application is separately
+        // reported.
+        CurOp individualOp(txn);
         txn->setReplicatedWrites(false);
         const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         if (replSettings.pretouch &&
@@ -758,7 +760,6 @@ namespace repl {
         // mongos will not send requests there. That's why the last argument is false (do not do
         // version checking).
         OldClientContext ctx(txn, ns, false);
-        txn->getCurOp()->reset();
 
         bool empty = !ctx.db()->getDatabaseCatalogEntry()->hasUserData();
         bool incompleteClone = incompleteCloneDbs.count( clientName ) != 0;

@@ -24,7 +24,7 @@ class MongoDFixture(interface.Fixture):
     against.
     """
 
-    AWAIT_READY_TIMEOUT_SECS = 30
+    AWAIT_READY_TIMEOUT_SECS = 300
 
     def __init__(self,
                  logger,
@@ -89,7 +89,9 @@ class MongoDFixture(interface.Fixture):
     def await_ready(self):
         deadline = time.time() + MongoDFixture.AWAIT_READY_TIMEOUT_SECS
 
-        # Wait until server is accepting connections.
+        # Wait until the mongod is accepting connections. The retry logic is necessary to support
+        # versions of PyMongo <3.0 that immediately raise a ConnectionFailure if a connection cannot
+        # be established.
         while True:
             # Check whether the mongod exited for some reason.
             if self.mongod.poll() is not None:
@@ -97,7 +99,9 @@ class MongoDFixture(interface.Fixture):
                                            " unexpectedly." % (self.port))
 
             try:
-                utils.new_mongo_client(self.port).admin.command("ping")
+                # Use a shorter connection timeout to more closely satisfy the requested deadline.
+                client = utils.new_mongo_client(self.port, timeout_millis=500)
+                client.admin.command("ping")
                 break
             except pymongo.errors.ConnectionFailure:
                 remaining = deadline - time.time()
@@ -115,7 +119,7 @@ class MongoDFixture(interface.Fixture):
         running_at_start = self.is_running()
         success = True  # Still a success even if nothing is running.
 
-        if not running_at_start:
+        if not running_at_start and self.port is not None:
             self.logger.info("mongod on port %d was expected to be running in teardown(), but"
                              " wasn't." % (self.port))
 
@@ -126,10 +130,14 @@ class MongoDFixture(interface.Fixture):
                                  self.mongod.pid)
                 self.mongod.stop()
 
-            success = self.mongod.wait() == 0
+            exit_code = self.mongod.wait()
+            success = exit_code == 0
 
             if running_at_start:
-                self.logger.info("Successfully terminated the mongod on port %d.", self.port)
+                self.logger.info("Successfully terminated the mongod on port %d, exited with code"
+                                 " %d.",
+                                 self.port,
+                                 exit_code)
 
         return success
 

@@ -49,10 +49,6 @@ namespace mongo {
     const BSONField<bool> CollectionType::dropped("dropped");
 
 
-    CollectionType::CollectionType() {
-        clear();
-    }
-
     StatusWith<CollectionType> CollectionType::fromBSON(const BSONObj& source) {
         CollectionType coll;
 
@@ -101,7 +97,7 @@ namespace mongo {
                     return Status(ErrorCodes::ShardKeyNotFound, "invalid shard key");
                 }
 
-                coll._keyPattern = obj.getOwned();
+                coll._keyPattern = KeyPattern(obj.getOwned());
             }
             else if ((status == ErrorCodes::NoSuchKey) && coll.getDropped()) {
                 // Sharding key can be missing if the collection is dropped
@@ -169,7 +165,7 @@ namespace mongo {
                 return Status(ErrorCodes::NoSuchKey, "missing key pattern");
             }
             else {
-                invariant(!_keyPattern->isEmpty());
+                invariant(!_keyPattern->toBSON().isEmpty());
             }
         }
 
@@ -193,7 +189,7 @@ namespace mongo {
         }
 
         if (_keyPattern.is_initialized()) {
-            builder.append(keyPattern.name(), _keyPattern.get());
+            builder.append(keyPattern.name(), _keyPattern->toBSON());
         }
 
         if (_unique.is_initialized()) {
@@ -205,16 +201,6 @@ namespace mongo {
         }
 
         return builder.obj();
-    }
-
-    void CollectionType::clear() {
-        _fullNs.reset();
-        _epoch.reset();
-        _updatedAt.reset();
-        _keyPattern.reset();
-        _unique.reset();
-        _allowBalance.reset();
-        _dropped.reset();
     }
 
     std::string CollectionType::toString() const {
@@ -234,8 +220,8 @@ namespace mongo {
         _updatedAt = updatedAt;
     }
 
-    void CollectionType::setKeyPattern(const BSONObj& keyPattern) {
-        invariant(!keyPattern.isEmpty());
+    void CollectionType::setKeyPattern(const KeyPattern& keyPattern) {
+        invariant(!keyPattern.toBSON().isEmpty());
         _keyPattern = keyPattern;
     }
 

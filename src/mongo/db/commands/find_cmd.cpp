@@ -39,10 +39,10 @@
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/cursor_responses.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/query/cursor_responses.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/get_executor.h"
@@ -201,7 +201,8 @@ namespace mongo {
             }
 
             // Fill out curop information.
-            beginQueryOp(nss, cmdObj, lpq->getNumToReturn(), lpq->getSkip(), txn->getCurOp());
+            int ntoreturn = lpq->getBatchSize().value_or(0);
+            beginQueryOp(txn, nss, cmdObj, ntoreturn, lpq->getSkip());
 
             // 1b) Finish the parsing step by using the LiteParsedQuery to create a CanonicalQuery.
             std::unique_ptr<CanonicalQuery> cq;
@@ -262,8 +263,7 @@ namespace mongo {
                 // there is no ClientCursor id, and then return.
                 const int numResults = 0;
                 const CursorId cursorId = 0;
-                endQueryOp(execHolder.get(), dbProfilingLevel, numResults, cursorId,
-                           txn->getCurOp());
+                endQueryOp(txn, execHolder.get(), dbProfilingLevel, numResults, cursorId);
                 appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
                 return true;
             }
@@ -294,20 +294,22 @@ namespace mongo {
             PlanExecutor* exec = cursor->getExecutor();
 
             // 5) Stream query results, adding them to a BSONArray as we go.
-            //
-            // TODO: Handle result sets larger than 16MB.
             BSONArrayBuilder firstBatch;
             BSONObj obj;
             PlanExecutor::ExecState state;
             int numResults = 0;
-            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+            while (!enoughForFirstBatch(pq, numResults, firstBatch.len())
+                    && PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+                // If adding this object will cause us to exceed the BSON size limit, then we stash
+                // it for later.
+                if (firstBatch.len() + obj.objsize() > BSONObjMaxUserSize && numResults > 0) {
+                    exec->enqueue(obj);
+                    break;
+                }
+
                 // Add result to output buffer.
                 firstBatch.append(obj);
                 numResults++;
-
-                if (enoughForFirstBatch(pq, numResults, firstBatch.len())) {
-                    break;
-                }
             }
 
             // Throw an assertion if query execution fails for any reason.
@@ -325,7 +327,7 @@ namespace mongo {
                 // State will be restored on getMore.
                 exec->saveState();
 
-                cursor->setLeftoverMaxTimeMicros(txn->getCurOp()->getRemainingMaxTimeMicros());
+                cursor->setLeftoverMaxTimeMicros(CurOp::get(txn)->getRemainingMaxTimeMicros());
                 cursor->setPos(numResults);
 
                 // Don't stash the RU for tailable cursors at EOF, let them get a new RU on their
@@ -345,7 +347,7 @@ namespace mongo {
             }
 
             // Fill out curop based on the results.
-            endQueryOp(exec, dbProfilingLevel, numResults, cursorId, txn->getCurOp());
+            endQueryOp(txn, exec, dbProfilingLevel, numResults, cursorId);
 
             // 7) Generate the response object to send to the client.
             appendCursorResponseObject(cursorId, nss.ns(), firstBatch.arr(), &result);

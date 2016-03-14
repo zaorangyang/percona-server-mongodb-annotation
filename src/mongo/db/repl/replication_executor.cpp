@@ -31,8 +31,11 @@
 #include "mongo/db/repl/replication_executor.h"
 
 #include <limits>
+#include <thread>
 
 #include "mongo/db/repl/database_task.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/executor/network_interface.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -43,20 +46,25 @@ namespace {
     stdx::function<void ()> makeNoExcept(const stdx::function<void ()> &fn);
 }  // namespace
 
-    ReplicationExecutor::ReplicationExecutor(NetworkInterface* netInterface, int64_t prngSeed) :
+    using executor::NetworkInterface;
+
+    ReplicationExecutor::ReplicationExecutor(NetworkInterface* netInterface,
+                                             StorageInterface* storageInterface,
+                                             int64_t prngSeed) :
         _random(prngSeed),
         _networkInterface(netInterface),
+        _storageInterface(storageInterface),
         _totalEventWaiters(0),
         _inShutdown(false),
         _dblockWorkers(threadpool::ThreadPool::DoNotStartThreadsTag(),
                        3,
-                       "replCallbackWithGlobalLock-"),
+                       "replExecDBWorker-"),
         _dblockTaskRunner(
             &_dblockWorkers,
-            stdx::bind(&NetworkInterface::createOperationContext, netInterface)),
+            stdx::bind(&StorageInterface::createOperationContext, storageInterface)),
         _dblockExclusiveLockTaskRunner(
             &_dblockWorkers,
-            stdx::bind(&NetworkInterface::createOperationContext, netInterface)),
+            stdx::bind(&StorageInterface::createOperationContext, storageInterface)),
         _nextId(0) {
     }
 
@@ -87,8 +95,13 @@ namespace {
         return _networkInterface->now();
     }
 
+    bool ReplicationExecutor::isRunThread() const {
+        return (_runThreadId == std::this_thread::get_id());
+    }
+
     void ReplicationExecutor::run() {
         setThreadName("ReplicationExecutor");
+        _runThreadId = std::this_thread::get_id();
         _networkInterface->startup();
         _dblockWorkers.startThreads();
         std::pair<WorkItem, CallbackHandle> work;
@@ -560,15 +573,6 @@ namespace {
         isSignaled(false),
         isSignaledCondition(new boost::condition_variable) {
     }
-
-    // This is a bitmask with the first bit set. It's used to mark connections that should be kept
-    // open during stepdowns.
-#ifndef _MSC_EXTENSIONS
-    const unsigned int ReplicationExecutor::NetworkInterface::kMessagingPortKeepOpen;
-#endif // _MSC_EXTENSIONS
-
-    ReplicationExecutor::NetworkInterface::NetworkInterface() {}
-    ReplicationExecutor::NetworkInterface::~NetworkInterface() {}
 
 namespace {
 

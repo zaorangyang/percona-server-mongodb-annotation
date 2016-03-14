@@ -33,12 +33,12 @@
 #include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
 
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/s/balancer_policy.h"
 #include "mongo/util/background.h"
 
 namespace mongo {
 
+    class BalancerPolicy;
+    struct MigrateInfo;
     struct WriteConcernOptions;
 
     /**
@@ -63,9 +63,6 @@ namespace mongo {
         virtual std::string name() const { return "Balancer"; }
 
     private:
-        typedef MigrateInfo CandidateChunk;
-        typedef boost::shared_ptr<CandidateChunk> CandidateChunkPtr;
-
         // hostname:port of my mongos
         std::string _myid;
 
@@ -94,7 +91,7 @@ namespace mongo {
          * @param conn is the connection with the config server(s)
          * @param candidateChunks (IN/OUT) filled with candidate chunks, one per collection, that could possibly be moved
          */
-        void _doBalanceRound(DBClientBase& conn, std::vector<CandidateChunkPtr>* candidateChunks);
+        void _doBalanceRound(std::vector<boost::shared_ptr<MigrateInfo>>* candidateChunks);
 
         /**
          * Issues chunk migration request, one at a time.
@@ -104,7 +101,7 @@ namespace mongo {
          * @param waitForDelete wait for deletes to complete after each chunk move
          * @return number of chunks effectively moved
          */
-        int _moveChunks(const std::vector<CandidateChunkPtr>* candidateChunks,
+        int _moveChunks(const std::vector<boost::shared_ptr<MigrateInfo>>& candidateChunks,
                         const WriteConcernOptions* writeConcern,
                         bool waitForDelete);
 

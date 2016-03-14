@@ -31,6 +31,7 @@
 #include <string>
 
 #include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/util/time_support.h"
 
@@ -47,27 +48,27 @@ namespace repl {
      */
     class ReplSetHeartbeatResponse {
     public:
-        ReplSetHeartbeatResponse();
 
         /**
          * Initializes this ReplSetHeartbeatResponse from the contents of "doc".
+         * "term" is only used to complete a V0 OpTime (which is really a Timestamp).
          */
-        Status initialize(const BSONObj& doc);
+        Status initialize(const BSONObj& doc, long long term);
 
         /**
          * Appends all non-default values to "builder".
          */
-        void addToBSON(BSONObjBuilder* builder) const;
+        void addToBSON(BSONObjBuilder* builder, bool isProtocolVersionV1) const;
 
         /**
          * Returns a BSONObj consisting of all non-default values to "builder".
          */
-        BSONObj toBSON() const;
+        BSONObj toBSON(bool isProtocolVersionV1) const;
 
         /**
          * Returns toBSON().toString()
          */
-        const std::string toString() const { return toBSON().toString(); }
+        const std::string toString() const { return toBSON(true).toString(); }
 
         bool hasDataSet() const { return _hasDataSet; }
         bool hasData() const { return _hasData; }
@@ -84,12 +85,15 @@ namespace repl {
         const std::string& getHbMsg() const { return _hbmsg; }
         bool hasTime() const { return _timeSet; }
         Seconds getTime() const;
-        bool hasOpTime() const { return _opTimeSet; }
-        Timestamp getOpTime() const;
-        const std::string& getSyncingTo() const { return _syncingTo; }
-        int getVersion() const { return _version; }
+        const HostAndPort& getSyncingTo() const { return _syncingTo; }
+        int getConfigVersion() const { return _configVersion; }
         bool hasConfig() const { return _configSet; }
         const ReplicaSetConfig& getConfig() const;
+        bool hasPrimaryId() const { return _primaryIdSet; }
+        long long getPrimaryId() const;
+        long long getTerm() const { return _term; }
+        bool hasOpTime() const { return _opTimeSet; }
+        OpTime getOpTime() const;
 
         /**
          * Sets _mismatch to true.
@@ -138,62 +142,63 @@ namespace repl {
         void setHbMsg(std::string hbmsg) { _hbmsg = hbmsg; }
 
         /**
-         * Sets the optional "time" field of the response to "theTime", which is 
+         * Sets the optional "time" field of the response to "theTime", which is
          * a count of seconds since the UNIX epoch.
          */
         void setTime(Seconds theTime) { _timeSet = true; _time = theTime; }
 
         /**
-         * Sets _opTime to "time" and sets _opTimeSet to true to indicate that the value
-         * of _opTime has been modified.
-         */
-        void setOpTime(Timestamp time) { _opTimeSet = true; _opTime = time; }
-
-        /**
          * Sets _syncingTo to "syncingTo".
          */
-        void setSyncingTo(std::string syncingTo) { _syncingTo = syncingTo; }
+        void setSyncingTo(const HostAndPort& syncingTo) { _syncingTo = syncingTo; }
 
         /**
-         * Sets _version to "version".
+         * Sets _configVersion to "configVersion".
          */
-        void setVersion(int version) { _version = version; }
+        void setConfigVersion(int configVersion) { _configVersion = configVersion; }
 
         /**
          * Initializes _config with "config".
          */
         void setConfig(const ReplicaSetConfig& config) { _configSet = true; _config = config; }
 
+        void setPrimaryId(long long primaryId) { _primaryIdSet = true; _primaryId = primaryId; }
+        void setOpTime(OpTime time) { _opTimeSet = true; _opTime = time; }
+        void setTerm(long long term) { _term = term; }
     private:
-        bool _electionTimeSet;
+        bool _electionTimeSet = false;
         Timestamp _electionTime;
 
-        bool _timeSet;
-        Seconds _time;  // Seconds since UNIX epoch.
+        bool _timeSet = false;
+        Seconds _time = Seconds(0);  // Seconds since UNIX epoch.
 
-        bool _opTimeSet;
-        Timestamp _opTime;
+        bool _opTimeSet = false;
+        OpTime _opTime;
 
-        bool _electableSet;
-        bool _electable;
+        bool _electableSet = false;
+        bool _electable = false;
 
-        bool _hasDataSet;
-        bool _hasData;
+        bool _hasDataSet = false;
+        bool _hasData = false;
 
-        bool _mismatch;
-        bool _isReplSet;
-        bool _stateDisagreement;
+        bool _mismatch = false;
+        bool _isReplSet = false;
+        bool _stateDisagreement = false;
 
-        bool _stateSet;
+        bool _stateSet = false;
         MemberState _state;
 
-        int _version;
+        int _configVersion = -1;
         std::string _setName;
         std::string _hbmsg;
-        std::string _syncingTo;
+        HostAndPort _syncingTo;
 
-        bool _configSet;
+        bool _configSet = false;
         ReplicaSetConfig _config;
+
+        bool _primaryIdSet = false;
+        long long _primaryId = -1;
+        long long _term = -1;
     };
 
 } // namespace repl

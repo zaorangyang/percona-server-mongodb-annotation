@@ -30,7 +30,6 @@
 
 #include <boost/shared_ptr.hpp>
 
-#include "mongo/client/dbclient_rs.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/concurrency/mutex.h"
@@ -181,42 +180,10 @@ namespace mongo {
 
     class ConfigServer {
     public:
-        ConfigServer() = default;
+        static void reloadSettings();
 
-        bool ok( bool checkConsistency = false );
-
-        const std::string& modelServer() const;
-
-        const Shard& getPrimary() const { return _primary; }
-
-        /**
-           call at startup, this will initiate connection to the grid db
-        */
-        bool init( const ConnectionString& configCS );
-
-        /**
-         * Check hosts are unique. Returns true if all configHosts
-         * hostname:port entries are unique. Otherwise return false
-         * and fill errmsg with message containing the offending server.
-         */
-        bool checkHostsAreUnique( const std::vector<std::string>& configHosts, std::string* errmsg );
-
-        int dbConfigVersion();
-        int dbConfigVersion( DBClientBase& conn );
-
-        void reloadSettings();
-
-        ConnectionString getConnectionString() const;
-
-        void replicaSetChange(const std::string& setName, const std::string& newConnectionString);
-
-        static int VERSION;
-
-    private:
-        std::string getHost( const std::string& name , bool withPort );
-
-        std::vector<std::string> _config;
-        Shard _primary;
+        static void replicaSetChange(const std::string& setName,
+                                     const std::string& newConnectionString);
     };
 
 } // namespace mongo

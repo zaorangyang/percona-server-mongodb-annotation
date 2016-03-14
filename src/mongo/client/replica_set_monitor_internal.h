@@ -40,7 +40,7 @@
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/client/dbclient_rs.h" // for TagSet and ReadPreferenceSettings
+#include "mongo/client/read_preference.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/cstdint.h"
@@ -48,6 +48,7 @@
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
+
     struct ReplicaSetMonitor::IsMasterReply {
         IsMasterReply() : ok(false) {}
         IsMasterReply(const HostAndPort& host, int64_t latencyMicros, const BSONObj& reply)
@@ -68,6 +69,7 @@ namespace mongo {
         bool isMaster;
         bool secondary;
         bool hidden;
+        OID electionId; // Set if this isMaster reply is from the primary
         HostAndPort primary; // empty if not present
         std::set<HostAndPort> normalHosts; // both "hosts" and "passives"
         BSONObj tags;
@@ -94,7 +96,7 @@ namespace mongo {
                 isMaster = false;
             }
 
-            bool matches(const ReadPreference& pref) const;
+            bool matches(const ReadPreference pref) const;
 
             /**
              * Checks if the given tag matches the tag attached to this node.
@@ -125,6 +127,7 @@ namespace mongo {
             int64_t latencyMicros; // unknownLatency if unknown
             BSONObj tags; // owned
         };
+
         typedef std::vector<Node> Nodes;
 
         /**
@@ -175,6 +178,7 @@ namespace mongo {
         const std::string name; // safe to read outside lock since it is const
         int consecutiveFailedScans;
         std::set<HostAndPort> seedNodes; // updated whenever a master reports set membership changes
+        OID maxElectionId; // largest election id observed by this ReplicaSetMonitor
         HostAndPort lastSeenMaster; // empty if we have never seen a master. can be same as current
         Nodes nodes; // maintained sorted and unique by host
         ScanStatePtr currentScan; // NULL if no scan in progress
@@ -207,4 +211,5 @@ namespace mongo {
         typedef std::vector<IsMasterReply> UnconfirmedReplies;
         UnconfirmedReplies unconfirmedReplies;
     };
-}
+
+} // namespace mongo

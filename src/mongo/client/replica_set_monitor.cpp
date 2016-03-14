@@ -48,21 +48,15 @@
 #include "mongo/util/string_map.h"
 #include "mongo/util/timer.h"
 
-#if 0 // enable this to ease debugging of this file.
-#undef DEV
-#define DEV if (true)
-
-#undef LOG
-#define LOG(x) log()
-#endif
-
 namespace mongo {
 
+    using boost::shared_ptr;
     using std::numeric_limits;
     using std::set;
     using std::string;
 
 namespace {
+
     // Pull nested types to top-level scope
     typedef ReplicaSetMonitor::IsMasterReply IsMasterReply;
     typedef ReplicaSetMonitor::ScanState ScanState;
@@ -86,8 +80,7 @@ namespace {
      *
      *      The order chosen below is intended to allow safe destruction in reverse order from
      *      construction order:
-     *          setsLock                 -- mutex protecting _seedServers and _sets, destroyed last
-     *          seedServers              -- list (map) of servers
+     *          setsLock                 -- mutex protecting sets, destroyed last
      *          sets                     -- list (map) of ReplicaSetMonitors
      *          replicaSetMonitorWatcher -- background job to check Replica Set members
      *          staticObserver           -- sentinel to detect process termination
@@ -101,7 +94,6 @@ namespace {
      *          release the SetState::mutex.
      */
     mongo::mutex setsLock;
-    StringMap<set<HostAndPort> > seedServers;
     StringMap<ReplicaSetMonitorPtr> sets;
 
     // global background job responsible for checking every X amount of time
@@ -196,6 +188,7 @@ namespace {
 
             for (StringMap<ReplicaSetMonitorPtr>::const_iterator it = setsCopy.begin();
                     it != setsCopy.end(); ++it) {
+
                 LOG(1) << "checking replica set: " << it->first;
                 ReplicaSetMonitorPtr m = it->second;
 
@@ -207,7 +200,7 @@ namespace {
                           << " checks in a row. Stopping polled monitoring of the set.";
 
                     // locks setsLock
-                    ReplicaSetMonitor::remove(m->getName(), false);
+                    ReplicaSetMonitor::remove(m->getName());
                 }
             }
         }
@@ -246,18 +239,18 @@ namespace {
     } compareHosts; // like an overloaded function, but able to pass to stl algorithms
 
     // The following structs should be treated as functions returning a UnaryPredicate.
-    // Usage example: std::find_if(nodes.begin(), nodes.end(), hostIs(someHost));
+    // Usage example: std::find_if(nodes.begin(), nodes.end(), HostIs(someHost));
     // They all hold their constructor argument by reference.
 
-    struct hostIs {
-        explicit hostIs(const HostAndPort& host) :_host(host) {}
+    struct HostIs {
+        explicit HostIs(const HostAndPort& host) :_host(host) {}
         bool operator() (const HostAndPort& host) { return host == _host; }
         bool operator() (const Node& node) { return node.host == _host; }
         const HostAndPort& _host;
     };
 
-    struct hostNotIn {
-        explicit hostNotIn(const std::set<HostAndPort>& hosts) :_hosts(hosts) {}
+    struct HostNotIn {
+        explicit HostNotIn(const std::set<HostAndPort>& hosts) :_hosts(hosts) {}
         bool operator() (const HostAndPort& host) { return !_hosts.count(host); }
         bool operator() (const Node& node) { return !_hosts.count(node.host); }
         const std::set<HostAndPort>& _hosts;
@@ -272,13 +265,15 @@ namespace {
 
     ReplicaSetMonitor::ReplicaSetMonitor(StringData name, const std::set<HostAndPort>& seeds)
             : _state(boost::make_shared<SetState>(name, seeds)) {
-        LogstreamBuilder lsb = log();
-        lsb << "starting new replica set monitor for replica set " << name << " with seeds ";
-        for (std::set<HostAndPort>::const_iterator it = seeds.begin();
-                it != seeds.end(); ++it) {
-            if (it != seeds.begin())
-                lsb << ',';
-            lsb << *it;
+
+        log() << "starting new replica set monitor for replica set " << name << " with seeds ";
+
+        for (std::set<HostAndPort>::const_iterator it = seeds.begin(); it != seeds.end(); ++it) {
+            if (it != seeds.begin()) {
+                log() << ',';
+            }
+
+            log() << *it;
         }
     }
 
@@ -305,7 +300,7 @@ namespace {
     }
 
     HostAndPort ReplicaSetMonitor::getMasterOrUassert() {
-        const ReadPreferenceSetting masterOnly(ReadPreference_PrimaryOnly, TagSet());
+        const ReadPreferenceSetting masterOnly(ReadPreference::PrimaryOnly, TagSet());
         HostAndPort master = getHostOrRefresh(masterOnly);
         uassert(10009, str::stream() << "ReplicaSetMonitor no master found for set: " << getName(),
                 !master.empty());
@@ -364,31 +359,22 @@ namespace {
         LOG(3) << "ReplicaSetMonitor::createIfNeeded " << name;
         boost::lock_guard<boost::mutex> lk(setsLock);
         ReplicaSetMonitorPtr& m = sets[name];
-        if ( ! m )
-            m = boost::make_shared<ReplicaSetMonitor>( name , servers );
+        if (!m) {
+            m = boost::make_shared<ReplicaSetMonitor>(name, servers);
+        }
 
         replicaSetMonitorWatcher.safeGo();
     }
 
-    ReplicaSetMonitorPtr ReplicaSetMonitor::get(const std::string& name,
-                                                const bool createFromSeed) {
-        LOG(3) << "ReplicaSetMonitor::get " << name;
+    shared_ptr<ReplicaSetMonitor> ReplicaSetMonitor::get(const std::string& name) {
+        LOG(2) << "ReplicaSetMonitor::get " << name;
+
         boost::lock_guard<boost::mutex> lk( setsLock );
         StringMap<ReplicaSetMonitorPtr>::const_iterator i = sets.find( name );
         if ( i != sets.end() ) {
             return i->second;
         }
-        if ( createFromSeed ) {
-            StringMap<set<HostAndPort> >::const_iterator j = seedServers.find( name );
-            if ( j != seedServers.end() ) {
-                LOG(4) << "Creating ReplicaSetMonitor from cached address";
-                ReplicaSetMonitorPtr& m = sets[name];
-                invariant( !m );
-                m.reset( new ReplicaSetMonitor( name, j->second ) );
-                replicaSetMonitorWatcher.safeGo();
-                return m;
-            }
-        }
+
         return ReplicaSetMonitorPtr();
     }
 
@@ -403,29 +389,17 @@ namespace {
         return activeSets;
     }
 
-    void ReplicaSetMonitor::remove(const string& name, bool clearSeedCache) {
-        LOG(2) << "Removing ReplicaSetMonitor for " << name << " from replica set table"
-               << (clearSeedCache ? " and the seed cache" : "");
+    void ReplicaSetMonitor::remove(const string& name) {
+        LOG(2) << "Removing ReplicaSetMonitor for " << name << " from replica set table";
 
-        boost::lock_guard<boost::mutex> lk( setsLock );
-        const StringMap<ReplicaSetMonitorPtr>::const_iterator setIt = sets.find(name);
+        boost::lock_guard<boost::mutex> lk(setsLock);
+        StringMap<ReplicaSetMonitorPtr>::const_iterator setIt = sets.find(name);
         if (setIt != sets.end()) {
-            if (!clearSeedCache) {
-                // Save list of current set members so that the monitor can be rebuilt if needed.
-                const ReplicaSetMonitorPtr& rsm = setIt->second;
-                boost::lock_guard<boost::mutex> lk(rsm->_state->mutex);
-                seedServers[name] = rsm->_state->seedNodes;
-            }
             sets.erase(setIt);
-        }
-
-        if ( clearSeedCache ) {
-            seedServers.erase( name );
         }
 
         // Kill all pooled ReplicaSetConnections for this set. They will not function correctly
         // after we kill the ReplicaSetMonitor.
-        // TODO we may only need to do this if clearSeedCache is true.
         pool.removeHost(name);
     }
 
@@ -476,7 +450,6 @@ namespace {
         replicaSetMonitorWatcher.wait();
         boost::lock_guard<boost::mutex> lock(setsLock);
         sets = StringMap<ReplicaSetMonitorPtr>();
-        seedServers = StringMap<set<HostAndPort> >();
     }
 
     Refresher::Refresher(const SetStatePtr& setState)
@@ -572,8 +545,16 @@ namespace {
             return;
         }
 
-        if (reply.isMaster)
-            receivedIsMasterFromMaster(reply);
+        if (reply.isMaster) {
+            const bool stalePrimary = !receivedIsMasterFromMaster(reply);
+            if (stalePrimary) {
+                log() << "node " << from << " believes it is primary, but its election id of "
+                      << reply.electionId << " is older than the most recent election id"
+                      << " for this set, " << _set->maxElectionId;
+                failedHost(from);
+                return;
+            }
+        }
 
         if (_scan->foundUpMaster) {
             // We only update a Node if a master has confirmed it is in the set.
@@ -643,14 +624,21 @@ namespace {
             // move lastSeenMaster to front of queue
             std::stable_partition(scan->hostsToScan.begin(),
                                   scan->hostsToScan.end(),
-                                  hostIs(set->lastSeenMaster));
+                                  HostIs(set->lastSeenMaster));
         }
 
         return scan;
     }
 
-    void Refresher::receivedIsMasterFromMaster(const IsMasterReply& reply) {
+    bool Refresher::receivedIsMasterFromMaster(const IsMasterReply& reply) {
         invariant(reply.isMaster);
+
+        if (reply.electionId.isSet()) {
+            if (_set->maxElectionId.isSet() && _set->maxElectionId.compare(reply.electionId) > 0) {
+                return false;
+            }
+            _set->maxElectionId = reply.electionId;
+        }
 
         // Mark all nodes as not master. We will mark ourself as master before releasing the lock.
         // NOTE: we use a "last-wins" policy if multiple hosts claim to be master.
@@ -671,7 +659,7 @@ namespace {
             // remove non-members from _set->nodes
             _set->nodes.erase(std::remove_if(_set->nodes.begin(),
                                              _set->nodes.end(),
-                                             hostNotIn(reply.normalHosts)),
+                                             HostNotIn(reply.normalHosts)),
                               _set->nodes.end());
 
             // add new members to _set->nodes
@@ -721,6 +709,8 @@ namespace {
 
         _scan->foundUpMaster = true;
         _set->lastSeenMaster = reply.host;
+
+        return true;
     }
 
     void Refresher::receivedIsMasterBeforeFoundMaster(const IsMasterReply& reply) {
@@ -736,7 +726,7 @@ namespace {
             std::deque<HostAndPort>::iterator it =
                 std::stable_partition(_scan->hostsToScan.begin(),
                                       _scan->hostsToScan.end(),
-                                      hostIs(reply.primary));
+                                      HostIs(reply.primary));
 
             if (it == _scan->hostsToScan.begin()) {
                 // reply.primary wasn't in hostsToScan
@@ -814,6 +804,10 @@ namespace {
             // hidden nodes can't be master, even if they claim to be.
             isMaster = !hidden && raw["ismaster"].trueValue();
 
+            if (isMaster && raw.hasField("electionId")) {
+                electionId = raw["electionId"].OID();
+            }
+
             const string primaryString = raw["primary"].str();
             primary = primaryString.empty() ? HostAndPort() : HostAndPort(primaryString);
 
@@ -835,15 +829,15 @@ namespace {
 
     const int64_t Node::unknownLatency = numeric_limits<int64_t>::max();
 
-    bool Node::matches(const ReadPreference& pref) const {
+    bool Node::matches(const ReadPreference pref) const {
         if (!isUp)
             return false;
 
-        if (pref == ReadPreference_PrimaryOnly) {
+        if (pref == ReadPreference::PrimaryOnly) {
             return isMaster;
         }
 
-        if (pref == ReadPreference_SecondaryOnly) {
+        if (pref == ReadPreference::SecondaryOnly) {
             if (isMaster)
                 return false;
         }
@@ -917,28 +911,28 @@ namespace {
     HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) const {
         switch (criteria.pref) {
         // "Prefered" read preferences are defined in terms of other preferences
-        case ReadPreference_PrimaryPreferred: {
-            HostAndPort out = getMatchingHost(ReadPreferenceSetting(ReadPreference_PrimaryOnly,
+        case ReadPreference::PrimaryPreferred: {
+            HostAndPort out = getMatchingHost(ReadPreferenceSetting(ReadPreference::PrimaryOnly,
                                                                     criteria.tags));
             // NOTE: the spec says we should use the primary even if tags don't match
             if (!out.empty())
                 return out;
-            return getMatchingHost(ReadPreferenceSetting(ReadPreference_SecondaryOnly,
+            return getMatchingHost(ReadPreferenceSetting(ReadPreference::SecondaryOnly,
                                                          criteria.tags));
         }
 
-        case ReadPreference_SecondaryPreferred: {
+        case ReadPreference::SecondaryPreferred: {
             HostAndPort out =
-                getMatchingHost(ReadPreferenceSetting(ReadPreference_SecondaryOnly,
+                getMatchingHost(ReadPreferenceSetting(ReadPreference::SecondaryOnly,
                                                       criteria.tags));
             if (!out.empty())
                 return out;
             // NOTE: the spec says we should use the primary even if tags don't match
-            return getMatchingHost(ReadPreferenceSetting(ReadPreference_PrimaryOnly,
+            return getMatchingHost(ReadPreferenceSetting(ReadPreference::PrimaryOnly,
                                                          criteria.tags));
         }
 
-        case ReadPreference_PrimaryOnly: {
+        case ReadPreference::PrimaryOnly: {
             // NOTE: isMaster implies isUp
             Nodes::const_iterator it = std::find_if(nodes.begin(), nodes.end(), isMaster);
             if (it == nodes.end())
@@ -947,8 +941,8 @@ namespace {
         }
 
         // The difference between these is handled by Node::matches
-        case ReadPreference_SecondaryOnly:
-        case ReadPreference_Nearest: {
+        case ReadPreference::SecondaryOnly:
+        case ReadPreference::Nearest: {
             BSONForEach(tagElem, criteria.tags.getTagBSON()) {
                 uassert(16358, "Tags should be a BSON object", tagElem.isABSONObj());
                 BSONObj tag = tagElem.Obj();

@@ -52,6 +52,11 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/stats/snapshots.h"
+#include "mongo/rpc/command_reply.h"
+#include "mongo/rpc/command_reply_builder.h"
+#include "mongo/rpc/command_request.h"
+#include "mongo/rpc/command_request_builder.h"
+#include "mongo/rpc/metadata.h"
 #include "mongo/util/admin_access.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/mongoutils/html.h"
@@ -250,12 +255,25 @@ namespace {
 
             BSONObj cmdObj = BSON(cmd << 1);
 
-            BSONObjBuilder result;
-            Command::execCommand(txn, c, 0, "admin.", cmdObj, result);
+            rpc::CommandRequestBuilder requestBuilder{};
+
+            requestBuilder.setDatabase("admin")
+                          .setCommandName(cmd)
+                          .setMetadata(rpc::makeEmptyMetadata())
+                          .setCommandArgs(cmdObj);
+
+            auto cmdRequestMsg = requestBuilder.done();
+            rpc::CommandRequest cmdRequest{cmdRequestMsg.get()};
+            rpc::CommandReplyBuilder cmdReplyBuilder{};
+
+            Command::execCommand(txn, c, cmdRequest, &cmdReplyBuilder);
+
+            auto cmdReplyMsg = cmdReplyBuilder.done();
+            rpc::CommandReply cmdReply{cmdReplyMsg.get()};
 
             responseCode = 200;
 
-            string j = result.done().jsonString(Strict, text);
+            string j = cmdReply.getCommandReply().jsonString(Strict, text);
             responseMsg = j;
 
             if (text) {
@@ -295,7 +313,8 @@ namespace {
                                 vector<string>& headers,
                                 const SockAddr &from) {
 
-        boost::scoped_ptr<OperationContext> txn(getGlobalServiceContext()->newOpCtx());
+        Client* client = &cc();
+        auto txn = client->makeOperationContext();
 
         if (url.size() > 1) {
 
@@ -419,7 +438,7 @@ namespace {
                                vector<string>& headers,
                                const SockAddr &from) {
 
-        AuthorizationSession* authSess = AuthorizationSession::get(cc());
+        AuthorizationSession* authSess = AuthorizationSession::get(txn->getClient());
         if (!authSess->getAuthorizationManager().isAuthEnabled()) {
             return true;
         }
@@ -446,8 +465,7 @@ namespace {
             // Only users in the admin DB are visible by the webserver
             UserName userName(parms["username"], "admin");
             User* user;
-            AuthorizationManager& authzManager =
-                AuthorizationSession::get(cc())->getAuthorizationManager();
+            AuthorizationManager& authzManager = authSess->getAuthorizationManager();
             Status status = authzManager.acquireUser(txn, userName, &user);
             if (!status.isOK()) {
                 if (status.code() != ErrorCodes::UserNotFound) {

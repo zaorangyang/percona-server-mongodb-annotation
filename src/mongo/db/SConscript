@@ -42,10 +42,9 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/bson/bson',
-        '$BUILD_DIR/mongo/util/foundation',
         '$BUILD_DIR/mongo/db/index_names',
-        '$BUILD_DIR/mongo/db/service_context',
-    ],
+        '$BUILD_DIR/mongo/util/foundation',
+    ]
 )
 
 env.CppUnitTest(
@@ -140,12 +139,10 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
-        '$BUILD_DIR/mongo/db/commands/server_status_core',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/stats/top',
+        '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/net/network',
-        '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/util/progress_meter',
     ],
 )
@@ -387,6 +384,7 @@ env.Library(
     source=[
         'client.cpp',
         'client_basic.cpp',
+        'operation_context.cpp',
         'service_context.cpp',
         'service_context_noop.cpp',
     ],
@@ -459,6 +457,7 @@ coredbEnv.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/client/remote_command_runner',
         '$BUILD_DIR/mongo/logger/parse_log_component_settings',
         '$BUILD_DIR/mongo/scripting/scripting_common',
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
@@ -516,10 +515,9 @@ serverOnlyFiles = [
     "commands/compact.cpp",
     "commands/copydb.cpp",
     "commands/copydb_start_commands.cpp",
-    "commands/count.cpp",
+    "commands/count_cmd.cpp",
     "commands/create_indexes.cpp",
     "commands/current_op.cpp",
-    "commands/cursor_responses.cpp",
     "commands/dbhash.cpp",
     "commands/distinct.cpp",
     "commands/drop_indexes.cpp",
@@ -552,6 +550,7 @@ serverOnlyFiles = [
     "commands/write_commands/batch_executor.cpp",
     "commands/write_commands/write_commands.cpp",
     "commands/writeback_compatibility_shim.cpp",
+    "curop_metrics.cpp",
     "db_raii.cpp",
     "dbcommands.cpp",
     "dbdirectclient.cpp",
@@ -597,11 +596,8 @@ serverOnlyFiles = [
     "repl/replication_info.cpp",
     "repl/resync.cpp",
     "repl/rs_initialsync.cpp",
-    "repl/rs_rollback.cpp",
     "repl/rs_sync.cpp",
-    "repl/sync.cpp",
     "repl/sync_source_feedback.cpp",
-    "repl/sync_tail.cpp",
     "service_context_d.cpp",
     "stats/fill_locker_info.cpp",
     "stats/lock_server_status_section.cpp",
@@ -622,12 +618,13 @@ if has_option('use-cpu-profiler'):
     # scope it more narrowly. Better would be if the commands were a library, and could be
     # conditionally made to depend on this file, as a library and then we could easily scope
     # just to this file.
-    env.InjectThirdPartyIncludePaths('tcmalloc')
+    env.InjectThirdPartyIncludePaths('gperftools')
 
 serveronlyEnv = env.Clone()
 serveronlyEnv.InjectThirdPartyIncludePaths(libraries=['snappy'])
 serveronlyLibdeps = [
     "$BUILD_DIR/mongo/client/parallel",
+    "$BUILD_DIR/mongo/executor/network_interface_impl",
     "$BUILD_DIR/mongo/s/batch_write_types",
     "$BUILD_DIR/mongo/s/catalog/legacy/catalog_manager_legacy",
     "$BUILD_DIR/mongo/s/client/sharding_connection_hook",
@@ -653,14 +650,15 @@ serveronlyLibdeps = [
     "ops/update_driver",
     "query/query",
     "range_deleter",
-    "repl/network_interface_impl",
     "repl/repl_coordinator_global",
     "repl/repl_coordinator_impl",
     "repl/repl_settings",
     "repl/replication_executor",
     "repl/replication_executor",
     "repl/replset_commands",
+    "repl/rs_rollback",
     "repl/rslog",
+    "repl/sync_tail",
     "repl/topology_coordinator_impl",
     "startup_warnings_mongod",
     "stats/counters",

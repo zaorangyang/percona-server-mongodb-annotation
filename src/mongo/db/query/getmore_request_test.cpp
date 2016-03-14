@@ -68,7 +68,7 @@ namespace {
             "db",
             BSON("getMore" << CursorId(123)));
         ASSERT_NOT_OK(result.getStatus());
-        ASSERT_EQUALS(ErrorCodes::TypeMismatch, result.getStatus().code());
+        ASSERT_EQUALS(ErrorCodes::FailedToParse, result.getStatus().code());
     }
 
     TEST(GetMoreRequestTest, parseFromBSONCollectionNotString) {
@@ -112,7 +112,7 @@ namespace {
         ASSERT_OK(result.getStatus());
         ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
         ASSERT_EQUALS(CursorId(-123), result.getValue().cursorid);
-        ASSERT_EQUALS(GetMoreRequest::kDefaultBatchSize, result.getValue().batchSize);
+        ASSERT_FALSE(result.getValue().batchSize);
     }
 
     TEST(GetMoreRequestTest, parseFromBSONUnrecognizedFieldName) {
@@ -121,10 +121,8 @@ namespace {
             BSON("getMore" << CursorId(123) <<
                  "collection" << "coll" <<
                  "unknown_field" << 1));
-        ASSERT_OK(result.getStatus());
-        ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
-        ASSERT_EQUALS(CursorId(123), result.getValue().cursorid);
-        ASSERT_EQUALS(GetMoreRequest::kDefaultBatchSize, result.getValue().batchSize);
+        ASSERT_NOT_OK(result.getStatus());
+        ASSERT_EQUALS(ErrorCodes::FailedToParse, result.getStatus().code());
     }
 
     TEST(GetMoreRequestTest, parseFromBSONInvalidBatchSize) {
@@ -135,14 +133,22 @@ namespace {
         ASSERT_EQUALS(ErrorCodes::BadValue, result.getStatus().code());
     }
 
-    TEST(GetMoreRequestTest, parseFromBSONDefaultBatchSize) {
+    TEST(GetMoreRequestTest, parseFromBSONInvalidBatchSizeOfZero) {
+        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
+            "db",
+            BSON("getMore" << CursorId(123) << "collection" << "coll" << "batchSize" << 0));
+        ASSERT_NOT_OK(result.getStatus());
+        ASSERT_EQUALS(ErrorCodes::BadValue, result.getStatus().code());
+    }
+
+    TEST(GetMoreRequestTest, parseFromBSONNoBatchSize) {
         StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
             "db",
             BSON("getMore" << CursorId(123) << "collection" << "coll"));
         ASSERT_OK(result.getStatus());
         ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
         ASSERT_EQUALS(CursorId(123), result.getValue().cursorid);
-        ASSERT_EQUALS(GetMoreRequest::kDefaultBatchSize, result.getValue().batchSize);
+        ASSERT_FALSE(result.getValue().batchSize);
     }
 
     TEST(GetMoreRequestTest, parseFromBSONBatchSizeProvided) {
@@ -151,7 +157,26 @@ namespace {
             BSON("getMore" << CursorId(123) << "collection" << "coll" << "batchSize" << 200));
         ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
         ASSERT_EQUALS(CursorId(123), result.getValue().cursorid);
-        ASSERT_EQUALS(200, result.getValue().batchSize);
+        ASSERT(result.getValue().batchSize);
+        ASSERT_EQUALS(200, *result.getValue().batchSize);
+    }
+
+    TEST(GetMoreRequestTest, parseFromBSONIgnoreDollarPrefixedFields) {
+        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
+            "db",
+            BSON("getMore" << CursorId(123) << "collection" << "coll" << "$foo" << "bar"));
+        ASSERT_OK(result.getStatus());
+        ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
+        ASSERT_EQUALS(CursorId(123), result.getValue().cursorid);
+    }
+
+    TEST(GetMoreRequestTest, parseFromBSONIgnoreMaxTimeMS) {
+        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
+            "db",
+            BSON("getMore" << CursorId(123) << "collection" << "coll" << "maxTimeMS" << 100));
+        ASSERT_OK(result.getStatus());
+        ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
+        ASSERT_EQUALS(CursorId(123), result.getValue().cursorid);
     }
 
 } // namespace

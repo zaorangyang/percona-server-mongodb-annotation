@@ -36,11 +36,14 @@
 
 #include <boost/shared_ptr.hpp>
 
+#include "mongo/client/dbclient_rs.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_connection.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
@@ -122,30 +125,28 @@ namespace mongo {
         return conn->type() == ConnectionString::MASTER || conn->type() == ConnectionString::SET;
     }
 
-    DBClientBase* getVersionable( DBClientBase* conn ){
-
-        switch ( conn->type() ) {
+    DBClientBase* getVersionable(DBClientBase* conn) {
+        switch (conn->type()) {
         case ConnectionString::INVALID:
-           massert( 15904, str::stream() << "cannot set version on invalid connection " << conn->toString(), false );
-           return NULL;
+            massert(15904, str::stream() << "cannot set version on invalid connection "
+                                         << conn->toString(), false);
+            return nullptr;
         case ConnectionString::MASTER:
-           return conn;
-        case ConnectionString::PAIR:
-           massert( 15905, str::stream() << "cannot set version or shard on pair connection " << conn->toString(), false );
-           return NULL;
+            return conn;
         case ConnectionString::SYNC:
-           massert( 15906, str::stream() << "cannot set version or shard on sync connection " << conn->toString(), false );
-           return NULL;
+            massert(15906, str::stream() << "cannot set version or shard on sync connection "
+                                         << conn->toString(), false);
+            return nullptr;
         case ConnectionString::CUSTOM:
-           massert( 16334, str::stream() << "cannot set version or shard on custom connection " << conn->toString(), false );
-           return NULL;
+            massert(16334, str::stream() << "cannot set version or shard on custom connection "
+                                         << conn->toString(), false);
+            return nullptr;
         case ConnectionString::SET:
-           DBClientReplicaSet* set = (DBClientReplicaSet*) conn;
-           return &( set->masterConn() );
+            DBClientReplicaSet* set = (DBClientReplicaSet*)conn;
+            return &(set->masterConn());
         }
 
-        verify( false );
-        return NULL;
+        MONGO_UNREACHABLE;
     }
 
     bool VersionManager::forceRemoteCheckShardVersionCB(const string& ns) {
@@ -199,15 +200,16 @@ namespace mongo {
             // Check to see if this is actually a shard and not a single config server
             // NOTE: Config servers are registered only by the name "config" in the shard cache, not
             // by host, so lookup by host will fail unless the host is also a shard.
-            Shard shard = Shard::findIfExists(conn->getServerAddress());
-            if (!shard.ok())
+            const auto& shard = grid.shardRegistry()->findIfExists(conn->getServerAddress());
+            if (!shard) {
                 return false;
+            }
 
-            LOG(1) << "initializing shard connection to " << shard.toString() << endl;
+            LOG(1) << "initializing shard connection to " << shard->toString() << endl;
 
             ok = setShardVersion(*conn,
                                  "",
-                                 configServer.modelServer(),
+                                 grid.catalogManager()->connectionString().toString(),
                                  ChunkVersion(),
                                  NULL,
                                  true,
@@ -321,7 +323,7 @@ namespace mongo {
                                          << refVersion.toString()
                                          << " : " << refManager->getSequenceNumber() << ") "
                                          << "on shard " << shard.getName()
-                                         << " (" << shard.getAddress().toString() << ")");
+                                         << " (" << shard.getConnString().toString() << ")");
 
                 throw SendStaleConfigException(ns,
                                                msg,
@@ -378,7 +380,7 @@ namespace mongo {
         BSONObj result;
         if (setShardVersion(*conn,
                             ns,
-                            configServer.modelServer(),
+                            grid.catalogManager()->connectionString().toString(),
                             version,
                             manager.get(),
                             authoritative,

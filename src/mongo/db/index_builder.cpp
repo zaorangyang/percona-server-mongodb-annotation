@@ -87,7 +87,10 @@ namespace {
 
         AuthorizationSession::get(txn.getClient())->grantInternalAuthorization();
 
-        txn.getCurOp()->reset(HostAndPort(), dbInsert);
+        {
+            stdx::lock_guard<Client> lk(*txn.getClient());
+            CurOp::get(txn)->setOp_inlock(dbInsert);
+        }
         NamespaceString ns(_index["ns"].String());
 
         ScopedTransaction transaction(&txn, MODE_IX);
@@ -141,8 +144,11 @@ namespace {
             }
         }
 
-        // Show which index we're building in the curop display.
-        txn->getCurOp()->setQuery(_index);
+        {
+            stdx::lock_guard<Client> lk(*txn->getClient());
+            // Show which index we're building in the curop display.
+            CurOp::get(txn)->setQuery_inlock(_index);
+        }
 
         bool haveSetBgIndexStarting = false;
         while (true) {
@@ -155,7 +161,6 @@ namespace {
                     indexer.allowBackgroundBuilding();
 
 
-                IndexDescriptor* descriptor(NULL);
                 try {
                     status = indexer.init(_index);
                     if ( status.code() == ErrorCodes::IndexAlreadyExists ) {
@@ -168,7 +173,6 @@ namespace {
 
                     if (status.isOK()) {
                         if (allowBackgroundBuilding) {
-                            descriptor = indexer.registerIndexBuild();
                             if (!haveSetBgIndexStarting) {
                                 _setBgIndexStarting();
                                 haveSetBgIndexStarting = true;
@@ -199,7 +203,6 @@ namespace {
                     Database* reloadDb = dbHolder().get(txn, ns.db());
                     fassert(28553, reloadDb);
                     fassert(28554, reloadDb->getCollection(ns.ns()));
-                    indexer.unregisterIndexBuild(descriptor);
                 }
 
                 if (status.code() == ErrorCodes::InterruptedAtShutdown) {
@@ -217,24 +220,6 @@ namespace {
 
             LOG(2) << "WriteConflictException while creating index in IndexBuilder, retrying.";
             txn->recoveryUnit()->abandonSnapshot();
-        }
-    }
-
-    std::vector<BSONObj>
-    IndexBuilder::killMatchingIndexBuilds(Collection* collection,
-                                          const IndexCatalog::IndexKillCriteria& criteria) {
-        invariant(collection);
-        return collection->getIndexCatalog()->killMatchingIndexBuilds(criteria);
-    }
-
-    void IndexBuilder::restoreIndexes(OperationContext* txn, const std::vector<BSONObj>& indexes) {
-        log() << "restarting " << indexes.size() << " background index build(s)" << endl;
-        for (int i = 0; i < static_cast<int>(indexes.size()); i++) {
-            IndexBuilder* indexBuilder = new IndexBuilder(indexes[i]);
-            // This looks like a memory leak, but indexBuilder deletes itself when it finishes
-            indexBuilder->go();
-            Lock::TempRelease release(txn->lockState());
-            IndexBuilder::waitForBgIndexStarting();
         }
     }
 }

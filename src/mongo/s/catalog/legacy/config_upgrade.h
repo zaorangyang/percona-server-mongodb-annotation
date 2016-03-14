@@ -28,13 +28,15 @@
 
 #pragma once
 
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/s/type_config_version.h"
+#include <string>
 
 namespace mongo {
 
+    class CatalogManager;
+    class Status;
+    class VersionType;
+
     /**
-     *
      * UPGRADE HISTORY
      *
      * The enum below documents the version changes to *both* the config server data layout
@@ -118,63 +120,18 @@ namespace mongo {
         UpgradeHistory_DummyBumpPre3_0 = 7,
     };
 
-    //
-    // CURRENT VERSION CONSTANTS
-    // Note: We must modify these constants we add new upgrades, otherwise we will fail on startup
-    //
-
     // Earliest version we're compatible with
     const int MIN_COMPATIBLE_CONFIG_VERSION = UpgradeHistory_DummyBumpPre2_8;
 
     // Latest version we know how to communicate with
     const int CURRENT_CONFIG_VERSION = UpgradeHistory_DummyBumpPre3_0;
 
-    //
-    // DECLARATION OF UPGRADE FUNCTIONALITY
-    // These functions must also be wired explicitly to the upgrade path in
-    // config_upgrade.cpp::createRegistry()
-    //
-
-    bool doUpgradeV0ToV7(const ConnectionString& configLoc,
-                         const VersionType& lastVersionInfo,
-                         std::string* errMsg);
-
-    bool doUpgradeV6ToV7(const ConnectionString& configLoc,
-                         const VersionType& lastVersionInfo,
-                         std::string* errMsg);
-
-    //
-    // Utilities for upgrading a config database to a new config version and checking the status of
-    // the config version.
-    //
-
-    enum VersionStatus {
-
-        // No way to upgrade the test version to be compatible with current version
-        VersionStatus_Incompatible,
-
-        // Current version is compatible with test version
-        VersionStatus_Compatible,
-
-        // Test version must be upgraded to be compatible with current version
-        VersionStatus_NeedUpgrade
-    };
-
-    /**
-     * Checks whether or not a particular cluster version is compatible with our current
-     * version and mongodb version.  The version is compatible if it falls between the
-     * MIN_COMPATIBLE_CONFIG_VERSION and CURRENT_CONFIG_VERSION and is not explicitly excluded.
-     *
-     * @return a VersionStatus enum indicating compatibility
-     */
-    VersionStatus isConfigVersionCompatible(const VersionType& versionInfo, std::string* whyNot);
-
     /**
      * Returns the config version of the cluster pointed at by the connection string.
      *
      * @return OK if version found successfully, error status if something bad happened.
      */
-    Status getConfigVersion(const ConnectionString& configLoc, VersionType* versionInfo);
+    Status getConfigVersion(CatalogManager* catalogManager, VersionType* versionInfo);
 
     /**
      * Checks the config version and ensures it's the latest version, otherwise tries to update.
@@ -183,10 +140,10 @@ namespace mongo {
      * @return initial and finalVersionInfo indicating the start and end versions of the upgrade.
      *         These are the same if no upgrade occurred.
      */
-    bool checkAndUpgradeConfigVersion(const ConnectionString& configLoc,
+    bool checkAndUpgradeConfigVersion(CatalogManager* catalogManager,
                                       bool upgrade,
                                       VersionType* initialVersionInfo,
                                       VersionType* finalVersionInfo,
                                       std::string* errMsg);
 
-} // end namespace
+} // namespace mongo

@@ -30,14 +30,10 @@
 
 #include <boost/filesystem/path.hpp>
 
-#include "mongo/db/client.h"
 #include "mongo/db/db.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/keypattern.h"
 
 namespace mongo {
-
-    extern const BSONObj reverseNaturalObj; // {"$natural": -1 }
 
     class Collection;
     class Cursor;

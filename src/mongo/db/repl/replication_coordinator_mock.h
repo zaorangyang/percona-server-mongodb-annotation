@@ -65,12 +65,12 @@ namespace repl {
         virtual void clearSyncSourceBlacklist();
 
         virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
-                const OperationContext* txn,
+                OperationContext* txn,
                 const OpTime& opTime,
                 const WriteConcernOptions& writeConcern);
 
         virtual ReplicationCoordinator::StatusAndDuration awaitReplicationOfLastOpForClient(
-                const OperationContext* txn,
+                OperationContext* txn,
                 const WriteConcernOptions& writeConcern);
 
         virtual Status stepDown(OperationContext* txn, 
@@ -102,7 +102,7 @@ namespace repl {
         virtual OpTime getMyLastOptime() const;
 
         virtual ReadAfterOpTimeResponse waitUntilOpTime(
-                        const OperationContext* txn,
+                        OperationContext* txn,
                         const ReadAfterOpTimeArgs& settings) override;
 
         virtual OID getElectionId();
@@ -197,11 +197,15 @@ namespace repl {
         virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder);
 
         virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
-                                          ReplSetHeartbeatResponseV1* response);
+                                          ReplSetHeartbeatResponse* response);
 
         virtual bool isV1ElectionProtocol();
 
         virtual void summarizeAsHtml(ReplSetHtmlSummary* output);
+
+        virtual long long getTerm();
+
+        virtual bool updateTerm(long long term);
 
     private:
 

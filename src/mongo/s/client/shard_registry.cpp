@@ -67,51 +67,30 @@ namespace mongo {
 
         boost::lock_guard<boost::mutex> lk(_mutex);
 
-        // We use the _lookup table for all shards and for the primary config DB. The config DB
-        // info, however, does not come from the ShardNS::shard. So when cleaning the _lookup table
-        // we leave the config state intact. The rationale is that this way we could drop shards
-        // that were removed without reinitializing the config DB information.
-
-        ShardMap::iterator i = _lookup.find("config");
-        if (i != _lookup.end()) {
-            shared_ptr<Shard> config = i->second;
-            _lookup.clear();
-            _lookup["config"] = config;
-        }
-        else {
-            _lookup.clear();
-        }
-
+        _lookup.clear();
         _rsLookup.clear();
 
-        for (const ShardType& shardData : shards) {
-            uassertStatusOK(shardData.validate());
+        ShardType configServerShard;
+        configServerShard.setName("config");
+        configServerShard.setHost(_catalogManager->connectionString().toString());
 
-            shared_ptr<Shard> shard = boost::make_shared<Shard>(shardData.getName(),
-                                                                shardData.getHost(),
-                                                                shardData.getMaxSize(),
-                                                                shardData.getDraining());
-            _lookup[shardData.getName()] = shard;
-            _lookup[shardData.getHost()] = shard;
+        _addShard_inlock(configServerShard);
 
-            const ConnectionString& cs = shard->getAddress();
+        for (const ShardType& shardType : shards) {
+            uassertStatusOK(shardType.validate());
 
-            if (cs.type() == ConnectionString::SET) {
-                if (cs.getSetName().size()) {
-                    boost::lock_guard<boost::mutex> lk(_rsMutex);
-                    _rsLookup[cs.getSetName()] = shard;
-                }
-
-                vector<HostAndPort> servers = cs.getServers();
-                for (unsigned i = 0; i < servers.size(); i++) {
-                    _lookup[servers[i].toString()] = shard;
-                }
+            // Skip the config host even if there is one left over from legacy installations. The
+            // config host is installed manually from the catalog manager data.
+            if (shardType.getName() == "config") {
+                continue;
             }
+
+            _addShard_inlock(shardType);
         }
     }
 
-    shared_ptr<Shard> ShardRegistry::findIfExists(const string& shardName) {
-        shared_ptr<Shard> shard = _findUsingLookUp(shardName);
+    shared_ptr<Shard> ShardRegistry::findIfExists(const ShardId& id) {
+        shared_ptr<Shard> shard = _findUsingLookUp(id);
         if (shard) {
             return shard;
         }
@@ -119,58 +98,29 @@ namespace mongo {
         // If we can't find the shard, we might just need to reload the cache
         reload();
 
-        return _findUsingLookUp(shardName);
-    }
-
-    shared_ptr<Shard> ShardRegistry::find(const string& ident) {
-        string errmsg;
-        ConnectionString connStr = ConnectionString::parse(ident, errmsg);
-        uassert(18642,
-                str::stream() << "Error parsing connection string: " << ident,
-                errmsg.empty());
-
-        if (connStr.type() == ConnectionString::SET) {
-            boost::lock_guard<boost::mutex> lk(_rsMutex);
-            ShardMap::iterator iter = _rsLookup.find(connStr.getSetName());
-
-            if (iter == _rsLookup.end()) {
-                return nullptr;
-            }
-
-            return iter->second;
-        }
-        else {
-            boost::lock_guard<boost::mutex> lk(_mutex);
-            ShardMap::iterator iter = _lookup.find(ident);
-
-            if (iter == _lookup.end()) {
-                return nullptr;
-            }
-
-            return iter->second;
-        }
+        return _findUsingLookUp(id);
     }
 
     Shard ShardRegistry::lookupRSName(const string& name) {
-        boost::lock_guard<boost::mutex> lk(_rsMutex);
+        boost::lock_guard<boost::mutex> lk(_mutex);
         ShardMap::iterator i = _rsLookup.find(name);
 
         return (i == _rsLookup.end()) ? Shard::EMPTY : *(i->second.get());
     }
 
-    void ShardRegistry::set(const string& name, const Shard& s) {
+    void ShardRegistry::set(const ShardId& id, const Shard& s) {
         shared_ptr<Shard> ss(boost::make_shared<Shard>(s));
 
         boost::lock_guard<boost::mutex> lk(_mutex);
-        _lookup[name] = ss;
+        _lookup[id] = ss;
     }
 
-    void ShardRegistry::remove(const string& name) {
+    void ShardRegistry::remove(const ShardId& id) {
         boost::lock_guard<boost::mutex> lk(_mutex);
 
         for (ShardMap::iterator i = _lookup.begin(); i != _lookup.end();) {
             shared_ptr<Shard> s = i->second;
-            if (s->getName() == name) {
+            if (s->getName() == id) {
                 _lookup.erase(i++);
             }
             else {
@@ -180,7 +130,7 @@ namespace mongo {
 
         for (ShardMap::iterator i = _rsLookup.begin(); i != _rsLookup.end();) {
             shared_ptr<Shard> s = i->second;
-            if (s->getName() == name) {
+            if (s->getName() == id) {
                 _rsLookup.erase(i++);
             }
             else {
@@ -189,23 +139,25 @@ namespace mongo {
         }
     }
 
-    void ShardRegistry::getAllShards(vector<Shard>& all) const {
+    void ShardRegistry::getAllShardIds(vector<ShardId>* all) const {
         std::set<string> seen;
 
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        for (ShardMap::const_iterator i = _lookup.begin(); i != _lookup.end(); ++i) {
-            const shared_ptr<Shard>& s = i->second;
-            if (s->getName() == "config") {
-                continue;
-            }
+        {
+            boost::lock_guard<boost::mutex> lk(_mutex);
+            for (ShardMap::const_iterator i = _lookup.begin(); i != _lookup.end(); ++i) {
+                const shared_ptr<Shard>& s = i->second;
+                if (s->getName() == "config") {
+                    continue;
+                }
 
-            if (seen.count(s->getName())) {
-                continue;
+                if (seen.count(s->getName())) {
+                    continue;
+                }
+                seen.insert(s->getName());
             }
-
-            seen.insert(s->getName());
-            all.push_back(*s);
         }
+
+        all->assign(seen.begin(), seen.end());
     }
 
     bool ShardRegistry::isAShardNode(const string& addr) const {
@@ -237,30 +189,46 @@ namespace mongo {
         boost::lock_guard<boost::mutex> lk(_mutex);
 
         for (ShardMap::const_iterator i = _lookup.begin(); i != _lookup.end(); ++i) {
-            b.append(i->first, i->second->getConnString());
+            b.append(i->first, i->second->getConnString().toString());
         }
 
         result->append("map", b.obj());
     }
 
-    shared_ptr<Shard> ShardRegistry::_findWithRetry(const string& ident) {
-        shared_ptr<Shard> shard(find(ident));
-        if (shard != nullptr) {
-            return shard;
+    void ShardRegistry::_addShard_inlock(const ShardType& shardType) {
+        // This validation should ideally go inside the ShardType::validate call. However, doing
+        // it there would prevent us from loading previously faulty shard hosts, which might have
+        // been stored (i.e., the entire getAllShards call would fail).
+        auto shardHostStatus = ConnectionString::parse(shardType.getHost());
+        if (!shardHostStatus.isOK()) {
+            warning() << "Unable to parse shard host "
+                        << shardHostStatus.getStatus().toString();
         }
 
-        // Not in our maps, re-load all
-        reload();
+        const ConnectionString& shardHost(shardHostStatus.getValue());
 
-        shard = find(ident);
-        massert(13129, str::stream() << "can't find shard for: " << ident, shard != NULL);
+        shared_ptr<Shard> shard = boost::make_shared<Shard>(shardType.getName(),
+                                                            shardHost,
+                                                            shardType.getMaxSize(),
+                                                            shardType.getDraining());
+        _lookup[shardType.getName()] = shard;
+        _lookup[shardType.getHost()] = shard;
 
-        return shard;
+        if (shardHost.type() == ConnectionString::SET) {
+            if (shardHost.getSetName().size()) {
+                _rsLookup[shardHost.getSetName()] = shard;
+            }
+
+            vector<HostAndPort> servers = shardHost.getServers();
+            for (unsigned i = 0; i < servers.size(); i++) {
+                _lookup[servers[i].toString()] = shard;
+            }
+        }
     }
 
-    shared_ptr<Shard> ShardRegistry::_findUsingLookUp(const string& shardName) {
+    shared_ptr<Shard> ShardRegistry::_findUsingLookUp(const ShardId& id) {
         boost::lock_guard<boost::mutex> lk(_mutex);
-        ShardMap::iterator it = _lookup.find(shardName);
+        ShardMap::iterator it = _lookup.find(id);
 
         if (it != _lookup.end()) {
             return it->second;

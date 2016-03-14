@@ -30,9 +30,9 @@
 
 #include <boost/scoped_ptr.hpp>
 
+#include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/db/repl/repl_set_heartbeat_response.h"
 
 namespace mongo {
 namespace repl {
@@ -60,18 +60,18 @@ namespace {
         ASSERT_EQUALS(false, hbResponse.isStateDisagreement());
         ASSERT_EQUALS("", hbResponse.getReplicaSetName());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(-1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(-1, hbResponse.getConfigVersion());
 
-        BSONObj hbResponseObj = hbResponse.toBSON();
+        BSONObj hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
 
         Status initializeResult = Status::OK();
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toString());
 
         // set version
-        hbResponse.setVersion(1);
+        hbResponse.setConfigVersion(1);
         ++fieldsSet;
         ASSERT_EQUALS(false, hbResponse.hasState());
         ASSERT_EQUALS(false, hbResponse.hasElectionTime());
@@ -84,17 +84,17 @@ namespace {
         ASSERT_EQUALS(false, hbResponse.isStateDisagreement());
         ASSERT_EQUALS("", hbResponse.getReplicaSetName());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
         ASSERT_EQUALS(1, hbResponseObj["v"].Number());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toString());
 
         // set setname
         hbResponse.setSetName("rs0");
@@ -110,18 +110,18 @@ namespace {
         ASSERT_EQUALS(false, hbResponse.isStateDisagreement());
         ASSERT_EQUALS("rs0", hbResponse.getReplicaSetName());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
         ASSERT_EQUALS(1, hbResponseObj["v"].Number());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toString());
 
         // set electionTime
         hbResponse.setElectionTime(Timestamp(10,0));
@@ -137,23 +137,23 @@ namespace {
         ASSERT_EQUALS(false, hbResponse.isStateDisagreement());
         ASSERT_EQUALS("rs0", hbResponse.getReplicaSetName());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
         ASSERT_EQUALS(1, hbResponseObj["v"].Number());
         ASSERT_EQUALS(Timestamp(10,0), hbResponseObj["electionTime"].timestamp());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toString());
 
         // set opTime
-        hbResponse.setOpTime(Timestamp(10));
+        hbResponse.setOpTime(OpTime(Timestamp(10), 0));
         ++fieldsSet;
         ASSERT_EQUALS(false, hbResponse.hasState());
         ASSERT_EQUALS(true, hbResponse.hasElectionTime());
@@ -166,12 +166,12 @@ namespace {
         ASSERT_EQUALS(false, hbResponse.isStateDisagreement());
         ASSERT_EQUALS("rs0", hbResponse.getReplicaSetName());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
-        ASSERT_EQUALS(Timestamp(0,10), hbResponse.getOpTime());
+        ASSERT_EQUALS(OpTime(Timestamp(0,10), 0), hbResponse.getOpTime());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
@@ -179,9 +179,10 @@ namespace {
         ASSERT_EQUALS(Timestamp(10,0), hbResponseObj["electionTime"].timestamp());
         ASSERT_EQUALS(Timestamp(0,10), hbResponseObj["opTime"].timestamp());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(),
+                      hbResponseObjRoundTripChecker.toBSON(false).toString());
 
         // set time
         hbResponse.setTime(Seconds(10));
@@ -197,13 +198,13 @@ namespace {
         ASSERT_EQUALS(false, hbResponse.isStateDisagreement());
         ASSERT_EQUALS("rs0", hbResponse.getReplicaSetName());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
-        ASSERT_EQUALS(Timestamp(0,10), hbResponse.getOpTime());
+        ASSERT_EQUALS(OpTime(Timestamp(0,10), 0), hbResponse.getOpTime());
         ASSERT_EQUALS(Seconds(10), hbResponse.getTime());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
@@ -212,9 +213,10 @@ namespace {
         ASSERT_EQUALS(Timestamp(0,10), hbResponseObj["opTime"].timestamp());
         ASSERT_EQUALS(10, hbResponseObj["time"].numberLong());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(),
+                      hbResponseObjRoundTripChecker.toBSON(false).toString());
 
         // set electable
         hbResponse.setElectable(true);
@@ -230,14 +232,14 @@ namespace {
         ASSERT_EQUALS(false, hbResponse.isStateDisagreement());
         ASSERT_EQUALS("rs0", hbResponse.getReplicaSetName());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
-        ASSERT_EQUALS(Timestamp(0,10), hbResponse.getOpTime());
+        ASSERT_EQUALS(OpTime(Timestamp(0,10), 0), hbResponse.getOpTime());
         ASSERT_EQUALS(Seconds(10), hbResponse.getTime());
         ASSERT_EQUALS(true, hbResponse.isElectable());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
@@ -247,9 +249,10 @@ namespace {
         ASSERT_EQUALS(10, hbResponseObj["time"].numberLong());
         ASSERT_EQUALS(true, hbResponseObj["e"].trueValue());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(),
+                      hbResponseObjRoundTripChecker.toBSON(false).toString());
 
         // set config
         ReplicaSetConfig config;
@@ -266,15 +269,15 @@ namespace {
         ASSERT_EQUALS(false, hbResponse.isStateDisagreement());
         ASSERT_EQUALS("rs0", hbResponse.getReplicaSetName());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
-        ASSERT_EQUALS(Timestamp(0,10), hbResponse.getOpTime());
+        ASSERT_EQUALS(OpTime(Timestamp(0,10), 0), hbResponse.getOpTime());
         ASSERT_EQUALS(Seconds(10), hbResponse.getTime());
         ASSERT_EQUALS(true, hbResponse.isElectable());
         ASSERT_EQUALS(config.toBSON().toString(), hbResponse.getConfig().toBSON().toString());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
@@ -285,9 +288,10 @@ namespace {
         ASSERT_EQUALS(true, hbResponseObj["e"].trueValue());
         ASSERT_EQUALS(config.toBSON().toString(), hbResponseObj["config"].Obj().toString());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(),
+                      hbResponseObjRoundTripChecker.toBSON(false).toString());
 
         // set state
         hbResponse.setState(MemberState(MemberState::RS_SECONDARY));
@@ -305,15 +309,15 @@ namespace {
         ASSERT_EQUALS(MemberState(MemberState::RS_SECONDARY).toString(),
                       hbResponse.getState().toString());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
-        ASSERT_EQUALS(Timestamp(0,10), hbResponse.getOpTime());
+        ASSERT_EQUALS(OpTime(Timestamp(0,10), 0), hbResponse.getOpTime());
         ASSERT_EQUALS(Seconds(10), hbResponse.getTime());
         ASSERT_EQUALS(true, hbResponse.isElectable());
         ASSERT_EQUALS(config.toBSON().toString(), hbResponse.getConfig().toBSON().toString());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
@@ -325,9 +329,10 @@ namespace {
         ASSERT_EQUALS(config.toBSON().toString(), hbResponseObj["config"].Obj().toString());
         ASSERT_EQUALS(2, hbResponseObj["state"].numberLong());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(),
+                      hbResponseObjRoundTripChecker.toBSON(false).toString());
 
         // set stateDisagreement
         hbResponse.noteStateDisagreement();
@@ -345,15 +350,15 @@ namespace {
         ASSERT_EQUALS(MemberState(MemberState::RS_SECONDARY).toString(),
                       hbResponse.getState().toString());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
-        ASSERT_EQUALS(Timestamp(0,10), hbResponse.getOpTime());
+        ASSERT_EQUALS(OpTime(Timestamp(0,10), 0), hbResponse.getOpTime());
         ASSERT_EQUALS(Seconds(10), hbResponse.getTime());
         ASSERT_EQUALS(true, hbResponse.isElectable());
         ASSERT_EQUALS(config.toBSON().toString(), hbResponse.getConfig().toBSON().toString());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
@@ -367,9 +372,10 @@ namespace {
         ASSERT_EQUALS(false, hbResponseObj["mismatch"].trueValue());
         ASSERT_EQUALS(true, hbResponseObj["stateDisagreement"].trueValue());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(),
+                      hbResponseObjRoundTripChecker.toBSON(false).toString());
 
         // set replSet
         hbResponse.noteReplSet();
@@ -387,15 +393,15 @@ namespace {
         ASSERT_EQUALS(MemberState(MemberState::RS_SECONDARY).toString(),
                       hbResponse.getState().toString());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort(), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
-        ASSERT_EQUALS(Timestamp(0,10), hbResponse.getOpTime());
+        ASSERT_EQUALS(OpTime(Timestamp(0,10), 0), hbResponse.getOpTime());
         ASSERT_EQUALS(Seconds(10), hbResponse.getTime());
         ASSERT_EQUALS(true, hbResponse.isElectable());
         ASSERT_EQUALS(config.toBSON().toString(), hbResponse.getConfig().toBSON().toString());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
@@ -410,12 +416,13 @@ namespace {
         ASSERT_EQUALS(true, hbResponseObj["stateDisagreement"].trueValue());
         ASSERT_EQUALS(true, hbResponseObj["rs"].trueValue());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(),
+                      hbResponseObjRoundTripChecker.toBSON(false).toString());
 
         // set syncingTo
-        hbResponse.setSyncingTo("syncTarget");
+        hbResponse.setSyncingTo(HostAndPort("syncTarget"));
         ++fieldsSet;
         ASSERT_EQUALS(true, hbResponse.hasState());
         ASSERT_EQUALS(true, hbResponse.hasElectionTime());
@@ -430,15 +437,15 @@ namespace {
         ASSERT_EQUALS(MemberState(MemberState::RS_SECONDARY).toString(),
                       hbResponse.getState().toString());
         ASSERT_EQUALS("", hbResponse.getHbMsg());
-        ASSERT_EQUALS("syncTarget", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort("syncTarget"), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
-        ASSERT_EQUALS(Timestamp(0,10), hbResponse.getOpTime());
+        ASSERT_EQUALS(OpTime(Timestamp(0,10), 0), hbResponse.getOpTime());
         ASSERT_EQUALS(Seconds(10), hbResponse.getTime());
         ASSERT_EQUALS(true, hbResponse.isElectable());
         ASSERT_EQUALS(config.toBSON().toString(), hbResponse.getConfig().toBSON().toString());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("", hbResponseObj["hbmsg"].String());
@@ -452,11 +459,12 @@ namespace {
         ASSERT_EQUALS(false, hbResponseObj["mismatch"].trueValue());
         ASSERT_EQUALS(true, hbResponseObj["stateDisagreement"].trueValue());
         ASSERT_EQUALS(true, hbResponseObj["rs"].trueValue());
-        ASSERT_EQUALS("syncTarget", hbResponseObj["syncingTo"].String());
+        ASSERT_EQUALS("syncTarget:27017", hbResponseObj["syncingTo"].String());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(),
+                      hbResponseObjRoundTripChecker.toBSON(false).toString());
 
         // set hbmsg
         hbResponse.setHbMsg("lub dub");
@@ -473,15 +481,15 @@ namespace {
         ASSERT_EQUALS(MemberState(MemberState::RS_SECONDARY).toString(),
                       hbResponse.getState().toString());
         ASSERT_EQUALS("lub dub", hbResponse.getHbMsg());
-        ASSERT_EQUALS("syncTarget", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort("syncTarget"), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
-        ASSERT_EQUALS(Timestamp(0,10), hbResponse.getOpTime());
+        ASSERT_EQUALS(OpTime(Timestamp(0,10), 0), hbResponse.getOpTime());
         ASSERT_EQUALS(Seconds(10), hbResponse.getTime());
         ASSERT_EQUALS(true, hbResponse.isElectable());
         ASSERT_EQUALS(config.toBSON().toString(), hbResponse.getConfig().toBSON().toString());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
         ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
         ASSERT_EQUALS("lub dub", hbResponseObj["hbmsg"].String());
@@ -495,11 +503,12 @@ namespace {
         ASSERT_EQUALS(false, hbResponseObj["mismatch"].trueValue());
         ASSERT_EQUALS(true, hbResponseObj["stateDisagreement"].trueValue());
         ASSERT_EQUALS(true, hbResponseObj["rs"].trueValue());
-        ASSERT_EQUALS("syncTarget", hbResponseObj["syncingTo"].String());
+        ASSERT_EQUALS("syncTarget:27017", hbResponseObj["syncingTo"].String());
 
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_EQUALS(Status::OK(), initializeResult);
-        ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
+        ASSERT_EQUALS(hbResponseObj.toString(),
+                      hbResponseObjRoundTripChecker.toBSON(false).toString());
 
         // set mismatched
         hbResponse.noteMismatched();
@@ -516,21 +525,21 @@ namespace {
         ASSERT_EQUALS(MemberState(MemberState::RS_SECONDARY).toString(),
                       hbResponse.getState().toString());
         ASSERT_EQUALS("lub dub", hbResponse.getHbMsg());
-        ASSERT_EQUALS("syncTarget", hbResponse.getSyncingTo());
-        ASSERT_EQUALS(1, hbResponse.getVersion());
+        ASSERT_EQUALS(HostAndPort("syncTarget"), hbResponse.getSyncingTo());
+        ASSERT_EQUALS(1, hbResponse.getConfigVersion());
         ASSERT_EQUALS(Timestamp(10,0), hbResponse.getElectionTime());
-        ASSERT_EQUALS(Timestamp(0,10), hbResponse.getOpTime());
+        ASSERT_EQUALS(OpTime(Timestamp(0,10), 0), hbResponse.getOpTime());
         ASSERT_EQUALS(Seconds(10), hbResponse.getTime());
         ASSERT_EQUALS(true, hbResponse.isElectable());
         ASSERT_EQUALS(config.toBSON().toString(), hbResponse.getConfig().toBSON().toString());
 
-        hbResponseObj = hbResponse.toBSON();
+        hbResponseObj = hbResponse.toBSON(false);
         ASSERT_EQUALS(2, hbResponseObj.nFields());
         ASSERT_EQUALS(true, hbResponseObj["mismatch"].trueValue());
 
         // NOTE: Does not check round-trip. Once noteMismached is set the bson will return an error
         //       from initialize parsing.
-        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj);
+        initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
         ASSERT_NOT_EQUALS(Status::OK(), initializeResult);
         ASSERT_EQUALS(ErrorCodes::InconsistentReplicaSetNames, initializeResult.code());
     }
@@ -538,7 +547,7 @@ namespace {
     TEST(ReplSetHeartbeatResponse, InitializeWrongElectionTimeType) {
         ReplSetHeartbeatResponse hbResponse;
         BSONObj initializerObj = BSON("ok" << 1.0 << "electionTime" << "hello");
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::TypeMismatch, result);
         ASSERT_EQUALS("Expected \"electionTime\" field in response to replSetHeartbeat command to "
                       "have type Date or Timestamp, but found type String",
@@ -548,7 +557,7 @@ namespace {
     TEST(ReplSetHeartbeatResponse, InitializeWrongTimeType) {
         ReplSetHeartbeatResponse hbResponse;
         BSONObj initializerObj = BSON("ok" << 1.0 << "time" << "hello");
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::TypeMismatch, result);
         ASSERT_EQUALS("Expected \"time\" field in response to replSetHeartbeat command to "
                       "have a numeric type, but found type String",
@@ -558,7 +567,7 @@ namespace {
     TEST(ReplSetHeartbeatResponse, InitializeWrongOpTimeType) {
         ReplSetHeartbeatResponse hbResponse;
         BSONObj initializerObj = BSON("ok" << 1.0 << "opTime" << "hello");
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::TypeMismatch, result);
         ASSERT_EQUALS("Expected \"opTime\" field in response to replSetHeartbeat command to "
                       "have type Date or Timestamp, but found type String",
@@ -568,7 +577,7 @@ namespace {
     TEST(ReplSetHeartbeatResponse, InitializeMemberStateWrongType) {
         ReplSetHeartbeatResponse hbResponse;
         BSONObj initializerObj = BSON("ok" << 1.0 << "state" << "hello");
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::TypeMismatch, result);
         ASSERT_EQUALS("Expected \"state\" field in response to replSetHeartbeat command to "
                       "have type NumberInt or NumberLong, but found type String",
@@ -578,7 +587,7 @@ namespace {
     TEST(ReplSetHeartbeatResponse, InitializeMemberStateTooLow) {
         ReplSetHeartbeatResponse hbResponse;
         BSONObj initializerObj = BSON("ok" << 1.0 << "state" << -1);
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::BadValue, result);
         ASSERT_EQUALS("Value for \"state\" in response to replSetHeartbeat is out of range; "
                       "legal values are non-negative and no more than 10",
@@ -588,7 +597,7 @@ namespace {
     TEST(ReplSetHeartbeatResponse, InitializeMemberStateTooHigh) {
         ReplSetHeartbeatResponse hbResponse;
         BSONObj initializerObj = BSON("ok" << 1.0 << "state" << 11);
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::BadValue, result);
         ASSERT_EQUALS("Value for \"state\" in response to replSetHeartbeat is out of range; "
                       "legal values are non-negative and no more than 10",
@@ -599,7 +608,7 @@ namespace {
         ReplSetHeartbeatResponse hbResponse;
         BSONObj initializerObj = BSON("ok" << 1.0 <<
                                       "v" << "hello");
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::TypeMismatch, result);
         ASSERT_EQUALS("Expected \"v\" field in response to replSetHeartbeat to "
                       "have type NumberInt, but found String",
@@ -611,7 +620,7 @@ namespace {
         BSONObj initializerObj = BSON("ok" << 1.0 <<
                                       "v" << 2 << // needs a version to get this far in initialize()
                                       "set" << 4);
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::TypeMismatch, result);
         ASSERT_EQUALS("Expected \"set\" field in response to replSetHeartbeat to "
                       "have type String, but found NumberInt32",
@@ -623,7 +632,7 @@ namespace {
         BSONObj initializerObj = BSON("ok" << 1.0 <<
                                       "v" << 2 << // needs a version to get this far in initialize()
                                       "hbmsg" << 4);
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::TypeMismatch, result);
         ASSERT_EQUALS("Expected \"hbmsg\" field in response to replSetHeartbeat to "
                       "have type String, but found NumberInt32",
@@ -635,7 +644,7 @@ namespace {
         BSONObj initializerObj = BSON("ok" << 1.0 <<
                                       "v" << 2 << // needs a version to get this far in initialize()
                                       "syncingTo" << 4);
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::TypeMismatch, result);
         ASSERT_EQUALS("Expected \"syncingTo\" field in response to replSetHeartbeat to "
                       "have type String, but found NumberInt32",
@@ -647,7 +656,7 @@ namespace {
         BSONObj initializerObj = BSON("ok" << 1.0 <<
                                       "v" << 2 << // needs a version to get this far in initialize()
                                       "config" << 4);
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::TypeMismatch, result);
         ASSERT_EQUALS("Expected \"config\" in response to replSetHeartbeat to "
                       "have type Object, but found NumberInt32",
@@ -659,7 +668,7 @@ namespace {
         BSONObj initializerObj = BSON("ok" << 1.0 <<
                                       "v" << 2 << // needs a version to get this far in initialize()
                                       "config" << BSON("illegalFieldName" << 2));
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::BadValue, result);
         ASSERT_EQUALS("Unexpected field illegalFieldName in replica set configuration",
                       result.reason());
@@ -675,13 +684,13 @@ namespace {
         initializerDate.append("ok", 1.0);
         initializerDate.append("v", 1);
         initializerDate.appendDate("electionTime", electionTime);
-        Status result = hbResponseDate.initialize(initializerDate.obj());
+        Status result = hbResponseDate.initialize(initializerDate.obj(), 0);
         ASSERT_EQUALS(Status::OK(), result);
 
         initializerTimestamp.append("ok", 1.0);
         initializerTimestamp.append("v", 1);
         initializerTimestamp.appendTimestamp("electionTime", electionTime.toULL());
-        result = hbResponseTimestamp.initialize(initializerTimestamp.obj());
+        result = hbResponseTimestamp.initialize(initializerTimestamp.obj(), 0);
         ASSERT_EQUALS(Status::OK(), result);
 
         ASSERT_EQUALS(hbResponseTimestamp.getElectionTime(), hbResponseTimestamp.getElectionTime());
@@ -697,13 +706,13 @@ namespace {
         initializerDate.append("ok", 1.0);
         initializerDate.append("v", 1);
         initializerDate.appendDate("opTime", opTime);
-        Status result = hbResponseDate.initialize(initializerDate.obj());
+        Status result = hbResponseDate.initialize(initializerDate.obj(), 0);
         ASSERT_EQUALS(Status::OK(), result);
 
         initializerTimestamp.append("ok", 1.0);
         initializerTimestamp.append("v", 1);
         initializerTimestamp.appendTimestamp("opTime", opTime.toULL());
-        result = hbResponseTimestamp.initialize(initializerTimestamp.obj());
+        result = hbResponseTimestamp.initialize(initializerTimestamp.obj(), 0);
         ASSERT_EQUALS(Status::OK(), result);
 
         ASSERT_EQUALS(hbResponseTimestamp.getOpTime(), hbResponseTimestamp.getOpTime());
@@ -714,7 +723,7 @@ namespace {
         std::string msg = "still initializing";
         Status result = hbResp.initialize(BSON("ok" << 1.0 <<
                                                "rs" << true <<
-                                               "hbmsg" << msg));
+                                               "hbmsg" << msg), 0);
         ASSERT_EQUALS(Status::OK(), result);
         ASSERT_EQUALS(true, hbResp.isReplSet());
         ASSERT_EQUALS(msg, hbResp.getHbMsg());
@@ -724,7 +733,7 @@ namespace {
         ReplSetHeartbeatResponse hbResp;
         std::string msg = "still initializing";
         Status result = hbResp.initialize(BSON("ok" << 1.0 <<
-                                               "opTime" << Timestamp()));
+                                               "opTime" << Timestamp()), 0);
         ASSERT_EQUALS(ErrorCodes::NoSuchKey, result.code());
         ASSERT_TRUE(stringContains(result.reason(), "\"v\""))
                     << result.reason() << " doesn't contain 'v' field required error msg";
@@ -733,7 +742,7 @@ namespace {
     TEST(ReplSetHeartbeatResponse, MismatchedRepliSetNames) {
         ReplSetHeartbeatResponse hbResponse;
         BSONObj initializerObj = BSON("ok" << 0.0 << "mismatch" << true);
-        Status result = hbResponse.initialize(initializerObj);
+        Status result = hbResponse.initialize(initializerObj, 0);
         ASSERT_EQUALS(ErrorCodes::InconsistentReplicaSetNames, result.code());
     }
 
@@ -742,7 +751,7 @@ namespace {
         std::string errMsg = "Unauthorized";
         Status result = hbResp.initialize(BSON("ok" << 0.0 <<
                                                        "errmsg" << errMsg <<
-                                                       "code" << ErrorCodes::Unauthorized));
+                                                       "code" << ErrorCodes::Unauthorized), 0);
         ASSERT_EQUALS(ErrorCodes::Unauthorized, result.code());
         ASSERT_EQUALS(errMsg, result.reason());
     }
@@ -750,7 +759,7 @@ namespace {
     TEST(ReplSetHeartbeatResponse, ServerError) {
         ReplSetHeartbeatResponse hbResp;
         std::string errMsg = "Random Error";
-        Status result = hbResp.initialize(BSON("ok" << 0.0 << "errmsg" << errMsg ));
+        Status result = hbResp.initialize(BSON("ok" << 0.0 << "errmsg" << errMsg ), 0);
         ASSERT_EQUALS(ErrorCodes::UnknownError, result.code());
         ASSERT_EQUALS(errMsg, result.reason());
      }

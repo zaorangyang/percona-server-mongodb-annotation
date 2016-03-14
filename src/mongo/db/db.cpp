@@ -34,6 +34,7 @@
 
 #include <boost/thread/thread.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <boost/optional.hpp>
 #include <boost/shared_ptr.hpp>
 #include <fstream>
 #include <iostream>
@@ -76,12 +77,12 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repair_database.h"
-#include "mongo/db/repl/network_interface_impl.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/restapi.h"
 #include "mongo/db/server_parameters.h"
@@ -92,6 +93,7 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/ttl.h"
+#include "mongo/executor/network_interface_impl.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
@@ -156,7 +158,6 @@ namespace mongo {
         }
 
         virtual void process(Message& m , AbstractMessagingPort* port) {
-            OperationContextImpl txn;
             while ( true ) {
                 if ( inShutdown() ) {
                     log() << "got request after shutdown()" << endl;
@@ -164,7 +165,12 @@ namespace mongo {
                 }
 
                 DbResponse dbresponse;
-                assembleResponse(&txn, m, dbresponse, port->remote());
+                {
+                    OperationContextImpl txn;
+                    assembleResponse(&txn, m, dbresponse, port->remote());
+                    // txn must go out of scope here so that the operation cannot show up in
+                    // currentOp results after the response reaches the client.
+                }
 
                 if ( dbresponse.response ) {
                     port->reply(m, *dbresponse.response, dbresponse.responseTo);
@@ -417,6 +423,8 @@ namespace mongo {
             dbWebServer->setupSockets();
         }
 
+        getGlobalServiceContext()->initializeGlobalStorageEngine();
+
         // Warn if we detect configurations for multiple registered storage engines in
         // the same configuration file/environment.
         if (serverGlobalParams.parsedOpts.hasField("storage")) {
@@ -441,7 +449,6 @@ namespace mongo {
             }
         }
 
-        getGlobalServiceContext()->setGlobalStorageEngine(storageGlobalParams.engine);
         getGlobalServiceContext()->setOpObserver(stdx::make_unique<OpObserver>());
 
         const repl::ReplSettings& replSettings =
@@ -751,7 +758,8 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager, ("SetGlobalEnviro
     repl::ReplicationCoordinatorImpl* replCoord = new repl::ReplicationCoordinatorImpl(
             getGlobalReplSettings(),
             new repl::ReplicationCoordinatorExternalStateImpl,
-            new repl::NetworkInterfaceImpl,
+            new executor::NetworkInterfaceImpl{},
+            new repl::StorageInterfaceImpl{},
             new repl::TopologyCoordinatorImpl(Seconds(repl::maxSyncSourceLagSecs)),
             static_cast<int64_t>(curTimeMillis64()));
     repl::setGlobalReplicationCoordinator(replCoord);

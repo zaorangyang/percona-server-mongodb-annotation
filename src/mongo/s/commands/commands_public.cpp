@@ -53,6 +53,7 @@
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_explain.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/commands/cluster_commands_common.h"
@@ -147,9 +148,15 @@ namespace mongo {
                     shards.insert(conf->getShard(fullns));
                 }
                 else {
-                    vector<Shard> shardList;
-                    Shard::getAllShards(shardList);
-                    shards.insert(shardList.begin(), shardList.end());
+                    vector<ShardId> shardIds;
+                    grid.shardRegistry()->getAllShardIds(&shardIds);
+
+                    for (const ShardId& shardId : shardIds) {
+                        const auto& shard = grid.shardRegistry()->findIfExists(shardId);
+                        if (shard) {
+                            shards.insert(*shard);
+                        }
+                    }
                 }
             }
         };
@@ -638,7 +645,7 @@ namespace mongo {
                         }
                     }
 
-                    b.append("fromhost", confFrom->getPrimary().getConnString());
+                    b.append("fromhost", confFrom->getPrimary().getConnString().toString());
                     BSONObj fixed = b.obj();
 
                     return adminPassthrough( confTo , fixed , result );
@@ -871,7 +878,7 @@ namespace mongo {
 
                 Strategy::CommandResult cmdResult;
                 cmdResult.shardTarget = shard;
-                cmdResult.target = shard.getAddress();
+                cmdResult.target = shard.getConnString();
                 cmdResult.result = result.obj();
 
                 vector<Strategy::CommandResult> shardResults;
@@ -917,7 +924,7 @@ namespace mongo {
 
                 if (ok) {
                     // check whether split is necessary (using update object for size heuristic)
-                    if (haveClient() && ClusterLastErrorInfo::get(cc()).autoSplitOk()) {
+                    if (Chunk::ShouldAutoSplit) {
                         chunk->splitIfShould(cmdObj.getObjectField("update").objsize());
                     }
                 }
@@ -1089,7 +1096,7 @@ namespace mongo {
                 Timer timer;
 
                 Strategy::CommandResult singleResult;
-                Status commandStat = STRATEGY->commandOpUnsharded(dbname,
+                Status commandStat = Strategy::commandOpUnsharded(dbname,
                                                                   explainCmdBob.obj(),
                                                                   0,
                                                                   fullns,
@@ -1266,7 +1273,7 @@ namespace mongo {
                     BSONObj finder = BSON("files_id" << cmdObj.firstElement());
 
                     vector<Strategy::CommandResult> results;
-                    STRATEGY->commandOp(dbName, cmdObj, 0, fullns, finder, &results);
+                    Strategy::commandOp(dbName, cmdObj, 0, fullns, finder, &results);
                     verify(results.size() == 1); // querying on shard key so should only talk to one shard
                     BSONObj res = results.begin()->result;
 
@@ -1299,7 +1306,7 @@ namespace mongo {
 
                         vector<Strategy::CommandResult> results;
                         try {
-                            STRATEGY->commandOp(dbName, shardCmd, 0, fullns, finder, &results);
+                            Strategy::commandOp(dbName, shardCmd, 0, fullns, finder, &results);
                         }
                         catch( DBException& e ){
                             //This is handled below and logged
@@ -1395,7 +1402,10 @@ namespace mongo {
                 list< shared_ptr<Future::CommandResult> > futures;
                 BSONArrayBuilder shardArray;
                 for ( set<Shard>::const_iterator i=shards.begin(), end=shards.end() ; i != end ; i++ ) {
-                    futures.push_back( Future::spawnCommand( i->getConnString() , dbName , cmdObj, options ) );
+                    futures.push_back(Future::spawnCommand(i->getConnString().toString(),
+                                                           dbName,
+                                                           cmdObj,
+                                                           options));
                     shardArray.append(i->getName());
                 }
 
@@ -1579,8 +1589,9 @@ namespace mongo {
                 shared_ptr<DBConfig> conf = status.getValue();
                 bool retval = passthrough( conf, cmdObj, result );
 
-                Status storeCursorStatus = storePossibleCursor(conf->getPrimary().getConnString(),
-                                                               result.asTempObj());
+                Status storeCursorStatus =
+                        storePossibleCursor(conf->getPrimary().getConnString().toString(),
+                                            result.asTempObj());
                 if (!storeCursorStatus.isOK()) {
                     return appendCommandStatus(result, storeCursorStatus);
                 }
@@ -1611,14 +1622,16 @@ namespace mongo {
                 auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(dbName));
                 bool retval = passthrough( conf, cmdObj, result );
 
-                Status storeCursorStatus = storePossibleCursor(conf->getPrimary().getConnString(),
-                                                               result.asTempObj());
+                Status storeCursorStatus =
+                        storePossibleCursor(conf->getPrimary().getConnString().toString(),
+                                            result.asTempObj());
                 if (!storeCursorStatus.isOK()) {
                     return appendCommandStatus(result, storeCursorStatus);
                 }
 
                 return retval;
             }
+
         } cmdListIndexes;
 
         class AvailableQueryOptions : public Command {

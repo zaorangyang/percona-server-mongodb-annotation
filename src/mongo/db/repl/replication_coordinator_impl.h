@@ -33,17 +33,19 @@
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/condition_variable.hpp>
 #include <vector>
+#include <memory>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/data_replicator.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/replication_executor.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/unordered_map.h"
@@ -58,16 +60,18 @@ namespace mongo {
 namespace repl {
 
     class ElectCmdRunner;
+    class ElectionWinnerDeclarer;
     class FreshnessChecker;
     class HandshakeArgs;
     class HeartbeatResponseAction;
+    class LastVote;
     class OplogReader;
     class ReplSetDeclareElectionWinnerArgs;
     class ReplSetRequestVotesArgs;
     class ReplicaSetConfig;
     class SyncSourceFeedback;
     class TopologyCoordinator;
-    class LastVote;
+    class VoteRequester;
 
     class ReplicationCoordinatorImpl : public ReplicationCoordinator,
                                        public KillOpListenerInterface {
@@ -78,7 +82,8 @@ namespace repl {
         // Takes ownership of the "externalState", "topCoord" and "network" objects.
         ReplicationCoordinatorImpl(const ReplSettings& settings,
                                    ReplicationCoordinatorExternalState* externalState,
-                                   ReplicationExecutor::NetworkInterface* network,
+                                   executor::NetworkInterface* network,
+                                   StorageInterface* storage,
                                    TopologyCoordinator* topoCoord,
                                    int64_t prngSeed);
         // Takes ownership of the "externalState" and "topCoord" objects.
@@ -120,12 +125,12 @@ namespace repl {
         virtual void interruptAll();
 
         virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
-                const OperationContext* txn,
+                OperationContext* txn,
                 const OpTime& opTime,
                 const WriteConcernOptions& writeConcern);
 
         virtual ReplicationCoordinator::StatusAndDuration awaitReplicationOfLastOpForClient(
-                const OperationContext* txn,
+                OperationContext* txn,
                 const WriteConcernOptions& writeConcern);
 
         virtual Status stepDown(OperationContext* txn,
@@ -157,7 +162,7 @@ namespace repl {
         virtual OpTime getMyLastOptime() const override;
 
         virtual ReadAfterOpTimeResponse waitUntilOpTime(
-                const OperationContext* txn,
+                OperationContext* txn,
                 const ReadAfterOpTimeArgs& settings) override;
 
         virtual OID getElectionId() override;
@@ -255,11 +260,18 @@ namespace repl {
         virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder);
 
         virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
-                                          ReplSetHeartbeatResponseV1* response) override;
+                                          ReplSetHeartbeatResponse* response) override;
 
         virtual bool isV1ElectionProtocol() override;
 
         virtual void summarizeAsHtml(ReplSetHtmlSummary* s) override;
+
+        /**
+         * Get current term from topology coordinator
+         */
+        virtual long long getTerm() override;
+
+        virtual bool updateTerm(long long term) override;
 
         // ================== Test support API ===================
 
@@ -279,12 +291,15 @@ namespace repl {
          */
         Status setLastOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
 
+        bool updateTerm_forTest(long long term);
+
     private:
         ReplicationCoordinatorImpl(const ReplSettings& settings,
                                    ReplicationCoordinatorExternalState* externalState,
                                    TopologyCoordinator* topCoord,
                                    int64_t prngSeed,
-                                   ReplicationExecutor::NetworkInterface* network,
+                                   executor::NetworkInterface* network,
+                                   StorageInterface* storage,
                                    ReplicationExecutor* replExec);
         /**
          * Configuration states for a replica set node.
@@ -484,7 +499,7 @@ namespace repl {
         ReplicationCoordinator::StatusAndDuration _awaitReplication_inlock(
                 const Timer* timer,
                 boost::unique_lock<boost::mutex>* lock,
-                const OperationContext* txn,
+                OperationContext* txn,
                 const OpTime& opTime,
                 const WriteConcernOptions& writeConcern);
 
@@ -585,6 +600,10 @@ namespace repl {
          */
         void _handleHeartbeatResponse(const ReplicationExecutor::RemoteCommandCallbackData& cbData,
                                       int targetIndex);
+
+        void _handleHeartbeatResponseV1(
+                const ReplicationExecutor::RemoteCommandCallbackData& cbData,
+                int targetIndex);
 
         void _trackHeartbeatHandle(const StatusWith<ReplicationExecutor::CallbackHandle>& handle);
 
@@ -693,22 +712,42 @@ namespace repl {
          * Called after an incoming heartbeat changes this node's view of the set such that it
          * believes it can be elected PRIMARY.
          * For proper concurrency, must be called via a ReplicationExecutor callback.
+         *
+         * For old style elections the election path is:
+         *      _startElectSelf()
+         *      _onFreshnessCheckComplete()
+         *      _onElectCmdRunnerComplete()
+         * For V1 (raft) style elections the election path is:
+         *      _startElectSelfV1()
+         *      _onVoteRequestComplete()
+         *      _onElectionWinnerDeclarerComplete()
          */
         void _startElectSelf();
+        void _startElectSelfV1();
 
         /**
          * Callback called when the FreshnessChecker has completed; checks the results and
          * decides whether to continue election proceedings.
-         * finishEvh is an event that is signaled when election is complete.
          **/
         void _onFreshnessCheckComplete();
 
         /**
          * Callback called when the ElectCmdRunner has completed; checks the results and
          * decides whether to complete the election and change state to primary.
-         * finishEvh is an event that is signaled when election is complete.
          **/
         void _onElectCmdRunnerComplete();
+
+        /**
+         * Callback called when the VoteRequester has completed; checks the results and
+         * decides whether to change state to primary and alert other nodes of our primary-ness.
+         */
+        void _onVoteRequestComplete();
+
+        /**
+         * Callback called when the ElectWinnerDeclarer has completed; checks the results and
+         * if we received any negative responses, relinquish primary.
+         */
+        void _onElectionWinnerDeclarerComplete();
 
         /**
          * Callback called after a random delay, to prevent repeated election ties.
@@ -761,10 +800,10 @@ namespace repl {
         void _heartbeatStepDownStart();
 
         /**
-         * Completes a step-down of the current node triggered by a heartbeat.  Must
-         * be run with a global shared or global exclusive lock.
+         * Completes a step-down of the current node.  Must be run with a global
+         * shared or global exclusive lock.
          */
-        void _heartbeatStepDownFinish(const ReplicationExecutor::CallbackData& cbData);
+        void _stepDownFinish(const ReplicationExecutor::CallbackData& cbData);
 
         /**
          * Schedules a replica set config change.
@@ -794,7 +833,7 @@ namespace repl {
 
         /**
          * Utility method that schedules or performs actions specified by a HeartbeatResponseAction
-         * returned by a TopologyCoordinator::processHeartbeatResponse call with the given
+         * returned by a TopologyCoordinator::processHeartbeatResponse(V1) call with the given
          * value of "responseStatus".
          */
         void _handleHeartbeatResponseAction(
@@ -810,6 +849,13 @@ namespace repl {
                                      Status* outStatus);
 
         /**
+         * Bottom half of processHeartbeatV1(), which runs in the replication executor.
+         */
+        void _processHeartbeatFinishV1(const ReplicationExecutor::CallbackData& cbData,
+                                       const ReplSetHeartbeatArgsV1& args,
+                                       ReplSetHeartbeatResponse* response,
+                                       Status* outStatus);
+        /**
          * Scan the SlaveInfoVector and determine the highest OplogEntry present on a majority of
          * servers; set _lastCommittedOpTime to this new entry, if greater than the current entry.
          */
@@ -817,6 +863,22 @@ namespace repl {
 
         void _summarizeAsHtml_finish(const ReplicationExecutor::CallbackData& cbData,
                                      ReplSetHtmlSummary* output);
+
+        /**
+         * Callback that gets the current term from topology coordinator.
+         */
+        void _getTerm_helper(const ReplicationExecutor::CallbackData& cbData, long long* term);
+
+
+        /**
+         * Callback that attempts to set the current term in topology coordinator and
+         * relinquishes primary if the term actually changes and we are primary.
+         */
+        void _updateTerm_helper(const ReplicationExecutor::CallbackData& cbData,
+                                long long term,
+                                bool* updated,
+                                Handle* cbHandle);
+        bool _updateTerm_incallback(long long term, Handle* cbHandle);
 
         //
         // All member variables are labeled with one of the following codes indicating the
@@ -927,10 +989,16 @@ namespace repl {
 
         // State for conducting an election of this node.
         // the presence of a non-null _freshnessChecker pointer indicates that an election is
-        // currently in progress.  Only one election is allowed at once.
+        // currently in progress. When using the V1 protocol, a non-null _voteRequester pointer
+        // indicates this instead.
+        // Only one election is allowed at a time.
         boost::scoped_ptr<FreshnessChecker> _freshnessChecker;                            // (X)
 
         boost::scoped_ptr<ElectCmdRunner> _electCmdRunner;                                // (X)
+
+        std::unique_ptr<VoteRequester> _voteRequester;                                    // (X)
+
+        std::unique_ptr<ElectionWinnerDeclarer> _electionWinnerDeclarer;                  // (X)
 
         // Event that the election code will signal when the in-progress election completes.
         // Unspecified value when _freshnessChecker is NULL.

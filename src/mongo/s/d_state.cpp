@@ -94,7 +94,7 @@ namespace mongo {
         boost::lock_guard<boost::mutex> lk(_mutex);
         invariant(_enabled);
 
-        return configServer.getConnectionString().toString();
+        return grid.catalogManager()->connectionString().toString();
     }
 
     void ShardingState::initialize(const string& server) {
@@ -487,9 +487,8 @@ namespace mongo {
 
         auto catalogManager = stdx::make_unique<CatalogManagerLegacy>();
         uassertStatusOK(catalogManager->init(configServerCS));
-        grid.setCatalogManager(std::move(catalogManager));
 
-        configServer.init(configServerCS);
+        grid.setCatalogManager(std::move(catalogManager));
 
         _enabled = true;
     }
@@ -796,7 +795,7 @@ namespace mongo {
             return;
         }
 
-        builder.append("configServer", configServer.getConnectionString().toString());
+        builder.append("configServer", grid.catalogManager()->connectionString().toString());
         builder.append("shardName", _shardName);
 
         BSONObjBuilder versionB(builder.subobjStart("versions"));

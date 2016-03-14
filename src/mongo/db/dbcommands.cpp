@@ -33,10 +33,12 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/scoped_ptr.hpp>
+#include <boost/optional.hpp>
 #include <time.h>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
@@ -73,6 +75,7 @@
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
@@ -91,6 +94,10 @@
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/rpc/request_interface.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/rpc/metadata.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/d_state.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
 #include "mongo/scripting/engine.h"
@@ -201,6 +208,9 @@ namespace mongo {
             }
 
             Status status = dropDatabase(txn, dbname);
+            if (status == ErrorCodes::DatabaseNotFound) {
+                return appendCommandStatus(result, Status::OK());
+            }
             if (status.isOK()) {
                 result.append( "dropped" , dbname );
             }
@@ -233,30 +243,6 @@ namespace mongo {
 
         }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db,
-                                                     const BSONObj& cmdObj) {
-            invariant(db);
-            std::list<std::string> collections;
-            db->getDatabaseCatalogEntry()->getCollectionNamespaces(&collections);
-
-            std::vector<BSONObj> allKilledIndexes;
-            for (std::list<std::string>::iterator it = collections.begin();
-                 it != collections.end();
-                 ++it) {
-                std::string ns = *it;
-
-                IndexCatalog::IndexKillCriteria criteria;
-                criteria.ns = ns;
-                std::vector<BSONObj> killedIndexes = 
-                    IndexBuilder::killMatchingIndexBuilds(db->getCollection(ns), criteria);
-                allKilledIndexes.insert(allKilledIndexes.end(), 
-                                        killedIndexes.begin(), 
-                                        killedIndexes.end());
-            }
-            return allKilledIndexes;
-        }
-
         bool run(OperationContext* txn,
                  const string& dbname,
                  BSONObj& cmdObj,
@@ -272,10 +258,10 @@ namespace mongo {
             // TODO: SERVER-4328 Don't lock globally
             ScopedTransaction transaction(txn, MODE_X);
             Lock::GlobalWrite lk(txn->lockState());
-            OldClientContext context(txn,  dbname );
+            OldClientContext context(txn, dbname);
 
             log() << "repairDatabase " << dbname;
-            std::vector<BSONObj> indexesInProg = stopIndexBuilds(txn, context.db(), cmdObj);
+            BackgroundOperation::assertNoBgOpInProgForDb(dbname);
 
             e = cmdObj.getField( "preserveClonedFilesOnFailure" );
             bool preserveClonedFilesOnFailure = e.isBoolean() && e.boolean();
@@ -288,8 +274,6 @@ namespace mongo {
             ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, txn, shouldReplicateWrites);
             Status status = repairDatabase(txn, engine, dbname, preserveClonedFilesOnFailure,
                                            backupOriginalFiles );
-
-            IndexBuilder::restoreIndexes(txn, indexesInProg);
 
             // Open database before returning
             dbHolder().openDb(txn, dbname);
@@ -1018,8 +1002,11 @@ namespace mongo {
             const string ns = parseNs(dbname, jsobj);
 
             // TODO: OldClientContext legacy, needs to be removed
-            txn->getCurOp()->ensureStarted();
-            txn->getCurOp()->setNS(dbname);
+            CurOp::get(txn)->ensureStarted();
+            {
+                stdx::lock_guard<Client> lk(*txn->getClient());
+                CurOp::get(txn)->setNS_inlock(dbname);
+            }
 
             // We lock the entire database in S-mode in order to ensure that the contents will not
             // change for the stats snapshot. This might be unnecessary and if it becomes a
@@ -1047,8 +1034,11 @@ namespace mongo {
                 result.appendNumber("fileSize", 0);
             }
             else {
-                // TODO: OldClientContext legacy, needs to be removed
-                txn->getCurOp()->enter(dbname.c_str(), db->getProfilingLevel());
+                {
+                    stdx::lock_guard<Client> lk(*txn->getClient());
+                    // TODO: OldClientContext legacy, needs to be removed
+                    CurOp::get(txn)->enter_inlock(dbname.c_str(), db->getProfilingLevel());
+                }
 
                 db->getStats(txn, &result, scale);
             }
@@ -1078,7 +1068,7 @@ namespace mongo {
                          int,
                          string& errmsg,
                          BSONObjBuilder& result) {
-            result << "you" << txn->getCurOp()->getRemoteString();
+            result << "you" << txn->getClient()->clientAddress(true /*includePort*/);
             return true;
         }
     } cmdWhatsMyUri;
@@ -1108,30 +1098,6 @@ namespace mongo {
             return true;
         }
     } availableQueryOptionsCmd;
-
-    bool _execCommand(OperationContext* txn,
-                      Command *c,
-                      const string& dbname,
-                      BSONObj& cmdObj,
-                      int queryOptions,
-                      std::string& errmsg,
-                      BSONObjBuilder& result) {
-
-        try {
-            return c->run(txn, dbname, cmdObj, queryOptions, errmsg, result);
-        }
-        catch (const SendStaleConfigException& e) {
-            LOG(1) << "command failed because of stale config, can retry" << causedBy(e);
-            throw;
-        }
-        catch (const DBException& e) {
-            // TODO: Rethrown errors have issues here, should divorce SendStaleConfigException from the DBException tree
-
-            result.append("errmsg", e.what());
-            result.append("code", e.getCode());
-            return false;
-        }
-    }
 
     /**
      * Guard object for making a good-faith effort to enter maintenance mode and leave it when it
@@ -1189,13 +1155,14 @@ namespace mongo {
     };
 
 namespace {
+    // TODO remove as part of SERVER-18236
     void appendGLEHelperData(BSONObjBuilder& bob, const Timestamp& opTime, const OID& oid) {
         BSONObjBuilder subobj(bob.subobjStart(kGLEStatsFieldName));
         subobj.append(kGLEStatsLastOpTimeFieldName, opTime);
         subobj.appendOID(kGLEStatsElectionIdFieldName, const_cast<OID*>(&oid));
         subobj.done();
     }
-} // namespace
+}  // namespace
 
     /**
      * this handles
@@ -1207,276 +1174,236 @@ namespace {
      then calls run()
     */
     void Command::execCommand(OperationContext* txn,
-                              Command * c ,
-                              int queryOptions,
-                              const char *cmdns,
-                              BSONObj& cmdObj,
-                              BSONObjBuilder& result) {
-        std::string dbname = nsToDatabase( cmdns );
-        scoped_ptr<MaintenanceModeSetter> mmSetter;
+                              Command* command,
+                              const rpc::RequestInterface& request,
+                              rpc::ReplyBuilderInterface* replyBuilder) {
 
-        if ( cmdObj["help"].trueValue() ) {
-            txn->getCurOp()->ensureStarted();
-            stringstream ss;
-            ss << "help for: " << c->name << " ";
-            c->help( ss );
-            result.append( "help" , ss.str() );
-            result.append("lockType", c->isWriteCommandForConfigServer() ? 1 : 0);
-            appendCommandStatus(result, true, "");
-            return;
-        }
+        try {
 
-        // Handle command option impersonatedUsers and impersonatedRoles.
-        // This must come before _checkAuthorization(), as there is some command parsing logic
-        // in that code path that must not see the impersonated user and roles array elements.
-        std::vector<UserName> parsedUserNames;
-        std::vector<RoleName> parsedRoleNames;
-        AuthorizationSession* authSession = AuthorizationSession::get(txn->getClient());
-        bool rolesFieldIsPresent = false;
-        bool usersFieldIsPresent = false;
-        audit::parseAndRemoveImpersonatedRolesField(cmdObj,
-                                                    authSession,
-                                                    &parsedRoleNames,
-                                                    &rolesFieldIsPresent);
-        audit::parseAndRemoveImpersonatedUsersField(cmdObj,
-                                                    authSession,
-                                                    &parsedUserNames,
-                                                    &usersFieldIsPresent);
-        if (rolesFieldIsPresent != usersFieldIsPresent) {
-            // If there is a version mismatch between the mongos and the mongod,
-            // the mongos may fail to pass the role information, causing an error.
-            Status s(ErrorCodes::IncompatibleAuditMetadata,
-                    "Audit metadata does not include both user and role information.");
-            appendCommandStatus(result, s);
-            return;
-        }
-        ImpersonationSessionGuard impersonationSession(authSession,
-                                                       usersFieldIsPresent,
-                                                       parsedUserNames,
-                                                       parsedRoleNames);
+            {
+                stdx::lock_guard<Client> lk(*txn->getClient());
+                CurOp::get(txn)->setCommand_inlock(command);
+            }
+            // TODO: move this back to runCommands when mongos supports OperationContext
+            // see SERVER-18515 for details.
+            uassertStatusOK(rpc::readRequestMetadata(txn, request.getMetadata()));
 
-        Status status = _checkAuthorization(c,
-                                            txn->getClient(),
-                                            dbname,
-                                            cmdObj);
-        if (!status.isOK()) {
-            appendCommandStatus(result, status);
-            return;
+            dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kMetadata);
+
+            // Right now our metadata handling relies on mutating the command object.
+            // This will go away when SERVER-18236 is implemented
+            BSONObj interposedCmd = request.getCommandArgs();
+
+            std::string dbname = request.getDatabase().toString();
+            scoped_ptr<MaintenanceModeSetter> mmSetter;
+
+            if (isHelpRequest(request)) {
+                CurOp::get(txn)->ensureStarted();
+                generateHelpResponse(txn, request, replyBuilder, *command);
+                return;
+            }
+
+            // Handle command option impersonatedUsers and impersonatedRoles.
+            // This must come before _checkAuthorization(), as there is some command parsing logic
+            // in that code path that must not see the impersonated user and roles array elements.
+            std::vector<UserName> parsedUserNames;
+            std::vector<RoleName> parsedRoleNames;
+            AuthorizationSession* authSession = AuthorizationSession::get(txn->getClient());
+            bool rolesFieldIsPresent = false;
+            bool usersFieldIsPresent = false;
+
+            // TODO: Remove these once the metadata refactor (SERVER-18236) is complete.
+            // Then we can construct the ImpersonationSessionGuard directly from the contents of the
+            // metadata object rather than slicing elements off of the command object.
+            audit::parseAndRemoveImpersonatedRolesField(interposedCmd,
+                                                        authSession,
+                                                        &parsedRoleNames,
+                                                        &rolesFieldIsPresent);
+            audit::parseAndRemoveImpersonatedUsersField(interposedCmd,
+                                                        authSession,
+                                                        &parsedUserNames,
+                                                        &usersFieldIsPresent);
+
+            uassert(ErrorCodes::IncompatibleAuditMetadata,
+                    "Audit metadata does not include both user and role information.",
+                    rolesFieldIsPresent == usersFieldIsPresent);
+
+            ImpersonationSessionGuard impersonationSession(authSession,
+                                                           usersFieldIsPresent,
+                                                           parsedUserNames,
+                                                           parsedRoleNames);
+
+            uassertStatusOK(_checkAuthorization(command,
+                                                txn->getClient(),
+                                                dbname,
+                                                interposedCmd));
+
+            {
+                repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
+
+                bool iAmPrimary = replCoord->canAcceptWritesForDatabase(dbname);
+                bool commandCanRunOnSecondary = command->slaveOk();
+
+                bool commandIsOverriddenToRunOnSecondary = command->slaveOverrideOk() &&
+
+                    // The $secondaryOk option is set.
+                    (rpc::ServerSelectionMetadata::get(txn).isSecondaryOk() ||
+
+                     // Or the command has a read preference (may be incorrect, see SERVER-18194).
+                     (rpc::ServerSelectionMetadata::get(txn).getReadPreference() != boost::none));
+
+                bool iAmStandalone = !txn->writesAreReplicated();
+                bool canRunHere = iAmPrimary ||
+                                  commandCanRunOnSecondary ||
+                                  commandIsOverriddenToRunOnSecondary ||
+                                  iAmStandalone;
+
+                // This logic is clearer if we don't have to invert it.
+                if (!canRunHere && command->slaveOverrideOk()) {
+                    uasserted(ErrorCodes::NotMasterNoSlaveOkCode,
+                              "not master and slaveOk=false");
+                }
+
+                uassert(ErrorCodes::NotMaster,
+                        "not master",
+                        canRunHere);
+
+                if (!command->maintenanceOk()
+                    && replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet
+                    && !replCoord->canAcceptWritesForDatabase(dbname)
+                    && !replCoord->getMemberState().secondary()) {
+
+                    uasserted(ErrorCodes::NotMasterOrSecondaryCode,
+                              "node is recovering");
+                }
+            }
+
+            if (command->adminOnly()) {
+                LOG(2) << "command: " << request.getCommandName();
+            }
+
+            if (command->maintenanceMode()) {
+                mmSetter.reset(new MaintenanceModeSetter);
+            }
+
+            if (command->shouldAffectCommandCounter()) {
+                OpCounters* opCounters = &globalOpCounters;
+                opCounters->gotCommand();
+            }
+
+            // Handle command option maxTimeMS.
+            int maxTimeMS = uassertStatusOK(
+                LiteParsedQuery::parseMaxTimeMSCommand(interposedCmd)
+            );
+
+            uassert(ErrorCodes::InvalidOptions,
+                    "no such command option $maxTimeMs; use maxTimeMS instead",
+                    !interposedCmd.hasField("$maxTimeMS"));
+
+            CurOp::get(txn)->setMaxTimeMicros(static_cast<unsigned long long>(maxTimeMS)
+                                              * 1000);
+
+            // Can throw
+            txn->checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
+
+            bool retval = false;
+
+            CurOp::get(txn)->ensureStarted();
+
+            command->_commandsExecuted.increment();
+
+            retval = command->run(txn, interposedCmd, request, replyBuilder);
+
+            dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kOutputDocs);
+
+            if (!retval) {
+                command->_commandsFailed.increment();
+            }
         }
+        catch (const DBException& exception) {
+            Command::generateErrorResponse(txn, replyBuilder, exception, request, command);
+        }
+    }
+
+    // This really belongs in commands.cpp, but we need to move it here so we can
+    // use shardingState and the repl coordinator without changing our entire library
+    // structure.
+    // It will be moved back as part of SERVER-18236.
+    bool Command::run(OperationContext* txn,
+                      const BSONObj& prevInterposedCmd,
+                      const rpc::RequestInterface& request,
+                      rpc::ReplyBuilderInterface* replyBuilder) {
+
+        // Implementation just forwards to the old method signature for now.
+        std::string errmsg;
+        BSONObjBuilder replyBuilderBob;
+
+        // run expects non-const bsonobj
+        BSONObj interposedCmd = prevInterposedCmd;
+
+        // run expects const db std::string (can't bind to temporary)
+        const std::string db = request.getDatabase().toString();
+
+        int queryFlags = 0;
+        std::tie(std::ignore, queryFlags) = uassertStatusOK(
+            rpc::downconvertRequestMetadata(request.getCommandArgs(),
+                                            request.getMetadata())
+        );
 
         repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
-        bool canRunHere =
-            replCoord->canAcceptWritesForDatabase(dbname) ||
-            c->slaveOk() ||
-            ( c->slaveOverrideOk() && ( queryOptions & QueryOption_SlaveOk ) ) || 
-            !txn->writesAreReplicated();
-
-        if ( ! canRunHere ) {
-            result.append( "note" , "from execCommand" );
-            if ( c->slaveOverrideOk() ) {
-                appendCommandStatus(result, false, "not master and slaveOk=false");
-            }
-            else {
-                appendCommandStatus(result, false, "not master");
-            }
-            return;
-        }
-
-        if (!c->maintenanceOk()
-                && replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet
-                && !replCoord->canAcceptWritesForDatabase(dbname)
-                && !replCoord->getMemberState().secondary()) {
-            result.append( "note" , "from execCommand" );
-            appendCommandStatus(result, false, "node is recovering");
-            return;
-        }
-
-        if ( c->adminOnly() ) {
-            LOG( 2 ) << "command: " << cmdObj << endl;
-        }
-
-        txn->getCurOp()->setCommand(c);
-
-        if (c->maintenanceMode()) {
-            mmSetter.reset(new MaintenanceModeSetter);
-        }
-
-        if (c->shouldAffectCommandCounter()) {
-            OpCounters* opCounters = &globalOpCounters;
-            opCounters->gotCommand();
-        }
-
-        // Handle command option maxTimeMS.
-        StatusWith<int> maxTimeMS = LiteParsedQuery::parseMaxTimeMSCommand(cmdObj);
-        if (!maxTimeMS.isOK()) {
-            appendCommandStatus(result, false, maxTimeMS.getStatus().reason());
-            return;
-        }
-        if (cmdObj.hasField("$maxTimeMS")) {
-            appendCommandStatus(result,
-                                false,
-                                "no such command option $maxTimeMS; use maxTimeMS instead");
-            return;
-        }
-
-        txn->getCurOp()->setMaxTimeMicros(static_cast<unsigned long long>(maxTimeMS.getValue())
-                                          * 1000);
-        try {
-            txn->checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
-        }
-        catch (UserException& e) {
-            appendCommandStatus(result, e.toStatus());
-            return;
-        }
-
-        std::string errmsg;
-        bool retval = false;
-
-        txn->getCurOp()->ensureStarted();
-
-        c->_commandsExecuted.increment();
 
         {
             // Handle read after opTime.
-
             repl::ReadAfterOpTimeArgs readAfterOptimeSettings;
-            auto readAfterParseStatus = readAfterOptimeSettings.initialize(cmdObj);
+            auto readAfterParseStatus = readAfterOptimeSettings.initialize(interposedCmd);
             if (!readAfterParseStatus.isOK()) {
-                appendCommandStatus(result, readAfterParseStatus);
-                return;
+                replyBuilder
+                    ->setMetadata(rpc::makeEmptyMetadata())
+                    .setCommandReply(readAfterParseStatus);
+                return false;
             }
 
             auto readAfterResult = replCoord->waitUntilOpTime(txn, readAfterOptimeSettings);
-            readAfterResult.appendInfo(&result);
-
+            readAfterResult.appendInfo(&replyBuilderBob);
             if (!readAfterResult.getStatus().isOK()) {
-                appendCommandStatus(result, readAfterResult.getStatus());
-                return;
+                replyBuilder
+                    ->setMetadata(rpc::makeEmptyMetadata())
+                    .setCommandReply(readAfterResult.getStatus(), replyBuilderBob.done());
+                return false;
             }
         }
 
-        retval = _execCommand(txn, c, dbname, cmdObj, queryOptions, errmsg, result);
-
-        if ( !retval ){
-            c->_commandsFailed.increment();
-        }
-
-        appendCommandStatus(result, retval, errmsg);
+        bool result = this->run(txn, db, interposedCmd, queryFlags, errmsg, replyBuilderBob);
 
         // For commands from mongos, append some info to help getLastError(w) work.
+        // TODO: refactor out of here as part of SERVER-18326
         if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet &&
-                shardingState.enabled()) {
+            shardingState.enabled()) {
             appendGLEHelperData(
-                    result,
+                    replyBuilderBob,
                     repl::ReplClientInfo::forClient(txn->getClient()).getLastOp().getTimestamp(),
                     replCoord->getElectionId());
         }
-        return;
-    }
 
-    /* TODO make these all command objects -- legacy stuff here
+        replyBuilder->setMetadata(rpc::makeEmptyMetadata());
 
-       usage:
-         abc.$cmd.findOne( { ismaster:1 } );
+        auto cmdResponse = replyBuilderBob.done();
 
-       returns true if ran a cmd
-    */
-    bool _runCommands(OperationContext* txn,
-                      const char* ns,
-                      BSONObj& _cmdobj,
-                      BufBuilder& b,
-                      BSONObjBuilder& anObjBuilder,
-                      int queryOptions) {
-        string dbname = nsToDatabase( ns );
-
-        const char *p = strchr(ns, '.');
-        if ( !p ) return false;
-        if ( strcmp(p, ".$cmd") != 0 ) return false;
-
-        BSONObj jsobj;
-        {
-            BSONElement e = _cmdobj.firstElement();
-            if ( e.type() == Object && (e.fieldName()[0] == '$'
-                                         ? str::equals("query", e.fieldName()+1)
-                                         : str::equals("query", e.fieldName())))
-            {
-                jsobj = e.embeddedObject();
-                if (_cmdobj.hasField("$maxTimeMS")) {
-                    Command::appendCommandStatus(anObjBuilder,
-                                                 false,
-                                                 "cannot use $maxTimeMS query option with "
-                                                    "commands; use maxTimeMS command option "
-                                                    "instead");
-                    BSONObj x = anObjBuilder.done();
-                    b.appendBuf(x.objdata(), x.objsize());
-                    return true;
-                }
-            }
-            else {
-                jsobj = _cmdobj;
-            }
-        }
-
-        // Treat the command the same as if it has slaveOk bit on if it has a read
-        // preference setting. This is to allow these commands to run on a secondary.
-        if (Query::hasReadPreference(_cmdobj)) {
-            queryOptions |= QueryOption_SlaveOk;
-        }
-
-        BSONElement e = jsobj.firstElement();
-
-        Command * c = e.type() ? Command::findCommand( e.fieldName() ) : 0;
-
-        if ( c ) {
-            LOG(2) << "run command " << ns << ' ' << c->getRedactedCopyForLogging(_cmdobj);
-            Command::execCommand(txn,
-                                 c,
-                                 queryOptions,
-                                 ns,
-                                 jsobj,
-                                 anObjBuilder);
+        if (result) {
+            replyBuilder->setCommandReply(std::move(cmdResponse));
         }
         else {
-            // In the absence of a Command object, no redaction is possible. Therefore
-            // to avoid displaying potentially sensitive information in the logs,
-            // we restrict the log message to the name of the unrecognized command.
-            // However, the complete command object will still be echoed to the client.
-            string msg = str::stream() << "no such command: " << e.fieldName();
-            LOG(2) << msg;
-            Command::appendCommandStatus(anObjBuilder, false, msg);
-            anObjBuilder.append("code", ErrorCodes::CommandNotFound);
-            anObjBuilder.append("bad cmd" , _cmdobj );
-            Command::unknownCommands.increment();
+            // maintain existing behavior of returning all data appended to builder
+            // even if command returned false
+            replyBuilder->setCommandReply(Status(ErrorCodes::CommandFailed, errmsg),
+                                          std::move(cmdResponse));
         }
 
-        BSONObj x = anObjBuilder.done();
-        b.appendBuf(x.objdata(), x.objsize());
-
-        return true;
+        return result;
     }
 
-    bool runCommands(OperationContext* txn,
-                     const char* ns,
-                     BSONObj& jsobj,
-                     CurOp& curop,
-                     BufBuilder& b,
-                     BSONObjBuilder& anObjBuilder,
-                     int queryOptions) {
-        try {
-            return _runCommands(txn, ns, jsobj, b, anObjBuilder, queryOptions);
-        }
-        catch (const SendStaleConfigException&){
-            throw;
-        }
-        catch (const AssertionException& e) {
-            verify( e.getCode() != SendStaleConfigCode && e.getCode() != RecvStaleConfigCode );
-
-            Command::appendCommandStatus(anObjBuilder, e.toStatus());
-            curop.debug().exceptionInfo = e.getInfo();
-        }
-        BSONObj x = anObjBuilder.done();
-        b.appendBuf(x.objdata(), x.objsize());
-        return true;
+    void Command::registerError(OperationContext* txn, const DBException& exception) {
+        CurOp::get(txn)->debug().exceptionInfo = exception.getInfo();
     }
 
 } // namespace mongo

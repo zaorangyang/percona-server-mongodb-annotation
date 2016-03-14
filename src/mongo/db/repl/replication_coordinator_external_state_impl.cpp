@@ -56,6 +56,7 @@
 #include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/executor/network_interface.h"
 #include "mongo/s/d_state.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
@@ -248,7 +249,7 @@ namespace {
     }
 
     void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(const Timestamp& newTime) {
-        setNewOptime(newTime);
+        setNewTimestamp(newTime);
     }
 
     StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
@@ -276,8 +277,7 @@ namespace {
                         "\" in most recent " << rsOplogName <<
                         " entry to have type Timestamp, but found " << typeName(tsElement.type()));
             }
-            // TODO(siyuan) add term
-            return StatusWith<OpTime>(OpTime(tsElement.timestamp(), 0));
+            return StatusWith<OpTime>(extractOpTime(oplogEntry));
         }
         catch (const DBException& ex) {
             return StatusWith<OpTime>(ex.toStatus());
@@ -295,8 +295,7 @@ namespace {
     }
 
     void ReplicationCoordinatorExternalStateImpl::closeConnections() {
-        MessagingPort::closeAllSockets(
-            ReplicationExecutor::NetworkInterface::kMessagingPortKeepOpen);
+        MessagingPort::closeAllSockets(executor::NetworkInterface::kMessagingPortKeepOpen);
     }
 
     void ReplicationCoordinatorExternalStateImpl::killAllUserOperations(OperationContext* txn) {
@@ -315,7 +314,7 @@ namespace {
     OperationContext* ReplicationCoordinatorExternalStateImpl::createOperationContext(
             const std::string& threadName) {
         Client::initThreadIfNotAlready(threadName.c_str());
-        return new OperationContextImpl;
+        return new OperationContextImpl();
     }
 
     void ReplicationCoordinatorExternalStateImpl::dropAllTempCollections(OperationContext* txn) {

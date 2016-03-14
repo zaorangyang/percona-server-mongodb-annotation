@@ -518,7 +518,7 @@ namespace mongo {
         // Turn on FIPS mode if requested.
         // OPENSSL_FIPS must be defined by the OpenSSL headers, plus MONGO_CONFIG_SSL_FIPS
         // must be defined via a MongoDB build flag.
-#if defined(OPENSSL_FIPS) && defined(MONGO_CONFIG_SSL_FIPS)
+#if defined(MONGO_CONFIG_HAVE_FIPS_MODE_SET)
         int status = FIPS_mode_set(1);
         if (!status) {
             severe() << "can't activate FIPS mode: " << 
@@ -693,10 +693,9 @@ namespace mongo {
                 return false;
             }
 
-            if ((notBeforeMillis > curTimeMillis64()) ||
-                (curTimeMillis64() > notAfterMillis)) {
-                dbexit(EXIT_BADOPTIONS,
-                       "The provided SSL certificate is expired or not yet valid.");
+            if ((notBeforeMillis > curTimeMillis64()) || (curTimeMillis64() > notAfterMillis)) {
+                severe() << "The provided SSL certificate is expired or not yet valid.";
+                fassertFailedNoTrace(28652);
             }
 
             *serverCertificateExpirationDate = Date_t::fromMillisSinceEpoch(notAfterMillis);

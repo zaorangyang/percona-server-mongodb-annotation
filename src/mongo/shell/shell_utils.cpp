@@ -196,10 +196,11 @@ namespace mongo {
             uassert(17134, "replMonitorStats requires a single string argument (the ReplSet name)",
                     a.nFields() == 1 && a.firstElement().type() == String);
 
-            ReplicaSetMonitorPtr rsm = ReplicaSetMonitor::get(a.firstElement().valuestrsafe(),true);
+            ReplicaSetMonitorPtr rsm = ReplicaSetMonitor::get(a.firstElement().valuestrsafe());
             if (!rsm) {
                 return BSON("" << "no ReplSetMonitor exists by that name");
             }
+
             BSONObjBuilder result;
             rsm->appendInfo(result);
             return result.obj();
@@ -305,11 +306,15 @@ namespace mongo {
             boost::lock_guard<boost::mutex> lk( _mutex );
             for( map<string,set<string> >::const_iterator i = _connectionUris.begin();
                 i != _connectionUris.end(); ++i ) {
-                string errmsg;
-                ConnectionString cs = ConnectionString::parse( i->first, errmsg );
-                if ( !cs.isValid() ) {
-                    continue;   
+
+                auto status = ConnectionString::parse(i->first);
+                if (!status.isOK()) {
+                    continue;
                 }
+
+                const ConnectionString cs(status.getValue());
+
+                string errmsg;
                 boost::scoped_ptr<DBClientWithCommands> conn( cs.connect( errmsg ) );
                 if ( !conn ) {
                     continue;
@@ -347,6 +352,7 @@ namespace mongo {
             if ( _nokillop ) {
                 return;
             }
+            c.setClientRPCProtocols(shellGlobalParams.rpcProtocols);
             connectionRegistry.registerConnection( c );
         }
 

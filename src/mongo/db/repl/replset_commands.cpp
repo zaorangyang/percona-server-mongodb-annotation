@@ -49,12 +49,12 @@
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
-#include "mongo/db/repl/repl_set_heartbeat_response_v1.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/executor/network_interface.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
@@ -710,39 +710,39 @@ namespace {
             {
                 AbstractMessagingPort *mp = txn->getClient()->port();
                 if( mp )
-                    mp->tag |= ReplicationExecutor::NetworkInterface::kMessagingPortKeepOpen;
+                    mp->tag |= executor::NetworkInterface::kMessagingPortKeepOpen;
             }
 
             if (getGlobalReplicationCoordinator()->isV1ElectionProtocol()) {
                 ReplSetHeartbeatArgsV1 args;
                 status = args.initialize(cmdObj);
-                if (!status.isOK()) {
+                if (status.isOK()) {
+                    ReplSetHeartbeatResponse response;
+                    status = getGlobalReplicationCoordinator()->processHeartbeatV1(args, &response);
+                    if (status.isOK())
+                        response.addToBSON(&result, true);
                     return appendCommandStatus(result, status);
                 }
-                ReplSetHeartbeatResponseV1 response;
-                status = getGlobalReplicationCoordinator()->processHeartbeatV1(args, &response);
-                if (status.isOK())
-                    response.addToBSON(&result);
+                // else: fall through to old heartbeat protocol as it is likely that
+                // a new node just joined the set
+            }
+
+            ReplSetHeartbeatArgs args;
+            status = args.initialize(cmdObj);
+            if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
-            else {
-                ReplSetHeartbeatArgs args;
-                status = args.initialize(cmdObj);
-                if (!status.isOK()) {
-                    return appendCommandStatus(result, status);
-                }
 
-                // ugh.
-                if (args.getCheckEmpty()) {
-                    result.append("hasData", replHasDatabases(txn));
-                }
-
-                ReplSetHeartbeatResponse response;
-                status = getGlobalReplicationCoordinator()->processHeartbeat(args, &response);
-                if (status.isOK())
-                    response.addToBSON(&result);
-                return appendCommandStatus(result, status);
+            // ugh.
+            if (args.getCheckEmpty()) {
+                result.append("hasData", replHasDatabases(txn));
             }
+
+            ReplSetHeartbeatResponse response;
+            status = getGlobalReplicationCoordinator()->processHeartbeat(args, &response);
+            if (status.isOK())
+                response.addToBSON(&result, false);
+            return appendCommandStatus(result, status);
         }
     } cmdReplSetHeartbeat;
 

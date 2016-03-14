@@ -32,9 +32,9 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/fetcher.h"
-#include "mongo/db/repl/network_interface_mock.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/replication_executor_test_fixture.h"
+#include "mongo/executor/network_interface_mock.h"
 
 #include "mongo/unittest/unittest.h"
 
@@ -42,13 +42,14 @@ namespace {
 
     using namespace mongo;
     using namespace mongo::repl;
+    using executor::NetworkInterfaceMock;
 
     const HostAndPort target("localhost", -1);
     const BSONObj findCmdObj = BSON("find" << "coll");
 
     class FetcherTest : public ReplicationExecutorTest {
     public:
-        static Status getDefaultStatus();
+        static Status getDetectableErrorStatus();
         FetcherTest();
         void setUp() override;
         void tearDown() override;
@@ -71,15 +72,16 @@ namespace {
 
     private:
         void _callback(const StatusWith<Fetcher::BatchData>& result,
-                       Fetcher::NextAction* nextAction);
+                       Fetcher::NextAction* nextAction,
+                       BSONObjBuilder* getMoreBob);
     };
 
-    Status FetcherTest::getDefaultStatus() {
+    Status FetcherTest::getDetectableErrorStatus() {
         return Status(ErrorCodes::InternalError, "Not mutated");
     }
 
     FetcherTest::FetcherTest()
-        : status(getDefaultStatus()),
+        : status(getDetectableErrorStatus()),
           cursorId(-1),
           nextAction(Fetcher::NextAction::kInvalid) { }
 
@@ -89,7 +91,7 @@ namespace {
         fetcher.reset(new Fetcher(
             &getExecutor(), target, "db", findCmdObj,
             stdx::bind(&FetcherTest::_callback, this,
-                       stdx::placeholders::_1, stdx::placeholders::_2)));
+                       stdx::placeholders::_1, stdx::placeholders::_2, stdx::placeholders::_3)));
         launchExecutorThread();
     }
 
@@ -100,7 +102,7 @@ namespace {
     }
 
     void FetcherTest::clear() {
-        status = getDefaultStatus();
+        status = getDetectableErrorStatus();
         cursorId = -1;
         documents.clear();
         nextAction = Fetcher::NextAction::kInvalid;
@@ -138,26 +140,31 @@ namespace {
         ASSERT_TRUE(fetcher->isActive());
         getNet()->runReadyNetworkOperations();
         ASSERT_FALSE(getNet()->hasReadyRequests());
-        fetcher->wait();
         ASSERT_FALSE(fetcher->isActive());
     }
 
     void FetcherTest::_callback(const StatusWith<Fetcher::BatchData>& result,
-                                Fetcher::NextAction* nextActionFromFetcher) {
+                                Fetcher::NextAction* nextActionFromFetcher,
+                                BSONObjBuilder* getMoreBob) {
         status = result.getStatus();
         if (result.isOK()) {
             const Fetcher::BatchData& batchData = result.getValue();
             cursorId = batchData.cursorId;
             documents = batchData.documents;
         }
-        nextAction = *nextActionFromFetcher;
+
         if (callbackHook) {
-            callbackHook(result, nextActionFromFetcher);
+            callbackHook(result, nextActionFromFetcher, getMoreBob);
+        }
+
+        if (nextActionFromFetcher) {
+            nextAction = *nextActionFromFetcher;
         }
     }
 
     void unusedFetcherCallback(const StatusWith<Fetcher::BatchData>& fetchResult,
-                               Fetcher::NextAction* nextAction) {
+                               Fetcher::NextAction* nextAction,
+                               BSONObjBuilder* getMoreBob) {
         FAIL("should not reach here");
     }
 
@@ -195,9 +202,6 @@ namespace {
         Fetcher fetcher(&getExecutor(), target, "db", findCmdObj, unusedFetcherCallback);
         ASSERT_FALSE(fetcher.getDiagnosticString().empty());
     }
-
-    void isActiveCallback(const StatusWith<Fetcher::BatchData>& fetchResult,
-                          Fetcher::NextAction* nextAction) { }
 
     TEST_F(FetcherTest, IsActiveAfterSchedule) {
         ASSERT_FALSE(fetcher->isActive());
@@ -253,7 +257,6 @@ namespace {
         processNetworkResponse(ErrorCodes::BadValue, "bad hint");
         ASSERT_EQUALS(ErrorCodes::BadValue, status.code());
         ASSERT_EQUALS("bad hint", status.reason());
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, FindCommandFailed2) {
@@ -263,7 +266,6 @@ namespace {
                                     "code" << int(ErrorCodes::BadValue)));
         ASSERT_EQUALS(ErrorCodes::BadValue, status.code());
         ASSERT_EQUALS("bad hint", status.reason());
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, CursorFieldMissing) {
@@ -271,7 +273,6 @@ namespace {
         processNetworkResponse(BSON("ok" << 1));
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_STRING_CONTAINS(status.reason(), "must contain 'cursor' field");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, CursorNotAnObject) {
@@ -279,7 +280,6 @@ namespace {
         processNetworkResponse(BSON("cursor" << 123 << "ok" << 1));
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_STRING_CONTAINS(status.reason(), "'cursor' field must be an object");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, CursorIdFieldMissing) {
@@ -289,19 +289,18 @@ namespace {
                                     "ok" << 1));
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_STRING_CONTAINS(status.reason(), "must contain 'cursor.id' field");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, CursorIdNotLongNumber) {
         ASSERT_OK(fetcher->schedule());
-        processNetworkResponse(BSON("cursor" << BSON("id" << 123 <<
+        processNetworkResponse(BSON("cursor" << BSON("id" << 123.1 <<
                                                      "ns" << "db.coll" <<
                                                      "firstBatch" << BSONArray()) <<
                                     "ok" << 1));
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_STRING_CONTAINS(status.reason(),
-                               "'cursor.id' field must be a number of type 'long'");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
+                               "'cursor.id' field must be");
+        ASSERT_EQ((int)Fetcher::NextAction::kInvalid, (int)nextAction);
     }
 
     TEST_F(FetcherTest, NamespaceFieldMissing) {
@@ -311,7 +310,6 @@ namespace {
                                     "ok" << 1));
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_STRING_CONTAINS(status.reason(), "must contain 'cursor.ns' field");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, NamespaceNotAString) {
@@ -322,7 +320,6 @@ namespace {
                                     "ok" << 1));
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_STRING_CONTAINS(status.reason(), "'cursor.ns' field must be a string");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, NamespaceEmpty) {
@@ -333,7 +330,6 @@ namespace {
                                     "ok" << 1));
         ASSERT_EQUALS(ErrorCodes::BadValue, status.code());
         ASSERT_STRING_CONTAINS(status.reason(), "'cursor.ns' contains an invalid namespace");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, NamespaceMissingCollectionName) {
@@ -344,7 +340,6 @@ namespace {
                                     "ok" << 1));
         ASSERT_EQUALS(ErrorCodes::BadValue, status.code());
         ASSERT_STRING_CONTAINS(status.reason(), "'cursor.ns' contains an invalid namespace");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, FirstBatchFieldMissing) {
@@ -354,7 +349,6 @@ namespace {
                                     "ok" << 1));
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_STRING_CONTAINS(status.reason(), "must contain 'cursor.firstBatch' field");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, FirstBatchNotAnArray) {
@@ -365,7 +359,6 @@ namespace {
                                     "ok" << 1));
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_STRING_CONTAINS(status.reason(), "'cursor.firstBatch' field must be an array");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, FirstBatchArrayContainsNonObject) {
@@ -377,7 +370,6 @@ namespace {
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_STRING_CONTAINS(status.reason(), "found non-object");
         ASSERT_STRING_CONTAINS(status.reason(), "in 'cursor.firstBatch' field");
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, FirstBatchEmptyArray) {
@@ -388,7 +380,6 @@ namespace {
                                     "ok" << 1));
         ASSERT_OK(status);
         ASSERT_TRUE(documents.empty());
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     }
 
     TEST_F(FetcherTest, FetchOneDocument) {
@@ -402,7 +393,31 @@ namespace {
         ASSERT_EQUALS(0, cursorId);
         ASSERT_EQUALS(1U, documents.size());
         ASSERT_EQUALS(doc, documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
+    }
+
+    TEST_F(FetcherTest, SetNextActionToContinueWhenNextBatchIsNotAvailable) {
+        ASSERT_OK(fetcher->schedule());
+        const BSONObj doc = BSON("_id" << 1);
+        callbackHook = [](const StatusWith<Fetcher::BatchData>& fetchResult,
+                          Fetcher::NextAction* nextAction,
+                          BSONObjBuilder* getMoreBob) {
+            ASSERT_OK(fetchResult.getStatus());
+            Fetcher::BatchData batchData{fetchResult.getValue()};
+
+            ASSERT(nextAction);
+            *nextAction = Fetcher::NextAction::kGetMore;
+            ASSERT(getMoreBob);
+            getMoreBob->append("getMore", batchData.cursorId);
+            getMoreBob->append("collection", batchData.nss.coll());
+        };
+        processNetworkResponse(BSON("cursor" << BSON("id" << 0LL <<
+                                                     "ns" << "db.coll" <<
+                                                     "firstBatch" << BSON_ARRAY(doc)) <<
+                                    "ok" << 1));
+        ASSERT_OK(status);
+        ASSERT_EQUALS(0, cursorId);
+        ASSERT_EQUALS(1U, documents.size());
+        ASSERT_EQUALS(doc, documents.front());
     }
 
     TEST_F(FetcherTest, FetchMultipleBatches) {
@@ -416,7 +431,7 @@ namespace {
         ASSERT_OK(status);
         ASSERT_EQUALS(1U, documents.size());
         ASSERT_EQUALS(doc, documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kContinue == nextAction);
+        ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
         ASSERT_TRUE(fetcher->isActive());
 
         ASSERT_TRUE(getNet()->hasReadyRequests());
@@ -429,7 +444,7 @@ namespace {
         ASSERT_OK(status);
         ASSERT_EQUALS(1U, documents.size());
         ASSERT_EQUALS(doc2, documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kContinue == nextAction);
+        ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
         ASSERT_TRUE(fetcher->isActive());
 
         ASSERT_TRUE(getNet()->hasReadyRequests());
@@ -446,7 +461,6 @@ namespace {
         ASSERT_FALSE(fetcher->isActive());
 
         ASSERT_FALSE(getNet()->hasReadyRequests());
-        ASSERT_FALSE(fetcher->isActive());
     }
 
     TEST_F(FetcherTest, ScheduleGetMoreAndCancel) {
@@ -460,7 +474,7 @@ namespace {
         ASSERT_OK(status);
         ASSERT_EQUALS(1U, documents.size());
         ASSERT_EQUALS(doc, documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kContinue == nextAction);
+        ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
         ASSERT_TRUE(fetcher->isActive());
 
         ASSERT_TRUE(getNet()->hasReadyRequests());
@@ -473,7 +487,7 @@ namespace {
         ASSERT_OK(status);
         ASSERT_EQUALS(1U, documents.size());
         ASSERT_EQUALS(doc2, documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kContinue == nextAction);
+        ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
         ASSERT_TRUE(fetcher->isActive());
 
         fetcher->cancel();
@@ -492,7 +506,7 @@ namespace {
         ASSERT_OK(status);
         ASSERT_EQUALS(1U, documents.size());
         ASSERT_EQUALS(doc, documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kContinue == nextAction);
+        ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
         ASSERT_TRUE(fetcher->isActive());
 
         ASSERT_TRUE(getNet()->hasReadyRequests());
@@ -505,7 +519,7 @@ namespace {
         ASSERT_OK(status);
         ASSERT_EQUALS(1U, documents.size());
         ASSERT_EQUALS(doc2, documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kContinue == nextAction);
+        ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
         ASSERT_TRUE(fetcher->isActive());
 
         getExecutor().shutdown();
@@ -514,7 +528,8 @@ namespace {
     }
 
     void setNextActionToNoAction(const StatusWith<Fetcher::BatchData>& fetchResult,
-                                 Fetcher::NextAction* nextAction) {
+                                 Fetcher::NextAction* nextAction,
+                                 BSONObjBuilder* getMoreBob) {
         *nextAction = Fetcher::NextAction::kNoAction;
     }
 
@@ -529,7 +544,7 @@ namespace {
         ASSERT_OK(status);
         ASSERT_EQUALS(1U, documents.size());
         ASSERT_EQUALS(doc, documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kContinue == nextAction);
+        ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
         ASSERT_TRUE(fetcher->isActive());
 
         ASSERT_TRUE(getNet()->hasReadyRequests());
@@ -545,7 +560,7 @@ namespace {
         ASSERT_OK(status);
         ASSERT_EQUALS(1U, documents.size());
         ASSERT_EQUALS(doc2, documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kContinue == nextAction);
+        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
         ASSERT_FALSE(fetcher->isActive());
     }
 
@@ -554,6 +569,7 @@ namespace {
      */
     void shutdownDuringSecondBatch(const StatusWith<Fetcher::BatchData>& fetchResult,
                                    Fetcher::NextAction* nextAction,
+                                   BSONObjBuilder* getMoreBob,
                                    const BSONObj& doc2,
                                    ReplicationExecutor* executor, bool* isShutdownCalled) {
         if (*isShutdownCalled) {
@@ -562,9 +578,13 @@ namespace {
 
         // First time during second batch
         ASSERT_OK(fetchResult.getStatus());
-        ASSERT_EQUALS(1U, fetchResult.getValue().documents.size());
-        ASSERT_EQUALS(doc2, fetchResult.getValue().documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kContinue == *nextAction);
+        Fetcher::BatchData batchData{fetchResult.getValue()};
+        ASSERT_EQUALS(1U, batchData.documents.size());
+        ASSERT_EQUALS(doc2, batchData.documents.front());
+        ASSERT_TRUE(Fetcher::NextAction::kGetMore == *nextAction);
+        ASSERT(getMoreBob);
+        getMoreBob->append("getMore", batchData.cursorId);
+        getMoreBob->append("collection", batchData.nss.coll());
 
         executor->shutdown();
         *isShutdownCalled = true;
@@ -581,7 +601,7 @@ namespace {
         ASSERT_OK(status);
         ASSERT_EQUALS(1U, documents.size());
         ASSERT_EQUALS(doc, documents.front());
-        ASSERT_TRUE(Fetcher::NextAction::kContinue == nextAction);
+        ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
         ASSERT_TRUE(fetcher->isActive());
 
         ASSERT_TRUE(getNet()->hasReadyRequests());
@@ -593,13 +613,14 @@ namespace {
 
         bool isShutdownCalled = false;
         callbackHook = stdx::bind(shutdownDuringSecondBatch,
-                                  stdx::placeholders::_1, stdx::placeholders::_2,
+                                  stdx::placeholders::_1,
+                                  stdx::placeholders::_2,
+                                  stdx::placeholders::_3,
                                   doc2,
                                   &getExecutor(), &isShutdownCalled);
 
         getNet()->runReadyNetworkOperations();
         ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
-        ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
         ASSERT_FALSE(fetcher->isActive());
     }
 

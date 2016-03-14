@@ -41,8 +41,11 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_interface_local.h"
+#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/rollback_source_impl.h"
 #include "mongo/db/repl/rs_rollback.h"
 #include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/stats/timer_stats.h"
@@ -103,8 +106,9 @@ namespace {
     }
 
     BackgroundSync::BackgroundSync() : _buffer(bufferMaxSizeGauge, &getSize),
-                                       _lastOpTimeFetched(std::numeric_limits<int>::max(),
-                                                          0),
+                                       _lastOpTimeFetched(
+                                               Timestamp(std::numeric_limits<int>::max(), 0),
+                                               std::numeric_limits<long long>::max()),
                                        _lastAppliedHash(0),
                                        _lastFetchedHash(0),
                                        _pause(true),
@@ -183,8 +187,6 @@ namespace {
             return;
         }
 
-        OperationContextImpl txn;
-
         // We need to wait until initial sync has started.
         if (_replCoord->getMyLastOptime().isNull()) {
             sleepsecs(1);
@@ -192,7 +194,8 @@ namespace {
         }
         // we want to unpause when we're no longer primary
         // start() also loads _lastOpTimeFetched, which we know is set from the "if"
-        else if (_pause) {
+        OperationContextImpl txn;
+        if (_pause) {
             start(&txn);
         }
 
@@ -227,7 +230,7 @@ namespace {
 
 
         // find a target to sync from the last optime fetched
-        Timestamp lastOpTimeFetched;
+        OpTime lastOpTimeFetched;
         {
             boost::unique_lock<boost::mutex> lock(_mutex);
             lastOpTimeFetched = _lastOpTimeFetched;
@@ -250,7 +253,7 @@ namespace {
             _replCoord->signalUpstreamUpdater();
         }
 
-        _syncSourceReader.tailingQueryGTE(rsOplogName.c_str(), lastOpTimeFetched);
+        _syncSourceReader.tailingQueryGTE(rsOplogName.c_str(), lastOpTimeFetched.getTimestamp());
 
         // if target cut connections between connecting and querying (for
         // example, because it stepped down) we might not have a cursor
@@ -353,8 +356,8 @@ namespace {
             {
                 boost::unique_lock<boost::mutex> lock(_mutex);
                 _lastFetchedHash = o["h"].numberLong();
-                _lastOpTimeFetched = o["ts"].timestamp();
-                LOG(3) << "lastOpTimeFetched: " << _lastOpTimeFetched.toStringPretty();
+                _lastOpTimeFetched = extractOpTime(o);
+                LOG(3) << "lastOpTimeFetched: " << _lastOpTimeFetched;
             }
         }
     }
@@ -393,6 +396,19 @@ namespace {
     bool BackgroundSync::_rollbackIfNeeded(OperationContext* txn, OplogReader& r) {
         string hn = r.conn()->getServerAddress();
 
+        // Abort only when syncRollback detects we are in a unrecoverable state.
+        // In other cases, we log the message contained in the error status and retry later.
+        auto fassertRollbackStatusNoTrace = [](int msgid, const Status& status) {
+            if (status.isOK()) {
+                return;
+            }
+            if (ErrorCodes::UnrecoverableRollbackError == status.code()) {
+                fassertNoTrace(msgid, status);
+            }
+            warning() << "rollback cannot proceed at this time (retrying later): "
+                      << status;
+        };
+
         if (!r.more()) {
             try {
                 BSONObj theirLastOp = r.getLastOp(rsOplogName.c_str());
@@ -401,10 +417,17 @@ namespace {
                     sleepsecs(2);
                     return true;
                 }
-                Timestamp theirTS = theirLastOp["ts"].timestamp();
-                if (theirTS < _lastOpTimeFetched) {
+                OpTime theirOpTime = extractOpTime(theirLastOp);
+                if (theirOpTime < _lastOpTimeFetched) {
                     log() << "we are ahead of the sync source, will try to roll back";
-                    syncRollback(txn, _replCoord->getMyLastOptime().getTimestamp(), &r, _replCoord);
+                    fassertRollbackStatusNoTrace(
+                        28656,
+                        syncRollback(txn,
+                                     _replCoord->getMyLastOptime(),
+                                     OplogInterfaceLocal(txn, rsOplogName),
+                                     RollbackSourceImpl(r.conn(), rsOplogName),
+                                     _replCoord));
+
                     return true;
                 }
                 /* we're not ahead?  maybe our new query got fresher data.  best to come back and try again */
@@ -419,12 +442,18 @@ namespace {
         }
 
         BSONObj o = r.nextSafe();
-        Timestamp ts = o["ts"].timestamp();
+        OpTime opTime = extractOpTime(o);
         long long hash = o["h"].numberLong();
-        if( ts != _lastOpTimeFetched || hash != _lastFetchedHash ) {
-            log() << "our last op time fetched: " << _lastOpTimeFetched.toStringPretty();
-            log() << "source's GTE: " << ts.toStringPretty();
-            syncRollback(txn, _replCoord->getMyLastOptime().getTimestamp(), &r, _replCoord);
+        if ( opTime != _lastOpTimeFetched || hash != _lastFetchedHash ) {
+            log() << "our last op time fetched: " << _lastOpTimeFetched;
+            log() << "source's GTE: " << opTime;
+            fassertRollbackStatusNoTrace(
+                28657,
+                syncRollback(txn,
+                             _replCoord->getMyLastOptime(),
+                             OplogInterfaceLocal(txn, rsOplogName),
+                             RollbackSourceImpl(r.conn(), rsOplogName),
+                             _replCoord));
             return true;
         }
 
@@ -446,7 +475,7 @@ namespace {
 
         _pause = true;
         _syncSourceHost = HostAndPort();
-        _lastOpTimeFetched = Timestamp(0,0);
+        _lastOpTimeFetched = OpTime();
         _lastFetchedHash = 0;
         _appliedBufferCondition.notify_all();
         _pausedCondition.notify_all();
@@ -461,7 +490,7 @@ namespace {
 
         // reset _last fields with current oplog data
         _lastAppliedHash = updatedLastAppliedHash;
-        _lastOpTimeFetched = _replCoord->getMyLastOptime().getTimestamp();
+        _lastOpTimeFetched = _replCoord->getMyLastOptime();
         _lastFetchedHash = _lastAppliedHash;
 
         LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched <<

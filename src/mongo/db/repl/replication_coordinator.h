@@ -62,7 +62,6 @@ namespace repl {
     class ReplSetHeartbeatArgs;
     class ReplSetHeartbeatArgsV1;
     class ReplSetHeartbeatResponse;
-    class ReplSetHeartbeatResponseV1;
     class ReplSetHtmlSummary;
     class ReplSetRequestVotesArgs;
     class ReplSetRequestVotesResponse;
@@ -172,7 +171,9 @@ namespace repl {
          * been replicated to at least a set of nodes that satisfies the writeConcern, whichever
          * comes first. A writeConcern.wTimeout of 0 indicates no timeout (block forever) and a
          * writeConcern.wTimeout of -1 indicates return immediately after checking. Return codes:
-         * ErrorCodes::ExceededTimeLimit if the writeConcern.wTimeout is reached before
+         * ErrorCodes::WriteConcernFailed if the writeConcern.wTimeout is reached before
+         *     the data has been sufficiently replicated
+         * ErrorCodes::ExceededTimeLimit if the txn->getMaxTimeMicrosRemaining is reached before
          *     the data has been sufficiently replicated
          * ErrorCodes::NotMaster if the node is not Primary/Master
          * ErrorCodes::UnknownReplWriteConcern if the writeConcern.wMode contains a write concern
@@ -180,7 +181,7 @@ namespace repl {
          * ErrorCodes::ShutdownInProgress if we are mid-shutdown
          * ErrorCodes::Interrupted if the operation was killed with killop()
          */
-        virtual StatusAndDuration awaitReplication(const OperationContext* txn,
+        virtual StatusAndDuration awaitReplication(OperationContext* txn,
                                                    const OpTime& opTime,
                                                    const WriteConcernOptions& writeConcern) = 0;
 
@@ -189,7 +190,7 @@ namespace repl {
          * performed on the client associated with "txn".
          */
         virtual StatusAndDuration awaitReplicationOfLastOpForClient(
-                const OperationContext* txn,
+                OperationContext* txn,
                 const WriteConcernOptions& writeConcern) = 0;
 
         /**
@@ -297,7 +298,7 @@ namespace repl {
          * Note: getDuration() on the returned ReadAfterOpTimeResponse will only be valid if
          * its didWait() method returns true.
          */
-        virtual ReadAfterOpTimeResponse waitUntilOpTime(const OperationContext* txn,
+        virtual ReadAfterOpTimeResponse waitUntilOpTime(OperationContext* txn,
                                                         const ReadAfterOpTimeArgs& settings) = 0;
 
         /**
@@ -426,7 +427,8 @@ namespace repl {
         virtual Status processHeartbeat(const ReplSetHeartbeatArgs& args,
                                         ReplSetHeartbeatResponse* response) = 0;
         virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
-                                          ReplSetHeartbeatResponseV1* response) = 0;
+                                          ReplSetHeartbeatResponse* response) = 0;
+
 
         /**
          * Arguments for the replSetReconfig command.
@@ -617,6 +619,19 @@ namespace repl {
          * replication state for use by the web interface.
          */
         virtual void summarizeAsHtml(ReplSetHtmlSummary* output) = 0;
+
+        /**
+         * Returns the current term.
+         */
+        virtual long long getTerm() = 0;
+
+        /**
+         * Attempts to update the current term for the V1 election protocol. If the term changes and
+         * this node is primary, relinquishes primary.
+         * Returns true if the term was updated (that is, when "term" was higher than the previously
+         * recorded term) and false otherwise.
+         */
+        virtual bool updateTerm(long long term) = 0;
 
     protected:
 

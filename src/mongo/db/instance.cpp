@@ -52,6 +52,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop_metrics.h"
 #include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -86,11 +87,20 @@
 #include "mongo/db/storage_options.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/rpc/command_reply_builder.h"
+#include "mongo/rpc/command_request.h"
+#include "mongo/rpc/legacy_reply.h"
+#include "mongo/rpc/legacy_reply_builder.h"
+#include "mongo/rpc/legacy_request.h"
+#include "mongo/rpc/legacy_request_builder.h"
+#include "mongo/rpc/request_interface.h"
+#include "mongo/rpc/metadata.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/d_state.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h" // for SendStaleConfigException
 #include "mongo/scripting/engine.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -164,10 +174,10 @@ namespace {
         return Status::OK();
     }
 
-    void generateErrorResponse(const AssertionException* exception,
-                               const QueryMessage& queryMessage,
-                               CurOp* curop,
-                               Message* response) {
+    void generateLegacyQueryErrorResponse(const AssertionException* exception,
+                                          const QueryMessage& queryMessage,
+                                          CurOp* curop,
+                                          Message* response) {
         curop->debug().exceptionInfo = exception->getInfo();
 
         log(LogComponent::kQuery) << "assertion " << exception->toString()
@@ -186,6 +196,7 @@ namespace {
         BSONObjBuilder err;
         exception->getInfo().append(err);
         if (scex) {
+            err.append("ok", 0.0);
             err.append("ns", scex->getns());
             scex->getVersionReceived().addToBSON(err, "vReceived");
             scex->getVersionWanted().addToBSON(err, "vWanted");
@@ -230,61 +241,41 @@ namespace {
         DbMessage dbMessage(message);
         QueryMessage queryMessage(dbMessage);
 
-        CurOp* op = CurOp::get(client);
+        CurOp* op = CurOp::get(txn);
 
-        std::unique_ptr<Message> response(new Message());
+        rpc::LegacyReplyBuilder builder{};
 
         try {
+            rpc::LegacyRequest request{&message};
             // Do the namespace validity check under the try/catch block so it does not cause the
             // connection to be terminated.
             uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid ns [" << nss.ns() << "]",
-                    nss.isValid());
+                    str::stream() << "Invalid ns [" << request.getDatabase() << ".$cmd" << "]",
+                    NamespaceString::validDBName(request.getDatabase()));
 
             // Auth checking for Commands happens later.
             int nToReturn = queryMessage.ntoreturn;
-            beginQueryOp(nss, queryMessage.query, nToReturn, queryMessage.ntoskip, op);
-            op->markCommand();
+            beginQueryOp(txn, nss, queryMessage.query, nToReturn, queryMessage.ntoskip);
+            {
+                stdx::lock_guard<Client> lk(*txn->getClient());
+                op->markCommand_inlock();
+            }
 
             uassert(16979, str::stream() << "bad numberToReturn (" << nToReturn
                                          << ") for $cmd type ns - can only be 1 or -1",
                     nToReturn == 1 || nToReturn == -1);
 
-            BufBuilder bb;
-            bb.skip(sizeof(QueryResult::Value));
-
-            BSONObjBuilder cmdResBuf;
-            if (!runCommands(txn,
-                             queryMessage.ns,
-                             queryMessage.query,
-                             *op,
-                             bb,
-                             cmdResBuf,
-                             queryMessage.queryOptions)) {
-                uasserted(13530, "bad or malformed command request?");
-            }
+            runCommands(txn, request, &builder);
 
             op->debug().iscommand = true;
             // TODO: Does this get overwritten/do we really need to set this twice?
-            op->debug().query = queryMessage.query;
-
-            QueryResult::View qr = bb.buf();
-            bb.decouple();
-            qr.setResultFlagsToOk();
-            qr.msgdata().setLen(bb.len());
-            op->debug().responseLength = bb.len();
-            qr.msgdata().setOperation(opReply);
-            qr.setCursorId(0);
-            qr.setStartingFrom(0);
-            qr.setNReturned(1);
-            response->setData(qr.view2ptr(), true);
-
-            invariant(!response->empty());
+            op->debug().query = request.getCommandArgs();
         }
-        catch (const AssertionException& exception) {
-            response.reset(new Message());
-            generateErrorResponse(&exception, queryMessage, op, response.get());
+        catch (const DBException& exception) {
+            Command::generateErrorResponse(txn, &builder, exception);
         }
+
+        auto response = builder.done();
 
         op->debug().responseLength = response->header().dataLen();
 
@@ -293,6 +284,50 @@ namespace {
     }
 
 namespace {
+
+    void receivedRpc(OperationContext* txn,
+                     Client& client,
+                     DbResponse& dbResponse,
+                     Message& message) {
+
+        invariant(message.operation() == dbCommand);
+
+        const MSGID responseTo = message.header().getId();
+
+        rpc::CommandReplyBuilder replyBuilder{};
+
+        auto curOp = CurOp::get(txn);
+
+        try {
+            // database is validated here
+            rpc::CommandRequest request{&message};
+
+            // We construct a legacy $cmd namespace so we can fill in curOp using
+            // the existing logic that existed for OP_QUERY commands
+            NamespaceString nss(request.getDatabase(), "$cmd");
+            beginQueryOp(txn, nss, request.getCommandArgs(), 1, 0);
+            {
+                stdx::lock_guard<Client> lk(*txn->getClient());
+                curOp->markCommand_inlock();
+            }
+
+            runCommands(txn, request, &replyBuilder);
+
+            curOp->debug().iscommand = true;
+            curOp->debug().query = request.getCommandArgs();
+
+        }
+        catch (const DBException& exception) {
+            Command::generateErrorResponse(txn, &replyBuilder, exception);
+        }
+
+        auto response = replyBuilder.done();
+
+        curOp->debug().responseLength = response->header().dataLen();
+
+        dbResponse.response = response.release();
+        dbResponse.responseTo = responseTo;
+    }
 
     // In SERVER-7775 we reimplemented the pseudo-commands fsyncUnlock, inProg, and killOp
     // as ordinary commands. To support old clients for another release, this helper serves
@@ -357,7 +392,7 @@ namespace {
         QueryMessage q(d);
         auto_ptr< Message > resp( new Message() );
 
-        CurOp& op = *CurOp::get(c);
+        CurOp& op = *CurOp::get(txn);
 
         try {
             Client* client = txn->getClient();
@@ -365,12 +400,12 @@ namespace {
             audit::logQueryAuthzCheck(client, nss, q.query, status.code());
             uassertStatusOK(status);
 
-            dbResponse.exhaustNS = runQuery(txn, q, nss, op, *resp);
+            dbResponse.exhaustNS = runQuery(txn, q, nss, *resp);
             verify( !resp->empty() );
         }
         catch (const AssertionException& exception) {
             resp.reset(new Message());
-            generateErrorResponse(&exception, q, &op, resp.get());
+            generateLegacyQueryErrorResponse(&exception, q, &op, resp.get());
         }
 
         op.debug().responseLength = resp->header().dataLen();
@@ -441,6 +476,10 @@ namespace {
         else if( op == dbGetMore ) {
             opread(m);
         }
+        else if ( op == dbCommand ) {
+            isCommand = true;
+            opwrite(m);
+        }
         else {
             opwrite(m);
         }
@@ -471,13 +510,11 @@ namespace {
             break;
         }
 
-        scoped_ptr<CurOp> nestedOp;
-        if (CurOp::get(c)->active()) {
-            nestedOp.reset(new CurOp(&c));
+        CurOp& currentOp = *CurOp::get(txn);
+        {
+            stdx::lock_guard<Client> lk(*txn->getClient());
+            currentOp.setOp_inlock(op);
         }
-
-        CurOp& currentOp = *CurOp::get(c);
-        currentOp.reset(remote,op);
 
         OpDebug& debug = currentOp.debug();
         debug.op = op;
@@ -503,6 +540,9 @@ namespace {
             else {
                 receivedQuery(txn, nsString, c, dbresponse, m);
             }
+        }
+        else if ( op == dbCommand ) {
+            receivedRpc(txn, c, dbresponse, m);
         }
         else if ( op == dbGetMore ) {
             if ( ! receivedGetMore(txn, dbresponse, m, currentOp) )
@@ -613,7 +653,7 @@ namespace {
             }
         }
 
-        debug.recordStats();
+        recordCurOpMetrics(txn);
         debug.reset();
     }
 
@@ -670,7 +710,10 @@ namespace {
         uassertStatusOK(status);
 
         op.debug().query = query;
-        op.setQuery(query);
+        {
+            stdx::lock_guard<Client> lk(*txn->getClient());
+            op.setQuery_inlock(query);
+        }
 
         UpdateRequest request(nsString);
         request.setUpsert(upsert);
@@ -793,7 +836,10 @@ namespace {
         uassertStatusOK(status);
 
         op.debug().query = pattern;
-        op.setQuery(pattern);
+        {
+            stdx::lock_guard<Client> lk(*txn->getClient());
+            op.setQuery_inlock(pattern);
+        }
 
         DeleteRequest request(nsString);
         request.setQuery(pattern);
@@ -892,7 +938,6 @@ namespace {
                                   ns,
                                   ntoreturn,
                                   cursorid,
-                                  curop,
                                   pass,
                                   exhaust,
                                   &isCursorAuthorized);
@@ -995,7 +1040,7 @@ namespace {
                 break;
             }
             catch( const WriteConflictException& e ) {
-                txn->getCurOp()->debug().writeConflicts++;
+                CurOp::get(txn)->debug().writeConflicts++;
                 txn->recoveryUnit()->abandonSnapshot();
                 WriteConflictException::logAndBackoff( attempt++, "insert", ns);
             }
@@ -1082,16 +1127,23 @@ namespace {
         const bool keepGoing = d.reservedField() & InsertOption_ContinueOnError;
         for (BSONObjIterator iter(allCmds); iter.more();) {
             try {
-                BSONObjBuilder resultBuilder;
                 BSONObj cmdObj = iter.next().Obj();
-                Command::execCommand(
-                        txn,
-                        createIndexesCmd,
-                        0, /* what should I use for query option? */
-                        d.getns(),
-                        cmdObj,
-                        resultBuilder);
-                uassertStatusOK(Command::getStatusFromCommandResult(resultBuilder.done()));
+
+                rpc::LegacyRequestBuilder requestBuilder{};
+                auto indexNs = NamespaceString(d.getns());
+                auto cmdRequestMsg = requestBuilder.setDatabase(indexNs.db())
+                                                   .setCommandName("createIndexes")
+                                                   .setMetadata(rpc::makeEmptyMetadata())
+                                                   .setCommandArgs(cmdObj).done();
+                rpc::LegacyRequest cmdRequest{cmdRequestMsg.get()};
+                rpc::LegacyReplyBuilder cmdReplyBuilder{};
+                Command::execCommand(txn,
+                                     createIndexesCmd,
+                                     cmdRequest,
+                                     &cmdReplyBuilder);
+                auto cmdReplyMsg = cmdReplyBuilder.done();
+                rpc::LegacyReply cmdReply{cmdReplyMsg.get()};
+                uassertStatusOK(Command::getStatusFromCommandResult(cmdReply.getCommandReply()));
             }
             catch (const DBException& ex) {
                 LastError::get(txn->getClient()).setLastError(ex.getCode(), ex.getInfo().msg);

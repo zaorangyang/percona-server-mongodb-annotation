@@ -92,17 +92,17 @@ namespace {
                 invariant(client);
 
                 // Make the client stable
-                boost::unique_lock<Client> clientLock(*client);
+                stdx::lock_guard<Client> lk(*client);
                 const OperationContext* txn = client->getOperationContext();
                 if (!txn) continue;
 
-                CurOp* curOp = txn->getCurOp();
+                CurOp* curOp = CurOp::get(txn);
                 if (!curOp) continue;
 
                 ss << "<tr><td>" << client->desc() << "</td>";
 
-                tablecell(ss, curOp->opNum());
-                tablecell(ss, curOp->active());
+                tablecell(ss, txn->getOpID());
+                tablecell(ss, true);
 
                 // LockState
                 {
@@ -115,12 +115,7 @@ namespace {
                     tablecell(ss, lockerInfoBuilder.obj());
                 }
 
-                if (curOp->active()) {
-                    tablecell(ss, curOp->elapsedSeconds());
-                }
-                else {
-                    tablecell(ss, "");
-                }
+                tablecell(ss, curOp->elapsedSeconds());
 
                 tablecell(ss, curOp->getOp());
                 tablecell(ss, html::escape(curOp->getNS()));
@@ -132,7 +127,7 @@ namespace {
                     tablecell(ss, "");
                 }
 
-                tablecell(ss, curOp->getRemoteString());
+                tablecell(ss, client->clientAddress(true /*includePort*/));
 
                 tablecell(ss, curOp->getMessage());
                 tablecell(ss, curOp->getProgressMeter().toString());
@@ -205,17 +200,19 @@ namespace {
                 BSONObjBuilder b;
 
                 // Make the client stable
-                boost::unique_lock<Client> clientLock(*client);
+                stdx::lock_guard<Client> lk(*client);
 
                 client->reportState(b);
 
                 const OperationContext* txn = client->getOperationContext();
+                b.appendBool("active", static_cast<bool>(txn));
                 if (txn) {
-
-                    // CurOp
-                    if (txn->getCurOp()) {
-                        txn->getCurOp()->reportState(&b);
+                    b.append("opid", txn->getOpID());
+                    if (txn->isKillPending()) {
+                        b.append("killPending", true);
                     }
+
+                    CurOp::get(txn)->reportState(&b);
 
                     // LockState
                     if (txn->lockState()) {

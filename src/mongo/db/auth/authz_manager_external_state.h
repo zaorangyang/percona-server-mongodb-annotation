@@ -37,7 +37,6 @@
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/namespace_string.h"
 #include "mongo/stdx/functional.h"
 
 namespace mongo {
@@ -129,102 +128,7 @@ namespace mongo {
         /**
          * Returns true if there exists at least one privilege document in the system.
          */
-        bool hasAnyPrivilegeDocuments(OperationContext* txn);
-
-        /**
-         * Creates the given user object in the given database.
-         *
-         * TODO(spencer): remove dbname argument once users are only written into the admin db
-         */
-        Status insertPrivilegeDocument(OperationContext* txn,
-                                       const std::string& dbname,
-                                       const BSONObj& userObj,
-                                       const BSONObj& writeConcern);
-
-        /**
-         * Updates the given user object with the given update modifier.
-         */
-        Status updatePrivilegeDocument(OperationContext* txn,
-                                       const UserName& user,
-                                       const BSONObj& updateObj,
-                                       const BSONObj& writeConcern);
-
-        /**
-         * Removes users for the given database matching the given query.
-         * Writes into *numRemoved the number of user documents that were modified.
-         */
-        Status removePrivilegeDocuments(OperationContext* txn,
-                                        const BSONObj& query,
-                                        const BSONObj& writeConcern,
-                                        int* numRemoved);
-
-        /**
-         * Finds a document matching "query" in "collectionName", and store a shared-ownership
-         * copy into "result".
-         *
-         * Returns Status::OK() on success.  If no match is found, returns
-         * ErrorCodes::NoMatchingDocument.  Other errors returned as appropriate.
-         */
-        virtual Status findOne(OperationContext* txn,
-                               const NamespaceString& collectionName,
-                               const BSONObj& query,
-                               BSONObj* result) = 0;
-
-        /**
-         * Finds all documents matching "query" in "collectionName".  For each document returned,
-         * calls the function resultProcessor on it.
-         */
-        virtual Status query(OperationContext* txn,
-                             const NamespaceString& collectionName,
-                             const BSONObj& query,
-                             const BSONObj& projection,
-                             const stdx::function<void(const BSONObj&)>& resultProcessor) = 0;
-
-        /**
-         * Inserts "document" into "collectionName".
-         * If there is a duplicate key error, returns a Status with code DuplicateKey.
-         */
-        virtual Status insert(OperationContext* txn,
-                              const NamespaceString& collectionName,
-                              const BSONObj& document,
-                              const BSONObj& writeConcern) = 0;
-
-        /**
-         * Update one document matching "query" according to "updatePattern" in "collectionName".
-         *
-         * If "upsert" is true and no document matches "query", inserts one using "query" as a
-         * template.
-         * If "upsert" is false and no document matches "query", return a Status with the code
-         * NoMatchingDocument.  The Status message in that case is not very descriptive and should
-         * not be displayed to the end user.
-         */
-        virtual Status updateOne(OperationContext* txn,
-                                 const NamespaceString& collectionName,
-                                 const BSONObj& query,
-                                 const BSONObj& updatePattern,
-                                 bool upsert,
-                                 const BSONObj& writeConcern);
-
-        /**
-         * Updates documents matching "query" according to "updatePattern" in "collectionName".
-         */
-        virtual Status update(OperationContext* txn,
-                              const NamespaceString& collectionName,
-                              const BSONObj& query,
-                              const BSONObj& updatePattern,
-                              bool upsert,
-                              bool multi,
-                              const BSONObj& writeConcern,
-                              int* nMatched) = 0;
-
-        /**
-         * Removes all documents matching "query" from "collectionName".
-         */
-        virtual Status remove(OperationContext* txn,
-                              const NamespaceString& collectionName,
-                              const BSONObj& query,
-                              const BSONObj& writeConcern,
-                              int* numRemoved) = 0;
+        virtual bool hasAnyPrivilegeDocuments(OperationContext* txn) = 0;
 
         virtual void logOp(
                 OperationContext* txn,

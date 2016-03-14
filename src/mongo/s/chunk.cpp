@@ -34,7 +34,6 @@
 
 #include <iostream>
 
-#include "mongo/base/owned_pointer_map.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/config.h"
@@ -48,6 +47,7 @@
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
@@ -92,24 +92,18 @@ namespace {
             return false;
         }
 
-        OwnedPointerMap<string, OwnedPointerVector<ChunkType> > shardToChunkMap;
-        DistributionStatus::populateShardToChunksMap(shardInfo,
-                                                     *chunkMgr,
-                                                     &shardToChunkMap.mutableMap());
+        map<string, vector<ChunkType>> shardToChunkMap;
+        DistributionStatus::populateShardToChunksMap(shardInfo, *chunkMgr, &shardToChunkMap);
 
-        DistributionStatus chunkDistribution(shardInfo, shardToChunkMap.map());
-
-        const string configServerStr = configServer.getConnectionString().toString();
-        StatusWith<string> tagStatus =
-                DistributionStatus::getTagForSingleChunk(configServerStr,
-                                                         manager.getns(),
-                                                         chunk);
+        StatusWith<string> tagStatus = grid.catalogManager()->getTagForChunk(manager.getns(),
+                                                                             chunk);
         if (!tagStatus.isOK()) {
             warning() << "Not auto-moving chunk because of an error encountered while "
                       << "checking tag for chunk: " << tagStatus.getStatus();
             return false;
         }
 
+        DistributionStatus chunkDistribution(shardInfo, shardToChunkMap);
         const string newLocation(
                 chunkDistribution.getBestReceieverShard(tagStatus.getValue()));
 
@@ -136,10 +130,15 @@ namespace {
 
         log() << "moving chunk (auto): " << toMove->toString() << " to: " << newLocation;
 
-        BSONObj res;
+        shared_ptr<Shard> newShard = grid.shardRegistry()->findIfExists(newLocation);
+        if (!newShard) {
+            warning() << "Newly selected shard " << newLocation << " could not be found.";
+            return false;
+        }
 
+        BSONObj res;
         WriteConcernOptions noThrottle;
-        if (!toMove->moveAndCommit(newLocation,
+        if (!toMove->moveAndCommit(*newShard,
                                    Chunk::MaxChunkSize,
                                    &noThrottle, /* secondaryThrottle */
                                    false, /* waitForDelete - small chunk, no need */
@@ -445,7 +444,7 @@ namespace {
         cmd.append( "max" , getMax() );
         cmd.append( "from" , getShard().getName() );
         cmd.append( "splitKeys" , m );
-        cmd.append( "configdb" , configServer.modelServer() );
+        cmd.append("configdb", grid.catalogManager()->connectionString().toString());
         cmd.append("epoch", _manager->getVersion().epoch());
         BSONObj cmdObj = cmd.obj();
 
@@ -483,12 +482,11 @@ namespace {
               << _shard.toString() << " -> " << to.toString();
 
         Shard from = _shard;
-        ScopedDbConnection fromconn(from.getConnString());
 
         BSONObjBuilder builder;
         builder.append("moveChunk", _manager->getns());
-        builder.append("from", from.getAddress().toString());
-        builder.append("to", to.getAddress().toString());
+        builder.append("from", from.getConnString().toString());
+        builder.append("to", to.getConnString().toString());
         // NEEDED FOR 2.0 COMPATIBILITY
         builder.append("fromShard", from.getName());
         builder.append("toShard", to.getName());
@@ -496,7 +494,7 @@ namespace {
         builder.append("min", _min);
         builder.append("max", _max);
         builder.append("maxChunkSizeBytes", chunkSize);
-        builder.append("configdb", configServer.modelServer());
+        builder.append("configdb", grid.catalogManager()->connectionString().toString());
 
         // For legacy secondary throttle setting.
         bool secondaryThrottle = true;
@@ -516,6 +514,7 @@ namespace {
         builder.append(LiteParsedQuery::cmdOptionMaxTimeMS, maxTimeMS);
         builder.append("epoch", _manager->getVersion().epoch());
 
+        ScopedDbConnection fromconn(from.getConnString());
         bool worked = fromconn->runCommand("admin", builder.done(), res);
         fromconn.done();
 

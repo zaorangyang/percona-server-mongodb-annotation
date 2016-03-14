@@ -64,7 +64,7 @@ namespace mongo {
 
     class OperationContextShutdown : public OperationContext {
     public:
-        OperationContextShutdown() {
+        OperationContextShutdown() : OperationContext(NULL, 0, NULL) {
             _recoveryUnit.reset(new RecoveryUnitNoop());
         }
 
@@ -95,6 +95,13 @@ namespace mongo {
             return oldState;
         }
 
+        virtual ProgressMeter* setMessage_inlock(const char * msg,
+                                                 const std::string &name,
+                                                 unsigned long long progressMeterTotal,
+                                                 int secondsBetween) {
+            return &_pm;
+        }
+
         virtual Locker* lockState() const {
             static LockerImplShutdown lk;
             return &lk;
@@ -107,8 +114,8 @@ namespace mongo {
             return &_pm;
         }
 
-        virtual void checkForInterrupt() const { }
-        virtual Status checkForInterruptNoAssert() const {
+        virtual void checkForInterrupt() { }
+        virtual Status checkForInterruptNoAssert() {
             return Status::OK();
         }
 

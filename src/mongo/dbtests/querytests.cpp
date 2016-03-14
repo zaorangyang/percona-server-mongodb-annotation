@@ -217,7 +217,6 @@ namespace QueryTests {
     public:
         ClientBase() : _client(&_txn) {
             mongo::LastError::get(_txn.getClient()).reset();
-            _txn.getCurOp()->reset();
         }
         virtual ~ClientBase() {
             mongo::LastError::get(_txn.getClient()).reset();
@@ -274,12 +273,9 @@ namespace QueryTests {
                 // Check internal server handoff to getmore.
                 OldClientWriteContext ctx(&_txn,  ns);
                 ClientCursorPin clientCursor( ctx.getCollection()->getCursorManager(), cursorId );
-                // pq doesn't exist if it's a runner inside of the clientcursor.
-                // ASSERT( clientCursor.c()->pq );
-                // ASSERT_EQUALS( 2, clientCursor.c()->pq->getNumToReturn() );
                 ASSERT_EQUALS( 2, clientCursor.c()->pos() );
             }
-            
+
             cursor = _client.getMore( ns, cursorId );
             ASSERT( cursor->more() );
             ASSERT_EQUALS( 3, cursor->next().getIntField( "a" ) );
@@ -1466,8 +1462,7 @@ namespace QueryTests {
         void run() {
             BSONObj result;
             _client.runCommand( "admin", BSON( "whatsmyuri" << 1 ), result );
-            SockAddr unknownAddress("0.0.0.0", 0);
-            ASSERT_EQUALS( unknownAddress.toString(), result[ "you" ].str() );
+            ASSERT_EQUALS("", result[ "you" ].str());
         }
     };
     
@@ -1504,8 +1499,7 @@ namespace QueryTests {
             DbMessage dbMessage( message );
             QueryMessage queryMessage( dbMessage );
             Message result;
-            string exhaust = runQuery(&_txn, queryMessage, NamespaceString(ns()), *CurOp::get(cc()),
-                                      result);
+            string exhaust = runQuery(&_txn, queryMessage, NamespaceString(ns()), result);
             ASSERT( exhaust.size() );
             ASSERT_EQUALS( string( ns() ), exhaust );
         }

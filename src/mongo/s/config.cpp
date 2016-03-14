@@ -48,6 +48,7 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_connection.h"
@@ -56,7 +57,6 @@
 #include "mongo/s/server.h"
 #include "mongo/s/type_locks.h"
 #include "mongo/s/type_lockpings.h"
-#include "mongo/s/type_tags.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/message.h"
@@ -72,7 +72,6 @@ namespace mongo {
     using std::stringstream;
     using std::vector;
 
-    int ConfigServer::VERSION = 3;
     Shard Shard::EMPTY;
 
 
@@ -271,16 +270,18 @@ namespace mongo {
     }
 
 
-    ChunkManagerPtr DBConfig::getChunkManagerIfExists( const string& ns, bool shouldReload, bool forceReload ){
-	
+    ChunkManagerPtr DBConfig::getChunkManagerIfExists(const string& ns,
+                                                      bool shouldReload,
+                                                      bool forceReload) {
+
         // Don't report exceptions here as errors in GetLastError
         LastError::Disabled ignoreForGLE(&LastError::get(cc()));
          
         try{
-            return getChunkManager( ns, shouldReload, forceReload );
+            return getChunkManager(ns, shouldReload, forceReload);
         }
-        catch( AssertionException& e ){
-            warning() << "chunk manager not found for " << ns << causedBy( e ) << endl;
+        catch (AssertionException& e) {
+            warning() << "chunk manager not found for " << ns << causedBy(e);
             return ChunkManagerPtr();
         }
     }
@@ -293,29 +294,32 @@ namespace mongo {
         ChunkManagerPtr oldManager;
 
         {
-            boost::lock_guard<boost::mutex> lk( _lock );
-            
-            bool earlyReload = ! _collections[ns].isSharded() && ( shouldReload || forceReload );
-            if ( earlyReload ) {
-                // this is to catch cases where there this is a new sharded collection
+            boost::lock_guard<boost::mutex> lk(_lock);
+
+            bool earlyReload = !_collections[ns].isSharded() && (shouldReload || forceReload);
+            if (earlyReload) {
+                // This is to catch cases where there this is a new sharded collection
                 _reload();
             }
 
             CollectionInfo& ci = _collections[ns];
-            uassert( 10181 ,  (string)"not sharded:" + ns , ci.isSharded() );
-            verify( ! ci.key().isEmpty() );
-            
-            if ( ! ( shouldReload || forceReload ) || earlyReload )
+            uassert(10181, str::stream() << "not sharded:" << ns, ci.isSharded());
+
+            invariant(!ci.key().isEmpty());
+
+            if (!(shouldReload || forceReload) || earlyReload) {
                 return ci.getCM();
+            }
 
             key = ci.key().copy();
-            if ( ci.getCM() ){
+
+            if (ci.getCM()){
                 oldManager = ci.getCM();
                 oldVersion = ci.getCM()->getVersion();
             }
         }
         
-        verify( ! key.isEmpty() );
+        invariant(!key.isEmpty());
         
         // TODO: We need to keep this first one-chunk check in until we have a more efficient way of
         // creating/reusing a chunk manager, as doing so requires copying the full set of chunks currently
@@ -348,78 +352,84 @@ namespace mongo {
 
         // we are not locked now, and want to load a new ChunkManager
         
-        auto_ptr<ChunkManager> temp;
+        auto_ptr<ChunkManager> tempChunkManager;
 
         {
             boost::lock_guard<boost::mutex> lll ( _hitConfigServerLock );
             
             if (!newestChunk.empty() && !forceReload) {
-                // if we have a target we're going for
-                // see if we've hit already
-                
+                // If we have a target we're going for see if we've hit already
                 boost::lock_guard<boost::mutex> lk( _lock );
-                CollectionInfo& ci = _collections[ns];
-                if ( ci.isSharded() && ci.getCM() ) {
 
+                CollectionInfo& ci = _collections[ns];
+
+                if ( ci.isSharded() && ci.getCM() ) {
                     ChunkVersion currentVersion = newestChunk[0].getVersion();
 
-                    // Only reload if the version we found is newer than our own in the same
-                    // epoch
+                    // Only reload if the version we found is newer than our own in the same epoch
                     if (currentVersion <= ci.getCM()->getVersion() &&
                             ci.getCM()->getVersion().hasEqualEpoch(currentVersion)) {
+
                         return ci.getCM();
                     }
                 }
             }
             
-            temp.reset(new ChunkManager(oldManager->getns(),
-                                        oldManager->getShardKeyPattern(),
-                                        oldManager->isUnique()));
-            temp->loadExistingRanges(oldManager.get());
+            tempChunkManager.reset(new ChunkManager(oldManager->getns(),
+                                                    oldManager->getShardKeyPattern(),
+                                                    oldManager->isUnique()));
+            tempChunkManager->loadExistingRanges(oldManager.get());
 
-            if ( temp->numChunks() == 0 ) {
-                // maybe we're not sharded any more
-                reload(); // this is a full reload
-                return getChunkManager( ns , false );
+            if (tempChunkManager->numChunks() == 0) {
+                // Maybe we're not sharded any more, so do a full reload
+                reload();
+
+                return getChunkManager(ns, false);
             }
         }
 
         boost::lock_guard<boost::mutex> lk( _lock );
         
         CollectionInfo& ci = _collections[ns];
-        uassert( 14822 ,  (string)"state changed in the middle: " + ns , ci.isSharded() );
+        uassert(14822, (string)"state changed in the middle: " + ns, ci.isSharded());
 
         // Reset if our versions aren't the same
-        bool shouldReset = ! temp->getVersion().equals( ci.getCM()->getVersion() );
+        bool shouldReset = !tempChunkManager->getVersion().equals(ci.getCM()->getVersion());
         
         // Also reset if we're forced to do so
-        if( ! shouldReset && forceReload ){
+        if (!shouldReset && forceReload) {
             shouldReset = true;
             warning() << "chunk manager reload forced for collection '" << ns
-                      << "', config version is " << temp->getVersion() << endl;
+                      << "', config version is " << tempChunkManager->getVersion();
         }
 
         //
         // LEGACY BEHAVIOR
-        // It's possible to get into a state when dropping collections when our new version is less than our prev
-        // version.  Behave identically to legacy mongos, for now, and warn to draw attention to the problem.
+        //
+        // It's possible to get into a state when dropping collections when our new version is
+        // less than our prev version. Behave identically to legacy mongos, for now, and warn to
+        // draw attention to the problem.
+        //
         // TODO: Assert in next version, to allow smooth upgrades
         //
 
-        if( shouldReset && temp->getVersion() < ci.getCM()->getVersion() ){
+        if (shouldReset && tempChunkManager->getVersion() < ci.getCM()->getVersion()) {
             shouldReset = false;
+
             warning() << "not resetting chunk manager for collection '" << ns
-                      << "', config version is " << temp->getVersion() << " and "
-                      << "old version is " << ci.getCM()->getVersion() << endl;
+                      << "', config version is " << tempChunkManager->getVersion() << " and "
+                      << "old version is " << ci.getCM()->getVersion();
         }
 
         // end legacy behavior
 
-        if ( shouldReset ){
-            ci.resetCM( temp.release() );
+        if (shouldReset) {
+            ci.resetCM(tempChunkManager.release());
         }
-        
-        uassert( 15883 , str::stream() << "not sharded after chunk manager reset : " << ns , ci.isSharded() );
+
+        uassert(15883, str::stream() << "not sharded after chunk manager reset : "
+                                     << ns, ci.isSharded());
+
         return ci.getCM();
     }
 
@@ -654,167 +664,17 @@ namespace mongo {
 
     /* --- ConfigServer ---- */
 
-    const std::string& ConfigServer::modelServer() const {
-        uassert(10190, "ConfigServer not setup", _primary.ok());
-        return _primary.getConnString();
-    }
-
-    ConnectionString ConfigServer::getConnectionString() const {
-        return _primary.getAddress();
-    }
-
-    bool ConfigServer::init( const ConnectionString& configCS ) {
-        invariant(configCS.isValid());
-
-        std::vector<HostAndPort> configHostAndPorts = configCS.getServers();
-        uassert( 10187 ,  "need configdbs" , configHostAndPorts.size() );
-
-        std::vector<std::string> configHosts;
-        set<string> hosts;
-        for ( size_t i=0; i<configHostAndPorts.size(); i++ ) {
-            string host = configHostAndPorts[i].toString();
-            hosts.insert( getHost( host , false ) );
-            configHosts.push_back(getHost( host , true ));
-        }
-
-        for ( set<string>::iterator i=hosts.begin(); i!=hosts.end(); i++ ) {
-
-            string host = *i;
-
-            // If this is a CUSTOM connection string (for testing) don't do DNS resolution
-            string errMsg;
-            if ( ConnectionString::parse( host, errMsg ).type() == ConnectionString::CUSTOM ) {
-                continue;
-            }
-
-            bool ok = false;
-            for ( int x=10; x>0; x-- ) {
-                if ( ! hostbyname( host.c_str() ).empty() ) {
-                    ok = true;
-                    break;
-                }
-                log() << "can't resolve DNS for [" << host << "]  sleeping and trying " << x << " more times" << endl;
-                sleepsecs( 10 );
-            }
-            if ( ! ok )
-                return false;
-        }
-
-        _config = configHosts;
-
-        string errmsg;
-        if( ! checkHostsAreUnique(configHosts, &errmsg) ) {
-            error() << errmsg << endl;;
-            return false;
-        }
-
-        // This should be the first time we are trying to set up the primary shard (i.e. init
-        // should be called only once)
-        invariant(_primary == Shard::EMPTY);
-        _primary = Shard("config", configCS, 0, false);
-
-        Shard::installShard("config", _primary);
-
-        LOG(1) << " config string : " << configCS.toString();
-
-        return true;
-    }
-
-    bool ConfigServer::checkHostsAreUnique( const vector<string>& configHosts, string* errmsg ) {
-
-        //If we have one host, its always unique
-        if ( configHosts.size() == 1 ) {
-            return true;
-        }
-
-        //Compare each host with all other hosts.
-        set<string> hostsTest;
-        pair<set<string>::iterator,bool> ret;
-        for ( size_t x=0; x < configHosts.size(); x++) {
-            ret = hostsTest.insert( configHosts[x] );
-            if ( ret.second == false ) {
-               *errmsg = str::stream() << "config servers " << configHosts[x]
-                                       << " exists twice in config listing.";
-               return false;
-            }
-        }
-        return true;
-    }
-
-    int ConfigServer::dbConfigVersion() {
-        ScopedDbConnection conn(_primary.getConnString(), 30.0);
-        int version = dbConfigVersion( conn.conn() );
-        conn.done();
-        return version;
-    }
-
-    int ConfigServer::dbConfigVersion( DBClientBase& conn ) {
-        auto_ptr<DBClientCursor> c = conn.query( "config.version" , BSONObj() );
-        int version = 0;
-        if ( c->more() ) {
-            BSONObj o = c->next();
-            version = o["version"].numberInt();
-            uassert( 10189 ,  "should only have 1 thing in config.version" , ! c->more() );
-        }
-        else {
-            if (grid.catalogManager()->doShardsExist() ||
-                conn.count(DatabaseType::ConfigNS)) {
-                version = 1;
-            }
-        }
-
-        return version;
-    }
-
     void ConfigServer::reloadSettings() {
-        set<string> got;
+        auto chunkSize = grid.catalogManager()->getGlobalSettings(SettingsType::ChunkSizeDocKey);
+        if (chunkSize.isOK()) {
+            const int csize = chunkSize.getValue().getChunkSize();
+            LOG(1) << "Found MaxChunkSize: " << csize;
 
-        try {
-            ScopedDbConnection conn(_primary.getConnString(), 30.0);
-            auto_ptr<DBClientCursor> cursor = conn->query(SettingsType::ConfigNS, BSONObj());
-            verify(cursor.get());
-
-            while (cursor->more()) {
-                StatusWith<SettingsType> settingsResult =
-                    SettingsType::fromBSON(cursor->nextSafe());
-                if (!settingsResult.isOK()) {
-                    warning() << settingsResult.getStatus();
-                    continue;
-                }
-                SettingsType settings = settingsResult.getValue();
-                string key = settings.getKey();
-                got.insert(key);
-
-                if (key == SettingsType::ChunkSizeDocKey) {
-                    int csize = settings.getChunkSize();
-
-                    // validate chunksize before proceeding
-                    if (csize == 0) {
-                        // setting was not modified; mark as such
-                        got.erase(key);
-                        log() << "warning: invalid chunksize (" << csize << ") ignored" << endl;
-                    } else {
-                        LOG(1) << "MaxChunkSize: " << csize << endl;
-                        if (!Chunk::setMaxChunkSizeSizeMB(csize)) {
-                            warning() << "invalid chunksize: " << csize << endl;
-                        }
-                    }
-                }
-                else if (key == SettingsType::BalancerDocKey) {
-                    // ones we ignore here
-                }
-                else {
-                    log() << "warning: unknown setting [" << key << "]";
-                }
+            if (!Chunk::setMaxChunkSizeSizeMB(csize)) {
+                warning() << "invalid chunksize: " << csize;
             }
-
-            conn.done();
         }
-        catch (const DBException& ex) {
-            warning() << "couldn't load settings on config db" << causedBy(ex);
-        }
-
-        if (!got.count(SettingsType::ChunkSizeDocKey)) {
+        else if (chunkSize == ErrorCodes::NoSuchKey) {
             const int chunkSize = Chunk::MaxChunkSize / (1024 * 1024);
             Status result =
                 grid.catalogManager()->insert(SettingsType::ConfigNS,
@@ -824,6 +684,9 @@ namespace mongo {
             if (!result.isOK()) {
                 warning() << "couldn't set chunkSize on config db" << causedBy(result);
             }
+        }
+        else {
+            warning() << "couldn't load settings on config db: " << chunkSize.getStatus();
         }
 
         // indexes
@@ -907,25 +770,10 @@ namespace mongo {
         }
     }
 
-    string ConfigServer::getHost( const std::string& name , bool withPort ) {
-        if ( name.find( ":" ) != string::npos ) {
-            if ( withPort )
-                return name;
-            return name.substr( 0 , name.find( ":" ) );
-        }
-
-        if ( withPort ) {
-            stringstream ss;
-            ss << name << ":" << ServerGlobalParams::ConfigServerPort;
-            return ss.str();
-        }
-
-        return name;
-    }
-
     void ConfigServer::replicaSetChange(const string& setName, const string& newConnectionString) {
         // This is run in it's own thread. Exceptions escaping would result in a call to terminate.
         Client::initThread("replSetChange");
+
         try {
             Shard s = Shard::lookupRSName(setName);
             if (s == Shard::EMPTY) {
@@ -956,6 +804,4 @@ namespace mongo {
         }
     }
 
-
-    ConfigServer& configServer = *(new ConfigServer());
-}
+} // namespace mongo

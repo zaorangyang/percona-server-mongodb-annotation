@@ -33,9 +33,9 @@
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/vote_requester.h"
-#include "mongo/db/repl/network_interface_mock.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/replication_executor.h"
+#include "mongo/executor/network_interface_mock.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/mongoutils/str.h"
@@ -43,6 +43,8 @@
 namespace mongo {
 namespace repl {
 namespace {
+
+    using executor::NetworkInterfaceMock;
     using unittest::assertGet;
 
     using RemoteCommandRequest = RemoteCommandRequest;
@@ -97,8 +99,8 @@ namespace {
             _requester->processResponse(request, response);
         }
 
-        Status getStatus() {
-            return _requester->getStatus();
+        VoteRequester::VoteRequestResult getResult() {
+            return _requester->getResult();
         }
 
         RemoteCommandRequest requestFrom(std::string hostname) {
@@ -179,7 +181,7 @@ namespace {
         ASSERT_FALSE(hasReceivedSufficientResponses());
         processResponse(requestFrom("host1"), votedYes());
         ASSERT_TRUE(hasReceivedSufficientResponses());
-        ASSERT_OK(getStatus());
+        ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
     }
 
     TEST_F(VoteRequesterTest, BadConfigVersionWinElection) {
@@ -190,7 +192,7 @@ namespace {
         ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
         processResponse(requestFrom("host2"), votedYes());
         ASSERT_TRUE(hasReceivedSufficientResponses());
-        ASSERT_OK(getStatus());
+        ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
         stopCapturingLogMessages();
     }
 
@@ -202,7 +204,7 @@ namespace {
         ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
         processResponse(requestFrom("host2"), votedYes());
         ASSERT_TRUE(hasReceivedSufficientResponses());
-        ASSERT_OK(getStatus());
+        ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
         stopCapturingLogMessages();
     }
 
@@ -214,7 +216,7 @@ namespace {
         ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
         processResponse(requestFrom("host2"), votedYes());
         ASSERT_TRUE(hasReceivedSufficientResponses());
-        ASSERT_OK(getStatus());
+        ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
         stopCapturingLogMessages();
     }
 
@@ -226,7 +228,7 @@ namespace {
         ASSERT_EQUALS(1, countLogLinesContaining("Got failed response from host1"));
         processResponse(requestFrom("host2"), votedYes());
         ASSERT_TRUE(hasReceivedSufficientResponses());
-        ASSERT_OK(getStatus());
+        ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
         stopCapturingLogMessages();
     }
 
@@ -238,7 +240,7 @@ namespace {
         ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
         processResponse(requestFrom("host2"), votedYes());
         ASSERT_TRUE(hasReceivedSufficientResponses());
-        ASSERT_OK(getStatus());
+        ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
         stopCapturingLogMessages();
     }
 
@@ -248,7 +250,7 @@ namespace {
         processResponse(requestFrom("host1"), votedNoBecauseTermIsGreater());
         ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
         ASSERT_TRUE(hasReceivedSufficientResponses());
-        ASSERT_EQUALS(getStatus().reason(), "running for a stale term");
+        ASSERT_EQUALS(VoteRequester::StaleTerm, getResult());
         stopCapturingLogMessages();
     }
 
@@ -261,7 +263,7 @@ namespace {
         processResponse(requestFrom("host2"), badResponseStatus());
         ASSERT_EQUALS(1, countLogLinesContaining("Got failed response from host2"));
         ASSERT_TRUE(hasReceivedSufficientResponses());
-        ASSERT_EQUALS(getStatus().reason(), "received insufficient votes");
+        ASSERT_EQUALS(VoteRequester::InsufficientVotes, getResult());
         stopCapturingLogMessages();
     }
 

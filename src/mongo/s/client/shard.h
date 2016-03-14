@@ -35,29 +35,38 @@
 namespace mongo {
 
     class BSONObj;
-    class ShardStatus;
+
+    /**
+     * Contains runtime information obtained from the shard.
+     */
+    class ShardStatus {
+    public:
+        ShardStatus(long long dataSizeBytes, const std::string& version);
+
+        long long dataSizeBytes() const { return _dataSizeBytes; }
+        const std::string& mongoVersion() const { return _mongoVersion; }
+
+        std::string toString() const;
+
+        bool operator< (const ShardStatus& other) const;
+
+    private:
+        long long _dataSizeBytes;
+        std::string _mongoVersion;
+    };
+
 
     /*
      * A "shard" one partition of the overall database (and a replica set typically).
      */
-
     class Shard {
     public:
         Shard();
 
         Shard(const std::string& name,
-              const std::string& addr,
-              long long maxSizeMB,
-              bool isDraining);
-
-        Shard(const std::string& name,
               const ConnectionString& connStr,
               long long maxSizeMB,
               bool isDraining);
-
-        Shard( const std::string& ident ) {
-            reset( ident );
-        }
 
         /**
          * Returns a Shard corresponding to 'ident', which can
@@ -71,20 +80,12 @@ namespace mongo {
         }
 
         /**
-         * Returns a Shard corresponding to 'shardName' if such a shard
-         * exists.
-         * If not, it returns Shard::EMPTY
-         */
-        static Shard findIfExists( const std::string& shardName );
-
-        /**
          * @param ident either name or address
          */
         void reset( const std::string& ident );
 
-        const ConnectionString& getAddress() const { return _cs; }
         const std::string& getName() const { return _name; }
-        const std::string& getConnString() const { return _addr; }
+        const ConnectionString& getConnString() const { return _cs; }
 
         long long getMaxSizeMB() const {
             return _maxSizeMB;
@@ -95,7 +96,7 @@ namespace mongo {
         }
 
         std::string toString() const {
-            return _name + ":" + _addr;
+            return _name + ":" + _cs.toString();
         }
 
         friend std::ostream& operator << (std::ostream& out, const Shard& s) {
@@ -112,19 +113,11 @@ namespace mongo {
             return ! ( *this == s );
         }
 
-        bool operator==( const std::string& s ) const {
-            return _name == s || _addr == s;
-        }
-
-        bool operator!=( const std::string& s ) const {
-            return _name != s && _addr != s;
-        }
-
         bool operator<(const Shard& o) const {
             return _name < o._name;
         }
 
-        bool ok() const { return _addr.size() > 0; }
+        bool ok() const { return _cs.isValid(); }
 
         BSONObj runCommand(const std::string& db, const std::string& simple) const;
         BSONObj runCommand(const std::string& db, const BSONObj& cmd) const;
@@ -133,19 +126,9 @@ namespace mongo {
         bool runCommand(const std::string& db, const BSONObj& cmd, BSONObj& res) const;
 
         /**
-         * Returns the version string from the shard based from the serverStatus command result.
-         */
-        static std::string getShardMongoVersion(const std::string& shardHost);
-
-        /**
-         * Returns the total data size in bytes the shard is currently using.
-         */
-        static long long getShardDataSizeBytes(const std::string& shardHost);
-
-        /**
          * Returns metadata and stats for this shard.
          */
-        ShardStatus getStatus() const ;
+        ShardStatus getStatus() const;
 
         /**
          * mostly for replica set
@@ -154,14 +137,13 @@ namespace mongo {
          */
         bool containsNode( const std::string& node ) const;
 
-        static void getAllShards( std::vector<Shard>& all );
         static Shard lookupRSName( const std::string& name);
         
         /**
          * @parm current - shard where the chunk/database currently lives in
          * @return the currently emptiest shard, if best then current, or EMPTY
          */
-        static Shard pick( const Shard& current = EMPTY );
+        static Shard pick();
 
         static void reloadShardInfo();
 
@@ -175,7 +157,6 @@ namespace mongo {
 
     private:
         std::string    _name;
-        std::string    _addr;
         ConnectionString _cs;
         long long _maxSizeMB;    // in MBytes, 0 is unlimited
         bool      _isDraining; // shard is currently being removed
@@ -183,38 +164,4 @@ namespace mongo {
 
     typedef boost::shared_ptr<Shard> ShardPtr;
 
-    class ShardStatus {
-    public:
-        ShardStatus(const Shard& shard, long long dataSizeBytes, const std::string& version);
-
-        std::string toString() const {
-            std::stringstream ss;
-            ss << "shard: " << _shard.toString()
-               << " dataSizeBytes: " << _dataSizeBytes
-               << " version: " << _mongoVersion;
-            return ss.str();
-        }
-
-        bool operator<( const ShardStatus& other ) const {
-            return _dataSizeBytes < other._dataSizeBytes;
-        }
-
-        Shard shard() const {
-            return _shard;
-        }
-
-        long long dataSizeBytes() const {
-            return _dataSizeBytes;
-        }
-
-        std::string mongoVersion() const {
-            return _mongoVersion;
-        }
-
-    private:
-        Shard _shard;
-        long long _dataSizeBytes;
-        std::string _mongoVersion;
-    };
-
-}
+} // namespace mongo

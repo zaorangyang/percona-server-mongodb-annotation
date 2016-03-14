@@ -37,6 +37,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_set.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
@@ -91,20 +92,20 @@ namespace {
         {
             Locker::LockerInfo lockerInfo;
             txn->lockState()->getLockerInfo(&lockerInfo);
-            txn->getCurOp()->debug().append(*txn->getCurOp(), lockerInfo.stats, b);
+            CurOp::get(txn)->debug().append(*CurOp::get(txn), lockerInfo.stats, b);
         }
 
         b.appendDate("ts", jsTime());
         b.append("client", txn->getClient()->clientAddress());
 
         AuthorizationSession * authSession = AuthorizationSession::get(txn->getClient());
-        _appendUserInfo(*txn->getCurOp(), b, authSession);
+        _appendUserInfo(*CurOp::get(txn), b, authSession);
 
         const BSONObj p = b.done();
 
         const bool wasLocked = txn->lockState()->isLocked();
 
-        const string dbName(nsToDatabase(txn->getCurOp()->getNS()));
+        const string dbName(nsToDatabase(CurOp::get(txn)->getNS()));
 
         try {
             bool acquireDbXLock = false;
@@ -126,7 +127,7 @@ namespace {
                 if (!db) {
                     // Database disappeared
                     log() << "note: not profiling because db went away for "
-                          << txn->getCurOp()->getNS();
+                          << CurOp::get(txn)->getNS();
                     break;
                 }
 
@@ -156,7 +157,7 @@ namespace {
         catch (const AssertionException& assertionEx) {
             warning() << "Caught Assertion while trying to profile "
                       << opToString(op)
-                      << " against " << txn->getCurOp()->getNS()
+                      << " against " << CurOp::get(txn)->getNS()
                       << ": " << assertionEx.toString() << endl;
         }
     }

@@ -32,6 +32,7 @@
 
 #include "mongo/s/chunk_manager.h"
 
+#include <boost/next_prior.hpp>
 #include <map>
 #include <set>
 
@@ -41,9 +42,12 @@
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/chunk.h"
 #include "mongo/s/chunk_diff.h"
 #include "mongo/s/client/shard_connection.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
@@ -69,33 +73,29 @@ namespace {
      *
      * The mongos adapter here tracks all shards, and stores ranges by (max, Chunk) in the map.
      */
-    class CMConfigDiffTracker : public ConfigDiffTracker<ChunkPtr, std::string> {
+    class CMConfigDiffTracker : public ConfigDiffTracker<shared_ptr<Chunk>, string> {
     public:
-        CMConfigDiffTracker( ChunkManager* manager ) : _manager( manager ) { }
+        CMConfigDiffTracker(ChunkManager* manager) : _manager(manager) { }
 
-        virtual bool isTracked(const ChunkType& chunk) const {
+        bool isTracked(const ChunkType& chunk) const final {
             // Mongos tracks all shards
             return true;
         }
 
-        virtual BSONObj minFrom( const ChunkPtr& val ) const {
-            return val.get()->getMin();
-        }
+        bool isMinKeyIndexed() const final { return false; }
 
-        virtual bool isMinKeyIndexed() const { return false; }
-
-        virtual pair<BSONObj,ChunkPtr> rangeFor(const ChunkType& chunk) const {
-            ChunkPtr c(new Chunk(_manager, chunk.toBSON()));
+        pair<BSONObj, shared_ptr<Chunk>> rangeFor(const ChunkType& chunk) const final {
+            shared_ptr<Chunk> c(new Chunk(_manager, chunk.toBSON()));
             return make_pair(chunk.getMax(), c);
         }
 
-        virtual string shardFor(const string& hostName) const {
+        string shardFor(const string& hostName) const final {
             Shard shard = Shard::make(hostName);
             return shard.getName();
         }
 
     private:
-        ChunkManager* _manager;
+        ChunkManager* const _manager;
     };
 
 
@@ -109,64 +109,84 @@ namespace {
         return true;
     }
 
+    bool isChunkMapValid(const ChunkMap& chunkMap) {
+#define ENSURE(x) do { if(!(x)) { log() << "ChunkManager::_isValid failed: " #x; return false; } } while(0)
+
+        if (chunkMap.empty()) {
+            return true;
+        }
+
+        // Check endpoints
+        ENSURE(allOfType(MinKey, chunkMap.begin()->second->getMin()));
+        ENSURE(allOfType(MaxKey, boost::prior(chunkMap.end())->second->getMax()));
+
+        // Make sure there are no gaps or overlaps
+        for (ChunkMap::const_iterator it = boost::next(chunkMap.begin()), end = chunkMap.end(); it != end; ++it) {
+            ChunkMap::const_iterator last = boost::prior(it);
+
+            if (!(it->second->getMin() == last->second->getMax())) {
+                log() << last->second->toString();
+                log() << it->second->toString();
+                log() << it->second->getMin();
+                log() << last->second->getMax();
+            }
+
+            ENSURE(it->second->getMin() == last->second->getMax());
+        }
+
+        return true;
+
+#undef ENSURE
+    }
+
 } // namespace
 
     AtomicUInt32 ChunkManager::NextSequenceNumber(1U);
 
-    ChunkManager::ChunkManager( const string& ns, const ShardKeyPattern& pattern , bool unique ) :
-        _ns( ns ),
-        _keyPattern( pattern.getKeyPattern() ),
-        _unique( unique ),
-        _chunkRanges(),
-        _sequenceNumber(NextSequenceNumber.addAndFetch(1))
-    {
-        //
-        // Sets up a chunk manager from new data
-        //
+    ChunkManager::ChunkManager(const string& ns, const ShardKeyPattern& pattern, bool unique)
+        : _ns( ns ),
+          _keyPattern( pattern.getKeyPattern() ),
+          _unique( unique ),
+          _sequenceNumber(NextSequenceNumber.addAndFetch(1)),
+          _chunkRanges() {
+
     }
 
     ChunkManager::ChunkManager(const CollectionType& coll)
         : _ns(coll.getNs()),
           _keyPattern(coll.getKeyPattern()),
           _unique(coll.getUnique()),
-          _chunkRanges(),
-          // The shard versioning mechanism hinges on keeping track of the number of times we
-          // reload ChunkManagers. Increasing this number here will prompt checkShardVersion to
-          // refresh the connection-level versions to the most up to date value.
-          _sequenceNumber(NextSequenceNumber.addAndFetch(1)) {
+          _sequenceNumber(NextSequenceNumber.addAndFetch(1)),
+          _chunkRanges() {
 
         _version = ChunkVersion::fromBSON(coll.toBSON());
     }
 
-    void ChunkManager::loadExistingRanges(const ChunkManager* oldManager ) {
+    void ChunkManager::loadExistingRanges(const ChunkManager* oldManager) {
         int tries = 3;
+
         while (tries--) {
             ChunkMap chunkMap;
             set<Shard> shards;
             ShardVersionMap shardVersions;
+
             Timer t;
 
             bool success = _load(chunkMap, shards, &shardVersions, oldManager);
-
-            if( success ){
-                {
-                    int ms = t.millis();
-                    log() << "ChunkManager: time to load chunks for " << _ns << ": " << ms << "ms"
-                        << " sequenceNumber: " << _sequenceNumber
-                        << " version: " << _version.toString()
-                        << " based on: " <<
-                        (oldManager ? oldManager->getVersion().toString() : "(empty)");;
-                }
+            if (success) {
+                log() << "ChunkManager: time to load chunks for " << _ns << ": "
+                      << t.millis() << "ms"
+                      << " sequenceNumber: " << _sequenceNumber
+                      << " version: " << _version.toString()
+                      << " based on: "
+                            << (oldManager ? oldManager->getVersion().toString() : "(empty)");
 
                 // TODO: Merge into diff code above, so we validate in one place
-                if (_isValid(chunkMap)) {
-                    // These variables are const for thread-safety. Since the
-                    // constructor can only be called from one thread, we don't have
-                    // to worry about that here.
-                    const_cast<ChunkMap&>(_chunkMap).swap(chunkMap);
-                    const_cast<set<Shard>&>(_shards).swap(shards);
-                    const_cast<ShardVersionMap&>(_shardVersions).swap(shardVersions);
-                    const_cast<ChunkRangeManager&>(_chunkRanges).reloadAll(_chunkMap);
+                if (isChunkMapValid(chunkMap)) {
+                    _chunkMap.swap(chunkMap);
+                    _shards.swap(shards);
+                    _shardVersions.swap(shardVersions);
+                    _chunkRanges.reloadAll(_chunkMap);
 
                     return;
                 }
@@ -175,32 +195,31 @@ namespace {
             if (_chunkMap.size() < 10) {
                 _printChunks();
             }
-            
-            warning() << "ChunkManager loaded an invalid config for " << _ns
-                      << ", trying again";
 
-            sleepmillis(10 * (3-tries));
+            warning() << "ChunkManager loaded an invalid config for " << _ns << ", trying again";
+
+            sleepmillis(10 * (3 - tries));
         }
 
-        // this will abort construction so we should never have a reference to an invalid config
-        msgasserted(13282, "Couldn't load a valid config for " + _ns + " after 3 attempts. Please try again.");
+        // This will abort construction so we should never have a reference to an invalid config
+        msgasserted(13282, str::stream() << "Couldn't load a valid config for " << _ns
+                                         << " after 3 attempts. Please try again.");
     }
 
     bool ChunkManager::_load(ChunkMap& chunkMap,
                              set<Shard>& shards,
                              ShardVersionMap* shardVersions,
-                             const ChunkManager* oldManager)
-    {
+                             const ChunkManager* oldManager) {
 
         // Reset the max version, but not the epoch, when we aren't loading from the oldManager
-        _version = ChunkVersion( 0, 0, _version.epoch() );
+        _version = ChunkVersion(0, 0, _version.epoch());
 
         // If we have a previous version of the ChunkManager to work from, use that info to reduce
         // our config query
-        if( oldManager && oldManager->getVersion().isSet() ){
-
+        if (oldManager && oldManager->getVersion().isSet()) {
             // Get the old max version
             _version = oldManager->getVersion();
+
             // Load a copy of the old versions
             *shardVersions = oldManager->_shardVersions;
 
@@ -210,17 +229,17 @@ namespace {
             // Could be v.expensive
             // TODO: If chunks were immutable and didn't reference the manager, we could do more
             // interesting things here
-            for( ChunkMap::const_iterator it = oldChunkMap.begin(); it != oldChunkMap.end(); it++ ){
+            for(const auto& oldChunkMapEntry : oldChunkMap){
+                shared_ptr<Chunk> oldC = oldChunkMapEntry.second;
+                shared_ptr<Chunk> newC(new Chunk(this,
+                                                 oldC->getMin(),
+                                                 oldC->getMax(),
+                                                 oldC->getShard(),
+                                                 oldC->getLastmod()));
 
-                ChunkPtr oldC = it->second;
-                ChunkPtr c( new Chunk( this, oldC->getMin(),
-                                             oldC->getMax(),
-                                             oldC->getShard(),
-                                             oldC->getLastmod() ) );
+                newC->setBytesWritten(oldC->getBytesWritten());
 
-                c->setBytesWritten( oldC->getBytesWritten() );
-
-                chunkMap.insert( make_pair( oldC->getMax(), c ) );
+                chunkMap.insert(make_pair(oldC->getMax(), newC));
             }
 
             LOG(2) << "loading chunk manager for collection " << _ns
@@ -229,22 +248,22 @@ namespace {
         }
 
         // Attach a diff tracker for the versioned chunk data
-        CMConfigDiffTracker differ( this );
-        differ.attach( _ns, chunkMap, _version, *shardVersions );
+        CMConfigDiffTracker differ(this);
+        differ.attach(_ns, chunkMap, _version, *shardVersions);
 
         // Diff tracker should *always* find at least one chunk if collection exists
         int diffsApplied = differ.calculateConfigDiff(grid.catalogManager());
-        if( diffsApplied > 0 ){
-
+        if (diffsApplied > 0) {
             LOG(2) << "loaded " << diffsApplied << " chunks into new chunk manager for " << _ns
                    << " with version " << _version;
 
             // Add all existing shards we find to the shards set
             for (ShardVersionMap::iterator it = shardVersions->begin();
-                 it != shardVersions->end();
-                ) {
-                if (Shard::findIfExists(it->first).ok()) {
-                    shards.insert(it->first);
+                 it != shardVersions->end(); ) {
+
+                shared_ptr<Shard> shard = grid.shardRegistry()->findIfExists(it->first);
+                if (shard) {
+                    shards.insert(*shard);
                     ++it;
                 }
                 else {
@@ -254,8 +273,7 @@ namespace {
 
             return true;
         }
-        else if( diffsApplied == 0 ){
-
+        else if (diffsApplied == 0) {
             // No chunks were found for the ns
             warning() << "no chunks found when reloading " << _ns
                       << ", previous version was " << _version;
@@ -263,15 +281,15 @@ namespace {
             // Set all our data to empty
             chunkMap.clear();
             shardVersions->clear();
-            _version = ChunkVersion( 0, 0, OID() );
+
+            _version = ChunkVersion(0, 0, OID());
 
             return true;
         }
         else { // diffsApplied < 0
 
-            bool allInconsistent = differ.numValidDiffs() == 0;
-
-            if( allInconsistent ){
+            bool allInconsistent = (differ.numValidDiffs() == 0);
+            if (allInconsistent) {
                 // All versions are different, this can be normal
                 warning() << "major change in chunk information found when reloading "
                           << _ns << ", previous version was " << _version;
@@ -279,55 +297,26 @@ namespace {
             else {
                 // Inconsistent load halfway through (due to yielding cursor during load)
                 // should be rare
-                warning() << "inconsistent chunks found when reloading "
-                          << _ns << ", previous version was " << _version
-                          << ", this should be rare";
+                warning() << "inconsistent chunks found when reloading " << _ns
+                          << ", previous version was " << _version << ", this should be rare";
             }
 
             // Set all our data to empty to be extra safe
             chunkMap.clear();
             shardVersions->clear();
-            _version = ChunkVersion( 0, 0, OID() );
+
+            _version = ChunkVersion(0, 0, OID());
 
             return allInconsistent;
         }
-
     }
 
-    ChunkManagerPtr ChunkManager::reload(bool force) const {
+    shared_ptr<ChunkManager> ChunkManager::reload(bool force) const {
         const NamespaceString nss(_ns);
         auto status = grid.catalogCache()->getDatabase(nss.db().toString());
         shared_ptr<DBConfig> config = uassertStatusOK(status);
 
         return config->getChunkManager(getns(), force);
-    }
-
-    bool ChunkManager::_isValid(const ChunkMap& chunkMap) {
-#define ENSURE(x) do { if(!(x)) { log() << "ChunkManager::_isValid failed: " #x; return false; } } while(0)
-
-        if (chunkMap.empty())
-            return true;
-
-        // Check endpoints
-        ENSURE(allOfType(MinKey, chunkMap.begin()->second->getMin()));
-        ENSURE(allOfType(MaxKey, boost::prior(chunkMap.end())->second->getMax()));
-
-        // Make sure there are no gaps or overlaps
-        for (ChunkMap::const_iterator it=boost::next(chunkMap.begin()), end=chunkMap.end(); it != end; ++it) {
-            ChunkMap::const_iterator last = boost::prior(it);
-
-            if (!(it->second->getMin() == last->second->getMax())) {
-                PRINT(last->second->toString());
-                PRINT(it->second->toString());
-                PRINT(it->second->getMin());
-                PRINT(last->second->getMax());
-            }
-            ENSURE(it->second->getMin() == last->second->getMax());
-        }
-
-        return true;
-
-#undef ENSURE
     }
 
     void ChunkManager::_printChunks() const {
@@ -455,12 +444,12 @@ namespace {
                     return chunk;
                 }
 
-                PRINT(chunkMin);
-                PRINT(*chunk);
-                PRINT( shardKey );
+                log() << chunkMin;
+                log() << *chunk;
+                log() << shardKey;
 
                 reload();
-                massert(13141, "Chunk map pointed to incorrect chunk", false);
+                msgasserted(13141, "Chunk map pointed to incorrect chunk");
             }
         }
 

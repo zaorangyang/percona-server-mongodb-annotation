@@ -106,14 +106,13 @@ namespace mongo {
 
                 invariant(client);
 
-                boost::unique_lock<Client> uniqueLock(*client);
+                stdx::lock_guard<Client> lk(*client);
                 const OperationContext* opCtx = client->getOperationContext();
 
                 if (!includeAll) {
                     // Skip over inactive connections.
-                    if (!opCtx || !opCtx->getCurOp() || !opCtx->getCurOp()->active()) {
+                    if (!opCtx)
                         continue;
-                    }
                 }
 
                 BSONObjBuilder infoBuilder;
@@ -122,20 +121,19 @@ namespace mongo {
                 client->reportState(infoBuilder);
 
                 // Operation context specific information
+                infoBuilder.appendBool("active", static_cast<bool>(opCtx));
                 if (opCtx) {
-                    // CurOp
-                    if (opCtx->getCurOp()) {
-                        opCtx->getCurOp()->reportState(&infoBuilder);
+                    infoBuilder.append("opid", opCtx->getOpID());
+                    if (opCtx->isKillPending()) {
+                        infoBuilder.append("killPending", true);
                     }
+
+                    CurOp::get(opCtx)->reportState(&infoBuilder);
 
                     // LockState
                     Locker::LockerInfo lockerInfo;
-                    client->getOperationContext()->lockState()->getLockerInfo(&lockerInfo);
+                    opCtx->lockState()->getLockerInfo(&lockerInfo);
                     fillLockerInfo(lockerInfo, infoBuilder);
-                }
-                else {
-                    // If no operation context, mark the operation as inactive
-                    infoBuilder.append("active", false);
                 }
 
                 infoBuilder.done();

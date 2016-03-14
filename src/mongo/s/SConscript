@@ -18,8 +18,7 @@ env.Library('base', ['mongo_version_range.cpp',
                      'type_locks.cpp',
                      'type_lockpings.cpp',
                      'type_config_version.cpp',
-                     'type_mongos.cpp',
-                     'type_tags.cpp'],
+                     'type_mongos.cpp'],
             LIBDEPS=['$BUILD_DIR/mongo/base/base',
                      '$BUILD_DIR/mongo/bson/bson'])
 
@@ -45,10 +44,6 @@ env.CppUnitTest('type_lockpings_test', 'type_lockpings_test.cpp',
                          '$BUILD_DIR/mongo/db/common'])
 
 env.CppUnitTest('type_mongos_test', 'type_mongos_test.cpp',
-                LIBDEPS=['base',
-                         '$BUILD_DIR/mongo/db/common'])
-
-env.CppUnitTest('type_tags_test', 'type_tags_test.cpp',
                 LIBDEPS=['base',
                          '$BUILD_DIR/mongo/db/common'])
 
@@ -239,6 +234,7 @@ env.Library(
         # This is only here temporarily for auto-split logic in chunk.cpp.
         'balancer_policy.cpp',
         'chunk.cpp',
+        'chunk_diff.cpp',
         'chunk_manager.cpp',
         'config.cpp',
         'grid.cpp',
@@ -290,21 +286,6 @@ env.CppUnitTest(
         'coreshard',
         'mongoscore',
     ]
-)
-
-env.CppUnitTest(
-    target='config_server_tests',
-    source=[
-        'config_server_tests.cpp',
-    ],
-    LIBDEPS=[
-        "$BUILD_DIR/mongo/db/coredb",
-        "$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init",
-        "$BUILD_DIR/mongo/util/net/message_server_port",
-        "$BUILD_DIR/mongo/dbtests/mocklib",
-        "coreshard",
-        "mongoscore",
-    ],
 )
 
 env.Library(

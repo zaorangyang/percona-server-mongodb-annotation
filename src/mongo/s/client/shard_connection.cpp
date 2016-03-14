@@ -38,6 +38,8 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/version_manager.h"
 #include "mongo/util/concurrency/spin_lock.h"
@@ -272,24 +274,26 @@ namespace {
                 Status* ss = i->second;
                 if ( ss->avail )
                     ss->avail->getLastError();
-                
             }
         }
 
         void checkVersions( const string& ns ) {
 
-            vector<Shard> all;
-            Shard::getAllShards( all );
+            vector<ShardId> all;
+            grid.shardRegistry()->getAllShardIds(&all);
 
             // Don't report exceptions here as errors in GetLastError
             LastError::Disabled ignoreForGLE(&LastError::get(cc()));
 
             // Now only check top-level shard connections
-            for ( unsigned i=0; i<all.size(); i++ ) {
-
-                Shard& shard = all[i];
+            for (const ShardId& shardId : all) {
                 try {
-                    string sconnString = shard.getConnString();
+                    const auto& shard = grid.shardRegistry()->findIfExists(shardId);
+                    if (!shard) {
+                        continue;
+                    }
+
+                    string sconnString = shard->getConnString().toString();
                     Status* s = _getStatus( sconnString );
 
                     if( ! s->avail ) {
@@ -302,7 +306,7 @@ namespace {
                 catch ( const DBException& ex ) {
 
                     warning() << "problem while initially checking shard versions on" << " "
-                              << shard.getName() << causedBy(ex);
+                              << shardId << causedBy(ex);
 
                     // NOTE: This is only a heuristic, to avoid multiple stale version retries
                     // across multiple shards, and does not affect correctness.
@@ -410,8 +414,10 @@ namespace {
     void usingAShardConnection(const string& addr);
 
 
-    ShardConnection::ShardConnection(const string& addr, const string& ns, ChunkManagerPtr manager)
-        : _addr(addr),
+    ShardConnection::ShardConnection(const ConnectionString& connectionString,
+                                     const string& ns,
+                                     boost::shared_ptr<ChunkManager> manager)
+        : _cs(connectionString),
           _ns(ns),
           _manager(manager) {
 
@@ -441,10 +447,10 @@ namespace {
     }
 
     void ShardConnection::_init() {
-        verify( _addr.size() );
-        _conn = ClientConnections::threadInstance()->get( _addr , _ns );
+        invariant(_cs.isValid());
+        _conn = ClientConnections::threadInstance()->get(_cs.toString(), _ns);
         _finishedInit = false;
-        usingAShardConnection( _addr );
+        usingAShardConnection(_cs.toString());
     }
 
     void ShardConnection::_finishInit() {
@@ -467,7 +473,7 @@ namespace {
 
     void ShardConnection::done() {
         if ( _conn ) {
-            ClientConnections::threadInstance()->done( _addr , _conn );
+            ClientConnections::threadInstance()->done(_cs.toString(), _conn);
             _conn = 0;
             _finishedInit = true;
         }
@@ -481,7 +487,7 @@ namespace {
 
             if (_conn->isFailed()) {
                 // Let the pool know about the bad connection and also delegate disposal to it.
-                ClientConnections::threadInstance()->done(_addr, _conn);
+                ClientConnections::threadInstance()->done(_cs.toString(), _conn);
             }
             else {
                 delete _conn;
@@ -528,7 +534,7 @@ namespace {
 
         Shard s = Shard::make(conn.getServerAddress());
         cmdBuilder.append("shard", s.getName());
-        cmdBuilder.append("shardHost", s.getConnString());
+        cmdBuilder.append("shardHost", s.getConnString().toString());
 
         if (ns.size() > 0) {
             version.addToBSON(cmdBuilder);

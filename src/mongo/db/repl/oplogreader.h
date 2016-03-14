@@ -39,10 +39,15 @@
 
 namespace mongo {
 
-    extern const BSONObj reverseNaturalObj; // { $natural : -1 }
+    class OperationContext;
 
 namespace repl {
+
     class ReplicationCoordinator;
+    class OpTime;
+
+    // {"$natural": -1 }
+    extern const BSONObj reverseNaturalObj;
 
     /**
      * Authenticates conn using the server's cluster-membership credentials.
@@ -97,15 +102,9 @@ namespace repl {
                    int nToSkip,
                    const BSONObj* fields=0);
 
-        void tailingQuery(const char *ns, const BSONObj& query, const BSONObj* fields=0);
+        void tailingQuery(const char *ns, const BSONObj& query);
 
-        void tailingQueryGTE(const char *ns, Timestamp t, const BSONObj* fields=0);
-
-        /* Do a tailing query, but only send the ts field back. */
-        void ghostQueryGTE(const char *ns, Timestamp t) {
-            const BSONObj fields = BSON("ts" << 1 << "_id" << 0);
-            return tailingQueryGTE(ns, t, &fields);
-        }
+        void tailingQueryGTE(const char *ns, Timestamp t);
 
         bool more() {
             uassert( 15910, "Doesn't have cursor for reading oplog", cursor.get() );
@@ -123,15 +122,17 @@ namespace repl {
             return cursor->getMessage()->size();
         }
 
-        int getTailingQueryOptions() const { return _tailingQueryOptions; }
-        void setTailingQueryOptions( int tailingQueryOptions ) { _tailingQueryOptions = tailingQueryOptions; }
+        BSONObj nextSafe() { return cursor->nextSafe(); }
+        BSONObj next() { return cursor->next(); }
 
+
+        // master/slave only
         void peek(std::vector<BSONObj>& v, int n) {
             if( cursor.get() )
                 cursor->peek(v,n);
         }
-        BSONObj nextSafe() { return cursor->nextSafe(); }
-        BSONObj next() { return cursor->next(); }
+
+        // master/slave only
         void putBack(BSONObj op) { cursor->putBack(op); }
 
         HostAndPort getHost() const;
@@ -145,8 +146,8 @@ namespace repl {
          * sync source blacklist.
          * This function may throw DB exceptions.
          */
-        void connectToSyncSource(OperationContext* txn, 
-                                 Timestamp lastOpTimeFetched,
+        void connectToSyncSource(OperationContext* txn,
+                                 const OpTime& lastOpTimeFetched,
                                  ReplicationCoordinator* replCoord);
     };
 

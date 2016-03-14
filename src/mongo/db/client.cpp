@@ -42,6 +42,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/service_context.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/mongoutils/str.h"
@@ -93,7 +94,7 @@ namespace mongo {
                    AbstractMessagingPort *p)
         : ClientBasic(serviceContext, p),
           _desc(std::move(desc)),
-          _threadId(boost::this_thread::get_id()),
+          _threadId(stdx::this_thread::get_id()),
           _connectionId(p ? p->connectionId() : 0) {
     }
 
@@ -107,19 +108,24 @@ namespace mongo {
         if (_connectionId) {
             builder.appendNumber("connectionId", _connectionId);
         }
+
+        if (hasRemote()) {
+            builder.append("client", getRemote().toString());
+        }
+    }
+
+    ServiceContext::UniqueOperationContext Client::makeOperationContext() {
+        return getServiceContext()->makeOperationContext(this);
     }
 
     void Client::setOperationContext(OperationContext* txn) {
         // We can only set the OperationContext once before resetting it.
         invariant(txn != NULL && _txn == NULL);
-
-        boost::unique_lock<SpinLock> uniqueLock(_lock);
         _txn = txn;
     }
 
     void Client::resetOperationContext() {
         invariant(_txn != NULL);
-        boost::unique_lock<SpinLock> uniqueLock(_lock);
         _txn = NULL;
     }
 

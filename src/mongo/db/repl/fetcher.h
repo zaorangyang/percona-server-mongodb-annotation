@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/thread/mutex.hpp>
 #include <string>
 #include <vector>
 
@@ -37,8 +36,11 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -54,29 +56,32 @@ namespace repl {
         typedef std::vector<BSONObj> Documents;
 
         /**
-         * Documents in current batch with cursor ID.
-         * If cursor ID is zero, there will be no additional batches.
+         * Documents in current batch with cursor ID and associated namespace name.
+         * If cursor ID is zero, there are no additional batches.
          */
         struct BatchData {
-            BatchData();
-            BatchData(CursorId theCursorId, Documents theDocuments);
-            CursorId cursorId;
+            BatchData() = default;
+            BatchData(CursorId theCursorId, const NamespaceString& theNss, Documents theDocuments);
+            CursorId cursorId = 0;
+            NamespaceString nss;
             Documents documents;
         };
 
         /**
          * Represents next steps of fetcher.
          */
-        enum class NextAction {
+        enum class NextAction : int {
             kInvalid=0,
             kNoAction=1,
-            kContinue=2
+            kGetMore=2
         };
 
         /**
          * Type of a fetcher callback function.
          */
-        typedef stdx::function<void (const StatusWith<BatchData>&, NextAction*)> CallbackFn;
+        typedef stdx::function<void (const StatusWith<BatchData>&,
+                                     NextAction*,
+                                     BSONObjBuilder*)> CallbackFn;
 
         /**
          * Creates Fetcher task but does not schedule it to be run by the executor.
@@ -138,7 +143,7 @@ namespace repl {
         void cancel();
 
         /**
-         * Waits for active remote command request to complete.
+         * Waits for remote command requests to complete.
          * Returns immediately if fetcher is not active.
          */
         void wait();
@@ -156,6 +161,11 @@ namespace repl {
         void _callback(const ReplicationExecutor::RemoteCommandCallbackData& rcbd,
                        const char* batchFieldName);
 
+        /**
+         * Sets fetcher state to inactive and notifies waiters.
+         */
+        void _finishCallback();
+
         // Not owned by us.
         ReplicationExecutor* _executor;
 
@@ -165,7 +175,9 @@ namespace repl {
         CallbackFn _work;
 
         // Protects member data of this Fetcher.
-        mutable boost::mutex _mutex;
+        mutable stdx::mutex _mutex;
+
+        mutable stdx::condition_variable _condition;
 
         // _active is true when Fetcher is scheduled to be run by the executor.
         bool _active;

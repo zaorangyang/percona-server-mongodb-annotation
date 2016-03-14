@@ -49,6 +49,8 @@ namespace mongo {
     const string LiteParsedQuery::metaRecordId("recordId");
     const string LiteParsedQuery::metaIndexKey("indexKey");
 
+    const int LiteParsedQuery::kDefaultBatchSize = 101;
+
     namespace {
 
         Status checkFieldType(const BSONElement& el, BSONType type) {
@@ -72,6 +74,7 @@ namespace mongo {
                                  LiteParsedQuery** out) {
         auto_ptr<LiteParsedQuery> pq(new LiteParsedQuery());
         pq->_ns = fullns;
+        pq->_fromCommand = true;
         pq->_explain = isExplain;
 
         // Parse the command BSON by looping through one element at a time.
@@ -153,8 +156,8 @@ namespace mongo {
                 }
 
                 int limit = el.numberInt();
-                if (limit < 0) {
-                    return Status(ErrorCodes::BadValue, "limit value must be non-negative");
+                if (limit <= 0) {
+                    return Status(ErrorCodes::BadValue, "limit value must be positive");
                 }
 
                 pq->_limit = limit;
@@ -168,8 +171,8 @@ namespace mongo {
                 }
 
                 int batchSize = el.numberInt();
-                if (batchSize <= 0) {
-                    return Status(ErrorCodes::BadValue, "batchSize value must be positive");
+                if (batchSize < 0) {
+                    return Status(ErrorCodes::BadValue, "batchSize value must be non-negative");
                 }
 
                 pq->_batchSize = batchSize;
@@ -347,6 +350,10 @@ namespace mongo {
         }
         if (pq->showRecordId()) {
             pq->addShowRecordIdMetaProj();
+        }
+
+        if (pq->isAwaitData() && !pq->isTailable()) {
+            return Status(ErrorCodes::BadValue, "Cannot set awaitData without tailable");
         }
 
         Status validateStatus = pq->validate();
@@ -553,26 +560,6 @@ namespace mongo {
         return false;
     }
 
-    LiteParsedQuery::LiteParsedQuery() :
-        _skip(0),
-        _limit(0),
-        _batchSize(101),
-        _wantMore(true),
-        _explain(false),
-        _maxScan(0),
-        _maxTimeMS(0),
-        _returnKey(false),
-        _showRecordId(false),
-        _snapshot(false),
-        _hasReadPref(false),
-        _tailable(false),
-        _slaveOk(false),
-        _oplogReplay(false),
-        _noCursorTimeout(false),
-        _awaitData(false),
-        _exhaust(false),
-        _partial(false) { }
-
     //
     // Old LiteParsedQuery parsing code: SOON TO BE DEPRECATED.
     //
@@ -613,8 +600,11 @@ namespace mongo {
                                  bool fromQueryMessage) {
         _ns = ns;
         _skip = ntoskip;
-        _limit = ntoreturn;
         _proj = proj.getOwned();
+
+        if (ntoreturn) {
+            _batchSize = ntoreturn;
+        }
 
         // Initialize flags passed as 'queryOptions' bit vector.
         initFromInt(queryOptions);
@@ -623,22 +613,16 @@ namespace mongo {
             return Status(ErrorCodes::BadValue, "bad skip value in query");
         }
 
-        if (_limit == std::numeric_limits<int>::min()) {
-            // _limit is negative but can't be negated.
-            return Status(ErrorCodes::BadValue, "bad limit value in query");
-        }
+        if (_batchSize && *_batchSize < 0) {
+            if (*_batchSize == std::numeric_limits<int>::min()) {
+                // _batchSize is negative but can't be negated.
+                return Status(ErrorCodes::BadValue, "bad limit value in query");
+            }
 
-        if (_limit < 0) {
-            // _limit greater than zero is simply a hint on how many objects to send back per
-            // "cursor batch".  A negative number indicates a hard limit.
+            // A negative number indicates that the cursor should be closed after the first batch.
             _wantMore = false;
-            _limit = -_limit;
+            _batchSize = -*_batchSize;
         }
-
-        // We are constructing this LiteParsedQuery from a legacy OP_QUERY message, and therefore
-        // cannot distinguish batchSize and limit. (They are a single field in OP_QUERY, but are
-        // passed separately for the find command.) Just set both values to be the same.
-        _batchSize = _limit;
 
         if (fromQueryMessage) {
             BSONElement queryField = queryObj["query"];
@@ -649,7 +633,6 @@ namespace mongo {
                 if (!status.isOK()) { return status; }
             }
             else {
-                // TODO: Does this ever happen?
                 _filter = queryObj.getOwned();
             }
         }

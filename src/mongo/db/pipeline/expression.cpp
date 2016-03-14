@@ -1480,7 +1480,7 @@ namespace {
 
         verify(str::equals(expr.fieldName(), "$filter"));
 
-        uassert(28646, "$filter only supports an object as it's argument",
+        uassert(28646, "$filter only supports an object as its argument",
                 expr.type() == Object);
 
         // "cond" must be parsed after "as" regardless of BSON order.
@@ -1693,7 +1693,7 @@ namespace {
 
         verify(str::equals(expr.fieldName(), "$map"));
 
-        uassert(16878, "$map only supports an object as it's argument",
+        uassert(16878, "$map only supports an object as its argument",
                 expr.type() == Object);
 
         // "in" must be parsed after "as" regardless of BSON order
@@ -2500,8 +2500,22 @@ namespace {
                 (pLength.getType() == NumberInt
                  || pLength.getType() == NumberLong
                  || pLength.getType() == NumberDouble));
+
         string::size_type lower = static_cast< string::size_type >( pLower.coerceToLong() );
         string::size_type length = static_cast< string::size_type >( pLength.coerceToLong() );
+
+        auto isContinuationByte = [](char c){ return ((c & 0xc0) == 0x80); };
+
+        uassert(28656, str::stream() << getOpName() <<
+                ":  Invalid range, starting index is a UTF-8 continuation byte.",
+                (lower >= str.length() || !isContinuationByte(str[lower])));
+
+        // Check the byte after the last character we'd return. If it is a continuation byte, that
+        // means we're in the middle of a UTF-8 character.
+        uassert(28657, str::stream() << getOpName() <<
+                ":  Invalid range, ending index is in the middle of a UTF-8 character.",
+                (lower + length >= str.length() || !isContinuationByte(str[lower + length])));
+
         if ( lower >= str.length() ) {
             // If lower > str.length() then string::substr() will throw out_of_range, so return an
             // empty string if lower is not a valid string index.

@@ -126,6 +126,7 @@ error_code("NotAReplicaSet", 123)
 error_code("IncompatibleElectionProtocol", 124)
 error_code("CommandFailed", 125)
 error_code("RPCProtocolNegotiationFailed", 126)
+error_code("UnrecoverableRollbackError", 127)
 
 # Non-sequential error codes (for compatibility only)
 error_code("NotMaster", 10107) #this comes from assert_util.h
@@ -139,6 +140,9 @@ error_code("BackgroundOperationInProgressForNamespace", 12587);
 error_code("NotMasterOrSecondaryCode", 13436);
 error_code("NotMasterNoSlaveOkCode", 13435);
 error_code("ShardKeyTooBig", 13334);
+error_code("SendStaleConfig", 13388);
+error_code("DatabaseDifferCase", 13297);
+error_code("PrepareConfigsFailedCode", 13104);
 
 error_class("NetworkError", ["HostUnreachable", "HostNotFound", "NetworkTimeout"])
 error_class("Interruption", ["Interrupted", "InterruptedAtShutdown", "ExceededTimeLimit"])
