@@ -32,6 +32,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bson_field.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/client_basic.h"

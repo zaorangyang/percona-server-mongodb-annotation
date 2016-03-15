@@ -49,6 +49,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/paths.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit_code.h"
 #include "mongo/util/file.h"
@@ -120,8 +121,7 @@ namespace audit {
         JSONAuditLog(const std::string &file, const BSONObj &filter)
             : _file(new AuditFile), 
               _matcher(filter.getOwned()), 
-              _fileName(file),
-              _mutex("auditFileMutex") {
+              _fileName(file) {
             _file->open(file.c_str(), false, false);
         }
 
@@ -143,7 +143,7 @@ namespace audit {
                 //
                 // We don't need the mutex around fsync, except to protect against concurrent
                 // logRotate destroying our pointer.  Welp.
-                SimpleMutex::scoped_lock lck(_mutex);
+                stdx::lock_guard<SimpleMutex> lck(_mutex);
 
                 // If pwrite performs a partial write, we don't want to
                 // muck about figuring out how much it did write (hard to
@@ -210,7 +210,7 @@ namespace audit {
         virtual void rotate() {
             int x = 0;
             x++;
-            SimpleMutex::scoped_lock lck(_mutex);
+            stdx::lock_guard<SimpleMutex> lck(_mutex);
 
             // Close the current file.
             _file.reset();
@@ -317,10 +317,10 @@ namespace audit {
     }
 
     static void appendCommonInfo(BSONObjBuilder &builder,
-                                 const StringData &atype,
+                                 StringData atype,
                                  ClientBasic* client) {
         builder << AuditFields::type(atype);
-        builder << AuditFields::timestamp(BSON("$date" << static_cast<long long>(jsTime().millis)));
+        builder << AuditFields::timestamp(BSON("$date" << static_cast<long long>(jsTime().toMillisSinceEpoch())));
         builder << AuditFields::local(BSON("host" << getHostNameCached() << "port" << serverGlobalParams.port));
         if (client->hasRemote()) {
             const HostAndPort hp = client->getRemote();
@@ -329,9 +329,9 @@ namespace audit {
             // It's not 100% clear that an empty obj here actually makes sense..
             builder << AuditFields::remote(BSONObj());
         }
-        if (client->hasAuthorizationSession()) {
+        if (AuthorizationSession::exists(client)) {
             // Build the users array, which consists of (user, db) pairs
-            AuthorizationSession *session = client->getAuthorizationSession();
+            AuthorizationSession *session = AuthorizationSession::get(client);
             BSONArrayBuilder users(builder.subarrayStart("users"));
             for (UserNameIterator it = session->getAuthenticatedUserNames(); it.more(); it.next()) {
                 BSONObjBuilder user(users.subobjStart());
@@ -348,7 +348,7 @@ namespace audit {
     
 
     static void _auditEvent(ClientBasic* client,
-                            const StringData& atype,
+                            StringData atype,
                             const BSONObj& params,
                             ErrorCodes::Error result = ErrorCodes::OK) {
         BSONObjBuilder builder;
@@ -359,8 +359,8 @@ namespace audit {
     }
 
     static void _auditAuthzFailure(ClientBasic* client,
-                                 const StringData& ns,
-                                 const StringData& command,
+                                 StringData ns,
+                                 StringData command,
                                  const BSONObj& args,
                                  ErrorCodes::Error result) {
         const BSONObj params = !ns.empty() ?
@@ -370,12 +370,12 @@ namespace audit {
     }
 
     void logAuthentication(ClientBasic* client,
-                           const StringData& mechanism,
+                           StringData mechanism,
                            const UserName& user,
                            ErrorCodes::Error result) PERCONA_AUDIT_STUB
     void logAuthentication(ClientBasic* client,
-                           const StringData& dbname,
-                           const StringData& mechanism,
+                           StringData dbname,
+                           StringData mechanism,
                            const std::string& user,
                            ErrorCodes::Error result) {
         if (!_auditLog) {
@@ -423,10 +423,6 @@ namespace audit {
         }
     }
 
-    void logFsyncUnlockAuthzCheck(
-            ClientBasic* client,
-            ErrorCodes::Error result) PERCONA_AUDIT_STUB
-
     void logGetMoreAuthzCheck(
             ClientBasic* client,
             const NamespaceString& ns,
@@ -438,19 +434,6 @@ namespace audit {
 
         if (result != ErrorCodes::OK) {
             _auditAuthzFailure(client, nssToString(ns), "getMore", BSON("cursorId" << cursorId), result);
-        }
-    }
-
-    void logInProgAuthzCheck(
-            ClientBasic* client,
-            const BSONObj& filter,
-            ErrorCodes::Error result) {
-        if (!_auditLog) {
-            return;
-        }
-
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, "", "inProg", BSON("filter" << filter), result);
         }
     }
 
@@ -481,19 +464,6 @@ namespace audit {
 
         if (result != ErrorCodes::OK) {
             _auditAuthzFailure(client, nssToString(ns), "killCursors", BSON("cursorId" << cursorId), result);
-        }
-    }
-
-    void logKillOpAuthzCheck(
-            ClientBasic* client,
-            const BSONObj& filter,
-            ErrorCodes::Error result) {
-        if (!_auditLog) {
-            return;
-        }
-
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, "", "killOp", BSON("filter" << filter), result);
         }
     }
 
@@ -551,7 +521,7 @@ namespace audit {
     }
 
     void logApplicationMessage(ClientBasic* client,
-                               const StringData& msg) {
+                               StringData msg) {
         if (!_auditLog) {
             return;
         }
@@ -571,8 +541,8 @@ namespace audit {
 
     void logCreateIndex(ClientBasic* client,
                         const BSONObj* indexSpec,
-                        const StringData& indexname,
-                        const StringData& nsname) {
+                        StringData indexname,
+                        StringData nsname) {
         if (!_auditLog) {
             return;
         }
@@ -584,7 +554,7 @@ namespace audit {
     }
 
     void logCreateCollection(ClientBasic* client,
-                             const StringData& nsname) { 
+                             StringData nsname) { 
         if (!_auditLog) {
             return;
         }
@@ -594,7 +564,7 @@ namespace audit {
     }
 
     void logCreateDatabase(ClientBasic* client,
-                           const StringData& nsname) {
+                           StringData nsname) {
         if (!_auditLog) {
             return;
         }
@@ -604,8 +574,8 @@ namespace audit {
     }
 
     void logDropIndex(ClientBasic* client,
-                      const StringData& indexname,
-                      const StringData& nsname) {
+                      StringData indexname,
+                      StringData nsname) {
         if (!_auditLog) {
             return;
         }
@@ -615,7 +585,7 @@ namespace audit {
     }
 
     void logDropCollection(ClientBasic* client,
-                           const StringData& nsname) { 
+                           StringData nsname) { 
         if (!_auditLog) {
             return;
         }
@@ -625,7 +595,7 @@ namespace audit {
     }
 
     void logDropDatabase(ClientBasic* client,
-                         const StringData& nsname) {
+                         StringData nsname) {
         if (!_auditLog) {
             return;
         }
@@ -635,8 +605,8 @@ namespace audit {
     }
 
     void logRenameCollection(ClientBasic* client,
-                             const StringData& source,
-                             const StringData& target) {
+                             StringData source,
+                             StringData target) {
         if (!_auditLog) {
             return;
         }
@@ -646,7 +616,7 @@ namespace audit {
     }
 
     void logEnableSharding(ClientBasic* client,
-                           const StringData& nsname) {
+                           StringData nsname) {
         if (!_auditLog) {
             return;
         }
@@ -656,7 +626,7 @@ namespace audit {
     }
 
     void logAddShard(ClientBasic* client,
-                     const StringData& name,
+                     StringData name,
                      const std::string& servers,
                      long long maxsize) {
         if (!_auditLog) {
@@ -670,7 +640,7 @@ namespace audit {
     }
 
     void logRemoveShard(ClientBasic* client,
-                        const StringData& shardname) {
+                        StringData shardname) {
         if (!_auditLog) {
             return;
         }
@@ -680,7 +650,7 @@ namespace audit {
     }
 
     void logShardCollection(ClientBasic* client,
-                            const StringData& ns,
+                            StringData ns,
                             const BSONObj& keyPattern,
                             bool unique) {
         if (!_auditLog) {
@@ -703,7 +673,7 @@ namespace audit {
                      const UserName& username) PERCONA_AUDIT_STUB
 
     void logDropAllUsersFromDatabase(ClientBasic* client,
-                                     const StringData& dbname) PERCONA_AUDIT_STUB
+                                     StringData dbname) PERCONA_AUDIT_STUB
 
     void logUpdateUser(ClientBasic* client,
                        const UserName& username,
@@ -733,7 +703,7 @@ namespace audit {
                      const RoleName& role) PERCONA_AUDIT_STUB
 
     void logDropAllRolesFromDatabase(ClientBasic* client,
-                                     const StringData& dbname) PERCONA_AUDIT_STUB
+                                     StringData dbname) PERCONA_AUDIT_STUB
 
     void logGrantRolesToRole(ClientBasic* client,
                              const RoleName& role,
@@ -751,7 +721,7 @@ namespace audit {
                                      const RoleName& role,
                                      const PrivilegeVector& privileges) PERCONA_AUDIT_STUB
 
-    void appendImpersonatedUsers(BSONObjBuilder* cmd) PERCONA_AUDIT_STUB
+    void writeImpersonatedUsersToMetadata(BSONObjBuilder* metadata) PERCONA_AUDIT_STUB
 
     void parseAndRemoveImpersonatedUsersField(
             BSONObj cmdObj,
