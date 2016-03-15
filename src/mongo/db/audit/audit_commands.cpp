@@ -73,7 +73,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forAnyNormalResource(), actions));
         }
 
-        bool run(OperationContext* txn, const std::string& dbname, BSONObj& jsobj, int, std::string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn, const std::string& dbname, BSONObj& jsobj, int, std::string& errmsg, BSONObjBuilder& result) {
             bool ok = true;
             const BSONElement &e = jsobj["logApplicationMessage"];
 
@@ -102,7 +102,7 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) { }
 
-        bool run(OperationContext* txn, const std::string& dbname, BSONObj& jsobj, int, std::string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn, const std::string& dbname, BSONObj& jsobj, int, std::string& errmsg, BSONObjBuilder& result) {
             result.appendElements(audit::_auditOptions.toBSON());
             return true;
         }
