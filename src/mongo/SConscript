@@ -143,6 +143,7 @@ versionInfo = env.Substfile(
 config_header_substs = (
     ('@mongo_config_byte_order@', 'MONGO_CONFIG_BYTE_ORDER'),
     ('@mongo_config_debug_build@', 'MONGO_CONFIG_DEBUG_BUILD'),
+    ('@mongo_config_have_thread_local@', 'MONGO_CONFIG_HAVE_THREAD_LOCAL'),
     ('@mongo_config_have___declspec_thread@', 'MONGO_CONFIG_HAVE___DECLSPEC_THREAD'),
     ('@mongo_config_have___thread@', 'MONGO_CONFIG_HAVE___THREAD'),
     ('@mongo_config_have_execinfo_backtrace@', 'MONGO_CONFIG_HAVE_EXECINFO_BACKTRACE'),
@@ -191,6 +192,7 @@ mongod = env.Program(
         "db/mongodwebserver",
         "db/serveronly",
         "db/repl/storage_interface_impl",
+        's/commands/shared_cluster_commands',
         "util/ntservice",
     ],
 )
@@ -227,16 +229,20 @@ env.Install(
             "s/mongos_options_init.cpp",
         ],
         LIBDEPS=[
+            'db/conn_pool_options',
+            'db/coredb',
+            'db/mongodandmongos',
+            'db/repl/replication_executor',
+            'executor/network_interface_impl',
             's/catalog/legacy/catalog_manager_legacy',
+            's/catalog/replset/catalog_manager_replica_set',
             's/client/sharding_connection_hook',
             's/commands/cluster_commands',
-            "s/mongoscore",
-            "db/coredb",
-            "s/coreshard",
-            "util/ntservice",
-            "db/mongodandmongos",
-            "db/conn_pool_options",
-            '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
+            's/commands/shared_cluster_commands',
+            's/coreshard',
+            's/mongoscore',
+            'util/ntservice',
+            'util/options_parser/options_parser_init',
         ]))
 
 # --- sniffer ---
@@ -314,21 +320,53 @@ else:
 # binaries
 
 distBinaries = []
-
-if env.TargetOSIs('windows'):
-    distBinaries.extend(['mongod.pdb', 'mongos.pdb'])
+distDebugSymbols = []
 
 def add_exe( v ):
     return "${PROGPREFIX}%s${PROGSUFFIX}" % v
 
+def failMissingObjCopy(env, target, source):
+    env.FatalError("Generating debug symbols requires objcopy, please set the OBJCOPY variable.")
+
 def installBinary( e, name ):
+    debug_sym_name = name
     name = add_exe( name )
 
-    if env.TargetOSIs('solaris', 'linux') and (not has_option("nostrip")):
-        name = e.Command('stripped/%s' % name, name, Copy('$TARGET', '$SOURCE'))[0]
-        e.AddPostAction(name, 'strip $TARGET')
+    debug_sym_cmd = None
+    if e.TargetOSIs('linux', 'solaris'):
+        if 'OBJCOPY' not in e:
+            debug_sym_cmd = failMissingObjCopy
+        else:
+            debug_sym_cmd = '${OBJCOPY} --only-keep-debug ${SOURCE} ${TARGET}'
+        debug_sym_name += '.debug'
+    elif e.TargetOSIs('osx'):
+        debug_sym_name += '.dSYM'
+        debug_sym_cmd = 'dsymutil -o ${TARGET} ${SOURCE}'
+    elif e.ToolchainIs('msvc'):
+        debug_sym_name += '.pdb'
+        distBinaries.append(debug_sym_name)
+        distDebugSymbols.append(debug_sym_name)
 
-    distBinaries.append(name)
+    if debug_sym_cmd:
+        debug_sym = e.Command(
+            debug_sym_name,
+            name,
+            debug_sym_cmd
+        )
+        e.Install("#/", debug_sym)
+        e.Alias('debugsymbols', debug_sym)
+        distDebugSymbols.append(debug_sym)
+
+    if env.TargetOSIs('linux', 'solaris') and (not has_option("nostrip")):
+        strip_cmd = e.Command(
+            'stripped/%s' % name,
+            [name, debug_sym],
+            '${OBJCOPY} --strip-debug --add-gnu-debuglink ${SOURCES[1]} ${SOURCES[0]} $TARGET'
+        )
+        distBinaries.append('stripped/%s' % name)
+    else:
+        distBinaries.append(name)
+
     inst = e.Install( "$INSTALL_DIR/bin", name )
 
     if env.TargetOSIs('posix'):
@@ -404,15 +442,22 @@ for full_dir, archive_dir in env["ARCHIVE_ADDITION_DIR_MAP"].items():
 # Attempts to build release artifacts without tools must fail
 if has_option("use-new-tools"):
     env.Command(
-        '#/${SERVER_ARCHIVE}',
-        ['#buildscripts/make_archive.py'] + env["MODULE_BANNERS"] + env["ARCHIVE_ADDITIONS"] +
-        distBinaries, ' '.join(['$PYTHON ${SOURCES[0]} -o $TARGET'] + archive_addition_transforms +
-        module_banner_transforms + [
-                '--transform ${str(Dir(BUILD_DIR))}/mongo/stripped=$SERVER_DIST_BASENAME/bin',
-                '--transform ${str(Dir(BUILD_DIR))}/mongo=$SERVER_DIST_BASENAME/bin',
-                '--transform ${str(Dir(BUILD_DIR))}/mongo/stripped/src/mongo-tools=$SERVER_DIST_BASENAME/bin',
+        target='#/${SERVER_ARCHIVE}',
+        source=['#buildscripts/make_archive.py'] + env["MODULE_BANNERS"] + env["ARCHIVE_ADDITIONS"] + distBinaries,
+        action=' '.join(
+            ['$PYTHON ${SOURCES[0]} -o $TARGET'] +
+            archive_addition_transforms +
+            module_banner_transforms +
+            [
+                '--transform $BUILD_DIR/mongo/stripped=$SERVER_DIST_BASENAME/bin',
+                '--transform $BUILD_DIR/mongo=$SERVER_DIST_BASENAME/bin',
+                '--transform $BUILD_DIR/mongo/stripped/src/mongo-tools=$SERVER_DIST_BASENAME/bin',
                 '--transform src/mongo-tools=$SERVER_DIST_BASENAME/bin',
-                '${TEMPFILE(SOURCES[1:])}']))
+                '${TEMPFILE(SOURCES[1:])}'
+            ],
+        ),
+        BUILD_DIR=env.Dir('$BUILD_DIR').path
+    )
 
     env.Alias("dist", source='#/${SERVER_ARCHIVE}')
 else:
@@ -421,6 +466,13 @@ else:
     env.Alias("dist", [], [ failDist ] )
     env.AlwaysBuild("dist")
 
+debug_symbols_dist = env.Command(
+    target='#/${SERVER_DIST_BASENAME}-debugsymbols${DIST_ARCHIVE_SUFFIX}',
+    source=['#buildscripts/make_archive.py'] + distDebugSymbols,
+    action='$PYTHON ${SOURCES[0]} -o $TARGET --transform $BUILD_DIR/mongo=$SERVER_DIST_BASENAME ${TEMPFILE(SOURCES[1:])}',
+    BUILD_DIR=env.Dir('$BUILD_DIR').path
+)
+env.Alias('dist-debugsymbols', debug_symbols_dist)
 
 #final alias
 env.Alias( "install", "$INSTALL_DIR" )

@@ -28,187 +28,189 @@
 
 #pragma once
 
-#include <boost/thread/condition.hpp>
-#include <boost/thread/thread.hpp>
 #include <string>
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
 
-    class DistLockManager;
-
+/**
+ * Implements the catalog manager using the legacy 3-config server protocol.
+ */
+class CatalogManagerLegacy final : public CatalogManager {
+public:
+    CatalogManagerLegacy();
+    ~CatalogManagerLegacy();
 
     /**
-     * Implements the catalog manager using the legacy 3-config server protocol.
+     * Initializes the catalog manager with the hosts, which will be used as a configuration
+     * server. Can only be called once for the lifetime.
      */
-    class CatalogManagerLegacy : public CatalogManager {
-    public:
-        CatalogManagerLegacy();
-        virtual ~CatalogManagerLegacy();
+    Status init(const ConnectionString& configCS);
 
-        /**
-         * Initializes the catalog manager with the hosts, which will be used as a configuration
-         * server. Can only be called once for the lifetime.
-         */
-        Status init(const ConnectionString& configCS);
+    Status startup(bool upgrade) override;
 
-        /**
-         * Updates the config server's metadata to the current version.
-         */
-        Status checkAndUpgradeConfigMetadata(bool doUpgrade);
+    ConnectionString connectionString() const override;
 
-        /**
-         * Starts the thread that periodically checks data consistency amongst the config servers.
-         * Note: this is not thread safe and can only be called once for the lifetime.
-         */
-        Status startConfigServerChecker();
+    void shutDown() override;
 
-        ConnectionString connectionString() const final;
+    Status enableSharding(const std::string& dbName) override;
 
-        void shutDown() final;
+    Status shardCollection(OperationContext* txn,
+                           const std::string& ns,
+                           const ShardKeyPattern& fieldsAndOrder,
+                           bool unique,
+                           std::vector<BSONObj>* initPoints,
+                           std::set<ShardId>* initShardIds) override;
 
-        virtual Status enableSharding(const std::string& dbName);
+    StatusWith<std::string> addShard(OperationContext* txn,
+                                     const std::string& name,
+                                     const ConnectionString& shardConnectionString,
+                                     const long long maxSize) override;
 
-        virtual Status shardCollection(const std::string& ns,
-                                       const ShardKeyPattern& fieldsAndOrder,
-                                       bool unique,
-                                       std::vector<BSONObj>* initPoints,
-                                       std::vector<Shard>* initShards);
+    StatusWith<ShardDrainingStatus> removeShard(OperationContext* txn,
+                                                const std::string& name) override;
 
-        virtual StatusWith<std::string> addShard(const std::string& name,
-                                                 const ConnectionString& shardConnectionString,
-                                                 const long long maxSize);
+    Status createDatabase(const std::string& dbName) override;
 
-        virtual StatusWith<ShardDrainingStatus> removeShard(OperationContext* txn,
-                                                            const std::string& name);
+    StatusWith<DatabaseType> getDatabase(const std::string& dbName) override;
 
-        virtual Status createDatabase(const std::string& dbName);
+    StatusWith<CollectionType> getCollection(const std::string& collNs) override;
 
-        virtual Status updateDatabase(const std::string& dbName, const DatabaseType& db);
+    Status getCollections(const std::string* dbName, std::vector<CollectionType>* collections);
 
-        virtual StatusWith<DatabaseType> getDatabase(const std::string& dbName);
+    Status dropCollection(OperationContext* txn, const std::string& collectionNs);
 
-        virtual Status updateCollection(const std::string& collNs, const CollectionType& coll);
+    Status getDatabasesForShard(const std::string& shardName,
+                                std::vector<std::string>* dbs) override;
 
-        virtual StatusWith<CollectionType> getCollection(const std::string& collNs);
+    Status getChunks(const BSONObj& query,
+                     const BSONObj& sort,
+                     boost::optional<int> limit,
+                     std::vector<ChunkType>* chunks) override;
 
-        virtual Status getCollections(const std::string* dbName,
-                                      std::vector<CollectionType>* collections);
+    Status getTagsForCollection(const std::string& collectionNs,
+                                std::vector<TagsType>* tags) override;
 
-        virtual Status dropCollection(const std::string& collectionNs);
+    StatusWith<std::string> getTagForChunk(const std::string& collectionNs,
+                                           const ChunkType& chunk) override;
 
-        Status getDatabasesForShard(const std::string& shardName,
-                                    std::vector<std::string>* dbs) final;
+    Status getAllShards(std::vector<ShardType>* shards) override;
 
-        virtual Status getChunks(const Query& query,
-                                 int nToReturn,
-                                 std::vector<ChunkType>* chunks);
+    bool isShardHost(const ConnectionString& shardConnectionString) override;
 
-        Status getTagsForCollection(const std::string& collectionNs,
-                                    std::vector<TagsType>* tags) final;
+    /**
+     * Grabs a distributed lock and runs the command on all config servers.
+     */
+    bool runUserManagementWriteCommand(const std::string& commandName,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       BSONObjBuilder* result) override;
 
-        StatusWith<std::string> getTagForChunk(const std::string& collectionNs,
-                                               const ChunkType& chunk) final;
+    bool runReadCommand(const std::string& dbname,
+                        const BSONObj& cmdObj,
+                        BSONObjBuilder* result) override;
 
-        virtual Status getAllShards(std::vector<ShardType>* shards);
+    Status applyChunkOpsDeprecated(const BSONArray& updateOps,
+                                   const BSONArray& preCondition) override;
 
-        virtual bool isShardHost(const ConnectionString& shardConnectionString);
+    void logAction(const ActionLogType& actionLog);
 
-        virtual bool doShardsExist();
+    void logChange(const std::string& clientAddress,
+                   const std::string& what,
+                   const std::string& ns,
+                   const BSONObj& detail) override;
 
-        /**
-         * Grabs a distributed lock and runs the command on all config servers.
-         */
-        virtual bool runUserManagementWriteCommand(const std::string& commandName,
-                                                   const std::string& dbname,
-                                                   const BSONObj& cmdObj,
-                                                   BSONObjBuilder* result);
+    StatusWith<SettingsType> getGlobalSettings(const std::string& key) override;
 
-        virtual bool runUserManagementReadCommand(const std::string& dbname,
-                                                  const BSONObj& cmdObj,
-                                                  BSONObjBuilder* result);
+    void writeConfigServerDirect(const BatchedCommandRequest& request,
+                                 BatchedCommandResponse* response) override;
 
-        virtual Status applyChunkOpsDeprecated(const BSONArray& updateOps,
-                                               const BSONArray& preCondition);
+    DistLockManager* getDistLockManager() const override;
 
-        virtual void logAction(const ActionLogType& actionLog);
+private:
+    /**
+     * Updates the config server's metadata to the current version.
+     */
+    Status _checkAndUpgradeConfigMetadata(bool doUpgrade);
 
-        virtual void logChange(OperationContext* txn,
-                               const std::string& what,
-                               const std::string& ns,
-                               const BSONObj& detail);
+    /**
+     * Starts the thread that periodically checks data consistency amongst the config servers.
+     * Note: this is not thread safe and can only be called once for the lifetime.
+     */
+    Status _startConfigServerChecker();
 
-        virtual StatusWith<SettingsType> getGlobalSettings(const std::string& key);
+    /**
+     * Direct network check to see if a particular database does not already exist with the
+     * same name or different case.
+     */
+    Status _checkDbDoesNotExist(const std::string& dbName) const;
 
-        virtual void writeConfigServerDirect(const BatchedCommandRequest& request,
-                                             BatchedCommandResponse* response);
+    /**
+     * Generates a new shard name "shard<xxxx>"
+     * where <xxxx> is an autoincrementing value and <xxxx> < 10000
+     */
+    StatusWith<std::string> _getNewShardName() const;
 
-        virtual DistLockManager* getDistLockManager() override;
+    /**
+     * Returns the number of shards recognized by the config servers
+     * in this sharded cluster.
+     * Optional: use query parameter to filter shard count.
+     */
+    size_t _getShardCount(const BSONObj& query = {}) const;
 
-    private:
-        /**
-         * Direct network check to see if a particular database does not already exist with the
-         * same name or different case.
-         */
-        Status _checkDbDoesNotExist(const std::string& dbName) const;
+    /**
+     * Returns true if all config servers have the same state.
+     * If inconsistency detected on first attempt, checks at most 3 more times.
+     */
+    bool _checkConfigServersConsistent(const unsigned tries = 4) const;
 
-        /**
-         * Generates a new shard name "shard<xxxx>"
-         * where <xxxx> is an autoincrementing value and <xxxx> < 10000
-         */
-        StatusWith<std::string> _getNewShardName() const;
+    /**
+     * Checks data consistency amongst config servers every 60 seconds.
+     */
+    void _consistencyChecker();
 
-        /**
-         * Returns the number of shards recognized by the config servers
-         * in this sharded cluster.
-         * Optional: use query parameter to filter shard count.
-         */
-        size_t _getShardCount(const BSONObj& query = {}) const;
+    /**
+     * Returns true if the config servers have the same contents since the last
+     * check was performed.
+     */
+    bool _isConsistentFromLastCheck();
 
-        /**
-         * Returns true if all config servers have the same state.
-         * If inconsistency detected on first attempt, checks at most 3 more times.
-         */
-        bool _checkConfigServersConsistent(const unsigned tries = 4) const;
+    // Parsed config server hosts, as specified on the command line.
+    ConnectionString _configServerConnectionString;
+    std::vector<ConnectionString> _configServers;
 
-        /**
-         * Checks data consistency amongst config servers every 60 seconds.
-         */
-        void _consistencyChecker();
+    // Distribted lock manager singleton.
+    std::unique_ptr<DistLockManager> _distLockManager;
 
-        /**
-         * Returns true if the config servers have the same contents since the last
-         * check was performed.
-         */
-        bool _isConsistentFromLastCheck();
+    // Whether the logChange call should attempt to create the changelog collection
+    AtomicInt32 _changeLogCollectionCreated;
 
-        // Parsed config server hosts, as specified on the command line.
-        ConnectionString _configServerConnectionString;
-        std::vector<ConnectionString> _configServers;
+    // Whether the logAction call should attempt to create the actionlog collection
+    AtomicInt32 _actionLogCollectionCreated;
 
-        // Distribted lock manager singleton.
-        std::unique_ptr<DistLockManager> _distLockManager;
+    // protects _inShutdown, _consistentFromLastCheck; used by _consistencyCheckerCV
+    stdx::mutex _mutex;
 
-        // protects _inShutdown, _consistentFromLastCheck; used by _consistencyCheckerCV
-        boost::mutex _mutex;
+    // True if CatalogManagerLegacy::shutDown has been called. False, otherwise.
+    bool _inShutdown = false;
 
-        // True if CatalogManagerLegacy::shutDown has been called. False, otherwise.
-        bool _inShutdown = false;
+    // used by consistency checker thread to check if config
+    // servers are consistent
+    bool _consistentFromLastCheck = false;
 
-        // used by consistency checker thread to check if config
-        // servers are consistent
-        bool _consistentFromLastCheck = false;
+    // Thread that runs dbHash on config servers for checking data consistency.
+    stdx::thread _consistencyCheckerThread;
 
-        // Thread that runs dbHash on config servers for checking data consistency.
-        boost::thread _consistencyCheckerThread;
+    // condition variable used by the consistency checker thread to wait
+    // for <= 60s, on every iteration, until shutDown is called
+    stdx::condition_variable _consistencyCheckerCV;
+};
 
-        // condition variable used by the consistency checker thread to wait
-        // for <= 60s, on every iteration, until shutDown is called
-        boost::condition _consistencyCheckerCV;
-    };
-
-} // namespace mongo
+}  // namespace mongo

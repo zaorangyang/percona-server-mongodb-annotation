@@ -55,10 +55,8 @@ namespace mongo {
                                                   const DocWriter* doc,
                                                   bool enforceQuota );
 
-        virtual RecordIterator* getIterator( OperationContext* txn,
-                                             const RecordId& start = RecordId(),
-                                             const CollectionScanParams::Direction& dir =
-                                             CollectionScanParams::FORWARD ) const;
+        virtual std::unique_ptr<RecordCursor> getCursor(OperationContext* txn,
+                                                        bool forward = true) const;
 
         virtual void appendCustomStats( OperationContext* txn,
                                         BSONObjBuilder* result,

@@ -219,6 +219,7 @@ PARAM
 POSIX
 PREDEFINE
 PRIu
+PRNG
 PTHREAD
 PTR
 Pandis
@@ -606,6 +607,7 @@ icount
 idx
 ifdef's
 ikey
+impl
 incr
 incrementing
 indices
@@ -755,6 +757,7 @@ opendir
 openfile
 optimizations
 optype
+ori
 os
 ovfl
 ownp
@@ -853,6 +856,7 @@ skiplists
 slotsp
 slvg
 snaplen
+snapsort
 snprintf
 sp
 spinlock

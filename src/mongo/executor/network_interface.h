@@ -31,91 +31,94 @@
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/db/repl/replication_executor.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/stdx/functional.h"
 
 namespace mongo {
 namespace executor {
 
+/**
+ * Interface to networking for use by TaskExecutor implementations.
+ */
+class NetworkInterface {
+    MONGO_DISALLOW_COPYING(NetworkInterface);
+
+public:
+    // A flag to keep replication MessagingPorts open when all other sockets are disconnected.
+    static const unsigned int kMessagingPortKeepOpen = 1;
+
+    using Response = RemoteCommandResponse;
+    using RemoteCommandCompletionFn = stdx::function<void(const TaskExecutor::ResponseStatus&)>;
+
+    virtual ~NetworkInterface();
+
     /**
-     * Interface to networking used by ReplicationExecutor.
-     *
-     * TODO(spencer): Change to use a TaskExecutor once that interface is available.
+     * Returns diagnostic info.
      */
-    class NetworkInterface {
-        MONGO_DISALLOW_COPYING(NetworkInterface);
-    public:
+    virtual std::string getDiagnosticString() = 0;
 
-        // A flag to keep replication MessagingPorts open when all other sockets are disconnected.
-        static const unsigned int kMessagingPortKeepOpen = 1;
+    /**
+     * Starts up the network interface.
+     *
+     * It is valid to call all methods except shutdown() before this method completes.  That is,
+     * implementations may not assume that startup() completes before startCommand() first
+     * executes.
+     *
+     * Called by the owning TaskExecutor inside its run() method.
+     */
+    virtual void startup() = 0;
 
-        typedef RemoteCommandResponse Response;
-        typedef stdx::function<void (const repl::ResponseStatus&)> RemoteCommandCompletionFn;
+    /**
+     * Shuts down the network interface. Must be called before this instance gets deleted,
+     * if startup() is called.
+     *
+     * Called by the owning TaskExecutor inside its run() method.
+     */
+    virtual void shutdown() = 0;
 
-        virtual ~NetworkInterface();
+    /**
+     * Blocks the current thread (presumably the executor thread) until the network interface
+     * knows of work for the executor to perform.
+     */
+    virtual void waitForWork() = 0;
 
-        /**
-         * Returns diagnostic info.
-         */
-        virtual std::string getDiagnosticString() = 0;
+    /**
+     * Similar to waitForWork, but only blocks until "when".
+     */
+    virtual void waitForWorkUntil(Date_t when) = 0;
 
-        /**
-         * Starts up the network interface.
-         *
-         * It is valid to call all methods except shutdown() before this method completes.  That is,
-         * implementations may not assume that startup() completes before startCommand() first
-         * executes.
-         *
-         * Called by the owning TaskExecutor inside its run() method.
-         */
-        virtual void startup() = 0;
+    /**
+     * Signals to the network interface that there is new work (such as a signaled event) for
+     * the executor to process.  Wakes the executor from waitForWork() and friends.
+     */
+    virtual void signalWorkAvailable() = 0;
 
-        /**
-         * Shuts down the network interface. Must be called before this instance gets deleted,
-         * if startup() is called.
-         *
-         * Called by the owning TaskExecutor inside its run() method.
-         */
-        virtual void shutdown() = 0;
+    /**
+     * Returns the current time.
+     */
+    virtual Date_t now() = 0;
 
-        /**
-         * Blocks the current thread (presumably the executor thread) until the network interface
-         * knows of work for the executor to perform.
-         */
-        virtual void waitForWork() = 0;
+    /**
+     * Returns the hostname of the current process.
+     */
+    virtual std::string getHostName() = 0;
 
-        /**
-         * Similar to waitForWork, but only blocks until "when".
-         */
-        virtual void waitForWorkUntil(Date_t when) = 0;
+    /**
+     * Starts asynchronous execution of the command described by "request".
+     */
+    virtual void startCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                              const RemoteCommandRequest& request,
+                              const RemoteCommandCompletionFn& onFinish) = 0;
 
-        /**
-         * Signals to the network interface that there is new work (such as a signaled event) for
-         * the executor to process.  Wakes the executor from waitForWork() and friends.
-         */
-        virtual void signalWorkAvailable() = 0;
+    /**
+     * Requests cancelation of the network activity associated with "cbHandle" if it has not yet
+     * completed.
+     */
+    virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) = 0;
 
-        /**
-         * Returns the current time.
-         */
-        virtual Date_t now() = 0;
+protected:
+    NetworkInterface();
+};
 
-        /**
-         * Starts asynchronous execution of the command described by "request".
-         */
-        virtual void startCommand(const repl::ReplicationExecutor::CallbackHandle& cbHandle,
-                                  const RemoteCommandRequest& request,
-                                  const RemoteCommandCompletionFn& onFinish) = 0;
-
-        /**
-         * Requests cancelation of the network activity associated with "cbHandle" if it has not yet
-         * completed.
-         */
-        virtual void cancelCommand(const repl::ReplicationExecutor::CallbackHandle& cbHandle) = 0;
-
-    protected:
-        NetworkInterface();
-    };
-
-} // namespace executor
-} // namespace mongo
+}  // namespace executor
+}  // namespace mongo

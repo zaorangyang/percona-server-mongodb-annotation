@@ -33,51 +33,57 @@
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/document_range.h"
+#include "mongo/rpc/protocol.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
 namespace rpc {
 
+/**
+ * Constructs an OP_COMMANDREPLY message.
+ */
+class CommandReplyBuilder : public ReplyBuilderInterface {
+public:
     /**
-     * Constructs an OP_COMMANDREPLY message.
+     * Constructs an OP_COMMANDREPLY in a new buffer.
      */
-    class CommandReplyBuilder : public ReplyBuilderInterface {
-    public:
+    CommandReplyBuilder();
 
-        /**
-         * Constructs an OP_COMMANDREPLY in a new buffer.
-         */
-        CommandReplyBuilder();
+    /*
+     * Constructs an OP_COMMANDREPLY in an existing buffer. Ownership of the buffer
+     * will be transfered to the CommandReplyBuilder.
+     */
+    CommandReplyBuilder(std::unique_ptr<Message> message);
 
-        /*
-         * Constructs an OP_COMMANDREPLY in an existing buffer. Ownership of the buffer
-         * will be transfered to the CommandReplyBuilder.
-         */
-        CommandReplyBuilder(std::unique_ptr<Message> message);
+    CommandReplyBuilder& setMetadata(BSONObj metadata) final;
+    CommandReplyBuilder& setRawCommandReply(BSONObj commandReply) final;
 
-        CommandReplyBuilder& setMetadata(BSONObj metadata) final;
-        CommandReplyBuilder& setRawCommandReply(BSONObj commandReply) final;
+    CommandReplyBuilder& addOutputDocs(DocumentRange outputDocs) final;
+    CommandReplyBuilder& addOutputDoc(BSONObj outputDoc) final;
 
-        CommandReplyBuilder& addOutputDocs(DocumentRange outputDocs) final;
-        CommandReplyBuilder& addOutputDoc(BSONObj outputDoc) final;
+    State getState() const final;
 
-        State getState() const final;
+    Protocol getProtocol() const final;
 
-        /**
-         * Writes data then transfers ownership of the message to the caller.
-         * The behavior of calling any methods on the object is subsequently
-         * undefined.
-         */
-        std::unique_ptr<Message> done() final;
+    void reset() final;
 
-    private:
-        // Default values are all empty.
-        BufBuilder _builder{};
-        std::unique_ptr<Message> _message;
+    /**
+     * Writes data then transfers ownership of the message to the caller.
+     * The behavior of calling any methods on the object is subsequently
+     * undefined.
+     */
+    std::unique_ptr<Message> done() final;
 
-        State _state{State::kMetadata};
-    };
+    std::size_t availableSpaceForOutputDocs() const final;
+
+private:
+    // Default values are all empty.
+    BufBuilder _builder{};
+    std::unique_ptr<Message> _message;
+
+    State _state{State::kMetadata};
+};
 
 }  // namespace rpc
 }  // namespace mongo

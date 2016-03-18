@@ -36,43 +36,38 @@
 
 namespace mongo {
 
-    class BSONObj;
+class BSONObj;
 
 namespace repl {
 
-    class ReadAfterOpTimeArgs {
-    public:
+class ReadAfterOpTimeArgs {
+public:
+    static const std::string kRootFieldName;
+    static const std::string kOpTimeFieldName;
+    static const std::string kOpTimestampFieldName;
+    static const std::string kOpTermFieldName;
 
-        static const std::string kRootFieldName;
-        static const std::string kOpTimeFieldName;
-        static const std::string kOpTimestampFieldName;
-        static const std::string kOpTermFieldName;
-        static const std::string kTimeoutFieldName;
+    ReadAfterOpTimeArgs();
+    explicit ReadAfterOpTimeArgs(OpTime opTime);
 
-        ReadAfterOpTimeArgs();
-        ReadAfterOpTimeArgs(OpTime opTime, Milliseconds timeout);
+    /**
+     * Format:
+     * {
+     *    find: “coll”,
+     *    filter: <Query Object>,
+     *    $readConcern: { // optional
+     *      afterOpTime: { ts: <timestamp>, term: <NumberLong> },
+     *    }
+     * }
+     */
+    Status initialize(const BSONObj& cmdObj);
 
-        /**
-         * Format:
-         * {
-         *    find: “coll”,
-         *    filter: <Query Object>,
-         *    after: { // optional
-         *      opTime: { ts: <timestamp>, term: <NumberLong> },
-         *      timeoutMS: <NumberLong> //optional
-         *    }
-         * }
-         */
-        Status initialize(const BSONObj& cmdObj);
+    const OpTime& getOpTime() const;
+    const Milliseconds& getTimeout() const;
 
-        const OpTime& getOpTime() const;
-        const Milliseconds& getTimeout() const;
+private:
+    OpTime _opTime;
+};
 
-    private:
-
-        OpTime _opTime;
-        Milliseconds _timeout;
-    };
-
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

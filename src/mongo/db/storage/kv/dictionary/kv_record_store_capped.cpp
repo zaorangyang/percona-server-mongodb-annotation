@@ -143,7 +143,7 @@ namespace mongo {
             // already built in, so we don't need to worry about deleting
             // records that are not yet committed, including the one we
             // just inserted
-            for (boost::scoped_ptr<RecordIterator> iter(getIterator(txn));
+            for (boost::scoped_ptr<KVRecordStore::KVRecordCursor> iter(KVRecordStore::getKVCursor(txn));
                  ((sizeSaved < sizeOverCap || docsRemoved < docsOverCap) &&
                   !iter->isEOF());
                  ) {
@@ -258,7 +258,7 @@ namespace mongo {
                                                        bool inclusive) {
         WriteUnitOfWork wu( txn );
         // Not very efficient, but it should only be used by tests.
-        for (boost::scoped_ptr<RecordIterator> iter(KVRecordStore::getIterator(txn, end)); !iter->isEOF(); ) {
+        for (boost::scoped_ptr<KVRecordCursor> iter(KVRecordStore::getKVCursor(txn)); !iter->isEOF(); ) {
             RecordId loc = iter->getNext();
             if (!inclusive && loc == end) {
                 continue;
@@ -275,7 +275,8 @@ namespace mongo {
         }
 
         RecordId lowestInvisible = _idTracker->lowestInvisible();
-        for (boost::scoped_ptr<RecordIterator> iter(getIterator(txn, startingPosition, CollectionScanParams::BACKWARD));
+        const bool isForward = true;
+        for (boost::scoped_ptr<KVRecordCursor> iter(KVRecordStore::getKVCursor(txn, !isForward));
              !iter->isEOF(); iter->getNext()) {
             if (iter->curr() <= startingPosition && iter->curr() < lowestInvisible) {
                 return iter->curr();
@@ -298,28 +299,22 @@ namespace mongo {
         return Status::OK();
     }
 
-    RecordIterator* KVRecordStoreCapped::getIterator(OperationContext* txn,
-                                                     const RecordId& start,
-                                                     const CollectionScanParams::Direction& dir) const {
-        const RecordId &realStart = ((dir == CollectionScanParams::FORWARD &&
-                                      (start.isNull() || start == RecordId::min()))
-                                     ? _lastDeletedId
-                                     : start);
-        if (_engineSupportsDocLocking && dir == CollectionScanParams::FORWARD) {
+    std::unique_ptr<RecordCursor> KVRecordStoreCapped::getCursor(OperationContext* txn,
+                                                                 bool forward) const {
+        if (_engineSupportsDocLocking && forward) {
             KVRecoveryUnit *ru = checked_cast<KVRecoveryUnit *>(txn->recoveryUnit());
-            // Must set this before we call KVRecordStore::getIterator because that will create a
-            // snapshot.
+            // We must cache the recovery unit's current state before
+            // we call KVRecordStore::getCursor() because that will
+            // create a snapshot.
             _idTracker->setRecoveryUnitRestriction(ru);
+            std::auto_ptr<KVRecordCursor> kvIter(KVRecordStore::getKVCursor(txn, forward));
 
-            std::auto_ptr<RecordIterator> iter(KVRecordStore::getIterator(txn, realStart, dir));
-
-            KVRecordIterator *kvIter = checked_cast<KVRecordIterator *>(iter.get());
-            _idTracker->setIteratorRestriction(ru, kvIter);
-
-            return iter.release();
-        } else {
-            return KVRecordStore::getIterator(txn, realStart, dir);
+            // NOTE: This does NOT transfer ownership of the cursor to the idTracker.
+            _idTracker->setIteratorRestriction(ru, kvIter.get());
+            return std::unique_ptr<KVRecordCursor>(kvIter.release());
         }
+
+        return KVRecordStore::getCursor(txn, forward);
     }
 
 } // namespace mongo

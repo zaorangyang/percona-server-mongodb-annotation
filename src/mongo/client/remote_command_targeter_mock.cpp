@@ -35,17 +35,24 @@
 
 namespace mongo {
 
-    RemoteCommandTargeterMock::RemoteCommandTargeterMock():
-            _findHostReturnValue(Status(ErrorCodes::InternalError, "No return value set")) {
-    }
+RemoteCommandTargeterMock::RemoteCommandTargeterMock()
+    : _findHostReturnValue(Status(ErrorCodes::InternalError, "No return value set")) {}
 
-    StatusWith<HostAndPort> RemoteCommandTargeterMock::findHost(
-            const ReadPreferenceSetting& readPref) {
-        return _findHostReturnValue;
-    }
+RemoteCommandTargeterMock::~RemoteCommandTargeterMock() = default;
 
-    void RemoteCommandTargeterMock::setFindHostReturnValue(StatusWith<HostAndPort> returnValue) {
-        _findHostReturnValue = std::move(returnValue);
-    }
+RemoteCommandTargeterMock* RemoteCommandTargeterMock::get(RemoteCommandTargeter* targeter) {
+    auto mock = dynamic_cast<RemoteCommandTargeterMock*>(targeter);
+    invariant(mock);
 
-} // namespace mongo
+    return mock;
+}
+
+StatusWith<HostAndPort> RemoteCommandTargeterMock::findHost(const ReadPreferenceSetting& readPref) {
+    return _findHostReturnValue;
+}
+
+void RemoteCommandTargeterMock::setFindHostReturnValue(StatusWith<HostAndPort> returnValue) {
+    _findHostReturnValue = std::move(returnValue);
+}
+
+}  // namespace mongo

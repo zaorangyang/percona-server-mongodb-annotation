@@ -50,9 +50,9 @@
 #include "mongo/s/d_state.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
-#include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/version.h"
@@ -61,102 +61,104 @@ namespace moe = mongo::optionenvironment;
 
 namespace mongo {
 
-    using std::endl;
-    using std::string;
+using std::endl;
+using std::string;
 
-    namespace dbtests {
+namespace dbtests {
 
-        mutex globalCurrentTestNameMutex;
-        std::string globalCurrentTestName;
+stdx::mutex globalCurrentTestNameMutex;
+std::string globalCurrentTestName;
 
-        class TestWatchDog : public BackgroundJob {
-        public:
-            virtual string name() const { return "TestWatchDog"; }
-            virtual void run(){
+class TestWatchDog : public BackgroundJob {
+public:
+    virtual string name() const {
+        return "TestWatchDog";
+    }
+    virtual void run() {
+        int minutesRunning = 0;
+        std::string lastRunningTestName, currentTestName;
 
-                int minutesRunning = 0;
-                std::string lastRunningTestName, currentTestName;
-
-                {
-                    boost::lock_guard<boost::mutex> lk( globalCurrentTestNameMutex );
-                    lastRunningTestName = globalCurrentTestName;
-                }
-
-                while (true) {
-                    sleepsecs(60);
-                    minutesRunning++;
-
-                    {
-                        boost::lock_guard<boost::mutex> lk( globalCurrentTestNameMutex );
-                        currentTestName = globalCurrentTestName;
-                    }
-
-                    if (currentTestName != lastRunningTestName) {
-                        minutesRunning = 0;
-                        lastRunningTestName = currentTestName;
-                    }
-
-                    if (minutesRunning > 30){
-                        log() << currentTestName << " has been running for more than 30 minutes. aborting." << endl;
-                        ::abort();
-                    }
-                    else if (minutesRunning > 1){
-                        warning() << currentTestName << " has been running for more than " << minutesRunning-1 << " minutes." << endl;
-
-                        // See what is stuck
-                        getGlobalLockManager()->dump();
-                    }
-                }
-            }
-        };
-
-        int runDbTests(int argc, char** argv) {
-            frameworkGlobalParams.perfHist = 1;
-            frameworkGlobalParams.seed = time( 0 );
-            frameworkGlobalParams.runsPerTest = 1;
-
-            Client::initThread("testsuite");
-
-            srand( (unsigned) frameworkGlobalParams.seed );
-            printGitVersion();
-            printOpenSSLVersion();
-
-            getGlobalServiceContext()->initializeGlobalStorageEngine();
-
-            // Initialize the sharding state so we can run starding tests in isolation
-            shardingState.initialize("$dummy:10000");
-
-            // Note: ShardingState::initialize also initializes the distLockMgr.
-            auto distLockMgr = dynamic_cast<LegacyDistLockManager*>(
-                    grid.catalogManager()->getDistLockManager());
-            if (distLockMgr) {
-                distLockMgr->enablePinger(false);
-            }
-
-            TestWatchDog twd;
-            twd.go();
-
-            int ret = ::mongo::unittest::Suite::run(frameworkGlobalParams.suites,
-                                                    frameworkGlobalParams.filter,
-                                                    frameworkGlobalParams.runsPerTest);
-
-
-            exitCleanly( (ExitCode)ret ); // so everything shuts down cleanly
-            return ret;
+        {
+            stdx::lock_guard<stdx::mutex> lk(globalCurrentTestNameMutex);
+            lastRunningTestName = globalCurrentTestName;
         }
-    }  // namespace dbtests
+
+        while (true) {
+            sleepsecs(60);
+            minutesRunning++;
+
+            {
+                stdx::lock_guard<stdx::mutex> lk(globalCurrentTestNameMutex);
+                currentTestName = globalCurrentTestName;
+            }
+
+            if (currentTestName != lastRunningTestName) {
+                minutesRunning = 0;
+                lastRunningTestName = currentTestName;
+            }
+
+            if (minutesRunning > 30) {
+                log() << currentTestName << " has been running for more than 30 minutes. aborting."
+                      << endl;
+                ::abort();
+            } else if (minutesRunning > 1) {
+                warning() << currentTestName << " has been running for more than "
+                          << minutesRunning - 1 << " minutes." << endl;
+
+                // See what is stuck
+                getGlobalLockManager()->dump();
+            }
+        }
+    }
+};
+
+int runDbTests(int argc, char** argv) {
+    frameworkGlobalParams.perfHist = 1;
+    frameworkGlobalParams.seed = time(0);
+    frameworkGlobalParams.runsPerTest = 1;
+
+    Client::initThread("testsuite");
+
+    srand((unsigned)frameworkGlobalParams.seed);
+    printGitVersion();
+    printOpenSSLVersion();
+
+    getGlobalServiceContext()->initializeGlobalStorageEngine();
+
+    // Initialize the sharding state so we can run starding tests in isolation
+    shardingState.initialize("$dummy:10000");
+
+    // Note: ShardingState::initialize also initializes the distLockMgr.
+    auto distLockMgr =
+        dynamic_cast<LegacyDistLockManager*>(grid.catalogManager()->getDistLockManager());
+    if (distLockMgr) {
+        distLockMgr->enablePinger(false);
+    }
+
+    TestWatchDog twd;
+    twd.go();
+
+    int ret = ::mongo::unittest::Suite::run(frameworkGlobalParams.suites,
+                                            frameworkGlobalParams.filter,
+                                            frameworkGlobalParams.runsPerTest);
+
+
+    exitCleanly((ExitCode)ret);  // so everything shuts down cleanly
+    return ret;
+}
+}  // namespace dbtests
 
 #ifdef _WIN32
 namespace ntservice {
-    bool shouldStartService() {
-        return false;
-    }
+bool shouldStartService() {
+    return false;
+}
 }
 #endif
 
 }  // namespace mongo
 
-void mongo::unittest::onCurrentTestNameChange( const std::string &testName ) {
-    boost::lock_guard<boost::mutex> lk( mongo::dbtests::globalCurrentTestNameMutex );
+void mongo::unittest::onCurrentTestNameChange(const std::string& testName) {
+    stdx::lock_guard<stdx::mutex> lk(mongo::dbtests::globalCurrentTestNameMutex);
     mongo::dbtests::globalCurrentTestName = testName;
 }

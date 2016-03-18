@@ -33,104 +33,91 @@
 #include <map>
 #include <string>
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread/mutex.hpp>
-
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/bson_collection_catalog_entry.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
-    class OperationContext;
-    class RecordStore;
+class OperationContext;
+class RecordStore;
 
-    class KVCatalog {
-    public:
-        /**
-         * @param rs - does NOT take ownership
-         */
-        KVCatalog( RecordStore* rs,
-                   bool isRsThreadSafe,
-                   bool directoryPerDb,
-                   bool directoryForIndexes );
-        ~KVCatalog();
+class KVCatalog {
+public:
+    /**
+     * @param rs - does NOT take ownership
+     */
+    KVCatalog(RecordStore* rs, bool isRsThreadSafe, bool directoryPerDb, bool directoryForIndexes);
+    ~KVCatalog();
 
-        void init( OperationContext* opCtx );
+    void init(OperationContext* opCtx);
 
-        void getAllCollections( std::vector<std::string>* out ) const;
+    void getAllCollections(std::vector<std::string>* out) const;
 
-        /**
-         * @return error or ident for instance
-         */
-        Status newCollection( OperationContext* opCtx,
-                              StringData ns,
-                              const CollectionOptions& options );
+    /**
+     * @return error or ident for instance
+     */
+    Status newCollection(OperationContext* opCtx, StringData ns, const CollectionOptions& options);
 
-        std::string getCollectionIdent( StringData ns ) const;
+    std::string getCollectionIdent(StringData ns) const;
 
-        std::string getIndexIdent( OperationContext* opCtx,
-                                   StringData ns,
-                                   StringData idName ) const;
+    std::string getIndexIdent(OperationContext* opCtx, StringData ns, StringData idName) const;
 
-        const BSONCollectionCatalogEntry::MetaData getMetaData( OperationContext* opCtx,
-                                                                StringData ns );
-        void putMetaData( OperationContext* opCtx,
-                          StringData ns,
-                          BSONCollectionCatalogEntry::MetaData& md );
+    const BSONCollectionCatalogEntry::MetaData getMetaData(OperationContext* opCtx, StringData ns);
+    void putMetaData(OperationContext* opCtx,
+                     StringData ns,
+                     BSONCollectionCatalogEntry::MetaData& md);
 
-        Status renameCollection( OperationContext* opCtx,
-                                 StringData fromNS,
-                                 StringData toNS,
-                                 bool stayTemp );
+    Status renameCollection(OperationContext* opCtx,
+                            StringData fromNS,
+                            StringData toNS,
+                            bool stayTemp);
 
-        Status dropCollection( OperationContext* opCtx,
-                               StringData ns );
+    Status dropCollection(OperationContext* opCtx, StringData ns);
 
-        std::vector<std::string> getAllIdentsForDB( StringData db ) const;
-        std::vector<std::string> getAllIdents( OperationContext* opCtx ) const;
+    std::vector<std::string> getAllIdentsForDB(StringData db) const;
+    std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
 
-        bool isUserDataIdent( StringData ident ) const;
-    private:
-        class AddIdentChange;
-        class RemoveIdentChange;
+    bool isUserDataIdent(StringData ident) const;
 
-        BSONObj _findEntry( OperationContext* opCtx,
-                            StringData ns,
+private:
+    class AddIdentChange;
+    class RemoveIdentChange;
+
+    BSONObj _findEntry(OperationContext* opCtx, StringData ns,
                             RecordId* out=NULL,
                             bool skipPessimisticLocking=false ) const;
 
-        /**
-         * Generates a new unique identifier for a new "thing".
-         * @param ns - the containing ns
-         * @param kind - what this "thing" is, likely collection or index
-         */
-        std::string _newUniqueIdent(StringData ns, const char* kind);
+    /**
+     * Generates a new unique identifier for a new "thing".
+     * @param ns - the containing ns
+     * @param kind - what this "thing" is, likely collection or index
+     */
+    std::string _newUniqueIdent(StringData ns, const char* kind);
 
-        // Helpers only used by constructor and init(). Don't call from elsewhere.
-        static std::string _newRand();
-        bool _hasEntryCollidingWithRand() const;
+    // Helpers only used by constructor and init(). Don't call from elsewhere.
+    static std::string _newRand();
+    bool _hasEntryCollidingWithRand() const;
 
-        RecordStore* _rs; // not owned
-        const bool _isRsThreadSafe;
-        const bool _directoryPerDb;
-        const bool _directoryForIndexes;
+    RecordStore* _rs;  // not owned
+    const bool _isRsThreadSafe;
+    const bool _directoryPerDb;
+    const bool _directoryForIndexes;
 
-        // These two are only used for ident generation inside _newUniqueIdent.
-        std::string _rand; // effectively const after init() returns
-        AtomicUInt64 _next;
+    // These two are only used for ident generation inside _newUniqueIdent.
+    std::string _rand;  // effectively const after init() returns
+    AtomicUInt64 _next;
 
-        struct Entry {
-            Entry(){}
-            Entry( std::string i, RecordId l )
-                : ident(i), storedLoc( l ) {}
-            std::string ident;
-            RecordId storedLoc;
-        };
-        typedef std::map<std::string,Entry> NSToIdentMap;
-        NSToIdentMap _idents;
-        mutable boost::mutex _identsLock;
+    struct Entry {
+        Entry() {}
+        Entry(std::string i, RecordId l) : ident(i), storedLoc(l) {}
+        std::string ident;
+        RecordId storedLoc;
     };
-
+    typedef std::map<std::string, Entry> NSToIdentMap;
+    NSToIdentMap _idents;
+    mutable stdx::mutex _identsLock;
+};
 }

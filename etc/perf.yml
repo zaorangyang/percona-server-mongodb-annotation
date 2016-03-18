@@ -7,7 +7,7 @@ post:
     - command: shell.cleanup
 
 functions:
-  "setup standalone":
+  "start server":
     - command: shell.exec
       params:
         script: |
@@ -36,8 +36,6 @@ functions:
           chmod +x mongod
           chmod +x mongo
           git clone https://github.com/mongodb/mongo-perf perf
-          pwd 
-          ls
           cd perf
           git checkout evergreen
     - command: shell.exec
@@ -48,21 +46,33 @@ functions:
           set -e 
           set -o verbose
           mkdir -p ./dbdata
-          ./mongod --storageEngine=${storageEngine} --dbpath ./dbdata
+          ${mongod_exec_wrapper} ./mongod --dbpath ./dbdata ${mongod_flags}
+          sleep 5
+          # if we started a replset, initiate it and wait for it to become primary
+          ./mongo --eval "if(db.isMaster().isreplicaset){rs.initiate(); assert.soon(function(){return db.isMaster().ismaster}, 'no primary')}"
           echo "MONGOD STARTED."
   "run perf tests":
     - command: shell.exec
       params:
         working_dir: src
         script: |
+          set -e
+          set -v
+          virtualenv ./venv
+          source ./venv/bin/activate
+          pip install argparse
+
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
           set -e 
           set -v
-          pwd 
-          ls
+          source ./venv/bin/activate
           cd perf
           #  give mongod a few seconds to start up so that we can connect.
           sleep 5
-          python ./benchrun.py --shell ../mongo --testFilter '${filter}' -t 1 2 4 8 16 -f testcases/* --out perf.json
+          ${perf_exec_wrapper} python benchrun.py --shell ../mongo -t 1 2 4 8 16 --trialCount 7 -f testcases/*.js --testFilter '${filter}' --out perf.json
     - command: "json.send"
       params:
         name: "perf"
@@ -110,7 +120,7 @@ tasks:
   depends_on:
   - name: compile
   commands:
-    - func: "setup standalone"
+    - func: "start server"
     - func: "run perf tests"
       vars:
         filter: "core-query"
@@ -118,7 +128,7 @@ tasks:
   depends_on:
   - name: compile
   commands:
-    - func: "setup standalone"
+    - func: "start server"
     - func: "run perf tests"
       vars:
         filter: "core-update"
@@ -126,7 +136,7 @@ tasks:
   depends_on:
   - name: compile
   commands:
-    - func: "setup standalone"
+    - func: "start server"
     - func: "run perf tests"
       vars:
         filter: "core-insert"
@@ -135,15 +145,34 @@ buildvariants:
 - name: linux-wt-standalone
   display_name: Linux WT Standalone
   expansions:
-    storageEngine: "wiredTiger"
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release --variant-dir="linux2/release"
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
+    mongod_exec_wrapper: "numactl --physcpubind=4,5,6,7 -i 1"
+    perf_exec_wrapper: "numactl --physcpubind=1,2,3 -i 0"
+    mongod_flags: "--storageEngine=wiredTiger --logpath ./mongod.log --fork --syncdelay 0 --nojournal --setParameter ttlMonitorEnabled=false --wiredTigerCacheSizeGB 16"
 
   run_on:
-  - "ubuntu1404-test"
+  - "centos6-perf"
   tasks:
   - name: compile
     distros:
     - rhel55
   - name: query
+  - name: update
+  - name: insert
+
+- name: linux-wt-repl
+  display_name: Linux WT 1-Node ReplSet
+  expansions:
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
+    mongod_exec_wrapper: "numactl --physcpubind=4,5,6,7 -i 1"
+    perf_exec_wrapper: "numactl --physcpubind=1,2,3 -i 0"
+    mongod_flags: "--replSet=test --storageEngine=wiredTiger --logpath ./mongod.log --fork --syncdelay 0 --nojournal --setParameter ttlMonitorEnabled=false --wiredTigerCacheSizeGB 16 --oplogSize 100000"
+
+  run_on:
+  - "centos6-perf"
+  tasks:
+  - name: compile
+    distros:
+    - rhel55
   - name: update
   - name: insert

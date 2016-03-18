@@ -46,7 +46,7 @@ namespace mongo {
 
         virtual void setRecoveryUnitRestriction(KVRecoveryUnit *ru) const = 0;
 
-        virtual void setIteratorRestriction(KVRecoveryUnit *ru, KVRecordStore::KVRecordIterator *iter) const = 0;
+        virtual void setIteratorRestriction(KVRecoveryUnit *ru, KVRecordStore::KVRecordCursor *iter) const = 0;
     };
 
     class NoopIdTracker : public VisibleIdTracker {
@@ -55,7 +55,7 @@ namespace mongo {
         void addUncommittedId(OperationContext *, const RecordId &) {}
         RecordId lowestInvisible() const { return RecordId::max(); }
         void setRecoveryUnitRestriction(KVRecoveryUnit *ru) const {}
-        void setIteratorRestriction(KVRecoveryUnit *, KVRecordStore::KVRecordIterator *) const {}
+        void setIteratorRestriction(KVRecoveryUnit *, KVRecordStore::KVRecordCursor *) const {}
     };
 
     class CappedIdTracker : public VisibleIdTracker {
@@ -94,7 +94,7 @@ namespace mongo {
 
         virtual void setRecoveryUnitRestriction(KVRecoveryUnit *ru) const {}
 
-        virtual void setIteratorRestriction(KVRecoveryUnit *ru, KVRecordStore::KVRecordIterator *iter) const {
+        virtual void setIteratorRestriction(KVRecoveryUnit *ru, KVRecordStore::KVRecordCursor *iter) const {
             iter->setIdTracker(this);
         }
 
@@ -137,7 +137,7 @@ namespace mongo {
             }
         }
 
-        void setIteratorRestriction(KVRecoveryUnit *ru, KVRecordStore::KVRecordIterator *iter) const {
+        void setIteratorRestriction(KVRecoveryUnit *ru, KVRecordStore::KVRecordCursor *iter) const {
             CappedIdTracker::setIteratorRestriction(ru, iter);
             invariant(!ru->getLowestInvisible().isNull());
             iter->setLowestInvisible(ru->getLowestInvisible());

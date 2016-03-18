@@ -62,7 +62,8 @@ namespace mongo {
         invariant(_db != NULL);
 
         // Get the next id, which is one greater than the greatest stored.
-        boost::scoped_ptr<RecordIterator> iter(getIterator(opCtx, RecordId(), CollectionScanParams::BACKWARD));
+        const bool FORWARD = false;
+        boost::scoped_ptr<KVRecordCursor> iter(getKVCursor(opCtx, FORWARD));//RecordId(), CollectionScanParams::BACKWARD));
         if (!iter->isEOF()) {
             const RecordId lastId = iter->curr();
             invariant(lastId.isNormal());
@@ -81,8 +82,8 @@ namespace mongo {
                 LOG(1) << "Doing scan of collection " << ns << " to refresh numRecords and dataSize";
                 _numRecords.store(0);
                 _dataSize.store(0);
-
-                for (boost::scoped_ptr<RecordIterator> iter(getIterator(opCtx)); !iter->isEOF(); ) {
+                const bool forward = true;
+                for (boost::scoped_ptr<KVRecordCursor> iter(getKVCursor(opCtx, forward)); !iter->isEOF(); ) {
                     RecordId loc = iter->getNext();
                     RecordData data = iter->dataFor(loc);
                     _numRecords.fetchAndAdd(1);
@@ -329,15 +330,27 @@ namespace mongo {
         return s;
     }
 
-    RecordIterator* KVRecordStore::getIterator(OperationContext* txn,
-                                               const RecordId& start,
-                                               const CollectionScanParams::Direction& dir) const {
-        return new KVRecordIterator(*this, _db.get(), txn, start, dir);
+    KVRecordStore::KVRecordCursor* KVRecordStore::getKVCursor(OperationContext* txn,
+                                                              bool forward) const {
+        return new KVRecordCursor(*this, _db.get(), txn, forward);
     }
 
-    std::vector<RecordIterator *> KVRecordStore::getManyIterators( OperationContext* txn ) const {
-        std::vector<RecordIterator *> iterators;
-        iterators.push_back(getIterator(txn));
+    std::unique_ptr<RecordCursor> KVRecordStore::getCursor(OperationContext* txn,
+                                                           bool forward) const {
+        KVRecordCursor *c = new KVRecordCursor(*this, _db.get(), txn, forward);
+        return std::unique_ptr<KVRecordCursor>(c);
+    }
+
+    std::unique_ptr<RecordCursor> KVRecordStore::getCursorForRepair(OperationContext* txn) const {
+        const bool isForward = true;
+        KVRecordCursor *c = new KVRecordCursor(*this, _db.get(), txn, isForward);
+        return std::unique_ptr<KVRecordCursor>(c);
+    }
+
+    std::vector<std::unique_ptr<RecordCursor>> KVRecordStore::getManyCursors(OperationContext* txn) const {
+        std::vector<std::unique_ptr<RecordCursor> > iterators;
+        const bool forward = true;
+        iterators.push_back(getCursor(txn, forward));
         return iterators;
     }
 
@@ -345,7 +358,8 @@ namespace mongo {
         // This is not a very performant implementation of truncate.
         //
         // At the time of this writing, it is only used by 'emptycapped', a test-only command.
-        for (boost::scoped_ptr<RecordIterator> iter(getIterator(txn));
+        const bool forward = true;
+        for (boost::scoped_ptr<KVRecordCursor> iter(getKVCursor(txn, forward));
              !iter->isEOF(); ) {
             RecordId id = iter->getNext();
             deleteRecord(txn, id);
@@ -370,7 +384,8 @@ namespace mongo {
         bool invalidObject = false;
         long long numRecords = 0;
         long long dataSizeTotal = 0;
-        for (boost::scoped_ptr<RecordIterator> iter( getIterator( txn ) );
+        const bool forward = true;
+        for (boost::scoped_ptr<KVRecordCursor> iter( getKVCursor(txn, forward) );
              !iter->isEOF(); ) {
             numRecords++;
             if (scanData) {
@@ -435,7 +450,26 @@ namespace mongo {
 
     // ---------------------------------------------------------------------- //
 
-    void KVRecordStore::KVRecordIterator::_setCursor(const RecordId id) {
+    boost::optional<Record> KVRecordStore::KVRecordCursor::next() {
+        if (isEOF()) {
+            return boost::none;
+        }
+
+        _saveLocAndVal();
+        _cursor->advance(_txn);
+        Record r;
+        r.id = _savedLoc;
+        r.data = dataFor(_savedLoc);
+        return r;
+    }
+
+    boost::optional<Record> KVRecordStore::KVRecordCursor::seekExact(const RecordId& id) {
+        _cursor.reset();
+        _setCursor(id);
+        return next();
+    }
+
+    void KVRecordStore::KVRecordCursor::_setCursor(const RecordId id) {
         // We should no cursor at this point, either because we're getting newly
         // constructed or because we're recovering from saved state (and so
         // the old cursor needed to be dropped).
@@ -446,36 +480,32 @@ namespace mongo {
 
         // A new iterator with no start position will be either min() or max()
         invariant(id.isNormal() || id == RecordId::min() || id == RecordId::max());
-        _cursor.reset(_db->getCursor(_txn, Slice::of(KeyString(id)), _dir));
+        const int dir = _isForward ? 1 : -1;
+        _cursor.reset(_db->getCursor(_txn, Slice::of(KeyString(id)), dir));
     }
 
-    KVRecordStore::KVRecordIterator::KVRecordIterator(const KVRecordStore &rs, KVDictionary *db, OperationContext *txn,
-                                                      const RecordId &start,
-                                                      const CollectionScanParams::Direction &dir)
+    KVRecordStore::KVRecordCursor::KVRecordCursor(const KVRecordStore &rs, KVDictionary *db, OperationContext *txn, const bool isForward)
         : _rs(rs),
           _db(db),
-          _dir(dir),
           _savedLoc(),
           _savedVal(),
           _lowestInvisible(),
           _idTracker(NULL),
           _txn(txn),
-          _cursor()
-    {
-        if (start.isNull()) {
-            // A null RecordId means the beginning for a forward cursor,
-            // and the end for a reverse cursor.
-            _setCursor(_dir == CollectionScanParams::FORWARD ? RecordId::min() : RecordId::max());
+          _cursor(),
+          _isForward(isForward) {
+        if (isForward) {
+            _setCursor(RecordId::min());
         } else {
-            _setCursor(start);
+            _setCursor(RecordId::max());
         }
     }
 
-    bool KVRecordStore::KVRecordIterator::isEOF() {
+    bool KVRecordStore::KVRecordCursor::isEOF() {
         return !_cursor || !_cursor->ok();
     }
 
-    RecordId KVRecordStore::KVRecordIterator::curr() {
+    RecordId KVRecordStore::KVRecordCursor::curr() {
         if (isEOF()) {
             return RecordId();
         }
@@ -485,7 +515,7 @@ namespace mongo {
         return KeyString::decodeRecordId(&br);
     }
 
-    void KVRecordStore::KVRecordIterator::_saveLocAndVal() {
+    void KVRecordStore::KVRecordCursor::_saveLocAndVal() {
         if (!isEOF()) {
             _savedLoc = curr();
             _savedVal = _cursor->currVal().owned();
@@ -496,7 +526,7 @@ namespace mongo {
         }
     }
 
-    RecordId KVRecordStore::KVRecordIterator::getNext() {
+    RecordId KVRecordStore::KVRecordCursor::getNext() {
         if (isEOF()) {
             return RecordId();
         }
@@ -525,13 +555,14 @@ namespace mongo {
         return _savedLoc;
     }
 
-    void KVRecordStore::KVRecordIterator::invalidate(const RecordId& loc) {
+    void KVRecordStore::KVRecordCursor::invalidate(const RecordId& loc) {
         // this only gets called to invalidate potentially buffered
-        // `loc' results between saveState() and restoreState(). since
-        // we dropped our cursor and have no buffered rows, we do nothing.
+        // `loc' results between saveState() and restoreState().
+        _savedLoc = RecordId();
     }
 
-    void KVRecordStore::KVRecordIterator::saveState() {
+    void KVRecordStore::KVRecordCursor::saveState() {
+        if (_txn == NULL && !_cursor) return;
         // we need to drop the current cursor because it was created with
         // an operation context that the caller intends to close after
         // this function finishes (and before restoreState() is called,
@@ -541,7 +572,7 @@ namespace mongo {
         _txn = NULL;
     }
 
-    bool KVRecordStore::KVRecordIterator::restoreState(OperationContext* txn) {
+    bool KVRecordStore::KVRecordCursor::restoreState(OperationContext* txn) {
         invariant(!_txn && !_cursor);
         _txn = txn;
         if (!_savedLoc.isNull()) {
@@ -566,7 +597,7 @@ namespace mongo {
         return true;
     }
 
-    RecordData KVRecordStore::KVRecordIterator::dataFor(const RecordId& loc) const {
+    RecordData KVRecordStore::KVRecordCursor::dataFor(const RecordId& loc) const {
         invariant(_txn);
 
         // Kind-of tricky:

@@ -41,94 +41,62 @@ using std::string;
 namespace mongo {
 namespace repl {
 
-    const string ReadAfterOpTimeArgs::kRootFieldName("after");
-    const string ReadAfterOpTimeArgs::kOpTimeFieldName("opTime");
-    const string ReadAfterOpTimeArgs::kOpTimestampFieldName("ts");
-    const string ReadAfterOpTimeArgs::kOpTermFieldName("term");
-    const string ReadAfterOpTimeArgs::kTimeoutFieldName("timeoutMS");
+const string ReadAfterOpTimeArgs::kRootFieldName("$readConcern");
+const string ReadAfterOpTimeArgs::kOpTimeFieldName("afterOpTime");
+const string ReadAfterOpTimeArgs::kOpTimestampFieldName("ts");
+const string ReadAfterOpTimeArgs::kOpTermFieldName("term");
 
-    ReadAfterOpTimeArgs::ReadAfterOpTimeArgs(): ReadAfterOpTimeArgs(OpTime(), Milliseconds(0)) {
-    }
+ReadAfterOpTimeArgs::ReadAfterOpTimeArgs() : ReadAfterOpTimeArgs(OpTime()) {}
 
-    ReadAfterOpTimeArgs::ReadAfterOpTimeArgs(OpTime opTime, Milliseconds timeout):
-            _opTime(std::move(opTime)),
-            _timeout(std::move(timeout)) {
-    }
+ReadAfterOpTimeArgs::ReadAfterOpTimeArgs(OpTime opTime) : _opTime(std::move(opTime)) {}
 
-    const OpTime& ReadAfterOpTimeArgs::getOpTime() const {
-        return _opTime;
-    }
+const OpTime& ReadAfterOpTimeArgs::getOpTime() const {
+    return _opTime;
+}
 
-    const Milliseconds& ReadAfterOpTimeArgs::getTimeout() const {
-        return _timeout;
-    }
+Status ReadAfterOpTimeArgs::initialize(const BSONObj& cmdObj) {
+    auto afterElem = cmdObj[ReadAfterOpTimeArgs::kRootFieldName];
 
-    Status ReadAfterOpTimeArgs::initialize(const BSONObj& cmdObj) {
-        auto afterElem = cmdObj[ReadAfterOpTimeArgs::kRootFieldName];
-
-        if (afterElem.eoo()) {
-            return Status::OK();
-        }
-
-        if (!afterElem.isABSONObj()) {
-            return Status(ErrorCodes::FailedToParse, "'after' field should be an object");
-        }
-
-        BSONObj readAfterObj = afterElem.Obj();
-        BSONElement opTimeElem;
-        auto opTimeStatus = bsonExtractTypedField(readAfterObj,
-                                                  ReadAfterOpTimeArgs::kOpTimeFieldName,
-                                                  Object,
-                                                  &opTimeElem);
-
-        if (!opTimeStatus.isOK()) {
-            return opTimeStatus;
-        }
-
-        BSONObj opTimeObj = opTimeElem.Obj();
-        BSONElement timestampElem;
-
-        Timestamp timestamp;
-        auto timestampStatus = bsonExtractTimestampField(opTimeObj,
-                                                         ReadAfterOpTimeArgs::kOpTimestampFieldName,
-                                                         &timestamp);
-
-        if (!timestampStatus.isOK()) {
-            return timestampStatus;
-        }
-
-        long long termNumber;
-        auto termStatus = bsonExtractIntegerField(opTimeObj,
-                                                  ReadAfterOpTimeArgs::kOpTermFieldName,
-                                                  &termNumber);
-
-        if (!termStatus.isOK()) {
-            return termStatus;
-        }
-
-        long long timeoutMS;
-        auto timeoutStatus = bsonExtractIntegerFieldWithDefault(
-                readAfterObj,
-                ReadAfterOpTimeArgs::kTimeoutFieldName,
-                0, // Default to no timeout.
-                &timeoutMS);
-
-        if (!timeoutStatus.isOK()) {
-            return timeoutStatus;
-        }
-
-        if (timeoutMS < 0) {
-            return Status(ErrorCodes::BadValue,
-                          str::stream() << ReadAfterOpTimeArgs::kRootFieldName
-                                        << "." << ReadAfterOpTimeArgs::kTimeoutFieldName
-                                        << " value must be positive");
-        }
-
-        _opTime = OpTime(timestamp, termNumber);
-        _timeout = Milliseconds(timeoutMS); // Note: 'long long' -> 'long' down casting.
-
+    if (afterElem.eoo()) {
         return Status::OK();
     }
 
-} // namespace repl
-} // namespace mongo
+    if (!afterElem.isABSONObj()) {
+        return Status(ErrorCodes::FailedToParse, "'after' field should be an object");
+    }
+
+    BSONObj readAfterObj = afterElem.Obj();
+    BSONElement opTimeElem;
+    auto opTimeStatus = bsonExtractTypedField(
+        readAfterObj, ReadAfterOpTimeArgs::kOpTimeFieldName, Object, &opTimeElem);
+
+    if (!opTimeStatus.isOK()) {
+        return opTimeStatus;
+    }
+
+    BSONObj opTimeObj = opTimeElem.Obj();
+    BSONElement timestampElem;
+
+    Timestamp timestamp;
+    auto timestampStatus = bsonExtractTimestampField(
+        opTimeObj, ReadAfterOpTimeArgs::kOpTimestampFieldName, &timestamp);
+
+    if (!timestampStatus.isOK()) {
+        return timestampStatus;
+    }
+
+    long long termNumber;
+    auto termStatus =
+        bsonExtractIntegerField(opTimeObj, ReadAfterOpTimeArgs::kOpTermFieldName, &termNumber);
+
+    if (!termStatus.isOK()) {
+        return termStatus;
+    }
+
+    _opTime = OpTime(timestamp, termNumber);
+
+    return Status::OK();
+}
+
+}  // namespace repl
+}  // namespace mongo

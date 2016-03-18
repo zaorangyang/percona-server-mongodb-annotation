@@ -39,42 +39,52 @@ namespace repl {
 
 namespace {
 
-    const int64_t prngSeed = 1;
+const int64_t prngSeed = 1;
 
-} // namespace
+}  // namespace
 
-    void ReplicationExecutorTest::launchExecutorThread() {
-        ASSERT(!_executorThread);
-        _executorThread.reset(
-                new boost::thread(stdx::bind(&ReplicationExecutor::run, _executor.get())));
-        postExecutorThreadLaunch();
-    }
+// static
+Status ReplicationExecutorTest::getDetectableErrorStatus() {
+    return Status(ErrorCodes::InternalError, "Not mutated");
+}
 
-    void ReplicationExecutorTest::postExecutorThreadLaunch() {
-        _net->enterNetwork();
-    }
+void ReplicationExecutorTest::launchExecutorThread() {
+    _executor->startup();
+    _executorStarted = true;
 
-    void ReplicationExecutorTest::joinExecutorThread() {
-        ASSERT(_executorThread);
-        getNet()->exitNetwork();
-        _executorThread->join();
-        _executorThread.reset();
-    }
+    postExecutorThreadLaunch();
+}
 
-    void ReplicationExecutorTest::setUp() {
-        _net = new executor::NetworkInterfaceMock;
-        _storage = new StorageInterfaceMock;
-        _executor.reset(new ReplicationExecutor(_net, _storage, prngSeed));
-    }
+void ReplicationExecutorTest::postExecutorThreadLaunch() {
+    _net->enterNetwork();
+}
 
-    void ReplicationExecutorTest::tearDown() {
-        if (_executorThread) {
-            _executor->shutdown();
-            joinExecutorThread();
-        }
-        _executor.reset();
+void ReplicationExecutorTest::joinExecutorThread() {
+    invariant(_executorStarted);
+
+    _net->exitNetwork();
+    _executor->join();
+    _executorStarted = false;
+}
+
+void ReplicationExecutorTest::setUp() {
+    _net = new executor::NetworkInterfaceMock();
+    _storage = new StorageInterfaceMock();
+
+    // Takes ownership of the net and storage
+    _executor = stdx::make_unique<ReplicationExecutor>(_net, _storage, prngSeed);
+}
+
+void ReplicationExecutorTest::tearDown() {
+    if (_executorStarted) {
+        _executor->shutdown();
+        joinExecutorThread();
+
         _net = nullptr;
+        _storage = nullptr;
+        _executor.reset();
     }
+}
 
 }  // namespace repl
 }  // namespace mongo

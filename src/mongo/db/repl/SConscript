@@ -44,6 +44,7 @@ env.Library(
         'storage_interface',
         '$BUILD_DIR/mongo/client/remote_command_runner',
         '$BUILD_DIR/mongo/executor/network_interface',
+        '$BUILD_DIR/mongo/executor/task_executor_interface',
         '$BUILD_DIR/mongo/util/foundation',
         '$BUILD_DIR/mongo/util/net/hostandport',
     ],
@@ -315,7 +316,6 @@ env.Library('repl_coordinator_interface',
             LIBDEPS=[
                 '$BUILD_DIR/mongo/util/net/hostandport',
                 'optime',
-                'reporter',
             ])
 
 env.Library('repl_coordinator_global',
@@ -422,33 +422,11 @@ env.Library(
     ],
 )
 
-env.Library(
-    target='fetcher',
-    source=[
-        'fetcher.cpp',
-    ],
-    LIBDEPS=[
-        'replication_executor',
-        '$BUILD_DIR/mongo/logger/logger',
-        '$BUILD_DIR/mongo/db/namespace_string',
-        '$BUILD_DIR/mongo/rpc/command_status',
-    ],
-)
-
 env.CppUnitTest(
     target='reporter_test',
     source='reporter_test.cpp',
     LIBDEPS=[
         'reporter',
-        'replication_executor_test_fixture',
-    ],
-)
-
-env.CppUnitTest(
-    target='fetcher_test',
-    source='fetcher_test.cpp',
-    LIBDEPS=[
-        'fetcher',
         'replication_executor_test_fixture',
     ],
 )
@@ -469,9 +447,9 @@ env.Library(
         'collection_cloner.cpp',
     ],
     LIBDEPS=[
-        'fetcher',
         'replication_executor',
         '$BUILD_DIR/mongo/db/catalog/collection_options',
+        '$BUILD_DIR/mongo/client/fetcher',
         '$BUILD_DIR/mongo/logger/logger',
     ],
 )
@@ -610,8 +588,8 @@ env.Library(
         'applier',
         'collection_cloner',
         'database_cloner',
-        'fetcher',
-        'repl_coordinator_interface',
+        'reporter',
+        '$BUILD_DIR/mongo/client/fetcher',
     ],
 )
 
@@ -623,9 +601,8 @@ env.CppUnitTest(
     LIBDEPS=[
         'base_cloner_test_fixture',
         'data_replicator',
-        'replica_set_messages',
         'replication_executor_test_fixture',
-        'repl_coordinator_test_fixture',
+        '$BUILD_DIR/mongo/unittest/concurrency',
     ],
 )
 

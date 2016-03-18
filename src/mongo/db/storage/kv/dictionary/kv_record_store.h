@@ -124,12 +124,12 @@ namespace mongo {
                                           const char* damageSource,
                                           const mutablebson::DamageVector& damages );
 
-        virtual RecordIterator* getIterator( OperationContext* txn,
-                                             const RecordId& start = RecordId(),
-                                             const CollectionScanParams::Direction& dir =
-                                             CollectionScanParams::FORWARD ) const;
+        virtual std::unique_ptr<RecordCursor> getCursor(OperationContext* txn,
+                                                        bool forward = true) const;
 
-        virtual std::vector<RecordIterator *> getManyIterators( OperationContext* txn ) const;
+        virtual std::unique_ptr<RecordCursor> getCursorForRepair(OperationContext* txn) const;
+
+        virtual std::vector<std::unique_ptr<RecordCursor>> getManyCursors(OperationContext* txn) const;
 
         virtual Status truncate( OperationContext* txn );
 
@@ -175,10 +175,21 @@ namespace mongo {
                                             long long numRecords,
                                             long long dataSize);
 
-        class KVRecordIterator : public RecordIterator {
+        class KVRecordCursor : public RecordCursor {
+        public:
+            virtual boost::optional<Record> next();
+            virtual boost::optional<Record> seekExact(const RecordId& id);
+            virtual void savePositioned() {
+                saveState();
+            }
+
+            virtual bool restore(OperationContext* txn) {
+                return restoreState(txn);
+            }
+
+        private:
             const KVRecordStore &_rs;
             KVDictionary *_db;
-            const CollectionScanParams::Direction _dir;
             RecordId _savedLoc;
             Slice _savedVal;
 
@@ -189,15 +200,17 @@ namespace mongo {
             OperationContext *_txn;
 
             boost::scoped_ptr<KVDictionary::Cursor> _cursor;
+            bool _isForward;
 
             void _setCursor(const RecordId id);
 
             void _saveLocAndVal();
 
         public: 
-            KVRecordIterator(const KVRecordStore &rs, KVDictionary *db, OperationContext *txn,
-                             const RecordId &start,
-                             const CollectionScanParams::Direction &dir);
+            KVRecordCursor(const KVRecordStore &rs, 
+                           KVDictionary *db, 
+                           OperationContext *txn, 
+                           const bool isForward);
 
             bool isEOF();
 
@@ -222,13 +235,16 @@ namespace mongo {
             }
         };
 
+        KVRecordCursor * getKVCursor(OperationContext* txn,
+                                     bool forward = true) const;
+
     protected:
         Status _insertRecord(OperationContext *txn, const RecordId &id, const Slice &value);
 
         void _updateStats(OperationContext *txn, long long nrDelta, long long dsDelta);
 
         // Internal version of dataFor that takes a KVDictionary - used by
-        // the RecordIterator to implement dataFor.
+        // the RecordCursor to implement dataFor.
         static RecordData _getDataFor(const KVDictionary* db, OperationContext* txn, const RecordId& loc, bool skipPessimisticLocking=false);
 
         // Generate the next unique RecordId key value for new records stored by this record store.

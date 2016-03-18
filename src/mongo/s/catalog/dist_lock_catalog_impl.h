@@ -37,49 +37,53 @@
 
 namespace mongo {
 
-    class RemoteCommandRunner;
-    class RemoteCommandTargeter;
+class RemoteCommandTargeter;
+class ShardRegistry;
 
-    class DistLockCatalogImpl: public DistLockCatalog {
-    public:
-        DistLockCatalogImpl(RemoteCommandTargeter* targeter,
-                            RemoteCommandRunner* executor,
-                            Milliseconds writeConcernTimeout);
+class DistLockCatalogImpl final : public DistLockCatalog {
+public:
+    DistLockCatalogImpl(RemoteCommandTargeter* targeter,
+                        ShardRegistry* shardRegistry,
+                        Milliseconds writeConcernTimeout);
 
-        virtual ~DistLockCatalogImpl();
+    virtual ~DistLockCatalogImpl();
 
-        virtual StatusWith<LockpingsType> getPing(StringData processID) override;
+    virtual StatusWith<LockpingsType> getPing(StringData processID) override;
 
-        virtual Status ping(StringData processID, Date_t ping) override;
+    virtual Status ping(StringData processID, Date_t ping) override;
 
-        virtual StatusWith<LocksType> grabLock(StringData lockID,
+    virtual StatusWith<LocksType> grabLock(StringData lockID,
+                                           const OID& lockSessionID,
+                                           StringData who,
+                                           StringData processId,
+                                           Date_t time,
+                                           StringData why) override;
+
+    virtual StatusWith<LocksType> overtakeLock(StringData lockID,
                                                const OID& lockSessionID,
+                                               const OID& currentHolderTS,
                                                StringData who,
                                                StringData processId,
                                                Date_t time,
                                                StringData why) override;
 
-        virtual StatusWith<LocksType> overtakeLock(StringData lockID,
-                                                   const OID& lockSessionID,
-                                                   const OID& currentHolderTS,
-                                                   StringData who,
-                                                   StringData processId,
-                                                   Date_t time,
-                                                   StringData why) override;
+    virtual Status unlock(const OID& lockSessionID) override;
 
-        virtual Status unlock(const OID& lockSessionID) override;
+    virtual StatusWith<ServerInfo> getServerInfo() override;
 
-        virtual StatusWith<ServerInfo> getServerInfo() override;
+    virtual StatusWith<LocksType> getLockByTS(const OID& lockSessionID) override;
 
-        virtual StatusWith<LocksType> getLockByTS(const OID& ts) override;
+    virtual StatusWith<LocksType> getLockByName(StringData name) override;
 
-    private:
-        RemoteCommandRunner* _cmdRunner;
-        RemoteCommandTargeter* _targeter;
+    virtual Status stopPing(StringData processId) override;
 
-        // These are not static to avoid initialization order fiasco.
-        const WriteConcernOptions _writeConcern;
-        const NamespaceString _lockPingNS;
-        const NamespaceString _locksNS;
-    };
+private:
+    ShardRegistry* _client;
+    RemoteCommandTargeter* _targeter;
+
+    // These are not static to avoid initialization order fiasco.
+    const WriteConcernOptions _writeConcern;
+    const NamespaceString _lockPingNS;
+    const NamespaceString _locksNS;
+};
 }
