@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2014-2015 MongoDB Inc.
+ *    Copyright (C) 2015 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -35,7 +35,8 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/client/remote_command_runner.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/time_support.h"
 
@@ -268,7 +269,6 @@ class TaskExecutor::CallbackHandle {
 
 public:
     CallbackHandle();
-    explicit CallbackHandle(std::shared_ptr<CallbackState> cbData);
 
     bool operator==(const CallbackHandle& other) const {
         return _callback == other._callback;
@@ -283,6 +283,7 @@ public:
     }
 
 private:
+    explicit CallbackHandle(std::shared_ptr<CallbackState> cbData);
     void setCallback(std::shared_ptr<CallbackState> callback) {
         _callback = callback;
     }
@@ -350,8 +351,8 @@ private:
  */
 struct TaskExecutor::CallbackArgs {
     CallbackArgs(TaskExecutor* theExecutor,
-                 const CallbackHandle& theHandle,
-                 const Status& theStatus,
+                 CallbackHandle theHandle,
+                 Status theStatus,
                  OperationContext* txn = NULL);
 
     TaskExecutor* executor;

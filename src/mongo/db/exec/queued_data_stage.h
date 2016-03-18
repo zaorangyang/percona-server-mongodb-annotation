@@ -48,20 +48,10 @@ class RecordId;
 class QueuedDataStage : public PlanStage {
 public:
     QueuedDataStage(WorkingSet* ws);
-    virtual ~QueuedDataStage() {}
 
     virtual StageState work(WorkingSetID* out);
 
     virtual bool isEOF();
-
-    // These don't really mean anything here.
-    // Some day we could count the # of calls to the yield functions to check that other stages
-    // have correct yielding behavior.
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-
-    virtual std::vector<PlanStage*> getChildren() const;
 
     virtual StageType stageType() const {
         return STAGE_QUEUED_DATA;
@@ -71,9 +61,7 @@ public:
     // Exec stats
     //
 
-    virtual PlanStageStats* getStats();
-
-    virtual const CommonStats* getCommonStats() const;
+    virtual std::unique_ptr<PlanStageStats> getStats();
 
     virtual const SpecificStats* getSpecificStats() const;
 
@@ -91,10 +79,13 @@ public:
     /**
      * ...data is returned (and we ADVANCED)
      *
-     * Allocates a new member and copies 'member' into it.
-     * Does not take ownership of anything in 'member'.
+     * The caller is responsible for allocating 'id' and filling out the WSM keyed by 'id'
+     * appropriately.
+     *
+     * The QueuedDataStage takes ownership of 'id', so the caller should not call WorkingSet::free()
+     * on it.
      */
-    void pushBack(const WorkingSetMember& member);
+    void pushBack(const WorkingSetID& id);
 
     static const char* kStageType;
 
@@ -107,7 +98,6 @@ private:
     std::queue<WorkingSetID> _members;
 
     // Stats
-    CommonStats _commonStats;
     MockStats _specificStats;
 };
 

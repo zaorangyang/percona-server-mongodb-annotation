@@ -155,7 +155,7 @@ namespace mongo {
             }
 
             uint64_t getInteger() const {
-                massert(28730, "PerconaFT: wrong engine status type for getInteger", _type == UInt64);
+                massert(28830, "PerconaFT: wrong engine status type for getInteger", _type == UInt64);
                 return _uint64;
             }
 
@@ -165,7 +165,7 @@ namespace mongo {
                 } else if (_type == UnixTime) {
                     return static_cast<double>(_time);
                 }
-                msgasserted(28731, "PerconaFT: wrong engine status type for getDouble");
+                msgasserted(28831, "PerconaFT: wrong engine status type for getDouble");
             }
         };
 
@@ -245,7 +245,7 @@ namespace mongo {
                 if (scaleElt.ok()) {
                     scale = scaleElt.safeNumberLong();
                 }
-                uassert(28732, "scale must be positive", scale > 0);
+                uassert(28832, "scale must be positive", scale > 0);
             }
 
             NestedBuilder::Stack result;

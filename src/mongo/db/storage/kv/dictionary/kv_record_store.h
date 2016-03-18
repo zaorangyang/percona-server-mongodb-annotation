@@ -183,9 +183,12 @@ namespace mongo {
                 saveState();
             }
 
-            virtual bool restore(OperationContext* txn) {
-                return restoreState(txn);
+            virtual bool restore() {
+                return restoreState();
             }
+            
+            virtual void detachFromOperationContext();
+            virtual void reattachToOperationContext(OperationContext* opCtx);
 
         private:
             const KVRecordStore &_rs;
@@ -222,7 +225,7 @@ namespace mongo {
 
             void saveState();
 
-            bool restoreState(OperationContext* txn);
+            bool restoreState();
 
             RecordData dataFor(const RecordId& loc) const;
 

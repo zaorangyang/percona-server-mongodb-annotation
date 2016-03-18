@@ -214,7 +214,7 @@ add_option('wiredtiger',
 )
 
 # library choices
-js_engine_choices = ['v8-3.12', 'v8-3.25', 'none']
+js_engine_choices = ['v8-3.12', 'v8-3.25', 'mozjs', 'none']
 add_option('js-engine',
     choices=js_engine_choices,
     default=js_engine_choices[0],
@@ -612,7 +612,7 @@ env_vars.Add('LINKFLAGS',
 env_vars.Add('MONGO_DIST_SRC_PREFIX',
     help='Sets the prefix for files in the source distribution archive',
     converter=variable_distsrc_converter,
-    default="mongodb-r${MONGO_VERSION}")
+    default="mongodb-src-r${MONGO_VERSION}")
 
 env_vars.Add('MONGO_VERSION',
     help='Sets the version string for MongoDB',
@@ -756,12 +756,14 @@ jsEngine = get_option( "js-engine")
 
 serverJs = get_option( "server-js" ) == "on"
 
-usev8 = (jsEngine != 'none')
+usev8 = (jsEngine.startswith('v8'))
+
+usemozjs = (jsEngine.startswith('mozjs'))
 
 v8version = jsEngine[3:] if jsEngine.startswith('v8-') else 'none'
 v8suffix = '' if v8version == '3.12' else '-' + v8version
 
-if not serverJs and not usev8:
+if not serverJs and not usev8 and not usemozjs:
     print("Warning: --server-js=off is not needed with --js-engine=none")
 
 # We defer building the env until we have determined whether we want certain values. Some values
@@ -855,12 +857,15 @@ def CheckForToolchain(context, toolchain, lang_name, compiler_var, source_suffix
 
 # These preprocessor macros came from
 # http://nadeausoftware.com/articles/2012/02/c_c_tip_how_detect_processor_type_using_compiler_predefined_macros
+#
+# NOTE: Remember to add a trailing comma to form any required one
+# element tuples, or your configure checks will fail in strange ways.
 processor_macros = {
     'x86_64': ('__x86_64', '_M_AMD64'),
     'i386': ('__i386', '_M_IX86'),
-    'sparc': ('__sparc'),
+    'sparc': ('__sparc',),
     'PowerPC': ('__powerpc__', '__PPC'),
-    'arm' : ('__arm__'),
+    'arm' : ('__arm__',),
     'arm64' : ('__arm64__', '__aarch64__'),
 }
 
@@ -991,7 +996,9 @@ if optBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")
 
 # Ignore requests to build fast and loose for release builds.
-if get_option('build-fast-and-loose') == "on" and not has_option('release'):
+# Also ignore fast-and-loose option if the scons cache is enabled (see SERVER-19088)
+if get_option('build-fast-and-loose') == "on" and \
+    not has_option('release') and not has_option('cache'):
     # See http://www.scons.org/wiki/GoFastButton for details
     env.Decider('MD5-timestamp')
     env.SetOption('max_drift', 1)
@@ -1195,11 +1202,8 @@ elif env.TargetOSIs('windows'):
                      'DbgHelp.lib',
                      'shell32.lib',
                      'Iphlpapi.lib',
+                     'winmm.lib',
                      'version.lib'])
-
-    # v8 calls timeGetTime()
-    if usev8:
-        env.Append(LIBS=['winmm.lib'])
 
 # When building on visual studio, this sets the name of the debug symbols file
 if env.ToolchainIs('msvc'):
@@ -1209,7 +1213,8 @@ env['STATIC_AND_SHARED_OBJECTS_ARE_THE_SAME'] = 1
 if env.TargetOSIs('posix'):
 
     # -Winvalid-pch Warn if a precompiled header (see Precompiled Headers) is found in the search path but can't be used.
-    env.Append( CCFLAGS=["-fPIC",
+    env.Append( CCFLAGS=["-fno-omit-frame-pointer",
+                         "-fPIC",
                          "-fno-strict-aliasing",
                          "-ggdb",
                          "-pthread",
@@ -2026,7 +2031,7 @@ def doConfigure(myenv):
         conf.FindSysLibDep("snappy", ["snappy"])
 
     if use_system_version_of_library("zlib"):
-        conf.FindSysLibDep("zlib", ["zlib" if windows else "z"])
+        conf.FindSysLibDep("zlib", ["zdll" if conf.env.TargetOSIs('windows') else "z"])
 
     if use_system_version_of_library("stemmer"):
         conf.FindSysLibDep("stemmer", ["stemmer"])
@@ -2039,13 +2044,21 @@ def doConfigure(myenv):
             myenv.ConfError("Cannot find wiredtiger headers")
         conf.FindSysLibDep("wiredtiger", ["wiredtiger"])
 
+    conf.env.Append(
+        CPPDEFINES=[
+            ("BOOST_THREAD_VERSION", "4"),
+            # Boost thread v4's variadic thread support doesn't
+            # permit more than four parameters.
+            "BOOST_THREAD_DONT_PROVIDE_VARIADIC_THREAD",
+            "BOOST_SYSTEM_NO_DEPRECATED",
+        ]
+    )
+
     if use_system_version_of_library("boost"):
         if not conf.CheckCXXHeader( "boost/filesystem/operations.hpp" ):
             myenv.ConfError("can't find boost headers")
         if not conf.CheckBoostMinVersion():
             myenv.ConfError("system's version of boost is too old. version 1.49 or better required")
-
-        conf.env.Append(CPPDEFINES=[("BOOST_THREAD_VERSION", "2")])
 
         # Note that on Windows with using-system-boost builds, the following
         # FindSysLibDep calls do nothing useful (but nothing problematic either)
@@ -2071,6 +2084,8 @@ def doConfigure(myenv):
                 # by the EINTR bug. Setting this avoids a retry loop
                 # in boosts mutex.hpp that we don't want to pay for.
                 "BOOST_THREAD_HAS_NO_EINTR_BUG",
+                "BOOST_THREAD_PROVIDES_NESTED_LOCKS",
+                "BOOST_THREAD_USES_DATETIME",
             ],
         )
 
@@ -2292,6 +2307,7 @@ Export("get_option")
 Export("has_option use_system_version_of_library")
 Export("serverJs")
 Export("usev8")
+Export("usemozjs")
 Export("v8version v8suffix")
 Export("boostSuffix")
 Export('module_sconscripts')
@@ -2302,7 +2318,8 @@ def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
 env.AddMethod(injectMongoIncludePaths, 'InjectMongoIncludePaths')
 
-env.Alias("compiledb", env.CompilationDatabase('compile_commands.json'))
+compileDb = env.Alias("compiledb", env.CompilationDatabase('compile_commands.json'))
+
 env.Alias("distsrc-tar", env.DistSrc("mongodb-src-${MONGO_VERSION}.tar"))
 env.Alias("distsrc-tgz", env.GZip(
     target="mongodb-src-${MONGO_VERSION}.tgz",

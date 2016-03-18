@@ -34,7 +34,6 @@
 #include "mongo/base/status.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/repl/reporter.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -57,8 +56,8 @@ class HandshakeArgs;
 class IsMasterResponse;
 class OplogReader;
 class OpTime;
-class ReadAfterOpTimeArgs;
-class ReadAfterOpTimeResponse;
+class ReadConcernArgs;
+class ReadConcernResponse;
 class ReplSetDeclareElectionWinnerArgs;
 class ReplSetDeclareElectionWinnerResponse;
 class ReplSetHeartbeatArgs;
@@ -68,6 +67,7 @@ class ReplSetHtmlSummary;
 class ReplSetRequestVotesArgs;
 class ReplSetRequestVotesResponse;
 class ReplicaSetConfig;
+class ReplicationMetadata;
 class UpdatePositionArgs;
 
 /**
@@ -85,14 +85,17 @@ extern const char* replAllDead;
  * with the rest of the system.  The public methods on ReplicationCoordinator are the public
  * API that the replication subsystem presents to the rest of the codebase.
  */
-class ReplicationCoordinator : public ReplicationProgressManager, public SyncSourceSelector {
+class ReplicationCoordinator : public SyncSourceSelector {
     MONGO_DISALLOW_COPYING(ReplicationCoordinator);
 
 public:
     static ReplicationCoordinator* get(ServiceContext* service);
     static ReplicationCoordinator* get(ServiceContext& service);
+    static ReplicationCoordinator* get(OperationContext* ctx);
+
     static void set(ServiceContext* service,
                     std::unique_ptr<ReplicationCoordinator> replCoordinator);
+
 
     struct StatusAndDuration {
     public:
@@ -291,18 +294,13 @@ public:
      * Waits until the optime of the current node is at least the opTime specified in
      * 'settings'.
      *
-     * The returned ReadAfterOpTimeResponse object's didWait() method returns true if
-     * an attempt was made to wait for the specified opTime. Cases when this can be
-     * false could include:
+     * The returned ReadConcernResponse object's didWait() method returns true if
+     * an attempt was made to wait for the specified opTime. This will return false when
+     * attempting to do read after opTime when node is not a replica set member.
      *
-     * 1. No read after opTime was specified.
-     * 2. Attempting to do read after opTime when node is not a replica set member.
-     *
-     * Note: getDuration() on the returned ReadAfterOpTimeResponse will only be valid if
-     * its didWait() method returns true.
      */
-    virtual ReadAfterOpTimeResponse waitUntilOpTime(OperationContext* txn,
-                                                    const ReadAfterOpTimeArgs& settings) = 0;
+    virtual ReadConcernResponse waitUntilOpTime(OperationContext* txn,
+                                                const ReadConcernArgs& settings) = 0;
 
     /**
      * Retrieves and returns the current election id, which is a unique id that is local to
@@ -395,6 +393,16 @@ public:
      * Handles an incoming replSetGetConfig command. Adds BSON to 'result'.
      */
     virtual void processReplSetGetConfig(BSONObjBuilder* result) = 0;
+
+    /**
+     * Processes the ReplicationMetadata returned from a command run against another replica set
+     * member and updates protocol version 1 information (most recent optime that is committed,
+     * member id of the current PRIMARY, the current config version and the current term).
+     *
+     * TODO(dannenberg): Move this method to be testing only if it does not end up being used
+     * to process the find and getmore metadata responses from the DataReplicator.
+     */
+    virtual void processReplicationMetadata(const ReplicationMetadata& replMetadata) = 0;
 
     /**
      * Toggles maintenanceMode to the value expressed by 'activate'
@@ -611,10 +619,21 @@ public:
     /**
      * Attempts to update the current term for the V1 election protocol. If the term changes and
      * this node is primary, relinquishes primary.
-     * Returns true if the term was updated (that is, when "term" was higher than the previously
-     * recorded term) and false otherwise.
+     * Returns a Status OK if the term was *not* updated (meaning, it is safe to proceed with
+     * the rest of the work, because the term is still the same).
+     * Returns StaleTerm if the supplied term was higher than the current term.
      */
-    virtual bool updateTerm(long long term) = 0;
+    virtual Status updateTerm(long long term) = 0;
+
+    /**
+     * Called when a new snapshot is created.
+     */
+    virtual void onSnapshotCreate(OpTime timeOfSnapshot) = 0;
+
+    /**
+     * Resets all information related to snapshotting.
+     */
+    virtual void dropAllSnapshots() = 0;
 
 protected:
     ReplicationCoordinator();

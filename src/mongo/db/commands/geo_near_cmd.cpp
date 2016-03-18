@@ -69,6 +69,9 @@ public:
     bool slaveOverrideOk() const {
         return true;
     }
+    bool supportsReadConcern() const final {
+        return true;
+    }
 
     void help(stringstream& h) const {
         h << "http://dochub.mongodb.org/core/geo#GeospatialIndexing-geoNearCommand";
@@ -183,7 +186,7 @@ public:
 
         const WhereCallbackReal whereCallback(txn, nss.db());
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, rewritten, BSONObj(), projObj, 0, numWanted, BSONObj(), whereCallback);
+            nss.ns(), rewritten, BSONObj(), projObj, 0, numWanted, BSONObj(), whereCallback);
         if (!statusWithCQ.isOK()) {
             errmsg = "Can't parse filter / create query";
             return false;

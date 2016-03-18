@@ -28,13 +28,11 @@
 
 #pragma once
 
-
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/record_id.h"
-#include "mongo/s/d_state.h"
 
 namespace mongo {
+
+class CollectionMetadata;
 
 /**
  * This stage drops documents that didn't belong to the shard we're executing on at the time of
@@ -73,25 +71,19 @@ namespace mongo {
  */
 class ShardFilterStage : public PlanStage {
 public:
-    ShardFilterStage(const CollectionMetadataPtr& metadata, WorkingSet* ws, PlanStage* child);
+    ShardFilterStage(const std::shared_ptr<CollectionMetadata>& metadata,
+                     WorkingSet* ws,
+                     PlanStage* child);
     virtual ~ShardFilterStage();
 
     virtual bool isEOF();
     virtual StageState work(WorkingSetID* out);
 
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-
-    virtual std::vector<PlanStage*> getChildren() const;
-
     virtual StageType stageType() const {
         return STAGE_SHARDING_FILTER;
     }
 
-    virtual PlanStageStats* getStats();
-
-    virtual const CommonStats* getCommonStats() const;
+    virtual std::unique_ptr<PlanStageStats> getStats();
 
     virtual const SpecificStats* getSpecificStats() const;
 
@@ -99,15 +91,13 @@ public:
 
 private:
     WorkingSet* _ws;
-    std::unique_ptr<PlanStage> _child;
 
     // Stats
-    CommonStats _commonStats;
     ShardingFilterStats _specificStats;
 
     // Note: it is important that this is the metadata from the time this stage is constructed.
     // See class comment for details.
-    const CollectionMetadataPtr _metadata;
+    const std::shared_ptr<CollectionMetadata> _metadata;
 };
 
 }  // namespace mongo

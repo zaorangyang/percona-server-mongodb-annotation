@@ -1,32 +1,30 @@
-// instance.cpp
-
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2008-2014 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
@@ -79,6 +77,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -94,7 +93,6 @@
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/request_interface.h"
 #include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/d_state.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
 #include "mongo/scripting/engine.h"
@@ -685,7 +683,7 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
             }
             Lock::CollectionLock collLock(
                 txn->lockState(), nsString.ns(), parsedUpdate.isIsolated() ? MODE_X : MODE_IX);
-            OldClientContext ctx(txn, nsString);
+            OldClientContext ctx(txn, nsString.ns());
 
             //  The common case: no implicit collection creation
             if (!upsert || ctx.db()->getCollection(nsString) != NULL) {
@@ -720,7 +718,7 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
 
         ScopedTransaction transaction(txn, MODE_IX);
         Lock::DBLock dbLock(txn->lockState(), nsString.db(), MODE_X);
-        OldClientContext ctx(txn, nsString);
+        OldClientContext ctx(txn, nsString.ns());
         uassert(ErrorCodes::NotMaster,
                 str::stream() << "Not primary while performing update on " << nsString.ns(),
                 repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nsString));
@@ -789,7 +787,7 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
 
             Lock::CollectionLock collLock(
                 txn->lockState(), nsString.ns(), parsedDelete.isIsolated() ? MODE_X : MODE_IX);
-            OldClientContext ctx(txn, nsString);
+            OldClientContext ctx(txn, nsString.ns());
 
             unique_ptr<PlanExecutor> exec = uassertStatusOK(
                 getExecutorDelete(txn, ctx.db()->getCollection(nsString), &parsedDelete));
@@ -808,11 +806,7 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
     }
 }
 
-QueryResult::View emptyMoreResult(long long);
-
 bool receivedGetMore(OperationContext* txn, DbResponse& dbresponse, Message& m, CurOp& curop) {
-    bool ok = true;
-
     DbMessage d(m);
 
     const char* ns = d.getns();
@@ -827,89 +821,44 @@ bool receivedGetMore(OperationContext* txn, DbResponse& dbresponse, Message& m, 
         CurOp::get(txn)->setNS_inlock(ns);
     }
 
-    unique_ptr<AssertionException> ex;
-    unique_ptr<Timer> timer;
-    int pass = 0;
     bool exhaust = false;
     QueryResult::View msgdata = 0;
-    Timestamp last;
-    while (1) {
-        bool isCursorAuthorized = false;
-        try {
-            const NamespaceString nsString(ns);
-            uassert(16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid());
+    bool isCursorAuthorized = false;
 
-            Status status = AuthorizationSession::get(txn->getClient())
-                                ->checkAuthForGetMore(nsString, cursorid);
-            audit::logGetMoreAuthzCheck(txn->getClient(), nsString, cursorid, status.code());
-            uassertStatusOK(status);
+    try {
+        const NamespaceString nsString(ns);
+        uassert(16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid());
 
-            if (str::startsWith(ns, "local.oplog.")) {
-                while (MONGO_FAIL_POINT(rsStopGetMore)) {
-                    sleepmillis(0);
-                }
+        Status status =
+            AuthorizationSession::get(txn->getClient())->checkAuthForGetMore(nsString, cursorid);
+        audit::logGetMoreAuthzCheck(txn->getClient(), nsString, cursorid, status.code());
+        uassertStatusOK(status);
 
-                if (pass == 0) {
-                    last = getLastSetTimestamp();
-                } else {
-                    repl::waitUpToOneSecondForTimestampChange(last);
-                }
-            }
-
-            msgdata = getMore(txn, ns, ntoreturn, cursorid, pass, exhaust, &isCursorAuthorized);
-        } catch (AssertionException& e) {
-            if (isCursorAuthorized) {
-                // If a cursor with id 'cursorid' was authorized, it may have been advanced
-                // before an exception terminated processGetMore.  Erase the ClientCursor
-                // because it may now be out of sync with the client's iteration state.
-                // SERVER-7952
-                // TODO Temporary code, see SERVER-4563 for a cleanup overview.
-                CursorManager::eraseCursorGlobal(txn, cursorid);
-            }
-            ex.reset(new AssertionException(e.getInfo().msg, e.getCode()));
-            ok = false;
-            break;
+        while (MONGO_FAIL_POINT(rsStopGetMore)) {
+            sleepmillis(0);
         }
 
-        if (msgdata.view2ptr() == 0) {
-            // this should only happen with QueryOption_AwaitData
-            exhaust = false;
-            massert(13073, "shutting down", !inShutdown());
-            if (!timer) {
-                timer.reset(new Timer());
-            } else {
-                if (timer->seconds() >= 4) {
-                    // after about 4 seconds, return. pass stops at 1000 normally.
-                    // we want to return occasionally so slave can checkpoint.
-                    pass = 10000;
-                }
-            }
-            pass++;
-            if (kDebugBuild)
-                sleepmillis(20);
-            else
-                sleepmillis(2);
-
-            // note: the 1100 is beacuse of the waitForDifferent above
-            // should eventually clean this up a bit
-            curop.setExpectedLatencyMs(1100 + timer->millis());
-
-            continue;
+        msgdata = getMore(txn, ns, ntoreturn, cursorid, &exhaust, &isCursorAuthorized);
+    } catch (AssertionException& e) {
+        if (isCursorAuthorized) {
+            // If a cursor with id 'cursorid' was authorized, it may have been advanced
+            // before an exception terminated processGetMore.  Erase the ClientCursor
+            // because it may now be out of sync with the client's iteration state.
+            // SERVER-7952
+            // TODO Temporary code, see SERVER-4563 for a cleanup overview.
+            CursorManager::eraseCursorGlobal(txn, cursorid);
         }
-        break;
-    };
 
-    if (ex) {
         BSONObjBuilder err;
-        ex->getInfo().append(err);
+        e.getInfo().append(err);
         BSONObj errObj = err.done();
 
-        curop.debug().exceptionInfo = ex->getInfo();
+        curop.debug().exceptionInfo = e.getInfo();
 
         replyToQuery(ResultFlag_ErrSet, m, dbresponse, errObj);
         curop.debug().responseLength = dbresponse.response->header().dataLen();
         curop.debug().nreturned = 1;
-        return ok;
+        return false;
     }
 
     Message* resp = new Message();
@@ -925,7 +874,7 @@ bool receivedGetMore(OperationContext* txn, DbResponse& dbresponse, Message& m, 
         dbresponse.exhaustNS = ns;
     }
 
-    return ok;
+    return true;
 }
 
 void checkAndInsert(OperationContext* txn,
@@ -1163,6 +1112,7 @@ static void shutdownServer() {
     /* must do this before unmapping mem or you may get a seg fault */
     log(LogComponent::kNetwork) << "shutdown: going to close sockets..." << endl;
     stdx::thread close_socket_thread(stdx::bind(MessagingPort::closeAllSockets, 0));
+    close_socket_thread.detach();
 
     getGlobalServiceContext()->shutdownGlobalStorageEngineCleanly();
 }

@@ -28,17 +28,15 @@
 
 #pragma once
 
-#include <memory>
-#include <mutex>
-#include <string>
-#include <vector>
-
-#include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
+
+class NamespaceString;
+class VersionType;
 
 /**
  * Implements the catalog manager for talking to replica set config servers.
@@ -56,30 +54,21 @@ public:
      */
     Status init(const ConnectionString& configCS, std::unique_ptr<DistLockManager> distLockManager);
 
-    Status startup(bool upgrade) override;
+    Status startup() override;
 
     ConnectionString connectionString() const override;
 
     void shutDown() override;
 
-    Status enableSharding(const std::string& dbName) override;
-
     Status shardCollection(OperationContext* txn,
                            const std::string& ns,
                            const ShardKeyPattern& fieldsAndOrder,
                            bool unique,
-                           std::vector<BSONObj>* initPoints,
-                           std::set<ShardId>* initShardsIds = nullptr) override;
-
-    StatusWith<std::string> addShard(OperationContext* txn,
-                                     const std::string& name,
-                                     const ConnectionString& shardConnectionString,
-                                     const long long maxSize) override;
+                           const std::vector<BSONObj>& initPoints,
+                           const std::set<ShardId>& initShardsIds) override;
 
     StatusWith<ShardDrainingStatus> removeShard(OperationContext* txn,
                                                 const std::string& name) override;
-
-    Status createDatabase(const std::string& dbName) override;
 
     StatusWith<DatabaseType> getDatabase(const std::string& dbName) override;
 
@@ -87,8 +76,6 @@ public:
 
     Status getCollections(const std::string* dbName,
                           std::vector<CollectionType>* collections) override;
-
-    Status dropCollection(OperationContext* txn, const std::string& collectionNs) override;
 
     Status getDatabasesForShard(const std::string& shardName,
                                 std::vector<std::string>* dbs) override;
@@ -105,8 +92,6 @@ public:
                                            const ChunkType& chunk) override;
 
     Status getAllShards(std::vector<ShardType>* shards) override;
-
-    bool isShardHost(const ConnectionString& shardConnectionString) override;
 
     bool runUserManagementWriteCommand(const std::string& commandName,
                                        const std::string& dbname,
@@ -134,7 +119,13 @@ public:
 
     DistLockManager* getDistLockManager() const override;
 
+    Status checkAndUpgrade(bool checkOnly) override;
+
 private:
+    Status _checkDbDoesNotExist(const std::string& dbName, DatabaseType* db) const override;
+
+    StatusWith<std::string> _generateNewShardName() const override;
+
     /**
      * Helper for running commands against the config server with logic for retargeting and
      * retrying the command in the event of a NotMaster response.
@@ -149,6 +140,19 @@ private:
     StatusWith<BSONObj> _runConfigServerCommandWithNotMasterRetries(const std::string& dbName,
                                                                     const BSONObj& cmdObj);
 
+    /**
+     * Helper method for running a count command against a given target server with appropriate
+     * error handling.
+     */
+    StatusWith<long long> _runCountCommand(const HostAndPort& target,
+                                           const NamespaceString& ns,
+                                           BSONObj query);
+
+    /**
+     * Returns the current cluster schema/protocol version.
+     */
+    StatusWith<VersionType> _getConfigVersion();
+
     // Config server connection string
     ConnectionString _configServerConnectionString;
 
@@ -162,7 +166,7 @@ private:
     AtomicInt32 _changeLogCollectionCreated;
 
     // protects _inShutdown
-    std::mutex _mutex;
+    stdx::mutex _mutex;
 
     // True if shutDown() has been called. False, otherwise.
     bool _inShutdown = false;

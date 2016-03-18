@@ -30,9 +30,10 @@
 
 #include "mongo/platform/basic.h"
 
-#include <chrono>
+#include <pcrecpp.h>
 
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/executor/network_interface_mock.h"
@@ -52,24 +53,26 @@
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/batched_insert_request.h"
 #include "mongo/s/write_ops/batched_update_request.h"
+#include "mongo/stdx/chrono.h"
+#include "mongo/stdx/future.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
 using executor::NetworkInterfaceMock;
+using executor::RemoteCommandRequest;
+using executor::RemoteCommandResponse;
 using executor::TaskExecutor;
 using std::string;
 using std::vector;
 using stdx::chrono::milliseconds;
 using unittest::assertGet;
 
-static const std::chrono::seconds kFutureTimeout{5};
+using CatalogManagerReplSetTest = CatalogManagerReplSetTestFixture;
 
-TEST_F(CatalogManagerReplSetTestFixture, GetCollectionExisting) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetCollectionExisting) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     CollectionType expectedColl;
     expectedColl.setNs(NamespaceString("TestDB.TestNS"));
@@ -78,18 +81,18 @@ TEST_F(CatalogManagerReplSetTestFixture, GetCollectionExisting) {
     expectedColl.setEpoch(OID::gen());
 
     auto future = launchAsync([this, &expectedColl] {
-        return assertGet(catalogManager()->getCollection(expectedColl.getNs()));
+        return assertGet(catalogManager()->getCollection(expectedColl.getNs().ns()));
     });
 
     onFindCommand([&expectedColl](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), CollectionType::ConfigNS);
+        ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
         // Ensure the query is correct
         ASSERT_EQ(query->ns(), CollectionType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSON(CollectionType::fullNs(expectedColl.getNs())));
+        ASSERT_EQ(query->getFilter(), BSON(CollectionType::fullNs(expectedColl.getNs().ns())));
         ASSERT_EQ(query->getSort(), BSONObj());
         ASSERT_EQ(query->getLimit().get(), 1);
 
@@ -97,14 +100,12 @@ TEST_F(CatalogManagerReplSetTestFixture, GetCollectionExisting) {
     });
 
     // Now wait for the getCollection call to return
-    const auto& actualColl = future.get();
+    const auto& actualColl = future.timed_get(kFutureTimeout);
     ASSERT_EQ(expectedColl.toBSON(), actualColl.toBSON());
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetCollectionNotExisting) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetCollectionNotExisting) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
         auto status = catalogManager()->getCollection("NonExistent");
@@ -114,13 +115,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetCollectionNotExisting) {
     onFindCommand([](const RemoteCommandRequest& request) { return vector<BSONObj>{}; });
 
     // Now wait for the getCollection call to return
-    future.wait();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetDatabaseExisting) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetDatabaseExisting) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     DatabaseType expectedDb;
     expectedDb.setName("bigdata");
@@ -133,7 +132,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetDatabaseExisting) {
 
     onFindCommand([&expectedDb](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), DatabaseType::ConfigNS);
+        ASSERT_EQ(nss.ns(), DatabaseType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -145,29 +144,25 @@ TEST_F(CatalogManagerReplSetTestFixture, GetDatabaseExisting) {
         return vector<BSONObj>{expectedDb.toBSON()};
     });
 
-    const auto& actualDb = future.get();
+    const auto& actualDb = future.timed_get(kFutureTimeout);
     ASSERT_EQ(expectedDb.toBSON(), actualDb.toBSON());
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetDatabaseNotExisting) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetDatabaseNotExisting) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
         auto dbResult = catalogManager()->getDatabase("NonExistent");
-        ASSERT_EQ(dbResult.getStatus(), ErrorCodes::NamespaceNotFound);
+        ASSERT_EQ(dbResult.getStatus(), ErrorCodes::DatabaseNotFound);
     });
 
     onFindCommand([](const RemoteCommandRequest& request) { return vector<BSONObj>{}; });
 
-    future.wait();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, UpdateCollection) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, UpdateCollection) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     CollectionType collection;
     collection.setNs(NamespaceString("db.coll"));
@@ -186,8 +181,8 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateCollection) {
 
         BatchedUpdateRequest actualBatchedUpdate;
         std::string errmsg;
-        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.cmdObj, &errmsg));
-        ASSERT_EQUALS(CollectionType::ConfigNS, actualBatchedUpdate.getCollName());
+        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        ASSERT_EQUALS(CollectionType::ConfigNS, actualBatchedUpdate.getNS().ns());
         auto updates = actualBatchedUpdate.getUpdates();
         ASSERT_EQUALS(1U, updates.size());
         auto update = updates.front();
@@ -206,13 +201,11 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateCollection) {
     });
 
     // Now wait for the updateCollection call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, UpdateCollectionNotMaster) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, UpdateCollectionNotMaster) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     CollectionType collection;
     collection.setNs(NamespaceString("db.coll"));
@@ -238,13 +231,11 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateCollectionNotMaster) {
     }
 
     // Now wait for the updateCollection call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, UpdateCollectionNotMasterFromTargeter) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(Status(ErrorCodes::NotMaster, "not master"));
+TEST_F(CatalogManagerReplSetTest, UpdateCollectionNotMasterFromTargeter) {
+    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotMaster, "not master"));
 
     CollectionType collection;
     collection.setNs(NamespaceString("db.coll"));
@@ -259,15 +250,13 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateCollectionNotMasterFromTargeter) 
     });
 
     // Now wait for the updateCollection call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, UpdateCollectionNotMasterRetrySuccess) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
+TEST_F(CatalogManagerReplSetTest, UpdateCollectionNotMasterRetrySuccess) {
     HostAndPort host1("TestHost1");
     HostAndPort host2("TestHost2");
-    targeter->setFindHostReturnValue(host1);
+    configTargeter()->setFindHostReturnValue(host1);
 
     CollectionType collection;
     collection.setNs(NamespaceString("db.coll"));
@@ -281,7 +270,7 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateCollectionNotMasterRetrySuccess) 
         ASSERT_OK(status);
     });
 
-    onCommand([host1, host2, targeter](const RemoteCommandRequest& request) {
+    onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(host1, request.target);
 
         BatchedCommandResponse response;
@@ -291,7 +280,7 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateCollectionNotMasterRetrySuccess) 
 
         // Ensure that when the catalog manager tries to retarget after getting the
         // NotMaster response, it will get back a new target.
-        targeter->setFindHostReturnValue(host2);
+        configTargeter()->setFindHostReturnValue(host2);
         return response.toBSON();
     });
 
@@ -300,8 +289,8 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateCollectionNotMasterRetrySuccess) 
 
         BatchedUpdateRequest actualBatchedUpdate;
         std::string errmsg;
-        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.cmdObj, &errmsg));
-        ASSERT_EQUALS(CollectionType::ConfigNS, actualBatchedUpdate.getCollName());
+        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        ASSERT_EQUALS(CollectionType::ConfigNS, actualBatchedUpdate.getNS().ns());
         auto updates = actualBatchedUpdate.getUpdates();
         ASSERT_EQUALS(1U, updates.size());
         auto update = updates.front();
@@ -320,13 +309,11 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateCollectionNotMasterRetrySuccess) 
     });
 
     // Now wait for the updateCollection call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetAllShardsValid) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetAllShardsValid) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     ShardType s1;
     s1.setName("shard0000");
@@ -354,7 +341,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetAllShardsValid) {
 
     onFindCommand([&s1, &s2, &s3](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), ShardType::ConfigNS);
+        ASSERT_EQ(nss.ns(), ShardType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -366,7 +353,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetAllShardsValid) {
         return vector<BSONObj>{s1.toBSON(), s2.toBSON(), s3.toBSON()};
     });
 
-    const vector<ShardType> actualShardsList = future.get();
+    const vector<ShardType> actualShardsList = future.timed_get(kFutureTimeout);
     ASSERT_EQ(actualShardsList.size(), expectedShardsList.size());
 
     for (size_t i = 0; i < actualShardsList.size(); ++i) {
@@ -374,10 +361,8 @@ TEST_F(CatalogManagerReplSetTestFixture, GetAllShardsValid) {
     }
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetAllShardsWithInvalidShard) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetAllShardsWithInvalidShard) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
         vector<ShardType> shards;
@@ -399,13 +384,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetAllShardsWithInvalidShard) {
         };
     });
 
-    future.wait();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetChunksForNSWithSortAndLimit) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetChunksForNSWithSortAndLimit) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     OID oid = OID::gen();
 
@@ -444,7 +427,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetChunksForNSWithSortAndLimit) {
 
     onFindCommand([&chunksQuery, chunkA, chunkB](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), ChunkType::ConfigNS);
+        ASSERT_EQ(nss.ns(), ChunkType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -456,15 +439,13 @@ TEST_F(CatalogManagerReplSetTestFixture, GetChunksForNSWithSortAndLimit) {
         return vector<BSONObj>{chunkA.toBSON(), chunkB.toBSON()};
     });
 
-    const auto& chunks = future.get();
+    const auto& chunks = future.timed_get(kFutureTimeout);
     ASSERT_EQ(chunkA.toBSON(), chunks[0].toBSON());
     ASSERT_EQ(chunkB.toBSON(), chunks[1].toBSON());
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetChunksForNSNoSortNoLimit) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetChunksForNSNoSortNoLimit) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     ChunkVersion queryChunkVersion({1, 2, OID::gen()});
 
@@ -484,7 +465,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetChunksForNSNoSortNoLimit) {
 
     onFindCommand([&chunksQuery](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), ChunkType::ConfigNS);
+        ASSERT_EQ(nss.ns(), ChunkType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -496,13 +477,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetChunksForNSNoSortNoLimit) {
         return vector<BSONObj>{};
     });
 
-    future.wait();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetChunksForNSInvalidChunk) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetChunksForNSInvalidChunk) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     ChunkVersion queryChunkVersion({1, 2, OID::gen()});
 
@@ -539,13 +518,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetChunksForNSInvalidChunk) {
         return vector<BSONObj>{chunkA.toBSON(), chunkB.toBSON()};
     });
 
-    future.wait();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementReadCommand) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, RunUserManagementReadCommand) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
         BSONObjBuilder responseBuilder;
@@ -567,13 +544,11 @@ TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementReadCommand) {
     });
 
     // Now wait for the runReadCommand call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementReadCommandUnsatisfiedReadPref) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(
+TEST_F(CatalogManagerReplSetTest, RunUserManagementReadCommandUnsatisfiedReadPref) {
+    configTargeter()->setFindHostReturnValue(
         Status(ErrorCodes::FailedToSatisfyReadPreference, "no nodes up"));
 
     BSONObjBuilder responseBuilder;
@@ -584,10 +559,8 @@ TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementReadCommandUnsatisfied
     ASSERT_EQUALS(ErrorCodes::FailedToSatisfyReadPreference, commandStatus);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementWriteCommandDistLockHeld) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, RunUserManagementWriteCommandDistLockHeld) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     distLock()->expectLock(
         [](StringData name,
@@ -610,10 +583,8 @@ TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementWriteCommandDistLockHe
     ASSERT_EQUALS(ErrorCodes::LockBusy, Command::getStatusFromCommandResult(response));
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementWriteCommandSuccess) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, RunUserManagementWriteCommandSuccess) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     distLock()->expectLock(
         [](StringData name,
@@ -651,13 +622,11 @@ TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementWriteCommandSuccess) {
     });
 
     // Now wait for the runUserManagementWriteCommand call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementWriteCommandNotMaster) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, RunUserManagementWriteCommandNotMaster) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     distLock()->expectLock(
         [](StringData name,
@@ -692,15 +661,15 @@ TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementWriteCommandNotMaster)
     }
 
     // Now wait for the runUserManagementWriteCommand call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementWriteCommandNotMasterRetrySuccess) {
+TEST_F(CatalogManagerReplSetTest, RunUserManagementWriteCommandNotMasterRetrySuccess) {
     HostAndPort host1("TestHost1");
     HostAndPort host2("TestHost2");
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(host1);
+
+
+    configTargeter()->setFindHostReturnValue(host1);
 
     distLock()->expectLock(
         [](StringData name,
@@ -725,7 +694,7 @@ TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementWriteCommandNotMasterR
         ASSERT_OK(commandStatus);
     });
 
-    onCommand([targeter, host1, host2](const RemoteCommandRequest& request) {
+    onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(host1, request.target);
 
         BSONObjBuilder responseBuilder;
@@ -733,7 +702,7 @@ TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementWriteCommandNotMasterR
 
         // Ensure that when the catalog manager tries to retarget after getting the
         // NotMaster response, it will get back a new target.
-        targeter->setFindHostReturnValue(host2);
+        configTargeter()->setFindHostReturnValue(host2);
         return responseBuilder.obj();
     });
 
@@ -748,13 +717,11 @@ TEST_F(CatalogManagerReplSetTestFixture, RunUserManagementWriteCommandNotMasterR
     });
 
     // Now wait for the runUserManagementWriteCommand call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsBalancerDoc) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetGlobalSettingsBalancerDoc) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     // sample balancer doc
     SettingsType st1;
@@ -767,7 +734,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsBalancerDoc) {
 
     onFindCommand([st1](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), SettingsType::ConfigNS);
+        ASSERT_EQ(nss.ns(), SettingsType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -777,14 +744,12 @@ TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsBalancerDoc) {
         return vector<BSONObj>{st1.toBSON()};
     });
 
-    const auto& actualBalSettings = future.get();
+    const auto& actualBalSettings = future.timed_get(kFutureTimeout);
     ASSERT_EQ(actualBalSettings.toBSON(), st1.toBSON());
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsChunkSizeDoc) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetGlobalSettingsChunkSizeDoc) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     // sample chunk size doc
     SettingsType st1;
@@ -797,7 +762,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsChunkSizeDoc) {
 
     onFindCommand([st1](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), SettingsType::ConfigNS);
+        ASSERT_EQ(nss.ns(), SettingsType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -807,14 +772,12 @@ TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsChunkSizeDoc) {
         return vector<BSONObj>{st1.toBSON()};
     });
 
-    const auto& actualBalSettings = future.get();
+    const auto& actualBalSettings = future.timed_get(kFutureTimeout);
     ASSERT_EQ(actualBalSettings.toBSON(), st1.toBSON());
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsInvalidDoc) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetGlobalSettingsInvalidDoc) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
         const auto balSettings = catalogManager()->getGlobalSettings("invalidKey");
@@ -824,7 +787,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsInvalidDoc) {
 
     onFindCommand([](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), SettingsType::ConfigNS);
+        ASSERT_EQ(nss.ns(), SettingsType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -837,13 +800,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsInvalidDoc) {
         };
     });
 
-    future.wait();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsNonExistent) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetGlobalSettingsNonExistent) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
         const auto chunkSizeSettings =
@@ -854,7 +815,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsNonExistent) {
 
     onFindCommand([](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), SettingsType::ConfigNS);
+        ASSERT_EQ(nss.ns(), SettingsType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -864,13 +825,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetGlobalSettingsNonExistent) {
         return vector<BSONObj>{};
     });
 
-    future.wait();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetCollectionsValidResultsNoDb) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetCollectionsValidResultsNoDb) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     CollectionType coll1;
     coll1.setNs(NamespaceString{"test.system.indexes"});
@@ -907,7 +866,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetCollectionsValidResultsNoDb) {
 
     onFindCommand([coll1, coll2, coll3](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), CollectionType::ConfigNS);
+        ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -918,17 +877,15 @@ TEST_F(CatalogManagerReplSetTestFixture, GetCollectionsValidResultsNoDb) {
         return vector<BSONObj>{coll1.toBSON(), coll2.toBSON(), coll3.toBSON()};
     });
 
-    const auto& actualColls = future.get();
+    const auto& actualColls = future.timed_get(kFutureTimeout);
     ASSERT_EQ(3U, actualColls.size());
     ASSERT_EQ(coll1.toBSON(), actualColls[0].toBSON());
     ASSERT_EQ(coll2.toBSON(), actualColls[1].toBSON());
     ASSERT_EQ(coll3.toBSON(), actualColls[2].toBSON());
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetCollectionsValidResultsWithDb) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetCollectionsValidResultsWithDb) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     CollectionType coll1;
     coll1.setNs(NamespaceString{"test.system.indexes"});
@@ -956,7 +913,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetCollectionsValidResultsWithDb) {
 
     onFindCommand([coll1, coll2](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), CollectionType::ConfigNS);
+        ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -970,16 +927,14 @@ TEST_F(CatalogManagerReplSetTestFixture, GetCollectionsValidResultsWithDb) {
         return vector<BSONObj>{coll1.toBSON(), coll2.toBSON()};
     });
 
-    const auto& actualColls = future.get();
+    const auto& actualColls = future.timed_get(kFutureTimeout);
     ASSERT_EQ(2U, actualColls.size());
     ASSERT_EQ(coll1.toBSON(), actualColls[0].toBSON());
     ASSERT_EQ(coll2.toBSON(), actualColls[1].toBSON());
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetCollectionsInvalidCollectionType) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetCollectionsInvalidCollectionType) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
         string dbName = "test";
@@ -1001,7 +956,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetCollectionsInvalidCollectionType) {
 
     onFindCommand([validColl](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), CollectionType::ConfigNS);
+        ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -1018,13 +973,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetCollectionsInvalidCollectionType) {
         };
     });
 
-    future.wait();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetDatabasesForShardValid) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetDatabasesForShardValid) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     DatabaseType dbt1;
     dbt1.setName("db1");
@@ -1044,7 +997,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetDatabasesForShardValid) {
 
     onFindCommand([dbt1, dbt2](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), DatabaseType::ConfigNS);
+        ASSERT_EQ(nss.ns(), DatabaseType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -1055,16 +1008,14 @@ TEST_F(CatalogManagerReplSetTestFixture, GetDatabasesForShardValid) {
         return vector<BSONObj>{dbt1.toBSON(), dbt2.toBSON()};
     });
 
-    const auto& actualDbNames = future.get();
+    const auto& actualDbNames = future.timed_get(kFutureTimeout);
     ASSERT_EQ(2U, actualDbNames.size());
     ASSERT_EQ(dbt1.getName(), actualDbNames[0]);
     ASSERT_EQ(dbt2.getName(), actualDbNames[1]);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetDatabasesForShardInvalidDoc) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetDatabasesForShardInvalidDoc) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
         vector<string> dbs;
@@ -1085,13 +1036,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetDatabasesForShardInvalidDoc) {
         };
     });
 
-    future.wait();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetTagsForCollection) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetTagsForCollection) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     TagsType tagA;
     tagA.setNS("TestDB.TestColl");
@@ -1116,7 +1065,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetTagsForCollection) {
 
     onFindCommand([tagA, tagB](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), TagsType::ConfigNS);
+        ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -1127,15 +1076,13 @@ TEST_F(CatalogManagerReplSetTestFixture, GetTagsForCollection) {
         return vector<BSONObj>{tagA.toBSON(), tagB.toBSON()};
     });
 
-    const auto& tags = future.get();
+    const auto& tags = future.timed_get(kFutureTimeout);
     ASSERT_EQ(tagA.toBSON(), tags[0].toBSON());
     ASSERT_EQ(tagB.toBSON(), tags[1].toBSON());
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetTagsForCollectionNoTags) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetTagsForCollectionNoTags) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
         vector<TagsType> tags;
@@ -1148,13 +1095,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetTagsForCollectionNoTags) {
 
     onFindCommand([](const RemoteCommandRequest& request) { return vector<BSONObj>{}; });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetTagsForCollectionInvalidTag) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetTagsForCollectionInvalidTag) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
         vector<TagsType> tags;
@@ -1180,13 +1125,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetTagsForCollectionInvalidTag) {
         return vector<BSONObj>{tagA.toBSON(), tagB.toBSON()};
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetTagForChunkOneTagFound) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetTagForChunkOneTagFound) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     ChunkType chunk;
     chunk.setName("chunk0000");
@@ -1202,7 +1145,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetTagForChunkOneTagFound) {
 
     onFindCommand([chunk](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), TagsType::ConfigNS);
+        ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -1221,14 +1164,12 @@ TEST_F(CatalogManagerReplSetTestFixture, GetTagForChunkOneTagFound) {
         return vector<BSONObj>{tt.toBSON()};
     });
 
-    const string& tagStr = future.get();
+    const string& tagStr = future.timed_get(kFutureTimeout);
     ASSERT_EQ("tag", tagStr);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetTagForChunkNoTagFound) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetTagForChunkNoTagFound) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     ChunkType chunk;
     chunk.setName("chunk0000");
@@ -1244,7 +1185,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetTagForChunkNoTagFound) {
 
     onFindCommand([chunk](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), TagsType::ConfigNS);
+        ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -1257,14 +1198,12 @@ TEST_F(CatalogManagerReplSetTestFixture, GetTagForChunkNoTagFound) {
         return vector<BSONObj>{};
     });
 
-    const string& tagStr = future.get();
+    const string& tagStr = future.timed_get(kFutureTimeout);
     ASSERT_EQ("", tagStr);  // empty string returned when tag document not found
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, GetTagForChunkInvalidTagDoc) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, GetTagForChunkInvalidTagDoc) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     ChunkType chunk;
     chunk.setName("chunk0000");
@@ -1283,7 +1222,7 @@ TEST_F(CatalogManagerReplSetTestFixture, GetTagForChunkInvalidTagDoc) {
 
     onFindCommand([chunk](const RemoteCommandRequest& request) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.toString(), TagsType::ConfigNS);
+        ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
 
         auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -1298,13 +1237,11 @@ TEST_F(CatalogManagerReplSetTestFixture, GetTagForChunkInvalidTagDoc) {
                                                                << TagsType::max(BSON("a" << 20)))};
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, UpdateDatabase) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, UpdateDatabase) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     DatabaseType dbt;
     dbt.setName("test");
@@ -1321,8 +1258,8 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateDatabase) {
 
         BatchedUpdateRequest actualBatchedUpdate;
         std::string errmsg;
-        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.cmdObj, &errmsg));
-        ASSERT_EQUALS(DatabaseType::ConfigNS, actualBatchedUpdate.getCollName());
+        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        ASSERT_EQUALS(DatabaseType::ConfigNS, actualBatchedUpdate.getNS().ns());
         auto updates = actualBatchedUpdate.getUpdates();
         ASSERT_EQUALS(1U, updates.size());
         auto update = updates.front();
@@ -1340,14 +1277,12 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateDatabase) {
     });
 
     // Now wait for the updateDatabase call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, UpdateDatabaseHostUnreachable) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
+TEST_F(CatalogManagerReplSetTest, UpdateDatabaseHostUnreachable) {
     HostAndPort host1("TestHost1");
-    targeter->setFindHostReturnValue(host1);
+    configTargeter()->setFindHostReturnValue(host1);
 
     DatabaseType dbt;
     dbt.setName("test");
@@ -1371,13 +1306,11 @@ TEST_F(CatalogManagerReplSetTestFixture, UpdateDatabaseHostUnreachable) {
     });
 
     // Now wait for the updateDatabase call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, ApplyChunkOpsDeprecated) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecated) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     BSONArray updateOps = BSON_ARRAY(BSON("update1"
                                           << "first update")
@@ -1388,12 +1321,10 @@ TEST_F(CatalogManagerReplSetTestFixture, ApplyChunkOpsDeprecated) {
                                         << BSON("precondition2"
                                                 << "second precondition"));
 
-    auto future = async(std::launch::async,
-                        [this, updateOps, preCondition] {
-                            auto status =
-                                catalogManager()->applyChunkOpsDeprecated(updateOps, preCondition);
-                            ASSERT_OK(status);
-                        });
+    auto future = launchAsync([this, updateOps, preCondition] {
+        auto status = catalogManager()->applyChunkOpsDeprecated(updateOps, preCondition);
+        ASSERT_OK(status);
+    });
 
     onCommand([updateOps, preCondition](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("config", request.dbname);
@@ -1404,13 +1335,11 @@ TEST_F(CatalogManagerReplSetTestFixture, ApplyChunkOpsDeprecated) {
     });
 
     // Now wait for the applyChunkOpsDeprecated call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTestFixture, ApplyChunkOpsDeprecatedCommandFailed) {
-    RemoteCommandTargeterMock* targeter =
-        RemoteCommandTargeterMock::get(shardRegistry()->getShard("config")->getTargeter());
-    targeter->setFindHostReturnValue(HostAndPort("TestHost1"));
+TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecatedCommandFailed) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     BSONArray updateOps = BSON_ARRAY(BSON("update1"
                                           << "first update")
@@ -1421,12 +1350,10 @@ TEST_F(CatalogManagerReplSetTestFixture, ApplyChunkOpsDeprecatedCommandFailed) {
                                         << BSON("precondition2"
                                                 << "second precondition"));
 
-    auto future = async(std::launch::async,
-                        [this, updateOps, preCondition] {
-                            auto status =
-                                catalogManager()->applyChunkOpsDeprecated(updateOps, preCondition);
-                            ASSERT_EQUALS(ErrorCodes::BadValue, status);
-                        });
+    auto future = launchAsync([this, updateOps, preCondition] {
+        auto status = catalogManager()->applyChunkOpsDeprecated(updateOps, preCondition);
+        ASSERT_EQUALS(ErrorCodes::BadValue, status);
+    });
 
     onCommand([updateOps, preCondition](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("config", request.dbname);
@@ -1440,7 +1367,629 @@ TEST_F(CatalogManagerReplSetTestFixture, ApplyChunkOpsDeprecatedCommandFailed) {
     });
 
     // Now wait for the applyChunkOpsDeprecated call to return
-    future.wait_for(kFutureTimeout);
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(CatalogManagerReplSetTest, createDatabaseSuccess) {
+    const string dbname = "databaseToCreate";
+    const HostAndPort configHost("TestHost1");
+    configTargeter()->setFindHostReturnValue(configHost);
+
+    ShardType s0;
+    s0.setName("shard0000");
+    s0.setHost("ShardHost0:27017");
+
+    ShardType s1;
+    s1.setName("shard0001");
+    s1.setHost("ShardHost1:27017");
+
+    ShardType s2;
+    s2.setName("shard0002");
+    s2.setHost("ShardHost2:27017");
+
+    // Prime the shard registry with information about the existing shards
+    auto future = launchAsync([this] { shardRegistry()->reload(); });
+
+    onFindCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(configHost, request.target);
+        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+
+        ASSERT_EQ(ShardType::ConfigNS, query->ns());
+        ASSERT_EQ(BSONObj(), query->getFilter());
+        ASSERT_EQ(BSONObj(), query->getSort());
+        ASSERT_FALSE(query->getLimit().is_initialized());
+
+        return vector<BSONObj>{s0.toBSON(), s1.toBSON(), s2.toBSON()};
+    });
+
+    future.timed_get(kFutureTimeout);
+
+    // Set up all the target mocks return values.
+    RemoteCommandTargeterMock::get(shardRegistry()->getShard(s0.getName())->getTargeter())
+        ->setFindHostReturnValue(HostAndPort(s0.getHost()));
+    RemoteCommandTargeterMock::get(shardRegistry()->getShard(s1.getName())->getTargeter())
+        ->setFindHostReturnValue(HostAndPort(s1.getHost()));
+    RemoteCommandTargeterMock::get(shardRegistry()->getShard(s2.getName())->getTargeter())
+        ->setFindHostReturnValue(HostAndPort(s2.getHost()));
+
+
+    // Now actually start the createDatabase work.
+
+    distLock()->expectLock([dbname](StringData name,
+                                    StringData whyMessage,
+                                    stdx::chrono::milliseconds waitFor,
+                                    stdx::chrono::milliseconds lockTryInterval) {},
+                           Status::OK());
+
+
+    future = launchAsync([this, dbname] {
+        Status status = catalogManager()->createDatabase(dbname);
+        ASSERT_OK(status);
+    });
+
+    // Report no databases with the same name already exist
+    onFindCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(configHost, request.target);
+        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+        ASSERT_EQ(DatabaseType::ConfigNS, nss.ns());
+        return vector<BSONObj>{};
+    });
+
+    // Return size information about first shard
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(s0.getHost(), request.target.toString());
+        ASSERT_EQUALS("admin", request.dbname);
+        string cmdName = request.cmdObj.firstElement().fieldName();
+        ASSERT_EQUALS("listDatabases", cmdName);
+
+        return BSON("ok" << 1 << "totalSize" << 10);
+    });
+
+    // Return size information about second shard
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(s1.getHost(), request.target.toString());
+        ASSERT_EQUALS("admin", request.dbname);
+        string cmdName = request.cmdObj.firstElement().fieldName();
+        ASSERT_EQUALS("listDatabases", cmdName);
+
+        return BSON("ok" << 1 << "totalSize" << 1);
+    });
+
+    // Return size information about third shard
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(s2.getHost(), request.target.toString());
+        ASSERT_EQUALS("admin", request.dbname);
+        string cmdName = request.cmdObj.firstElement().fieldName();
+        ASSERT_EQUALS("listDatabases", cmdName);
+
+        return BSON("ok" << 1 << "totalSize" << 100);
+    });
+
+    // Process insert to config.databases collection
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(configHost, request.target);
+        ASSERT_EQUALS("config", request.dbname);
+
+        BatchedInsertRequest actualBatchedInsert;
+        std::string errmsg;
+        ASSERT_TRUE(actualBatchedInsert.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        ASSERT_EQUALS(DatabaseType::ConfigNS, actualBatchedInsert.getNS().ns());
+        auto inserts = actualBatchedInsert.getDocuments();
+        ASSERT_EQUALS(1U, inserts.size());
+        auto insert = inserts.front();
+
+        DatabaseType expectedDb;
+        expectedDb.setName(dbname);
+        expectedDb.setPrimary(s1.getName());  // This is the one we reported with the smallest size
+        expectedDb.setSharded(false);
+
+        ASSERT_EQUALS(expectedDb.toBSON(), insert);
+
+        BatchedCommandResponse response;
+        response.setOk(true);
+        response.setNModified(1);
+
+        return response.toBSON();
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(CatalogManagerReplSetTest, createDatabaseDistLockHeld) {
+    const string dbname = "databaseToCreate";
+
+
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
+
+    distLock()->expectLock(
+        [dbname](StringData name,
+                 StringData whyMessage,
+                 milliseconds waitFor,
+                 milliseconds lockTryInterval) {
+            ASSERT_EQUALS(dbname, name);
+            ASSERT_EQUALS("createDatabase", whyMessage);
+        },
+        Status(ErrorCodes::LockBusy, "lock already held"));
+
+    Status status = catalogManager()->createDatabase(dbname);
+    ASSERT_EQUALS(ErrorCodes::LockBusy, status);
+}
+
+TEST_F(CatalogManagerReplSetTest, createDatabaseDBExists) {
+    const string dbname = "databaseToCreate";
+
+
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
+
+    distLock()->expectLock([dbname](StringData name,
+                                    StringData whyMessage,
+                                    stdx::chrono::milliseconds waitFor,
+                                    stdx::chrono::milliseconds lockTryInterval) {},
+                           Status::OK());
+
+
+    auto future = launchAsync([this, dbname] {
+        Status status = catalogManager()->createDatabase(dbname);
+        ASSERT_EQUALS(ErrorCodes::NamespaceExists, status);
+    });
+
+    onFindCommand([dbname](const RemoteCommandRequest& request) {
+        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+
+        BSONObjBuilder queryBuilder;
+        queryBuilder.appendRegex(
+            DatabaseType::name(), (string) "^" + pcrecpp::RE::QuoteMeta(dbname) + "$", "i");
+
+        ASSERT_EQ(DatabaseType::ConfigNS, query->ns());
+        ASSERT_EQ(queryBuilder.obj(), query->getFilter());
+
+        return vector<BSONObj>{BSON("_id" << dbname)};
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(CatalogManagerReplSetTest, createDatabaseDBExistsDifferentCase) {
+    const string dbname = "databaseToCreate";
+    const string dbnameDiffCase = "databasetocreate";
+
+
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
+
+    distLock()->expectLock([dbname](StringData name,
+                                    StringData whyMessage,
+                                    stdx::chrono::milliseconds waitFor,
+                                    stdx::chrono::milliseconds lockTryInterval) {},
+                           Status::OK());
+
+
+    auto future = launchAsync([this, dbname] {
+        Status status = catalogManager()->createDatabase(dbname);
+        ASSERT_EQUALS(ErrorCodes::DatabaseDifferCase, status);
+    });
+
+    onFindCommand([dbname, dbnameDiffCase](const RemoteCommandRequest& request) {
+        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+
+        BSONObjBuilder queryBuilder;
+        queryBuilder.appendRegex(
+            DatabaseType::name(), (string) "^" + pcrecpp::RE::QuoteMeta(dbname) + "$", "i");
+
+        ASSERT_EQ(DatabaseType::ConfigNS, query->ns());
+        ASSERT_EQ(queryBuilder.obj(), query->getFilter());
+
+        return vector<BSONObj>{BSON("_id" << dbnameDiffCase)};
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(CatalogManagerReplSetTest, createDatabaseNoShards) {
+    const string dbname = "databaseToCreate";
+
+
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
+
+    distLock()->expectLock([dbname](StringData name,
+                                    StringData whyMessage,
+                                    stdx::chrono::milliseconds waitFor,
+                                    stdx::chrono::milliseconds lockTryInterval) {},
+                           Status::OK());
+
+
+    auto future = launchAsync([this, dbname] {
+        Status status = catalogManager()->createDatabase(dbname);
+        ASSERT_EQUALS(ErrorCodes::ShardNotFound, status);
+    });
+
+    // Report no databases with the same name already exist
+    onFindCommand([dbname](const RemoteCommandRequest& request) {
+        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+        ASSERT_EQ(DatabaseType::ConfigNS, nss.ns());
+        return vector<BSONObj>{};
+    });
+
+    // Report no shards exist
+    onFindCommand([](const RemoteCommandRequest& request) {
+        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+
+        ASSERT_EQ(ShardType::ConfigNS, query->ns());
+        ASSERT_EQ(BSONObj(), query->getFilter());
+        ASSERT_EQ(BSONObj(), query->getSort());
+        ASSERT_FALSE(query->getLimit().is_initialized());
+
+        return vector<BSONObj>{};
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(CatalogManagerReplSetTest, createDatabaseDuplicateKeyOnInsert) {
+    const string dbname = "databaseToCreate";
+    const HostAndPort configHost("TestHost1");
+    configTargeter()->setFindHostReturnValue(configHost);
+
+    ShardType s0;
+    s0.setName("shard0000");
+    s0.setHost("ShardHost0:27017");
+
+    ShardType s1;
+    s1.setName("shard0001");
+    s1.setHost("ShardHost1:27017");
+
+    ShardType s2;
+    s2.setName("shard0002");
+    s2.setHost("ShardHost2:27017");
+
+    // Prime the shard registry with information about the existing shards
+    auto future = launchAsync([this] { shardRegistry()->reload(); });
+
+    onFindCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(configHost, request.target);
+        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+
+        ASSERT_EQ(ShardType::ConfigNS, query->ns());
+        ASSERT_EQ(BSONObj(), query->getFilter());
+        ASSERT_EQ(BSONObj(), query->getSort());
+        ASSERT_FALSE(query->getLimit().is_initialized());
+
+        return vector<BSONObj>{s0.toBSON(), s1.toBSON(), s2.toBSON()};
+    });
+
+    future.timed_get(kFutureTimeout);
+
+    // Set up all the target mocks return values.
+    RemoteCommandTargeterMock::get(shardRegistry()->getShard(s0.getName())->getTargeter())
+        ->setFindHostReturnValue(HostAndPort(s0.getHost()));
+    RemoteCommandTargeterMock::get(shardRegistry()->getShard(s1.getName())->getTargeter())
+        ->setFindHostReturnValue(HostAndPort(s1.getHost()));
+    RemoteCommandTargeterMock::get(shardRegistry()->getShard(s2.getName())->getTargeter())
+        ->setFindHostReturnValue(HostAndPort(s2.getHost()));
+
+
+    // Now actually start the createDatabase work.
+
+    distLock()->expectLock([dbname](StringData name,
+                                    StringData whyMessage,
+                                    stdx::chrono::milliseconds waitFor,
+                                    stdx::chrono::milliseconds lockTryInterval) {},
+                           Status::OK());
+
+
+    future = launchAsync([this, dbname] {
+        Status status = catalogManager()->createDatabase(dbname);
+        ASSERT_EQUALS(ErrorCodes::NamespaceExists, status);
+    });
+
+    // Report no databases with the same name already exist
+    onFindCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(configHost, request.target);
+        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+        ASSERT_EQ(DatabaseType::ConfigNS, nss.ns());
+        return vector<BSONObj>{};
+    });
+
+    // Return size information about first shard
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(s0.getHost(), request.target.toString());
+        ASSERT_EQUALS("admin", request.dbname);
+        string cmdName = request.cmdObj.firstElement().fieldName();
+        ASSERT_EQUALS("listDatabases", cmdName);
+
+        return BSON("ok" << 1 << "totalSize" << 10);
+    });
+
+    // Return size information about second shard
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(s1.getHost(), request.target.toString());
+        ASSERT_EQUALS("admin", request.dbname);
+        string cmdName = request.cmdObj.firstElement().fieldName();
+        ASSERT_EQUALS("listDatabases", cmdName);
+
+        return BSON("ok" << 1 << "totalSize" << 1);
+    });
+
+    // Return size information about third shard
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(s2.getHost(), request.target.toString());
+        ASSERT_EQUALS("admin", request.dbname);
+        string cmdName = request.cmdObj.firstElement().fieldName();
+        ASSERT_EQUALS("listDatabases", cmdName);
+
+        return BSON("ok" << 1 << "totalSize" << 100);
+    });
+
+    // Process insert to config.databases collection
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(configHost, request.target);
+        ASSERT_EQUALS("config", request.dbname);
+
+        BatchedInsertRequest actualBatchedInsert;
+        std::string errmsg;
+        ASSERT_TRUE(actualBatchedInsert.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        ASSERT_EQUALS(DatabaseType::ConfigNS, actualBatchedInsert.getNS().ns());
+        auto inserts = actualBatchedInsert.getDocuments();
+        ASSERT_EQUALS(1U, inserts.size());
+        auto insert = inserts.front();
+
+        DatabaseType expectedDb;
+        expectedDb.setName(dbname);
+        expectedDb.setPrimary(s1.getName());  // This is the one we reported with the smallest size
+        expectedDb.setSharded(false);
+
+        ASSERT_EQUALS(expectedDb.toBSON(), insert);
+
+        BatchedCommandResponse response;
+        response.setOk(false);
+        response.setErrCode(ErrorCodes::DuplicateKey);
+        response.setErrMessage("duplicate key");
+
+        return response.toBSON();
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(CatalogManagerReplSetTest, EnableShardingNoDBExists) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("config:123"));
+
+    vector<ShardType> shards;
+    ShardType shard;
+    shard.setName("shard0");
+    shard.setHost("shard0:12");
+
+    setupShards(vector<ShardType>{shard});
+
+    RemoteCommandTargeterMock* shardTargeter =
+        RemoteCommandTargeterMock::get(shardRegistry()->getShard("shard0")->getTargeter());
+    shardTargeter->setFindHostReturnValue(HostAndPort("shard0:12"));
+
+    distLock()->expectLock(
+        [](StringData name,
+           StringData whyMessage,
+           stdx::chrono::milliseconds,
+           stdx::chrono::milliseconds) {
+            ASSERT_EQ("test", name);
+            ASSERT_FALSE(whyMessage.empty());
+        },
+        Status::OK());
+
+    auto future = launchAsync([this] {
+        auto status = catalogManager()->enableSharding("test");
+        ASSERT_OK(status);
+    });
+
+    // Query to find if db already exists in config.
+    onFindCommand([](const RemoteCommandRequest& request) {
+        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+        ASSERT_EQ(DatabaseType::ConfigNS, nss.toString());
+
+        auto queryResult = LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false);
+        ASSERT_OK(queryResult.getStatus());
+
+        const auto& query = queryResult.getValue();
+        BSONObj expectedQuery(fromjson(R"({ _id: { $regex: "^test$", $options: "i" }})"));
+
+        ASSERT_EQ(DatabaseType::ConfigNS, query->ns());
+        ASSERT_EQ(expectedQuery, query->getFilter());
+        ASSERT_EQ(BSONObj(), query->getSort());
+        ASSERT_EQ(1, query->getLimit().get());
+
+        return vector<BSONObj>{};
+    });
+
+    // list databases for checking shard size.
+    onCommand([](const RemoteCommandRequest& request) {
+        ASSERT_EQ(HostAndPort("shard0:12"), request.target);
+        ASSERT_EQ("admin", request.dbname);
+        ASSERT_EQ(BSON("listDatabases" << 1), request.cmdObj);
+
+        return fromjson(R"({
+                databases: [],
+                totalSize: 1,
+                ok: 1
+            })");
+    });
+
+    onCommand([](const RemoteCommandRequest& request) {
+        ASSERT_EQ(HostAndPort("config:123"), request.target);
+        ASSERT_EQ("config", request.dbname);
+
+        BSONObj expectedCmd(fromjson(R"({
+            update: "databases",
+            updates: [{
+                q: { _id: "test" },
+                u: { _id: "test", primary: "shard0", partitioned: true },
+                multi: false,
+                upsert: true
+            }],
+            writeConcern: { w: "majority" }
+        })"));
+
+        ASSERT_EQ(expectedCmd, request.cmdObj);
+
+        return fromjson(R"({
+                nModified: 0,
+                n: 1,
+                upserted: [
+                    { _id: "test", primary: "shard0", partitioned: true }
+                ],
+                ok: 1
+            })");
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(CatalogManagerReplSetTest, EnableShardingLockBusy) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("config:123"));
+
+    distLock()->expectLock(
+        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
+        {ErrorCodes::LockBusy, "lock taken"});
+
+    auto status = catalogManager()->enableSharding("test");
+    ASSERT_EQ(ErrorCodes::LockBusy, status.code());
+}
+
+TEST_F(CatalogManagerReplSetTest, EnableShardingDBExistsWithDifferentCase) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("config:123"));
+
+    vector<ShardType> shards;
+    ShardType shard;
+    shard.setName("shard0");
+    shard.setHost("shard0:12");
+
+    setupShards(vector<ShardType>{shard});
+
+    distLock()->expectLock(
+        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
+        Status::OK());
+
+    auto future = launchAsync([this] {
+        auto status = catalogManager()->enableSharding("test");
+        ASSERT_EQ(ErrorCodes::DatabaseDifferCase, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
+
+    // Query to find if db already exists in config.
+    onFindCommand([](const RemoteCommandRequest& request) {
+        BSONObj existingDoc(fromjson(R"({ _id: "Test", primary: "shard0", partitioned: true })"));
+        return vector<BSONObj>{existingDoc};
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(CatalogManagerReplSetTest, EnableShardingDBExists) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("config:123"));
+
+    vector<ShardType> shards;
+    ShardType shard;
+    shard.setName("shard0");
+    shard.setHost("shard0:12");
+
+    setupShards(vector<ShardType>{shard});
+
+    distLock()->expectLock(
+        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
+        Status::OK());
+
+    auto future = launchAsync([this] {
+        auto status = catalogManager()->enableSharding("test");
+        ASSERT_OK(status);
+    });
+
+    // Query to find if db already exists in config.
+    onFindCommand([](const RemoteCommandRequest& request) {
+        BSONObj existingDoc(fromjson(R"({ _id: "test", primary: "shard2", partitioned: false })"));
+        return vector<BSONObj>{existingDoc};
+    });
+
+    onCommand([](const RemoteCommandRequest& request) {
+        ASSERT_EQ(HostAndPort("config:123"), request.target);
+        ASSERT_EQ("config", request.dbname);
+
+        BSONObj expectedCmd(fromjson(R"({
+            update: "databases",
+            updates: [{
+                q: { _id: "test" },
+                u: { _id: "test", primary: "shard2", partitioned: true },
+                multi: false,
+                upsert: true
+            }],
+            writeConcern: { w: "majority" }
+        })"));
+
+        ASSERT_EQ(expectedCmd, request.cmdObj);
+
+        return fromjson(R"({
+                nModified: 0,
+                n: 1,
+                upserted: [
+                    { _id: "test", primary: "shard2", partitioned: true }
+                ],
+                ok: 1
+            })");
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(CatalogManagerReplSetTest, EnableShardingDBExistsInvalidFormat) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("config:123"));
+
+    vector<ShardType> shards;
+    ShardType shard;
+    shard.setName("shard0");
+    shard.setHost("shard0:12");
+
+    setupShards(vector<ShardType>{shard});
+
+    distLock()->expectLock(
+        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
+        Status::OK());
+
+    auto future = launchAsync([this] {
+        auto status = catalogManager()->enableSharding("test");
+        ASSERT_EQ(ErrorCodes::TypeMismatch, status.code());
+    });
+
+    // Query to find if db already exists in config.
+    onFindCommand([](const RemoteCommandRequest& request) {
+        // Bad type for primary field.
+        BSONObj existingDoc(fromjson(R"({ _id: "test", primary: 12, partitioned: false })"));
+        return vector<BSONObj>{existingDoc};
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(CatalogManagerReplSetTest, EnableShardingNoDBExistsNoShards) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("config:123"));
+
+    distLock()->expectLock(
+        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
+        Status::OK());
+
+    auto future = launchAsync([this] {
+        auto status = catalogManager()->enableSharding("test");
+        ASSERT_EQ(ErrorCodes::ShardNotFound, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
+
+    // Query to find if db already exists in config.
+    onFindCommand([](const RemoteCommandRequest& request) { return vector<BSONObj>{}; });
+
+    // Query for config.shards reload.
+    onFindCommand([](const RemoteCommandRequest& request) { return vector<BSONObj>{}; });
+
+    future.timed_get(kFutureTimeout);
 }
 
 }  // namespace

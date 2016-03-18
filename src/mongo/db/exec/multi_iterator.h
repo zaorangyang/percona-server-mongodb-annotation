@@ -59,26 +59,19 @@ public:
 
     void kill();
 
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    virtual void doSaveState();
+    virtual void doRestoreState();
+    virtual void doDetachFromOperationContext();
+    virtual void doReattachToOperationContext(OperationContext* opCtx);
+    virtual void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
     // Returns empty PlanStageStats object
-    virtual PlanStageStats* getStats();
-
-    // Not used.
-    virtual CommonStats* getCommonStats() const {
-        return NULL;
-    }
+    virtual std::unique_ptr<PlanStageStats> getStats();
 
     // Not used.
     virtual SpecificStats* getSpecificStats() const {
         return NULL;
     }
-
-    // Not used.
-    virtual std::vector<PlanStage*> getChildren() const;
 
     // Not used.
     virtual StageType stageType() const {
@@ -95,8 +88,9 @@ private:
     // Not owned by us.
     WorkingSet* _ws;
 
-    // We allocate a working set member with this id on construction of the stage. It gets
-    // used for all fetch requests, changing the RecordId as appropriate.
+    // We allocate a working set member with this id on construction of the stage. It gets used for
+    // all fetch requests. This should only be used for passing up the Fetcher for a NEED_YIELD, and
+    // should remain in the INVALID state.
     const WorkingSetID _wsidForFetch;
 };
 

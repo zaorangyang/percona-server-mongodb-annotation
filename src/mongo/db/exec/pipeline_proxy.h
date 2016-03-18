@@ -52,14 +52,13 @@ public:
 
     virtual bool isEOF();
 
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    virtual void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
     //
-    // Manage our OperationContext. We intentionally don't propagate to the child
-    // Runner as that is handled by DocumentSourceCursor as it needs to.
+    // Manage our OperationContext.
     //
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
+    virtual void doDetachFromOperationContext();
+    virtual void doReattachToOperationContext(OperationContext* opCtx);
 
     /**
      * Make obj the next object returned by getNext().
@@ -73,20 +72,13 @@ public:
     std::shared_ptr<PlanExecutor> getChildExecutor();
 
     // Returns empty PlanStageStats object
-    virtual PlanStageStats* getStats();
+    virtual std::unique_ptr<PlanStageStats> getStats();
 
-    // Not used.
-    virtual CommonStats* getCommonStats() const {
-        return NULL;
-    }
 
     // Not used.
     virtual SpecificStats* getSpecificStats() const {
         return NULL;
     }
-
-    // Not used.
-    virtual std::vector<PlanStage*> getChildren() const;
 
     // Not used.
     virtual StageType stageType() const {

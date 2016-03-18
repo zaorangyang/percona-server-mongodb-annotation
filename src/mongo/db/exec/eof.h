@@ -45,26 +45,16 @@ public:
     virtual bool isEOF();
     virtual StageState work(WorkingSetID* out);
 
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-
-    virtual std::vector<PlanStage*> getChildren() const;
 
     virtual StageType stageType() const {
         return STAGE_EOF;
     }
 
-    PlanStageStats* getStats();
-
-    virtual const CommonStats* getCommonStats() const;
+    std::unique_ptr<PlanStageStats> getStats();
 
     virtual const SpecificStats* getSpecificStats() const;
 
     static const char* kStageType;
-
-private:
-    CommonStats _commonStats;
 };
 
 }  // namespace mongo

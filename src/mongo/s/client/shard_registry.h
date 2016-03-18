@@ -30,12 +30,12 @@
 
 #include <boost/optional.hpp>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -76,10 +76,15 @@ public:
      */
     ShardRegistry(std::unique_ptr<RemoteCommandTargeterFactory> targeterFactory,
                   std::unique_ptr<executor::TaskExecutor> executor,
-                  executor::NetworkInterface* network,
-                  CatalogManager* catalogManager);
+                  executor::NetworkInterface* network);
 
     ~ShardRegistry();
+
+    /**
+     * Stores the given CatalogManager into _catalogManager for use for retrieving the list of
+     * registered shards, and creates the hard-coded config shard.
+     */
+    void init(CatalogManager* catalogManager);
 
     /**
      * Invokes the executor's startup method, which will start any networking/async execution
@@ -108,6 +113,16 @@ public:
     std::shared_ptr<Shard> getShard(const ShardId& shardId);
 
     /**
+     * Instantiates a new detached shard connection, which does not appear in the list of shards
+     * tracked by the registry and as a result will not be returned by getAllShardIds.
+     *
+     * The caller owns the returned shard object and is responsible for disposing of it when done.
+     *
+     * @param connStr Connection string to the shard.
+     */
+    std::unique_ptr<Shard> createConnection(const ConnectionString& connStr) const;
+
+    /**
      * Lookup shard by replica set name. Returns nullptr if the name can't be found.
      * Note: this doesn't refresh the table if the name isn't found, so it's possible that a
      * newly added shard/Replica Set may not be found.
@@ -132,7 +147,7 @@ public:
                                                     const NamespaceString& nss,
                                                     const BSONObj& query,
                                                     const BSONObj& sort,
-                                                    boost::optional<int> limit);
+                                                    boost::optional<long long> limit);
 
     /**
      * Runs a command against the specified host and returns the result.
@@ -168,11 +183,11 @@ private:
     executor::NetworkInterface* const _network;
 
     // Catalog manager from which to load the shard information. Not owned and must outlive
-    // the shard registry object.
-    CatalogManager* const _catalogManager;
+    // the shard registry object.  Should be set once by a call to init() then never modified again.
+    CatalogManager* _catalogManager;
 
     // Protects the maps below
-    mutable std::mutex _mutex;
+    mutable stdx::mutex _mutex;
 
     // Map of both shardName -> Shard and hostName -> Shard
     ShardMap _lookup;

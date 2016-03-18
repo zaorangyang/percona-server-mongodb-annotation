@@ -41,40 +41,19 @@ namespace mongo {
 class NamespaceString;
 class OperationContext;
 
-class ScopedRecoveryUnitSwapper {
-public:
-    ScopedRecoveryUnitSwapper(ClientCursor* cc, OperationContext* txn);
-
-    ~ScopedRecoveryUnitSwapper();
-
-    /**
-     * Dismissing the RU swapper causes it to simply free the recovery unit rather than swapping
-     * it back into the ClientCursor.
-     */
-    void dismiss();
-
-private:
-    ClientCursor* _cc;
-    OperationContext* _txn;
-    bool _dismissed;
-
-    std::unique_ptr<RecoveryUnit> _txnPreviousRecoveryUnit;
-    OperationContext::RecoveryUnitState _txnPreviousRecoveryUnitState;
-};
-
 /**
  * Returns true if enough results have been prepared to stop adding more to the first batch.
  *
  * Should be called *after* adding to the result set rather than before.
  */
-bool enoughForFirstBatch(const LiteParsedQuery& pq, int numDocs, int bytesBuffered);
+bool enoughForFirstBatch(const LiteParsedQuery& pq, long long numDocs, int bytesBuffered);
 
 /**
  * Returns true if enough results have been prepared to stop adding more to a getMore batch.
  *
  * Should be called *after* adding to the result set rather than before.
  */
-bool enoughForGetMore(int ntoreturn, int numDocs, int bytesBuffered);
+bool enoughForGetMore(long long ntoreturn, long long numDocs, int bytesBuffered);
 
 /**
  * Whether or not the ClientCursor* is tailable.
@@ -115,8 +94,8 @@ bool shouldSaveCursorGetMore(PlanExecutor::ExecState finalState,
 void beginQueryOp(OperationContext* txn,
                   const NamespaceString& nss,
                   const BSONObj& queryObj,
-                  int ntoreturn,
-                  int ntoskip);
+                  long long ntoreturn,
+                  long long ntoskip);
 
 /**
  * Fills out CurOp for "txn" with information regarding this query's execution.
@@ -129,7 +108,7 @@ void beginQueryOp(OperationContext* txn,
 void endQueryOp(OperationContext* txn,
                 const PlanExecutor& exec,
                 int dbProfilingLevel,
-                int numResults,
+                long long numResults,
                 CursorId cursorId);
 
 /**
@@ -151,8 +130,7 @@ QueryResult::View getMore(OperationContext* txn,
                           const char* ns,
                           int ntoreturn,
                           long long cursorid,
-                          int pass,
-                          bool& exhaust,
+                          bool* exhaust,
                           bool* isCursorAuthorized);
 
 /**

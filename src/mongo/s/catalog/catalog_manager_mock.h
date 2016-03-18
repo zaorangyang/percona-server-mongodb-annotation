@@ -28,14 +28,10 @@
 
 #pragma once
 
-#include <memory>
-
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 
 namespace mongo {
-
-class Query;
 
 /**
  * A dummy implementation of CatalogManager for testing purposes.
@@ -47,28 +43,24 @@ public:
 
     ConnectionString connectionString() const override;
 
-    Status startup(bool upgrade) override;
+    Status startup() override;
 
     void shutDown() override;
-
-    Status enableSharding(const std::string& dbName) override;
 
     Status shardCollection(OperationContext* txn,
                            const std::string& ns,
                            const ShardKeyPattern& fieldsAndOrder,
                            bool unique,
-                           std::vector<BSONObj>* initPoints,
-                           std::set<ShardId>* initShardIds = nullptr) override;
+                           const std::vector<BSONObj>& initPoints,
+                           const std::set<ShardId>& initShardIds) override;
 
     StatusWith<std::string> addShard(OperationContext* txn,
-                                     const std::string& name,
+                                     const std::string* shardProposedName,
                                      const ConnectionString& shardConnectionString,
                                      const long long maxSize) override;
 
     StatusWith<ShardDrainingStatus> removeShard(OperationContext* txn,
                                                 const std::string& name) override;
-
-    Status createDatabase(const std::string& dbName) override;
 
     Status updateDatabase(const std::string& dbName, const DatabaseType& db) override;
 
@@ -80,8 +72,6 @@ public:
 
     Status getCollections(const std::string* dbName,
                           std::vector<CollectionType>* collections) override;
-
-    Status dropCollection(OperationContext* txn, const std::string& collectionNs) override;
 
     Status getDatabasesForShard(const std::string& shardName,
                                 std::vector<std::string>* dbs) override;
@@ -98,8 +88,6 @@ public:
                                            const ChunkType& chunk) override;
 
     Status getAllShards(std::vector<ShardType>* shards) override;
-
-    bool isShardHost(const ConnectionString& shardConnectionString) override;
 
     bool runUserManagementWriteCommand(const std::string& commandName,
                                        const std::string& dbname,
@@ -127,7 +115,13 @@ public:
 
     DistLockManager* getDistLockManager() const override;
 
+    Status checkAndUpgrade(bool checkOnly) override;
+
 private:
+    Status _checkDbDoesNotExist(const std::string& dbName, DatabaseType* db) const override;
+
+    StatusWith<std::string> _generateNewShardName() const override;
+
     std::unique_ptr<DistLockManagerMock> _mockDistLockMgr;
 };
 

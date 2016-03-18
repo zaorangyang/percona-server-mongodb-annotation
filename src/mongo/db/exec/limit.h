@@ -44,25 +44,17 @@ namespace mongo {
  */
 class LimitStage : public PlanStage {
 public:
-    LimitStage(int limit, WorkingSet* ws, PlanStage* child);
+    LimitStage(long long limit, WorkingSet* ws, PlanStage* child);
     virtual ~LimitStage();
 
     virtual bool isEOF();
     virtual StageState work(WorkingSetID* out);
 
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-
-    virtual std::vector<PlanStage*> getChildren() const;
-
     virtual StageType stageType() const {
         return STAGE_LIMIT;
     }
 
-    virtual PlanStageStats* getStats();
-
-    virtual const CommonStats* getCommonStats() const;
+    virtual std::unique_ptr<PlanStageStats> getStats();
 
     virtual const SpecificStats* getSpecificStats() const;
 
@@ -70,13 +62,11 @@ public:
 
 private:
     WorkingSet* _ws;
-    std::unique_ptr<PlanStage> _child;
 
     // We only return this many results.
-    int _numToReturn;
+    long long _numToReturn;
 
     // Stats
-    CommonStats _commonStats;
     LimitStats _specificStats;
 };
 

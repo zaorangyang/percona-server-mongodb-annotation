@@ -88,9 +88,9 @@ public:
         params.tailable = false;
 
         // Make the filter.
-        StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
-        verify(swme.isOK());
-        unique_ptr<MatchExpression> filterExpr(swme.getValue());
+        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(filterObj);
+        verify(statusWithMatcher.isOK());
+        unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
         // Make a scan and have the runner own it.
         unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
@@ -301,7 +301,7 @@ public:
         scan->saveState();
         scan->invalidate(&_txn, locs[count], INVALIDATION_DELETION);
         remove(coll->docFor(&_txn, locs[count]).value());
-        scan->restoreState(&_txn);
+        scan->restoreState();
 
         // Skip over locs[count].
         ++count;
@@ -362,7 +362,7 @@ public:
         scan->saveState();
         scan->invalidate(&_txn, locs[count], INVALIDATION_DELETION);
         remove(coll->docFor(&_txn, locs[count]).value());
-        scan->restoreState(&_txn);
+        scan->restoreState();
 
         // Skip over locs[count].
         ++count;

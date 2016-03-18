@@ -27,7 +27,6 @@ var blacklist = [
     'auth_drop_role.js',
     'auth_drop_user.js', // SERVER-16739 OpenSSL libcrypto crash
 
-    'agg_base.js', // SERVER-18878 previous workload has not finished executing on the secondaries
     'agg_group_external.js', // uses >100MB of data, and is flaky
     'agg_sort_external.js', // uses >100MB of data, and is flaky
     'compact.js', // compact can only be run against a standalone mongod
@@ -68,4 +67,4 @@ var blacklist = [
 
 runWorkloadsSerially(ls(dir).filter(function(file) {
     return !Array.contains(blacklist, file);
-}), { sharded: true, replication: true });
+}), { sharded: true, replication: true, useLegacyConfigServers: false });

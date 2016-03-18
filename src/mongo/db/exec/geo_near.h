@@ -28,15 +28,17 @@
 
 #pragma once
 
-
 #include "mongo/db/exec/near.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/plan_stats.h"
-#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/geo/geometry_container.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/s2_indexing_params.h"
+#include "mongo/db/geo/r2_region_coverer.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/query/index_bounds.h"
+#include "third_party/s2/s2cellunion.h"
 
 namespace mongo {
 
@@ -69,8 +71,6 @@ public:
                    Collection* collection,
                    IndexDescriptor* twoDIndex);
 
-    virtual ~GeoNear2DStage();
-
 protected:
     virtual StatusWith<CoveredInterval*> nextInterval(OperationContext* txn,
                                                       WorkingSet* workingSet,
@@ -84,12 +84,6 @@ protected:
                                              WorkingSetID* out);
 
 private:
-    virtual void finishSaveState();
-
-    virtual void finishRestoreState(OperationContext* txn);
-
-    virtual void finishInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-
     const GeoNearParams _nearParams;
 
     // The 2D index we're searching over
@@ -104,6 +98,9 @@ private:
 
     // Amount to increment the next bounds by
     double _boundsIncrement;
+
+    // Keeps track of the region that has already been scanned
+    R2CellUnion _scannedCells;
 
     class DensityEstimator;
     std::unique_ptr<DensityEstimator> _densityEstimator;
@@ -135,17 +132,13 @@ protected:
                                              WorkingSetID* out);
 
 private:
-    virtual void finishSaveState();
-
-    virtual void finishRestoreState(OperationContext* txn);
-
-    virtual void finishInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-
     const GeoNearParams _nearParams;
 
     // The 2D index we're searching over
     // Not owned here
     IndexDescriptor* const _s2Index;
+
+    S2IndexingParams _indexParams;
 
     // The total search annulus
     const R2Annulus _fullBounds;
@@ -155,6 +148,9 @@ private:
 
     // Amount to increment the next bounds by
     double _boundsIncrement;
+
+    // Keeps track of the region that has already been scanned
+    S2CellUnion _scannedCells;
 
     class DensityEstimator;
     std::unique_ptr<DensityEstimator> _densityEstimator;

@@ -52,22 +52,19 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
-#include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/startup_warnings_common.h"
-#include "mongo/executor/network_interface_impl.h"
-#include "mongo/executor/task_executor.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balance.h"
-#include "mongo/s/catalog/legacy/catalog_manager_legacy.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/s/config.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/request.h"
+#include "mongo/s/sharding_initialization.h"
 #include "mongo/s/version_mongos.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
@@ -88,6 +85,7 @@
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/static_observer.h"
 #include "mongo/util/stringutils.h"
+#include "mongo/util/system_tick_source.h"
 #include "mongo/util/text.h"
 #include "mongo/util/version.h"
 
@@ -196,6 +194,28 @@ DBClientBase* createDirectClient(OperationContext* txn) {
 
 using namespace mongo;
 
+static Status initializeSharding(bool doUpgrade) {
+    Status status = initializeGlobalShardingState(mongosGlobalParams.configdbs);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = grid.catalogManager()->checkAndUpgrade(!doUpgrade);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (doUpgrade) {
+        return Status::OK();
+    }
+
+    status = grid.catalogManager()->startup();
+    if (!status.isOK()) {
+        return status;
+    }
+    return Status::OK();
+}
+
 static ExitCode runMongosServer(bool doUpgrade) {
     setThreadName("mongosMain");
     printShardingVersionInfo(false);
@@ -217,36 +237,13 @@ static ExitCode runMongosServer(bool doUpgrade) {
         dbexit(EXIT_BADOPTIONS);
     }
 
-    auto catalogManager = stdx::make_unique<CatalogManagerLegacy>();
-
-    {
-        Status statusCatalogManagerInit = catalogManager->init(mongosGlobalParams.configdbs);
-        if (!statusCatalogManagerInit.isOK()) {
-            error() << "couldn't initialize catalog manager " << statusCatalogManagerInit;
-            return EXIT_SHARDING_ERROR;
-        }
+    Status status = initializeSharding(doUpgrade);
+    if (!status.isOK()) {
+        error() << "Error initializing sharding system: " << status;
+        return EXIT_SHARDING_ERROR;
     }
-
-    auto shardRegistry(
-        stdx::make_unique<ShardRegistry>(stdx::make_unique<RemoteCommandTargeterFactoryImpl>(),
-                                         stdx::make_unique<repl::ReplicationExecutor>(
-                                             new executor::NetworkInterfaceImpl(), nullptr, 0),
-                                         nullptr,
-                                         catalogManager.get()));
-    shardRegistry->startup();
-
-    grid.init(std::move(catalogManager), std::move(shardRegistry));
-
-    {
-        Status startupStatus = grid.catalogManager()->startup(doUpgrade);
-        if (!startupStatus.isOK()) {
-            error() << "Mongos catalog manager startup failed: " << startupStatus;
-            return EXIT_SHARDING_ERROR;
-        }
-
-        if (doUpgrade) {
-            return EXIT_CLEAN;
-        }
+    if (doUpgrade) {
+        return EXIT_CLEAN;
     }
 
     ConfigServer::reloadSettings();
@@ -264,7 +261,7 @@ static ExitCode runMongosServer(bool doUpgrade) {
         web.detach();
     }
 
-    Status status = getGlobalAuthorizationManager()->initialize(NULL);
+    status = getGlobalAuthorizationManager()->initialize(NULL);
     if (!status.isOK()) {
         error() << "Initializing authorization data failed: " << status;
         return EXIT_SHARDING_ERROR;
@@ -369,6 +366,7 @@ MONGO_INITIALIZER(CreateAuthorizationExternalStateFactory)(InitializerContext* c
 
 MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
     setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
+    getGlobalServiceContext()->setTickSource(stdx::make_unique<SystemTickSource>());
     return Status::OK();
 }
 

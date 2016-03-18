@@ -33,7 +33,6 @@
 #include "data_replicator.h"
 
 #include <algorithm>
-#include <thread>
 
 #include "mongo/base/status.h"
 #include "mongo/client/query_fetcher.h"
@@ -44,7 +43,6 @@
 #include "mongo/db/repl/database_cloner.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/reporter.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/thread.h"
@@ -146,13 +144,11 @@ std::string OplogFetcher::toString() const {
 
 void OplogFetcher::_delegateCallback(const Fetcher::QueryResponseStatus& fetchResult,
                                      Fetcher::NextAction* nextAction) {
-    const bool checkStartTS = _getResponses() == 0;
-
     if (fetchResult.isOK()) {
         Fetcher::Documents::const_iterator firstDoc = fetchResult.getValue().documents.begin();
         auto hasDoc = firstDoc != fetchResult.getValue().documents.end();
 
-        if (checkStartTS) {
+        if (fetchResult.getValue().first) {
             if (!hasDoc) {
                 // Set next action to none.
                 *nextAction = Fetcher::NextAction::kNoAction;
@@ -518,8 +514,8 @@ DataReplicator::DataReplicator(DataReplicatorOptions opts, ReplicationExecutor* 
     uassert(ErrorCodes::BadValue, "invalid applier function", _opts.applierFn);
     uassert(ErrorCodes::BadValue, "invalid rollback function", _opts.rollbackFn);
     uassert(ErrorCodes::BadValue,
-            "invalid replication progress manager",
-            _opts.replicationProgressManager);
+            "invalid replSetUpdatePosition command object creation function",
+            _opts.prepareReplSetUpdatePositionCommandFn);
     uassert(ErrorCodes::BadValue, "invalid getMyLastOptime function", _opts.getMyLastOptime);
     uassert(ErrorCodes::BadValue, "invalid setMyLastOptime function", _opts.setMyLastOptime);
     uassert(ErrorCodes::BadValue, "invalid setFollowerMode function", _opts.setFollowerMode);
@@ -979,7 +975,7 @@ void DataReplicator::_doNextActions_Rollback_inlock() {
 void DataReplicator::_doNextActions_Steady_inlock() {
     // Check sync source is still good.
     if (_syncSource.empty()) {
-        _syncSource = _opts.syncSourceSelector->chooseNewSyncSource();
+        _syncSource = _opts.syncSourceSelector->chooseNewSyncSource(_lastTimestampFetched);
     }
     if (_syncSource.empty()) {
         // No sync source, reschedule check
@@ -1013,7 +1009,8 @@ void DataReplicator::_doNextActions_Steady_inlock() {
 
     if (!_reporterPaused && (!_reporter || !_reporter->getStatus().isOK())) {
         // TODO get reporter in good shape
-        _reporter.reset(new Reporter(_exec, _opts.replicationProgressManager, _syncSource));
+        _reporter.reset(
+            new Reporter(_exec, _opts.prepareReplSetUpdatePositionCommandFn, _syncSource));
     }
 }
 
@@ -1194,7 +1191,7 @@ void DataReplicator::_setState_inlock(const DataReplicatorState& newState) {
 
 Status DataReplicator::_ensureGoodSyncSource_inlock() {
     if (_syncSource.empty()) {
-        _syncSource = _opts.syncSourceSelector->chooseNewSyncSource();
+        _syncSource = _opts.syncSourceSelector->chooseNewSyncSource(_lastTimestampFetched);
         if (!_syncSource.empty()) {
             return Status::OK();
         }

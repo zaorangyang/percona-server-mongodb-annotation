@@ -26,13 +26,14 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/catalog/catalog_manager_mock.h"
 
 #include "mongo/base/status.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_settings.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -52,27 +53,23 @@ ConnectionString CatalogManagerMock::connectionString() const {
     return kConfigHost;
 }
 
-Status CatalogManagerMock::startup(bool upgrade) {
+Status CatalogManagerMock::startup() {
     return Status::OK();
 }
 
 void CatalogManagerMock::shutDown() {}
 
-Status CatalogManagerMock::enableSharding(const string& dbName) {
-    return Status::OK();
-}
-
 Status CatalogManagerMock::shardCollection(OperationContext* txn,
                                            const string& ns,
                                            const ShardKeyPattern& fieldsAndOrder,
                                            bool unique,
-                                           vector<BSONObj>* initPoints,
-                                           std::set<ShardId>* initShardIds) {
+                                           const vector<BSONObj>& initPoints,
+                                           const std::set<ShardId>& initShardIds) {
     return Status::OK();
 }
 
 StatusWith<string> CatalogManagerMock::addShard(OperationContext* txn,
-                                                const string& name,
+                                                const std::string* shardProposedName,
                                                 const ConnectionString& shardConnectionString,
                                                 const long long maxSize) {
     return Status::OK();
@@ -81,10 +78,6 @@ StatusWith<string> CatalogManagerMock::addShard(OperationContext* txn,
 StatusWith<ShardDrainingStatus> CatalogManagerMock::removeShard(OperationContext* txn,
                                                                 const string& name) {
     return ShardDrainingStatus::COMPLETED;
-}
-
-Status CatalogManagerMock::createDatabase(const string& dbName) {
-    return Status::OK();
 }
 
 Status CatalogManagerMock::updateDatabase(const string& dbName, const DatabaseType& db) {
@@ -105,10 +98,6 @@ StatusWith<CollectionType> CatalogManagerMock::getCollection(const string& collN
 
 Status CatalogManagerMock::getCollections(const string* dbName,
                                           vector<CollectionType>* collections) {
-    return Status::OK();
-}
-
-Status CatalogManagerMock::dropCollection(OperationContext* txn, const string& collectionNs) {
     return Status::OK();
 }
 
@@ -135,10 +124,6 @@ StatusWith<string> CatalogManagerMock::getTagForChunk(const string& collectionNs
 
 Status CatalogManagerMock::getAllShards(vector<ShardType>* shards) {
     return Status::OK();
-}
-
-bool CatalogManagerMock::isShardHost(const ConnectionString& shardConnectionString) {
-    return false;
 }
 
 bool CatalogManagerMock::runUserManagementWriteCommand(const string& commandName,
@@ -175,6 +160,18 @@ void CatalogManagerMock::writeConfigServerDirect(const BatchedCommandRequest& re
 
 DistLockManager* CatalogManagerMock::getDistLockManager() const {
     return _mockDistLockMgr.get();
+}
+
+Status CatalogManagerMock::_checkDbDoesNotExist(const std::string& dbName, DatabaseType* db) const {
+    return Status::OK();
+}
+
+StatusWith<std::string> CatalogManagerMock::_generateNewShardName() const {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
+Status CatalogManagerMock::checkAndUpgrade(bool checkOnly) {
+    return Status::OK();
 }
 
 }  // namespace mongo

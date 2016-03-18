@@ -28,20 +28,21 @@
 
 #pragma once
 
-#include <functional>
-#include <future>
 #include <type_traits>
 #include <vector>
 
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/stdx/functional.h"
+#include "mongo/stdx/future.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
 class BSONObj;
 class CatalogManagerReplicaSet;
 class DistLockManagerMock;
-struct RemoteCommandRequest;
 class ShardRegistry;
 template <typename T>
 class StatusWith;
@@ -62,7 +63,7 @@ public:
     template <class T>
     class FutureHandle {
     public:
-        FutureHandle<T>(std::future<T> future,
+        FutureHandle<T>(stdx::future<T> future,
                         executor::TaskExecutor* executor,
                         executor::NetworkInterfaceMock* network)
             : _future(std::move(future)), _executor(executor), _network(network) {}
@@ -100,21 +101,15 @@ public:
         }
 
         template <class Rep, class Period>
-        std::future_status wait_for(
-            const std::chrono::duration<Rep, Period>& timeout_duration) const {
-            return _future.wait_for(timeout_duration);
-        }
+        T timed_get(const stdx::chrono::duration<Rep, Period>& timeout_duration) {
+            auto status = _future.wait_for(timeout_duration);
+            ASSERT(status == stdx::future_status::ready);
 
-        void wait() const {
-            _future.wait();
-        }
-
-        T get() {
             return _future.get();
         }
 
     private:
-        std::future<T> _future;
+        stdx::future<T> _future;
         executor::TaskExecutor* _executor;
         executor::NetworkInterfaceMock* _network;
     };
@@ -129,16 +124,16 @@ public:
      */
     template <typename Lambda>
     FutureHandle<typename std::result_of<Lambda()>::type> launchAsync(Lambda&& func) const {
-        auto future = async(std::launch::async, std::forward<Lambda>(func));
+        auto future = async(stdx::launch::async, std::forward<Lambda>(func));
         return NetworkTestEnv::FutureHandle<typename std::result_of<Lambda()>::type>{
             std::move(future), _executor, _mockNetwork};
     }
 
 
-    using OnCommandFunction = std::function<StatusWith<BSONObj>(const RemoteCommandRequest&)>;
+    using OnCommandFunction = stdx::function<StatusWith<BSONObj>(const RemoteCommandRequest&)>;
 
     using OnFindCommandFunction =
-        std::function<StatusWith<std::vector<BSONObj>>(const RemoteCommandRequest&)>;
+        stdx::function<StatusWith<std::vector<BSONObj>>(const RemoteCommandRequest&)>;
 
     /**
      * Create a new environment based on the given network.

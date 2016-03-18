@@ -62,12 +62,12 @@ namespace mongo {
             if (params.directoryperdb) {
                 severe() << "PerconaFT: directoryPerDB not yet supported.  This option is incompatible with PerconaFT.";
                 severe() << "PerconaFT: The following server crash is intentional.";
-                fassertFailedNoTrace(28728);
+                fassertFailedNoTrace(28828);
             }
             if (tokuftGlobalOptions.engineOptions.directoryForIndexes) {
                 severe() << "PerconaFT: directoryForIndexes not yet supported.  This option is incompatible with PerconaFT.";
                 severe() << "PerconaFT: The following server crash is intentional.";
-                fassertFailedNoTrace(28729);
+                fassertFailedNoTrace(28929);
             }
 
             KVStorageEngineOptions options;

@@ -57,19 +57,17 @@ public:
     virtual StageState work(WorkingSetID* out);
     virtual bool isEOF();
 
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-
-    virtual std::vector<PlanStage*> getChildren() const;
+    virtual void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    virtual void doSaveState();
+    virtual void doRestoreState();
+    virtual void doDetachFromOperationContext();
+    virtual void doReattachToOperationContext(OperationContext* opCtx);
 
     virtual StageType stageType() const {
         return STAGE_COLLSCAN;
     }
 
-    virtual PlanStageStats* getStats();
-
-    virtual const CommonStats* getCommonStats() const;
+    virtual std::unique_ptr<PlanStageStats> getStats();
 
     virtual const SpecificStats* getSpecificStats() const;
 
@@ -99,12 +97,12 @@ private:
 
     RecordId _lastSeenId;  // Null if nothing has been returned from _cursor yet.
 
-    // We allocate a working set member with this id on construction of the stage. It gets
-    // used for all fetch requests, changing the RecordId as appropriate.
+    // We allocate a working set member with this id on construction of the stage. It gets used for
+    // all fetch requests. This should only be used for passing up the Fetcher for a NEED_YIELD, and
+    // should remain in the INVALID state.
     const WorkingSetID _wsidForFetch;
 
     // Stats
-    CommonStats _commonStats;
     CollectionScanStats _specificStats;
 };
 

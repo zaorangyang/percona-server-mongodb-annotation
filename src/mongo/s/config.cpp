@@ -43,6 +43,8 @@
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_database.h"
+#include "mongo/s/catalog/type_lockpings.h"
+#include "mongo/s/catalog/type_locks.h"
 #include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
@@ -51,8 +53,6 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/type_locks.h"
-#include "mongo/s/type_lockpings.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -438,10 +438,10 @@ bool DBConfig::_load() {
 
     for (const auto& coll : collections) {
         if (coll.getDropped()) {
-            _collections.erase(coll.getNs());
+            _collections.erase(coll.getNs().ns());
             numCollsErased++;
         } else {
-            _collections[coll.getNs()] = CollectionInfo(coll);
+            _collections[coll.getNs().ns()] = CollectionInfo(coll);
             numCollsSharded++;
         }
     }
@@ -599,7 +599,7 @@ bool DBConfig::_dropShardedCollections(OperationContext* txn,
 
         i->second.getCM()->getAllShardIds(&shardIds);
 
-        uassertStatusOK(grid.catalogManager()->dropCollection(txn, i->first));
+        uassertStatusOK(grid.catalogManager()->dropCollection(txn, NamespaceString(i->first)));
 
         // We should warn, but it's not a fatal error if someone else reloaded the db/coll as
         // unsharded in the meantime

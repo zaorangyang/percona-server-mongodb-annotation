@@ -149,6 +149,8 @@ void Strategy::queryOp(Request& r) {
 
     Timer queryTimer;
 
+    globalOpCounters.gotQuery();
+
     QueryMessage q(r.d());
 
     NamespaceString ns(q.ns);
@@ -390,9 +392,8 @@ void Strategy::commandOp(const string& db,
         CommandResult result;
         result.shardTargetId = shardId;
 
-        string errMsg;  // ignored, should never be invalid b/c an exception thrown earlier
-        result.target =
-            ConnectionString::parse(cursor.getShardCursor(shardId)->originalHost(), errMsg);
+        result.target = fassertStatusOK(
+            28739, ConnectionString::parse(cursor.getShardCursor(shardId)->originalHost()));
         result.result = cursor.getShardCursor(shardId)->peekFirst().getOwned();
         results->push_back(result);
     }
@@ -444,8 +445,7 @@ Status Strategy::commandOpWrite(const std::string& dbName,
         if (!status.isOK())
             return status;
 
-        RawBSONSerializable request(command);
-        dispatcher.addCommand(host, dbName, request);
+        dispatcher.addCommand(host, dbName, command);
     }
 
     // Errors reported when recv'ing responses
@@ -660,7 +660,7 @@ void Strategy::writeOp(int op, Request& r) {
         NamespaceString fullNS(request->getNS());
         string cmdNS = fullNS.getCommandNS();
         // We only pass in collection name to command
-        request->setNS(fullNS.coll());
+        request->setNS(fullNS);
 
         BSONObjBuilder builder;
         BSONObj requestBSON = request->toBSON();

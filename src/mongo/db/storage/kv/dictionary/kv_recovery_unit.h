@@ -20,6 +20,8 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
     <http://www.gnu.org/licenses/>.
 ======= */
 
+#pragma once
+
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/recovery_unit.h"
 

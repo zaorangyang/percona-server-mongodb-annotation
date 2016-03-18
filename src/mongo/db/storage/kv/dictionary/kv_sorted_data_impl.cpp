@@ -650,12 +650,9 @@ namespace mongo {
 
             _savedLoc = getRecordId();
             _cursor.reset();
-            _txn = NULL;
         }
 
-        void restore(OperationContext* txn) {
-            invariant(!_txn);
-            _txn = txn;
+        void restore() {
             _initialized = true;
             if (_keyStringWasSaved) {
                 _restoredPositionFound = this->_locateWhilePreservingCache(_savedKeyString);
@@ -663,6 +660,16 @@ namespace mongo {
             } else {
                 invariant(isEOF()); // this is the whole point!
             }
+        }
+
+        void detachFromOperationContext() {
+            invariant(!_cursor);
+            _txn = NULL;
+        }
+
+        void reattachToOperationContext(OperationContext* opCtx) {
+            invariant(_txn == NULL);
+            _txn = opCtx;
         }
     };
 

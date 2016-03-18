@@ -28,11 +28,11 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <type_traits>
 
 #include "mongo/base/status_with.h"
-#include "mongo/platform/cstdint.h"
 
 namespace mongo {
 class BSONObj;
@@ -100,6 +100,11 @@ StatusWith<ProtocolSet> parseProtocolSet(StringData repr);
  * Determines the ProtocolSet of a remote server from an isMaster reply.
  */
 StatusWith<ProtocolSet> parseProtocolSetFromIsMasterReply(const BSONObj& isMasterReply);
+
+/**
+ * Returns true if wire version supports OP_COMMAND in mongod (not mongos).
+ */
+bool supportsWireVersionForOpCommandInMongod(int minWireVersion, int maxWireVersion);
 
 }  // namespace rpc
 }  // namespace mongo

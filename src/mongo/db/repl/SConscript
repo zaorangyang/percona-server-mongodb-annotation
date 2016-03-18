@@ -2,6 +2,25 @@
 
 Import("env")
 
+env.Library(
+    target='bgsync',
+    source=[
+        'bgsync.cpp',
+    ],
+    LIBDEPS=[
+        'repl_coordinator_interface',
+        'rollback_source_impl',
+        'rs_rollback',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
+        '$BUILD_DIR/mongo/db/commands/server_status_core',
+        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/db/stats/timer_stats',
+        '$BUILD_DIR/mongo/executor/task_executor_interface',
+        '$BUILD_DIR/mongo/util/fail_point',
+    ],
+)
+
 env.Library('repl_settings',
             'repl_settings.cpp',
             LIBDEPS=[
@@ -42,7 +61,6 @@ env.Library(
         'database_task',
         'task_runner',
         'storage_interface',
-        '$BUILD_DIR/mongo/client/remote_command_runner',
         '$BUILD_DIR/mongo/executor/network_interface',
         '$BUILD_DIR/mongo/executor/task_executor_interface',
         '$BUILD_DIR/mongo/util/foundation',
@@ -58,6 +76,7 @@ env.Library(
     LIBDEPS=[
         'replication_executor',
         'replmocks',
+        '$BUILD_DIR/mongo/executor/task_executor_test_fixture',
     ],
 )
 
@@ -68,6 +87,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'replication_executor_test_fixture',
+        '$BUILD_DIR/mongo/executor/task_executor_test_fixture',
         '$BUILD_DIR/mongo/unittest/concurrency',
     ],
 )
@@ -338,9 +358,9 @@ env.Library('replmocks',
                 'storage_interface',
             ])
 
-env.Library('read_after_optime_args',
+env.Library('read_concern_args',
             [
-                'read_after_optime_args.cpp'
+                'read_concern_args.cpp'
             ],
             LIBDEPS=[
                 '$BUILD_DIR/mongo/base/base',
@@ -353,7 +373,7 @@ env.Library('replica_set_messages',
                 'handshake_args.cpp',
                 'is_master_response.cpp',
                 'member_config.cpp',
-                'read_after_optime_response.cpp',
+                'read_concern_response.cpp',
                 'repl_set_declare_election_winner_args.cpp',
                 'repl_set_heartbeat_args.cpp',
                 'repl_set_heartbeat_args_v1.cpp',
@@ -362,11 +382,12 @@ env.Library('replica_set_messages',
                 'repl_set_request_votes_args.cpp',
                 'replica_set_config.cpp',
                 'replica_set_tag.cpp',
+                'replication_metadata.cpp',
                 'update_position_args.cpp',
                 'last_vote.cpp',
             ],
             LIBDEPS=[
-                'read_after_optime_args',
+                'read_concern_args',
                 '$BUILD_DIR/mongo/bson/bson',
                 '$BUILD_DIR/mongo/bson/util/bson_extract',
                 '$BUILD_DIR/mongo/util/net/hostandport',
@@ -536,17 +557,17 @@ env.CppUnitTest(
 )
 
 env.CppUnitTest(
-    target='read_after_optime_args_test',
+    target='read_concern_args_test',
     source=[
-        'read_after_optime_args_test.cpp',
+        'read_concern_args_test.cpp',
     ],
     LIBDEPS=['replica_set_messages']
 )
 
 env.CppUnitTest(
-    target='read_after_optime_response_test',
+    target='read_concern_response_test',
     source=[
-        'read_after_optime_response_test.cpp',
+        'read_concern_response_test.cpp',
     ],
     LIBDEPS=['replica_set_messages']
 )

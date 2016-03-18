@@ -67,4 +67,4 @@ var blacklist = [
 // SERVER-16196 re-enable executing workloads against sharded clusters
 // runWorkloadsSerially(ls(dir).filter(function(file) {
 //     return !Array.contains(blacklist, file);
-// }), { sharded: true });
+// }), { sharded: true, useLegacyConfigServers: false });

@@ -43,47 +43,18 @@ const int64_t prngSeed = 1;
 
 }  // namespace
 
-// static
-Status ReplicationExecutorTest::getDetectableErrorStatus() {
-    return Status(ErrorCodes::InternalError, "Not mutated");
-}
-
-void ReplicationExecutorTest::launchExecutorThread() {
-    _executor->startup();
-    _executorStarted = true;
-
-    postExecutorThreadLaunch();
+ReplicationExecutor& ReplicationExecutorTest::getReplExecutor() {
+    return dynamic_cast<ReplicationExecutor&>(getExecutor());
 }
 
 void ReplicationExecutorTest::postExecutorThreadLaunch() {
-    _net->enterNetwork();
+    getNet()->enterNetwork();
 }
 
-void ReplicationExecutorTest::joinExecutorThread() {
-    invariant(_executorStarted);
-
-    _net->exitNetwork();
-    _executor->join();
-    _executorStarted = false;
-}
-
-void ReplicationExecutorTest::setUp() {
-    _net = new executor::NetworkInterfaceMock();
+std::unique_ptr<executor::TaskExecutor> ReplicationExecutorTest::makeTaskExecutor(
+    std::unique_ptr<executor::NetworkInterface> net) {
     _storage = new StorageInterfaceMock();
-
-    // Takes ownership of the net and storage
-    _executor = stdx::make_unique<ReplicationExecutor>(_net, _storage, prngSeed);
-}
-
-void ReplicationExecutorTest::tearDown() {
-    if (_executorStarted) {
-        _executor->shutdown();
-        joinExecutorThread();
-
-        _net = nullptr;
-        _storage = nullptr;
-        _executor.reset();
-    }
+    return stdx::make_unique<ReplicationExecutor>(net.release(), _storage, prngSeed);
 }
 
 }  // namespace repl

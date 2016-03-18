@@ -41,9 +41,9 @@
 #include "mongo/db/query/find_and_modify_request.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
+#include "mongo/s/catalog/type_lockpings.h"
+#include "mongo/s/catalog/type_locks.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/type_lockpings.h"
-#include "mongo/s/type_locks.h"
 #include "mongo/s/write_ops/wc_error_detail.h"
 #include "mongo/util/time_support.h"
 
@@ -107,7 +107,7 @@ StatusWith<BSONObj> extractFindAndModifyNewObj(const BSONObj& responseObj) {
         return newDocElem.Obj();
     }
 
-    return {ErrorCodes::LockStateChangeFailed,
+    return {ErrorCodes::UnsupportedFormat,
             str::stream() << "no '" << kFindAndModifyResponseResultDocField
                           << "' in findAndModify response"};
 }
@@ -138,11 +138,9 @@ StatusWith<OID> extractElectionId(const BSONObj& responseObj) {
 
 }  // unnamed namespace
 
-DistLockCatalogImpl::DistLockCatalogImpl(RemoteCommandTargeter* targeter,
-                                         ShardRegistry* shardRegistry,
+DistLockCatalogImpl::DistLockCatalogImpl(ShardRegistry* shardRegistry,
                                          Milliseconds writeConcernTimeout)
     : _client(shardRegistry),
-      _targeter(targeter),
       _writeConcern(WriteConcernOptions(WriteConcernOptions::kMajority,
                                         WriteConcernOptions::JOURNAL,
                                         writeConcernTimeout.count())),
@@ -151,8 +149,12 @@ DistLockCatalogImpl::DistLockCatalogImpl(RemoteCommandTargeter* targeter,
 
 DistLockCatalogImpl::~DistLockCatalogImpl() = default;
 
+RemoteCommandTargeter* DistLockCatalogImpl::_targeter() {
+    return _client->getShard("config")->getTargeter();
+}
+
 StatusWith<LockpingsType> DistLockCatalogImpl::getPing(StringData processID) {
-    auto targetStatus = _targeter->findHost(kReadPref);
+    auto targetStatus = _targeter()->findHost(kReadPref);
 
     if (!targetStatus.isOK()) {
         return targetStatus.getStatus();
@@ -175,18 +177,19 @@ StatusWith<LockpingsType> DistLockCatalogImpl::getPing(StringData processID) {
                 str::stream() << "ping entry for " << processID << " not found"};
     }
 
-    LockpingsType pingDoc;
-
-    string errMsg;
-    if (!pingDoc.parseBSON(findResultSet.front(), &errMsg)) {
-        return {ErrorCodes::FailedToParse, errMsg};
+    BSONObj doc = findResultSet.front();
+    auto pingDocResult = LockpingsType::fromBSON(doc);
+    if (!pingDocResult.isOK()) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "failed to parse document: " << doc << " : "
+                              << pingDocResult.getStatus().toString()};
     }
 
-    return pingDoc;
+    return pingDocResult.getValue();
 }
 
 Status DistLockCatalogImpl::ping(StringData processID, Date_t ping) {
-    auto targetStatus = _targeter->findHost(kReadPref);
+    auto targetStatus = _targeter()->findHost(kReadPref);
 
     if (!targetStatus.isOK()) {
         return targetStatus.getStatus();
@@ -224,7 +227,7 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(StringData lockID,
                                                     StringData processId,
                                                     Date_t time,
                                                     StringData why) {
-    auto targetStatus = _targeter->findHost(kReadPref);
+    auto targetStatus = _targeter()->findHost(kReadPref);
 
     if (!targetStatus.isOK()) {
         return targetStatus.getStatus();
@@ -263,19 +266,15 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(StringData lockID,
         return findAndModifyStatus.getStatus();
     }
 
-    BSONObj newDoc(findAndModifyStatus.getValue());
-
-    if (newDoc.isEmpty()) {
-        return LocksType();
+    BSONObj doc = findAndModifyStatus.getValue();
+    auto locksTypeResult = LocksType::fromBSON(doc);
+    if (!locksTypeResult.isOK()) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "failed to parse: " << doc << " : "
+                              << locksTypeResult.getStatus().toString()};
     }
 
-    LocksType lockDoc;
-    string errMsg;
-    if (!lockDoc.parseBSON(newDoc, &errMsg)) {
-        return {ErrorCodes::FailedToParse, errMsg};
-    }
-
-    return lockDoc;
+    return locksTypeResult.getValue();
 }
 
 StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(StringData lockID,
@@ -285,7 +284,7 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(StringData lockID,
                                                         StringData processId,
                                                         Date_t time,
                                                         StringData why) {
-    auto targetStatus = _targeter->findHost(kReadPref);
+    auto targetStatus = _targeter()->findHost(kReadPref);
 
     if (!targetStatus.isOK()) {
         return targetStatus.getStatus();
@@ -320,23 +319,19 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(StringData lockID,
         return findAndModifyStatus.getStatus();
     }
 
-    BSONObj newDoc(findAndModifyStatus.getValue());
-
-    if (newDoc.isEmpty()) {
-        return LocksType();
+    BSONObj doc = findAndModifyStatus.getValue();
+    auto locksTypeResult = LocksType::fromBSON(doc);
+    if (!locksTypeResult.isOK()) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "failed to parse: " << doc << " : "
+                              << locksTypeResult.getStatus().toString()};
     }
 
-    LocksType lockDoc;
-    string errMsg;
-    if (!lockDoc.parseBSON(newDoc, &errMsg)) {
-        return {ErrorCodes::FailedToParse, errMsg};
-    }
-
-    return lockDoc;
+    return locksTypeResult.getValue();
 }
 
 Status DistLockCatalogImpl::unlock(const OID& lockSessionID) {
-    auto targetStatus = _targeter->findHost(kReadPref);
+    auto targetStatus = _targeter()->findHost(kReadPref);
 
     if (!targetStatus.isOK()) {
         return targetStatus.getStatus();
@@ -370,7 +365,7 @@ Status DistLockCatalogImpl::unlock(const OID& lockSessionID) {
 }
 
 StatusWith<DistLockCatalog::ServerInfo> DistLockCatalogImpl::getServerInfo() {
-    auto targetStatus = _targeter->findHost(kReadPref);
+    auto targetStatus = _targeter()->findHost(kReadPref);
 
     if (!targetStatus.isOK()) {
         return targetStatus.getStatus();
@@ -409,7 +404,7 @@ StatusWith<DistLockCatalog::ServerInfo> DistLockCatalogImpl::getServerInfo() {
 }
 
 StatusWith<LocksType> DistLockCatalogImpl::getLockByTS(const OID& lockSessionID) {
-    auto targetStatus = _targeter->findHost(kReadPref);
+    auto targetStatus = _targeter()->findHost(kReadPref);
 
     if (!targetStatus.isOK()) {
         return targetStatus.getStatus();
@@ -429,18 +424,19 @@ StatusWith<LocksType> DistLockCatalogImpl::getLockByTS(const OID& lockSessionID)
                 str::stream() << "lock with ts " << lockSessionID << " not found"};
     }
 
-    LocksType lockDoc;
-
-    string errMsg;
-    if (!lockDoc.parseBSON(findResultSet.front(), &errMsg)) {
-        return {ErrorCodes::FailedToParse, errMsg};
+    BSONObj doc = findResultSet.front();
+    auto locksTypeResult = LocksType::fromBSON(doc);
+    if (!locksTypeResult.isOK()) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "failed to parse: " << doc << " : "
+                              << locksTypeResult.getStatus().toString()};
     }
 
-    return lockDoc;
+    return locksTypeResult.getValue();
 }
 
 StatusWith<LocksType> DistLockCatalogImpl::getLockByName(StringData name) {
-    auto targetStatus = _targeter->findHost(kReadPref);
+    auto targetStatus = _targeter()->findHost(kReadPref);
 
     if (!targetStatus.isOK()) {
         return targetStatus.getStatus();
@@ -460,18 +456,19 @@ StatusWith<LocksType> DistLockCatalogImpl::getLockByName(StringData name) {
                 str::stream() << "lock with name " << name << " not found"};
     }
 
-    LocksType lockDoc;
-
-    string errMsg;
-    if (!lockDoc.parseBSON(findResultSet.front(), &errMsg)) {
-        return {ErrorCodes::FailedToParse, errMsg};
+    BSONObj doc = findResultSet.front();
+    auto locksTypeResult = LocksType::fromBSON(doc);
+    if (!locksTypeResult.isOK()) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "failed to parse: " << doc << " : "
+                              << locksTypeResult.getStatus().toString()};
     }
 
-    return lockDoc;
+    return locksTypeResult.getValue();
 }
 
 Status DistLockCatalogImpl::stopPing(StringData processId) {
-    auto targetStatus = _targeter->findHost(kReadPref);
+    auto targetStatus = _targeter()->findHost(kReadPref);
 
     if (!targetStatus.isOK()) {
         return targetStatus.getStatus();

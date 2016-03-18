@@ -152,9 +152,11 @@ public:
      */
     static bool isSimpleIdQuery(const BSONObj& query);
 
-    // What namespace is this query over?
+    const NamespaceString& nss() const {
+        return _pq->nss();
+    }
     const std::string& ns() const {
-        return _pq->ns();
+        return _pq->nss().ns();
     }
 
     //
@@ -205,16 +207,6 @@ public:
      * Returns a count of 'type' nodes in expression tree.
      */
     static size_t countNodes(const MatchExpression* root, MatchExpression::MatchType type);
-
-    /**
-     * Takes ownership of 'tree'.  Performs some rewriting of the query to a logically
-     * equivalent but more digestible form.
-     *
-     * TODO: This doesn't entirely belong here.  Really we'd do this while exploring
-     * solutions in an enumeration setting but given the current lack of pruning
-     * while exploring the enumeration space we do it here.
-     */
-    static MatchExpression* logicalRewrite(MatchExpression* tree);
 
 private:
     // You must go through canonicalize to create a CanonicalQuery.

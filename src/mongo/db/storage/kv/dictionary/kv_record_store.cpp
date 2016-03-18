@@ -113,7 +113,7 @@ namespace mongo {
         }
     }
 
-#define invariantKVOK(s, expr) massert(28733, expr, s.isOK())
+#define invariantKVOK(s, expr) massert(28833, expr, s.isOK())
 
     long long KVRecordStore::dataSize( OperationContext* txn ) const {
         if (_sizeStorer) {
@@ -186,7 +186,7 @@ namespace mongo {
                 return RecordData(nullptr, 0);
             } else {
                 log() << "storage engine get() failed, operation will fail: " << status.toString();
-                uasserted(28722, status.toString());
+                uasserted(28822, status.toString());
             }
         }
 
@@ -197,7 +197,7 @@ namespace mongo {
     RecordData KVRecordStore::dataFor( OperationContext* txn, const RecordId& loc) const {
         RecordData rd;
         bool found = findRecord(txn, loc, &rd);
-        massert(28723, "Didn't find RecordId in record store", found);
+        massert(28823, "Didn't find RecordId in record store", found);
         return rd;
     }
 
@@ -562,19 +562,17 @@ namespace mongo {
     }
 
     void KVRecordStore::KVRecordCursor::saveState() {
-        if (_txn == NULL && !_cursor) return;
+        if (!_cursor) return;
         // we need to drop the current cursor because it was created with
         // an operation context that the caller intends to close after
         // this function finishes (and before restoreState() is called,
         // which will give us a new operation context)
         _saveLocAndVal();
         _cursor.reset();
-        _txn = NULL;
     }
 
-    bool KVRecordStore::KVRecordCursor::restoreState(OperationContext* txn) {
-        invariant(!_txn && !_cursor);
-        _txn = txn;
+    bool KVRecordStore::KVRecordCursor::restoreState() {
+        invariant(!_cursor);
         if (!_savedLoc.isNull()) {
             RecordId saved = _savedLoc;
             _setCursor(_savedLoc);
@@ -595,6 +593,16 @@ namespace mongo {
         // because this cursor would have been deleted by higher layers if
         // the collection were to indeed be dropped.
         return true;
+    }
+
+    void KVRecordStore::KVRecordCursor::detachFromOperationContext() {
+        invariant(!_cursor);
+        _txn = NULL;
+    }
+
+    void KVRecordStore::KVRecordCursor::reattachToOperationContext(OperationContext* opCtx) {
+        invariant(_txn == NULL);
+        _txn = opCtx;
     }
 
     RecordData KVRecordStore::KVRecordCursor::dataFor(const RecordId& loc) const {
