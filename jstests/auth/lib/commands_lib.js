@@ -327,6 +327,30 @@ var authCommandsLib = {
             ]
         },
         {
+            testname: "aggregate_indexStats",
+            command: {aggregate: "foo", pipeline: [{$indexStats: {}}]},
+            setup: function (db) {
+                db.createCollection("foo");
+            },
+            teardown: function (db) {
+                db.foo.drop();
+            },
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: {
+                        clusterMonitor: 1,
+                        clusterAdmin: 1,
+                        root: 1,
+                        __system: 1
+                    },
+                    privileges: [
+                        {resource: {anyResource: true}, actions: ["indexStats"]}
+                    ]
+                }
+            ]
+        },
+        {
             testname: "appendOplogNote",
             command: {appendOplogNote: 1, data: {a: 1}},
             skipSharded: true,
@@ -344,6 +368,25 @@ var authCommandsLib = {
                         { resource: {cluster: true}, actions: ["appendOplogNote"] }
                     ],
                     expectFail: true, // because no replication enabled
+                },
+                { runOnDb: firstDbName, roles: {} },
+                { runOnDb: secondDbName, roles: {} }
+            ]
+        },
+        {
+            testname: "authSchemaUpgrade",
+            command: {authSchemaUpgrade: 1},
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: {
+                        userAdminAnyDatabase: 1,
+                        root: 1,
+                        __system: 1
+                    },
+                    privileges: [
+                        { resource: {cluster: true}, actions: ["authSchemaUpgrade"] }
+                    ]
                 },
                 { runOnDb: firstDbName, roles: {} },
                 { runOnDb: secondDbName, roles: {} }
@@ -1116,6 +1159,21 @@ var authCommandsLib = {
             ]
         },
         {
+            testname: "findWithTerm",
+            command: {find: "foo", limit: -1, term: NumberLong(1)},
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: {__system: 1},
+                    privileges: [
+                        { resource: {db: firstDbName, collection: "foo"}, actions: ["find"] },
+                        { resource: {cluster: true}, actions: ["internal"] }
+                    ],
+                    expectFail: true // because of invalid limit
+                },
+            ]
+        },
+        {
             testname: "findAndModify",
             command: {findAndModify: "x", query: {_id: "abc"}, update: {$inc: {n: 1}}},
             setup: function (db) {
@@ -1301,6 +1359,21 @@ var authCommandsLib = {
                     roles: roles_readAny,
                     privileges: [
                         { resource: {db: secondDbName, collection: "foo"}, actions: ["find"] }
+                    ],
+                    expectFail: true
+                }
+            ]
+        },
+        {
+            testname: "getMoreWithTerm",
+            command: {getMore: NumberLong("1"), collection: "foo", term: NumberLong(1)},
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: {__system: 1},
+                    privileges: [
+                        { resource: {db: firstDbName, collection: "foo"}, actions: ["find"] },
+                        { resource: {cluster: true}, actions: ["internal"] }
                     ],
                     expectFail: true
                 }

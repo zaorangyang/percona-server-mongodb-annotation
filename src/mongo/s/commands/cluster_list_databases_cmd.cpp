@@ -94,7 +94,7 @@ public:
         grid.shardRegistry()->getAllShardIds(&shardIds);
 
         for (const ShardId& shardId : shardIds) {
-            const auto s = grid.shardRegistry()->getShard(shardId);
+            const auto s = grid.shardRegistry()->getShard(txn, shardId);
             if (!s) {
                 continue;
             }
@@ -102,8 +102,8 @@ public:
             const auto shardHost = uassertStatusOK(s->getTargeter()->findHost(
                 {ReadPreference::PrimaryPreferred, TagSet::primaryOnly()}));
 
-            BSONObj x = uassertStatusOK(
-                grid.shardRegistry()->runCommand(shardHost, "admin", BSON("listDatabases" << 1)));
+            BSONObj x = uassertStatusOK(grid.shardRegistry()->runCommand(
+                txn, shardHost, "admin", BSON("listDatabases" << 1)));
 
             BSONObjIterator j(x["databases"].Obj());
             while (j.more()) {
@@ -163,7 +163,7 @@ public:
             // get config db from the config servers
             BSONObjBuilder builder;
 
-            if (!catalogManager->runReadCommand("config", BSON("dbstats" << 1), &builder)) {
+            if (!catalogManager->runReadCommand(txn, "config", BSON("dbstats" << 1), &builder)) {
                 bb.append(BSON("name"
                                << "config"));
             } else {
@@ -184,7 +184,7 @@ public:
             // get admin db from the config servers
             BSONObjBuilder builder;
 
-            if (!catalogManager->runReadCommand("admin", BSON("dbstats" << 1), &builder)) {
+            if (!catalogManager->runReadCommand(txn, "admin", BSON("dbstats" << 1), &builder)) {
                 bb.append(BSON("name"
                                << "admin"));
             } else {

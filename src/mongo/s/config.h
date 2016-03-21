@@ -145,7 +145,8 @@ public:
 
     // Atomically returns *either* the chunk manager *or* the primary shard for the collection,
     // neither if the collection doesn't exist.
-    void getChunkManagerOrPrimary(const std::string& ns,
+    void getChunkManagerOrPrimary(OperationContext* txn,
+                                  const std::string& ns,
                                   std::shared_ptr<ChunkManager>& manager,
                                   std::shared_ptr<Shard>& primary);
 
@@ -161,7 +162,7 @@ public:
     /**
      * Returns shard id for primary shard for the database for which this DBConfig represents.
      */
-    const ShardId& getShardId(const std::string& ns);
+    const ShardId& getShardId(OperationContext* txn, const std::string& ns);
 
     void setPrimary(OperationContext* txn, const std::string& s);
 
@@ -211,8 +212,23 @@ class ConfigServer {
 public:
     static void reloadSettings(OperationContext* txn);
 
-    static void replicaSetChange(const std::string& setName,
-                                 const std::string& newConnectionString);
+    /**
+     * For use in mongos and mongod which needs notifications about changes to shard and config
+     * server replset membership to update the ShardRegistry.
+     *
+     * This is expected to be run in an existing thread.
+     */
+    static void replicaSetChangeShardRegistryUpdateHook(const std::string& setName,
+                                                        const std::string& newConnectionString);
+
+    /**
+     * For use in mongos which needs notifications about changes to shard replset membership to
+     * update the config.shards collection.
+     *
+     * This is expected to be run in a brand new thread.
+     */
+    static void replicaSetChangeConfigServerUpdateHook(const std::string& setName,
+                                                       const std::string& newConnectionString);
 };
 
 }  // namespace mongo

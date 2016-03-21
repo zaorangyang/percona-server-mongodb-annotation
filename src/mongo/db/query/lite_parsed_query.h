@@ -109,7 +109,7 @@ public:
         bool isOplogReplay = false,
         bool isNoCursorTimeout = false,
         bool isAwaitData = false,
-        bool isPartial = false);
+        bool allowPartialResults = false);
 
     /**
      * Converts this LPQ into a find command.
@@ -150,19 +150,26 @@ public:
      */
     static bool isQueryIsolated(const BSONObj& query);
 
-    // Name of the find command parameter used to pass read preference.
-    static const char* kFindCommandReadPrefField;
+    // Read preference is attached to commands in "wrapped" form, e.g.
+    //   { $query: { <cmd>: ... } , <kWrappedReadPrefField>: { ... } }
+    //
+    // However, mongos internally "unwraps" the read preference and adds it as a parameter to the
+    // command, e.g.
+    //  { <cmd>: ... , <kUnwrappedReadPrefField>: { <kWrappedReadPrefField>: { ... } } }
+    static const std::string kWrappedReadPrefField;
+    static const std::string kUnwrappedReadPrefField;
 
     // Names of the maxTimeMS command and query option.
     static const std::string cmdOptionMaxTimeMS;
     static const std::string queryOptionMaxTimeMS;
 
     // Names of the $meta projection values.
-    static const std::string metaTextScore;
     static const std::string metaGeoNearDistance;
     static const std::string metaGeoNearPoint;
-    static const std::string metaRecordId;
     static const std::string metaIndexKey;
+    static const std::string metaRecordId;
+    static const std::string metaSortKey;
+    static const std::string metaTextScore;
 
     const NamespaceString& nss() const {
         return _nss;
@@ -262,8 +269,8 @@ public:
     bool isExhaust() const {
         return _exhaust;
     }
-    bool isPartial() const {
-        return _partial;
+    bool isAllowPartialResults() const {
+        return _allowPartialResults;
     }
 
     boost::optional<long long> getReplicationTerm() const {
@@ -384,7 +391,7 @@ private:
     bool _noCursorTimeout = false;
     bool _awaitData = false;
     bool _exhaust = false;
-    bool _partial = false;
+    bool _allowPartialResults = false;
 
     boost::optional<long long> _replicationTerm;
 };

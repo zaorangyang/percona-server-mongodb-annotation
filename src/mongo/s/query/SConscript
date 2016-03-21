@@ -11,6 +11,8 @@ env.Library(
         '$BUILD_DIR/mongo/db/query/query_common',
         "$BUILD_DIR/mongo/s/coreshard",
         "cluster_client_cursor",
+        "cluster_cursor_cleanup_job",
+        "store_possible_cursor",
     ],
 )
 
@@ -30,6 +32,7 @@ env.Library(
         "router_stage_limit.cpp",
         "router_stage_merge.cpp",
         "router_stage_mock.cpp",
+        "router_stage_remove_sortkey.cpp",
         "router_stage_skip.cpp",
     ],
     LIBDEPS=[
@@ -41,6 +44,7 @@ env.CppUnitTest(
     target="router_exec_stage_test",
     source=[
         "router_stage_limit_test.cpp",
+        "router_stage_remove_sortkey_test.cpp",
         "router_stage_skip_test.cpp",
     ],
     LIBDEPS=[
@@ -52,6 +56,7 @@ env.Library(
     target="async_results_merger",
     source=[
         "async_results_merger.cpp",
+        "cluster_client_cursor_params.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/query/command_request_response",
@@ -82,6 +87,24 @@ env.CppUnitTest(
 )
 
 env.Library(
+    target="store_possible_cursor",
+    source=[
+        "store_possible_cursor.cpp"
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/query/command_request_response",
+        "cluster_client_cursor",
+        "cluster_cursor_manager",
+    ],
+    LIBDEPS_TAGS=[
+        # Circular with libmongoscore.  TODO: This tag should be removed as part of the work for
+        # SERVER-20194.
+        'incomplete',
+    ],
+)
+
+env.Library(
     target="cluster_cursor_manager",
     source=[
         "cluster_cursor_manager.cpp",
@@ -100,5 +123,30 @@ env.CppUnitTest(
         "$BUILD_DIR/mongo/util/clock_source_mock",
         "cluster_client_cursor_mock",
         "cluster_cursor_manager",
+    ],
+)
+
+env.Library(
+    target="cluster_cursor_cleanup_job",
+    source=[
+        "cluster_cursor_cleanup_job.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/s/coreshard",
+        "$BUILD_DIR/mongo/util/background_job",
+    ],
+    LIBDEPS_TAGS=[
+        # Needs mongo::inShutDown()
+        'incomplete',
+    ],
+)
+
+env.CppUnitTest(
+    target="cluster_client_cursor_impl_test",
+    source=[
+        "cluster_client_cursor_impl_test.cpp",
+    ],
+    LIBDEPS=[
+        "cluster_client_cursor",
     ],
 )

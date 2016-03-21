@@ -86,7 +86,7 @@ DB.prototype.commandHelp = function( name ){
 
  // Like runCommand but applies readPreference if one has been set
  // on the connection. Also sets slaveOk if a (non-primary) readPref has been set.
- DB.prototype.runReadCommand = function (obj, extra) {
+ DB.prototype.runReadCommand = function (obj, extra, queryOptions) {
      "use strict";
 
      // Support users who call this function with a string commandName, e.g.
@@ -96,9 +96,12 @@ DB.prototype.commandHelp = function( name ){
          this._attachReadPreferenceToCommand(mergedObj,
                                              this.getMongo().getReadPref());
 
-     var options = 0;
-     // We automatically set slaveOk if readPreference is anything but primary.
-     if (this.getMongo().getReadPrefMode() !== "primary") {
+     var options = (typeof(queryOptions) !== "undefined") ? queryOptions : this.getQueryOptions();
+     var readPrefMode = this.getMongo().getReadPrefMode();
+
+     // Set slaveOk if readPrefMode has been explicitly set with a readPreference other than
+     // primary.
+     if (!!readPrefMode && readPrefMode !== "primary") {
          options |= 4;
      }
 

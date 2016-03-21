@@ -153,6 +153,12 @@ public:
         StatusWith<boost::optional<BSONObj>> next();
 
         /**
+         * Returns whether or not the underlying cursor is tailing a capped collection.  Cannot be
+         * called after returnCursor() is called.  A cursor must be owned.
+         */
+        bool isTailable() const;
+
+        /**
          * Transfers ownership of the underlying cursor back to the manager.  A cursor must be
          * owned, and a cursor will no longer be owned after this method completes.
          *
@@ -165,6 +171,17 @@ public:
          * Returns the cursor id for the underlying cursor, or zero if no cursor is owned.
          */
         CursorId getCursorId() const;
+
+        /**
+         * Returns the number of result documents returned so far by this cursor via the next()
+         * method.
+         */
+        long long getNumReturnedSoFar() const;
+
+        /**
+         * Stashes 'obj' to be returned later by this cursor. A cursor must be owned.
+         */
+        void queueResult(const BSONObj& obj);
 
     private:
         // ClusterCursorManager is a friend so that its methods can call the PinnedCursor

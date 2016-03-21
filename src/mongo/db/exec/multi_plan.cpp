@@ -353,7 +353,7 @@ vector<PlanStageStats*> MultiPlanStage::generateCandidateStats() {
             continue;
         }
 
-        unique_ptr<PlanStageStats> stats = std::move(_candidates[ix].root->getStats());
+        unique_ptr<PlanStageStats> stats = _candidates[ix].root->getStats();
         candidateStats.push_back(stats.release());
     }
 
@@ -379,6 +379,10 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
 
         if (PlanStage::ADVANCED == state) {
             // Save result for later.
+            WorkingSetMember* member = candidate.ws->get(id);
+            // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we choose to
+            // return the results from the 'candidate' plan.
+            member->makeObjOwnedIfNeeded();
             candidate.results.push_back(id);
 
             // Once a plan returns enough results, stop working.

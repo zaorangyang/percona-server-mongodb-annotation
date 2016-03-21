@@ -177,6 +177,30 @@ TEST(LiteParsedQueryTest, MinFieldsLessThanMax) {
                       .getStatus());
 }
 
+TEST(LiteParsedQueryTest, ForbidTailableWithNonNaturalSort) {
+    BSONObj cmdObj = fromjson(
+        "{find: 'testns',"
+        "tailable: true,"
+        "sort: {a: 1}}");
+    const NamespaceString nss("test.testns");
+    bool isExplain = false;
+    auto result = LiteParsedQuery::makeFromFindCommand(nss, cmdObj, isExplain);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(LiteParsedQueryTest, AllowTailableWithNaturalSort) {
+    BSONObj cmdObj = fromjson(
+        "{find: 'testns',"
+        "tailable: true,"
+        "sort: {$natural: 1}}");
+    const NamespaceString nss("test.testns");
+    bool isExplain = false;
+    auto result = LiteParsedQuery::makeFromFindCommand(nss, cmdObj, isExplain);
+    ASSERT_OK(result.getStatus());
+    ASSERT_TRUE(result.getValue()->isTailable());
+    ASSERT_EQ(result.getValue()->getSort(), BSON("$natural" << 1));
+}
+
 // Helper function which returns the Status of creating a LiteParsedQuery object with the given
 // parameters.
 void assertLiteParsedQuerySuccess(const BSONObj& query, const BSONObj& proj, const BSONObj& sort) {
@@ -288,7 +312,7 @@ TEST(LiteParsedQueryTest, MakeAsFindCmdDefaultArgs) {
     ASSERT_FALSE(lpq->isOplogReplay());
     ASSERT_FALSE(lpq->isNoCursorTimeout());
     ASSERT_FALSE(lpq->isAwaitData());
-    ASSERT_FALSE(lpq->isPartial());
+    ASSERT_FALSE(lpq->isAllowPartialResults());
 }
 
 TEST(LiteParsedQueryTest, MakeFindCmdAllArgs) {
@@ -350,7 +374,7 @@ TEST(LiteParsedQueryTest, MakeFindCmdAllArgs) {
     ASSERT_TRUE(lpq->isOplogReplay());
     ASSERT_TRUE(lpq->isNoCursorTimeout());
     ASSERT_TRUE(lpq->isAwaitData());
-    ASSERT_TRUE(lpq->isPartial());
+    ASSERT_TRUE(lpq->isAllowPartialResults());
 }
 
 TEST(LiteParsedQueryTest, MakeAsFindCmdNToReturn) {
@@ -412,7 +436,7 @@ TEST(LiteParsedQueryTest, MakeAsFindCmdNToReturn) {
     ASSERT_TRUE(lpq->isOplogReplay());
     ASSERT_TRUE(lpq->isNoCursorTimeout());
     ASSERT_TRUE(lpq->isAwaitData());
-    ASSERT_TRUE(lpq->isPartial());
+    ASSERT_TRUE(lpq->isAllowPartialResults());
 }
 
 //
@@ -552,11 +576,10 @@ TEST(LiteParsedQueryTest, ParseFromCommandAllFlagsTrue) {
     BSONObj cmdObj = fromjson(
         "{find: 'testns',"
         "tailable: true,"
-        "slaveOk: true,"
         "oplogReplay: true,"
         "noCursorTimeout: true,"
         "awaitData: true,"
-        "partial: true}");
+        "allowPartialResults: true}");
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     unique_ptr<LiteParsedQuery> lpq(
@@ -564,11 +587,11 @@ TEST(LiteParsedQueryTest, ParseFromCommandAllFlagsTrue) {
 
     // Test that all the flags got set to true.
     ASSERT(lpq->isTailable());
-    ASSERT(lpq->isSlaveOk());
+    ASSERT(!lpq->isSlaveOk());
     ASSERT(lpq->isOplogReplay());
     ASSERT(lpq->isNoCursorTimeout());
     ASSERT(lpq->isAwaitData());
-    ASSERT(lpq->isPartial());
+    ASSERT(lpq->isAllowPartialResults());
 }
 
 TEST(LiteParsedQueryTest, ParseFromCommandCommentWithValidMinMax) {
@@ -892,7 +915,7 @@ TEST(LiteParsedQueryTest, ParseFromCommandPartialWrongType) {
     BSONObj cmdObj = fromjson(
         "{find: 'testns',"
         "filter:  {a: 1},"
-        "exhaust: 3}");
+        "allowPartialResults: 3}");
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     auto result = LiteParsedQuery::makeFromFindCommand(nss, cmdObj, isExplain);
@@ -1146,7 +1169,7 @@ TEST(LiteParsedQueryTest, DefaultQueryParametersCorrect) {
     ASSERT_EQUALS(false, lpq->isNoCursorTimeout());
     ASSERT_EQUALS(false, lpq->isAwaitData());
     ASSERT_EQUALS(false, lpq->isExhaust());
-    ASSERT_EQUALS(false, lpq->isPartial());
+    ASSERT_EQUALS(false, lpq->isAllowPartialResults());
 }
 
 //

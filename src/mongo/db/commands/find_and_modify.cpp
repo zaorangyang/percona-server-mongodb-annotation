@@ -38,6 +38,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -96,12 +97,22 @@ const DeleteStats* getDeleteStats(const PlanStageStats* stats) {
  *
  * If the operation failed, then an error Status is returned.
  */
-StatusWith<boost::optional<BSONObj>> advanceExecutor(PlanExecutor* exec, bool isRemove) {
+StatusWith<boost::optional<BSONObj>> advanceExecutor(OperationContext* txn,
+                                                     PlanExecutor* exec,
+                                                     bool isRemove,
+                                                     Collection* collection) {
     BSONObj value;
     PlanExecutor::ExecState state = exec->getNext(&value, nullptr);
+    if (collection && PlanExecutor::DEAD != state) {
+        PlanSummaryStats summaryStats;
+        Explain::getSummaryStats(*exec, &summaryStats);
+        collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
+    }
+
     if (PlanExecutor::ADVANCED == state) {
         return boost::optional<BSONObj>(std::move(value));
     }
+
     if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
         const std::unique_ptr<PlanStageStats> stats(exec->getStats());
         error() << "Plan executor error during findAndModify: " << PlanExecutor::statestr(state)
@@ -117,6 +128,7 @@ StatusWith<boost::optional<BSONObj>> advanceExecutor(PlanExecutor* exec, bool is
                 str::stream() << "executor returned " << PlanExecutor::statestr(state)
                               << " while executing " << opstr};
     }
+
     invariant(state == PlanExecutor::IS_EOF);
     return boost::optional<BSONObj>(boost::none);
 }
@@ -217,6 +229,7 @@ public:
                    const std::string& dbName,
                    const BSONObj& cmdObj,
                    ExplainCommon::Verbosity verbosity,
+                   const rpc::ServerSelectionMetadata&,
                    BSONObjBuilder* out) const override {
         const std::string fullNs = parseNsCollectionRequired(dbName, cmdObj);
         Status allowedWriteStatus = userAllowedWriteNS(fullNs);
@@ -383,7 +396,7 @@ public:
                     std::move(statusWithPlanExecutor.getValue());
 
                 StatusWith<boost::optional<BSONObj>> advanceStatus =
-                    advanceExecutor(exec.get(), args.isRemove());
+                    advanceExecutor(txn, exec.get(), args.isRemove(), collection);
                 if (!advanceStatus.isOK()) {
                     return appendCommandStatus(result, advanceStatus.getStatus());
                 }
@@ -453,7 +466,7 @@ public:
                     std::move(statusWithPlanExecutor.getValue());
 
                 StatusWith<boost::optional<BSONObj>> advanceStatus =
-                    advanceExecutor(exec.get(), args.isRemove());
+                    advanceExecutor(txn, exec.get(), args.isRemove(), collection);
                 if (!advanceStatus.isOK()) {
                     return appendCommandStatus(result, advanceStatus.getStatus());
                 }

@@ -47,6 +47,10 @@ public:
         return _d.getns();
     }
 
+    const char* getnsIfPresent() const {
+        return _d.messageShouldHaveNs() ? _d.getns() : "";
+    }
+
     int op() const {
         return _m.operation();
     }
@@ -75,7 +79,7 @@ public:
 
     void process(OperationContext* txn, int attempt = 0);
 
-    void init();
+    void init(OperationContext* txn);
 
 private:
     Client* const _clientInfo;

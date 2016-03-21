@@ -43,7 +43,7 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/query/cursor_responses.h"
+#include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/find_common.h"
@@ -57,6 +57,12 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+namespace {
+
+const char kTermField[] = "term";
+
+}  // namespace
 
 /**
  * A command for running .find() queries.
@@ -106,20 +112,16 @@ public:
     Status checkAuthForCommand(ClientBasic* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
-        AuthorizationSession* authzSession = AuthorizationSession::get(client);
-        ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
-
-        if (authzSession->isAuthorizedForActionsOnResource(pattern, ActionType::find)) {
-            return Status::OK();
-        }
-
-        return Status(ErrorCodes::Unauthorized, "unauthorized");
+        NamespaceString nss(parseNs(dbname, cmdObj));
+        auto hasTerm = cmdObj.hasField(kTermField);
+        return AuthorizationSession::get(client)->checkAuthForFind(nss, hasTerm);
     }
 
     Status explain(OperationContext* txn,
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainCommon::Verbosity verbosity,
+                   const rpc::ServerSelectionMetadata&,
                    BSONObjBuilder* out) const override {
         const std::string fullns = parseNs(dbname, cmdObj);
         const NamespaceString nss(fullns);
@@ -232,7 +234,7 @@ public:
         // that we don't hold locks while waiting on the network.
         ShardingState* const shardingState = ShardingState::get(txn);
         if (OperationShardVersion::get(txn).hasShardVersion() && shardingState->enabled()) {
-            ChunkVersion receivedVersion = OperationShardVersion::get(txn).getShardVersion();
+            ChunkVersion receivedVersion = OperationShardVersion::get(txn).getShardVersion(nss);
             ChunkVersion latestVersion;
             uassertStatusOK(shardingState->refreshMetadataIfNeeded(
                 txn, nss.ns(), receivedVersion, &latestVersion));
@@ -276,7 +278,7 @@ public:
             // there is no ClientCursor id, and then return.
             const long long numResults = 0;
             const CursorId cursorId = 0;
-            endQueryOp(txn, *exec, dbProfilingLevel, numResults, cursorId);
+            endQueryOp(txn, collection, *exec, dbProfilingLevel, numResults, cursorId);
             appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
             return true;
         }
@@ -353,7 +355,7 @@ public:
         }
 
         // Fill out curop based on the results.
-        endQueryOp(txn, *cursorExec, dbProfilingLevel, numResults, cursorId);
+        endQueryOp(txn, collection, *cursorExec, dbProfilingLevel, numResults, cursorId);
 
         // 7) Generate the response object to send to the client.
         appendCursorResponseObject(cursorId, nss.ns(), firstBatch.arr(), &result);

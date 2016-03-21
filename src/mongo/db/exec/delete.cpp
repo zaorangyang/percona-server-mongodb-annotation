@@ -136,7 +136,7 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
         try {
             // If the snapshot changed, then we have to make sure we have the latest copy of the
             // doc and that it still matches.
-            std::unique_ptr<RecordCursor> cursor;
+            std::unique_ptr<SeekableRecordCursor> cursor;
             if (getOpCtx()->recoveryUnit()->getSnapshotId() != member->obj.snapshotId()) {
                 cursor = _collection->getCursor(getOpCtx());
                 if (!WorkingSetCommon::fetch(getOpCtx(), _ws, id, cursor)) {
@@ -154,26 +154,31 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
                 }
             }
 
+            // Ensure that the BSONObj underlying the WorkingSetMember is owned because saveState()
+            // is allowed to free the memory.
+            if (_params.returnDeleted) {
+                member->makeObjOwnedIfNeeded();
+            }
+
             // TODO: Do we want to buffer docs and delete them in a group rather than
             // saving/restoring state repeatedly?
 
             try {
-                child()->saveState();
                 if (supportsDocLocking()) {
-                    // Doc-locking engines require this after saveState() since they don't use
+                    // Doc-locking engines require this before saveState() since they don't use
                     // invalidations.
                     WorkingSetCommon::prepareForSnapshotChange(_ws);
                 }
+                child()->saveState();
             } catch (const WriteConflictException& wce) {
                 std::terminate();
             }
 
             if (_params.returnDeleted) {
-                // Save a copy of the document that is about to get deleted.
+                // Save a copy of the document that is about to get deleted, but keep it in the
+                // LOC_AND_OBJ state in case we need to retry deleting it.
                 BSONObj deletedDoc = member->obj.value();
                 member->obj.setValue(deletedDoc.getOwned());
-                member->loc = RecordId();
-                member->transitionToOwnedObj();
             }
 
             // Do the write, unless this is an explain.
@@ -185,11 +190,21 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
 
             ++_specificStats.docsDeleted;
         } catch (const WriteConflictException& wce) {
+            // Ensure that the BSONObj underlying the WorkingSetMember is owned because it may be
+            // freed when we yield.
+            member->makeObjOwnedIfNeeded();
             _idRetrying = id;
             memberFreer.Dismiss();  // Keep this member around so we can retry deleting it.
             *out = WorkingSet::INVALID_ID;
             _commonStats.needYield++;
             return NEED_YIELD;
+        }
+
+        if (_params.returnDeleted) {
+            // After deleting the document, the RecordId associated with this member is invalid.
+            // Remove the 'loc' from the WorkingSetMember before returning it.
+            member->loc = RecordId();
+            member->transitionToOwnedObj();
         }
 
         //  As restoreState may restore (recreate) cursors, cursors are tied to the

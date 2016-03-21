@@ -103,6 +103,12 @@ public:
      * If we have reached the end of the stream of results, returns boost::none along with an ok
      * status.
      *
+     * If this AsyncResultsMerger is fetching results from a remote cursor tailing a capped
+     * collection, may return boost::none before end-of-stream. (Tailable cursors remain open even
+     * when there are no further results, and may subsequently return more results when they become
+     * available.) The calling code is responsible for handling multiple boost::none return values,
+     * keeping the cursor open in the tailable case.
+     *
      * If there has been an error received from one of the shards, or there is an error in
      * processing results from a shard, then a non-ok status is returned.
      *
@@ -161,14 +167,25 @@ private:
         bool exhausted() const;
 
         HostAndPort hostAndPort;
-        BSONObj cmdObj;
+
+        // The command object for sending to the remote to establish the cursor. If a remote cursor
+        // has not been established yet, this member will be set to a valid command object. If a
+        // remote cursor has already been established, this member will be unset.
+        boost::optional<BSONObj> cmdObj;
+
+        // The cursor id for the remote cursor. If a remote cursor has not been established yet,
+        // this member will be unset. If a remote cursor has been established and is not yet
+        // exhausted, this member will be set to a valid non-zero cursor id. If a remote cursor was
+        // established but is now exhausted, this member will be set to zero.
         boost::optional<CursorId> cursorId;
+
         std::queue<BSONObj> docBuffer;
         executor::TaskExecutor::CallbackHandle cbHandle;
         Status status = Status::OK();
 
-        // Set to true once we have heard from the remote node at least once.
-        bool gotFirstResponse = false;
+        // Count of fetched docs during ARM processing of the current batch. Used to reduce the
+        // batchSize in getMore when mongod returned less docs than the requested batchSize.
+        long long fetchedCount = 0;
     };
 
     class MergingComparator {
@@ -229,10 +246,13 @@ private:
                              size_t remoteIndex);
 
     /**
-     * If there is a valid unsignaled event that has been requested via nextReady(), signals that
-     * event.
+     * If there is a valid unsignaled event that has been requested via nextReady() and there are
+     * buffered results that are ready to return, signals that event.
+     *
+     * Invalidates the current event, as we must signal the event exactly once and we only keep a
+     * handle to a valid event if it is unsignaled.
      */
-    void signalCurrentEvent_inlock();
+    void signalCurrentEventIfReady_inlock();
 
     /**
      * Returns true if this async cursor is waiting to receive another batch from a remote.
@@ -248,6 +268,10 @@ private:
     executor::TaskExecutor* _executor;
 
     ClusterClientCursorParams _params;
+
+    // The metadata obj to pass along with the command request. Used to indicate that the command is
+    // ok to run on secondaries.
+    BSONObj _metadataObj;
 
     // Must be acquired before accessing any data members (other than _params, which is read-only).
     // Must also be held when calling any of the '_inlock()' helper functions.
@@ -267,6 +291,10 @@ private:
     Status _status = Status::OK();
 
     executor::TaskExecutor::EventHandle _currentEvent;
+
+    // For tailable cursors, set to true if the next result returned from nextReady() should be
+    // boost::none.
+    bool _eofNext = false;
 
     //
     // Killing

@@ -132,7 +132,7 @@ void CollectionInfo::save(OperationContext* txn, const string& ns) {
         coll.setUpdatedAt(Date_t::now());
     }
 
-    uassertStatusOK(grid.catalogManager(txn)->updateCollection(ns, coll));
+    uassertStatusOK(grid.catalogManager(txn)->updateCollection(txn, ns, coll));
     _dirty = false;
 }
 
@@ -164,10 +164,10 @@ bool DBConfig::isSharded(const string& ns) {
     return i->second.isSharded();
 }
 
-const ShardId& DBConfig::getShardId(const string& ns) {
+const ShardId& DBConfig::getShardId(OperationContext* txn, const string& ns) {
     uassert(28679, "ns can't be sharded", !isSharded(ns));
 
-    uassert(10178, "no primary!", grid.shardRegistry()->getShard(_primaryId));
+    uassert(10178, "no primary!", grid.shardRegistry()->getShard(txn, _primaryId));
     return _primaryId;
 }
 
@@ -220,7 +220,8 @@ bool DBConfig::removeSharding(OperationContext* txn, const string& ns) {
 
 // Handles weird logic related to getting *either* a chunk manager *or* the collection primary
 // shard
-void DBConfig::getChunkManagerOrPrimary(const string& ns,
+void DBConfig::getChunkManagerOrPrimary(OperationContext* txn,
+                                        const string& ns,
                                         std::shared_ptr<ChunkManager>& manager,
                                         std::shared_ptr<Shard>& primary) {
     // The logic here is basically that at any time, our collection can become sharded or
@@ -239,7 +240,7 @@ void DBConfig::getChunkManagerOrPrimary(const string& ns,
         // No namespace
         if (i == _collections.end()) {
             // If we don't know about this namespace, it's unsharded by default
-            primary = grid.shardRegistry()->getShard(_primaryId);
+            primary = grid.shardRegistry()->getShard(txn, _primaryId);
         } else {
             CollectionInfo& cInfo = i->second;
 
@@ -250,7 +251,7 @@ void DBConfig::getChunkManagerOrPrimary(const string& ns,
             if (_shardingEnabled && cInfo.isSharded()) {
                 manager = cInfo.getCM();
             } else {
-                primary = grid.shardRegistry()->getShard(_primaryId);
+                primary = grid.shardRegistry()->getShard(txn, _primaryId);
             }
         }
     }
@@ -317,7 +318,8 @@ std::shared_ptr<ChunkManager> DBConfig::getChunkManager(OperationContext* txn,
     vector<ChunkType> newestChunk;
     if (oldVersion.isSet() && !forceReload) {
         uassertStatusOK(
-            grid.catalogManager(txn)->getChunks(BSON(ChunkType::ns(ns)),
+            grid.catalogManager(txn)->getChunks(txn,
+                                                BSON(ChunkType::ns(ns)),
                                                 BSON(ChunkType::DEPRECATED_lastmod() << -1),
                                                 1,
                                                 &newestChunk,
@@ -415,9 +417,14 @@ std::shared_ptr<ChunkManager> DBConfig::getChunkManager(OperationContext* txn,
     if (shouldReset) {
         const auto cmOpTime = tempChunkManager->getConfigOpTime();
         invariant(cmOpTime >= _configOpTime);
-        invariant(cmOpTime >= ci.getCM()->getConfigOpTime());
 
-        ci.resetCM(tempChunkManager.release());
+        // The existing ChunkManager could have been updated since we last checked, so
+        // replace the existing chunk manager only if it is strictly newer.
+        // The condition should be (>) than instead of (>=), but use (>=) since legacy non-repl
+        // config servers will always have an opTime of zero.
+        if (cmOpTime >= ci.getCM()->getConfigOpTime()) {
+            ci.resetCM(tempChunkManager.release());
+        }
     }
 
     uassert(
@@ -427,7 +434,7 @@ std::shared_ptr<ChunkManager> DBConfig::getChunkManager(OperationContext* txn,
 }
 
 void DBConfig::setPrimary(OperationContext* txn, const std::string& s) {
-    const auto shard = grid.shardRegistry()->getShard(s);
+    const auto shard = grid.shardRegistry()->getShard(txn, s);
 
     stdx::lock_guard<stdx::mutex> lk(_lock);
     _primaryId = shard->getId();
@@ -440,7 +447,7 @@ bool DBConfig::load(OperationContext* txn) {
 }
 
 bool DBConfig::_load(OperationContext* txn) {
-    auto status = grid.catalogManager(txn)->getDatabase(_name);
+    auto status = grid.catalogManager(txn)->getDatabase(txn, _name);
     if (status == ErrorCodes::DatabaseNotFound) {
         return false;
     }
@@ -461,7 +468,7 @@ bool DBConfig::_load(OperationContext* txn) {
     vector<CollectionType> collections;
     repl::OpTime configOpTimeWhenLoadingColl;
     uassertStatusOK(grid.catalogManager(txn)
-                        ->getCollections(&_name, &collections, &configOpTimeWhenLoadingColl));
+                        ->getCollections(txn, &_name, &collections, &configOpTimeWhenLoadingColl));
 
     int numCollsErased = 0;
     int numCollsSharded = 0;
@@ -497,7 +504,7 @@ void DBConfig::_save(OperationContext* txn, bool db, bool coll) {
         dbt.setPrimary(_primaryId);
         dbt.setSharded(_shardingEnabled);
 
-        uassertStatusOK(grid.catalogManager(txn)->updateDatabase(_name, dbt));
+        uassertStatusOK(grid.catalogManager(txn)->updateDatabase(txn, _name, dbt));
     }
 
     if (coll) {
@@ -537,14 +544,14 @@ bool DBConfig::dropDatabase(OperationContext* txn, string& errmsg) {
      */
 
     log() << "DBConfig::dropDatabase: " << _name;
-    grid.catalogManager(txn)
-        ->logChange(txn->getClient()->clientAddress(true), "dropDatabase.start", _name, BSONObj());
+    grid.catalogManager(txn)->logChange(
+        txn, txn->getClient()->clientAddress(true), "dropDatabase.start", _name, BSONObj());
 
     // 1
     grid.catalogCache()->invalidate(_name);
 
-    Status result = grid.catalogManager(txn)
-                        ->remove(DatabaseType::ConfigNS, BSON(DatabaseType::name(_name)), 0, NULL);
+    Status result = grid.catalogManager(txn)->remove(
+        txn, DatabaseType::ConfigNS, BSON(DatabaseType::name(_name)), 0, NULL);
     if (!result.isOK()) {
         errmsg = result.reason();
         log() << "could not drop '" << _name << "': " << errmsg;
@@ -571,7 +578,7 @@ bool DBConfig::dropDatabase(OperationContext* txn, string& errmsg) {
 
     // 3
     {
-        const auto shard = grid.shardRegistry()->getShard(_primaryId);
+        const auto shard = grid.shardRegistry()->getShard(txn, _primaryId);
         ScopedDbConnection conn(shard->getConnString(), 30.0);
         BSONObj res;
         if (!conn->dropDatabase(_name, &res)) {
@@ -583,7 +590,7 @@ bool DBConfig::dropDatabase(OperationContext* txn, string& errmsg) {
 
     // 4
     for (const ShardId& shardId : shardIds) {
-        const auto shard = grid.shardRegistry()->getShard(shardId);
+        const auto shard = grid.shardRegistry()->getShard(txn, shardId);
         if (!shard) {
             continue;
         }
@@ -600,7 +607,7 @@ bool DBConfig::dropDatabase(OperationContext* txn, string& errmsg) {
     LOG(1) << "\t dropped primary db for: " << _name;
 
     grid.catalogManager(txn)
-        ->logChange(txn->getClient()->clientAddress(true), "dropDatabase", _name, BSONObj());
+        ->logChange(txn, txn->getClient()->clientAddress(true), "dropDatabase", _name, BSONObj());
 
     return true;
 }
@@ -679,7 +686,7 @@ void DBConfig::getAllShardedCollections(set<string>& namespaces) {
 
 void ConfigServer::reloadSettings(OperationContext* txn) {
     auto catalogManager = grid.catalogManager(txn);
-    auto chunkSizeResult = catalogManager->getGlobalSettings(SettingsType::ChunkSizeDocKey);
+    auto chunkSizeResult = catalogManager->getGlobalSettings(txn, SettingsType::ChunkSizeDocKey);
     if (chunkSizeResult.isOK()) {
         const int csize = chunkSizeResult.getValue().getChunkSizeMB();
         LOG(1) << "Found MaxChunkSize: " << csize;
@@ -690,7 +697,8 @@ void ConfigServer::reloadSettings(OperationContext* txn) {
     } else if (chunkSizeResult.getStatus() == ErrorCodes::NoMatchingDocument) {
         const int chunkSize = Chunk::MaxChunkSize / (1024 * 1024);
         Status result =
-            grid.catalogManager(txn)->insert(SettingsType::ConfigNS,
+            grid.catalogManager(txn)->insert(txn,
+                                             SettingsType::ConfigNS,
                                              BSON(SettingsType::key(SettingsType::ChunkSizeDocKey)
                                                   << SettingsType::chunkSizeMB(chunkSize)),
                                              NULL);
@@ -784,7 +792,22 @@ void ConfigServer::reloadSettings(OperationContext* txn) {
     }
 }
 
-void ConfigServer::replicaSetChange(const string& setName, const string& newConnectionString) {
+void ConfigServer::replicaSetChangeShardRegistryUpdateHook(const string& setName,
+                                                           const string& newConnectionString) {
+    auto shard = grid.shardRegistry()->lookupRSName(setName);
+    if (shard) {
+        // Inform the ShardRegsitry of the new connection string for the shard.
+        auto connString = fassertStatusOK(28805, ConnectionString::parse(newConnectionString));
+        if (shard->isConfig()) {
+            grid.shardRegistry()->updateConfigServerConnectionString(connString);
+        } else {
+            grid.shardRegistry()->updateLookupMapsForShard(std::move(shard), connString);
+        }
+    }
+}
+
+void ConfigServer::replicaSetChangeConfigServerUpdateHook(const string& setName,
+                                                          const string& newConnectionString) {
     // This is run in it's own thread. Exceptions escaping would result in a call to terminate.
     Client::initThread("replSetChange");
     auto txn = cc().makeOperationContext();
@@ -797,25 +820,27 @@ void ConfigServer::replicaSetChange(const string& setName, const string& newConn
         }
 
         if (s->isConfig()) {
-            grid.shardRegistry()->updateConfigServerConnectionString(
-                fassertStatusOK(28783, ConnectionString::parse(newConnectionString)));
-        } else {
-            Status result = grid.catalogManager(txn.get())
-                                ->update(ShardType::ConfigNS,
-                                         BSON(ShardType::name(s->getId())),
-                                         BSON("$set" << BSON(ShardType::host(newConnectionString))),
-                                         false,  // upsert
-                                         false,  // multi
-                                         NULL);
-            if (!result.isOK()) {
-                error() << "RSChangeWatcher: could not update config db for set: " << setName
-                        << " to: " << newConnectionString << ": " << result.reason();
-            }
+            // No need to tell the config servers their own connection string.
+            return;
         }
+
+        Status result = grid.catalogManager(txn.get())
+                            ->update(txn.get(),
+                                     ShardType::ConfigNS,
+                                     BSON(ShardType::name(s->getId())),
+                                     BSON("$set" << BSON(ShardType::host(newConnectionString))),
+                                     false,  // upsert
+                                     false,  // multi
+                                     NULL);
+        if (!result.isOK()) {
+            error() << "RSChangeWatcher: could not update config db for set: " << setName
+                    << " to: " << newConnectionString << ": " << result.reason();
+        }
+
     } catch (const std::exception& e) {
-        log() << "caught exception while updating config servers: " << e.what();
+        warning() << "caught exception while updating config servers: " << e.what();
     } catch (...) {
-        log() << "caught unknown exception while updating config servers";
+        warning() << "caught unknown exception while updating config servers";
     }
 }
 

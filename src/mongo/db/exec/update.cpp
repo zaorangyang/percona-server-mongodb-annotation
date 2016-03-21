@@ -530,13 +530,14 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                 args.update = logObj;
                 args.criteria = idQuery;
                 args.fromMigrate = request->isFromMigration();
-                _collection->updateDocumentWithDamages(
+                StatusWith<RecordData> newRecStatus = _collection->updateDocumentWithDamages(
                     getOpCtx(),
                     loc,
                     Snapshotted<RecordData>(oldObj.snapshotId(), oldRec),
                     source,
                     _damages,
                     args);
+                newObj = uassertStatusOK(std::move(newRecStatus)).releaseToBson();
             }
 
             _specificStats.fastmod = true;
@@ -833,7 +834,7 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
         }
 
         try {
-            std::unique_ptr<RecordCursor> cursor;
+            std::unique_ptr<SeekableRecordCursor> cursor;
             if (getOpCtx()->recoveryUnit()->getSnapshotId() != member->obj.snapshotId()) {
                 cursor = _collection->getCursor(getOpCtx());
                 // our snapshot has changed, refetch
@@ -852,14 +853,18 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
                 }
             }
 
+            // Ensure that the BSONObj underlying the WorkingSetMember is owned because saveState()
+            // is allowed to free the memory.
+            member->makeObjOwnedIfNeeded();
+
             // Save state before making changes
             try {
-                child()->saveState();
                 if (supportsDocLocking()) {
-                    // Doc-locking engines require this after saveState() since they don't use
+                    // Doc-locking engines require this before saveState() since they don't use
                     // invalidations.
                     WorkingSetCommon::prepareForSnapshotChange(_ws);
                 }
+                child()->saveState();
             } catch (const WriteConflictException& wce) {
                 std::terminate();
             }
@@ -886,6 +891,9 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
                 member->transitionToOwnedObj();
             }
         } catch (const WriteConflictException& wce) {
+            // Ensure that the BSONObj underlying the WorkingSetMember is owned because it may be
+            // freed when we yield.
+            member->makeObjOwnedIfNeeded();
             _idRetrying = id;
             memberFreer.Dismiss();  // Keep this member around so we can retry updating it.
             *out = WorkingSet::INVALID_ID;
@@ -1031,8 +1039,8 @@ UpdateResult UpdateStage::makeUpdateResult(const PlanExecutor& exec, OpDebug* op
     // Get summary information about the plan.
     PlanSummaryStats stats;
     Explain::getSummaryStats(exec, &stats);
-    opDebug->nscanned = stats.totalKeysExamined;
-    opDebug->nscannedObjects = stats.totalDocsExamined;
+    opDebug->keysExamined = stats.totalKeysExamined;
+    opDebug->docsExamined = stats.totalDocsExamined;
 
     return UpdateResult(updateStats->nMatched > 0 /* Did we update at least one obj? */,
                         !updateStats->isDocReplacement /* $mod or obj replacement */,

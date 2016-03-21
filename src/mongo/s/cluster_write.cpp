@@ -127,7 +127,7 @@ void splitIfNeeded(OperationContext* txn, const NamespaceString& nss, const Targ
 
     ChunkManagerPtr chunkManager;
     shared_ptr<Shard> dummyShard;
-    config->getChunkManagerOrPrimary(nss.ns(), chunkManager, dummyShard);
+    config->getChunkManagerOrPrimary(txn, nss.ns(), chunkManager, dummyShard);
 
     if (!chunkManager) {
         return;
@@ -244,7 +244,7 @@ void ClusterWriter::write(OperationContext* txn,
     const string dbName = nss.db().toString();
 
     if (dbName == "config" || dbName == "admin") {
-        grid.catalogManager(txn)->writeConfigServerDirect(request, response);
+        grid.catalogManager(txn)->writeConfigServerDirect(txn, request, response);
     } else {
         ChunkManagerTargeter targeter(request.getTargetingNSS());
         Status targetInitStatus = targeter.init(txn);

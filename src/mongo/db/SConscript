@@ -12,6 +12,7 @@ env.SConscript(
         'concurrency',
         'exec',
         'fts',
+        'ftdc',
         'geo',
         'index',
         'matcher',
@@ -286,6 +287,27 @@ env.CppUnitTest(
     ],
 )
 
+env.Library(
+    target='collection_index_usage_tracker',
+    source=[
+        'collection_index_usage_tracker.cpp'
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target='collection_index_usage_tracker_test',
+    source=[
+        'collection_index_usage_tracker_test.cpp',
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/util/clock_source_mock",
+        'collection_index_usage_tracker',
+    ],
+)
+
 # This library exists because some libraries, such as our networking library, need access to server
 # options, but not to the helpers to set them from the command line.  libserver_options_core.a just
 # has the structure for storing the server options, while libserver_options.a has the code to set
@@ -341,6 +363,10 @@ env.Library(
         '$BUILD_DIR/mongo/util/concurrency/synchronization',
         'range_arithmetic',
     ],
+    LIBDEPS_TAGS=[
+        # Needs mongo::inShutdown
+        'incomplete',
+    ]
 )
 
 env.CppUnitTest(
@@ -355,7 +381,6 @@ env.CppUnitTest(
     ],
 )
 
-
 # This library is linked into mongos and mongod only, not into the shell or any tools.
 env.Library(
     target="mongodandmongos",
@@ -366,6 +391,8 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/client/clientdriver",
+        "$BUILD_DIR/mongo/db/auth/authservercommon",
+        "$BUILD_DIR/mongo/db/coredb",
         "$BUILD_DIR/mongo/rpc/command_reply",
         "$BUILD_DIR/mongo/rpc/command_request",
         "$BUILD_DIR/mongo/rpc/metadata",
@@ -374,6 +401,10 @@ env.Library(
         "$BUILD_DIR/mongo/util/processinfo",
         "$BUILD_DIR/mongo/util/signal_handlers",
         "auth/authorization_manager_global",
+    ],
+    LIBDEPS_TAGS=[
+        # Depends on Command::execCommand, which is not uniquely defined
+        'incomplete',
     ],
 )
 
@@ -387,9 +418,14 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/coredb",
+        "$BUILD_DIR/mongo/db/curop",
         "$BUILD_DIR/mongo/util/net/miniwebserver",
         "mongodandmongos",
         'repl/repl_coordinator_global',
+    ],
+    LIBDEPS_TAGS=[
+        # Depends on symbols from serverOnlyFiles
+        'incomplete',
     ],
 )
 
@@ -462,6 +498,10 @@ env.Library(
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
         '$BUILD_DIR/mongo/util/foundation',
         '$BUILD_DIR/mongo/util/processinfo',
+        '$BUILD_DIR/mongo/s/client/sharding_client',
+        '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
+        'auth/authcommon',
+        'auth/authorization_manager_global',
         'auth/serverauth',
         'commands/server_status_core',
         'common',
@@ -469,6 +509,7 @@ env.Library(
         'index/key_generator',
         'index_names',
         'log_process_details',
+        'lasterror',
         'matcher/expressions',
         'matcher/expressions_geo',
         'matcher/expressions_text',
@@ -477,6 +518,12 @@ env.Library(
         'startup_warnings_common',
         'stats/counters',
         'stats/timer_stats',
+    ],
+    LIBDEPS_TAGS=[
+        # Dependencies on Command::registerError and
+        # Command::execCommand, which are not uniquely defined. Also
+        # depends on mongo::exitCleanly.
+        'incomplete',
     ],
 )
 
@@ -636,6 +683,7 @@ serveronlyLibdeps = [
     "catalog/collection_options",
     "catalog/index_key_validate",
     "commands/killcursors_common",
+    "collection_index_usage_tracker",
     "common",
     "concurrency/lock_manager",
     "concurrency/write_conflict_exception",
@@ -643,6 +691,7 @@ serveronlyLibdeps = [
     "exec/exec",
     "exec/working_set",
     "fts/ftsmongod",
+    "ftdc/ftdc_mongod",
     "global_timestamp",
     "index/index_descriptor",
     "ops/update_driver",

@@ -299,8 +299,8 @@ namespace mongo {
         return Status::OK();
     }
 
-    std::unique_ptr<RecordCursor> KVRecordStoreCapped::getCursor(OperationContext* txn,
-                                                                 bool forward) const {
+    std::unique_ptr<SeekableRecordCursor> KVRecordStoreCapped::getCursor(OperationContext* txn,
+                                                                         bool forward) const {
         if (_engineSupportsDocLocking && forward) {
             KVRecoveryUnit *ru = checked_cast<KVRecoveryUnit *>(txn->recoveryUnit());
             // We must cache the recovery unit's current state before

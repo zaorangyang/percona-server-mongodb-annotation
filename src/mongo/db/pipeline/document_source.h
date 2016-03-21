@@ -42,6 +42,7 @@
 #include "mongo/base/init.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/pipeline/accumulator.h"
@@ -62,6 +63,7 @@ class ExpressionFieldPath;
 class ExpressionObject;
 class DocumentSourceLimit;
 class PlanExecutor;
+class RecordCursor;
 
 /**
  * Registers a DocumentSource to have the name 'key'. When a stage with name '$key' is found,
@@ -176,7 +178,9 @@ public:
 
     virtual void serializeToArray(std::vector<Value>& array, bool explain = false) const;
 
-    /// Returns true if doesn't require an input source (most DocumentSources do).
+    /**
+     * Returns true if doesn't require an input source (most DocumentSources do).
+     */
     virtual bool isValidInitialSource() const {
         return false;
     }
@@ -287,6 +291,9 @@ public:
          */
         virtual BSONObj insert(const NamespaceString& ns, const std::vector<BSONObj>& objs) = 0;
 
+        virtual CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
+                                                      const NamespaceString& ns) = 0;
+
         // Add new methods as needed.
     };
 
@@ -366,9 +373,8 @@ public:
     /**
      * Informs this object of projection and dependency information.
      *
-     * @param projection A projection specification describing the fields needed by the rest of
-     *                   the pipeline.
-     * @param deps The output of DepsTracker::toParsedDeps
+     * @param projection The projection that has been passed down to the query system.
+     * @param deps The output of DepsTracker::toParsedDeps.
      */
     void setProjection(const BSONObj& projection, const boost::optional<ParsedDeps>& deps);
 
@@ -523,6 +529,32 @@ private:
     std::pair<Value, Value> _firstPartOfNextGroup;
     Value _currentId;
     Accumulators _currentAccumulators;
+};
+
+/**
+ * Provides a document source interface to retrieve index statistics for a given namespace.
+ * Each document returned represents a single index and mongod instance.
+ */
+class DocumentSourceIndexStats final : public DocumentSource, public DocumentSourceNeedsMongod {
+public:
+    // virtuals from DocumentSource
+    boost::optional<Document> getNext() final;
+    const char* getSourceName() const final;
+    Value serialize(bool explain = false) const final;
+
+    virtual bool isValidInitialSource() const final {
+        return true;
+    }
+
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+private:
+    DocumentSourceIndexStats(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    CollectionIndexUsageMap _indexStatsMap;
+    CollectionIndexUsageMap::const_iterator _indexStatsIter;
+    std::string _processName;
 };
 
 
@@ -918,19 +950,75 @@ public:
     const char* getSourceName() const final;
     Value serialize(bool explain = false) const final;
 
+    GetDepsReturn getDependencies(DepsTracker* deps) const final {
+        return SEE_NEXT;
+    }
+
     boost::intrusive_ptr<DocumentSource> getShardSource() final;
     boost::intrusive_ptr<DocumentSource> getMergeSource() final;
+
+    long long getSampleSize() const {
+        return _size;
+    }
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
 private:
     explicit DocumentSourceSample(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
     long long _size;
 
-    // When no storage engine optimizations are available, $sample uses a $sort stage to randomly
-    // sort the documents.
+    // Uses a $sort stage to randomly sort the documents.
     boost::intrusive_ptr<DocumentSourceSort> _sortStage;
+};
+
+/**
+ * This class is not a registered stage, it is only used as an optimized replacement for $sample
+ * when the storage engine allows us to use a random cursor.
+ */
+class DocumentSourceSampleFromRandomCursor final : public DocumentSource {
+public:
+    boost::optional<Document> getNext() final;
+    const char* getSourceName() const final;
+    Value serialize(bool explain = false) const final;
+    GetDepsReturn getDependencies(DepsTracker* deps) const final;
+
+    static boost::intrusive_ptr<DocumentSourceSampleFromRandomCursor> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        long long size,
+        std::string idField,
+        long long collectionSize);
+
+private:
+    DocumentSourceSampleFromRandomCursor(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         long long size,
+                                         std::string idField,
+                                         long long collectionSize);
+
+    /**
+     * Keep asking for documents from the random cursor until it yields a new document. Errors if a
+     * a document is encountered without a value for '_idField', or if the random cursor keeps
+     * returning duplicate elements.
+     */
+    boost::optional<Document> getNextNonDuplicateDocument();
+
+    long long _size;
+
+    // The field to use as the id of a document. Usually '_id', but 'ts' for the oplog.
+    std::string _idField;
+
+    // Keeps track of the documents that have been returned, since a random cursor is allowed to
+    // return duplicates.
+    ValueSet _seenDocs;
+
+    // The approximate number of documents in the collection (includes orphans).
+    const long long _nDocsInColl;
+
+    // The value to be assigned to the randMetaField of outcoming documents. Each call to getNext()
+    // will decrement this value by an amount scaled by _nDocsInColl as an attempt to appear as if
+    // the documents were produced by a top-k random sort.
+    double _randMetaFieldVal = 1.0;
 };
 
 class DocumentSourceLimit final : public DocumentSource, public SplittableDocumentSource {
@@ -1061,30 +1149,43 @@ public:
     GetDepsReturn getDependencies(DepsTracker* deps) const final;
 
     /**
-      Create a new projection DocumentSource from BSON.
-
-      This is a convenience for directly handling BSON, and relies on the
-      above methods.
-
-      @param pBsonElement the BSONElement with an object named $project
-      @param pExpCtx the expression context for the pipeline
-      @returns the created projection
+     * Creates a new $unwind DocumentSource from a BSON specification.
      */
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    std::string getUnwindPath() {
-        return _unwindPath->getPath(false);
+    static boost::intrusive_ptr<DocumentSourceUnwind> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const std::string& path,
+        bool includeNullIfEmptyOrMissing,
+        bool includeArrayIndex);
+
+    std::string getUnwindPath() const {
+        return _unwindPath.getPath(false);
+    }
+
+    bool preserveNullAndEmptyArrays() const {
+        return _preserveNullAndEmptyArrays;
+    }
+
+    bool includeArrayIndex() const {
+        return _includeArrayIndex;
     }
 
 private:
-    explicit DocumentSourceUnwind(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
-
-    /** Specify the field to unwind. */
-    void unwindPath(const FieldPath& fieldPath);
+    DocumentSourceUnwind(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                         const FieldPath& fieldPath,
+                         bool includeNullIfEmptyOrMissing,
+                         bool includeArrayIndex);
 
     // Configuration state.
-    std::unique_ptr<FieldPath> _unwindPath;
+    const FieldPath _unwindPath;
+    // Documents that have a nullish value, or an empty array for the field '_unwindPath', will pass
+    // through the $unwind stage unmodified if '_preserveNullAndEmptyArrays' is true.
+    const bool _preserveNullAndEmptyArrays;
+    // If set, the $unwind stage will replace the unwound field with a sub-document with structure
+    // {index: <array index>, value: <array value>} instead of just the array value.
+    const bool _includeArrayIndex;
 
     // Iteration state.
     class Unwinder;

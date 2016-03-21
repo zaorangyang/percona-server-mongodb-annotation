@@ -245,7 +245,7 @@ public:
         void setEndPosition(const BSONObj& key, bool inclusive) override {
             if (key.isEmpty()) {
                 // This means scan to end of index.
-                _endState = {};
+                _endState = boost::none;
                 return;
             }
 
@@ -281,7 +281,7 @@ public:
             return *_it;
         }
 
-        void savePositioned() override {
+        void save() override {
             // Keep original position if we haven't moved since the last restore.
             _txn = nullptr;
             if (_lastMoveWasRestore)

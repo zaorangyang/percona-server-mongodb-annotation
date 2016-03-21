@@ -684,6 +684,8 @@ TEST_F(ReplCoordTest, AwaitReplicationReplSetBaseCases) {
 
     statusAndDur = getReplCoord()->awaitReplication(&txn, time, writeConcern);
     ASSERT_OK(statusAndDur.status);
+
+    ASSERT_TRUE(getExternalState()->isApplierSignaledToCancelFetcher());
 }
 
 TEST_F(ReplCoordTest, AwaitReplicationNumberOfNodesNonBlocking) {
@@ -1186,8 +1188,13 @@ private:
     }
 };
 
+TEST_F(ReplCoordTest, UpdateTermNotReplMode) {
+    init(ReplSettings());
+    ASSERT_TRUE(ReplicationCoordinator::modeNone == getReplCoord()->getReplicationMode());
+    ASSERT_EQUALS(ErrorCodes::BadValue, getReplCoord()->updateTerm(0).code());
+}
+
 TEST_F(ReplCoordTest, UpdateTerm) {
-    ReplCoordTest::setUp();
     init("mySet/test1:1234,test2:1234,test3:1234");
 
     assertStartSuccess(
@@ -1211,19 +1218,20 @@ TEST_F(ReplCoordTest, UpdateTerm) {
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
     // lower term, no change
-    getReplCoord()->updateTerm(0);
+    ASSERT_OK(getReplCoord()->updateTerm(0));
     ASSERT_EQUALS(1, getReplCoord()->getTerm());
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
     // same term, no change
-    getReplCoord()->updateTerm(1);
+    ASSERT_OK(getReplCoord()->updateTerm(1));
     ASSERT_EQUALS(1, getReplCoord()->getTerm());
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
     // higher term, step down and change term
     Handle cbHandle;
-    getReplCoord()->updateTerm_forTest(2);
+    ASSERT_EQUALS(ErrorCodes::StaleTerm, getReplCoord()->updateTerm(2).code());
     ASSERT_EQUALS(2, getReplCoord()->getTerm());
+    getReplCoord()->waitForStepDownFinish_forTest();
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
 }
 
@@ -1987,22 +1995,7 @@ TEST_F(ReplCoordTest, AwaitReplicationReconfigSimple) {
     Status status(ErrorCodes::InternalError, "Not Set");
     stdx::thread reconfigThread(stdx::bind(doReplSetReconfig, getReplCoord(), &status));
 
-    NetworkInterfaceMock* net = getNet();
-    getNet()->enterNetwork();
-    const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-    const RemoteCommandRequest& request = noi->getRequest();
-    repl::ReplSetHeartbeatArgs hbArgs;
-    ASSERT_OK(hbArgs.initialize(request.cmdObj));
-    repl::ReplSetHeartbeatResponse hbResp;
-    hbResp.setSetName("mySet");
-    hbResp.setState(MemberState::RS_SECONDARY);
-    hbResp.setConfigVersion(2);
-    BSONObjBuilder respObj;
-    respObj << "ok" << 1;
-    hbResp.addToBSON(&respObj, false);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj.obj()));
-    net->runReadyNetworkOperations();
-    getNet()->exitNetwork();
+    replyToReceivedHeartbeat();
     reconfigThread.join();
     ASSERT_OK(status);
 
@@ -2064,22 +2057,8 @@ TEST_F(ReplCoordTest, AwaitReplicationReconfigNodeCountExceedsNumberOfNodes) {
     Status status(ErrorCodes::InternalError, "Not Set");
     stdx::thread reconfigThread(stdx::bind(doReplSetReconfigToFewer, getReplCoord(), &status));
 
-    NetworkInterfaceMock* net = getNet();
-    getNet()->enterNetwork();
-    const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-    const RemoteCommandRequest& request = noi->getRequest();
-    repl::ReplSetHeartbeatArgs hbArgs;
-    ASSERT_OK(hbArgs.initialize(request.cmdObj));
-    repl::ReplSetHeartbeatResponse hbResp;
-    hbResp.setSetName("mySet");
-    hbResp.setState(MemberState::RS_SECONDARY);
-    hbResp.setConfigVersion(2);
-    BSONObjBuilder respObj;
-    respObj << "ok" << 1;
-    hbResp.addToBSON(&respObj, false);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj.obj()));
-    net->runReadyNetworkOperations();
-    getNet()->exitNetwork();
+    replyToReceivedHeartbeat();
+
     reconfigThread.join();
     ASSERT_OK(status);
 
@@ -2140,22 +2119,7 @@ TEST_F(ReplCoordTest, AwaitReplicationReconfigToSmallerMajority) {
     Status status(ErrorCodes::InternalError, "Not Set");
     stdx::thread reconfigThread(stdx::bind(doReplSetReconfig, getReplCoord(), &status));
 
-    NetworkInterfaceMock* net = getNet();
-    getNet()->enterNetwork();
-    const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-    const RemoteCommandRequest& request = noi->getRequest();
-    repl::ReplSetHeartbeatArgs hbArgs;
-    ASSERT_OK(hbArgs.initialize(request.cmdObj));
-    repl::ReplSetHeartbeatResponse hbResp;
-    hbResp.setSetName("mySet");
-    hbResp.setState(MemberState::RS_SECONDARY);
-    hbResp.setConfigVersion(2);
-    BSONObjBuilder respObj;
-    respObj << "ok" << 1;
-    hbResp.addToBSON(&respObj, false);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj.obj()));
-    net->runReadyNetworkOperations();
-    getNet()->exitNetwork();
+    replyToReceivedHeartbeat();
     reconfigThread.join();
     ASSERT_OK(status);
 
@@ -2652,6 +2616,52 @@ TEST_F(ReplCoordTest, MetadataUpdatesTermAndPrimaryId) {
     ASSERT_EQUALS(-1, getTopoCoord().getCurrentPrimaryIndex());
 }
 
+TEST_F(ReplCoordTest, SignalPrimaryUnavailable) {
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "protocolVersion" << 1 << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("host"
+                                               << "node1:12345"
+                                               << "_id" << 0)
+                                          << BSON("host"
+                                                  << "node2:12345"
+                                                  << "_id" << 1))),
+                       HostAndPort("node1", 12345));
+
+    ReplSetHeartbeatResponse hbResp;
+    hbResp.setSetName("mySet");
+    hbResp.setState(MemberState::RS_PRIMARY);
+    hbResp.setConfigVersion(2);
+    BSONObjBuilder respObj;
+    respObj << "ok" << 1;
+    hbResp.addToBSON(&respObj, false);
+
+    auto net = getNet();
+    net->enterNetwork();
+    net->scheduleResponse(
+        net->getNextReadyRequest(), net->now(), makeResponseStatus(respObj.obj()));
+    net->runReadyNetworkOperations();
+    net->exitNetwork();
+
+    ASSERT_EQUALS(1, getTopoCoord().getCurrentPrimaryIndex());
+
+    // Reset primary index but do not stand for election.
+    getReplCoord()->signalPrimaryUnavailable();
+    ASSERT_EQUALS(rpc::ReplSetMetadata::kNoPrimary, getTopoCoord().getCurrentPrimaryIndex());
+    ASSERT_EQUALS(TopologyCoordinator::Role::follower, getTopoCoord().getRole());
+
+    // Update our optime and follower mode to secondary so that we stand for election when
+    // primary becomes unavailable.
+    getTopoCoord().setPrimaryIndex(1);
+    auto opTime = OpTime(Timestamp(1, 0), 0);
+    getReplCoord()->setMyLastOptime(opTime);
+    ASSERT_EQUALS(opTime, getReplCoord()->getMyLastOptime());
+    ASSERT_TRUE(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    getReplCoord()->signalPrimaryUnavailable();
+    ASSERT_EQUALS(rpc::ReplSetMetadata::kNoPrimary, getTopoCoord().getCurrentPrimaryIndex());
+    ASSERT_EQUALS(TopologyCoordinator::Role::candidate, getTopoCoord().getRole());
+}
+
 TEST_F(ReplCoordTest, SnapshotCommitting) {
     init("mySet");
 
@@ -2741,7 +2751,8 @@ TEST_F(ReplCoordTest, LivenessForwardingForChainedMember) {
         BSONObj entry = entryElement.Obj();
         long long memberId = entry["memberId"].Number();
         memberIds.insert(memberId);
-        ASSERT_EQUALS(optime.getTimestamp(), entry["optime"].timestamp());
+        OpTime entryOpTime = OpTime::parseFromBSON(entry["optime"].Obj()).getValue();
+        ASSERT_EQUALS(optime, entryOpTime);
     }
     ASSERT_EQUALS(2U, memberIds.size());
 
@@ -2766,7 +2777,8 @@ TEST_F(ReplCoordTest, LivenessForwardingForChainedMember) {
         BSONObj entry = entryElement.Obj();
         long long memberId = entry["memberId"].Number();
         memberIds2.insert(memberId);
-        ASSERT_EQUALS(optime.getTimestamp(), entry["optime"].timestamp());
+        OpTime entryOpTime = OpTime::parseFromBSON(entry["optime"].Obj()).getValue();
+        ASSERT_EQUALS(optime, entryOpTime);
     }
     ASSERT_EQUALS(1U, memberIds2.size());
 }
@@ -2848,8 +2860,14 @@ TEST_F(ReplCoordTest, LivenessElectionTimeout) {
 
     // Confirm that the node relinquishes PRIMARY after only one node is left UP.
     const Date_t startDate1 = getNet()->now();
+    const Date_t endDate = startDate1 + Milliseconds(1980);
     getNet()->enterNetwork();
-    getNet()->runUntil(startDate1 + Milliseconds(1980));
+    while (getNet()->now() < endDate) {
+        getNet()->runUntil(endDate);
+        if (getNet()->now() < endDate) {
+            getNet()->blackHole(getNet()->getNextReadyRequest());
+        }
+    }
     getNet()->exitNetwork();
     getReplCoord()->waitForStepDownFinish_forTest();
     ASSERT_EQUALS(MemberState::RS_SECONDARY, getReplCoord()->getMemberState().s);

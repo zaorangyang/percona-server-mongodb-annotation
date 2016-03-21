@@ -53,7 +53,7 @@
 #include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/executor/network_interface_factory.h"
-#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
@@ -73,7 +73,15 @@ namespace {
 const char hashFieldName[] = "h";
 int SleepToAllowBatchingMillis = 2;
 const int BatchIsSmallish = 40000;  // bytes
-const Milliseconds fetcherMaxTimeMS(2000);
+
+/**
+ * Returns new thread pool for thead pool task executor.
+ */
+std::unique_ptr<ThreadPool> makeThreadPool() {
+    ThreadPool::Options threadPoolOptions;
+    threadPoolOptions.poolName = "rsBackgroundSync";
+    return stdx::make_unique<ThreadPool>(threadPoolOptions);
+}
 
 /**
  * Checks the criteria for rolling back.
@@ -147,6 +155,7 @@ size_t getSize(const BSONObj& o) {
 
 BackgroundSync::BackgroundSync()
     : _buffer(bufferMaxSizeGauge, &getSize),
+      _threadPoolTaskExecutor(makeThreadPool(), executor::makeNetworkInterface()),
       _lastOpTimeFetched(Timestamp(std::numeric_limits<int>::max(), 0),
                          std::numeric_limits<long long>::max()),
       _lastFetchedHash(0),
@@ -187,28 +196,19 @@ void BackgroundSync::notify(OperationContext* txn) {
     }
 }
 
-void BackgroundSync::producerThread(executor::TaskExecutor* taskExecutor) {
+void BackgroundSync::producerThread() {
     Client::initThread("rsBackgroundSync");
     AuthorizationSession::get(cc())->grantInternalAuthorization();
 
-    // Disregard task executor passed into this function and use a local thread pool task executor
-    // instead. This ensures that potential blocking operations inside the fetcher callback will
-    // not affect other coordinators (such as the replication coordinator) that might be dependent
-    // on the shared task executor.
-    ThreadPool::Options threadPoolOptions;
-    threadPoolOptions.poolName = "rsBackgroundSync";
-    executor::ThreadPoolTaskExecutor threadPoolTaskExecutor(
-        stdx::make_unique<ThreadPool>(threadPoolOptions), executor::makeNetworkInterface());
-    taskExecutor = &threadPoolTaskExecutor;
-    taskExecutor->startup();
-    ON_BLOCK_EXIT([taskExecutor]() {
-        taskExecutor->shutdown();
-        taskExecutor->join();
+    _threadPoolTaskExecutor.startup();
+    ON_BLOCK_EXIT([this]() {
+        _threadPoolTaskExecutor.shutdown();
+        _threadPoolTaskExecutor.join();
     });
 
     while (!inShutdown()) {
         try {
-            _producerThread(taskExecutor);
+            _producerThread();
         } catch (const DBException& e) {
             std::string msg(str::stream() << "sync producer problem: " << e.toString());
             error() << msg;
@@ -221,12 +221,16 @@ void BackgroundSync::producerThread(executor::TaskExecutor* taskExecutor) {
     stop();
 }
 
-void BackgroundSync::_producerThread(executor::TaskExecutor* taskExecutor) {
+void BackgroundSync::_producerThread() {
     const MemberState state = _replCoord->getMemberState();
     // we want to pause when the state changes to primary
     if (_replCoord->isWaitingForApplierToDrain() || state.primary()) {
         if (!isPaused()) {
             stop();
+        }
+        if (_replCoord->isWaitingForApplierToDrain() && _buffer.empty()) {
+            // This will wake up the applier if it is sitting in blockingPeek().
+            _buffer.clear();
         }
         sleepsecs(1);
         return;
@@ -251,10 +255,10 @@ void BackgroundSync::_producerThread(executor::TaskExecutor* taskExecutor) {
         start(&txn);
     }
 
-    _produce(&txn, taskExecutor);
+    _produce(&txn);
 }
 
-void BackgroundSync::_produce(OperationContext* txn, executor::TaskExecutor* taskExecutor) {
+void BackgroundSync::_produce(OperationContext* txn) {
     // this oplog reader does not do a handshake because we don't want the server it's syncing
     // from to track how far it has synced
     {
@@ -309,6 +313,13 @@ void BackgroundSync::_produce(OperationContext* txn, executor::TaskExecutor* tas
 
     const Milliseconds oplogSocketTimeout(OplogReader::kSocketTimeout);
 
+    const auto isV1ElectionProtocol = _replCoord->isV1ElectionProtocol();
+    // Under protocol version 1, make the awaitData timeout (maxTimeMS) dependent on the election
+    // timeout. This enables the sync source to communicate liveness of the primary to secondaries.
+    // Under protocol version 0, use a default timeout of 2 seconds for awaitData.
+    const Milliseconds fetcherMaxTimeMS(
+        isV1ElectionProtocol ? _replCoord->getConfig().getElectionTimeoutPeriod() / 2 : Seconds(2));
+
     // Prefer host in oplog reader to _syncSourceHost because _syncSourceHost may be cleared
     // if sync source feedback fails.
     const HostAndPort source = syncSourceReader.getHost();
@@ -326,18 +337,35 @@ void BackgroundSync::_produce(OperationContext* txn, executor::TaskExecutor* tas
                                       stdx::cref(source),
                                       lastOpTimeFetched,
                                       lastHashFetched,
+                                      fetcherMaxTimeMS,
                                       &remoteOplogStartStatus);
 
-    auto cmdObj = BSON("find" << nsToCollectionSubstring(rsOplogName) << "filter"
-                              << BSON("ts" << BSON("$gte" << lastOpTimeFetched.getTimestamp()))
-                              << "tailable" << true << "oplogReplay" << true << "awaitData" << true
-                              << "maxTimeMS" << durationCount<Milliseconds>(fetcherMaxTimeMS));
-    Fetcher fetcher(taskExecutor,
+
+    BSONObjBuilder cmdBob;
+    cmdBob.append("find", nsToCollectionSubstring(rsOplogName));
+    cmdBob.append("filter", BSON("ts" << BSON("$gte" << lastOpTimeFetched.getTimestamp())));
+    cmdBob.append("tailable", true);
+    cmdBob.append("oplogReplay", true);
+    cmdBob.append("awaitData", true);
+    cmdBob.append("maxTimeMS", durationCount<Milliseconds>(fetcherMaxTimeMS));
+
+    BSONObjBuilder metadataBob;
+    if (isV1ElectionProtocol) {
+        cmdBob.append("term", _replCoord->getTerm());
+        metadataBob.append(rpc::kReplSetMetadataFieldName, 1);
+    }
+
+    auto dbName = nsToDatabase(rsOplogName);
+    auto cmdObj = cmdBob.obj();
+    auto metadataObj = metadataBob.obj();
+    Fetcher fetcher(&_threadPoolTaskExecutor,
                     source,
-                    nsToDatabase(rsOplogName),
+                    dbName,
                     cmdObj,
                     fetcherCallback,
-                    rpc::makeEmptyMetadata());
+                    metadataObj,
+                    _replCoord->getConfig().getElectionTimeoutPeriod());
+
     auto scheduleStatus = fetcher.schedule();
     if (!scheduleStatus.isOK()) {
         warning() << "unable to schedule fetcher to read remote oplog on " << source << ": "
@@ -379,6 +407,7 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
                                       const HostAndPort& source,
                                       OpTime lastOpTimeFetched,
                                       long long lastFetchedHash,
+                                      Milliseconds fetcherMaxTimeMS,
                                       Status* remoteOplogStartStatus) {
     // if target cut connections between connecting and querying (for
     // example, because it stepped down) we might not have a cursor
@@ -396,6 +425,25 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
     }
 
     const auto& queryResponse = result.getValue();
+
+    // Forward metadata (containing liveness information) to replication coordinator.
+    bool receivedMetadata =
+        queryResponse.otherFields.metadata.hasElement(rpc::kReplSetMetadataFieldName);
+    if (receivedMetadata) {
+        auto metadataResult =
+            rpc::ReplSetMetadata::readFromMetadata(queryResponse.otherFields.metadata);
+        if (!metadataResult.isOK()) {
+            error() << "invalid replication metadata from sync source " << source << ": "
+                    << metadataResult.getStatus() << ": " << queryResponse.otherFields.metadata;
+            return;
+        }
+        const auto& metadata = metadataResult.getValue();
+        _replCoord->processReplSetMetadata(metadata);
+        if (metadata.getPrimaryIndex() == rpc::ReplSetMetadata::kNoPrimary) {
+            _replCoord->signalPrimaryUnavailable();
+        }
+    }
+
     const auto& documents = queryResponse.documents;
     auto documentBegin = documents.cbegin();
     auto documentEnd = documents.cend();
@@ -507,6 +555,9 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
     bob->append("getMore", queryResponse.cursorId);
     bob->append("collection", queryResponse.nss.coll());
     bob->append("maxTimeMS", durationCount<Milliseconds>(fetcherMaxTimeMS));
+    if (receivedMetadata) {
+        bob->append("term", _replCoord->getTerm());
+    }
 }
 
 bool BackgroundSync::_shouldChangeSyncSource(const HostAndPort& syncSource) {
@@ -567,6 +618,10 @@ HostAndPort BackgroundSync::getSyncTarget() {
 void BackgroundSync::clearSyncTarget() {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
     _syncSourceHost = HostAndPort();
+}
+
+void BackgroundSync::cancelFetcher() {
+    _threadPoolTaskExecutor.cancelAllCommands();
 }
 
 void BackgroundSync::stop() {

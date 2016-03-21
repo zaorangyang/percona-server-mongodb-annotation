@@ -88,6 +88,7 @@ public:
                            const std::string& dbname,
                            const BSONObj& cmdObj,
                            ExplainCommon::Verbosity verbosity,
+                           const rpc::ServerSelectionMetadata&,
                            BSONObjBuilder* out) const {
         auto request = CountRequest::parseFromBSON(dbname, cmdObj);
         if (!request.isOK()) {
@@ -154,6 +155,12 @@ public:
         Status execPlanStatus = exec->executePlan();
         if (!execPlanStatus.isOK()) {
             return appendCommandStatus(result, execPlanStatus);
+        }
+
+        PlanSummaryStats summaryStats;
+        Explain::getSummaryStats(*exec, &summaryStats);
+        if (collection) {
+            collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
         }
 
         // Plan is done executing. We just need to pull the count out of the root stage.

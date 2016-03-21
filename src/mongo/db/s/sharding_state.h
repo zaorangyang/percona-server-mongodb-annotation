@@ -88,7 +88,7 @@ public:
     // Initialize sharding state and begin authenticating outgoing connections and handling
     // shard versions.  If this is not run before sharded operations occur auth will not work
     // and versions will not be tracked.
-    void initialize(const std::string& server);
+    void initialize(OperationContext* txn, const std::string& server);
 
     // TODO: The only reason we need this method and cannot merge it together with the initialize
     // call is the setShardVersion request being sent by the config coordinator to the config server
@@ -162,7 +162,7 @@ public:
 
     // querying support
 
-    bool needCollectionMetadata(Client* client, const std::string& ns) const;
+    bool needCollectionMetadata(OperationContext* txn, const std::string& ns) const;
     std::shared_ptr<CollectionMetadata> getCollectionMetadata(const std::string& ns);
 
     // chunk migrate and split support

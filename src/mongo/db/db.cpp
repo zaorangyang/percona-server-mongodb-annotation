@@ -60,6 +60,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/dbwebserver.h"
+#include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index_rebuilder.h"
 #include "mongo/db/initialize_server_global_state.h"
@@ -81,6 +82,7 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/restapi.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
@@ -89,6 +91,7 @@
 #include "mongo/db/stats/snapshots.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/ttl.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -237,7 +240,7 @@ static void logStartup() {
         collection = db->getCollection(ns);
     }
     invariant(collection);
-    uassertStatusOK(collection->insertDocument(&txn, o, false).getStatus());
+    uassertStatusOK(collection->insertDocument(&txn, o, false));
     wunit.commit();
 }
 
@@ -414,6 +417,12 @@ static void _initAndListen(int listenPort) {
 
     getGlobalServiceContext()->initializeGlobalStorageEngine();
 
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
+    if (WiredTigerCustomizationHooks::get(getGlobalServiceContext())->restartRequired()) {
+        exitCleanly(EXIT_CLEAN);
+    }
+#endif
+
     // Warn if we detect configurations for multiple registered storage engines in
     // the same configuration file/environment.
     if (serverGlobalParams.parsedOpts.hasField("storage")) {
@@ -456,7 +465,7 @@ static void _initAndListen(int listenPort) {
     }
 
     DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
-    logMongodStartupWarnings(storageGlobalParams);
+    logMongodStartupWarnings(storageGlobalParams, serverGlobalParams);
 
 #if defined(_WIN32)
     printTargetMinOS();
@@ -581,6 +590,8 @@ static void _initAndListen(int listenPort) {
     startClientCursorMonitor();
 
     PeriodicTask::startRunningPeriodicTasks();
+
+    startFTDC();
 
     logStartup();
 

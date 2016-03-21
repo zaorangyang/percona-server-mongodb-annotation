@@ -79,7 +79,7 @@ void testTransform(const char* specStr,
     // Create projection exec object.
     BSONObj spec = fromjson(specStr);
     BSONObj query = fromjson(queryStr);
-    unique_ptr<MatchExpression> queryExpression = std::move(parseMatchExpression(query));
+    unique_ptr<MatchExpression> queryExpression = parseMatchExpression(query);
     ProjectionExec exec(spec, queryExpression.get());
 
     // Create working set member.
@@ -222,6 +222,23 @@ TEST(ProjectionExecTest, TransformMetaTextScore) {
                   new mongo::TextScoreComputedData(100),
                   true,
                   "{a: 'hello', b: 100}");
+}
+
+TEST(ProjectionExecTest, TransformMetaSortKey) {
+    testTransform("{b: {$meta: 'sortKey'}}",
+                  "{}",
+                  "{a: 'hello'}",
+                  new mongo::SortKeyComputedData(BSON("" << 99)),
+                  true,
+                  "{a: 'hello', b: {'': 99}}");
+
+    // Projected meta field should overwrite existing field.
+    testTransform("{a: {$meta: 'sortKey'}}",
+                  "{}",
+                  "{a: 'hello'}",
+                  new mongo::SortKeyComputedData(BSON("" << 99)),
+                  true,
+                  "{a: {'': 99}}");
 }
 
 }  // namespace

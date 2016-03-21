@@ -261,10 +261,10 @@ Status MigrationDestinationManager::start(const string& ns,
         _migrateThreadHandle.join();
     }
 
-    _migrateThreadHandle = std::move(
+    _migrateThreadHandle =
         stdx::thread([this, ns, min, max, shardKeyPattern, fromShard, epoch, writeConcern]() {
             _migrateThread(ns, min, max, shardKeyPattern, fromShard, epoch, writeConcern);
-        }));
+        });
 
     return Status::OK();
 }
@@ -955,8 +955,11 @@ MoveTimingHelper::~MoveTimingHelper() {
             _b.append("errmsg", *_cmdErrmsg);
         }
 
-        grid.catalogManager(_txn)->logChange(
-            _txn->getClient()->clientAddress(true), (string) "moveChunk." + _where, _ns, _b.obj());
+        grid.catalogManager(_txn)->logChange(_txn,
+                                             _txn->getClient()->clientAddress(true),
+                                             (string) "moveChunk." + _where,
+                                             _ns,
+                                             _b.obj());
     } catch (const std::exception& e) {
         warning() << "couldn't record timing for moveChunk '" << _where << "': " << e.what()
                   << migrateLog;

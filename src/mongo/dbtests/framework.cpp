@@ -61,19 +61,21 @@ int runDbTests(int argc, char** argv) {
     Client::initThread("testsuite");
 
     srand((unsigned)frameworkGlobalParams.seed);
-    printGitVersion();
-    printOpenSSLVersion();
+    printBuildInfo();
 
     getGlobalServiceContext()->initializeGlobalStorageEngine();
 
-    // Initialize the sharding state so we can run starding tests in isolation
-    ShardingState::get(getGlobalServiceContext())->initialize("$dummy:10000");
+    {
+        auto txn = cc().makeOperationContext();
+        // Initialize the sharding state so we can run sharding tests in isolation
+        ShardingState::get(getGlobalServiceContext())->initialize(txn.get(), "$dummy:10000");
+    }
 
     // Note: ShardingState::initialize also initializes the distLockMgr.
     {
         auto txn = cc().makeOperationContext();
         auto distLockMgr = dynamic_cast<LegacyDistLockManager*>(
-            grid.catalogManager(txn.get())->getDistLockManager());
+            grid.forwardingCatalogManager()->getDistLockManager());
         if (distLockMgr) {
             distLockMgr->enablePinger(false);
         }

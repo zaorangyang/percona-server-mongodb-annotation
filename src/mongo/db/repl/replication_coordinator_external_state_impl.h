@@ -49,7 +49,7 @@ class ReplicationCoordinatorExternalStateImpl : public ReplicationCoordinatorExt
 public:
     ReplicationCoordinatorExternalStateImpl();
     virtual ~ReplicationCoordinatorExternalStateImpl();
-    void startThreads(executor::TaskExecutor* taskExecutor) override;
+    virtual void startThreads() override;
     virtual void startMasterSlave(OperationContext* txn);
     virtual void shutdown();
     virtual void initiateOplog(OperationContext* txn, bool updateReplOpTime);
@@ -68,6 +68,7 @@ public:
     virtual void killAllUserOperations(OperationContext* txn);
     virtual void clearShardingState();
     virtual void signalApplierToChooseNewSyncSource();
+    virtual void signalApplierToCancelFetcher();
     virtual OperationContext* createOperationContext(const std::string& threadName);
     virtual void dropAllTempCollections(OperationContext* txn);
     void dropAllSnapshots() final;

@@ -203,7 +203,9 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
 int WiredTigerIndex::Create(OperationContext* txn,
                             const std::string& uri,
                             const std::string& config) {
-    WT_SESSION* s = WiredTigerRecoveryUnit::get(txn)->getSession(txn)->getSession();
+    // Don't use the session from the recovery unit: create should not be used in a transaction
+    WiredTigerSession session(WiredTigerRecoveryUnit::get(txn)->getSessionCache()->conn());
+    WT_SESSION* s = session.getSession();
     LOG(1) << "create uri: " << uri << " config: " << config;
     return s->create(s, uri.c_str(), config.c_str());
 }
@@ -656,7 +658,7 @@ public:
         return curr(parts);
     }
 
-    void savePositioned() override {
+    void save() override {
         try {
             if (_cursor)
                 _cursor->reset();
@@ -670,7 +672,7 @@ public:
     }
 
     void saveUnpositioned() override {
-        savePositioned();
+        save();
         _eof = true;
     }
 
@@ -690,7 +692,7 @@ public:
 
     void detachFromOperationContext() final {
         _txn = nullptr;
-        _cursor = {};
+        _cursor = boost::none;
     }
 
     void reattachToOperationContext(OperationContext* txn) final {

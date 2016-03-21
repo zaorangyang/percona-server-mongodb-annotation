@@ -88,7 +88,7 @@ ReplicationCoordinatorExternalStateImpl::ReplicationCoordinatorExternalStateImpl
     : _startedThreads(false), _nextThreadId(0) {}
 ReplicationCoordinatorExternalStateImpl::~ReplicationCoordinatorExternalStateImpl() {}
 
-void ReplicationCoordinatorExternalStateImpl::startThreads(executor::TaskExecutor* taskExecutor) {
+void ReplicationCoordinatorExternalStateImpl::startThreads() {
     stdx::lock_guard<stdx::mutex> lk(_threadMutex);
     if (_startedThreads) {
         return;
@@ -96,8 +96,7 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(executor::TaskExecuto
     log() << "Starting replication applier threads";
     _applierThread.reset(new stdx::thread(runSyncThread));
     BackgroundSync* bgsync = BackgroundSync::get();
-    _producerThread.reset(
-        new stdx::thread(stdx::bind(&BackgroundSync::producerThread, bgsync, taskExecutor)));
+    _producerThread.reset(new stdx::thread(stdx::bind(&BackgroundSync::producerThread, bgsync)));
     _syncSourceFeedbackThread.reset(
         new stdx::thread(stdx::bind(&SyncSourceFeedback::run, &_syncSourceFeedback)));
     if (enableReplSnapshotThread) {
@@ -338,6 +337,10 @@ void ReplicationCoordinatorExternalStateImpl::clearShardingState() {
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
     BackgroundSync::get()->clearSyncTarget();
+}
+
+void ReplicationCoordinatorExternalStateImpl::signalApplierToCancelFetcher() {
+    BackgroundSync::get()->cancelFetcher();
 }
 
 OperationContext* ReplicationCoordinatorExternalStateImpl::createOperationContext(

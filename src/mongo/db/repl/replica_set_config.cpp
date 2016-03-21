@@ -51,7 +51,7 @@ const std::string ReplicaSetConfig::kVersionFieldName = "version";
 const std::string ReplicaSetConfig::kMajorityWriteConcernModeName = "$majority";
 const Milliseconds ReplicaSetConfig::kDefaultHeartbeatInterval(2000);
 const Seconds ReplicaSetConfig::kDefaultHeartbeatTimeoutPeriod(10);
-const Milliseconds ReplicaSetConfig::kDefaultElectionTimeoutPeriod(2000);
+const Milliseconds ReplicaSetConfig::kDefaultElectionTimeoutPeriod(10000);
 
 namespace {
 
@@ -428,6 +428,18 @@ Status ReplicaSetConfig::validate() const {
                           "Arbiters are not allowed in replica set configurations being used for "
                           "config servers");
         }
+        for (MemberIterator mem = membersBegin(); mem != membersEnd(); mem++) {
+            if (!mem->shouldBuildIndexes()) {
+                return Status(ErrorCodes::BadValue,
+                              "Members in replica set configurations being used for config "
+                              "servers must build indexes");
+            }
+            if (mem->getSlaveDelay() != Seconds(0)) {
+                return Status(ErrorCodes::BadValue,
+                              "Members in replica set configurations being used for config "
+                              "servers cannot have a non-zero slaveDelay");
+            }
+        }
         if (!serverGlobalParams.configsvr) {
             return Status(ErrorCodes::BadValue,
                           "Nodes being used for config servers must be started with the "
@@ -647,6 +659,40 @@ std::vector<std::string> ReplicaSetConfig::getWriteConcernNames() const {
         names.push_back(mode->first);
     }
     return names;
+}
+
+Milliseconds ReplicaSetConfig::getPriorityTakeoverDelay(int memberIdx) const {
+    auto member = getMemberAt(memberIdx);
+    int priorityRank = _calculatePriorityRank(member.getPriority());
+    Milliseconds nodeSpecificDelay =
+        getVoterPosition(memberIdx) * getElectionTimeoutPeriod() / getTotalVotingMembers();
+    return (priorityRank + 1) * getElectionTimeoutPeriod() + nodeSpecificDelay;
+}
+
+int ReplicaSetConfig::_calculatePriorityRank(int priority) const {
+    int count = 0;
+    for (MemberIterator mem = membersBegin(); mem != membersEnd(); mem++) {
+        if (mem->getPriority() > priority) {
+            count++;
+        }
+    }
+    return count;
+}
+
+int ReplicaSetConfig::getVoterPosition(int memberIdx) const {
+    int pos = 0;
+    int idx = 0;
+    for (auto mem = membersBegin(); mem != membersEnd(); ++mem) {
+        if (idx == memberIdx) {
+            break;
+        }
+
+        if (mem->isVoter()) {
+            pos++;
+        }
+        idx++;
+    }
+    return pos;
 }
 
 }  // namespace repl

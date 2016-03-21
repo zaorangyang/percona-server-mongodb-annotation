@@ -35,9 +35,12 @@
 #include <type_traits>
 #include <utility>
 
+#include "mongo/executor/connection_pool_asio.h"
+#include "mongo/executor/async_stream_interface.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/executor/async_stream_interface.h"
+#include "mongo/executor/downconvert_find_and_getmore_commands.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/reply_interface.h"
@@ -123,12 +126,37 @@ void asyncRecvMessageBody(AsyncStreamInterface& stream,
     stream.read(asio::buffer(mdView.data(), bodyLength), std::forward<Handler>(handler));
 }
 
+ResponseStatus decodeRPC(Message* received, rpc::Protocol protocol, Milliseconds elapsed) {
+    try {
+        // makeReply will throw if the reply is invalid
+        auto reply = rpc::makeReply(received);
+        if (reply->getProtocol() != protocol) {
+            auto requestProtocol = rpc::toString(static_cast<rpc::ProtocolSet>(protocol));
+            if (!requestProtocol.isOK())
+                return requestProtocol.getStatus();
+
+            return Status(ErrorCodes::RPCProtocolNegotiationFailed,
+                          str::stream() << "Mismatched RPC protocols - request was '"
+                                        << requestProtocol.getValue().toString() << "' '"
+                                        << " but reply was '" << opToString(received->operation())
+                                        << "'");
+        }
+        auto ownedCommandReply = reply->getCommandReply().getOwned();
+        auto ownedReplyMetadata = reply->getMetadata().getOwned();
+        return {RemoteCommandResponse(
+            std::move(ownedCommandReply), std::move(ownedReplyMetadata), elapsed)};
+    } catch (...) {
+        return exceptionToStatus();
+    }
+}
+
 }  // namespace
 
 NetworkInterfaceASIO::AsyncCommand::AsyncCommand(AsyncConnection* conn,
+                                                 CommandType type,
                                                  Message&& command,
                                                  Date_t now)
-    : _conn(conn), _toSend(std::move(command)), _start(now) {
+    : _conn(conn), _type(type), _toSend(std::move(command)), _start(now) {
     _toSend.header().setResponseTo(0);
 }
 
@@ -150,30 +178,20 @@ MSGHEADER::Value& NetworkInterfaceASIO::AsyncCommand::header() {
 
 ResponseStatus NetworkInterfaceASIO::AsyncCommand::response(rpc::Protocol protocol, Date_t now) {
     auto& received = _toRecv;
-    try {
-        auto reply = rpc::makeReply(&received);
-
-        if (reply->getProtocol() != protocol) {
-            auto requestProtocol = rpc::toString(static_cast<rpc::ProtocolSet>(protocol));
-            if (!requestProtocol.isOK())
-                return requestProtocol.getStatus();
-
-            return Status(ErrorCodes::RPCProtocolNegotiationFailed,
-                          str::stream() << "Mismatched RPC protocols - request was '"
-                                        << requestProtocol.getValue().toString() << "' '"
-                                        << " but reply was '" << opToString(received.operation())
-                                        << "'");
+    switch (_type) {
+        case CommandType::kRPC: {
+            return decodeRPC(&received, protocol, now - _start);
         }
-
-        // unavoidable copy
-        auto ownedCommandReply = reply->getCommandReply().getOwned();
-        auto ownedReplyMetadata = reply->getMetadata().getOwned();
-        return ResponseStatus(RemoteCommandResponse(
-            std::move(ownedCommandReply), std::move(ownedReplyMetadata), now - _start));
-    } catch (...) {
-        // makeReply can throw if the reply was invalid.
-        return exceptionToStatus();
+        case CommandType::kDownConvertedFind: {
+            auto ns = DbMessage(_toSend).getns();
+            return upconvertLegacyQueryResponse(_toSend.header().getId(), ns, received);
+        }
+        case CommandType::kDownConvertedGetMore: {
+            auto ns = DbMessage(_toSend).getns();
+            return upconvertLegacyGetMoreResponse(_toSend.header().getId(), ns, received);
+        }
     }
+    MONGO_UNREACHABLE;
 }
 
 void NetworkInterfaceASIO::_startCommand(AsyncOp* op) {
@@ -188,9 +206,25 @@ void NetworkInterfaceASIO::_startCommand(AsyncOp* op) {
 }
 
 void NetworkInterfaceASIO::_beginCommunication(AsyncOp* op) {
-    auto& cmd = op->beginCommand(op->request(), op->operationProtocol(), now());
+    // The way that we connect connections for the connection pool is by
+    // starting the callback chain with connect(), but getting off at the first
+    // _beginCommunication. I.e. all AsyncOp's start off with _inSetup == true
+    // and arrive here as they're connected and authed. Once they hit here, we
+    // return to the connection pool's get() callback with _inSetup == false,
+    // so we can proceed with user operations after they return to this
+    // codepath.
+    if (op->_inSetup) {
+        op->_inSetup = false;
+        op->finish(RemoteCommandResponse());
+        return;
+    }
 
-    _asyncRunCommand(&cmd,
+    auto beginStatus = op->beginCommand(op->request());
+    if (!beginStatus.isOK()) {
+        return _completeOperation(op, beginStatus);
+    }
+
+    _asyncRunCommand(op->command(),
                      [this, op](std::error_code ec, size_t bytes) {
                          _validateAndRun(op, ec, [this, op]() { _completedOpCallback(op); });
                      });
@@ -198,7 +232,7 @@ void NetworkInterfaceASIO::_beginCommunication(AsyncOp* op) {
 
 void NetworkInterfaceASIO::_completedOpCallback(AsyncOp* op) {
     // TODO: handle metadata readers.
-    auto response = op->command().response(op->operationProtocol(), now());
+    auto response = op->command()->response(op->operationProtocol(), now());
     _completeOperation(op, response);
 }
 
@@ -218,11 +252,32 @@ void NetworkInterfaceASIO::_networkErrorCallback(AsyncOp* op, const std::error_c
 void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus& resp) {
     op->finish(resp);
 
+    std::unique_ptr<AsyncOp> ownedOp;
+
     {
-        // NOTE: op will be deleted in the call to erase() below.
-        // It is invalid to reference op after this point.
         stdx::lock_guard<stdx::mutex> lk(_inProgressMutex);
-        _inProgress.erase(op);
+
+        auto iter = _inProgress.find(op);
+
+        // We're in connection start
+        if (iter == _inProgress.end()) {
+            return;
+        }
+
+        ownedOp = std::move(iter->second);
+        _inProgress.erase(iter);
+    }
+
+    invariant(ownedOp);
+
+    auto conn = std::move(op->_connectionPoolHandle);
+    auto asioConn = static_cast<connection_pool_asio::ASIOConnection*>(conn.get());
+
+    asioConn->bindAsyncOp(std::move(ownedOp));
+    if (!resp.isOK()) {
+        asioConn->indicateFailed(resp.getStatus());
+    } else {
+        asioConn->indicateUsed();
     }
 
     signalWorkAvailable();
@@ -277,7 +332,8 @@ void NetworkInterfaceASIO::_runConnectionHook(AsyncOp* op) {
         return _beginCommunication(op);
     }
 
-    auto swOptionalRequest = _hook->makeRequest(op->request().target);
+    auto swOptionalRequest =
+        callNoexcept(*_hook, &NetworkConnectionHook::makeRequest, op->request().target);
 
     if (!swOptionalRequest.isOK()) {
         return _completeOperation(op, swOptionalRequest.getStatus());
@@ -289,17 +345,22 @@ void NetworkInterfaceASIO::_runConnectionHook(AsyncOp* op) {
         return _beginCommunication(op);
     }
 
-    auto& cmd = op->beginCommand(*optionalRequest, op->operationProtocol(), now());
+    auto beginStatus = op->beginCommand(*optionalRequest);
+    if (!beginStatus.isOK()) {
+        return _completeOperation(op, beginStatus);
+    }
 
     auto finishHook = [this, op]() {
-        auto response = op->command().response(op->operationProtocol(), now());
+        auto response = op->command()->response(op->operationProtocol(), now());
 
         if (!response.isOK()) {
             return _completeOperation(op, response.getStatus());
         }
 
-        auto handleStatus =
-            _hook->handleReply(op->request().target, std::move(response.getValue()));
+        auto handleStatus = callNoexcept(*_hook,
+                                         &NetworkConnectionHook::handleReply,
+                                         op->request().target,
+                                         std::move(response.getValue()));
 
         if (!handleStatus.isOK()) {
             return _completeOperation(op, handleStatus);
@@ -308,7 +369,7 @@ void NetworkInterfaceASIO::_runConnectionHook(AsyncOp* op) {
         return _beginCommunication(op);
     };
 
-    return _asyncRunCommand(&cmd,
+    return _asyncRunCommand(op->command(),
                             [this, op, finishHook](std::error_code ec, std::size_t bytes) {
                                 _validateAndRun(op, ec, finishHook);
                             });

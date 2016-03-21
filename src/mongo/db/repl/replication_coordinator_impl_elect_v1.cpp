@@ -37,6 +37,7 @@
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/repl/election_winner_declarer.h"
 #include "mongo/db/repl/vote_requester.h"
+#include "mongo/platform/unordered_set.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -181,7 +182,7 @@ void ReplicationCoordinatorImpl::_onDryRunComplete(long long originalTerm) {
     }
 
     log() << "dry election run succeeded, running for election";
-    _updateTerm_incallback(originalTerm + 1, nullptr);
+    _updateTerm_incallback(originalTerm + 1);
     // Secure our vote for ourself first
     _topCoord->voteForMyselfV1();
 
@@ -277,6 +278,20 @@ void ReplicationCoordinatorImpl::_onVoteRequestComplete(long long originalTerm) 
     }
 
     log() << "election succeeded, assuming primary role in term " << _topCoord->getTerm();
+    {
+        // Mark all nodes that responded to our vote request as up to avoid immediately
+        // relinquishing primary.
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        Date_t now = _replExecutor.now();
+        const unordered_set<HostAndPort> liveNodes = _voteRequester->getResponders();
+        for (auto& nodeInfo : _slaveInfo) {
+            if (liveNodes.count(nodeInfo.hostAndPort)) {
+                nodeInfo.down = false;
+                nodeInfo.lastUpdate = now;
+            }
+        }
+    }
+
     // Prevent last committed optime from updating until we finish draining.
     _setFirstOpTimeOfMyTerm(
         OpTime(Timestamp(std::numeric_limits<int>::max(), 0), std::numeric_limits<int>::max()));
@@ -298,8 +313,7 @@ void ReplicationCoordinatorImpl::_onElectionWinnerDeclarerComplete() {
     if (!endResult.isOK()) {
         log() << "stepping down from primary, because: " << endResult;
         _topCoord->prepareForStepDown();
-        _replExecutor.scheduleWorkWithGlobalExclusiveLock(
-            stdx::bind(&ReplicationCoordinatorImpl::_stepDownFinish, this, stdx::placeholders::_1));
+        _stepDownStart();
     }
 
     lossGuard.dismiss();

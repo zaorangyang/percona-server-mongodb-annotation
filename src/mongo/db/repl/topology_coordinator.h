@@ -29,6 +29,7 @@
 #pragma once
 
 #include <string>
+#include <iosfwd>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
@@ -109,14 +110,14 @@ public:
      * Gets the latest term this member is aware of. If this member is the primary,
      * it's the current term of the replica set.
      */
-    virtual long long getTerm() const = 0;
+    virtual long long getTerm() = 0;
 
     /**
      * Sets the latest term this member is aware of to the higher of its current value and
      * the value passed in as "term".
      * Returns true if the local term value is changed.
      */
-    virtual bool updateTerm(long long term) = 0;
+    virtual bool updateTerm(long long term, Date_t now) = 0;
 
     ////////////////////////////////////////////////////////////
     //
@@ -427,11 +428,6 @@ public:
     virtual void loadLastVote(const LastVote& lastVote) = 0;
 
     /**
-     * Returns the most recent term this node is aware of.
-     */
-    virtual long long getTerm() = 0;
-
-    /**
      * Readies the TopologyCoordinator for stepdown.
      */
     virtual void prepareForStepDown() = 0;
@@ -440,6 +436,21 @@ public:
      * Updates the current primary index.
      */
     virtual void setPrimaryIndex(long long primaryIndex) = 0;
+
+    /**
+     * Returns the additional delay to be added to election related timeouts pertaining to the
+     * member with the id "memberId".
+     * If the additional delay could not be calculated (for example, because the  member is absent
+     * from the config or the ping table), Milliseconds() is returned.
+     */
+    virtual Milliseconds getTimeoutDelayForMember(int memberId) = 0;
+
+    /**
+     * Returns true if the node is able to take over the primary because of a higher priority and
+     * the node has transitioned to the candidate role as a result of the call.
+     */
+    virtual bool stagePriorityTakeoverIfElectable(const Date_t now,
+                                                  const OpTime& lastOpApplied) = 0;
 
 protected:
     TopologyCoordinator() {}
@@ -487,6 +498,12 @@ private:
 
     int _value;
 };
+
+//
+// Convenience method for unittest code. Please use accessors otherwise.
+//
+
+std::ostream& operator<<(std::ostream& os, TopologyCoordinator::Role role);
 
 }  // namespace repl
 }  // namespace mongo

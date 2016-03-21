@@ -10,6 +10,7 @@ env.Library(
     ],
     LIBDEPS = [
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/service_context",
     ],
 )
 
@@ -79,8 +80,13 @@ env.Library(
         "scoped_timer",
         "working_set",
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/ops/update_driver",
         '$BUILD_DIR/third_party/s2/s2',
     ],
+    LIBDEPS_TAGS=[
+        # A great number of undefined symbols in this library
+        'incomplete',
+    ]
 )
 
 env.CppUnitTest(

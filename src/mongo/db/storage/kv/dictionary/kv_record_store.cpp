@@ -300,11 +300,11 @@ namespace mongo {
         return StatusWith<RecordId>(id);
     }
 
-    Status KVRecordStore::updateWithDamages( OperationContext* txn,
-                                             const RecordId& id,
-                                             const RecordData& oldRec,
-                                             const char* damageSource,
-                                             const mutablebson::DamageVector& damages ) {
+    StatusWith<RecordData> KVRecordStore::updateWithDamages( OperationContext* txn,
+                                                             const RecordId& id,
+                                                             const RecordData& oldRec,
+                                                             const char* damageSource,
+                                                             const mutablebson::DamageVector& damages ) {
         const KeyString key(id);
 
         const Slice oldValue(oldRec.data(), oldRec.size());
@@ -315,7 +315,7 @@ namespace mongo {
 
         const Status s = _db->update(txn, Slice::of(key), oldValue, message);
         if (!s.isOK()) {
-            return s;
+            return StatusWith<RecordData>(s);
         }
 
         // We also need to reach in and screw with the old doc's data so that the update system gets
@@ -327,7 +327,8 @@ namespace mongo {
                       /* eek */
                       const_cast<char *>(oldRec.data()) + event.targetOffset);
         }
-        return s;
+
+        return StatusWith<RecordData>(oldRec);
     }
 
     KVRecordStore::KVRecordCursor* KVRecordStore::getKVCursor(OperationContext* txn,
@@ -335,7 +336,7 @@ namespace mongo {
         return new KVRecordCursor(*this, _db.get(), txn, forward);
     }
 
-    std::unique_ptr<RecordCursor> KVRecordStore::getCursor(OperationContext* txn,
+    std::unique_ptr<SeekableRecordCursor> KVRecordStore::getCursor(OperationContext* txn,
                                                            bool forward) const {
         KVRecordCursor *c = new KVRecordCursor(*this, _db.get(), txn, forward);
         return std::unique_ptr<KVRecordCursor>(c);

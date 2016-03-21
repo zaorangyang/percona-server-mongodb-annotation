@@ -137,6 +137,7 @@ void beginQueryOp(OperationContext* txn,
 }
 
 void endQueryOp(OperationContext* txn,
+                Collection* collection,
                 const PlanExecutor& exec,
                 int dbProfilingLevel,
                 long long numResults,
@@ -151,10 +152,14 @@ void endQueryOp(OperationContext* txn,
     // Fill out curop based on explain summary statistics.
     PlanSummaryStats summaryStats;
     Explain::getSummaryStats(exec, &summaryStats);
-    curop->debug().scanAndOrder = summaryStats.hasSortStage;
-    curop->debug().nscanned = summaryStats.totalKeysExamined;
-    curop->debug().nscannedObjects = summaryStats.totalDocsExamined;
+    curop->debug().hasSortStage = summaryStats.hasSortStage;
+    curop->debug().keysExamined = summaryStats.totalKeysExamined;
+    curop->debug().docsExamined = summaryStats.totalDocsExamined;
     curop->debug().idhack = summaryStats.isIdhack;
+
+    if (collection) {
+        collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
+    }
 
     const logger::LogComponent queryLogComponent = logger::LogComponent::kQuery;
     const logger::LogSeverity logLevelOne = logger::LogSeverity::Debug(1);
@@ -387,6 +392,10 @@ QueryResult::View getMore(OperationContext* txn,
             uint64_t lastInsertCount = notifier->getCount();
             notifier->waitForInsert(lastInsertCount, timeout);
             notifier.reset();
+
+            // Set expected latency to match wait time. This makes sure the logs aren't spammed
+            // by awaitData queries that exceed slowms due to blocking on the CappedInsertNotifier.
+            curop.setExpectedLatencyMs(durationCount<Milliseconds>(timeout));
 
             // Reacquiring locks.
             ctx = make_unique<AutoGetCollectionForRead>(txn, nss);
@@ -657,10 +666,10 @@ std::string runQuery(OperationContext* txn,
         // use by future getmore ops).
         cc->setLeftoverMaxTimeMicros(curop.getRemainingMaxTimeMicros());
 
-        endQueryOp(txn, *cc->getExecutor(), dbProfilingLevel, numResults, ccId);
+        endQueryOp(txn, collection, *cc->getExecutor(), dbProfilingLevel, numResults, ccId);
     } else {
         LOG(5) << "Not caching executor but returning " << numResults << " results.\n";
-        endQueryOp(txn, *exec, dbProfilingLevel, numResults, ccId);
+        endQueryOp(txn, collection, *exec, dbProfilingLevel, numResults, ccId);
     }
 
     // Add the results from the query into the output buffer.

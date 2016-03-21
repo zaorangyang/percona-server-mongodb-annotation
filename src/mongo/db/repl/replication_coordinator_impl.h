@@ -194,6 +194,8 @@ public:
 
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
 
+    virtual void signalPrimaryUnavailable() override;
+
     virtual Status setMaintenanceMode(bool activate) override;
 
     virtual bool getMaintenanceMode() override;
@@ -306,7 +308,14 @@ public:
      */
     Status setLastOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
 
-    bool updateTerm_forTest(long long term);
+    /**
+     * Non-blocking version of setFollowerMode.
+     * Returns event handle that we can use to wait for the operation to complete.
+     * When the operation is complete (wait() returns), 'success' will be set to true
+     * if the member state has been set successfully.
+     */
+    ReplicationExecutor::EventHandle setFollowerMode_nonBlocking(const MemberState& newState,
+                                                                 bool* success);
 
     /**
      * If called after _startElectSelfV1(), blocks until all asynchronous
@@ -328,6 +337,13 @@ public:
     void waitForStepDownFinish_forTest();
 
 private:
+    using CallbackFn = executor::TaskExecutor::CallbackFn;
+
+    using CallbackHandle = executor::TaskExecutor::CallbackHandle;
+
+    using ScheduleFn = stdx::function<StatusWith<executor::TaskExecutor::CallbackHandle>(
+        const executor::TaskExecutor::CallbackFn& work)>;
+
     struct SnapshotInfo {
         OpTime opTime;
         SnapshotName name;
@@ -400,7 +416,8 @@ private:
         kActionNone,
         kActionCloseAllConnections,  // Also indicates that we should clear sharding state.
         kActionFollowerModeStateChange,
-        kActionWinElection
+        kActionWinElection,
+        kActionStartSingleNodeElection
     };
 
     // Struct that holds information about clients waiting for replication.
@@ -472,8 +489,10 @@ private:
      * Returns an action to be performed after unlocking _mutex, via
      * _performPostMemberStateUpdateAction.
      */
-    PostMemberStateUpdateAction _setCurrentRSConfig_inlock(const ReplicaSetConfig& newConfig,
-                                                           int myIndex);
+    PostMemberStateUpdateAction _setCurrentRSConfig_inlock(
+        const ReplicationExecutor::CallbackArgs& cbData,
+        const ReplicaSetConfig& newConfig,
+        int myIndex);
 
     /**
      * Updates the last committed OpTime to be "committedOpTime" if it is more recent than the
@@ -531,10 +550,6 @@ private:
                                       int secs,
                                       BSONObjBuilder* response,
                                       Status* result);
-    /*
-     * Bottom half of clearSyncSourceBlacklist
-     */
-    void _clearSyncSourceBlacklist_finish(const ReplicationExecutor::CallbackArgs& cbData);
 
     /**
      * Bottom half of processReplSetDeclareElectionWinner.
@@ -609,7 +624,6 @@ private:
      * to decide whether or not to finish a step down.
      * Should only be called from executor callbacks.
      */
-    void _signalStepDownWaitersFromCallback(const ReplicationExecutor::CallbackArgs& cbData);
     void _signalStepDownWaiters();
 
     /**
@@ -698,7 +712,7 @@ private:
      * Starts a heartbeat for each member in the current config.  Called within the executor
      * context.
      */
-    void _startHeartbeats();
+    void _startHeartbeats_inlock(const ReplicationExecutor::CallbackArgs& cbData);
 
     /**
      * Cancels all heartbeats.  Called within executor context.
@@ -900,7 +914,7 @@ private:
      */
     void _requestRemotePrimaryStepdown(const HostAndPort& target);
 
-    void _heartbeatStepDownStart();
+    void _stepDownStart();
 
     /**
      * Completes a step-down of the current node.  Must be run with a global
@@ -980,23 +994,15 @@ private:
     /**
      * Callback that attempts to set the current term in topology coordinator and
      * relinquishes primary if the term actually changes and we are primary.
-     */
-    void _updateTerm_helper(const ReplicationExecutor::CallbackArgs& cbData,
-                            long long term,
-                            bool* updated,
-                            Handle* cbHandle);
-    /**
      * Returns true if the term increased.
      */
-    bool _updateTerm_incallback(long long term, Handle* cbHandle);
+    bool _updateTerm_incallback(long long term);
 
     /**
      * Callback that processes the ReplSetMetadata returned from a command run against another
      * replica set member and updates protocol version 1 information (most recent optime that is
      * committed, member id of the current PRIMARY, the current config version and the current term)
      */
-    void _processReplSetMetadata_helper(const ReplicationExecutor::CallbackArgs& cbData,
-                                        const rpc::ReplSetMetadata& replMetadata);
     void _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata);
 
     /**
@@ -1013,12 +1019,13 @@ private:
      * Callback which schedules "_handleLivenessTimeout" to be run whenever the liveness timeout
      * for the node who was least recently reported to be alive occurs.
      */
-    void _scheduleNextLivenessUpdate();
+    void _scheduleNextLivenessUpdate(const ReplicationExecutor::CallbackArgs& cbData);
 
     /**
      * Bottom half of _scheduleNextLivenessUpdate.
+     * Must be called from within a callback.
      */
-    void _scheduleNextLivenessUpdate_inlock();
+    void _scheduleNextLivenessUpdate_inlock(const ReplicationExecutor::CallbackArgs& cbData);
 
     /**
      * Callback which marks downed nodes as down, triggers a stepdown if a majority of nodes are no
@@ -1034,9 +1041,53 @@ private:
     void _cancelAndRescheduleLivenessUpdate_inlock(int updatedMemberId);
 
     /**
-     * Bottom half of isV1ElectionProtocol.
+     * Callback which starts an election if this node is electable and using protocolVersion 1.
      */
-    bool _isV1ElectionProtocol_inlock();
+    void _priorityTakeover(const ReplicationExecutor::CallbackArgs& cbData);
+
+    /**
+     * Reset the term of last vote to 0 to prevent any node from voting for term 0.
+     * Blocking until last vote write finishes. Must be called without holding _mutex.
+     */
+    void _resetElectionInfoOnProtocolVersionUpgrade(const ReplicaSetConfig& newConfig);
+
+    /**
+     * Schedules work and returns handle to callback.
+     * If work cannot be scheduled due to shutdown, returns empty handle.
+     * All other non-shutdown scheduling failures will abort the process.
+     * Does not run 'work' if callback is canceled.
+     */
+    CallbackHandle _scheduleWork(const CallbackFn& work);
+
+    /**
+     * Schedules work to be run no sooner than 'when' and returns handle to callback.
+     * If work cannot be scheduled due to shutdown, returns empty handle.
+     * All other non-shutdown scheduling failures will abort the process.
+     * Does not run 'work' if callback is canceled.
+     */
+    CallbackHandle _scheduleWorkAt(Date_t when, const CallbackFn& work);
+
+    /**
+     * Schedules work and waits for completion.
+     */
+    void _scheduleWorkAndWaitForCompletion(const CallbackFn& work);
+
+    /**
+     * Schedules work to be run no sooner than 'when' and waits for completion.
+     */
+    void _scheduleWorkAtAndWaitForCompletion(Date_t when, const CallbackFn& work);
+
+    /**
+     * Does the actual work of scheduling the work with the executor.
+     * Used by _scheduleWork() and _scheduleWorkAt() only.
+     * Do not call this function directly.
+     */
+    static CallbackHandle _wrapAndScheduleWork(ScheduleFn scheduleFn, const CallbackFn& work);
+
+    /**
+     * Schedule notification of election win.
+     */
+    void _scheduleElectionWinNotification();
 
     //
     // All member variables are labeled with one of the following codes indicating the
@@ -1206,15 +1257,24 @@ private:
     boost::optional<SnapshotInfo> _currentCommittedSnapshot;  // (M)
 
     // The cached current term. It's in sync with the term in topology coordinator.
-    long long _cachedTerm = OpTime::kProtocolVersionV0Term;  // (M)
+    long long _cachedTerm = OpTime::kUninitializedTerm;  // (M)
 
     // Callback Handle used to cancel a scheduled LivenessTimeout callback.
     ReplicationExecutor::CallbackHandle _handleLivenessTimeoutCbh;  // (M)
+
+    // Callback Handle used to cancel a scheduled PriorityTakover callback.
+    ReplicationExecutor::CallbackHandle _priorityTakeoverCbh;  // (M)
 
     // The id of the earliest member, for which the handleLivenessTimeout callback has been
     // scheduled.  We need this so that we don't needlessly cancel and reschedule the callback on
     // every liveness update.
     int _earliestMemberId = -1;  // (M)
+
+    // Cached copy of the current config protocol version.
+    AtomicInt64 _protVersion;  // (S)
+
+    // Prevents a busy loop of cancelling heartbeats when we have no sync source.
+    bool _justLostSyncSource = true;  // (M)
 };
 
 }  // namespace repl

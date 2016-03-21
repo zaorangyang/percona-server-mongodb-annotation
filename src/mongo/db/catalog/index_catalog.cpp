@@ -126,37 +126,17 @@ Status IndexCatalog::init(OperationContext* txn) {
     return Status::OK();
 }
 
-namespace {
-class IndexCleanupOnRollback : public RecoveryUnit::Change {
-public:
-    /**
-     * None of these pointers are owned by this class.
-     */
-    IndexCleanupOnRollback(OperationContext* txn,
-                           Collection* collection,
-                           IndexCatalogEntryContainer* entries,
-                           const IndexDescriptor* desc)
-        : _txn(txn), _collection(collection), _entries(entries), _desc(desc) {}
-
-    virtual void commit() {}
-
-    virtual void rollback() {
-        _entries->remove(_desc);
-        _collection->infoCache()->reset(_txn);
-    }
-
-private:
-    OperationContext* _txn;
-    Collection* _collection;
-    IndexCatalogEntryContainer* _entries;
-    const IndexDescriptor* _desc;
-};
-}  // namespace
-
 IndexCatalogEntry* IndexCatalog::_setupInMemoryStructures(OperationContext* txn,
                                                           IndexDescriptor* descriptor,
                                                           bool initFromDisk) {
     unique_ptr<IndexDescriptor> descriptorCleanup(descriptor);
+
+    Status status = _isSpecOk(descriptor->infoObj());
+    if (!status.isOK() && status != ErrorCodes::IndexAlreadyExists) {
+        severe() << "Found an invalid index " << descriptor->infoObj() << " on the "
+                 << _collection->ns().ns() << " collection: " << status.reason();
+        fassertFailedNoTrace(28782);
+    }
 
     unique_ptr<IndexCatalogEntry> entry(new IndexCatalogEntry(_collection->ns().ns(),
                                                               _collection->getCatalogEntry(),
@@ -170,8 +150,12 @@ IndexCatalogEntry* IndexCatalog::_setupInMemoryStructures(OperationContext* txn,
     _entries.add(entry.release());
 
     if (!initFromDisk) {
-        txn->recoveryUnit()->registerChange(
-            new IndexCleanupOnRollback(txn, _collection, &_entries, descriptor));
+        txn->recoveryUnit()->onRollback([this, txn, descriptor] {
+            // Need to preserve indexName as descriptor no longer exists after remove().
+            const std::string indexName = descriptor->indexName();
+            _entries.remove(descriptor);
+            _collection->infoCache()->droppedIndex(txn, indexName);
+        });
     }
 
     invariant(save == _entries.find(descriptor));
@@ -437,7 +421,7 @@ void IndexCatalog::IndexBuildBlock::success() {
     _txn->recoveryUnit()->registerChange(new IndexCompletionChange(_txn, entry));
     entry->setIsReady(true);
 
-    _catalog->_collection->infoCache()->addedIndex(_txn);
+    _catalog->_collection->infoCache()->addedIndex(_txn, _indexName);
 }
 
 namespace {
@@ -480,7 +464,7 @@ Status IndexCatalog::_isSpecOk(const BSONObj& spec) const {
     if (!vElt.eoo()) {
         if (!vElt.isNumber()) {
             return Status(ErrorCodes::CannotCreateIndex,
-                          str::stream() << "non-numeric value for \"v\" field:" << vElt);
+                          str::stream() << "non-numeric value for \"v\" field: " << vElt);
         }
         double v = vElt.Number();
 
@@ -502,10 +486,10 @@ Status IndexCatalog::_isSpecOk(const BSONObj& spec) const {
 
     if (nss.isSystemDotIndexes())
         return Status(ErrorCodes::CannotCreateIndex,
-                      "cannot create indexes on the system.indexes collection");
+                      "cannot have an index on the system.indexes collection");
 
     if (nss.isOplog())
-        return Status(ErrorCodes::CannotCreateIndex, "cannot create indexes on the oplog");
+        return Status(ErrorCodes::CannotCreateIndex, "cannot have an index on the oplog");
 
     if (nss.coll() == "$freelist") {
         // this isn't really proper, but we never want it and its not an error per se
@@ -514,10 +498,14 @@ Status IndexCatalog::_isSpecOk(const BSONObj& spec) const {
 
     const BSONElement specNamespace = spec["ns"];
     if (specNamespace.type() != String)
-        return Status(ErrorCodes::CannotCreateIndex, "the index spec needs a 'ns' string field");
+        return Status(ErrorCodes::CannotCreateIndex,
+                      "the index spec is missing a \"ns\" string field");
 
     if (nss.ns() != specNamespace.valueStringData())
-        return Status(ErrorCodes::CannotCreateIndex, "the index spec ns does not match");
+        return Status(ErrorCodes::CannotCreateIndex,
+                      str::stream() << "the \"ns\" field of the index spec '"
+                                    << specNamespace.valueStringData()
+                                    << "' does not match the collection name '" << nss.ns() << "'");
 
     // logical name of the index
     const BSONElement nameElem = spec["name"];
@@ -526,10 +514,10 @@ Status IndexCatalog::_isSpecOk(const BSONObj& spec) const {
 
     const StringData name = nameElem.valueStringData();
     if (name.find('\0') != std::string::npos)
-        return Status(ErrorCodes::CannotCreateIndex, "index names cannot contain NUL bytes");
+        return Status(ErrorCodes::CannotCreateIndex, "index name cannot contain NUL bytes");
 
     if (name.empty())
-        return Status(ErrorCodes::CannotCreateIndex, "index names cannot be empty");
+        return Status(ErrorCodes::CannotCreateIndex, "index name cannot be empty");
 
     const std::string indexNamespace = IndexDescriptor::makeIndexNamespace(nss.ns(), name);
     if (indexNamespace.length() > NamespaceString::MaxNsLen)
@@ -557,7 +545,7 @@ Status IndexCatalog::_isSpecOk(const BSONObj& spec) const {
 
         if (filterElement.type() != Object) {
             return Status(ErrorCodes::CannotCreateIndex,
-                          "'partialFilterExpression' for an index has to be a document");
+                          "\"partialFilterExpression\" for an index must be a document");
         }
         StatusWithMatchExpression statusWithMatcher =
             MatchExpressionParser::parse(filterElement.Obj());
@@ -579,7 +567,7 @@ Status IndexCatalog::_isSpecOk(const BSONObj& spec) const {
         }
 
         if (filterElement) {
-            return Status(ErrorCodes::CannotCreateIndex, "_id index cannot be partial");
+            return Status(ErrorCodes::CannotCreateIndex, "_id index cannot be a partial index");
         }
 
         if (isSparse) {
@@ -601,16 +589,20 @@ Status IndexCatalog::_isSpecOk(const BSONObj& spec) const {
         return Status::OK();
     }
     if (storageEngineElement.type() != mongo::Object) {
-        return Status(ErrorCodes::CannotCreateIndex, "'storageEngine' has to be a document.");
+        return Status(ErrorCodes::CannotCreateIndex,
+                      "\"storageEngine\" options must be a document if present");
     }
     BSONObj storageEngineOptions = storageEngineElement.Obj();
     if (storageEngineOptions.isEmpty()) {
         return Status(ErrorCodes::CannotCreateIndex,
-                      "Empty 'storageEngine' options are invalid. "
-                      "Please remove, or include valid options.");
+                      "Empty \"storageEngine\" options are invalid. "
+                      "Please remove the field or include valid options.");
     }
-    Status storageEngineStatus = validateStorageOptions(
-        storageEngineOptions, &StorageEngine::Factory::validateIndexStorageOptions);
+    Status storageEngineStatus =
+        validateStorageOptions(storageEngineOptions,
+                               stdx::bind(&StorageEngine::Factory::validateIndexStorageOptions,
+                                          stdx::placeholders::_1,
+                                          stdx::placeholders::_2));
     if (!storageEngineStatus.isOK()) {
         return storageEngineStatus;
     }
@@ -807,7 +799,7 @@ public:
 
     void rollback() final {
         _entries->add(_entry);
-        _collection->infoCache()->reset(_txn);
+        _collection->infoCache()->addedIndex(_txn, _entry->descriptor()->indexName());
     }
 
 private:
@@ -845,20 +837,16 @@ Status IndexCatalog::_dropIndex(OperationContext* txn, IndexCatalogEntry* entry)
         false, str::stream() << "index '" << indexName << "' dropped");
 
     // --------- START REAL WORK ----------
-
     audit::logDropIndex(&cc(), indexName, _collection->ns().ns());
 
     invariant(_entries.release(entry->descriptor()) == entry);
     txn->recoveryUnit()->registerChange(new IndexRemoveChange(txn, _collection, &_entries, entry));
     entry = NULL;
-
     _deleteIndexFromDisk(txn, indexName, indexNamespace);
 
     _checkMagic();
 
-    // Now that we've dropped the index, ask the info cache to rebuild its cached view of
-    // collection state.
-    _collection->infoCache()->reset(txn);
+    _collection->infoCache()->droppedIndex(txn, indexName);
 
     return Status::OK();
 }

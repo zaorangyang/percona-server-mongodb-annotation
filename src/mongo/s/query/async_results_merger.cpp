@@ -32,11 +32,12 @@
 
 #include "mongo/s/query/async_results_merger.h"
 
+#include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/getmore_response.h"
 #include "mongo/db/query/killcursors_request.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
 
@@ -50,6 +51,12 @@ AsyncResultsMerger::AsyncResultsMerger(executor::TaskExecutor* executor,
     for (const auto& remote : _params.remotes) {
         _remotes.emplace_back(remote);
     }
+
+    // Initialize command metadata to handle isSecondaryOk.
+    BSONObjBuilder metadataBuilder;
+    rpc::ServerSelectionMetadata metadata(_params.isSecondaryOk, boost::none);
+    uassertStatusOK(metadata.writeToMetadata(&metadataBuilder));
+    _metadataObj = metadataBuilder.obj();
 }
 
 AsyncResultsMerger::~AsyncResultsMerger() {
@@ -75,6 +82,12 @@ bool AsyncResultsMerger::ready_inlock() {
         return true;
     }
 
+    if (_eofNext) {
+        // We are ready to return boost::none due to reaching the end of a batch of results from a
+        // tailable cursor.
+        return true;
+    }
+
     for (const auto& remote : _remotes) {
         // First check whether any of the remotes reported an error.
         if (!remote.status.isOK()) {
@@ -85,7 +98,7 @@ bool AsyncResultsMerger::ready_inlock() {
         // We don't return any results until we have received at least one response from each remote
         // node. This is necessary for versioned commands: we have to ensure that we've properly
         // established the shard version on each node before we can start returning results.
-        if (!remote.gotFirstResponse) {
+        if (!remote.cursorId) {
             return false;
         }
     }
@@ -95,6 +108,9 @@ bool AsyncResultsMerger::ready_inlock() {
 }
 
 bool AsyncResultsMerger::readySorted_inlock() {
+    // Tailable cursors cannot have a sort.
+    invariant(!_params.isTailable);
+
     for (const auto& remote : _remotes) {
         if (!remote.hasNext() && !remote.exhausted()) {
             return false;
@@ -123,11 +139,16 @@ StatusWith<boost::optional<BSONObj>> AsyncResultsMerger::nextReady() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     dassert(ready_inlock());
     if (_lifecycleState != kAlive) {
-        return Status(ErrorCodes::IllegalOperation, "async cluster client cursor killed");
+        return Status(ErrorCodes::IllegalOperation, "AsyncResultsMerger killed");
     }
 
     if (!_status.isOK()) {
         return _status;
+    }
+
+    if (_eofNext) {
+        _eofNext = false;
+        return {boost::none};
     }
 
     const bool hasSort = !_params.sort.isEmpty();
@@ -135,6 +156,9 @@ StatusWith<boost::optional<BSONObj>> AsyncResultsMerger::nextReady() {
 }
 
 boost::optional<BSONObj> AsyncResultsMerger::nextReadySorted() {
+    // Tailable cursors cannot have a sort.
+    invariant(!_params.isTailable);
+
     if (_mergeQueue.empty()) {
         return boost::none;
     }
@@ -166,6 +190,14 @@ boost::optional<BSONObj> AsyncResultsMerger::nextReadyUnsorted() {
         if (_remotes[_gettingFromRemote].hasNext()) {
             BSONObj front = _remotes[_gettingFromRemote].docBuffer.front();
             _remotes[_gettingFromRemote].docBuffer.pop();
+
+            if (_params.isTailable && !_remotes[_gettingFromRemote].hasNext()) {
+                // The cursor is tailable and we're about to return the last buffered result. This
+                // means that the next value returned should be boost::none to indicate the end of
+                // the batch.
+                _eofNext = true;
+            }
+
             return front;
         }
 
@@ -184,13 +216,25 @@ Status AsyncResultsMerger::askForNextBatch_inlock(size_t remoteIndex) {
 
     invariant(!remote.cbHandle.isValid());
 
+    // If mongod returned less docs than the requested batchSize then modify the next getMore
+    // request to fetch the remaining docs only. If the remote node has a plan with OR for top k and
+    // a full sort as is the case for the OP_QUERY find then this optimization will prevent
+    // switching to the full sort plan branch.
+    auto adjustedBatchSize = _params.batchSize;
+
+    if (remote.cursorId && _params.batchSize && *_params.batchSize > remote.fetchedCount) {
+        adjustedBatchSize = *_params.batchSize - remote.fetchedCount;
+    } else {
+        remote.fetchedCount = 0;
+    }
+
     BSONObj cmdObj = remote.cursorId
-        ? GetMoreRequest(_params.nsString, *remote.cursorId, _params.batchSize, boost::none)
+        ? GetMoreRequest(_params.nsString, *remote.cursorId, adjustedBatchSize, boost::none)
               .toBSON()
-        : remote.cmdObj;
+        : *remote.cmdObj;
 
     executor::RemoteCommandRequest request(
-        remote.hostAndPort, _params.nsString.db().toString(), cmdObj);
+        remote.hostAndPort, _params.nsString.db().toString(), cmdObj, _metadataObj);
 
     auto callbackStatus = _executor->scheduleRemoteCommand(
         request,
@@ -210,7 +254,7 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() 
     if (_lifecycleState != kAlive) {
         // Can't schedule further network operations if the ARM is being killed.
         return Status(ErrorCodes::IllegalOperation,
-                      "nextEvent() called on a killed async cluster client cursor");
+                      "nextEvent() called on a killed AsyncResultsMerger");
     }
 
     if (_currentEvent.isValid()) {
@@ -242,8 +286,15 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() 
     if (!eventStatus.isOK()) {
         return eventStatus;
     }
-    _currentEvent = eventStatus.getValue();
-    return _currentEvent;
+    auto eventToReturn = eventStatus.getValue();
+    _currentEvent = eventToReturn;
+
+    // It's possible that after we told the caller we had no ready results but before the call to
+    // this method, new results became available. In this case we have to signal the event right
+    // away so that the caller will not block.
+    signalCurrentEventIfReady_inlock();
+
+    return eventToReturn;
 }
 
 void AsyncResultsMerger::handleBatchResponse(
@@ -261,7 +312,7 @@ void AsyncResultsMerger::handleBatchResponse(
         invariant(_lifecycleState == kKillStarted);
 
         // Make sure to wake up anyone waiting on '_currentEvent' if we're shutting down.
-        signalCurrentEvent_inlock();
+        signalCurrentEventIfReady_inlock();
 
         // If we're killed and we're not waiting on any more batches to come back, then we are ready
         // to kill the cursors on the remote hosts and clean up this cursor. Schedule the
@@ -282,49 +333,67 @@ void AsyncResultsMerger::handleBatchResponse(
     }
 
     // Early return from this point on signal anyone waiting on an event, if ready() is true.
-    ScopeGuard signaller = MakeGuard(&AsyncResultsMerger::signalCurrentEvent_inlock, this);
+    ScopeGuard signaller = MakeGuard(&AsyncResultsMerger::signalCurrentEventIfReady_inlock, this);
 
     if (!cbData.response.isOK()) {
         remote.status = cbData.response.getStatus();
         return;
     }
 
-    auto getMoreParseStatus = GetMoreResponse::parseFromBSON(cbData.response.getValue().data);
+    auto getMoreParseStatus = CursorResponse::parseFromBSON(cbData.response.getValue().data);
     if (!getMoreParseStatus.isOK()) {
         remote.status = getMoreParseStatus.getStatus();
         return;
     }
 
-    auto getMoreResponse = getMoreParseStatus.getValue();
+    auto cursorResponse = getMoreParseStatus.getValue();
 
     // If we have a cursor established, and we get a non-zero cursorid that is not equal to the
     // established cursorid, we will fail the operation.
-    if (remote.cursorId && getMoreResponse.cursorId != 0 &&
-        *remote.cursorId != getMoreResponse.cursorId) {
+    if (remote.cursorId && cursorResponse.cursorId != 0 &&
+        *remote.cursorId != cursorResponse.cursorId) {
         remote.status = Status(ErrorCodes::BadValue,
                                str::stream() << "Expected cursorid " << *remote.cursorId
-                                             << " but received " << getMoreResponse.cursorId);
+                                             << " but received " << cursorResponse.cursorId);
         return;
     }
 
-    // Mark that we've gotten a valid response back from 'remote' at least once.
-    remote.gotFirstResponse = true;
+    remote.cursorId = cursorResponse.cursorId;
+    remote.cmdObj = boost::none;
 
-    remote.cursorId = getMoreResponse.cursorId;
+    for (const auto& obj : cursorResponse.batch) {
+        // If there's a sort, we're expecting the remote node to give us back a sort key.
+        if (!_params.sort.isEmpty() &&
+            obj[ClusterClientCursorParams::kSortKeyField].type() != BSONType::Object) {
+            remote.status = Status(ErrorCodes::InternalError,
+                                   str::stream() << "Missing field '"
+                                                 << ClusterClientCursorParams::kSortKeyField
+                                                 << "' in document: " << obj);
+            return;
+        }
 
-    for (const auto& obj : getMoreResponse.batch) {
         remote.docBuffer.push(obj);
+        ++remote.fetchedCount;
     }
 
     // If we're doing a sorted merge, then we have to make sure to put this remote onto the
     // merge queue.
-    if (!_params.sort.isEmpty() && !getMoreResponse.batch.empty()) {
+    if (!_params.sort.isEmpty() && !cursorResponse.batch.empty()) {
         _mergeQueue.push(remoteIndex);
+    }
+
+    // If the cursor is tailable and we just received an empty batch, the next return value should
+    // be boost::none in order to indicate the end of the batch.
+    if (_params.isTailable && !remote.hasNext()) {
+        _eofNext = true;
     }
 
     // If even after receiving this batch we still don't have anything buffered (i.e. the batchSize
     // was zero), then can schedule work to retrieve the next batch right away.
-    if (!remote.hasNext() && !remote.exhausted()) {
+    //
+    // We do not ask for the next batch if the cursor is tailable, as batches received from remote
+    // tailable cursors should be passed through to the client without asking for more batches.
+    if (!_params.isTailable && !remote.hasNext() && !remote.exhausted()) {
         auto nextBatchStatus = askForNextBatch_inlock(remoteIndex);
         if (!nextBatchStatus.isOK()) {
             remote.status = nextBatchStatus;
@@ -335,10 +404,10 @@ void AsyncResultsMerger::handleBatchResponse(
     // ScopeGuard requires dismiss on success, but we want waiter to be signalled on success as
     // well as failure.
     signaller.Dismiss();
-    signalCurrentEvent_inlock();
+    signalCurrentEventIfReady_inlock();
 }
 
-void AsyncResultsMerger::signalCurrentEvent_inlock() {
+void AsyncResultsMerger::signalCurrentEventIfReady_inlock() {
     if (ready_inlock() && _currentEvent.isValid()) {
         // To prevent ourselves from signalling the event twice, we set '_currentEvent' as
         // invalid after signalling it.
@@ -429,7 +498,10 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill() {
 
 AsyncResultsMerger::RemoteCursorData::RemoteCursorData(
     const ClusterClientCursorParams::Remote& params)
-    : hostAndPort(params.hostAndPort), cmdObj(params.cmdObj) {}
+    : hostAndPort(params.hostAndPort), cmdObj(params.cmdObj), cursorId(params.cursorId) {
+    // Either cmdObj or cursorId can be provided, but not both.
+    invariant(static_cast<bool>(cmdObj) != static_cast<bool>(cursorId));
+}
 
 bool AsyncResultsMerger::RemoteCursorData::hasNext() const {
     return !docBuffer.empty();
@@ -447,7 +519,10 @@ bool AsyncResultsMerger::MergingComparator::operator()(const size_t& lhs, const 
     const BSONObj& leftDoc = _remotes[lhs].docBuffer.front();
     const BSONObj& rightDoc = _remotes[rhs].docBuffer.front();
 
-    return leftDoc.woSortOrder(rightDoc, _sort, true /*useDotted*/) > 0;
+    BSONObj leftDocKey = leftDoc[ClusterClientCursorParams::kSortKeyField].Obj();
+    BSONObj rightDocKey = rightDoc[ClusterClientCursorParams::kSortKeyField].Obj();
+
+    return leftDocKey.woCompare(rightDocKey, _sort, false /*considerFieldName*/) > 0;
 }
 
 }  // namespace mongo

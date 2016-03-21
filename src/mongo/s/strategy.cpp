@@ -32,8 +32,9 @@
 
 #include "mongo/s/strategy.h"
 
-#include "mongo/base/status.h"
+#include "mongo/base/data_cursor.h"
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
@@ -46,10 +47,13 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/getmore_request.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/bson_serializable.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_explain.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
@@ -74,11 +78,7 @@ using std::string;
 using std::stringstream;
 using std::vector;
 
-
-namespace {
-// A spigot to enable the ClusterClientCursor codepath
 MONGO_EXPORT_SERVER_PARAMETER(useClusterClientCursor, bool, false);
-}  // namespace
 
 static bool _isSystemIndexes(const char* ns) {
     return nsToCollectionSubstring(ns) == "system.indexes";
@@ -87,7 +87,7 @@ static bool _isSystemIndexes(const char* ns) {
 /**
  * Returns true if request is a query for sharded indexes.
  */
-static bool doShardedIndexQuery(OperationContext* txn, Request& r, const QuerySpec& qSpec) {
+static bool doShardedIndexQuery(OperationContext* txn, Request& request, const QuerySpec& qSpec) {
     // Extract the ns field from the query, which may be embedded within the "query" or
     // "$query" field.
     auto nsField = qSpec.filter()["ns"];
@@ -112,21 +112,21 @@ static bool doShardedIndexQuery(OperationContext* txn, Request& r, const QuerySp
 
     ShardPtr shard;
     ChunkManagerPtr cm;
-    config->getChunkManagerOrPrimary(indexNSSQuery.ns(), cm, shard);
+    config->getChunkManagerOrPrimary(txn, indexNSSQuery.ns(), cm, shard);
     if (cm) {
         set<ShardId> shardIds;
         cm->getAllShardIds(&shardIds);
         verify(shardIds.size() > 0);
-        shard = grid.shardRegistry()->getShard(*shardIds.begin());
+        shard = grid.shardRegistry()->getShard(txn, *shardIds.begin());
     }
 
-    ShardConnection dbcon(shard->getConnString(), r.getns());
+    ShardConnection dbcon(shard->getConnString(), request.getns());
     DBClientBase& c = dbcon.conn();
 
     string actualServer;
 
     Message response;
-    bool ok = c.call(r.m(), response, true, &actualServer);
+    bool ok = c.call(request.m(), response, true, &actualServer);
     uassert(10200, "mongos: error calling db", ok);
 
     {
@@ -134,32 +134,32 @@ static bool doShardedIndexQuery(OperationContext* txn, Request& r, const QuerySp
         if (qr.getResultFlags() & ResultFlag_ShardConfigStale) {
             dbcon.done();
             // Version is zero b/c this is deprecated codepath
-            throw RecvStaleConfigException(r.getns(),
+            throw RecvStaleConfigException(request.getns(),
                                            "Strategy::doQuery",
                                            ChunkVersion(0, 0, OID()),
                                            ChunkVersion(0, 0, OID()));
         }
     }
 
-    r.reply(response, actualServer.size() ? actualServer : c.getServerAddress());
+    request.reply(response, actualServer.size() ? actualServer : c.getServerAddress());
     dbcon.done();
 
     return true;
 }
 
-void Strategy::queryOp(OperationContext* txn, Request& r) {
-    verify(!NamespaceString(r.getns()).isCommand());
+void Strategy::queryOp(OperationContext* txn, Request& request) {
+    verify(!NamespaceString(request.getns()).isCommand());
 
     Timer queryTimer;
 
     globalOpCounters.gotQuery();
 
-    QueryMessage q(r.d());
+    QueryMessage q(request.d());
 
     NamespaceString ns(q.ns);
     ClientBasic* client = txn->getClient();
     AuthorizationSession* authSession = AuthorizationSession::get(client);
-    Status status = authSession->checkAuthForQuery(ns, q.query);
+    Status status = authSession->checkAuthForFind(ns, false);
     audit::logQueryAuthzCheck(client, ns, q.query, status.code());
     uassertStatusOK(status);
 
@@ -179,13 +179,15 @@ void Strategy::queryOp(OperationContext* txn, Request& r) {
     // code path.
     // TODO: Delete the spigot and always use the new code.
     if (useClusterClientCursor) {
-        auto txn = cc().makeOperationContext();
-
-        ReadPreferenceSetting readPreference(ReadPreference::PrimaryOnly, TagSet::primaryOnly());
+        // Determine the default read preference mode based on the value of the slaveOk flag.
+        ReadPreference readPreferenceOption = (q.queryOptions & QueryOption_SlaveOk)
+            ? ReadPreference::SecondaryPreferred
+            : ReadPreference::PrimaryOnly;
+        ReadPreferenceSetting readPreference(readPreferenceOption, TagSet());
 
         BSONElement rpElem;
         auto readPrefExtractStatus = bsonExtractTypedField(
-            q.query, LiteParsedQuery::kFindCommandReadPrefField, mongo::Object, &rpElem);
+            q.query, LiteParsedQuery::kWrappedReadPrefField, mongo::Object, &rpElem);
 
         if (readPrefExtractStatus.isOK()) {
             auto parsedRps = ReadPreferenceSetting::fromBSON(rpElem.Obj());
@@ -198,6 +200,34 @@ void Strategy::queryOp(OperationContext* txn, Request& r) {
         auto canonicalQuery = CanonicalQuery::canonicalize(q, WhereCallbackNoop());
         uassertStatusOK(canonicalQuery.getStatus());
 
+        // If the $explain flag was set, we must run the operation on the shards as an explain
+        // command rather than a find command.
+        if (canonicalQuery.getValue()->getParsed().isExplain()) {
+            const LiteParsedQuery& lpq = canonicalQuery.getValue()->getParsed();
+            BSONObj findCommand = lpq.asFindCommand();
+
+            // We default to allPlansExecution verbosity.
+            auto verbosity = ExplainCommon::EXEC_ALL_PLANS;
+
+            const bool secondaryOk = (readPreference.pref != ReadPreference::PrimaryOnly);
+            rpc::ServerSelectionMetadata metadata(secondaryOk, readPreference);
+
+            BSONObjBuilder explainBuilder;
+            uassertStatusOK(
+                Strategy::explainFind(txn, findCommand, lpq, verbosity, metadata, &explainBuilder));
+
+            BSONObj explainObj = explainBuilder.done();
+            replyToQuery(0,  // query result flags
+                         request.p(),
+                         request.m(),
+                         static_cast<const void*>(explainObj.objdata()),
+                         explainObj.objsize(),
+                         1,  // numResults
+                         0,  // startingFrom
+                         CursorId(0));
+            return;
+        }
+
         // Do the work to generate the first batch of results. This blocks waiting to get responses
         // from the shard(s).
         std::vector<BSONObj> batch;
@@ -206,14 +236,14 @@ void Strategy::queryOp(OperationContext* txn, Request& r) {
         // otherwise we assume that a cursor with the returned id can be retrieved via the
         // ClusterCursorManager
         auto cursorId =
-            ClusterFind::runQuery(txn.get(), *canonicalQuery.getValue(), readPreference, &batch);
+            ClusterFind::runQuery(txn, *canonicalQuery.getValue(), readPreference, &batch);
         uassertStatusOK(cursorId.getStatus());
 
-        // Build the response document.
         // TODO: this constant should be shared between mongos and mongod, and should
         // not be inside ShardedClientCursor.
         BufBuilder buffer(ShardedClientCursor::INIT_REPLY_BUFFER_SIZE);
 
+        // Fill out the response buffer.
         int numResults = 0;
         for (const auto& obj : batch) {
             buffer.appendBuf((void*)obj.objdata(), obj.objsize());
@@ -221,8 +251,8 @@ void Strategy::queryOp(OperationContext* txn, Request& r) {
         }
 
         replyToQuery(0,  // query result flags
-                     r.p(),
-                     r.m(),
+                     request.p(),
+                     request.m(),
                      buffer.buf(),
                      buffer.len(),
                      numResults,
@@ -237,7 +267,7 @@ void Strategy::queryOp(OperationContext* txn, Request& r) {
     StatusWith<int> maxTimeMS = LiteParsedQuery::parseMaxTimeMSQuery(q.query);
     uassert(17233, maxTimeMS.getStatus().reason(), maxTimeMS.isOK());
 
-    if (_isSystemIndexes(q.ns) && doShardedIndexQuery(txn, r, qSpec)) {
+    if (_isSystemIndexes(q.ns) && doShardedIndexQuery(txn, request, qSpec)) {
         return;
     }
 
@@ -255,7 +285,7 @@ void Strategy::queryOp(OperationContext* txn, Request& r) {
                                          static_cast<long long>(queryTimer.millis()));
             BSONObj b = explain_builder.obj();
 
-            replyToQuery(0, r.p(), r.m(), b);
+            replyToQuery(0, request.p(), request.m(), b);
             delete (cursor);
             return;
         }
@@ -292,8 +322,8 @@ void Strategy::queryOp(OperationContext* txn, Request& r) {
         }
 
         replyToQuery(0,
-                     r.p(),
-                     r.m(),
+                     request.p(),
+                     request.m(),
                      buffer.buf(),
                      buffer.len(),
                      docCount,
@@ -305,20 +335,20 @@ void Strategy::queryOp(OperationContext* txn, Request& r) {
         // Remote cursors are stored remotely, we shouldn't need this around.
         unique_ptr<ParallelSortClusteredCursor> cursorDeleter(cursor);
 
-        ShardPtr shard = cursor->getQueryShard();
+        ShardPtr shard = grid.shardRegistry()->getShard(txn, cursor->getQueryShardId());
         verify(shard.get());
         DBClientCursorPtr shardCursor = cursor->getShardCursor(shard->getId());
 
         // Implicitly stores the cursor in the cache
-        r.reply(*(shardCursor->getMessage()), shardCursor->originalHost());
+        request.reply(*(shardCursor->getMessage()), shardCursor->originalHost());
 
         // We don't want to kill the cursor remotely if there's still data left
         shardCursor->decouple();
     }
 }
 
-void Strategy::clientCommandOp(OperationContext* txn, Request& r) {
-    QueryMessage q(r.d());
+void Strategy::clientCommandOp(OperationContext* txn, Request& request) {
+    QueryMessage q(request.d());
 
     LOG(3) << "command: " << q.ns << " " << q.query << " ntoreturn: " << q.ntoreturn
            << " options: " << q.queryOptions;
@@ -329,11 +359,11 @@ void Strategy::clientCommandOp(OperationContext* txn, Request& r) {
                       " " + q.query.toString());
     }
 
-    NamespaceString nss(r.getns());
+    NamespaceString nss(request.getns());
     // Regular queries are handled in strategy_shard.cpp
     verify(nss.isCommand() || nss.isSpecialCommand());
 
-    if (handleSpecialNamespaces(txn, r, q))
+    if (handleSpecialNamespaces(txn, request, q))
         return;
 
     int loops = 5;
@@ -371,7 +401,7 @@ void Strategy::clientCommandOp(OperationContext* txn, Request& r) {
 
             Command::runAgainstRegistered(txn, q.ns, cmdObj, builder, q.queryOptions);
             BSONObj x = builder.done();
-            replyToQuery(0, r.p(), r.m(), x);
+            replyToQuery(0, request.p(), request.m(), x);
             return;
         } catch (const StaleConfigException& e) {
             if (loops <= 0)
@@ -393,11 +423,11 @@ void Strategy::clientCommandOp(OperationContext* txn, Request& r) {
                 fassert(28791, !cmChangeAttempted);
                 cmChangeAttempted = true;
 
-                grid.catalogManager()->waitForCatalogManagerChange();
+                grid.forwardingCatalogManager()->waitForCatalogManagerChange(txn);
             } else {
                 Command::appendCommandStatus(builder, e.toStatus());
                 BSONObj x = builder.done();
-                replyToQuery(0, r.p(), r.m(), x);
+                replyToQuery(0, request.p(), request.m(), x);
                 return;
             }
         }
@@ -405,8 +435,8 @@ void Strategy::clientCommandOp(OperationContext* txn, Request& r) {
 }
 
 // TODO: remove after MongoDB 3.2
-bool Strategy::handleSpecialNamespaces(OperationContext* txn, Request& r, QueryMessage& q) {
-    const char* ns = strstr(r.getns(), ".$cmd.sys.");
+bool Strategy::handleSpecialNamespaces(OperationContext* txn, Request& request, QueryMessage& q) {
+    const char* ns = strstr(request.getns(), ".$cmd.sys.");
     if (!ns)
         return false;
     ns += 10;
@@ -436,7 +466,7 @@ bool Strategy::handleSpecialNamespaces(OperationContext* txn, Request& r, QueryM
     }
 
     BSONObj x = reply.done();
-    replyToQuery(0, r.p(), r.m(), x);
+    replyToQuery(0, request.p(), request.m(), x);
     return true;
 }
 
@@ -492,7 +522,7 @@ Status Strategy::commandOpUnsharded(OperationContext* txn,
         return Status(ErrorCodes::IllegalOperation, ss);
     }
 
-    const auto primaryShard = grid.shardRegistry()->getShard(conf->getPrimaryId());
+    const auto primaryShard = grid.shardRegistry()->getShard(txn, conf->getPrimaryId());
 
     BSONObj shardResult;
     try {
@@ -518,12 +548,12 @@ Status Strategy::commandOpUnsharded(OperationContext* txn,
     return Status::OK();
 }
 
-void Strategy::getMore(OperationContext* txn, Request& r) {
+void Strategy::getMore(OperationContext* txn, Request& request) {
     Timer getMoreTimer;
 
-    const char* ns = r.getns();
-    const int ntoreturn = r.d().pullInt();
-    const long long id = r.d().pullInt64();
+    const char* ns = request.getns();
+    const int ntoreturn = request.d().pullInt();
+    const long long id = request.d().pullInt64();
 
     // TODO:  Handle stale config exceptions here from coll being dropped or sharded during op
     // for now has same semantics as legacy request
@@ -531,17 +561,58 @@ void Strategy::getMore(OperationContext* txn, Request& r) {
     auto statusGetDb = grid.catalogCache()->getDatabase(txn, nss.db().toString());
     if (statusGetDb == ErrorCodes::DatabaseNotFound) {
         cursorCache.remove(id);
-        replyToQuery(ResultFlag_CursorNotFound, r.p(), r.m(), 0, 0, 0);
+        replyToQuery(ResultFlag_CursorNotFound, request.p(), request.m(), 0, 0, 0);
         return;
     }
 
     uassertStatusOK(statusGetDb);
 
+    // Spigot which controls whether OP_QUERY style find on mongos uses the new ClusterClientCursor
+    // code path.
+    //
+    // TODO: Delete the spigot and always use the new code.
+    if (useClusterClientCursor) {
+        boost::optional<long long> batchSize;
+        if (ntoreturn) {
+            batchSize = ntoreturn;
+        }
+        GetMoreRequest getMoreRequest(NamespaceString(ns), id, batchSize, boost::none);
+
+        auto cursorResponse = ClusterFind::runGetMore(txn, getMoreRequest);
+        if (cursorResponse == ErrorCodes::CursorNotFound) {
+            replyToQuery(ResultFlag_CursorNotFound, request.p(), request.m(), 0, 0, 0);
+            return;
+        }
+        uassertStatusOK(cursorResponse.getStatus());
+
+        // Build the response document.
+        //
+        // TODO: this constant should be shared between mongos and mongod, and should not be inside
+        // ShardedClientCursor.
+        BufBuilder buffer(ShardedClientCursor::INIT_REPLY_BUFFER_SIZE);
+
+        int numResults = 0;
+        for (const auto& obj : cursorResponse.getValue().batch) {
+            buffer.appendBuf((void*)obj.objdata(), obj.objsize());
+            ++numResults;
+        }
+
+        replyToQuery(0,
+                     request.p(),
+                     request.m(),
+                     buffer.buf(),
+                     buffer.len(),
+                     numResults,
+                     cursorResponse.getValue().numReturnedSoFar.value_or(0),
+                     cursorResponse.getValue().cursorId);
+        return;
+    }
+
     shared_ptr<DBConfig> config = statusGetDb.getValue();
 
     ShardPtr primary;
     ChunkManagerPtr info;
-    config->getChunkManagerOrPrimary(ns, info, primary);
+    config->getChunkManagerOrPrimary(txn, ns, info, primary);
 
     //
     // TODO: Cleanup cursor cache, consolidate into single codepath
@@ -559,7 +630,7 @@ void Strategy::getMore(OperationContext* txn, Request& r) {
     ClientBasic* client = ClientBasic::getCurrent();
     NamespaceString nsString(ns);
     AuthorizationSession* authSession = AuthorizationSession::get(client);
-    Status status = authSession->checkAuthForGetMore(nsString, id);
+    Status status = authSession->checkAuthForGetMore(nsString, id, false);
     audit::logGetMoreAuthzCheck(client, nsString, id, status.code());
     uassertStatusOK(status);
 
@@ -572,7 +643,7 @@ void Strategy::getMore(OperationContext* txn, Request& r) {
         ScopedDbConnection conn(host);
 
         Message response;
-        bool ok = conn->callRead(r.m(), response);
+        bool ok = conn->callRead(request.m(), response);
         uassert(10204, "dbgrid: getmore: error calling db", ok);
 
         bool hasMore = (response.singleData().getCursor() != 0);
@@ -581,7 +652,7 @@ void Strategy::getMore(OperationContext* txn, Request& r) {
             cursorCache.removeRef(id);
         }
 
-        r.reply(response, "" /*conn->getServerAddress() */);
+        request.reply(response, "" /*conn->getServerAddress() */);
         conn.done();
         return;
     } else if (cursor) {
@@ -614,8 +685,8 @@ void Strategy::getMore(OperationContext* txn, Request& r) {
         }
 
         replyToQuery(0,
-                     r.p(),
-                     r.m(),
+                     request.p(),
+                     request.m(),
                      buffer.buf(),
                      buffer.len(),
                      docCount,
@@ -625,36 +696,88 @@ void Strategy::getMore(OperationContext* txn, Request& r) {
     } else {
         LOG(3) << "could not find cursor " << id << " in cache for " << ns;
 
-        replyToQuery(ResultFlag_CursorNotFound, r.p(), r.m(), 0, 0, 0);
+        replyToQuery(ResultFlag_CursorNotFound, request.p(), request.m(), 0, 0, 0);
         return;
     }
 }
 
-void Strategy::writeOp(OperationContext* txn, int op, Request& r) {
+void Strategy::killCursors(OperationContext* txn, Request& request) {
+    if (!useClusterClientCursor) {
+        cursorCache.gotKillCursors(request.m());
+        return;
+    }
+
+    DbMessage& dbMessage = request.d();
+    const int numCursors = dbMessage.pullInt();
+    massert(28793,
+            str::stream() << "Invalid killCursors message. numCursors: " << numCursors
+                          << ", message size: " << dbMessage.msg().dataSize() << ".",
+            dbMessage.msg().dataSize() == 8 + (8 * numCursors));
+    uassert(28794,
+            str::stream() << "numCursors must be between 1 and 29999.  numCursors: " << numCursors
+                          << ".",
+            numCursors >= 1 && numCursors < 30000);
+    ConstDataCursor cursors(dbMessage.getArray(numCursors));
+    Client* client = txn->getClient();
+    AuthorizationSession* authSession = AuthorizationSession::get(client);
+    ClusterCursorManager* manager = grid.getCursorManager();
+
+    for (int i = 0; i < numCursors; ++i) {
+        CursorId cursorId = cursors.readAndAdvance<LittleEndian<int64_t>>();
+        boost::optional<NamespaceString> nss = manager->getNamespaceForCursorId(cursorId);
+        if (!nss) {
+            LOG(3) << "Can't find cursor to kill.  Cursor id: " << cursorId << ".";
+            continue;
+        }
+
+        Status authorizationStatus = authSession->checkAuthForKillCursors(*nss, cursorId);
+        audit::logKillCursorsAuthzCheck(client,
+                                        *nss,
+                                        cursorId,
+                                        authorizationStatus.isOK() ? ErrorCodes::OK
+                                                                   : ErrorCodes::Unauthorized);
+        if (!authorizationStatus.isOK()) {
+            LOG(3) << "Not authorized to kill cursor.  Namespace: '" << *nss
+                   << "', cursor id: " << cursorId << ".";
+            continue;
+        }
+
+        Status killCursorStatus = manager->killCursor(*nss, cursorId);
+        if (!killCursorStatus.isOK()) {
+            LOG(3) << "Can't find cursor to kill.  Namespace: '" << *nss
+                   << "', cursor id: " << cursorId << ".";
+            continue;
+        }
+        LOG(3) << "Killed cursor.  Namespace: '" << *nss << "', cursor id: " << cursorId << ".";
+    }
+}
+
+void Strategy::writeOp(OperationContext* txn, int op, Request& request) {
     // make sure we have a last error
     dassert(&LastError::get(cc()));
 
-    OwnedPointerVector<BatchedCommandRequest> requestsOwned;
-    vector<BatchedCommandRequest*>& requests = requestsOwned.mutableVector();
+    OwnedPointerVector<BatchedCommandRequest> commandRequestsOwned;
+    vector<BatchedCommandRequest*>& commandRequests = commandRequestsOwned.mutableVector();
 
-    msgToBatchRequests(r.m(), &requests);
+    msgToBatchRequests(request.m(), &commandRequests);
 
-    for (vector<BatchedCommandRequest*>::iterator it = requests.begin(); it != requests.end();
+    for (vector<BatchedCommandRequest*>::iterator it = commandRequests.begin();
+         it != commandRequests.end();
          ++it) {
         // Multiple commands registered to last error as multiple requests
-        if (it != requests.begin())
+        if (it != commandRequests.begin())
             LastError::get(cc()).startRequest();
 
-        BatchedCommandRequest* request = *it;
+        BatchedCommandRequest* commandRequest = *it;
 
         // Adjust namespaces for command
-        NamespaceString fullNS(request->getNS());
+        NamespaceString fullNS(commandRequest->getNS());
         string cmdNS = fullNS.getCommandNS();
         // We only pass in collection name to command
-        request->setNS(fullNS);
+        commandRequest->setNS(fullNS);
 
         BSONObjBuilder builder;
-        BSONObj requestBSON = request->toBSON();
+        BSONObj requestBSON = commandRequest->toBSON();
 
         {
             // Disable the last error object for the duration of the write cmd
@@ -662,18 +785,50 @@ void Strategy::writeOp(OperationContext* txn, int op, Request& r) {
             Command::runAgainstRegistered(txn, cmdNS.c_str(), requestBSON, builder, 0);
         }
 
-        BatchedCommandResponse response;
-        bool parsed = response.parseBSON(builder.done(), NULL);
+        BatchedCommandResponse commandResponse;
+        bool parsed = commandResponse.parseBSON(builder.done(), NULL);
         (void)parsed;  // for compile
-        dassert(parsed && response.isValid(NULL));
+        dassert(parsed && commandResponse.isValid(NULL));
 
         // Populate the lastError object based on the write response
         LastError::get(cc()).reset();
-        bool hadError = batchErrorToLastError(*request, response, &LastError::get(cc()));
+        bool hadError =
+            batchErrorToLastError(*commandRequest, commandResponse, &LastError::get(cc()));
 
         // Check if this is an ordered batch and we had an error which should stop processing
-        if (request->getOrdered() && hadError)
+        if (commandRequest->getOrdered() && hadError)
             break;
     }
+}
+
+Status Strategy::explainFind(OperationContext* txn,
+                             const BSONObj& findCommand,
+                             const LiteParsedQuery& lpq,
+                             ExplainCommon::Verbosity verbosity,
+                             const rpc::ServerSelectionMetadata& serverSelectionMetadata,
+                             BSONObjBuilder* out) {
+    BSONObjBuilder explainCmdBob;
+    int options = 0;
+    ClusterExplain::wrapAsExplain(
+        findCommand, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
+
+    // We will time how long it takes to run the commands on the shards.
+    Timer timer;
+
+    std::vector<Strategy::CommandResult> shardResults;
+    Strategy::commandOp(txn,
+                        lpq.nss().db().toString(),
+                        explainCmdBob.obj(),
+                        options,
+                        lpq.nss().toString(),
+                        lpq.getFilter(),
+                        &shardResults);
+
+    long long millisElapsed = timer.millis();
+
+    const char* mongosStageName = ClusterExplain::getStageNameForReadOp(shardResults, findCommand);
+
+    return ClusterExplain::buildExplainResult(
+        txn, shardResults, mongosStageName, millisElapsed, out);
 }
 }

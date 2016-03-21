@@ -44,14 +44,16 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/global_timestamp.h"
-#include "mongo/db/query/cursor_responses.h"
+#include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/s/operation_shard_version.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -97,7 +99,7 @@ public:
     }
 
     bool supportsReadConcern() const final {
-        // Uses the $readMajorityTemporaryName setting from whatever created the cursor.
+        // Uses the readConcern setting from whatever created the cursor.
         return false;
     }
 
@@ -126,7 +128,7 @@ public:
         const GetMoreRequest& request = parseStatus.getValue();
 
         return AuthorizationSession::get(client)
-            ->checkAuthForGetMore(request.nss, request.cursorid);
+            ->checkAuthForGetMore(request.nss, request.cursorid, request.term.is_initialized());
     }
 
     bool run(OperationContext* txn,
@@ -149,6 +151,9 @@ public:
             return appendCommandStatus(result, parseStatus.getStatus());
         }
         const GetMoreRequest& request = parseStatus.getValue();
+
+        // Disable shard version checking - getmore commands are always unversioned
+        OperationShardVersion::get(txn).setShardVersion(request.nss, ChunkVersion::IGNORED());
 
         // Depending on the type of cursor being operated on, we hold locks for the whole
         // getMore, or none of the getMore, or part of the getMore.  The three cases in detail:
@@ -302,6 +307,10 @@ public:
             Microseconds timeout(CurOp::get(txn)->getRemainingMaxTimeMicros());
             notifier->waitForInsert(lastInsertCount, timeout);
             notifier.reset();
+
+            // Set expected latency to match wait time. This makes sure the logs aren't spammed
+            // by awaitData queries that exceed slowms due to blocking on the CappedInsertNotifier.
+            CurOp::get(txn)->setExpectedLatencyMs(durationCount<Milliseconds>(timeout));
 
             ctx.reset(new AutoGetCollectionForRead(txn, request.nss));
             exec->restoreState();

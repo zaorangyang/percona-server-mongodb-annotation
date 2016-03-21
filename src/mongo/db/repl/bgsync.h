@@ -32,6 +32,7 @@
 #include "mongo/client/fetcher.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
@@ -42,12 +43,6 @@ namespace mongo {
 
 class DBClientBase;
 class OperationContext;
-
-namespace executor {
-
-class TaskExecutor;
-
-}  // namespace executor
 
 namespace repl {
 
@@ -102,7 +97,7 @@ public:
     virtual ~BackgroundSync() {}
 
     // starts the producer thread
-    void producerThread(executor::TaskExecutor* taskExecutor);
+    void producerThread();
     // starts the sync target notifying thread
     void notifierThread();
 
@@ -120,6 +115,11 @@ public:
 
     // Clears any fetched and buffered oplog entries.
     void clearBuffer();
+
+    /**
+     * Cancel existing find/getMore commands on the sync source's oplog collection.
+     */
+    void cancelFetcher();
 
     bool getInitialSyncRequestedFlag();
     void setInitialSyncRequestedFlag(bool value);
@@ -144,7 +144,10 @@ private:
     // Production thread
     BlockingQueue<BSONObj> _buffer;
 
-    // _mutex protects all of the class variables except _syncSourceReader and _buffer
+    // Task executor used to run find/getMore commands on sync source.
+    executor::ThreadPoolTaskExecutor _threadPoolTaskExecutor;
+
+    // _mutex protects all of the class variables except _buffer
     mutable stdx::mutex _mutex;
 
     OpTime _lastOpTimeFetched;
@@ -166,8 +169,8 @@ private:
     BackgroundSync operator=(const BackgroundSync& s);
 
     // Production thread
-    void _producerThread(executor::TaskExecutor* taskExecutor);
-    void _produce(OperationContext* txn, executor::TaskExecutor* taskExecutor);
+    void _producerThread();
+    void _produce(OperationContext* txn);
 
     /**
      * Processes query responses from fetcher.
@@ -177,6 +180,7 @@ private:
                           const HostAndPort& source,
                           OpTime lastOpTimeFetched,
                           long long lastFetchedHash,
+                          Milliseconds fetcherMaxTimeMS,
                           Status* remoteOplogStartStatus);
 
     /**

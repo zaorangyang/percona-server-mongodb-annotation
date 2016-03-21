@@ -111,6 +111,11 @@ StatusWith<boost::optional<BSONObj>> ClusterCursorManager::PinnedCursor::next() 
     return _cursor->next();
 }
 
+bool ClusterCursorManager::PinnedCursor::isTailable() const {
+    invariant(_cursor);
+    return _cursor->isTailable();
+}
+
 void ClusterCursorManager::PinnedCursor::returnCursor(CursorState cursorState) {
     invariant(_cursor);
     // Note that unpinning a cursor transfers ownership of the underlying ClusterClientCursor object
@@ -121,6 +126,16 @@ void ClusterCursorManager::PinnedCursor::returnCursor(CursorState cursorState) {
 
 CursorId ClusterCursorManager::PinnedCursor::getCursorId() const {
     return _cursorId;
+}
+
+long long ClusterCursorManager::PinnedCursor::getNumReturnedSoFar() const {
+    invariant(_cursor);
+    return _cursor->getNumReturnedSoFar();
+}
+
+void ClusterCursorManager::PinnedCursor::queueResult(const BSONObj& obj) {
+    invariant(_cursor);
+    _cursor->queueResult(obj);
 }
 
 void ClusterCursorManager::PinnedCursor::returnAndKillCursor() {
@@ -240,10 +255,9 @@ void ClusterCursorManager::checkInCursor(std::unique_ptr<ClusterClientCursor> cu
         return;
     }
 
-    // The cursor is exhausted, and the cursor doesn't have a pending kill.  We should delete it.
-    auto detachedCursor = detachCursor_inlock(nss, cursorId);
-    invariantOK(detachedCursor.getStatus());
-    // Cursor is deleted when 'detachedCursor' goes out of scope.
+    // The cursor is exhausted, and the cursor doesn't already have a pending kill. Schedule for
+    // deletion by setting the kill pending flag.
+    entry->setKillPending();
 }
 
 Status ClusterCursorManager::killCursor(const NamespaceString& nss, CursorId cursorId) {

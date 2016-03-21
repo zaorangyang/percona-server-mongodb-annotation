@@ -67,10 +67,6 @@ int indexOfIterator(const std::vector<T>& vec, typename std::vector<T>::const_it
     return static_cast<int>(it - vec.begin());
 }
 
-// Interval between the time the last heartbeat from a node was received successfully, or
-// the time when we gave up retrying, and when the next heartbeat should be sent to a target.
-const auto kHeartbeatInterval = Seconds{2};
-
 // Maximum number of retries for a failed heartbeat.
 const int kMaxHeartbeatRetries = 2;
 
@@ -100,22 +96,15 @@ bool _hasOnlyAuthErrorUpHeartbeats(const std::vector<MemberHeartbeatData>& hbdat
 
 }  // namespace
 
-PingStats::PingStats()
-    : count(0),
-      value(std::numeric_limits<unsigned int>::max()),
-      _numFailuresSinceLastStart(std::numeric_limits<int>::max()) {}
-
 void PingStats::start(Date_t now) {
     _lastHeartbeatStartDate = now;
     _numFailuresSinceLastStart = 0;
 }
 
-void PingStats::hit(int millis) {
+void PingStats::hit(Milliseconds millis) {
     _numFailuresSinceLastStart = std::numeric_limits<int>::max();
     ++count;
-    value = value == std::numeric_limits<unsigned int>::max()
-        ? millis
-        : static_cast<unsigned long>((value * .8) + (millis * .2));
+    value = value == Milliseconds() ? millis : Milliseconds((value * 4 + millis) / 5);
 }
 
 void PingStats::miss() {
@@ -124,7 +113,7 @@ void PingStats::miss() {
 
 TopologyCoordinatorImpl::TopologyCoordinatorImpl(Options options)
     : _role(Role::follower),
-      _term(0),
+      _term(OpTime::kUninitializedTerm),
       _currentPrimaryIndex(-1),
       _forceSyncSourceIndex(-1),
       _options(std::move(options)),
@@ -451,6 +440,13 @@ void TopologyCoordinatorImpl::prepareFreshResponse(
     const OpTime& lastOpApplied,
     BSONObjBuilder* response,
     Status* result) {
+    if (_rsConfig.getProtocolVersion() != 0) {
+        *result = Status(ErrorCodes::BadValue,
+                         str::stream() << "replset: incompatible replset protocol version: "
+                                       << _rsConfig.getProtocolVersion());
+        return;
+    }
+
     if (_selfIndex == -1) {
         *result = Status(ErrorCodes::ReplicaSetNotFound,
                          "Cannot participate in elections because not initialized");
@@ -569,6 +565,12 @@ void TopologyCoordinatorImpl::prepareElectResponse(
     const OpTime& lastOpApplied,
     BSONObjBuilder* response,
     Status* result) {
+    if (_rsConfig.getProtocolVersion() != 0) {
+        *result = Status(ErrorCodes::BadValue,
+                         str::stream() << "replset: incompatible replset protocol version: "
+                                       << _rsConfig.getProtocolVersion());
+        return;
+    }
     if (_selfIndex == -1) {
         *result = Status(ErrorCodes::ReplicaSetNotFound,
                          "Cannot participate in election because not initialized");
@@ -873,6 +875,21 @@ std::pair<ReplSetHeartbeatArgsV1, Milliseconds> TopologyCoordinatorImpl::prepare
     return std::make_pair(hbArgs, timeout);
 }
 
+Milliseconds TopologyCoordinatorImpl::getTimeoutDelayForMember(int memberId) {
+    const MemberConfig* member = _rsConfig.findMemberByID(memberId);
+    if (!member) {
+        return Milliseconds();
+    }
+
+    HostAndPort target = member->getHostAndPort();
+    if (_pings.find(target) == _pings.end()) {
+        return Milliseconds();
+    }
+
+    Milliseconds pingTime = _pings[target].getMillis();
+    return pingTime * (_rsConfig.getVoterPosition(_selfIndex) + 1);
+}
+
 HeartbeatResponseAction TopologyCoordinatorImpl::processHeartbeatResponse(
     Date_t now,
     Milliseconds networkRoundTripTime,
@@ -882,32 +899,49 @@ HeartbeatResponseAction TopologyCoordinatorImpl::processHeartbeatResponse(
     const MemberState originalState = getMemberState();
     PingStats& hbStats = _pings[target];
     invariant(hbStats.getLastHeartbeatStartDate() != Date_t());
+    const bool isUnauthorized = (hbResponse.getStatus().code() == ErrorCodes::Unauthorized) ||
+        (hbResponse.getStatus().code() == ErrorCodes::AuthenticationFailed);
     if (!hbResponse.isOK()) {
-        hbStats.miss();
+        if (isUnauthorized) {
+            hbStats.hit(networkRoundTripTime);
+        } else {
+            hbStats.miss();
+        }
     } else {
-        hbStats.hit(durationCount<Milliseconds>(networkRoundTripTime));
+        hbStats.hit(networkRoundTripTime);
         // Log diagnostics.
         if (hbResponse.getValue().isStateDisagreement()) {
             LOG(1) << target << " thinks that we are down because they cannot send us heartbeats.";
         }
     }
 
-    const bool isUnauthorized = (hbResponse.getStatus().code() == ErrorCodes::Unauthorized) ||
-        (hbResponse.getStatus().code() == ErrorCodes::AuthenticationFailed);
+    // If a node is not PRIMARY and has no sync source,
+    // we increase the heartbeat rate in order
+    // to help it find a sync source more quickly,
+    // which helps ensure the PRIMARY will continue to
+    // see the majority of the cluster.
+    //
+    // Arbiters also use half the election timeout period for their heartbeat frequency
+    Milliseconds heartbeatInterval;
+    if (_rsConfig.getProtocolVersion() == 1 &&
+        (getMemberState().arbiter() || (getSyncSourceAddress().empty() && !_iAmPrimary()))) {
+        // We want to delay by ping time times our position relative to other voters, in order to
+        // avoid having two nodes stand for election at the same time.
+        heartbeatInterval = _rsConfig.getElectionTimeoutPeriod() / 2 +
+            hbStats.getMillis() * _rsConfig.getVoterPosition(_selfIndex);
+    } else {
+        heartbeatInterval = _rsConfig.getHeartbeatInterval();
+    }
 
     const Milliseconds alreadyElapsed = now - hbStats.getLastHeartbeatStartDate();
     Date_t nextHeartbeatStartDate;
-    // determine next start time
-    if (_rsConfig.isInitialized() &&
-        (hbStats.getNumFailuresSinceLastStart() <= kMaxHeartbeatRetries) &&
-        (alreadyElapsed < _rsConfig.getHeartbeatTimeoutPeriodMillis())) {
-        if (isUnauthorized) {
-            nextHeartbeatStartDate = now + _rsConfig.getHeartbeatInterval();
-        } else {
-            nextHeartbeatStartDate = now;
-        }
+    // Determine next heartbeat start time.
+    if (hbStats.getNumFailuresSinceLastStart() <= kMaxHeartbeatRetries &&
+        alreadyElapsed < _rsConfig.getHeartbeatTimeoutPeriod()) {
+        // There are still retries left, let's use one.
+        nextHeartbeatStartDate = now;
     } else {
-        nextHeartbeatStartDate = now + _rsConfig.getHeartbeatInterval();
+        nextHeartbeatStartDate = now + heartbeatInterval;
     }
 
     if (hbResponse.isOK() && hbResponse.getValue().hasConfig()) {
@@ -963,7 +997,7 @@ HeartbeatResponseAction TopologyCoordinatorImpl::processHeartbeatResponse(
                       " issue for member _id:" << member.getId();
             hbData.setAuthIssue(now);
         } else if (hbStats.getNumFailuresSinceLastStart() > kMaxHeartbeatRetries ||
-                   alreadyElapsed >= _rsConfig.getHeartbeatTimeoutPeriodMillis()) {
+                   alreadyElapsed >= _rsConfig.getHeartbeatTimeoutPeriod()) {
             LOG(1) << "setDownValues: heartbeat response failed for member _id:" << member.getId()
                    << ", msg:  " << hbResponse.getStatus().reason();
 
@@ -979,8 +1013,13 @@ HeartbeatResponseAction TopologyCoordinatorImpl::processHeartbeatResponse(
                << ", msg:  " << hbr.getHbMsg();
         hbData.setUpValues(now, member.getHostAndPort(), hbr);
     }
-    HeartbeatResponseAction nextAction =
-        _updatePrimaryFromHBData(memberIndex, originalState, now, myLastOpApplied);
+
+    HeartbeatResponseAction nextAction;
+    if (_rsConfig.getProtocolVersion() == 0) {
+        nextAction = _updatePrimaryFromHBData(memberIndex, originalState, now, myLastOpApplied);
+    } else {
+        nextAction = _updatePrimaryFromHBDataV1(memberIndex, originalState, now, myLastOpApplied);
+    }
 
     nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
     return nextAction;
@@ -991,10 +1030,129 @@ HeartbeatResponseAction TopologyCoordinatorImpl::setMemberAsDown(Date_t now,
                                                                  const OpTime& myLastOpApplied) {
     invariant(memberIndex != _selfIndex);
     invariant(memberIndex != -1);
+    invariant(_currentPrimaryIndex == _selfIndex);
     MemberHeartbeatData& hbData = _hbdata[memberIndex];
     hbData.setDownValues(now, "no response within election timeout period");
 
-    return _updatePrimaryFromHBData(memberIndex, MemberState(), now, myLastOpApplied);
+    if (CannotSeeMajority & _getMyUnelectableReason(now, myLastOpApplied)) {
+        if (_stepDownPending) {
+            return HeartbeatResponseAction::makeNoAction();
+        }
+        _stepDownPending = true;
+        log() << "can't see a majority of the set, relinquishing primary";
+        return HeartbeatResponseAction::makeStepDownSelfAction(_selfIndex);
+    }
+
+    return HeartbeatResponseAction::makeNoAction();
+}
+
+HeartbeatResponseAction TopologyCoordinatorImpl::_updatePrimaryFromHBDataV1(
+    int updatedConfigIndex,
+    const MemberState& originalState,
+    Date_t now,
+    const OpTime& lastOpApplied) {
+    // This method has two interrelated responsibilities, performed in two phases.
+    //
+    // First, it updates the local notion of which remote node, if any is primary.
+    //
+    // Second, if there is no remote primary, and the local node is not primary, it considers
+    // whether or not to stand for election.
+    invariant(updatedConfigIndex != _selfIndex);
+
+    // We are missing from the config, so do not participate in primary maintenance or election.
+    if (_selfIndex == -1) {
+        return HeartbeatResponseAction::makeNoAction();
+    }
+
+    ////////////////////
+    // Phase 1
+    ////////////////////
+
+    // If we believe the node whose data was just updated is primary, confirm that
+    // the updated data supports that notion.  If not, erase our notion of who is primary.
+    if (updatedConfigIndex == _currentPrimaryIndex) {
+        const MemberHeartbeatData& updatedHBData = _hbdata[updatedConfigIndex];
+        if (!updatedHBData.up() || !updatedHBData.getState().primary()) {
+            _currentPrimaryIndex = -1;
+        }
+    }
+
+    // Scan the member list's heartbeat data for who is primary, and update _currentPrimaryIndex.
+    if (_currentPrimaryIndex != _selfIndex) {
+        int remotePrimaryIndex = -1;
+        for (std::vector<MemberHeartbeatData>::const_iterator it = _hbdata.begin();
+             it != _hbdata.end();
+             ++it) {
+            const int itIndex = indexOfIterator(_hbdata, it);
+            if (itIndex == _selfIndex) {
+                continue;
+            }
+
+            if (it->getState().primary() && it->up()) {
+                if (remotePrimaryIndex != -1) {
+                    // Two other nodes think they are primary (asynchronously polled)
+                    // -- wait for things to settle down.
+                    warning() << "two remote primaries (transiently)";
+                    return HeartbeatResponseAction::makeNoAction();
+                }
+                remotePrimaryIndex = itIndex;
+            }
+        }
+
+        if (remotePrimaryIndex != -1) {
+            // Clear last heartbeat message on ourselves.
+            setMyHeartbeatMessage(now, "");
+
+            _currentPrimaryIndex = remotePrimaryIndex;
+            if (_rsConfig.getMemberAt(remotePrimaryIndex).getPriority() <
+                _rsConfig.getMemberAt(_selfIndex).getPriority()) {
+                return HeartbeatResponseAction::makePriorityTakeoverAction();
+            }
+            return HeartbeatResponseAction::makeNoAction();
+        }
+    }
+
+    ////////////////////
+    // Phase 2
+    ////////////////////
+
+    // We do not believe any remote to be primary.
+
+    // If we are primary, check if we can still see majority of the set; stepdown if we can't.
+    if (_iAmPrimary()) {
+        if (CannotSeeMajority & _getMyUnelectableReason(now, lastOpApplied)) {
+            if (_stepDownPending) {
+                return HeartbeatResponseAction::makeNoAction();
+            }
+            _stepDownPending = true;
+            log() << "can't see a majority of the set, relinquishing primary";
+            return HeartbeatResponseAction::makeStepDownSelfAction(_selfIndex);
+        }
+
+        LOG(2) << "Choosing to remain primary";
+        return HeartbeatResponseAction::makeNoAction();
+    }
+
+    fassert(28798, _currentPrimaryIndex == -1);
+
+    const MemberState currentState = getMemberState();
+    if (originalState.recovering() && currentState.secondary()) {
+        // We just transitioned from RECOVERING to SECONDARY, this can only happen if we
+        // received a heartbeat with an auth error when previously all the heartbeats we'd
+        // received had auth errors.  In this case, don't return makeElectAction() because
+        // that could cause the election to start before the ReplicationCoordinator has updated
+        // its notion of the member state to SECONDARY.  Instead return noAction so that the
+        // ReplicationCoordinator knows to update its tracking of the member state off of the
+        // TopologyCoordinator, and leave starting the election until the next heartbeat comes
+        // back.
+        return HeartbeatResponseAction::makeNoAction();
+    }
+
+    // At this point, there is no primary anywhere.  Check to see if we should become a candidate.
+    if (!checkShouldStandForElection(now, lastOpApplied)) {
+        return HeartbeatResponseAction::makeNoAction();
+    }
+    return HeartbeatResponseAction::makeElectAction();
 }
 
 HeartbeatResponseAction TopologyCoordinatorImpl::_updatePrimaryFromHBData(
@@ -1210,8 +1368,14 @@ bool TopologyCoordinatorImpl::checkShouldStandForElection(Date_t now, const OpTi
         return false;
     }
     if (_electionSleepUntil > now) {
-        LOG(2) << "Not standing for election before " << dateToISOStringLocal(_electionSleepUntil)
-               << " because I stood too recently";
+        if (_rsConfig.getProtocolVersion() == 1) {
+            LOG(2) << "Not standing for election before "
+                   << dateToISOStringLocal(_electionSleepUntil)
+                   << " because I stood up or learned about a new term too recently";
+        } else {
+            LOG(2) << "Not standing for election before "
+                   << dateToISOStringLocal(_electionSleepUntil) << " because I stood too recently";
+        }
         return false;
     }
     // All checks passed, become a candidate and start election proceedings.
@@ -1491,9 +1655,9 @@ void TopologyCoordinatorImpl::prepareStatusResponse(const ReplicationExecutor::C
             }
             bb.appendDate("lastHeartbeat", it->getLastHeartbeat());
             bb.appendDate("lastHeartbeatRecv", it->getLastHeartbeatRecv());
-            const int ping = _getPing(itConfig.getHostAndPort());
-            if (ping != -1) {
-                bb.append("pingMs", ping);
+            Milliseconds ping = _getPing(itConfig.getHostAndPort());
+            if (ping != UninitializedPing) {
+                bb.append("pingMs", durationCount<Milliseconds>(ping));
                 std::string s = it->getLastHeartbeatMsg();
                 if (!s.empty())
                     bb.append("lastHeartbeatMessage", s);
@@ -1720,7 +1884,20 @@ void TopologyCoordinatorImpl::updateConfig(const ReplicaSetConfig& newConfig,
     invariant(_role != Role::candidate);
     invariant(selfIndex < newConfig.getNumMembers());
 
+    // Reset term on startup and upgrade/downgrade of protocol version.
+    if (!_rsConfig.isInitialized() ||
+        _rsConfig.getProtocolVersion() != newConfig.getProtocolVersion()) {
+        if (newConfig.getProtocolVersion() == 1) {
+            _term = OpTime::kInitialTerm;
+        } else {
+            invariant(newConfig.getProtocolVersion() == 0);
+            _term = OpTime::kUninitializedTerm;
+        }
+        LOG(1) << "Updated term in topology coordinator to " << _term << " due to new config";
+    }
+
     _updateHeartbeatDataForReconfig(newConfig, selfIndex, now);
+    _stepDownPending = false;
     _rsConfig = newConfig;
     _selfIndex = selfIndex;
     _forceSyncSourceIndex = -1;
@@ -1740,7 +1917,6 @@ void TopologyCoordinatorImpl::updateConfig(const ReplicaSetConfig& newConfig,
 
     // By this point we know we are in Role::follower
     _currentPrimaryIndex = -1;  // force secondaries to re-detect who the primary is
-    _stepDownPending = false;
 
     if (_followerMode == MemberState::RS_SECONDARY && _rsConfig.getNumMembers() == 1 &&
         _selfIndex == 0 && _rsConfig.getMemberAt(_selfIndex).isElectable()) {
@@ -1910,7 +2086,7 @@ std::string TopologyCoordinatorImpl::_getUnelectableReasonString(
     return ss;
 }
 
-int TopologyCoordinatorImpl::_getPing(const HostAndPort& host) {
+Milliseconds TopologyCoordinatorImpl::_getPing(const HostAndPort& host) {
     return _pings[host].getMillis();
 }
 
@@ -2119,15 +2295,18 @@ int TopologyCoordinatorImpl::getMaintenanceCount() const {
     return _maintenanceModeCalls;
 }
 
-bool TopologyCoordinatorImpl::updateTerm(long long term) {
+bool TopologyCoordinatorImpl::updateTerm(long long term, Date_t now) {
     if (term <= _term) {
         return false;
     }
+    // Don't run election if we just stood up or learned about a new term.
+    _electionSleepUntil = now + _rsConfig.getElectionTimeoutPeriod();
     _term = term;
     return true;
 }
 
-long long TopologyCoordinatorImpl::getTerm() const {
+
+long long TopologyCoordinatorImpl::getTerm() {
     return _term;
 }
 
@@ -2181,7 +2360,6 @@ bool TopologyCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& currentS
 void TopologyCoordinatorImpl::prepareReplResponseMetadata(rpc::ReplSetMetadata* metadata,
                                                           const OpTime& lastVisibleOpTime,
                                                           const OpTime& lastCommittedOpTime) const {
-    // TODO(dannenberg): change the third arg to be the lastOpTimeVisible.
     *metadata = rpc::ReplSetMetadata(_term,
                                      lastCommittedOpTime,
                                      lastVisibleOpTime,
@@ -2248,10 +2426,6 @@ void TopologyCoordinatorImpl::loadLastVote(const LastVote& lastVote) {
     _lastVote = lastVote;
 }
 
-long long TopologyCoordinatorImpl::getTerm() {
-    return _term;
-}
-
 void TopologyCoordinatorImpl::voteForMyselfV1() {
     _lastVote.setTerm(_term);
     _lastVote.setCandidateId(_selfConfig().getId());
@@ -2259,6 +2433,31 @@ void TopologyCoordinatorImpl::voteForMyselfV1() {
 
 void TopologyCoordinatorImpl::setPrimaryIndex(long long primaryIndex) {
     _currentPrimaryIndex = primaryIndex;
+}
+
+bool TopologyCoordinatorImpl::stagePriorityTakeoverIfElectable(const Date_t now,
+                                                               const OpTime& lastOpApplied) {
+    if (_role == Role::leader) {
+        LOG(2) << "Not standing for election again; already primary";
+        return false;
+    }
+
+    if (_role == Role::candidate) {
+        LOG(2) << "Not standing for election again; already candidate";
+        return false;
+    }
+
+    const UnelectableReasonMask unelectableReason = _getMyUnelectableReason(now, lastOpApplied);
+    if (unelectableReason) {
+        LOG(2) << "Not standing for election because "
+               << _getUnelectableReasonString(unelectableReason);
+        return false;
+    }
+
+    // All checks passed, become a candidate and start election proceedings.
+    _role = Role::candidate;
+
+    return true;
 }
 
 }  // namespace repl

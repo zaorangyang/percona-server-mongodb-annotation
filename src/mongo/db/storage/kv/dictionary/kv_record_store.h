@@ -118,13 +118,13 @@ namespace mongo {
             return _db->updateSupported();
         }
 
-        virtual Status updateWithDamages( OperationContext* txn,
-                                          const RecordId& loc,
-                                          const RecordData& oldRec,
-                                          const char* damageSource,
-                                          const mutablebson::DamageVector& damages );
+        virtual StatusWith<RecordData> updateWithDamages( OperationContext* txn,
+                                                          const RecordId& loc,
+                                                          const RecordData& oldRec,
+                                                          const char* damageSource,
+                                                          const mutablebson::DamageVector& damages );
 
-        virtual std::unique_ptr<RecordCursor> getCursor(OperationContext* txn,
+        virtual std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* txn,
                                                         bool forward = true) const;
 
         virtual std::unique_ptr<RecordCursor> getCursorForRepair(OperationContext* txn) const;
@@ -175,11 +175,11 @@ namespace mongo {
                                             long long numRecords,
                                             long long dataSize);
 
-        class KVRecordCursor : public RecordCursor {
+        class KVRecordCursor : public SeekableRecordCursor {
         public:
             virtual boost::optional<Record> next();
             virtual boost::optional<Record> seekExact(const RecordId& id);
-            virtual void savePositioned() {
+            virtual void save() {
                 saveState();
             }
 

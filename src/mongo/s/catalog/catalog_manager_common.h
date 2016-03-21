@@ -48,25 +48,30 @@ class CatalogManagerCommon : public CatalogManager {
 public:
     virtual ~CatalogManagerCommon() = default;
 
-    Status enableSharding(const std::string& dbName) override;
+    Status enableSharding(OperationContext* txn, const std::string& dbName) override;
 
     StatusWith<std::string> addShard(OperationContext* txn,
                                      const std::string* shardProposedName,
                                      const ConnectionString& shardConnectionString,
                                      const long long maxSize) override;
 
-    Status updateDatabase(const std::string& dbName, const DatabaseType& db) override;
+    Status updateDatabase(OperationContext* txn,
+                          const std::string& dbName,
+                          const DatabaseType& db) override;
 
-    Status updateCollection(const std::string& collNs, const CollectionType& coll) override;
+    Status updateCollection(OperationContext* txn,
+                            const std::string& collNs,
+                            const CollectionType& coll) override;
 
-    Status createDatabase(const std::string& dbName) override;
+    Status createDatabase(OperationContext* txn, const std::string& dbName) override;
 
 protected:
     /**
      * Selects an optimal shard on which to place a newly created database from the set of
      * available shards. Will return ShardNotFound if shard could not be found.
      */
-    static StatusWith<ShardId> selectShardForNewDatabase(ShardRegistry* shardRegistry);
+    static StatusWith<ShardId> selectShardForNewDatabase(OperationContext* txn,
+                                                         ShardRegistry* shardRegistry);
 
     CatalogManagerCommon() = default;
 
@@ -81,12 +86,14 @@ private:
      *  NamespaceExists if it exists with the same casing
      *  DatabaseDifferCase if it exists under different casing.
      */
-    virtual Status _checkDbDoesNotExist(const std::string& dbName, DatabaseType* db) = 0;
+    virtual Status _checkDbDoesNotExist(OperationContext* txn,
+                                        const std::string& dbName,
+                                        DatabaseType* db) = 0;
 
     /**
      * Generates a unique name to be given to a newly added shard.
      */
-    virtual StatusWith<std::string> _generateNewShardName() = 0;
+    virtual StatusWith<std::string> _generateNewShardName(OperationContext* txn) = 0;
 };
 
 }  // namespace mongo

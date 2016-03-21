@@ -67,7 +67,9 @@ std::unique_ptr<ThreadPoolTaskExecutor> makeTaskExecutor(std::unique_ptr<Network
 
 }  // namespace
 
-Status initializeGlobalShardingState(const ConnectionString& configCS) {
+Status initializeGlobalShardingState(OperationContext* txn,
+                                     const ConnectionString& configCS,
+                                     bool allowNetworking) {
     SyncClusterConnection::setConnectionValidationHook(
         [](const HostAndPort& target, const executor::RemoteCommandResponse& isMasterReply) {
             return ShardingNetworkConnectionHook::validateHostImpl(target, isMasterReply);
@@ -79,6 +81,7 @@ Status initializeGlobalShardingState(const ConnectionString& configCS) {
         stdx::make_unique<ShardRegistry>(stdx::make_unique<RemoteCommandTargeterFactoryImpl>(),
                                          makeTaskExecutor(std::move(network)),
                                          networkPtr,
+                                         makeTaskExecutor(executor::makeNetworkInterface()),
                                          configCS));
 
     std::unique_ptr<ForwardingCatalogManager> catalogManager;
@@ -96,6 +99,11 @@ Status initializeGlobalShardingState(const ConnectionString& configCS) {
     grid.init(std::move(catalogManager),
               std::move(shardRegistry),
               stdx::make_unique<ClusterCursorManager>(getGlobalServiceContext()->getClockSource()));
+
+    auto status = grid.catalogManager(txn)->startup(txn, allowNetworking);
+    if (!status.isOK()) {
+        return status;
+    }
 
     return Status::OK();
 }

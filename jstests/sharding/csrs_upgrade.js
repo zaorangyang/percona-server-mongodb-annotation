@@ -125,10 +125,7 @@ var st;
         _id: csrsName,
         version: 1,
         configsvr: true,
-        members: [ { _id: 0, host: st.c0.name }],
-        settings: {
-            protocolVersion :1
-        }
+        members: [ { _id: 0, host: st.c0.name }]
     };
     assert.commandWorked(st.c0.adminCommand({replSetInitiate: csrsConfig}));
     var csrs = [];
@@ -188,6 +185,14 @@ var st;
     var csrsStatus;
     assert.soon(function () {
         csrsStatus = csrs[0].adminCommand({replSetGetStatus: 1});
+        if (csrsStatus.members[0].stateStr == "STARTUP" ||
+            csrsStatus.members[0].stateStr == "STARTUP2" ||
+            csrsStatus.members[0].stateStr == "RECOVERING") {
+            // Make sure first node is fully online or else mongoses still in SCCC mode might not
+            // find any node online to talk to.
+            return false;
+        }
+
         var i;
         for (i = 0; i < csrsStatus.members.length; ++i) {
             if (TestData.storageEngine != "wiredTiger" && TestData.storageEngine != "") {
@@ -210,9 +215,11 @@ var st;
     var sconfig = Object.extend({}, st.s0.fullOptions, /* deep */ true);
     delete sconfig.port;
     sconfig.configdb = csrsName + "/" + csrs[0].name;
-    assertCanSplit(startMongos(sconfig), "when mongos started with --configdb=" + sconfig.configdb);
+    assertCanSplit(MongoRunner.runMongos(sconfig),
+                   "when mongos started with --configdb=" + sconfig.configdb);
     sconfig.configdb = st.s0.fullOptions.configdb;
-    assertCanSplit(startMongos(sconfig), "when mongos started with --configdb=" + sconfig.configdb);
+    assertCanSplit(MongoRunner.runMongos(sconfig),
+                   "when mongos started with --configdb=" + sconfig.configdb);
     assertCanSplit(st.s0, "on mongos that drove the upgrade");
     assertCanSplit(st.s1, "on mongos that was previously unaware of the upgrade");
 }());

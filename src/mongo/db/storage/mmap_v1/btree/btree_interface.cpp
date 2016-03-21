@@ -146,7 +146,7 @@ public:
         void setEndPosition(const BSONObj& key, bool inclusive) override {
             if (key.isEmpty()) {
                 // This means scan to end of index.
-                _endState = {};
+                _endState = boost::none;
                 return;
             }
 
@@ -196,7 +196,7 @@ public:
             return curr(parts);
         }
 
-        void savePositioned() override {
+        void save() override {
             if (!_lastMoveWasRestore)
                 _savedEOF = isEOF();
 
@@ -213,7 +213,7 @@ public:
         }
 
         void saveUnpositioned() override {
-            // Don't leak our registration if savePositioned() was previously called.
+            // Don't leak our registration if save() was previously called.
             if (!_saved.bucket.isNull())
                 _btree->savedCursors()->unregisterCursor(&_saved);
 

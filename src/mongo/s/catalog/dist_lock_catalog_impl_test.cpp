@@ -88,7 +88,7 @@ public:
     }
 
     RemoteCommandTargeterMock* targeter() {
-        return RemoteCommandTargeterMock::get(_shardRegistry->getShard("config")->getTargeter());
+        return RemoteCommandTargeterMock::get(_shardRegistry->getConfigShard()->getTargeter());
     }
 
     DistLockCatalogImpl* catalog() {
@@ -108,6 +108,8 @@ private:
         auto networkUniquePtr = stdx::make_unique<executor::NetworkInterfaceMock>();
         executor::NetworkInterfaceMock* network = networkUniquePtr.get();
         auto executor = executor::makeThreadPoolTestExecutor(std::move(networkUniquePtr));
+        auto addShardExecutor = executor::makeThreadPoolTestExecutor(
+            stdx::make_unique<executor::NetworkInterfaceMock>());
 
         _networkTestEnv = stdx::make_unique<NetworkTestEnv>(executor.get(), network);
 
@@ -116,6 +118,7 @@ private:
             stdx::make_unique<ShardRegistry>(stdx::make_unique<RemoteCommandTargeterFactoryMock>(),
                                              std::move(executor),
                                              network,
+                                             std::move(addShardExecutor),
                                              configCS);
         _shardRegistry->startup();
 
@@ -1028,8 +1031,7 @@ TEST_F(DistLockCatalogFixture, BasicGetServerInfo) {
 
         return fromjson(R"({
                 localTime: { $date: "2015-05-26T13:06:27.293Z" },
-                $gleStats: {
-                    lastOpTime: { $timestamp: { t: 0, i: 0 }},
+                repl: {
                     electionId: ObjectId("555fa85d4d8640862a0fc79b")
                 },
                 ok: 1

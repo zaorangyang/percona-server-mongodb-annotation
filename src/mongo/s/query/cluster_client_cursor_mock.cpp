@@ -56,7 +56,12 @@ StatusWith<boost::optional<BSONObj>> ClusterClientCursorMock::next() {
         return out.getStatus();
     }
 
+    ++_numReturnedSoFar;
     return boost::optional<BSONObj>(out.getValue());
+}
+
+long long ClusterClientCursorMock::getNumReturnedSoFar() const {
+    return _numReturnedSoFar;
 }
 
 void ClusterClientCursorMock::kill() {
@@ -66,7 +71,11 @@ void ClusterClientCursorMock::kill() {
     }
 }
 
-void ClusterClientCursorMock::queueResult(BSONObj obj) {
+bool ClusterClientCursorMock::isTailable() const {
+    return false;
+}
+
+void ClusterClientCursorMock::queueResult(const BSONObj& obj) {
     _resultsQueue.push({obj});
 }
 

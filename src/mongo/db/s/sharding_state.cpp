@@ -33,16 +33,19 @@
 #include "mongo/db/s/sharding_state.h"
 
 #include "mongo/client/remote_command_targeter_factory_impl.h"
+#include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/metadata_loader.h"
+#include "mongo/db/s/operation_shard_version.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/util/log.h"
@@ -140,7 +143,7 @@ string ShardingState::getShardName() {
     return _shardName;
 }
 
-void ShardingState::initialize(const string& server) {
+void ShardingState::initialize(OperationContext* txn, const string& server) {
     uassert(18509,
             "Unable to obtain host name during sharding initialization.",
             !getHostName().empty());
@@ -154,9 +157,11 @@ void ShardingState::initialize(const string& server) {
     }
 
     ShardedConnectionInfo::addHook();
+    ReplicaSetMonitor::setSynchronousConfigChangeHook(
+        &ConfigServer::replicaSetChangeShardRegistryUpdateHook);
 
     ConnectionString configServerCS = uassertStatusOK(ConnectionString::parse(server));
-    uassertStatusOK(initializeGlobalShardingState(configServerCS));
+    uassertStatusOK(initializeGlobalShardingState(txn, configServerCS, false));
 
     _enabled = true;
 }
@@ -557,7 +562,8 @@ Status ShardingState::doRefreshMetadata(OperationContext* txn,
     long long refreshMillis;
 
     {
-        Status status = mdLoader.makeCollectionMetadata(grid.catalogManager(txn),
+        Status status = mdLoader.makeCollectionMetadata(txn,
+                                                        grid.catalogManager(txn),
                                                         ns,
                                                         getShardName(),
                                                         fullReload ? NULL : beforeMetadata.get(),
@@ -773,14 +779,16 @@ void ShardingState::appendInfo(OperationContext* txn, BSONObjBuilder& builder) {
     versionB.done();
 }
 
-bool ShardingState::needCollectionMetadata(Client* client, const string& ns) const {
+bool ShardingState::needCollectionMetadata(OperationContext* txn, const string& ns) const {
     if (!_enabled)
         return false;
 
-    if (!ShardedConnectionInfo::get(client, false))
-        return false;
+    Client* client = txn->getClient();
 
-    return true;
+    // Shard version information received from mongos may either by attached to the Client or
+    // directly to the OperationContext.
+    return ShardedConnectionInfo::get(client, false) ||
+        OperationShardVersion::get(txn).hasShardVersion();
 }
 
 shared_ptr<CollectionMetadata> ShardingState::getCollectionMetadata(const string& ns) {

@@ -6,7 +6,7 @@ var num = 5;
 var host = getHostName();
 var name = "tags";
 
-var replTest = new ReplSetTest( {name: name, nodes: num, startPort:31000} );
+var replTest = new ReplSetTest( {name: name, nodes: num} );
 var nodes = replTest.startSet();
 var port = replTest.ports;
 replTest.initiate({_id : name, members :
@@ -99,7 +99,6 @@ myprint("paritions: [0-1-2-0] [3] [4]")
 myprint("test1");
 myprint("2 should be primary");
 master = replTest.getMaster();
-replTest.awaitReplication();
 
 printjson(master.getDB("admin").runCommand({replSetGetStatus:1}));
 

@@ -55,9 +55,12 @@ public:
      */
     Status init(const ConnectionString& configCS);
 
-    Status startup() override;
+    /**
+     * Can terminate the server if called more than once.
+     */
+    Status startup(OperationContext* txn, bool allowNetworking) override;
 
-    void shutDown(bool allowNetworking) override;
+    void shutDown(OperationContext* txn, bool allowNetworking) override;
 
     Status shardCollection(OperationContext* txn,
                            const std::string& ns,
@@ -69,72 +72,88 @@ public:
     StatusWith<ShardDrainingStatus> removeShard(OperationContext* txn,
                                                 const std::string& name) override;
 
-    StatusWith<OpTimePair<DatabaseType>> getDatabase(const std::string& dbName) override;
+    StatusWith<OpTimePair<DatabaseType>> getDatabase(OperationContext* txn,
+                                                     const std::string& dbName) override;
 
-    StatusWith<OpTimePair<CollectionType>> getCollection(const std::string& collNs) override;
+    StatusWith<OpTimePair<CollectionType>> getCollection(OperationContext* txn,
+                                                         const std::string& collNs) override;
 
-    Status getCollections(const std::string* dbName,
+    Status getCollections(OperationContext* txn,
+                          const std::string* dbName,
                           std::vector<CollectionType>* collections,
                           repl::OpTime* optime);
 
     Status dropCollection(OperationContext* txn, const NamespaceString& ns) override;
 
-    Status getDatabasesForShard(const std::string& shardName,
+    Status getDatabasesForShard(OperationContext* txn,
+                                const std::string& shardName,
                                 std::vector<std::string>* dbs) override;
 
-    Status getChunks(const BSONObj& query,
+    Status getChunks(OperationContext* txn,
+                     const BSONObj& query,
                      const BSONObj& sort,
                      boost::optional<int> limit,
                      std::vector<ChunkType>* chunks,
                      repl::OpTime* opTime) override;
 
-    Status getTagsForCollection(const std::string& collectionNs,
+    Status getTagsForCollection(OperationContext* txn,
+                                const std::string& collectionNs,
                                 std::vector<TagsType>* tags) override;
 
-    StatusWith<std::string> getTagForChunk(const std::string& collectionNs,
+    StatusWith<std::string> getTagForChunk(OperationContext* txn,
+                                           const std::string& collectionNs,
                                            const ChunkType& chunk) override;
 
-    Status getAllShards(std::vector<ShardType>* shards) override;
+    Status getAllShards(OperationContext* txn, std::vector<ShardType>* shards) override;
 
     /**
      * Grabs a distributed lock and runs the command on all config servers.
      */
-    bool runUserManagementWriteCommand(const std::string& commandName,
+    bool runUserManagementWriteCommand(OperationContext* txn,
+                                       const std::string& commandName,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        BSONObjBuilder* result) override;
 
-    bool runReadCommand(const std::string& dbname,
+    bool runReadCommand(OperationContext* txn,
+                        const std::string& dbname,
                         const BSONObj& cmdObj,
                         BSONObjBuilder* result) override;
 
-    bool runUserManagementReadCommand(const std::string& dbname,
+    bool runUserManagementReadCommand(OperationContext* txn,
+                                      const std::string& dbname,
                                       const BSONObj& cmdObj,
                                       BSONObjBuilder* result) override;
 
-    Status applyChunkOpsDeprecated(const BSONArray& updateOps,
+    Status applyChunkOpsDeprecated(OperationContext* txn,
+                                   const BSONArray& updateOps,
                                    const BSONArray& preCondition) override;
 
-    void logAction(const ActionLogType& actionLog);
+    void logAction(OperationContext* txn, const ActionLogType& actionLog);
 
-    void logChange(const std::string& clientAddress,
+    void logChange(OperationContext* txn,
+                   const std::string& clientAddress,
                    const std::string& what,
                    const std::string& ns,
                    const BSONObj& detail) override;
 
-    StatusWith<SettingsType> getGlobalSettings(const std::string& key) override;
+    StatusWith<SettingsType> getGlobalSettings(OperationContext* txn,
+                                               const std::string& key) override;
 
-    void writeConfigServerDirect(const BatchedCommandRequest& request,
+    void writeConfigServerDirect(OperationContext* txn,
+                                 const BatchedCommandRequest& request,
                                  BatchedCommandResponse* response) override;
 
     DistLockManager* getDistLockManager() override;
 
-    Status checkAndUpgrade(bool checkOnly) override;
+    Status initConfigVersion(OperationContext* txn) override;
 
 private:
-    Status _checkDbDoesNotExist(const std::string& dbName, DatabaseType* db) override;
+    Status _checkDbDoesNotExist(OperationContext* txn,
+                                const std::string& dbName,
+                                DatabaseType* db) override;
 
-    StatusWith<std::string> _generateNewShardName() override;
+    StatusWith<std::string> _generateNewShardName(OperationContext* txn) override;
 
     /**
      * Starts the thread that periodically checks data consistency amongst the config servers.
@@ -150,10 +169,10 @@ private:
     size_t _getShardCount(const BSONObj& query) const;
 
     /**
-     * Returns true if all config servers have the same state.
+     * Returns OK if all config servers that were contacted have the same state.
      * If inconsistency detected on first attempt, checks at most 3 more times.
      */
-    bool _checkConfigServersConsistent(const unsigned tries = 4) const;
+    Status _checkConfigServersConsistent(const unsigned tries = 4) const;
 
     /**
      * Checks data consistency amongst config servers every 60 seconds.

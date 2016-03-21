@@ -640,7 +640,7 @@ namespace mongo {
             }
         }
 
-        void savePositioned() {
+        void save() {
             _initialize();
             if (!isEOF() && !_keyStringWasSaved) {
                 Slice key = _cursor->currKey();

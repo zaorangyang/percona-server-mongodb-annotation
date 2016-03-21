@@ -111,7 +111,12 @@ public:
     /**
      * Wakes up threads waiting on this object for the arrival of new data.
      */
-    void notifyOfInsert();
+    void notifyOfInsert(int count);
+
+    /**
+     * Wakes up all threads waiting but doesn't increment the count.
+     */
+    void notifyAll();
 
     /**
      * Get a counter value which is incremented on every insert into a capped collection.
@@ -122,8 +127,25 @@ public:
     /**
      * Waits for 'timeout' microseconds, or until notifyAll() is called to indicate that new
      * data is available in the capped collection.
+     *
+     * NOTE: Waiting threads can be signaled by calling kill or notify* methods.
      */
     void waitForInsert(uint64_t referenceCount, Microseconds timeout) const;
+
+    /**
+     * Same as above but without a timeout.
+     */
+    void waitForInsert(uint64_t referenceCount) const;
+
+    /**
+     * Cancels the notifier if the collection is dropped/invalidated, and wakes all waiting.
+     */
+    void kill();
+
+    /**
+     * Returns true if no new insert notification will occur.
+     */
+    bool isDead();
 
 private:
     // Signalled when a successful insert is made into a capped collection.
@@ -137,6 +159,9 @@ private:
     // The condition which '_cappedNewDataNotifier' is being notified of is an increment of this
     // counter. Access to this counter is synchronized with '_cappedNewDataMutex'.
     uint64_t _cappedInsertCount;
+
+    // True once the notifier is dead.
+    bool _dead;
 };
 
 /**
@@ -203,7 +228,8 @@ public:
      */
     bool findDoc(OperationContext* txn, const RecordId& loc, Snapshotted<BSONObj>* out) const;
 
-    std::unique_ptr<RecordCursor> getCursor(OperationContext* txn, bool forward = true) const;
+    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* txn,
+                                                    bool forward = true) const;
 
     /**
      * Returns many cursors that partition the Collection into many disjoint sets. Iterating
@@ -217,29 +243,38 @@ public:
                         bool noWarn = false,
                         BSONObj* deletedId = 0);
 
+    /*
+     * Inserts all documents inside one WUOW.
+     * Caller should ensure vector is appropriately sized for this.
+     * If errors occor (including WCE), caller should retry documents individually.
+     */
+    Status insertDocuments(OperationContext* txn,
+                           std::vector<BSONObj>::iterator begin,
+                           std::vector<BSONObj>::iterator end,
+                           bool enforceQuota,
+                           bool fromMigrate = false);
+
     /**
      * this does NOT modify the doc before inserting
      * i.e. will not add an _id field for documents that are missing it
      *
      * If enforceQuota is false, quotas will be ignored.
      */
-    StatusWith<RecordId> insertDocument(OperationContext* txn,
-                                        const BSONObj& doc,
-                                        bool enforceQuota,
-                                        bool fromMigrate = false);
+    Status insertDocument(OperationContext* txn,
+                          const BSONObj& doc,
+                          bool enforceQuota,
+                          bool fromMigrate = false);
 
     /**
      * Callers must ensure no document validation is performed for this collection when calling
      * this method.
      */
-    StatusWith<RecordId> insertDocument(OperationContext* txn,
-                                        const DocWriter* doc,
-                                        bool enforceQuota);
+    Status insertDocument(OperationContext* txn, const DocWriter* doc, bool enforceQuota);
 
-    StatusWith<RecordId> insertDocument(OperationContext* txn,
-                                        const BSONObj& doc,
-                                        MultiIndexBlock* indexBlock,
-                                        bool enforceQuota);
+    Status insertDocument(OperationContext* txn,
+                          const BSONObj& doc,
+                          MultiIndexBlock* indexBlock,
+                          bool enforceQuota);
 
     /**
      * updates the document @ oldLocation with newDoc
@@ -261,13 +296,14 @@ public:
     /**
      * Not allowed to modify indexes.
      * Illegal to call if updateWithDamagesSupported() returns false.
+     * @return the contents of the updated record.
      */
-    Status updateDocumentWithDamages(OperationContext* txn,
-                                     const RecordId& loc,
-                                     const Snapshotted<RecordData>& oldRec,
-                                     const char* damageSource,
-                                     const mutablebson::DamageVector& damages,
-                                     oplogUpdateEntryArgs& args);
+    StatusWith<RecordData> updateDocumentWithDamages(OperationContext* txn,
+                                                     const RecordId& loc,
+                                                     const Snapshotted<RecordData>& oldRec,
+                                                     const char* damageSource,
+                                                     const mutablebson::DamageVector& damages,
+                                                     oplogUpdateEntryArgs& args);
 
     // -----------
 
@@ -390,9 +426,12 @@ private:
      *  - some user error checks
      *  - adjust padding
      */
-    StatusWith<RecordId> _insertDocument(OperationContext* txn,
-                                         const BSONObj& doc,
-                                         bool enforceQuota);
+    Status _insertDocument(OperationContext* txn, const BSONObj& doc, bool enforceQuota);
+
+    Status _insertDocuments(OperationContext* txn,
+                            std::vector<BSONObj>::iterator begin,
+                            std::vector<BSONObj>::iterator end,
+                            bool enforceQuota);
 
     bool _enforceQuota(bool userEnforeQuota) const;
 

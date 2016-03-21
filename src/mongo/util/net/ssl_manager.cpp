@@ -906,11 +906,11 @@ StatusWith<boost::optional<std::string>> SSLManager::parseAndValidatePeerCertifi
 
     if (result != X509_V_OK) {
         if (_allowInvalidCertificates) {
-            warning() << "SSL peer certificate validation failed:"
+            warning() << "SSL peer certificate validation failed: "
                       << X509_verify_cert_error_string(result);
         } else {
             str::stream msg;
-            msg << "SSL peer certificate validation failed:"
+            msg << "SSL peer certificate validation failed: "
                 << X509_verify_cert_error_string(result);
             error() << msg.ss.str();
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
@@ -952,12 +952,15 @@ StatusWith<boost::optional<std::string>> SSLManager::parseAndValidatePeerCertifi
         sk_GENERAL_NAME_pop_free(sanNames, GENERAL_NAME_free);
     } else {
         // If Subject Alternate Name (SAN) didn't exist, check Common Name (CN).
-        int cnBegin = peerSubjectName.find("CN=") + 3;
-        int cnEnd = peerSubjectName.find(",", cnBegin);
-        std::string commonName = peerSubjectName.substr(cnBegin, cnEnd - cnBegin);
+        size_t cnBegin = peerSubjectName.find("CN=");
+        if (cnBegin != std::string::npos) {
+            size_t cnEnd = peerSubjectName.find(",", cnBegin);
+            if (cnEnd != std::string::npos) {
+                cnEnd = cnEnd - cnBegin;
+            }
+            std::string commonName = peerSubjectName.substr(cnBegin + 3, cnEnd);
 
-        if (_hostNameMatch(remoteHost.c_str(), commonName.c_str())) {
-            cnMatch = true;
+            cnMatch = _hostNameMatch(remoteHost.c_str(), commonName.c_str());
         }
     }
 

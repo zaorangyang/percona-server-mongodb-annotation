@@ -95,6 +95,10 @@ public:
                               const RemoteCommandRequest& request,
                               const RemoteCommandCompletionFn& onFinish);
     virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle);
+    /**
+     * Not implemented.
+     */
+    void cancelAllCommands() override {}
     virtual void setAlarm(Date_t when, const stdx::function<void()>& action);
 
 
@@ -137,6 +141,12 @@ public:
      * Will not return until the executor thread is blocked in waitForWorkUntil or waitForWork.
      */
     NetworkOperationIterator getNextReadyRequest();
+
+    /**
+     * Gets the first unscheduled request. There must be at least one unscheduled request in the
+     * queue.
+     */
+    NetworkOperationIterator getFrontOfUnscheduledQueue();
 
     /**
      * Schedules "response" in response to "noi" at virtual time "when".

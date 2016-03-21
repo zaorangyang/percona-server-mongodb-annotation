@@ -46,12 +46,6 @@ struct HostAndPort;
 template <typename T>
 class StatusWith;
 
-namespace executor {
-
-class TaskExecutor;
-
-}  // namespace executor
-
 namespace repl {
 
 class LastVote;
@@ -74,7 +68,7 @@ public:
      *
      * NOTE: Only starts threads if they are not already started,
      */
-    virtual void startThreads(executor::TaskExecutor* taskExecutor) = 0;
+    virtual void startThreads() = 0;
 
     /**
      * Starts the Master/Slave threads and sets up logOp
@@ -179,6 +173,11 @@ public:
      * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.
      */
     virtual void signalApplierToChooseNewSyncSource() = 0;
+
+    /**
+     * Notifies the bgsync to cancel the current oplog fetcher.
+     */
+    virtual void signalApplierToCancelFetcher() = 0;
 
     /**
      * Returns an OperationContext, owned by the caller, that may be used in methods of

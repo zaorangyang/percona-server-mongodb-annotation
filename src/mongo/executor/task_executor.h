@@ -282,6 +282,13 @@ public:
         return _callback.get();
     }
 
+    /**
+     * True if this handle is valid.
+     */
+    explicit operator bool() const {
+        return isValid();
+    }
+
 private:
     explicit CallbackHandle(std::shared_ptr<CallbackState> cbData);
     void setCallback(std::shared_ptr<CallbackState> callback) {
@@ -332,6 +339,13 @@ public:
 
     bool isValid() const {
         return _event.get();
+    }
+
+    /**
+     * True if this event handle is valid.
+     */
+    explicit operator bool() const {
+        return isValid();
     }
 
 private:

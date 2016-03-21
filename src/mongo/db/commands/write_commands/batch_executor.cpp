@@ -65,6 +65,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/operation_shard_version.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/stats/counters.h"
@@ -780,13 +781,12 @@ void WriteBatchExecutor::execInserts(const BatchedCommandRequest& request,
     ExecInsertsState state(_txn, &request);
     normalizeInserts(request, &state.normalizedInserts);
 
-    ShardedConnectionInfo* info = ShardedConnectionInfo::get(_txn->getClient(), false);
-    if (info) {
-        if (request.isMetadataSet() && request.getMetadata()->isShardVersionSet()) {
-            info->setVersion(request.getTargetingNS(), request.getMetadata()->getShardVersion());
-        } else {
-            info->setVersion(request.getTargetingNS(), ChunkVersion::IGNORED());
-        }
+    auto& operationShardVersion = OperationShardVersion::get(_txn);
+    if (request.isMetadataSet() && request.getMetadata()->isShardVersionSet()) {
+        operationShardVersion.setShardVersion(request.getTargetingNSS(),
+                                              request.getMetadata()->getShardVersion());
+    } else {
+        operationShardVersion.setShardVersion(request.getTargetingNSS(), ChunkVersion::IGNORED());
     }
 
     // Yield frequency is based on the same constants used by PlanYieldPolicy.
@@ -833,20 +833,18 @@ void WriteBatchExecutor::execUpdate(const BatchItemRef& updateItem,
     beginCurrentOp(_txn, updateItem);
     incOpStats(updateItem);
 
-    ShardedConnectionInfo* info = ShardedConnectionInfo::get(_txn->getClient(), false);
-    if (info) {
-        auto rootRequest = updateItem.getRequest();
-        if (!updateItem.getUpdate()->getMulti() && rootRequest->isMetadataSet() &&
-            rootRequest->getMetadata()->isShardVersionSet()) {
-            info->setVersion(rootRequest->getTargetingNS(),
-                             rootRequest->getMetadata()->getShardVersion());
-        } else {
-            info->setVersion(rootRequest->getTargetingNS(), ChunkVersion::IGNORED());
-        }
+    auto& operationShardVersion = OperationShardVersion::get(_txn);
+    auto rootRequest = updateItem.getRequest();
+    if (!updateItem.getUpdate()->getMulti() && rootRequest->isMetadataSet() &&
+        rootRequest->getMetadata()->isShardVersionSet()) {
+        operationShardVersion.setShardVersion(rootRequest->getTargetingNSS(),
+                                              rootRequest->getMetadata()->getShardVersion());
+    } else {
+        operationShardVersion.setShardVersion(rootRequest->getTargetingNSS(),
+                                              ChunkVersion::IGNORED());
     }
 
     WriteOpResult result;
-
     multiUpdate(_txn, updateItem, &result);
 
     if (!result.getStats().upsertedID.isEmpty()) {
@@ -873,20 +871,18 @@ void WriteBatchExecutor::execRemove(const BatchItemRef& removeItem, WriteErrorDe
     beginCurrentOp(_txn, removeItem);
     incOpStats(removeItem);
 
-    ShardedConnectionInfo* info = ShardedConnectionInfo::get(_txn->getClient(), false);
-    if (info) {
-        auto rootRequest = removeItem.getRequest();
-        if (removeItem.getDelete()->getLimit() == 1 && rootRequest->isMetadataSet() &&
-            rootRequest->getMetadata()->isShardVersionSet()) {
-            info->setVersion(rootRequest->getTargetingNS(),
-                             rootRequest->getMetadata()->getShardVersion());
-        } else {
-            info->setVersion(rootRequest->getTargetingNS(), ChunkVersion::IGNORED());
-        }
+    auto& operationShardVersion = OperationShardVersion::get(_txn);
+    auto rootRequest = removeItem.getRequest();
+    if (removeItem.getDelete()->getLimit() == 1 && rootRequest->isMetadataSet() &&
+        rootRequest->getMetadata()->isShardVersionSet()) {
+        operationShardVersion.setShardVersion(rootRequest->getTargetingNSS(),
+                                              rootRequest->getMetadata()->getShardVersion());
+    } else {
+        operationShardVersion.setShardVersion(rootRequest->getTargetingNSS(),
+                                              ChunkVersion::IGNORED());
     }
 
     WriteOpResult result;
-
     multiRemove(_txn, removeItem, &result);
 
     // END CURRENT OP
@@ -1073,10 +1069,10 @@ static void singleInsert(OperationContext* txn,
     dassert(txn->lockState()->isCollectionLockedForMode(insertNS, MODE_IX));
 
     WriteUnitOfWork wunit(txn);
-    StatusWith<RecordId> status = collection->insertDocument(txn, docToInsert, true);
+    Status status = collection->insertDocument(txn, docToInsert, true);
 
     if (!status.isOK()) {
-        result->setError(toWriteError(status.getStatus()));
+        result->setError(toWriteError(status));
     } else {
         result->getStats().n = 1;
         wunit.commit();
@@ -1250,11 +1246,14 @@ static void multiUpdate(OperationContext* txn,
             result->getStats().n = didInsert ? 1 : numMatched;
             result->getStats().upsertedID = resUpsertedID;
 
+            PlanSummaryStats summary;
+            Explain::getSummaryStats(*exec, &summary);
+            collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+
             // No-ops need to reset lastOp in the client, for write concern.
             if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
                 repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
             }
-
         } catch (const WriteConflictException& dle) {
             debug->writeConflicts++;
             if (isMulti) {
@@ -1335,18 +1334,23 @@ static void multiRemove(OperationContext* txn,
                 return;
             }
 
-            std::unique_ptr<PlanExecutor> exec = uassertStatusOK(
-                getExecutorDelete(txn, autoDb.getDb()->getCollection(nss), &parsedDelete));
+            auto collection = autoDb.getDb()->getCollection(nss);
+
+            std::unique_ptr<PlanExecutor> exec =
+                uassertStatusOK(getExecutorDelete(txn, collection, &parsedDelete));
 
             // Execute the delete and retrieve the number deleted.
             uassertStatusOK(exec->executePlan());
             result->getStats().n = DeleteStage::getNumDeleted(*exec);
 
+            PlanSummaryStats summary;
+            Explain::getSummaryStats(*exec, &summary);
+            collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+
             // No-ops need to reset lastOp in the client, for write concern.
             if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
                 repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
             }
-
             break;
         } catch (const WriteConflictException& dle) {
             CurOp::get(txn)->debug().writeConflicts++;

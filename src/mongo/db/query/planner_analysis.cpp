@@ -213,7 +213,7 @@ void explodeScan(IndexScanNode* isn,
 
         // Copy the filter, if there is one.
         if (isn->filter.get()) {
-            child->filter = std::move(isn->filter->shallowClone());
+            child->filter = isn->filter->shallowClone();
         }
 
         // Create child bounds.
@@ -674,7 +674,7 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
         KeepMutationsNode* keep = new KeepMutationsNode();
 
         // We must run the entire expression tree to make sure the document is still valid.
-        keep->filter = std::move(query.root()->shallowClone());
+        keep->filter = query.root()->shallowClone();
 
         if (STAGE_SORT == solnRoot->getType()) {
             // We want to insert the invalidated results before the sort stage, if there is one.
@@ -760,6 +760,23 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
                     }
                 }
             }
+        }
+        // If we don't have a covered project, and we're not allowed to put an uncovered one in,
+        // bail out.
+        if (solnRoot->fetched() &&
+            (params.options & QueryPlannerParams::NO_UNCOVERED_PROJECTIONS)) {
+            delete solnRoot;
+            return nullptr;
+        }
+
+        // If there's no sort stage but we have a sortKey meta-projection, we need to add a stage to
+        // generate the sort key computed data.
+        if (!hasSortStage && query.getProj()->wantSortKey()) {
+            SortKeyGeneratorNode* keyGenNode = new SortKeyGeneratorNode();
+            keyGenNode->queryObj = lpq.getFilter();
+            keyGenNode->sortSpec = lpq.getSort();
+            keyGenNode->children.push_back(solnRoot);
+            solnRoot = keyGenNode;
         }
 
         // We now know we have whatever data is required for the projection.

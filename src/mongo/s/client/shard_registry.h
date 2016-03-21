@@ -46,6 +46,7 @@ class BSONObjBuilder;
 class CatalogManager;
 struct HostAndPort;
 class NamespaceString;
+class OperationContext;
 class RemoteCommandTargeterFactory;
 class Shard;
 class ShardType;
@@ -83,13 +84,17 @@ public:
      *
      * @param targeterFactory Produces targeters for each shard's individual connection string
      * @param commandRunner Command runner for executing commands against hosts
-     * @param executor Asynchronous task executor to use for making calls to shards.
+     * @param executor Asynchronous task executor to use for making calls to shards and
+     *     config servers.
      * @param network Network interface backing executor.
+     * @param addShardExecutor Asynchronous task executor to use for making calls to nodes that
+     *     are not yet in the ShardRegistry
      * @param configServerCS ConnectionString used for communicating with the config servers
      */
     ShardRegistry(std::unique_ptr<RemoteCommandTargeterFactory> targeterFactory,
                   std::unique_ptr<executor::TaskExecutor> executor,
                   executor::NetworkInterface* network,
+                  std::unique_ptr<executor::TaskExecutor> addShardExecutor,
                   ConnectionString configServerCS);
 
     ~ShardRegistry();
@@ -123,12 +128,38 @@ public:
         return _configServerCS;
     }
 
-    void reload();
+    /**
+     * Reloads the ShardRegistry based on the contents of the config server's config.shards
+     * collection.
+     */
+    void reload(OperationContext* txn);
 
     /**
-     * Returns shared pointer to shard object with given shard id.
+     * Updates _lookup and _rsLookup based on the given new version of the given Shard's
+     * ConnectionString.
+     * Used to update the ShardRegistry when a change in replica set membership is detected by the
+     * ReplicaSetMonitor.
      */
-    std::shared_ptr<Shard> getShard(const ShardId& shardId);
+    void updateLookupMapsForShard(std::shared_ptr<Shard> shard,
+                                  const ConnectionString& newConnString);
+
+    /**
+     * Returns a shared pointer to the shard object with the given shard id.
+     * May refresh the shard registry if there's no cached information about the shard.
+     */
+    std::shared_ptr<Shard> getShard(OperationContext* txn, const ShardId& shardId);
+
+    /**
+     * Returns a shared pointer to the shard object with the given shard id.
+     * Will not refresh the shard registry or otherwise perform any network traffic.  This means
+     * that if the shard was recently added it may not be found.  USE WITH CAUTION.
+     */
+    std::shared_ptr<Shard> getShardNoReload(const ShardId& shardId);
+
+    /**
+     * Returns shared pointer to the shard object representing the config servers.
+     */
+    std::shared_ptr<Shard> getConfigShard();
 
     /**
      * Instantiates a new detached shard connection, which does not appear in the list of shards
@@ -156,37 +187,51 @@ public:
     /**
      * Executes 'find' command against the specified host and fetches *all* the results that
      * the host will return until there are no more or until an error is returned.
+     * "host" must refer to a config server.
      *
      * Returns either the complete set of results or an error, never partial results.
      *
      * Note: should never be used outside of CatalogManagerReplicaSet or DistLockCatalogImpl.
      */
-    StatusWith<QueryResponse> exhaustiveFind(const HostAndPort& host,
-                                             const NamespaceString& nss,
-                                             const BSONObj& query,
-                                             const BSONObj& sort,
-                                             boost::optional<long long> limit,
-                                             boost::optional<repl::ReadConcernArgs> readConcern,
-                                             const BSONObj& metadata);
+    StatusWith<QueryResponse> exhaustiveFindOnConfigNode(
+        const HostAndPort& host,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const BSONObj& sort,
+        boost::optional<long long> limit,
+        boost::optional<repl::ReadConcernArgs> readConcern,
+        const BSONObj& metadata);
 
     /**
      * Runs a command against the specified host and returns the result.  It is the responsibility
      * of the caller to check the returned BSON for command-specific failures.
      */
-    StatusWith<CommandResponse> runCommandWithMetadata(const HostAndPort& host,
-                                                       const std::string& dbName,
-                                                       const BSONObj& cmdObj,
-                                                       const BSONObj& metadata);
-
-    /**
-     * Runs a command against the specified host and returns the result.
-     */
-    StatusWith<BSONObj> runCommand(const HostAndPort& host,
+    StatusWith<BSONObj> runCommand(OperationContext* txn,
+                                   const HostAndPort& host,
                                    const std::string& dbName,
                                    const BSONObj& cmdObj);
 
     /**
-     * Helper for running commands against a given shard with logic for retargeting and
+     * Same as runCommand above but used for talking to nodes that are not yet in the ShardRegistry.
+     */
+    StatusWith<BSONObj> runCommandForAddShard(OperationContext* txn,
+                                              const HostAndPort& host,
+                                              const std::string& dbName,
+                                              const BSONObj& cmdObj);
+
+    /**
+     * Runs a command against the specified host and returns the result.  It is the responsibility
+     * of the caller to check the returned BSON for command-specific failures.
+     *
+     * "host" must refer to a config server node.
+     */
+    StatusWith<CommandResponse> runCommandOnConfig(const HostAndPort& host,
+                                                   const std::string& dbname,
+                                                   const BSONObj& cmdObj,
+                                                   const BSONObj& metadata);
+
+    /**
+     * Helpers for running commands against a given shard with logic for retargeting and
      * retrying the command in the event of a NotMaster response.
      * Returns ErrorCodes::NotMaster if after the max number of retries we still haven't
      * successfully delivered the command to a primary.  Can also return a non-ok status in the
@@ -196,14 +241,17 @@ public:
      * response object for any kind of command-specific failure.  The only exception is
      * NotMaster errors, which we intercept and follow the rules described above for handling.
      */
-    StatusWith<BSONObj> runCommandWithNotMasterRetries(const ShardId& shard,
+    StatusWith<BSONObj> runCommandWithNotMasterRetries(OperationContext* txn,
+                                                       const ShardId& shard,
                                                        const std::string& dbname,
                                                        const BSONObj& cmdObj);
 
-    StatusWith<CommandResponse> runCommandWithNotMasterRetries(const ShardId& shardId,
-                                                               const std::string& dbname,
-                                                               const BSONObj& cmdObj,
-                                                               const BSONObj& metadata);
+    StatusWith<BSONObj> runCommandOnConfigWithNotMasterRetries(const std::string& dbname,
+                                                               const BSONObj& cmdObj);
+
+    StatusWith<CommandResponse> runCommandOnConfigWithNotMasterRetries(const std::string& dbname,
+                                                                       const BSONObj& cmdObj,
+                                                                       const BSONObj& metadata);
 
 private:
     typedef std::map<ShardId, std::shared_ptr<Shard>> ShardMap;
@@ -218,18 +266,42 @@ private:
      */
     void _addConfigShard_inlock();
 
+    void _updateLookupMapsForShard_inlock(std::shared_ptr<Shard> shard,
+                                          const ConnectionString& newConnString);
+
     std::shared_ptr<Shard> _findUsingLookUp(const ShardId& shardId);
+
+    /**
+     * Runs a command against the specified host and returns the result.  It is the responsibility
+     * of the caller to check the returned BSON for command-specific failures.
+     */
+    StatusWith<CommandResponse> _runCommandWithMetadata(executor::TaskExecutor* executor,
+                                                        const HostAndPort& host,
+                                                        const std::string& dbName,
+                                                        const BSONObj& cmdObj,
+                                                        const BSONObj& metadata);
+
+    StatusWith<CommandResponse> _runCommandWithNotMasterRetries(executor::TaskExecutor* executor,
+                                                                RemoteCommandTargeter* targeter,
+                                                                const std::string& dbname,
+                                                                const BSONObj& cmdObj,
+                                                                const BSONObj& metadata);
 
     // Factory to obtain remote command targeters for shards
     const std::unique_ptr<RemoteCommandTargeterFactory> _targeterFactory;
 
-    // Executor for scheduling work and remote commands to shards that run in an asynchronous
-    // manner.
+    // Executor for scheduling work and remote commands to shards and config servers.  Has a
+    // connection hook set on it for initialization sharding data on shards and detecting if
+    // the catalog manager needs swapping.
     const std::unique_ptr<executor::TaskExecutor> _executor;
 
     // Network interface being used by _executor.  Used for asking questions about the network
     // configuration, such as getting the current server's hostname.
     executor::NetworkInterface* const _network;
+
+    // Executor specifically used for sending commands to servers that are in the process of being
+    // added as shards.  Does not have any connection hook set on it.
+    const std::unique_ptr<executor::TaskExecutor> _executorForAddShard;
 
     // Protects the config server connections string and the lookup maps below
     mutable stdx::mutex _mutex;

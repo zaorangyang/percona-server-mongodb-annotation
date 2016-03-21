@@ -32,20 +32,50 @@
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/cursor_id.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
 struct ClusterClientCursorParams {
+    // When mongos has to do a merge in order to return results to the client in the correct sort
+    // order, it requests a sortKey meta-projection using this field name.
+    static const char kSortKeyField[];
+
     /**
      * Contains any CCC parameters that are specified per-remote node.
      */
     struct Remote {
+        /**
+         * Use when a new cursor should be created on the remote.
+         */
+        Remote(HostAndPort hostAndPort, BSONObj cmdObj)
+            : hostAndPort(std::move(hostAndPort)), cmdObj(std::move(cmdObj)) {}
+
+        /**
+         * Use when an a cursor already exists on the remote.  The resulting CCC will take ownership
+         * of the existing remote cursor, generating results based on its current state.
+         *
+         * Note that any results already generated from this cursor will not be returned by the
+         * resulting CCC.  The caller is responsible for ensuring that results previously generated
+         * by this cursor have been processed.
+         */
+        Remote(HostAndPort hostAndPort, CursorId cursorId)
+            : hostAndPort(std::move(hostAndPort)), cursorId(cursorId) {}
+
         // How the networking layer should contact this remote.
         HostAndPort hostAndPort;
 
         // The raw command parameters to send to this remote (e.g. the find command specification).
-        BSONObj cmdObj;
+        //
+        // Exactly one of 'cmdObj' or 'cursorId' must be set.
+        boost::optional<BSONObj> cmdObj;
+
+        // The cursorId for the remote node, if one already exists.
+        //
+        // Exactly one of 'cmdObj' or 'cursorId' must be set.
+        boost::optional<CursorId> cursorId;
     };
 
     ClusterClientCursorParams() {}
@@ -71,6 +101,13 @@ struct ClusterClientCursorParams {
     // Limits the number of results returned by the ClusterClientCursor to this many. Optional.
     // Should be forwarded to the remote hosts in 'cmdObj'.
     boost::optional<long long> limit;
+
+    // Whether this cursor is tailing a capped collection.
+    bool isTailable = false;
+
+    // Whether any of the remote nodes might be secondaries due to a read preference mode other
+    // than "primary".
+    bool isSecondaryOk = false;
 };
 
 }  // mongo

@@ -34,6 +34,8 @@
 
 #include "mongo/s/query/router_stage_limit.h"
 #include "mongo/s/query/router_stage_merge.h"
+#include "mongo/s/query/router_stage_mock.h"
+#include "mongo/s/query/router_stage_remove_sortkey.h"
 #include "mongo/s/query/router_stage_skip.h"
 #include "mongo/stdx/memory.h"
 
@@ -41,14 +43,42 @@ namespace mongo {
 
 ClusterClientCursorImpl::ClusterClientCursorImpl(executor::TaskExecutor* executor,
                                                  ClusterClientCursorParams params)
-    : _root(buildMergerPlan(executor, std::move(params))) {}
+    : _isTailable(params.isTailable), _root(buildMergerPlan(executor, std::move(params))) {}
+
+ClusterClientCursorImpl::ClusterClientCursorImpl(std::unique_ptr<RouterStageMock> root)
+    : _root(std::move(root)) {}
 
 StatusWith<boost::optional<BSONObj>> ClusterClientCursorImpl::next() {
-    return _root->next();
+    // First return stashed results, if there are any.
+    if (!_stash.empty()) {
+        BSONObj front = std::move(_stash.front());
+        _stash.pop();
+        ++_numReturnedSoFar;
+        return {front};
+    }
+
+    auto next = _root->next();
+    if (next.isOK() && next.getValue()) {
+        ++_numReturnedSoFar;
+    }
+    return next;
 }
 
 void ClusterClientCursorImpl::kill() {
     _root->kill();
+}
+
+bool ClusterClientCursorImpl::isTailable() const {
+    return _isTailable;
+}
+
+long long ClusterClientCursorImpl::getNumReturnedSoFar() const {
+    return _numReturnedSoFar;
+}
+
+void ClusterClientCursorImpl::queueResult(const BSONObj& obj) {
+    invariant(obj.isOwned());
+    _stash.push(obj);
 }
 
 std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
@@ -63,6 +93,10 @@ std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
 
     if (params.limit) {
         root = stdx::make_unique<RouterStageLimit>(std::move(root), *params.limit);
+    }
+
+    if (!params.sort.isEmpty()) {
+        root = stdx::make_unique<RouterStageRemoveSortKey>(std::move(root));
     }
 
     return root;

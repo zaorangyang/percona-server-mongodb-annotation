@@ -41,6 +41,7 @@
 #include "mongo/db/query/find_and_modify_request.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/s/catalog/type_lockpings.h"
@@ -117,21 +118,19 @@ StatusWith<BSONObj> extractFindAndModifyNewObj(const BSONObj& responseObj) {
 }
 
 /**
- * Extract the electionId from a command response.
- *
- * TODO: this needs to support OP_COMMAND metadata.
+ * Extract the electionId from a serverStatus command response.
  */
 StatusWith<OID> extractElectionId(const BSONObj& responseObj) {
-    BSONElement gleStatsElem;
-    auto gleStatus = bsonExtractTypedField(responseObj, "$gleStats", Object, &gleStatsElem);
+    BSONElement replElem;
+    auto replElemStatus = bsonExtractTypedField(responseObj, "repl", Object, &replElem);
 
-    if (!gleStatus.isOK()) {
-        return {ErrorCodes::UnsupportedFormat, gleStatus.reason()};
+    if (!replElemStatus.isOK()) {
+        return {ErrorCodes::UnsupportedFormat, replElemStatus.reason()};
     }
 
     OID electionId;
 
-    auto electionIdStatus = bsonExtractOIDField(gleStatsElem.Obj(), "electionId", &electionId);
+    auto electionIdStatus = bsonExtractOIDField(replElem.Obj(), "electionId", &electionId);
 
     if (!electionIdStatus.isOK()) {
         return {ErrorCodes::UnsupportedFormat, electionIdStatus.reason()};
@@ -157,7 +156,7 @@ DistLockCatalogImpl::DistLockCatalogImpl(ShardRegistry* shardRegistry,
 DistLockCatalogImpl::~DistLockCatalogImpl() = default;
 
 RemoteCommandTargeter* DistLockCatalogImpl::_targeter() {
-    return _client->getShard("config")->getTargeter();
+    return _client->getConfigShard()->getTargeter();
 }
 
 StatusWith<LockpingsType> DistLockCatalogImpl::getPing(StringData processID) {
@@ -203,8 +202,8 @@ Status DistLockCatalogImpl::ping(StringData processID, Date_t ping) {
     request.setUpsert(true);
     request.setWriteConcern(_writeConcern);
 
-    auto resultStatus = _client->runCommandWithNotMasterRetries(
-        "config", _locksNS.db().toString(), request.toBSON());
+    auto resultStatus =
+        _client->runCommandOnConfigWithNotMasterRetries(_locksNS.db().toString(), request.toBSON());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
@@ -234,8 +233,8 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(StringData lockID,
     request.setShouldReturnNew(true);
     request.setWriteConcern(_writeConcern);
 
-    auto resultStatus = _client->runCommandWithNotMasterRetries(
-        "config", _locksNS.db().toString(), request.toBSON());
+    auto resultStatus =
+        _client->runCommandOnConfigWithNotMasterRetries(_locksNS.db().toString(), request.toBSON());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
@@ -287,8 +286,8 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(StringData lockID,
     request.setShouldReturnNew(true);
     request.setWriteConcern(_writeConcern);
 
-    auto resultStatus = _client->runCommandWithNotMasterRetries(
-        "config", _locksNS.db().toString(), request.toBSON());
+    auto resultStatus =
+        _client->runCommandOnConfigWithNotMasterRetries(_locksNS.db().toString(), request.toBSON());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
@@ -319,8 +318,8 @@ Status DistLockCatalogImpl::unlock(const OID& lockSessionID) {
         BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))));
     request.setWriteConcern(_writeConcern);
 
-    auto resultStatus = _client->runCommandWithNotMasterRetries(
-        "config", _locksNS.db().toString(), request.toBSON());
+    auto resultStatus =
+        _client->runCommandOnConfigWithNotMasterRetries(_locksNS.db().toString(), request.toBSON());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
@@ -347,14 +346,14 @@ StatusWith<DistLockCatalog::ServerInfo> DistLockCatalogImpl::getServerInfo() {
         return targetStatus.getStatus();
     }
 
-    auto resultStatus =
-        _client->runCommand(targetStatus.getValue(), "admin", BSON("serverStatus" << 1));
+    auto resultStatus = _client->runCommandOnConfig(
+        targetStatus.getValue(), "admin", BSON("serverStatus" << 1), rpc::makeEmptyMetadata());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
     }
 
-    BSONObj responseObj(resultStatus.getValue());
+    BSONObj responseObj(resultStatus.getValue().response);
 
     auto cmdStatus = getStatusFromCommandResult(responseObj);
 
@@ -448,8 +447,8 @@ Status DistLockCatalogImpl::stopPing(StringData processId) {
         FindAndModifyRequest::makeRemove(_lockPingNS, BSON(LockpingsType::process() << processId));
     request.setWriteConcern(_writeConcern);
 
-    auto resultStatus = _client->runCommandWithNotMasterRetries(
-        "config", _locksNS.db().toString(), request.toBSON());
+    auto resultStatus =
+        _client->runCommandOnConfigWithNotMasterRetries(_locksNS.db().toString(), request.toBSON());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
@@ -467,8 +466,8 @@ StatusWith<vector<BSONObj>> DistLockCatalogImpl::_findOnConfig(const HostAndPort
                                                                const BSONObj& sort,
                                                                boost::optional<long long> limit) {
     repl::ReadConcernArgs readConcern(boost::none, repl::ReadConcernLevel::kMajorityReadConcern);
-    auto result =
-        _client->exhaustiveFind(host, nss, query, sort, limit, readConcern, kReplMetadata);
+    auto result = _client->exhaustiveFindOnConfigNode(
+        host, nss, query, sort, limit, readConcern, kReplMetadata);
 
     if (!result.isOK()) {
         return result.getStatus();

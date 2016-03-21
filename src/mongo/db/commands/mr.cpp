@@ -694,7 +694,7 @@ void State::insert(const string& ns, const BSONObj& o) {
         b.appendElements(o);
         BSONObj bo = b.obj();
 
-        uassertStatusOK(coll->insertDocument(_txn, bo, true).getStatus());
+        uassertStatusOK(coll->insertDocument(_txn, bo, true));
         wuow.commit();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "M/R insert", ns);
@@ -713,7 +713,7 @@ void State::_insertToInc(BSONObj& o) {
         bool shouldReplicateWrites = _txn->writesAreReplicated();
         _txn->setReplicatedWrites(false);
         ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, _txn, shouldReplicateWrites);
-        uassertStatusOK(coll->insertDocument(_txn, o, true, false).getStatus());
+        uassertStatusOK(coll->insertDocument(_txn, o, true, false));
         wuow.commit();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "M/R insertToInc", _config.incLong);
@@ -1315,7 +1315,7 @@ public:
             // Get metadata before we check our version, to make sure it doesn't increment
             // in the meantime.  Need to do this in the same lock scope as the block.
             if (ShardingState::get(getGlobalServiceContext())
-                    ->needCollectionMetadata(client, config.ns)) {
+                    ->needCollectionMetadata(txn, config.ns)) {
                 collMetadata =
                     ShardingState::get(getGlobalServiceContext())->getCollectionMetadata(config.ns);
             }

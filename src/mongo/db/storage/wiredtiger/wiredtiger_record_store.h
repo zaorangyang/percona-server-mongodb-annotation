@@ -40,6 +40,7 @@
 #include "mongo/db/storage/record_store.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/fail_point_service.h"
 
 /**
@@ -131,13 +132,14 @@ public:
 
     virtual bool updateWithDamagesSupported() const;
 
-    virtual Status updateWithDamages(OperationContext* txn,
-                                     const RecordId& loc,
-                                     const RecordData& oldRec,
-                                     const char* damageSource,
-                                     const mutablebson::DamageVector& damages);
+    virtual StatusWith<RecordData> updateWithDamages(OperationContext* txn,
+                                                     const RecordId& loc,
+                                                     const RecordData& oldRec,
+                                                     const char* damageSource,
+                                                     const mutablebson::DamageVector& damages);
 
-    std::unique_ptr<RecordCursor> getCursor(OperationContext* txn, bool forward) const final;
+    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* txn,
+                                                    bool forward) const final;
     std::unique_ptr<RecordCursor> getRandomCursor(OperationContext* txn) const final;
 
     std::vector<std::unique_ptr<RecordCursor>> getManyCursors(OperationContext* txn) const final;
@@ -207,6 +209,9 @@ public:
     RecordId lowestCappedHiddenRecord() const;
 
     bool inShutdown() const;
+
+    void reclaimOplog(OperationContext* txn);
+
     int64_t cappedDeleteAsNeeded(OperationContext* txn, const RecordId& justInserted);
 
     int64_t cappedDeleteAsNeeded_inlock(OperationContext* txn, const RecordId& justInserted);
@@ -214,6 +219,16 @@ public:
     boost::timed_mutex& cappedDeleterMutex() {  // NOLINT
         return _cappedDeleterMutex;
     }
+
+    // Returns false if the oplog was dropped while waiting for a deletion request.
+    bool yieldAndAwaitOplogDeletionRequest(OperationContext* txn);
+
+    class OplogStones;
+
+    // Exposed only for testing.
+    OplogStones* oplogStones() {
+        return _oplogStones.get();
+    };
 
 private:
     class Cursor;
@@ -244,6 +259,7 @@ private:
 
     // The capped settings should not be updated once operations have started
     const bool _isCapped;
+    // True if the namespace of this record store starts with "local.oplog.", and false otherwise.
     const bool _isOplog;
     const int64_t _cappedMaxSize;
     const int64_t _cappedMaxSizeSlack;  // when to start applying backpressure
@@ -272,7 +288,9 @@ private:
     int _sizeStorerCounter;
 
     bool _shuttingDown;
-    bool _hasBackgroundThread;
+
+    // Non-null if this record store is underlying the active oplog.
+    std::shared_ptr<OplogStones> _oplogStones;
 };
 
 // WT failpoint to throw write conflict exceptions randomly

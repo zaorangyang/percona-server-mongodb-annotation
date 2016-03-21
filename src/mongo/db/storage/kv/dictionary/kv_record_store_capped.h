@@ -55,8 +55,8 @@ namespace mongo {
                                                   const DocWriter* doc,
                                                   bool enforceQuota );
 
-        virtual std::unique_ptr<RecordCursor> getCursor(OperationContext* txn,
-                                                        bool forward = true) const;
+        virtual std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* txn,
+                                                                bool forward = true) const;
 
         virtual void appendCustomStats( OperationContext* txn,
                                         BSONObjBuilder* result,

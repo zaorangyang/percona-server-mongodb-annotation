@@ -68,9 +68,6 @@ public:
      */
     static ReplicaSetConfig assertMakeRSConfig(const BSONObj& configBSON);
 
-    ReplCoordTest();
-    virtual ~ReplCoordTest();
-
 protected:
     virtual void setUp();
     virtual void tearDown();
@@ -80,6 +77,13 @@ protected:
      */
     executor::NetworkInterfaceMock* getNet() {
         return _net;
+    }
+
+    /**
+     * Gets the replication executor under test.
+     */
+    ReplicationExecutor* getReplExec() {
+        return _replExec.get();
     }
 
     /**
@@ -188,18 +192,25 @@ protected:
      */
     int64_t countLogLinesContaining(const std::string& needle);
 
+    /**
+     * Receive the heartbeat request from replication coordinator and reply with a response.
+     */
+    void replyToReceivedHeartbeat();
+    void replyToReceivedHeartbeatV1();
+
 private:
     std::unique_ptr<ReplicationCoordinatorImpl> _repl;
     // Owned by ReplicationCoordinatorImpl
-    TopologyCoordinatorImpl* _topo;
+    TopologyCoordinatorImpl* _topo = nullptr;
+    // Owned by ReplicationExecutor
+    executor::NetworkInterfaceMock* _net = nullptr;
+    // Owned by ReplicationExecutor
+    StorageInterfaceMock* _storage = nullptr;
+    std::unique_ptr<ReplicationExecutor> _replExec;
     // Owned by ReplicationCoordinatorImpl
-    executor::NetworkInterfaceMock* _net;
-    // Owned by ReplicationCoordinatorImpl
-    StorageInterfaceMock* _storage;
-    // Owned by ReplicationCoordinatorImpl
-    ReplicationCoordinatorExternalStateMock* _externalState;
+    ReplicationCoordinatorExternalStateMock* _externalState = nullptr;
     ReplSettings _settings;
-    bool _callShutdown;
+    bool _callShutdown = false;
 };
 
 }  // namespace repl

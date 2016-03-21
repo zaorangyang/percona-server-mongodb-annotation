@@ -261,6 +261,7 @@ struct __wt_cursor_index {
 
 	WT_CURSOR *child;
 	WT_CURSOR **cg_cursors;
+	uint8_t	*cg_needvalue;
 };
 
 struct __wt_cursor_json {
@@ -303,9 +304,10 @@ struct __wt_cursor_stat {
 	int	notinitialized;		/* Cursor not initialized */
 	int	notpositioned;		/* Cursor not positioned */
 
-	WT_STATS *stats;		/* Stats owned by the cursor */
-	int	  stats_base;		/* Base statistics value */
-	int	  stats_count;		/* Count of stats elements */
+	int64_t	     *stats;		/* Statistics */
+	int	      stats_base;	/* Base statistics value */
+	int	      stats_count;	/* Count of statistics values */
+	const char *(*stats_desc)(int);	/* Statistics descriptions */
 
 	union {				/* Copies of the statistics */
 		WT_DSRC_STATS dsrc_stats;

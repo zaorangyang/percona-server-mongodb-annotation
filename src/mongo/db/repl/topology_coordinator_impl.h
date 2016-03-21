@@ -52,6 +52,8 @@ class ReplSetMetadata;
 
 namespace repl {
 
+static const Milliseconds UninitializedPing{};
+
 /**
  * Represents a latency measurement for each replica set member based on heartbeat requests.
  * The measurement is an average weighted 80% to the old value, and 20% to the new value.
@@ -60,8 +62,6 @@ namespace repl {
  */
 class PingStats {
 public:
-    PingStats();
-
     /**
      * Records that a new heartbeat request started at "now".
      *
@@ -74,7 +74,7 @@ public:
      * Records that a heartbeat request completed successfully, and that "millis" milliseconds
      * were spent for a single network roundtrip plus remote processing time.
      */
-    void hit(int millis);
+    void hit(Milliseconds millis);
 
     /**
      * Records that a heartbeat request failed.
@@ -91,7 +91,7 @@ public:
     /**
      * Gets the weighted average round trip time for heartbeat messages to the target.
      */
-    unsigned int getMillis() const {
+    Milliseconds getMillis() const {
         return value;
     }
 
@@ -114,10 +114,10 @@ public:
     }
 
 private:
-    unsigned int count;
-    unsigned int value;
+    unsigned int count = 0;
+    Milliseconds value = UninitializedPing;
     Date_t _lastHeartbeatStartDate;
-    int _numFailuresSinceLastStart;
+    int _numFailuresSinceLastStart = std::numeric_limits<int>::max();
 };
 
 class TopologyCoordinatorImpl : public TopologyCoordinator {
@@ -150,8 +150,8 @@ public:
     virtual HostAndPort getSyncSourceAddress() const;
     virtual std::vector<HostAndPort> getMaybeUpHostAndPorts() const;
     virtual int getMaintenanceCount() const;
-    virtual long long getTerm() const;
-    virtual bool updateTerm(long long term);
+    virtual long long getTerm();
+    virtual bool updateTerm(long long term, Date_t now);
     virtual void setForceSyncSourceIndex(int index);
     virtual HostAndPort chooseNewSyncSource(Date_t now, const Timestamp& lastTimestampApplied);
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
@@ -228,12 +228,13 @@ public:
     virtual void summarizeAsHtml(ReplSetHtmlSummary* output);
     virtual void loadLastVote(const LastVote& lastVote);
     virtual void voteForMyselfV1();
-    virtual long long getTerm();
     virtual void prepareForStepDown();
     virtual void setPrimaryIndex(long long primaryIndex);
     virtual HeartbeatResponseAction setMemberAsDown(Date_t now,
                                                     const int memberIndex,
                                                     const OpTime& myLastOpApplied);
+    virtual Milliseconds getTimeoutDelayForMember(int memberId);
+    virtual bool stagePriorityTakeoverIfElectable(const Date_t now, const OpTime& lastOpApplied);
 
     ////////////////////////////////////////////////////////////
     //
@@ -282,7 +283,7 @@ private:
     int _getTotalPings();
 
     // Returns the current "ping" value for the given member by their address
-    int _getPing(const HostAndPort& host);
+    Milliseconds _getPing(const HostAndPort& host);
 
     // Determines if we will veto the member specified by "args.id", given that the last op
     // we have applied locally is "lastOpApplied".
@@ -333,12 +334,18 @@ private:
 
     /**
      * Performs updating "_currentPrimaryIndex" for processHeartbeatResponse(), and determines if an
-     * election should commence.
+     * election or stepdown should commence.
+     * _updatePrimaryFromHBDataV1() is a simplified version of _updatePrimaryFromHBData() to be used
+     * when in ProtocolVersion1.
      */
     HeartbeatResponseAction _updatePrimaryFromHBData(int updatedConfigIndex,
                                                      const MemberState& originalState,
                                                      Date_t now,
                                                      const OpTime& lastOpApplied);
+    HeartbeatResponseAction _updatePrimaryFromHBDataV1(int updatedConfigIndex,
+                                                       const MemberState& originalState,
+                                                       Date_t now,
+                                                       const OpTime& lastOpApplied);
 
     /**
      * Updates _hbdata based on the newConfig, ensuring that every member in the newConfig
@@ -351,8 +358,6 @@ private:
                                          Date_t now);
 
     void _stepDownSelfAndReplaceWith(int newPrimary);
-
-    MemberState _getMyState() const;
 
     /**
      * Looks up the provided member in the blacklist and returns true if the member's blacklist
@@ -373,7 +378,7 @@ private:
 
     // This node's election term.  The term is used as part of the consensus algorithm to elect
     // and maintain one primary (leader) node in the cluster.
-    long long _term = 0;
+    long long _term;
 
     // the index of the member we currently believe is primary, if one exists, otherwise -1
     int _currentPrimaryIndex;
@@ -414,6 +419,8 @@ private:
     Date_t _stepDownUntil;
 
     // A time before which this node will not stand for election.
+    // In protocol version 1, this is used to prevent running for election after seeing
+    // a new term.
     Date_t _electionSleepUntil;
 
     // The number of calls we have had to enter maintenance mode

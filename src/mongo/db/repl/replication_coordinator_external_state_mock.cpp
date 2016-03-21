@@ -52,11 +52,12 @@ ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock
       _storeLocalLastVoteDocumentStatus(Status::OK()),
       _storeLocalConfigDocumentShouldHang(false),
       _storeLocalLastVoteDocumentShouldHang(false),
+      _isApplierSignaledToCancelFetcher(false),
       _connectionsClosed(false) {}
 
 ReplicationCoordinatorExternalStateMock::~ReplicationCoordinatorExternalStateMock() {}
 
-void ReplicationCoordinatorExternalStateMock::startThreads(executor::TaskExecutor* taskExecutor) {}
+void ReplicationCoordinatorExternalStateMock::startThreads() {}
 void ReplicationCoordinatorExternalStateMock::startMasterSlave(OperationContext*) {}
 void ReplicationCoordinatorExternalStateMock::initiateOplog(OperationContext* txn,
                                                             bool updateReplOpTime) {}
@@ -157,6 +158,10 @@ void ReplicationCoordinatorExternalStateMock::setStoreLocalConfigDocumentToHang(
     }
 }
 
+bool ReplicationCoordinatorExternalStateMock::isApplierSignaledToCancelFetcher() const {
+    return _isApplierSignaledToCancelFetcher;
+}
+
 void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentStatus(Status status) {
     _storeLocalLastVoteDocumentStatus = status;
 }
@@ -178,6 +183,10 @@ void ReplicationCoordinatorExternalStateMock::killAllUserOperations(OperationCon
 void ReplicationCoordinatorExternalStateMock::clearShardingState() {}
 
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
+
+void ReplicationCoordinatorExternalStateMock::signalApplierToCancelFetcher() {
+    _isApplierSignaledToCancelFetcher = true;
+}
 
 OperationContext* ReplicationCoordinatorExternalStateMock::createOperationContext(
     const std::string& threadName) {

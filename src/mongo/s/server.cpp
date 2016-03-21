@@ -52,6 +52,7 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/startup_warnings_common.h"
@@ -63,6 +64,7 @@
 #include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
+#include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/request.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/s/version_mongos.h"
@@ -133,13 +135,13 @@ public:
         auto txn = cc().makeOperationContext();
 
         try {
-            r.init();
+            r.init(txn.get());
             r.process(txn.get());
         } catch (const AssertionException& ex) {
             LOG(ex.isUserAssertion() ? 1 : 0) << "Assertion failed"
                                               << " while processing " << opToString(m.operation())
                                               << " op"
-                                              << " for " << r.getns() << causedBy(ex);
+                                              << " for " << r.getnsIfPresent() << causedBy(ex);
 
             if (r.expectResponse()) {
                 m.header().setId(r.id());
@@ -151,7 +153,7 @@ public:
         } catch (const DBException& ex) {
             log() << "Exception thrown"
                   << " while processing " << opToString(m.operation()) << " op"
-                  << " for " << r.getns() << causedBy(ex);
+                  << " for " << r.getnsIfPresent() << causedBy(ex);
 
             if (r.expectResponse()) {
                 m.header().setId(r.id());
@@ -170,6 +172,7 @@ public:
 void start(const MessageServer::Options& opts) {
     balancer.go();
     cursorCache.startTimeoutThread();
+    clusterCursorCleanupJob.go();
 
     UserCacheInvalidator cacheInvalidatorThread(getGlobalAuthorizationManager());
     {
@@ -196,23 +199,14 @@ DBClientBase* createDirectClient(OperationContext* txn) {
 
 using namespace mongo;
 
-static Status initializeSharding(OperationContext* txn, bool doUpgrade) {
-    Status status = initializeGlobalShardingState(mongosGlobalParams.configdbs);
+static Status initializeSharding(OperationContext* txn) {
+    Status status = initializeGlobalShardingState(txn, mongosGlobalParams.configdbs, true);
     if (!status.isOK()) {
         return status;
     }
 
     auto catalogManager = grid.catalogManager(txn);
-    status = catalogManager->checkAndUpgrade(!doUpgrade);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    if (doUpgrade) {
-        return Status::OK();
-    }
-
-    status = catalogManager->startup();
+    status = catalogManager->initConfigVersion(txn);
     if (!status.isOK()) {
         return status;
     }
@@ -220,7 +214,7 @@ static Status initializeSharding(OperationContext* txn, bool doUpgrade) {
     return Status::OK();
 }
 
-static ExitCode runMongosServer(bool doUpgrade) {
+static ExitCode runMongosServer() {
     Client::initThread("mongosMain");
     printShardingVersionInfo(false);
 
@@ -228,7 +222,10 @@ static ExitCode runMongosServer(bool doUpgrade) {
     globalConnPool.addHook(new ShardingConnectionHook(false));
     shardConnectionPool.addHook(new ShardingConnectionHook(true));
 
-    ReplicaSetMonitor::setConfigChangeHook(&ConfigServer::replicaSetChange);
+    ReplicaSetMonitor::setAsynchronousConfigChangeHook(
+        &ConfigServer::replicaSetChangeConfigServerUpdateHook);
+    ReplicaSetMonitor::setSynchronousConfigChangeHook(
+        &ConfigServer::replicaSetChangeShardRegistryUpdateHook);
 
     // Mongos connection pools already takes care of authenticating new connections so the
     // replica set connection shouldn't need to.
@@ -240,13 +237,10 @@ static ExitCode runMongosServer(bool doUpgrade) {
 
     {
         auto txn = cc().makeOperationContext();
-        Status status = initializeSharding(txn.get(), doUpgrade);
+        Status status = initializeSharding(txn.get());
         if (!status.isOK()) {
             error() << "Error initializing sharding system: " << status;
             return EXIT_SHARDING_ERROR;
-        }
-        if (doUpgrade) {
-            return EXIT_CLEAN;
         }
 
         ConfigServer::reloadSettings(txn.get());
@@ -332,7 +326,7 @@ static int _main() {
     }
 #endif
 
-    ExitCode exitCode = runMongosServer(mongosGlobalParams.upgrade);
+    ExitCode exitCode = runMongosServer();
 
     // To maintain backwards compatibility, we exit with EXIT_NET_ERROR if the listener loop
     // returns.
@@ -349,7 +343,7 @@ static ExitCode initService() {
     ntservice::reportStatus(SERVICE_RUNNING);
     log() << "Service running";
 
-    ExitCode exitCode = runMongosServer(mongosGlobalParams.upgrade);
+    ExitCode exitCode = runMongosServer();
 
     // ignore EXIT_NET_ERROR on clean shutdown since we return this when the listening socket
     // is closed
@@ -401,7 +395,7 @@ int mongoSMain(int argc, char* argv[], char** envp) {
     startupConfigActions(std::vector<std::string>(argv, argv + argc));
     cmdline_utils::censorArgvArray(argc, argv);
 
-    mongo::logCommonStartupWarnings();
+    mongo::logCommonStartupWarnings(serverGlobalParams);
 
     try {
         int exitCode = _main();
@@ -454,7 +448,11 @@ void mongo::exitCleanly(ExitCode code) {
         }
 
         auto catalogMgr = grid.catalogManager(txn);
-        catalogMgr->shutDown();
+        catalogMgr->shutDown(txn);
+
+        auto cursorManager = grid.getCursorManager();
+        cursorManager->killAllCursors();
+        cursorManager->reapZombieCursors();
     }
 
     mongo::dbexit(code);

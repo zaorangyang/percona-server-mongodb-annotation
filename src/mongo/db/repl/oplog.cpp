@@ -122,10 +122,8 @@ stdx::condition_variable newTimestampNotifier;
 static std::string _oplogCollectionName;
 
 // so we can fail the same way
-void checkOplogInsert(StatusWith<RecordId> result) {
-    massert(17322,
-            str::stream() << "write to oplog failed: " << result.getStatus().toString(),
-            result.isOK());
+void checkOplogInsert(Status result) {
+    massert(17322, str::stream() << "write to oplog failed: " << result.toString(), result.isOK());
 }
 
 /**
@@ -144,10 +142,10 @@ std::pair<OpTime, long long> getNextOpTime(OperationContext* txn,
                                            ReplicationCoordinator* replCoord,
                                            const char* opstr,
                                            ReplicationCoordinator::Mode replicationMode) {
-    synchronizeOnCappedInFlightResource(txn->lockState());
+    synchronizeOnCappedInFlightResource(txn->lockState(), oplog->ns());
 
     long long hashNew = 0;
-    long long term = OpTime::kProtocolVersionV0Term;
+    long long term = OpTime::kUninitializedTerm;
 
     // Fetch term out of the newOpMutex.
     if (replicationMode == ReplicationCoordinator::modeReplSet &&
@@ -383,21 +381,11 @@ OpTime writeOpsToOplog(OperationContext* txn, const std::deque<BSONObj>& ops) {
         OldClientContext ctx(txn, rsOplogName, _localDB);
         WriteUnitOfWork wunit(txn);
 
-        for (std::deque<BSONObj>::const_iterator it = ops.begin(); it != ops.end(); ++it) {
-            const BSONObj& op = *it;
-            const OpTime optime = fassertStatusOK(28779, OpTime::parseFromBSON(op));
-
-            checkOplogInsert(_localOplogCollection->insertDocument(txn, op, false));
-
-            // lastOptime and optime are successive in the log, so it's safe to compare them.
-            if (!(lastOptime < optime)) {
-                severe() << "replication oplog stream went back in time. "
-                            "previous timestamp: " << lastOptime << " newest timestamp: " << optime
-                         << ". Op being applied: " << op;
-                fassertFailedNoTrace(18905);
-            }
-            lastOptime = optime;
-        }
+        std::vector<BSONObj> opsVect(ops.begin(), ops.end());
+        checkOplogInsert(
+            _localOplogCollection->insertDocuments(txn, opsVect.begin(), opsVect.end(), false));
+        lastOptime =
+            fassertStatusOK(ErrorCodes::InvalidBSON, OpTime::parseFromBSON(opsVect.back()));
         wunit.commit();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "writeOps", _localOplogCollection->ns().ns());
@@ -677,13 +665,13 @@ Status applyOperation_inlock(OperationContext* txn,
         // 2. If okay, commit
         // 3. If not, do update (and commit)
         // 4. If both !Ok, return status
-        StatusWith<RecordId> status{ErrorCodes::NotYetInitialized, ""};
+        Status status{ErrorCodes::NotYetInitialized, ""};
         {
             WriteUnitOfWork wuow(txn);
             try {
                 status = collection->insertDocument(txn, o, true);
             } catch (DBException dbe) {
-                status = StatusWith<RecordId>(dbe.toStatus());
+                status = dbe.toStatus();
             }
             if (status.isOK()) {
                 wuow.commit();
@@ -691,8 +679,8 @@ Status applyOperation_inlock(OperationContext* txn,
         }
         // Now see if we need to do an update, based on duplicate _id index key
         if (!status.isOK()) {
-            if (status.getStatus().code() != ErrorCodes::DuplicateKey) {
-                return status.getStatus();
+            if (status.code() != ErrorCodes::DuplicateKey) {
+                return status;
             }
 
             // Do update on DuplicateKey errors.
@@ -983,8 +971,10 @@ void SnapshotThread::run() {
             SnapshotName name(0);  // assigned real value in block.
             {
                 // Make sure there are no in-flight capped inserts while we create our snapshot.
-                Lock::ResourceLock cappedInsertLock(
-                    txn->lockState(), resourceCappedInFlight, MODE_X);
+                Lock::ResourceLock cappedInsertLockForOtherDb(
+                    txn->lockState(), resourceCappedInFlightForOtherDb, MODE_X);
+                Lock::ResourceLock cappedInsertLockForLocalDb(
+                    txn->lockState(), resourceCappedInFlightForLocalDb, MODE_X);
 
                 // Reserve the name immediately before we take our snapshot. This ensures that all
                 // names that compare lower must be from points in time visible to this named

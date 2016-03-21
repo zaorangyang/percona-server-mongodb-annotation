@@ -38,7 +38,7 @@
 
 namespace mongo {
 
-class EmptyRecordCursor final : public RecordCursor {
+class EmptyRecordCursor final : public SeekableRecordCursor {
 public:
     boost::optional<Record> next() final {
         return {};
@@ -46,7 +46,7 @@ public:
     boost::optional<Record> seekExact(const RecordId& id) final {
         return {};
     }
-    void savePositioned() final {}
+    void save() final {}
     bool restore() final {
         return true;
     }
@@ -124,16 +124,17 @@ public:
         return false;
     }
 
-    virtual Status updateWithDamages(OperationContext* txn,
-                                     const RecordId& loc,
-                                     const RecordData& oldRec,
-                                     const char* damageSource,
-                                     const mutablebson::DamageVector& damages) {
+    virtual StatusWith<RecordData> updateWithDamages(OperationContext* txn,
+                                                     const RecordId& loc,
+                                                     const RecordData& oldRec,
+                                                     const char* damageSource,
+                                                     const mutablebson::DamageVector& damages) {
         invariant(false);
     }
 
 
-    std::unique_ptr<RecordCursor> getCursor(OperationContext* txn, bool forward) const final {
+    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* txn,
+                                                    bool forward) const final {
         return stdx::make_unique<EmptyRecordCursor>();
     }
 
