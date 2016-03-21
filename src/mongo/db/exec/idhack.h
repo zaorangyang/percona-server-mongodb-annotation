@@ -43,7 +43,7 @@ class RecordCursor;
  * A standalone stage implementing the fast path for key-value retrievals
  * via the _id index.
  */
-class IDHackStage : public PlanStage {
+class IDHackStage final : public PlanStage {
 public:
     /** Takes ownership of all the arguments -collection. */
     IDHackStage(OperationContext* txn,
@@ -53,29 +53,29 @@ public:
 
     IDHackStage(OperationContext* txn, Collection* collection, const BSONObj& key, WorkingSet* ws);
 
-    virtual ~IDHackStage();
+    ~IDHackStage();
 
-    virtual bool isEOF();
-    virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState work(WorkingSetID* out) final;
 
-    virtual void doSaveState();
-    virtual void doRestoreState();
-    virtual void doDetachFromOperationContext();
-    virtual void doReattachToOperationContext(OperationContext* opCtx);
-    virtual void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
     /**
      * ID Hack has a very strict criteria for the queries it supports.
      */
     static bool supportsQuery(const CanonicalQuery& query);
 
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_IDHACK;
     }
 
     std::unique_ptr<PlanStageStats> getStats();
 
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
@@ -86,9 +86,6 @@ private:
      * Called whenever we have a WSM containing the matching obj.
      */
     StageState advance(WorkingSetID id, WorkingSetMember* member, WorkingSetID* out);
-
-    // transactional context for read locks. Not owned by us
-    OperationContext* _txn;
 
     // Not owned here.
     const Collection* _collection;
@@ -104,7 +101,7 @@ private:
     // Have we returned our one document?
     bool _done;
 
-    // Do we need to add index key metadata for $returnKey?
+    // Do we need to add index key metadata for returnKey?
     bool _addKeyMetadata;
 
     // If we want to return a RecordId and it points to something that's not in memory,

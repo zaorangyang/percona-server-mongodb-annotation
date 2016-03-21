@@ -77,7 +77,7 @@ protected:
 
 private:
     virtual std::unique_ptr<TaskExecutor> makeTaskExecutor(
-        std::unique_ptr<NetworkInterface> net) = 0;
+        std::unique_ptr<NetworkInterfaceMock> net) = 0;
 
     virtual void postExecutorThreadLaunch();
 

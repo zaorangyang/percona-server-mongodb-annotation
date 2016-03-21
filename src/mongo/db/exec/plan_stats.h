@@ -146,9 +146,7 @@ private:
 struct AndHashStats : public SpecificStats {
     AndHashStats() : flaggedButPassed(0), flaggedInProgress(0), memUsage(0), memLimit(0) {}
 
-    virtual ~AndHashStats() {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         AndHashStats* specific = new AndHashStats(*this);
         return specific;
     }
@@ -178,9 +176,7 @@ struct AndHashStats : public SpecificStats {
 struct AndSortedStats : public SpecificStats {
     AndSortedStats() : flagged(0) {}
 
-    virtual ~AndSortedStats() {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         AndSortedStats* specific = new AndSortedStats(*this);
         return specific;
     }
@@ -195,7 +191,7 @@ struct AndSortedStats : public SpecificStats {
 struct CachedPlanStats : public SpecificStats {
     CachedPlanStats() {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         return new CachedPlanStats(*this);
     }
 };
@@ -203,7 +199,7 @@ struct CachedPlanStats : public SpecificStats {
 struct CollectionScanStats : public SpecificStats {
     CollectionScanStats() : docsTested(0), direction(1) {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         CollectionScanStats* specific = new CollectionScanStats(*this);
         return specific;
     }
@@ -219,7 +215,7 @@ struct CollectionScanStats : public SpecificStats {
 struct CountStats : public SpecificStats {
     CountStats() : nCounted(0), nSkipped(0), trivialCount(false) {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         CountStats* specific = new CountStats(*this);
         return specific;
     }
@@ -244,9 +240,7 @@ struct CountScanStats : public SpecificStats {
           isUnique(false),
           keysExamined(0) {}
 
-    virtual ~CountScanStats() {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         CountScanStats* specific = new CountScanStats(*this);
         // BSON objects have to be explicitly copied.
         specific->keyPattern = keyPattern.getOwned();
@@ -270,7 +264,7 @@ struct CountScanStats : public SpecificStats {
 struct DeleteStats : public SpecificStats {
     DeleteStats() : docsDeleted(0), nInvalidateSkips(0) {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         return new DeleteStats(*this);
     }
 
@@ -282,30 +276,38 @@ struct DeleteStats : public SpecificStats {
 };
 
 struct DistinctScanStats : public SpecificStats {
-    DistinctScanStats() : keysExamined(0), indexVersion(0) {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         DistinctScanStats* specific = new DistinctScanStats(*this);
+        // BSON objects have to be explicitly copied.
         specific->keyPattern = keyPattern.getOwned();
+        specific->indexBounds = indexBounds.getOwned();
         return specific;
     }
 
     // How many keys did we look at while distinct-ing?
-    size_t keysExamined;
-
-    std::string indexName;
+    size_t keysExamined = 0;
 
     BSONObj keyPattern;
 
-    int indexVersion;
+    // Properties of the index used for the distinct scan.
+    std::string indexName;
+    int indexVersion = 0;
+    bool isMultiKey = false;
+    bool isPartial = false;
+    bool isSparse = false;
+    bool isUnique = false;
+
+    // >1 if we're traversing the index forwards and <1 if we're traversing it backwards.
+    int direction = 1;
+
+    // A BSON representation of the distinct scan's index bounds.
+    BSONObj indexBounds;
 };
 
 struct FetchStats : public SpecificStats {
     FetchStats() : alreadyHasObj(0), forcedFetches(0), docsExamined(0) {}
 
-    virtual ~FetchStats() {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         FetchStats* specific = new FetchStats(*this);
         return specific;
     }
@@ -323,9 +325,7 @@ struct FetchStats : public SpecificStats {
 struct GroupStats : public SpecificStats {
     GroupStats() : nGroups(0) {}
 
-    virtual ~GroupStats() {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         GroupStats* specific = new GroupStats(*this);
         return specific;
     }
@@ -337,9 +337,7 @@ struct GroupStats : public SpecificStats {
 struct IDHackStats : public SpecificStats {
     IDHackStats() : keysExamined(0), docsExamined(0) {}
 
-    virtual ~IDHackStats() {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         IDHackStats* specific = new IDHackStats(*this);
         return specific;
     }
@@ -364,9 +362,7 @@ struct IndexScanStats : public SpecificStats {
           seenInvalidated(0),
           keysExamined(0) {}
 
-    virtual ~IndexScanStats() {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         IndexScanStats* specific = new IndexScanStats(*this);
         // BSON objects have to be explicitly copied.
         specific->keyPattern = keyPattern.getOwned();
@@ -412,7 +408,7 @@ struct IndexScanStats : public SpecificStats {
 struct LimitStats : public SpecificStats {
     LimitStats() : limit(0) {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         LimitStats* specific = new LimitStats(*this);
         return specific;
     }
@@ -423,7 +419,7 @@ struct LimitStats : public SpecificStats {
 struct MockStats : public SpecificStats {
     MockStats() {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         return new MockStats(*this);
     }
 };
@@ -431,7 +427,7 @@ struct MockStats : public SpecificStats {
 struct MultiPlanStats : public SpecificStats {
     MultiPlanStats() {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         return new MultiPlanStats(*this);
     }
 };
@@ -439,9 +435,7 @@ struct MultiPlanStats : public SpecificStats {
 struct OrStats : public SpecificStats {
     OrStats() : dupsTested(0), dupsDropped(0), locsForgotten(0) {}
 
-    virtual ~OrStats() {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         OrStats* specific = new OrStats(*this);
         return specific;
     }
@@ -456,7 +450,7 @@ struct OrStats : public SpecificStats {
 struct ProjectionStats : public SpecificStats {
     ProjectionStats() {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         ProjectionStats* specific = new ProjectionStats(*this);
         return specific;
     }
@@ -468,9 +462,7 @@ struct ProjectionStats : public SpecificStats {
 struct SortStats : public SpecificStats {
     SortStats() : forcedFetches(0), memUsage(0), memLimit(0) {}
 
-    virtual ~SortStats() {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         SortStats* specific = new SortStats(*this);
         return specific;
     }
@@ -494,9 +486,7 @@ struct SortStats : public SpecificStats {
 struct MergeSortStats : public SpecificStats {
     MergeSortStats() : dupsTested(0), dupsDropped(0), forcedFetches(0) {}
 
-    virtual ~MergeSortStats() {}
-
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         MergeSortStats* specific = new MergeSortStats(*this);
         return specific;
     }
@@ -514,7 +504,7 @@ struct MergeSortStats : public SpecificStats {
 struct ShardingFilterStats : public SpecificStats {
     ShardingFilterStats() : chunkSkips(0) {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         ShardingFilterStats* specific = new ShardingFilterStats(*this);
         return specific;
     }
@@ -525,7 +515,7 @@ struct ShardingFilterStats : public SpecificStats {
 struct SkipStats : public SpecificStats {
     SkipStats() : skip(0) {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         SkipStats* specific = new SkipStats(*this);
         return specific;
     }
@@ -534,46 +524,25 @@ struct SkipStats : public SpecificStats {
 };
 
 struct IntervalStats {
-    IntervalStats()
-        : numResultsFound(0),
-          numResultsBuffered(0),
-          minDistanceAllowed(-1),
-          maxDistanceAllowed(-1),
-          inclusiveMaxDistanceAllowed(false),
-          minDistanceFound(-1),
-          maxDistanceFound(-1),
-          minDistanceBuffered(-1),
-          maxDistanceBuffered(-1) {}
+    // Number of results found in the covering of this interval.
+    long long numResultsBuffered = 0;
+    // Number of documents in this interval returned to the parent stage.
+    long long numResultsReturned = 0;
 
-    long long numResultsFound;
-    long long numResultsBuffered;
-
-    double minDistanceAllowed;
-    double maxDistanceAllowed;
-    bool inclusiveMaxDistanceAllowed;
-
-    double minDistanceFound;
-    double maxDistanceFound;
-    double minDistanceBuffered;
-    double maxDistanceBuffered;
+    // Min distance of this interval - always inclusive.
+    double minDistanceAllowed = -1;
+    // Max distance of this interval - inclusive iff inclusiveMaxDistanceAllowed.
+    double maxDistanceAllowed = -1;
+    // True only in the last interval.
+    bool inclusiveMaxDistanceAllowed = false;
 };
 
 class NearStats : public SpecificStats {
 public:
     NearStats() {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         return new NearStats(*this);
-    }
-
-    long long totalResultsFound() {
-        long long totalResultsFound = 0;
-        for (std::vector<IntervalStats>::iterator it = intervalStats.begin();
-             it != intervalStats.end();
-             ++it) {
-            totalResultsFound += it->numResultsFound;
-        }
-        return totalResultsFound;
     }
 
     std::vector<IntervalStats> intervalStats;
@@ -591,7 +560,7 @@ struct UpdateStats : public SpecificStats {
           inserted(false),
           nInvalidateSkips(0) {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         return new UpdateStats(*this);
     }
 
@@ -629,7 +598,7 @@ struct UpdateStats : public SpecificStats {
 struct TextStats : public SpecificStats {
     TextStats() : parsedTextQuery() {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         TextStats* specific = new TextStats(*this);
         return specific;
     }
@@ -646,7 +615,7 @@ struct TextStats : public SpecificStats {
 struct TextMatchStats : public SpecificStats {
     TextMatchStats() : docsRejected(0) {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         TextMatchStats* specific = new TextMatchStats(*this);
         return specific;
     }
@@ -657,7 +626,7 @@ struct TextMatchStats : public SpecificStats {
 struct TextOrStats : public SpecificStats {
     TextOrStats() : fetches(0) {}
 
-    virtual SpecificStats* clone() const {
+    SpecificStats* clone() const final {
         TextOrStats* specific = new TextOrStats(*this);
         return specific;
     }

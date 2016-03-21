@@ -35,6 +35,7 @@
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/repl/repl_client_info.h"
 
 namespace mongo {
 
@@ -67,10 +68,19 @@ long long deleteObjects(OperationContext* txn,
     ParsedDelete parsedDelete(txn, &request);
     uassertStatusOK(parsedDelete.parseRequest());
 
+    auto client = txn->getClient();
+    auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
+
     std::unique_ptr<PlanExecutor> exec =
         uassertStatusOK(getExecutorDelete(txn, collection, &parsedDelete));
 
     uassertStatusOK(exec->executePlan());
+
+    // No-ops need to reset lastOp in the client, for write concern.
+    if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
+        repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
+    }
+
     return DeleteStage::getNumDeleted(*exec);
 }
 

@@ -42,14 +42,15 @@ namespace repl {
 
 class SyncSourceFeedback {
 public:
-    SyncSourceFeedback();
-    ~SyncSourceFeedback();
-
     /// Notifies the SyncSourceFeedbackThread to wake up and send an update upstream of slave
     /// replication progress.
     void forwardSlaveProgress();
 
-    /// Loops continuously until shutdown() is called, passing updates when they are present.
+    /**
+     * Loops continuously until shutdown() is called, passing updates when they are present. If no
+     * update occurs within the _keepAliveInterval, progress is forwarded to let the upstream node
+     * know that this node, along with the alive nodes chaining through it, are still alive.
+     */
     void run();
 
     /// Signals the run() method to terminate.
@@ -81,14 +82,16 @@ private:
     HostAndPort _syncTarget;
     // our connection to our sync target
     std::unique_ptr<DBClientConnection> _connection;
-    // protects cond, _shutdownSignaled, and _positionChanged.
+    // protects cond, _shutdownSignaled, _keepAliveInterval, and _positionChanged.
     stdx::mutex _mtx;
     // used to alert our thread of changes which need to be passed up the chain
     stdx::condition_variable _cond;
+    /// _keepAliveInterval indicates how frequently to forward progress in the absence of updates.
+    Milliseconds _keepAliveInterval = Milliseconds(100);
     // used to indicate a position change which has not yet been pushed along
-    bool _positionChanged;
+    bool _positionChanged = false;
     // Once this is set to true the _run method will terminate
-    bool _shutdownSignaled;
+    bool _shutdownSignaled = false;
 };
 }  // namespace repl
 }  // namespace mongo

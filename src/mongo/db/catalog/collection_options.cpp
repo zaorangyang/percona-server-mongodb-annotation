@@ -49,6 +49,45 @@ bool CollectionOptions::validMaxCappedDocs(long long* max) {
     return false;
 }
 
+namespace {
+
+Status checkStorageEngineOptions(const BSONElement& elem) {
+    invariant(elem.fieldNameStringData() == "storageEngine");
+
+    // Storage engine-specific collection options.
+    // "storageEngine" field must be of type "document".
+    // Every field inside "storageEngine" has to be a document.
+    // Format:
+    // {
+    //     ...
+    //     storageEngine: {
+    //         storageEngine1: {
+    //             ...
+    //         },
+    //         storageEngine2: {
+    //             ...
+    //         }
+    //     },
+    //     ...
+    // }
+    if (elem.type() != mongo::Object) {
+        return {ErrorCodes::BadValue, "'storageEngine' has to be a document."};
+    }
+
+    BSONForEach(storageEngineElement, elem.Obj()) {
+        StringData storageEngineName = storageEngineElement.fieldNameStringData();
+        if (storageEngineElement.type() != mongo::Object) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << "'storageEngine." << storageEngineName
+                                  << "' has to be an embedded document."};
+        }
+    }
+
+    return Status::OK();
+}
+
+}  // namespace
+
 void CollectionOptions::reset() {
     capped = false;
     cappedSize = 0;
@@ -62,9 +101,10 @@ void CollectionOptions::reset() {
     flagsSet = false;
     temp = false;
     storageEngine = BSONObj();
+    indexOptionDefaults = BSONObj();
     validator = BSONObj();
     validationLevel = "";
-    validationState = "";
+    validationAction = "";
 }
 
 bool CollectionOptions::isValid() const {
@@ -127,48 +167,42 @@ Status CollectionOptions::parse(const BSONObj& options) {
         } else if (fieldName == "temp") {
             temp = e.trueValue();
         } else if (fieldName == "storageEngine") {
-            // Storage engine-specific collection options.
-            // "storageEngine" field must be of type "document".
-            // Every field inside "storageEngine" has to be a document.
-            // Format:
-            // {
-            //     ...
-            //     storageEngine: {
-            //         storageEngine1: {
-            //             ...
-            //         },
-            //         storageEngine2: {
-            //             ...
-            //         }
-            //     },
-            //     ...
-            // }
-            if (e.type() != mongo::Object) {
-                return Status(ErrorCodes::BadValue, "'storageEngine' has to be a document.");
+            Status status = checkStorageEngineOptions(e);
+            if (!status.isOK()) {
+                return status;
             }
-
-            BSONForEach(storageEngineElement, e.Obj()) {
-                StringData storageEngineName = storageEngineElement.fieldNameStringData();
-                if (storageEngineElement.type() != mongo::Object) {
-                    return Status(ErrorCodes::BadValue,
-                                  str::stream() << "'storageEngine." << storageEngineName
-                                                << "' has to be an embedded document.");
+            storageEngine = e.Obj().getOwned();
+        } else if (fieldName == "indexOptionDefaults") {
+            if (e.type() != mongo::Object) {
+                return {ErrorCodes::TypeMismatch, "'indexOptionDefaults' has to be a document."};
+            }
+            BSONForEach(option, e.Obj()) {
+                if (option.fieldNameStringData() == "storageEngine") {
+                    Status status = checkStorageEngineOptions(option);
+                    if (!status.isOK()) {
+                        return {status.code(),
+                                str::stream() << "In indexOptionDefaults: " << status.reason()};
+                    }
+                } else {
+                    // Return an error on first unrecognized field.
+                    return {ErrorCodes::InvalidOptions,
+                            str::stream() << "indexOptionDefaults." << option.fieldNameStringData()
+                                          << " is not a supported option."};
                 }
             }
-
-            storageEngine = e.Obj().getOwned();
+            indexOptionDefaults = e.Obj().getOwned();
         } else if (fieldName == "validator") {
             if (e.type() != mongo::Object) {
                 return Status(ErrorCodes::BadValue, "'validator' has to be a document.");
             }
 
             validator = e.Obj().getOwned();
-        } else if (fieldName == "validationState") {
+        } else if (fieldName == "validationAction") {
             if (e.type() != mongo::String) {
-                return Status(ErrorCodes::BadValue, "'validationState' has to be a string.");
+                return Status(ErrorCodes::BadValue, "'validationAction' has to be a string.");
             }
 
-            validationState = e.String();
+            validationAction = e.String();
         } else if (fieldName == "validationLevel") {
             if (e.type() != mongo::String) {
                 return Status(ErrorCodes::BadValue, "'validationLevel' has to be a string.");
@@ -209,6 +243,10 @@ BSONObj CollectionOptions::toBSON() const {
         b.append("storageEngine", storageEngine);
     }
 
+    if (!indexOptionDefaults.isEmpty()) {
+        b.append("indexOptionDefaults", indexOptionDefaults);
+    }
+
     if (!validator.isEmpty()) {
         b.append("validator", validator);
     }
@@ -217,8 +255,8 @@ BSONObj CollectionOptions::toBSON() const {
         b.append("validationLevel", validationLevel);
     }
 
-    if (!validationState.empty()) {
-        b.append("validationState", validationState);
+    if (!validationAction.empty()) {
+        b.append("validationAction", validationAction);
     }
 
     return b.obj();

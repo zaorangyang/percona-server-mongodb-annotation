@@ -27,7 +27,6 @@
  *    then also delete it in the license file.
  */
 
-
 #pragma once
 
 #include "mongo/db/dbmessage.h"
@@ -36,6 +35,7 @@
 namespace mongo {
 
 class Client;
+class OperationContext;
 
 class Request {
     MONGO_DISALLOW_COPYING(Request);
@@ -73,7 +73,7 @@ public:
         return _p;
     }
 
-    void process(int attempt = 0);
+    void process(OperationContext* txn, int attempt = 0);
 
     void init();
 

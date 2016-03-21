@@ -39,6 +39,7 @@
 namespace mongo {
 
 class DBClientCursorHolder;
+class OperationContext;
 class StaleConfigException;
 class ParallelConnectionMetadata;
 
@@ -150,7 +151,7 @@ public:
     std::string getNS();
 
     /** call before using */
-    void init();
+    void init(OperationContext* txn);
 
     bool more();
     BSONObj next();
@@ -158,9 +159,9 @@ public:
         return "ParallelSort";
     }
 
-    void fullInit();
-    void startInit();
-    void finishInit();
+    void fullInit(OperationContext* txn);
+    void startInit(OperationContext* txn);
+    void finishInit(OperationContext* txn);
 
     bool isCommand() {
         return NamespaceString(_qSpec.ns()).isCommand();
@@ -217,7 +218,10 @@ private:
                       const StaleConfigException& e,
                       bool& forceReload,
                       bool& fullReload);
-    void _handleStaleNS(const NamespaceString& staleNS, bool forceReload, bool fullReload);
+    void _handleStaleNS(OperationContext* txn,
+                        const NamespaceString& staleNS,
+                        bool forceReload,
+                        bool fullReload);
 
     bool _didInit;
     bool _done;
@@ -227,7 +231,9 @@ private:
 
     // Count round-trips req'd for namespaces and total
     std::map<std::string, int> _staleNSMap;
+
     int _totalTries;
+    bool _cmChangeAttempted;
 
     std::map<ShardId, PCMData> _cursorMap;
 

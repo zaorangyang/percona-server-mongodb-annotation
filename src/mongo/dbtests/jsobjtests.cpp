@@ -41,6 +41,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/storage/mmap_v1/btree/key.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/platform/decimal128.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/embedded_builder.h"
 #include "mongo/util/log.h"
@@ -710,6 +711,9 @@ struct AppendNumber {
         b.appendNumber("c", (1024LL * 1024 * 1024) - 1);
         b.appendNumber("d", (1024LL * 1024 * 1024 * 1024) - 1);
         b.appendNumber("e", 1024LL * 1024 * 1024 * 1024 * 1024 * 1024);
+        if (Decimal128::enabled) {
+            b.appendNumber("f", mongo::Decimal128("1"));
+        }
 
         BSONObj o = b.obj();
         keyTest(o);
@@ -719,6 +723,10 @@ struct AppendNumber {
         ASSERT(o["c"].type() == NumberInt);
         ASSERT(o["d"].type() == NumberDouble);
         ASSERT(o["e"].type() == NumberLong);
+
+        if (Decimal128::enabled) {
+            ASSERT(o["f"].type() == NumberDecimal);
+        }
     }
 };
 
@@ -1619,6 +1627,11 @@ public:
         ASSERT_EQUALS(objTypeOf(1LL), NumberLong);
         ASSERT_EQUALS(arrTypeOf(1LL), NumberLong);
 
+        if (Decimal128::enabled) {
+            ASSERT_EQUALS(objTypeOf(mongo::Decimal128("1")), NumberDecimal);
+            ASSERT_EQUALS(arrTypeOf(mongo::Decimal128("1")), NumberDecimal);
+        }
+
         ASSERT_EQUALS(objTypeOf(MAXKEY), MaxKey);
         ASSERT_EQUALS(arrTypeOf(MAXKEY), MaxKey);
     }
@@ -1961,35 +1974,6 @@ struct ArrayMacroTest {
         ASSERT_EQUALS(arr, obj);
         ASSERT_EQUALS(arr["2"].type(), Object);
         ASSERT_EQUALS(arr["2"].embeddedObject()["foo"].type(), Array);
-    }
-};
-
-class NumberParsing {
-public:
-    void run() {
-        BSONObjBuilder a;
-        BSONObjBuilder b;
-
-        a.append("a", (int)1);
-        ASSERT(b.appendAsNumber("a", "1"));
-
-        a.append("b", 1.1);
-        ASSERT(b.appendAsNumber("b", "1.1"));
-
-        a.append("c", (int)-1);
-        ASSERT(b.appendAsNumber("c", "-1"));
-
-        a.append("d", -1.1);
-        ASSERT(b.appendAsNumber("d", "-1.1"));
-
-        a.append("e", (long long)32131231231232313LL);
-        ASSERT(b.appendAsNumber("e", "32131231231232313"));
-
-        ASSERT(!b.appendAsNumber("f", "zz"));
-        ASSERT(!b.appendAsNumber("f", "5zz"));
-        ASSERT(!b.appendAsNumber("f", "zz5"));
-
-        ASSERT_EQUALS(a.obj(), b.obj());
     }
 };
 
@@ -2412,7 +2396,6 @@ public:
         add<NestedDottedConversions>();
         add<BSONArrayBuilderTest>();
         add<ArrayMacroTest>();
-        add<NumberParsing>();
         add<bson2settest>();
         add<BSONArrayIteratorSorted>();
         add<checkForStorageTests>();

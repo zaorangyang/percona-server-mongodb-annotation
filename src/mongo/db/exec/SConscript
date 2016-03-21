@@ -9,7 +9,7 @@ env.Library(
         "working_set.cpp",
     ],
     LIBDEPS = [
-        "$BUILD_DIR/mongo/bson/bson",
+        "$BUILD_DIR/mongo/base",
     ],
 )
 
@@ -29,6 +29,7 @@ env.Library(
         "scoped_timer.cpp",
     ],
     LIBDEPS = [
+        '$BUILD_DIR/mongo/util/net/network',
     ],
 )
 
@@ -65,6 +66,7 @@ env.Library(
         "shard_filter.cpp",
         "skip.cpp",
         "sort.cpp",
+        "sort_key_generator.cpp",
         "stagedebug_cmd.cpp",
         "subplan.cpp",
         "text.cpp",
@@ -75,7 +77,9 @@ env.Library(
     ],
     LIBDEPS = [
         "scoped_timer",
-        "$BUILD_DIR/mongo/bson/bson",
+        "working_set",
+        "$BUILD_DIR/mongo/base",
+        '$BUILD_DIR/third_party/s2/s2',
     ],
 )
 

@@ -49,14 +49,17 @@ namespace mongo {
  * operates with RecordIds, we are unable to evaluate the AND for the invalidated RecordId, and it
  * must be fully matched later.
  */
-class AndHashStage : public PlanStage {
+class AndHashStage final : public PlanStage {
 public:
-    AndHashStage(WorkingSet* ws, const Collection* collection);
+    AndHashStage(OperationContext* opCtx, WorkingSet* ws, const Collection* collection);
 
     /**
      * For testing only. Allows tests to set memory usage threshold.
      */
-    AndHashStage(WorkingSet* ws, const Collection* collection, size_t maxMemUsage);
+    AndHashStage(OperationContext* opCtx,
+                 WorkingSet* ws,
+                 const Collection* collection,
+                 size_t maxMemUsage);
 
     void addChild(PlanStage* child);
 
@@ -66,18 +69,18 @@ public:
      */
     size_t getMemUsage() const;
 
-    virtual StageState work(WorkingSetID* out);
-    virtual bool isEOF();
+    StageState work(WorkingSetID* out) final;
+    bool isEOF() final;
 
-    virtual void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_AND_HASH;
     }
 
-    virtual std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 

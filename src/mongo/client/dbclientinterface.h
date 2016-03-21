@@ -45,6 +45,10 @@
 
 namespace mongo {
 
+namespace executor {
+struct RemoteCommandResponse;
+}
+
 /** the query field 'options' can have these bits set: */
 enum QueryOptions {
     /** Tailable means cursor is not closed when the last data is retrieved.  rather, the cursor
@@ -402,7 +406,6 @@ public:
                       bool assertOk = true,
                       std::string* actualServer = 0) = 0;
     virtual void say(Message& toSend, bool isRetry = false, std::string* actualServer = 0) = 0;
-    virtual void sayPiggyBack(Message& toSend) = 0;
     /* used by QueryOption_Exhaust.  To use that your subclass must implement this. */
     virtual bool recv(Message& m) {
         verify(false);
@@ -569,6 +572,13 @@ public:
                             const BSONObj& cmd,
                             BSONObj& info,
                             int options = 0);
+
+    /**
+    * Authenticates to another cluster member using appropriate authentication data.
+    * Uses getInternalUserAuthParams() to retrive authentication parameters.
+    * @return true if the authentication was succesful
+    */
+    bool authenticateInternalUser();
 
     /**
      * Authenticate a user.
@@ -922,24 +932,6 @@ protected:
 
     virtual void _auth(const BSONObj& params);
 
-    /**
-     * Use the MONGODB-CR protocol to authenticate as "username" against the database "dbname",
-     * with the given password.  If digestPassword is false, the password is assumed to be
-     * pre-digested.  Returns false on failure, and sets "errmsg".
-     */
-    bool _authMongoCR(const std::string& dbname,
-                      const std::string& username,
-                      const std::string& pwd,
-                      BSONObj* info,
-                      bool digestPassword);
-
-    /**
-     * Use the MONGODB-X509 protocol to authenticate as "username. The certificate details
-     * has already been communicated automatically as part of the connect call.
-     * Returns false on failure and set "errmsg".
-     */
-    bool _authX509(const std::string& dbname, const std::string& username, BSONObj* info);
-
     // should be set by subclasses during connection.
     void _setServerRPCProtocols(rpc::ProtocolSet serverProtocols);
 
@@ -1085,7 +1077,7 @@ public:
      */
     virtual bool isStillConnected() = 0;
 
-    virtual void killCursor(long long cursorID) = 0;
+    virtual void killCursor(long long cursorID);
 
     virtual bool callRead(Message& toSend, Message& response) = 0;
 
@@ -1115,11 +1107,22 @@ public:
     using DBClientBase::query;
 
     /**
+     * A hook used to validate the reply of an 'isMaster' command during connection. If the hook
+     * returns a non-OK Status, the DBClientConnection object will disconnect from the remote
+     * server. This function must not throw - it can only indicate failure by returning a non-OK
+     * status.
+     */
+    using HandshakeValidationHook =
+        stdx::function<Status(const executor::RemoteCommandResponse& isMasterReply)>;
+
+    /**
        @param _autoReconnect if true, automatically reconnect on a connection failure
        @param timeout tcp timeout in seconds - this is for read/write, not connect.
        Connect timeout is fixed, but short, at 5 seconds.
      */
-    DBClientConnection(bool _autoReconnect = false, double so_timeout = 0);
+    DBClientConnection(bool _autoReconnect = false,
+                       double so_timeout = 0,
+                       const HandshakeValidationHook& hook = HandshakeValidationHook());
 
     virtual ~DBClientConnection() {
         _numConnections.fetchAndAdd(-1);
@@ -1139,9 +1142,12 @@ public:
 
     /**
      * Semantically equivalent to the previous connect method, but returns a Status
-     * instead of taking an errmsg out parameter.
+     * instead of taking an errmsg out parameter. Also allows optional validation of the reply to
+     * the 'isMaster' command executed during connection.
      *
      * @param server The server to connect to.
+     * @param a hook to validate the 'isMaster' reply received during connection. If the hook
+     * fails, the connection will be terminated and a non-OK status will be returned.
      */
     Status connect(const HostAndPort& server);
 
@@ -1230,7 +1236,6 @@ public:
         return _serverAddress;
     }
 
-    virtual void killCursor(long long cursorID);
     virtual bool callRead(Message& toSend, Message& response) {
         return call(toSend, response);
     }
@@ -1266,19 +1271,11 @@ public:
      */
     void setParentReplSetName(const std::string& replSetName);
 
-    static void setLazyKillCursor(bool lazy) {
-        _lazyKillCursor = lazy;
-    }
-    static bool getLazyKillCursor() {
-        return _lazyKillCursor;
-    }
-
     uint64_t getSockCreationMicroSec() const;
 
 protected:
     friend class SyncClusterConnection;
     virtual void _auth(const BSONObj& params);
-    virtual void sayPiggyBack(Message& toSend);
 
     std::unique_ptr<MessagingPort> _port;
 
@@ -1301,7 +1298,6 @@ protected:
     double _so_timeout;
 
     static AtomicInt32 _numConnections;
-    static bool _lazyKillCursor;  // lazy means we piggy back kill cursors on next op
 
 private:
     /**
@@ -1314,6 +1310,9 @@ private:
     // Contains the string for the replica set name of the host this is connected to.
     // Should be empty if this connection is not pointing to a replica set member.
     std::string _parentReplSetName;
+
+    // Hook ran on every call to connect()
+    HandshakeValidationHook _hook;
 };
 
 BSONElement getErrField(const BSONObj& result);

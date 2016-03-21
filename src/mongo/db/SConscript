@@ -42,7 +42,7 @@ env.Library(
         'write_concern_options.cpp'
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/bson/bson',
+        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/index_names',
         '$BUILD_DIR/mongo/util/foundation',
     ]
@@ -91,14 +91,23 @@ env.CppUnitTest(
     ],
 )
 
+env.Library(
+    target="dbmessage",
+    source=[
+        "dbmessage.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/util/net/network',
+    ]
+)
+
 env.CppUnitTest(
     target="dbmessage_test",
     source=[
         "dbmessage_test.cpp"
     ],
     LIBDEPS=[
-        "common",
-        "$BUILD_DIR/mongo/client/clientdriver",
+        "dbmessage",
     ],
 )
 env.CppUnitTest('record_id_test', 'record_id_test.cpp', LIBDEPS=[])
@@ -109,6 +118,7 @@ env.Library(
         'startup_warnings_common.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ]
 )
 
@@ -163,6 +173,9 @@ env.Library(
     source=[
         "index_names.cpp",
     ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
 )
 
 env.Library(
@@ -170,6 +183,11 @@ env.Library(
     source=[
         "hasher.cpp",
     ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/foundation',
+        '$BUILD_DIR/mongo/util/md5',
+    ]
 )
 
 # Range arithmetic library, used by both mongod and mongos
@@ -179,7 +197,7 @@ env.Library(
         'range_arithmetic.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/bson/bson',
+        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/util/foundation',
     ],
 )
@@ -199,6 +217,9 @@ env.Library(
     source=[
         'global_timestamp.cpp',
     ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
 )
 
 env.Library(
@@ -227,7 +248,7 @@ env.Library(
         "server_parameters.cpp",
     ],
     LIBDEPS=[
-        "$BUILD_DIR/mongo/bson/bson",
+        "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/util/foundation",
     ],
 )
@@ -259,7 +280,7 @@ env.CppUnitTest(
         'update_index_data_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/bson/bson',
+        '$BUILD_DIR/mongo/base',
         'common',
         'update_index_data',
     ],
@@ -275,7 +296,7 @@ env.Library(
         "server_options.cpp",
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/bson/bson',
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -285,7 +306,7 @@ env.Library(
         "server_options_helpers.cpp",
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/bson/bson',
+        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
         # The dependency on network is a temporary crutch that should go away once the
         # networking library has separate options
@@ -313,8 +334,8 @@ env.Library(
         'range_deleter_mock_env.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base/base',
-        '$BUILD_DIR/mongo/bson/bson',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/util/concurrency/synchronization',
@@ -344,9 +365,15 @@ env.Library(
         "server_extra_log_context.cpp",
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/client/clientdriver",
+        "$BUILD_DIR/mongo/rpc/command_reply",
+        "$BUILD_DIR/mongo/rpc/command_request",
+        "$BUILD_DIR/mongo/rpc/metadata",
         "$BUILD_DIR/mongo/util/net/message_server_port",
         "$BUILD_DIR/mongo/util/net/miniwebserver",
+        "$BUILD_DIR/mongo/util/processinfo",
         "$BUILD_DIR/mongo/util/signal_handlers",
+        "auth/authorization_manager_global",
     ],
 )
 
@@ -499,14 +526,13 @@ serverOnlyFiles = [
     "commands/geo_near_cmd.cpp",
     "commands/get_last_error.cpp",
     "commands/getmore_cmd.cpp",
-    "commands/group.cpp",
+    "commands/group_cmd.cpp",
     "commands/index_filter_commands.cpp",
     "commands/kill_op.cpp",
     "commands/killcursors_cmd.cpp",
     "commands/list_collections.cpp",
     "commands/list_databases.cpp",
     "commands/list_indexes.cpp",
-    "commands/merge_chunks_cmd.cpp",
     "commands/mr.cpp",
     "commands/oplog_note.cpp",
     "commands/parallel_collection_scan.cpp",
@@ -597,7 +623,6 @@ serveronlyEnv.InjectThirdPartyIncludePaths(libraries=['snappy'])
 serveronlyLibdeps = [
     "$BUILD_DIR/mongo/client/parallel",
     "$BUILD_DIR/mongo/executor/network_interface_factory",
-    "$BUILD_DIR/mongo/s/batch_write_types",
     "$BUILD_DIR/mongo/s/catalog/legacy/catalog_manager_legacy",
     "$BUILD_DIR/mongo/s/catalog/replset/catalog_manager_replica_set",
     "$BUILD_DIR/mongo/s/client/sharding_connection_hook",
@@ -610,6 +635,7 @@ serveronlyLibdeps = [
     "auth/authmongod",
     "catalog/collection_options",
     "catalog/index_key_validate",
+    "commands/killcursors_common",
     "common",
     "concurrency/lock_manager",
     "concurrency/write_conflict_exception",
@@ -628,13 +654,12 @@ serveronlyLibdeps = [
     "repl/repl_coordinator_global",
     "repl/repl_coordinator_impl",
     "repl/repl_settings",
-    "repl/replication_executor",
-    "repl/replication_executor",
     "repl/replset_commands",
     "repl/rs_rollback",
     "repl/rslog",
     "repl/sync_tail",
     "repl/topology_coordinator_impl",
+    "s/commands",
     "s/metadata",
     "s/sharding",
     "startup_warnings_mongod",
@@ -664,7 +689,11 @@ env.Library(
     source=[
         'log_process_details.cpp',
     ],
-    LIBDEPS=[],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/net/network',
+        'server_options',
+    ],
 )
 
 env.Library(
@@ -673,5 +702,9 @@ env.Library(
         'conn_pool_options.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/db/server_parameters',
+        '$BUILD_DIR/mongo/s/client/sharding_client',
     ],
 )

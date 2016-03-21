@@ -28,14 +28,15 @@
 
 #pragma once
 
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
-#include "mongo/db/repl/replication_executor.h"
 #include "mongo/executor/network_interface_mock.h"
-#include "mongo/stdx/thread.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/future.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -129,16 +130,22 @@ public:
             std::move(future), _executor, _mockNetwork};
     }
 
-
     using OnCommandFunction = stdx::function<StatusWith<BSONObj>(const RemoteCommandRequest&)>;
+    using OnCommandWithMetadataFunction =
+        stdx::function<StatusWith<RemoteCommandResponse>(const RemoteCommandRequest&)>;
 
     using OnFindCommandFunction =
         stdx::function<StatusWith<std::vector<BSONObj>>(const RemoteCommandRequest&)>;
+    // Function that accepts a find request and returns a tuple of resulting documents and response
+    // metadata.
+    using OnFindCommandWithMetadataFunction =
+        stdx::function<StatusWith<std::tuple<std::vector<BSONObj>, BSONObj>>(
+            const RemoteCommandRequest&)>;
 
     /**
      * Create a new environment based on the given network.
      */
-    NetworkTestEnv(repl::ReplicationExecutor* executor, NetworkInterfaceMock* network);
+    NetworkTestEnv(TaskExecutor* executor, NetworkInterfaceMock* network);
 
     /**
      * Blocking methods, which receive one message from the network and respond using the
@@ -146,11 +153,13 @@ public:
      * single request + response or find tests.
      */
     void onCommand(OnCommandFunction func);
+    void onCommandWithMetadata(OnCommandWithMetadataFunction func);
     void onFindCommand(OnFindCommandFunction func);
+    void onFindWithMetadataCommand(OnFindCommandWithMetadataFunction func);
 
 private:
     // Task executor used for running asynchronous operations.
-    repl::ReplicationExecutor* _executor;
+    TaskExecutor* _executor;
 
     // Mocked out network under the task executor.
     NetworkInterfaceMock* _mockNetwork;

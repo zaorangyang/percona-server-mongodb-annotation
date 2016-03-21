@@ -49,8 +49,26 @@ namespace mongo {
  *
  * Owns the query solutions and PlanStage roots for all candidate plans.
  */
-class MultiPlanStage : public PlanStage {
+class MultiPlanStage final : public PlanStage {
 public:
+    /**
+     * Callers use this to specify how the MultiPlanStage should interact with the plan cache.
+     */
+    enum class CachingMode {
+        // Always write a cache entry for the winning plan to the plan cache, overwriting any
+        // previously existing cache entry for the query shape.
+        AlwaysCache,
+
+        // Write a cache entry for the query shape *unless* we encounter one of the following edge
+        // cases:
+        //  - Two or more plans tied for the win.
+        //  - The winning plan returned zero query results during the plan ranking trial period.
+        SometimesCache,
+
+        // Do not write to the plan cache.
+        NeverCache,
+    };
+
     /**
      * Takes no ownership.
      *
@@ -60,24 +78,22 @@ public:
     MultiPlanStage(OperationContext* txn,
                    const Collection* collection,
                    CanonicalQuery* cq,
-                   bool shouldCache = true);
+                   CachingMode cachingMode = CachingMode::AlwaysCache);
 
-    virtual bool isEOF();
+    bool isEOF() final;
 
-    virtual StageState work(WorkingSetID* out);
+    StageState work(WorkingSetID* out) final;
 
-    virtual void doReattachToOperationContext(OperationContext* opCtx);
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
-    virtual void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_MULTI_PLAN;
     }
 
-    virtual std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
 
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     /**
      * Takes ownership of QuerySolution and PlanStage. not of WorkingSet
@@ -167,14 +183,11 @@ private:
 
     static const int kNoSuchPlan = -1;
 
-    // Not owned here.
-    OperationContext* _txn;
-
     // Not owned here. Must be non-null.
     const Collection* _collection;
 
-    // Whether or not we should try to cache the winning plan in the plan cache.
-    const bool _shouldCache;
+    // Describes the cases in which we should write an entry for the winning plan to the plan cache.
+    const CachingMode _cachingMode;
 
     // The query that we're trying to figure out the best solution to.
     // not owned here

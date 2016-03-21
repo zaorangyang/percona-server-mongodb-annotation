@@ -58,7 +58,7 @@ void LegacyDistLockManager::startUp() {
     _pinger = stdx::make_unique<LegacyDistLockPinger>();
 }
 
-void LegacyDistLockManager::shutDown() {
+void LegacyDistLockManager::shutDown(bool allowNetworking) {
     stdx::unique_lock<stdx::mutex> sl(_mutex);
     _isStopped = true;
 
@@ -67,7 +67,7 @@ void LegacyDistLockManager::shutDown() {
     }
 
     if (_pinger) {
-        _pinger->shutdown();
+        _pinger->shutdown(allowNetworking);
     }
 }
 
@@ -99,8 +99,8 @@ StatusWith<DistLockManager::ScopedDistLock> LegacyDistLockManager::lock(
         bool acquired = false;
         BSONObj lockDoc;
         try {
-            acquired =
-                distLock->lock_try(whyMessage.toString(), &lockDoc, kDefaultSocketTimeout.count());
+            acquired = distLock->lock_try(
+                whyMessage.toString(), &lockDoc, durationCount<Seconds>(kDefaultSocketTimeout));
 
             if (!acquired) {
                 lastStatus = Status(ErrorCodes::LockBusy,
@@ -204,7 +204,7 @@ Status LegacyDistLockManager::checkStatus(const DistLockHandle& lockHandle) {
         distLock = iter->second.get();
     }
 
-    return distLock->checkStatus(kDefaultSocketTimeout.count());
+    return distLock->checkStatus(durationCount<Seconds>(kDefaultSocketTimeout));
 }
 
 void LegacyDistLockManager::enablePinger(bool enable) {

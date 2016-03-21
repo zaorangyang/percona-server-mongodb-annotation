@@ -83,7 +83,9 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/s/operation_shard_version.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/request_interface.h"
 #include "mongo/rpc/reply_builder_interface.h"
@@ -105,6 +107,17 @@ using std::ostringstream;
 using std::string;
 using std::stringstream;
 using std::unique_ptr;
+
+// This is a special flag that allows for testing of snapshot behavior by skipping the replication
+// related checks and isolating the storage/query side of snapshotting.
+bool testingSnapshotBehaviorInIsolation = false;
+ExportedServerParameter<bool> TestingSnapshotBehaviorInIsolation(
+    ServerParameterSet::getGlobal(),
+    "testingSnapshotBehaviorInIsolation",
+    &testingSnapshotBehaviorInIsolation,
+    true,
+    false);
+
 
 class CmdShutdownMongoD : public CmdShutdown {
 public:
@@ -508,6 +521,12 @@ public:
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
+        if (cmdObj.hasField("autoIndexId")) {
+            const char* deprecationWarning =
+                "the autoIndexId option is deprecated and will be removed in a future release";
+            warning() << deprecationWarning;
+            result.append("note", deprecationWarning);
+        }
         return appendCommandStatus(result, createCollection(txn, dbname, cmdObj));
     }
 } cmdCreate;
@@ -577,7 +596,8 @@ public:
         BSONObj sort = BSON("files_id" << 1 << "n" << 1);
 
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            auto statusWithCQ = CanonicalQuery::canonicalize(ns, query, sort, BSONObj());
+            auto statusWithCQ =
+                CanonicalQuery::canonicalize(NamespaceString(ns), query, sort, BSONObj());
             if (!statusWithCQ.isOK()) {
                 uasserted(17240, "Can't canonicalize query " + query.toString());
                 return 0;
@@ -746,7 +766,7 @@ public:
                 result.append("millis", timer.millis());
                 return 1;
             }
-            exec = InternalPlanner::collectionScan(txn, ns, collection);
+            exec = InternalPlanner::collectionScan(txn, ns, collection, PlanExecutor::YIELD_MANUAL);
         } else if (min.isEmpty() || max.isEmpty()) {
             errmsg = "only one of min or max specified";
             return false;
@@ -770,7 +790,13 @@ public:
             min = Helpers::toKeyFormat(kp.extendRangeBound(min, false));
             max = Helpers::toKeyFormat(kp.extendRangeBound(max, false));
 
-            exec = InternalPlanner::indexScan(txn, collection, idx, min, max, false);
+            exec = InternalPlanner::indexScan(txn,
+                                              collection,
+                                              idx,
+                                              min,
+                                              max,
+                                              false,  // endKeyInclusive
+                                              PlanExecutor::YIELD_MANUAL);
         }
 
         long long avgObjSize = collection->dataSize(txn) / collection->numRecords(txn);
@@ -1225,6 +1251,9 @@ void Command::execCommand(OperationContext* txn,
 
         CurOp::get(txn)->setMaxTimeMicros(static_cast<unsigned long long>(maxTimeMS) * 1000);
 
+        // Handle shard version that may have been sent along with the command.
+        OperationShardVersion::get(txn).initializeFromCommand(request.getCommandArgs());
+
         // Can throw
         txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
@@ -1257,9 +1286,9 @@ bool Command::run(OperationContext* txn,
 
     repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
 
+    repl::ReadConcernArgs readConcern;
     {
         // parse and validate ReadConcernArgs
-        repl::ReadConcernArgs readConcern;
         auto readConcernParseStatus = readConcern.initialize(request.getCommandArgs());
         if (!readConcernParseStatus.isOK()) {
             replyBuilder->setMetadata(rpc::makeEmptyMetadata())
@@ -1271,8 +1300,7 @@ bool Command::run(OperationContext* txn,
             // Only return an error if a non-nullish readConcern was parsed, but do not process
             // readConcern regardless.
             if (!readConcern.getOpTime().isNull() ||
-                readConcern.getLevel() !=
-                    repl::ReadConcernArgs::ReadConcernLevel::kLocalReadConcern) {
+                readConcern.getLevel() != repl::ReadConcernLevel::kLocalReadConcern) {
                 replyBuilder->setMetadata(rpc::makeEmptyMetadata())
                     .setCommandReply({ErrorCodes::InvalidOptions,
                                       str::stream()
@@ -1281,36 +1309,34 @@ bool Command::run(OperationContext* txn,
                 return false;
             }
         } else {
-            if (readConcern.getLevel() ==
-                repl::ReadConcernArgs::ReadConcernLevel::kMajorityReadConcern) {
-                // wait for a committed snapshot to exist
+            // Skip waiting for the OpTime when testing snapshot behavior.
+            if (!testingSnapshotBehaviorInIsolation) {
+                // Wait for readConcern to be satisfied.
+                auto readConcernResult = replCoord->waitUntilOpTime(txn, readConcern);
+                readConcernResult.appendInfo(&replyBuilderBob);
+                if (!readConcernResult.getStatus().isOK()) {
+                    replyBuilder->setMetadata(rpc::makeEmptyMetadata())
+                        .setCommandReply(readConcernResult.getStatus(), replyBuilderBob.done());
+                    return false;
+                }
+            }
+
+            if ((replCoord->getReplicationMode() ==
+                     repl::ReplicationCoordinator::Mode::modeReplSet ||
+                 testingSnapshotBehaviorInIsolation) &&
+                readConcern.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
                 Status status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+
+                // Wait until a snapshot is available.
                 while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
-                    WriteConcernOptions writeConcern;
-                    writeConcern.wMode = WriteConcernOptions::kMajority;
-                    // must be a non-null OpTime that is from before any write
-                    repl::ReplicationCoordinator::StatusAndDuration awaitStatus =
-                        replCoord->awaitReplication(
-                            txn, repl::OpTime(Timestamp(1, 0), -1), writeConcern);
-                    if (!awaitStatus.status.isOK()) {
-                        replyBuilder->setMetadata(rpc::makeEmptyMetadata()).setCommandReply(status);
-                        return false;
-                    }
+                    replCoord->waitForNewSnapshot(txn);
                     status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
                 }
+
                 if (!status.isOK()) {
                     replyBuilder->setMetadata(rpc::makeEmptyMetadata()).setCommandReply(status);
                     return false;
                 }
-            }  // end of readConcernMajority specific work
-
-            // wait for readConcern to be satisfied
-            auto readConcernResult = replCoord->waitUntilOpTime(txn, readConcern);
-            readConcernResult.appendInfo(&replyBuilderBob);
-            if (!readConcernResult.getStatus().isOK()) {
-                replyBuilder->setMetadata(rpc::makeEmptyMetadata())
-                    .setCommandReply(readConcernResult.getStatus(), replyBuilderBob.done());
-                return false;
             }
         }
     }
@@ -1328,20 +1354,19 @@ bool Command::run(OperationContext* txn,
 
     BSONObjBuilder metadataBob;
 
-    // For commands from mongos, append some info to help getLastError(w) work.
-    // TODO: refactor out of here as part of SERVER-18326
     bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+    if (isReplSet) {
+        repl::OpTime lastOpTimeFromClient =
+            repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
+        replCoord->prepareReplResponseMetadata(
+            request, lastOpTimeFromClient, readConcern, &metadataBob);
 
-    if (isReplSet && ShardingState::get(txn)->enabled()) {
-        rpc::ShardingMetadata(
-            repl::ReplClientInfo::forClient(txn->getClient()).getLastOp().getTimestamp(),
-            replCoord->getElectionId()).writeToMetadata(&metadataBob);
-    }
-
-    const auto& metadata = request.getMetadata();
-    if (isReplSet && metadata.hasField(rpc::kReplicationMetadataFieldName)) {
-        BSONObjBuilder replInfoBob(metadataBob.subobjStart(rpc::kReplicationMetadataFieldName));
-        replCoord->prepareReplResponseMetadata(&replInfoBob);
+        // For commands from mongos, append some info to help getLastError(w) work.
+        // TODO: refactor out of here as part of SERVER-18326
+        if (ShardingState::get(txn)->enabled()) {
+            rpc::ShardingMetadata(lastOpTimeFromClient.getTimestamp(), replCoord->getElectionId())
+                .writeToMetadata(&metadataBob);
+        }
     }
 
     auto cmdResponse = replyBuilderBob.done();

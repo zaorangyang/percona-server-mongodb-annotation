@@ -1,6 +1,5 @@
-// strategy.h
-/*
- *    Copyright (C) 2010 10gen Inc.
+/**
+ *    Copyright (C) 2010-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,35 +17,35 @@
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
-
 
 #pragma once
 
-#include "chunk.h"
-#include "request.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/request.h"
 
 namespace mongo {
 
-class BatchItemRef;
+class OperationContext;
 
 /**
  * Legacy interface for processing client read/write/cmd requests.
  */
 class Strategy {
 public:
-    static void queryOp(Request& r);
+    static void queryOp(OperationContext* txn, Request& r);
 
-    static void getMore(Request& r);
+    static void getMore(OperationContext* txn, Request& r);
 
-    static void writeOp(int op, Request& r);
+    static void writeOp(OperationContext* txn, int op, Request& r);
 
     struct CommandResult {
         ShardId shardTargetId;
@@ -63,26 +62,13 @@ public:
      * TODO: Replace these methods and all other methods of command dispatch with a more general
      * command op framework.
      */
-    static void commandOp(const std::string& db,
+    static void commandOp(OperationContext* txn,
+                          const std::string& db,
                           const BSONObj& command,
                           int options,
                           const std::string& versionedNS,
                           const BSONObj& targetingQuery,
                           std::vector<CommandResult>* results);
-
-    /**
-     * Executes a write command against a particular database, and targets the command based on
-     * a write operation.
-     *
-     * Does *not* retry or retarget if the metadata is stale.
-     *
-     * Similar to commandOp() above, but the targeting rules are different for writes than for
-     * reads.
-     */
-    static Status commandOpWrite(const std::string& db,
-                                 const BSONObj& command,
-                                 BatchItemRef targetingBatchItem,
-                                 std::vector<CommandResult>* results);
 
     /**
      * Some commands can only be run in a sharded configuration against a namespace that has
@@ -93,7 +79,8 @@ public:
      * On success, fills in 'shardResult' with output from the namespace's primary shard. This
      * output may itself indicate an error status on the shard.
      */
-    static Status commandOpUnsharded(const std::string& db,
+    static Status commandOpUnsharded(OperationContext* txn,
+                                     const std::string& db,
                                      const BSONObj& command,
                                      int options,
                                      const std::string& versionedNS,
@@ -104,9 +91,10 @@ public:
      *
      * DEPRECATED: should not be used by new code.
      */
-    static void clientCommandOp(Request& r);
+    static void clientCommandOp(OperationContext* txn, Request& r);
 
 protected:
-    static bool handleSpecialNamespaces(Request& r, QueryMessage& q);
+    static bool handleSpecialNamespaces(OperationContext* txn, Request& r, QueryMessage& q);
 };
-}
+
+}  // namespace mongo

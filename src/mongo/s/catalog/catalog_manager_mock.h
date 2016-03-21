@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/catalog_manager_common.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 
 namespace mongo {
@@ -36,16 +36,18 @@ namespace mongo {
 /**
  * A dummy implementation of CatalogManager for testing purposes.
  */
-class CatalogManagerMock : public CatalogManager {
+class CatalogManagerMock : public CatalogManagerCommon {
 public:
     CatalogManagerMock();
     ~CatalogManagerMock();
 
-    ConnectionString connectionString() const override;
+    ConfigServerMode getMode() override {
+        return ConfigServerMode::NONE;
+    }
 
     Status startup() override;
 
-    void shutDown() override;
+    void shutDown(bool allowNetworking) override;
 
     Status shardCollection(OperationContext* txn,
                            const std::string& ns,
@@ -64,14 +66,17 @@ public:
 
     Status updateDatabase(const std::string& dbName, const DatabaseType& db) override;
 
-    StatusWith<DatabaseType> getDatabase(const std::string& dbName) override;
+    StatusWith<OpTimePair<DatabaseType>> getDatabase(const std::string& dbName) override;
 
     Status updateCollection(const std::string& collNs, const CollectionType& coll) override;
 
-    StatusWith<CollectionType> getCollection(const std::string& collNs) override;
+    StatusWith<OpTimePair<CollectionType>> getCollection(const std::string& collNs) override;
 
     Status getCollections(const std::string* dbName,
-                          std::vector<CollectionType>* collections) override;
+                          std::vector<CollectionType>* collections,
+                          repl::OpTime* optime) override;
+
+    Status dropCollection(OperationContext* txn, const NamespaceString& ns) override;
 
     Status getDatabasesForShard(const std::string& shardName,
                                 std::vector<std::string>* dbs) override;
@@ -79,7 +84,8 @@ public:
     Status getChunks(const BSONObj& filter,
                      const BSONObj& sort,
                      boost::optional<int> limit,
-                     std::vector<ChunkType>* chunks) override;
+                     std::vector<ChunkType>* chunks,
+                     repl::OpTime* opTime) override;
 
     Status getTagsForCollection(const std::string& collectionNs,
                                 std::vector<TagsType>* tags) override;
@@ -94,9 +100,13 @@ public:
                                        const BSONObj& cmdObj,
                                        BSONObjBuilder* result) override;
 
-    bool runReadCommand(const std::string& dbname,
-                        const BSONObj& cmdObj,
-                        BSONObjBuilder* result) override;
+    virtual bool runReadCommand(const std::string& dbname,
+                                const BSONObj& cmdObj,
+                                BSONObjBuilder* result) override;
+
+    bool runUserManagementReadCommand(const std::string& dbname,
+                                      const BSONObj& cmdObj,
+                                      BSONObjBuilder* result) override;
 
     Status applyChunkOpsDeprecated(const BSONArray& updateOps,
                                    const BSONArray& preCondition) override;
@@ -113,14 +123,14 @@ public:
     void writeConfigServerDirect(const BatchedCommandRequest& request,
                                  BatchedCommandResponse* response) override;
 
-    DistLockManager* getDistLockManager() const override;
+    DistLockManager* getDistLockManager() override;
 
     Status checkAndUpgrade(bool checkOnly) override;
 
 private:
-    Status _checkDbDoesNotExist(const std::string& dbName, DatabaseType* db) const override;
+    Status _checkDbDoesNotExist(const std::string& dbName, DatabaseType* db) override;
 
-    StatusWith<std::string> _generateNewShardName() const override;
+    StatusWith<std::string> _generateNewShardName() override;
 
     std::unique_ptr<DistLockManagerMock> _mockDistLockMgr;
 };

@@ -57,11 +57,12 @@ class RecordID;
  */
 class TextMatchStage final : public PlanStage {
 public:
-    TextMatchStage(unique_ptr<PlanStage> child,
+    TextMatchStage(OperationContext* opCtx,
+                   unique_ptr<PlanStage> child,
                    const FTSQuery& query,
                    const FTSSpec& spec,
                    WorkingSet* ws);
-    ~TextMatchStage() final;
+    ~TextMatchStage();
 
     void addChild(PlanStage* child);
 

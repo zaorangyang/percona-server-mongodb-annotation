@@ -59,12 +59,11 @@ TextOrStage::TextOrStage(OperationContext* txn,
                          WorkingSet* ws,
                          const MatchExpression* filter,
                          IndexDescriptor* index)
-    : PlanStage(kStageType),
+    : PlanStage(kStageType, txn),
       _ftsSpec(ftsSpec),
       _ws(ws),
       _scoreIterator(_scores.end()),
       _filter(filter),
-      _txn(txn),
       _idRetrying(WorkingSet::INVALID_ID),
       _index(index) {}
 
@@ -91,16 +90,13 @@ void TextOrStage::doRestoreState() {
 }
 
 void TextOrStage::doDetachFromOperationContext() {
-    _txn = NULL;
     if (_recordCursor)
         _recordCursor->detachFromOperationContext();
 }
 
-void TextOrStage::doReattachToOperationContext(OperationContext* opCtx) {
-    invariant(_txn == NULL);
-    _txn = opCtx;
+void TextOrStage::doReattachToOperationContext() {
     if (_recordCursor)
-        _recordCursor->reattachToOperationContext(opCtx);
+        _recordCursor->reattachToOperationContext(getOpCtx());
 }
 
 void TextOrStage::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
@@ -186,7 +182,7 @@ PlanStage::StageState TextOrStage::work(WorkingSetID* out) {
 PlanStage::StageState TextOrStage::initStage(WorkingSetID* out) {
     *out = WorkingSet::INVALID_ID;
     try {
-        _recordCursor = _index->getCollection()->getCursor(_txn);
+        _recordCursor = _index->getCollection()->getCursor(getOpCtx());
         _internalState = State::kReadingTerms;
         return PlanStage::NEED_TIME;
     } catch (const WriteConflictException& wce) {
@@ -297,7 +293,7 @@ public:
         return getObj();
     }
 
-    virtual ElementIterator* allocateIterator(const ElementPath* path) const {
+    ElementIterator* allocateIterator(const ElementPath* path) const final {
         WorkingSetMember* member = _ws->get(_id);
         if (!member->hasObj()) {
             // Try to look in the key.
@@ -323,7 +319,7 @@ public:
         return new BSONElementIterator(path, getObj());
     }
 
-    virtual void releaseIterator(ElementIterator* iterator) const {
+    void releaseIterator(ElementIterator* iterator) const final {
         delete iterator;
     }
 
@@ -369,8 +365,12 @@ PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out)
             bool shouldKeep;
             bool wasDeleted = false;
             try {
-                TextMatchableDocument tdoc(
-                    _txn, newKeyData.indexKeyPattern, newKeyData.keyData, _ws, wsid, _recordCursor);
+                TextMatchableDocument tdoc(getOpCtx(),
+                                           newKeyData.indexKeyPattern,
+                                           newKeyData.keyData,
+                                           _ws,
+                                           wsid,
+                                           _recordCursor);
                 shouldKeep = _filter->matches(&tdoc);
             } catch (const WriteConflictException& wce) {
                 _idRetrying = wsid;

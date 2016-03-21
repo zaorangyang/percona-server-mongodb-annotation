@@ -39,7 +39,9 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/query/find_and_modify_request.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/s/catalog/type_lockpings.h"
 #include "mongo/s/catalog/type_locks.h"
@@ -50,12 +52,14 @@
 namespace mongo {
 
 using std::string;
+using std::vector;
 
 namespace {
 
 const char kCmdResponseWriteConcernField[] = "writeConcernError";
 const char kFindAndModifyResponseResultDocField[] = "value";
 const char kLocalTimeField[] = "localTime";
+const BSONObj kReplMetadata = BSON(rpc::kReplSetMetadataFieldName << 1);
 const ReadPreferenceSetting kReadPref(ReadPreference::PrimaryOnly, TagSet());
 
 /**
@@ -142,8 +146,11 @@ DistLockCatalogImpl::DistLockCatalogImpl(ShardRegistry* shardRegistry,
                                          Milliseconds writeConcernTimeout)
     : _client(shardRegistry),
       _writeConcern(WriteConcernOptions(WriteConcernOptions::kMajority,
-                                        WriteConcernOptions::JOURNAL,
-                                        writeConcernTimeout.count())),
+                                        // Note: Even though we're setting NONE here,
+                                        // kMajority implies JOURNAL, if journaling is supported
+                                        // by this mongod.
+                                        WriteConcernOptions::NONE,
+                                        durationCount<Milliseconds>(writeConcernTimeout))),
       _lockPingNS(LockpingsType::ConfigNS),
       _locksNS(LocksType::ConfigNS) {}
 
@@ -160,11 +167,11 @@ StatusWith<LockpingsType> DistLockCatalogImpl::getPing(StringData processID) {
         return targetStatus.getStatus();
     }
 
-    auto findResult = _client->exhaustiveFind(targetStatus.getValue(),
-                                              _lockPingNS,
-                                              BSON(LockpingsType::process() << processID),
-                                              BSONObj(),
-                                              1);
+    auto findResult = _findOnConfig(targetStatus.getValue(),
+                                    _lockPingNS,
+                                    BSON(LockpingsType::process() << processID),
+                                    BSONObj(),
+                                    1);
 
     if (!findResult.isOK()) {
         return findResult.getStatus();
@@ -189,12 +196,6 @@ StatusWith<LockpingsType> DistLockCatalogImpl::getPing(StringData processID) {
 }
 
 Status DistLockCatalogImpl::ping(StringData processID, Date_t ping) {
-    auto targetStatus = _targeter()->findHost(kReadPref);
-
-    if (!targetStatus.isOK()) {
-        return targetStatus.getStatus();
-    }
-
     auto request =
         FindAndModifyRequest::makeUpdate(_lockPingNS,
                                          BSON(LockpingsType::process() << processID),
@@ -202,21 +203,14 @@ Status DistLockCatalogImpl::ping(StringData processID, Date_t ping) {
     request.setUpsert(true);
     request.setWriteConcern(_writeConcern);
 
-    auto resultStatus =
-        _client->runCommand(targetStatus.getValue(), _locksNS.db().toString(), request.toBSON());
+    auto resultStatus = _client->runCommandWithNotMasterRetries(
+        "config", _locksNS.db().toString(), request.toBSON());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
     }
 
     BSONObj responseObj(resultStatus.getValue());
-
-    auto cmdStatus = getStatusFromCommandResult(responseObj);
-
-    if (!cmdStatus.isOK()) {
-        return cmdStatus;
-    }
-
     auto findAndModifyStatus = extractFindAndModifyNewObj(responseObj);
     return findAndModifyStatus.getStatus();
 }
@@ -227,12 +221,6 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(StringData lockID,
                                                     StringData processId,
                                                     Date_t time,
                                                     StringData why) {
-    auto targetStatus = _targeter()->findHost(kReadPref);
-
-    if (!targetStatus.isOK()) {
-        return targetStatus.getStatus();
-    }
-
     BSONObj newLockDetails(BSON(LocksType::lockID(lockSessionID)
                                 << LocksType::state(LocksType::LOCKED) << LocksType::who() << who
                                 << LocksType::process() << processId << LocksType::when(time)
@@ -246,8 +234,8 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(StringData lockID,
     request.setShouldReturnNew(true);
     request.setWriteConcern(_writeConcern);
 
-    auto resultStatus =
-        _client->runCommand(targetStatus.getValue(), _locksNS.db().toString(), request.toBSON());
+    auto resultStatus = _client->runCommandWithNotMasterRetries(
+        "config", _locksNS.db().toString(), request.toBSON());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
@@ -255,14 +243,14 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(StringData lockID,
 
     BSONObj responseObj(resultStatus.getValue());
 
-    auto cmdStatus = getStatusFromCommandResult(responseObj);
-
-    if (!cmdStatus.isOK()) {
-        return cmdStatus;
-    }
-
     auto findAndModifyStatus = extractFindAndModifyNewObj(responseObj);
     if (!findAndModifyStatus.isOK()) {
+        if (findAndModifyStatus == ErrorCodes::DuplicateKey) {
+            // Another thread won the upsert race. Also see SERVER-14322.
+            return {ErrorCodes::LockStateChangeFailed,
+                    str::stream() << "duplicateKey error during upsert of lock: " << lockID};
+        }
+
         return findAndModifyStatus.getStatus();
     }
 
@@ -284,12 +272,6 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(StringData lockID,
                                                         StringData processId,
                                                         Date_t time,
                                                         StringData why) {
-    auto targetStatus = _targeter()->findHost(kReadPref);
-
-    if (!targetStatus.isOK()) {
-        return targetStatus.getStatus();
-    }
-
     BSONArrayBuilder orQueryBuilder;
     orQueryBuilder.append(
         BSON(LocksType::name() << lockID << LocksType::state(LocksType::UNLOCKED)));
@@ -305,8 +287,8 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(StringData lockID,
     request.setShouldReturnNew(true);
     request.setWriteConcern(_writeConcern);
 
-    auto resultStatus =
-        _client->runCommand(targetStatus.getValue(), _locksNS.db().toString(), request.toBSON());
+    auto resultStatus = _client->runCommandWithNotMasterRetries(
+        "config", _locksNS.db().toString(), request.toBSON());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
@@ -331,20 +313,14 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(StringData lockID,
 }
 
 Status DistLockCatalogImpl::unlock(const OID& lockSessionID) {
-    auto targetStatus = _targeter()->findHost(kReadPref);
-
-    if (!targetStatus.isOK()) {
-        return targetStatus.getStatus();
-    }
-
     auto request = FindAndModifyRequest::makeUpdate(
         _locksNS,
         BSON(LocksType::lockID(lockSessionID)),
         BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))));
     request.setWriteConcern(_writeConcern);
 
-    auto resultStatus =
-        _client->runCommand(targetStatus.getValue(), _locksNS.db().toString(), request.toBSON());
+    auto resultStatus = _client->runCommandWithNotMasterRetries(
+        "config", _locksNS.db().toString(), request.toBSON());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
@@ -410,7 +386,7 @@ StatusWith<LocksType> DistLockCatalogImpl::getLockByTS(const OID& lockSessionID)
         return targetStatus.getStatus();
     }
 
-    auto findResult = _client->exhaustiveFind(
+    auto findResult = _findOnConfig(
         targetStatus.getValue(), _locksNS, BSON(LocksType::lockID(lockSessionID)), BSONObj(), 1);
 
     if (!findResult.isOK()) {
@@ -442,7 +418,7 @@ StatusWith<LocksType> DistLockCatalogImpl::getLockByName(StringData name) {
         return targetStatus.getStatus();
     }
 
-    auto findResult = _client->exhaustiveFind(
+    auto findResult = _findOnConfig(
         targetStatus.getValue(), _locksNS, BSON(LocksType::name() << name), BSONObj(), 1);
 
     if (!findResult.isOK()) {
@@ -468,18 +444,12 @@ StatusWith<LocksType> DistLockCatalogImpl::getLockByName(StringData name) {
 }
 
 Status DistLockCatalogImpl::stopPing(StringData processId) {
-    auto targetStatus = _targeter()->findHost(kReadPref);
-
-    if (!targetStatus.isOK()) {
-        return targetStatus.getStatus();
-    }
-
     auto request =
         FindAndModifyRequest::makeRemove(_lockPingNS, BSON(LockpingsType::process() << processId));
     request.setWriteConcern(_writeConcern);
 
-    auto resultStatus =
-        _client->runCommand(targetStatus.getValue(), _locksNS.db().toString(), request.toBSON());
+    auto resultStatus = _client->runCommandWithNotMasterRetries(
+        "config", _locksNS.db().toString(), request.toBSON());
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
@@ -489,6 +459,22 @@ Status DistLockCatalogImpl::stopPing(StringData processId) {
 
     auto findAndModifyStatus = extractFindAndModifyNewObj(responseObj);
     return findAndModifyStatus.getStatus();
+}
+
+StatusWith<vector<BSONObj>> DistLockCatalogImpl::_findOnConfig(const HostAndPort& host,
+                                                               const NamespaceString& nss,
+                                                               const BSONObj& query,
+                                                               const BSONObj& sort,
+                                                               boost::optional<long long> limit) {
+    repl::ReadConcernArgs readConcern(boost::none, repl::ReadConcernLevel::kMajorityReadConcern);
+    auto result =
+        _client->exhaustiveFind(host, nss, query, sort, limit, readConcern, kReplMetadata);
+
+    if (!result.isOK()) {
+        return result.getStatus();
+    }
+
+    return result.getValue().docs;
 }
 
 }  // namespace mongo

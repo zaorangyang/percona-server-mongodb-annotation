@@ -32,40 +32,40 @@
 
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 
-#include "mongo/util/scopeguard.h"
+#include "mongo/s/query/router_stage_limit.h"
+#include "mongo/s/query/router_stage_merge.h"
+#include "mongo/s/query/router_stage_skip.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 ClusterClientCursorImpl::ClusterClientCursorImpl(executor::TaskExecutor* executor,
-                                                 const ClusterClientCursorParams& params,
-                                                 const std::vector<HostAndPort>& remotes)
-    : _executor(executor), _params(params), _accc(executor, params, remotes) {}
+                                                 ClusterClientCursorParams params)
+    : _root(buildMergerPlan(executor, std::move(params))) {}
 
 StatusWith<boost::optional<BSONObj>> ClusterClientCursorImpl::next() {
-    // On error, kill the underlying ACCC.
-    ScopeGuard cursorKiller = MakeGuard(&ClusterClientCursorImpl::kill, this);
-
-    while (!_accc.ready()) {
-        auto nextEventStatus = _accc.nextEvent();
-        if (!nextEventStatus.isOK()) {
-            return nextEventStatus.getStatus();
-        }
-        auto event = nextEventStatus.getValue();
-
-        // Block until there are further results to return.
-        _executor->waitForEvent(event);
-    }
-
-    auto statusWithNext = _accc.nextReady();
-    if (statusWithNext.isOK()) {
-        cursorKiller.Dismiss();
-    }
-    return statusWithNext;
+    return _root->next();
 }
 
 void ClusterClientCursorImpl::kill() {
-    auto killEvent = _accc.kill();
-    _executor->waitForEvent(killEvent);
+    _root->kill();
+}
+
+std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
+    executor::TaskExecutor* executor, ClusterClientCursorParams params) {
+    // The first stage is always the one which merges from the remotes.
+    auto leaf = stdx::make_unique<RouterStageMerge>(executor, params);
+
+    std::unique_ptr<RouterExecStage> root = std::move(leaf);
+    if (params.skip) {
+        root = stdx::make_unique<RouterStageSkip>(std::move(root), *params.skip);
+    }
+
+    if (params.limit) {
+        root = stdx::make_unique<RouterStageLimit>(std::move(root), *params.limit);
+    }
+
+    return root;
 }
 
 }  // namespace mongo

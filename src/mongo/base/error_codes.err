@@ -139,8 +139,14 @@ error_code("CappedPositionLost", 136)
 error_code("IncompatibleShardingConfigVersion", 137)
 error_code("RemoteOplogStale", 138)
 error_code("JSInterpreterFailure", 139)
+error_code("InvalidSSLConfiguration", 140)
+error_code("SSLHandshakeFailed", 141)
+error_code("JSUncatchableError", 142)
+error_code("CursorInUse", 143)
+error_code("IncompatibleCatalogManager", 144)
 
 # Non-sequential error codes (for compatibility only)
+error_code("RecvStaleConfig", 9996)
 error_code("NotMaster", 10107) #this comes from assert_util.h
 error_code("DuplicateKey", 11000)
 error_code("InterruptedAtShutdown", 11600)
@@ -158,5 +164,5 @@ error_code("PrepareConfigsFailedCode", 13104);
 
 error_class("NetworkError", ["HostUnreachable", "HostNotFound", "NetworkTimeout"])
 error_class("Interruption", ["Interrupted", "InterruptedAtShutdown", "ExceededTimeLimit"])
-error_class("IndexCreationError", ["CannotCreateIndex", "IndexOptionsConflict", 
+error_class("IndexCreationError", ["CannotCreateIndex", "IndexOptionsConflict",
                                    "IndexKeySpecsConflict", "IndexAlreadyExists"])

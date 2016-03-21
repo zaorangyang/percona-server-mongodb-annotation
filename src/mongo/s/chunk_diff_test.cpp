@@ -28,8 +28,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/s/chunk_diff.h"
-
 #include <string>
 #include <map>
 #include <utility>
@@ -37,6 +35,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/random.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/chunk_diff.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -242,7 +241,6 @@ protected:
                     rightB.append(chunk[ChunkType::shard()]);
 
                     version.incMajor();
-                    version._minor = 0;
                     version.addToBSON(leftB, ChunkType::DEPRECATED_lastmod());
                     version.incMinor();
                     version.addToBSON(rightB, ChunkType::DEPRECATED_lastmod());
@@ -295,7 +293,6 @@ protected:
                         prevShardB.append(prevShardChunk[ChunkType::shard()]);
 
                         version.incMajor();
-                        version._minor = 0;
                         version.addToBSON(newShardB, ChunkType::DEPRECATED_lastmod());
                         version.incMinor();
                         version.addToBSON(prevShardB, ChunkType::DEPRECATED_lastmod());

@@ -30,7 +30,6 @@
 "createIndex",  # Not used for permissions checks, but to id the event in logs.
 "createRole",
 "createUser",
-"cursorInfo",
 "dbHash",
 "dbStats",
 "diagLogging",
@@ -58,7 +57,6 @@
 "grantRolesToUser",  # Not used for permissions checks, but to id the event in logs.
 "hostInfo",
 "impersonate",
-"indexStats",
 "inprog",
 "insert",
 "internal", # Special action type that represents internal actions

@@ -57,9 +57,6 @@ using std::string;
 
 namespace repl {
 
-SyncSourceFeedback::SyncSourceFeedback() : _positionChanged(false), _shutdownSignaled(false) {}
-SyncSourceFeedback::~SyncSourceFeedback() {}
-
 void SyncSourceFeedback::_resetConnection() {
     LOG(1) << "resetting connection in sync source feedback";
     _connection.reset();
@@ -71,7 +68,7 @@ bool SyncSourceFeedback::replAuthenticate() {
 
     if (!isInternalAuthSet())
         return false;
-    return authenticateInternalUser(_connection.get());
+    return _connection->authenticateInternalUser();
 }
 
 bool SyncSourceFeedback::_connect(OperationContext* txn, const HostAndPort& host) {
@@ -79,7 +76,8 @@ bool SyncSourceFeedback::_connect(OperationContext* txn, const HostAndPort& host
         return true;
     }
     log() << "setting syncSourceFeedback to " << host.toString();
-    _connection.reset(new DBClientConnection(false, OplogReader::kSocketTimeout.count()));
+    _connection.reset(
+        new DBClientConnection(false, durationCount<Seconds>(OplogReader::kSocketTimeout)));
     string errmsg;
     try {
         if (!_connection->connect(host, errmsg) ||
@@ -94,17 +92,21 @@ bool SyncSourceFeedback::_connect(OperationContext* txn, const HostAndPort& host
         return false;
     }
 
+    // Update keepalive value from config.
+    auto rsConfig = repl::ReplicationCoordinator::get(txn)->getConfig();
+    _keepAliveInterval = rsConfig.getElectionTimeoutPeriod() / 2;
+
     return hasConnection();
 }
 
 void SyncSourceFeedback::forwardSlaveProgress() {
-    stdx::unique_lock<stdx::mutex> lock(_mtx);
+    stdx::lock_guard<stdx::mutex> lock(_mtx);
     _positionChanged = true;
     _cond.notify_all();
 }
 
 Status SyncSourceFeedback::updateUpstream(OperationContext* txn) {
-    ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
+    auto replCoord = repl::ReplicationCoordinator::get(txn);
     if (replCoord->getMemberState().primary()) {
         // primary has no one to update to
         return Status::OK();
@@ -136,8 +138,8 @@ Status SyncSourceFeedback::updateUpstream(OperationContext* txn) {
         log() << "SyncSourceFeedback error sending update, response: " << res.toString() << endl;
         // blacklist sync target for .5 seconds and find a new one, unless we were rejected due
         // to the syncsource having a newer config
-        if (status != ErrorCodes::InvalidReplicaSetConfig || res["cfgver"].eoo() ||
-            res["cfgver"].numberLong() < replCoord->getConfig().getConfigVersion()) {
+        if (status != ErrorCodes::InvalidReplicaSetConfig || res["configVersion"].eoo() ||
+            res["configVersion"].numberLong() < replCoord->getConfig().getConfigVersion()) {
             replCoord->blacklistSyncSource(_syncTarget, Date_t::now() + Milliseconds(500));
             BackgroundSync::get()->clearSyncTarget();
             _resetConnection();
@@ -156,12 +158,13 @@ void SyncSourceFeedback::shutdown() {
 void SyncSourceFeedback::run() {
     Client::initThread("SyncSourceFeedback");
 
-    ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
     while (true) {  // breaks once _shutdownSignaled is true
         {
             stdx::unique_lock<stdx::mutex> lock(_mtx);
             while (!_positionChanged && !_shutdownSignaled) {
-                _cond.wait(lock);
+                if (_cond.wait_for(lock, _keepAliveInterval) == stdx::cv_status::timeout) {
+                    break;
+                }
             }
 
             if (_shutdownSignaled) {
@@ -172,7 +175,7 @@ void SyncSourceFeedback::run() {
         }
 
         auto txn = cc().makeOperationContext();
-        MemberState state = replCoord->getMemberState();
+        MemberState state = ReplicationCoordinator::get(txn.get())->getMemberState();
         if (state.primary() || state.startup()) {
             _resetConnection();
             continue;

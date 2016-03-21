@@ -34,7 +34,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/forwarding_catalog_manager.h"
 #include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/util/log.h"
@@ -46,27 +46,31 @@ Grid grid;
 
 Grid::Grid() : _allowLocalShard(true) {}
 
-void Grid::init(std::unique_ptr<CatalogManager> catalogManager,
-                std::unique_ptr<ShardRegistry> shardRegistry) {
+void Grid::init(std::unique_ptr<ForwardingCatalogManager> catalogManager,
+                std::unique_ptr<ShardRegistry> shardRegistry,
+                std::unique_ptr<ClusterCursorManager> cursorManager) {
     invariant(!_catalogManager);
     invariant(!_catalogCache);
     invariant(!_shardRegistry);
+    invariant(!_cursorManager);
 
     _catalogManager = std::move(catalogManager);
-    _catalogCache = stdx::make_unique<CatalogCache>(_catalogManager.get());
+    _catalogCache = stdx::make_unique<CatalogCache>();
     _shardRegistry = std::move(shardRegistry);
+    _cursorManager = std::move(cursorManager);
 }
 
-StatusWith<std::shared_ptr<DBConfig>> Grid::implicitCreateDb(const std::string& dbName) {
-    auto status = catalogCache()->getDatabase(dbName);
+StatusWith<std::shared_ptr<DBConfig>> Grid::implicitCreateDb(OperationContext* txn,
+                                                             const std::string& dbName) {
+    auto status = catalogCache()->getDatabase(txn, dbName);
     if (status.isOK()) {
         return status;
     }
 
     if (status == ErrorCodes::DatabaseNotFound) {
-        auto statusCreateDb = catalogManager()->createDatabase(dbName);
+        auto statusCreateDb = catalogManager(txn)->createDatabase(dbName);
         if (statusCreateDb.isOK() || statusCreateDb == ErrorCodes::NamespaceExists) {
-            return catalogCache()->getDatabase(dbName);
+            return catalogCache()->getDatabase(txn, dbName);
         }
 
         return statusCreateDb;
@@ -100,8 +104,9 @@ bool Grid::shouldBalance(const SettingsType& balancerSettings) const {
     return true;
 }
 
-bool Grid::getConfigShouldBalance() const {
-    auto balSettingsResult = grid.catalogManager()->getGlobalSettings(SettingsType::BalancerDocKey);
+bool Grid::getConfigShouldBalance(OperationContext* txn) const {
+    auto balSettingsResult =
+        grid.catalogManager(txn)->getGlobalSettings(SettingsType::BalancerDocKey);
     if (!balSettingsResult.isOK()) {
         warning() << balSettingsResult.getStatus();
         return false;
@@ -122,6 +127,16 @@ void Grid::clearForUnitTests() {
 
     _shardRegistry->shutdown();
     _shardRegistry.reset();
+
+    _cursorManager.reset();
+}
+
+ForwardingCatalogManager* Grid::catalogManager() {
+    return _catalogManager.get();
+}
+
+ForwardingCatalogManager* Grid::catalogManager(OperationContext* txn) {
+    return _catalogManager.get();
 }
 
 }  // namespace mongo

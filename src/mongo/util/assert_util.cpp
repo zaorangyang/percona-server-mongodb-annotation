@@ -83,7 +83,7 @@ string DBException::toString() const {
 }
 
 void DBException::traceIfNeeded(const DBException& e) {
-    if (traceExceptions && !inShutdown()) {
+    if (traceExceptions) {
         warning() << "DBException thrown" << causedBy(e) << endl;
         printStackTrace();
     }
@@ -148,10 +148,9 @@ NOINLINE_DECL void verifyFailed(const char* expr, const char* file, unsigned lin
 
 NOINLINE_DECL void invariantFailed(const char* expr, const char* file, unsigned line) {
     log() << "Invariant failure " << expr << ' ' << file << ' ' << dec << line << endl;
-    logContext();
     breakpoint();
     log() << "\n\n***aborting after invariant() failure\n\n" << endl;
-    quickExit(EXIT_ABRUPT);
+    std::abort();
 }
 
 NOINLINE_DECL void invariantOKFailed(const char* expr,
@@ -168,10 +167,9 @@ NOINLINE_DECL void invariantOKFailed(const char* expr,
 
 NOINLINE_DECL void fassertFailed(int msgid) {
     log() << "Fatal Assertion " << msgid << endl;
-    logContext();
     breakpoint();
     log() << "\n\n***aborting after fassert() failure\n\n" << endl;
-    quickExit(EXIT_ABRUPT);
+    std::abort();
 }
 
 NOINLINE_DECL void fassertFailedNoTrace(int msgid) {
@@ -308,22 +306,5 @@ string ExceptionInfo::toString() const {
     stringstream ss;
     ss << "exception: " << code << " " << msg;
     return ss.str();
-}
-
-NOINLINE_DECL ErrorMsg::ErrorMsg(const char* msg, char ch) {
-    int l = strlen(msg);
-    verify(l < 128);
-    memcpy(buf, msg, l);
-    char* p = buf + l;
-    p[0] = ch;
-    p[1] = 0;
-}
-
-NOINLINE_DECL ErrorMsg::ErrorMsg(const char* msg, unsigned val) {
-    int l = strlen(msg);
-    verify(l < 128);
-    memcpy(buf, msg, l);
-    char* p = buf + l;
-    sprintf(p, "%u", val);
 }
 }

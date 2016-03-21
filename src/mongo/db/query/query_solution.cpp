@@ -79,6 +79,8 @@ void TextNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent + 1);
     *ss << "caseSensitive= " << caseSensitive << '\n';
     addIndent(ss, indent + 1);
+    *ss << "diacriticSensitive= " << diacriticSensitive << '\n';
+    addIndent(ss, indent + 1);
     *ss << "indexPrefix = " << indexPrefix.toString() << '\n';
     if (NULL != filter) {
         addIndent(ss, indent + 1);
@@ -96,6 +98,7 @@ QuerySolutionNode* TextNode::clone() const {
     copy->query = this->query;
     copy->language = this->language;
     copy->caseSensitive = this->caseSensitive;
+    copy->diacriticSensitive = this->diacriticSensitive;
     copy->indexPrefix = this->indexPrefix;
 
     return copy;
@@ -638,6 +641,31 @@ QuerySolutionNode* ProjectionNode::clone() const {
 }
 
 //
+// SortKeyGeneratorNode
+//
+
+void SortKeyGeneratorNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+    addIndent(ss, indent);
+    *ss << "SORT_KEY_GENERATOR\n";
+    addIndent(ss, indent + 1);
+    *ss << "sortSpec = " << sortSpec.toString() << '\n';
+    addIndent(ss, indent + 1);
+    *ss << "queryObj = " << queryObj.toString() << '\n';
+    addCommon(ss, indent);
+    addIndent(ss, indent + 1);
+    *ss << "Child:" << '\n';
+    children[0]->appendToString(ss, indent + 2);
+}
+
+QuerySolutionNode* SortKeyGeneratorNode::clone() const {
+    SortKeyGeneratorNode* copy = new SortKeyGeneratorNode();
+    cloneBaseData(copy);
+    copy->queryObj = this->queryObj;
+    copy->sortSpec = this->sortSpec;
+    return copy;
+}
+
+//
 // SortNode
 //
 
@@ -646,8 +674,6 @@ void SortNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     *ss << "SORT\n";
     addIndent(ss, indent + 1);
     *ss << "pattern = " << pattern.toString() << '\n';
-    addIndent(ss, indent + 1);
-    *ss << "query for bounds = " << query.toString() << '\n';
     addIndent(ss, indent + 1);
     *ss << "limit = " << limit << '\n';
     addCommon(ss, indent);
@@ -662,7 +688,6 @@ QuerySolutionNode* SortNode::clone() const {
 
     copy->_sorts = this->_sorts;
     copy->pattern = this->pattern;
-    copy->query = this->query;
     copy->limit = this->limit;
 
     return copy;

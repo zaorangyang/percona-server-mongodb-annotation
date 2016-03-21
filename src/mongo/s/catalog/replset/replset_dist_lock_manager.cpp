@@ -52,6 +52,10 @@ using std::unique_ptr;
 using stdx::chrono::milliseconds;
 using stdx::chrono::duration_cast;
 
+const stdx::chrono::seconds ReplSetDistLockManager::kDistLockWriteConcernTimeout{5};
+const stdx::chrono::seconds ReplSetDistLockManager::kDistLockPingInterval{30};
+const stdx::chrono::minutes ReplSetDistLockManager::kDistLockExpirationTime{15};
+
 ReplSetDistLockManager::ReplSetDistLockManager(ServiceContext* globalContext,
                                                StringData processID,
                                                unique_ptr<DistLockCatalog> catalog,
@@ -69,7 +73,8 @@ void ReplSetDistLockManager::startUp() {
     _execThread = stdx::make_unique<stdx::thread>(&ReplSetDistLockManager::doTask, this);
 }
 
-void ReplSetDistLockManager::shutDown() {
+void ReplSetDistLockManager::shutDown(bool allowNetworking) {
+    invariant(allowNetworking);
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         _isShutDown = true;
@@ -97,7 +102,7 @@ bool ReplSetDistLockManager::isShutDown() {
 
 void ReplSetDistLockManager::doTask() {
     LOG(0) << "creating distributed lock ping thread for process " << _processID
-           << " (sleeping for " << duration_cast<milliseconds>(_pingInterval).count() << " ms)";
+           << " (sleeping for " << _pingInterval << ")";
 
     Timer elapsedSincelastPing(_serviceContext->getTickSource());
     while (!isShutDown()) {
@@ -220,15 +225,13 @@ StatusWith<bool> ReplSetDistLockManager::canOvertakeLock(LocksType lockDoc) {
     milliseconds elapsedSinceLastPing(configServerLocalTime - pingInfo->configLocalTime);
     if (elapsedSinceLastPing >= _lockExpiration) {
         LOG(0) << "forcing lock '" << lockDoc.getName() << "' because elapsed time "
-               << duration_cast<milliseconds>(elapsedSinceLastPing).count()
-               << " ms >= takeover time " << duration_cast<milliseconds>(_lockExpiration).count()
-               << " ms";
+               << elapsedSinceLastPing << " >= takeover time " << _lockExpiration;
         return true;
     }
 
     LOG(1) << "could not force lock '" << lockDoc.getName() << "' because elapsed time "
-           << duration_cast<milliseconds>(elapsedSinceLastPing).count() << " ms < takeover time "
-           << duration_cast<milliseconds>(_lockExpiration).count() << " ms";
+           << durationCount<Milliseconds>(elapsedSinceLastPing) << " < takeover time "
+           << durationCount<Milliseconds>(_lockExpiration) << " ms";
     return false;
 }
 
@@ -242,8 +245,8 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lock(
         string who = str::stream() << _processID << ":" << getThreadName();
 
         LOG(1) << "trying to acquire new distributed lock for " << name
-               << " ( lock timeout : " << duration_cast<milliseconds>(_lockExpiration).count()
-               << " ms, ping interval : " << duration_cast<milliseconds>(_pingInterval).count()
+               << " ( lock timeout : " << durationCount<Milliseconds>(_lockExpiration)
+               << " ms, ping interval : " << durationCount<Milliseconds>(_pingInterval)
                << " ms, process : " << _processID << " )"
                << " with lockSessionID: " << lockSessionID << ", why: " << whyMessage;
 

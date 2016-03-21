@@ -40,6 +40,7 @@
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
 #include "mongo/s/catalog/type_config_version.h"
+#include "mongo/s/client/shard_connection.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
@@ -56,6 +57,7 @@ string ConfigServerFixture::shardName() {
 }
 
 void ConfigServerFixture::setUp() {
+    shardConnectionPool.clear();
     DBException::traceExceptions = true;
 
     // Make all connections redirect to the direct client
@@ -75,9 +77,10 @@ void ConfigServerFixture::setUp() {
                              ChunkType::ConfigNS,
                              BSON(ChunkType::ns() << 1 << ChunkType::DEPRECATED_lastmod() << 1)));
 
-    ConnectionString connStr(uassertStatusOK(ConnectionString::parse("$dummy:10000")));
+    const ConnectionString connStr(uassertStatusOK(ConnectionString::parse("$dummy:10000")));
+
     ShardingState::get(getGlobalServiceContext())->initialize(connStr.toString());
-    ShardingState::get(getGlobalServiceContext())->gotShardName(shardName());
+    ShardingState::get(getGlobalServiceContext())->setShardName(shardName());
 }
 
 void ConfigServerFixture::clearServer() {

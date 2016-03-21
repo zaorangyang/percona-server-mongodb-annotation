@@ -43,6 +43,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
@@ -185,7 +186,7 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
 
     if (sortStage) {
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            pExpCtx->ns.ns(), queryObj, sortObj, projectionForQuery, whereCallback);
+            pExpCtx->ns, queryObj, sortObj, projectionForQuery, whereCallback);
 
         if (statusWithCQ.isOK()) {
             auto statusWithPlanExecutor = getExecutor(txn,
@@ -210,7 +211,7 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
     if (!exec.get()) {
         const BSONObj noSort;
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            pExpCtx->ns.ns(), queryObj, noSort, projectionForQuery, whereCallback);
+            pExpCtx->ns, queryObj, noSort, projectionForQuery, whereCallback);
         uassertStatusOK(statusWithCQ.getStatus());
 
         exec = uassertStatusOK(getExecutor(txn,

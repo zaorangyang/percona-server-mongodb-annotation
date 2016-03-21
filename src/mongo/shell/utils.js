@@ -19,6 +19,22 @@ function reconnect(db) {
                 });
 };
 
+function _getErrorWithCode(codeOrObj, message) {
+    var e = new Error(message);
+    if (codeOrObj != undefined) {
+        if (codeOrObj.writeError) {
+            e.code = codeOrObj.writeError.code;
+        } else if (codeOrObj.code) {
+            e.code = codeOrObj.code;
+        } else {
+            // At this point assume codeOrObj is a number type
+            e.code = codeOrObj;
+        }
+    }
+
+    return e;
+}
+
 // Please consider using bsonWoCompare instead of this as much as possible.
 friendlyEqual = function( a , b ){
     if ( a == b )
@@ -158,7 +174,11 @@ jsTestOptions = function(){
                               authMechanism : TestData.authMechanism,
                               adminUser : TestData.adminUser || "admin",
                               adminPassword : TestData.adminPassword || "password",
-                              useLegacyConfigServers: TestData.useLegacyConfigServers || false });
+                              useLegacyConfigServers: TestData.useLegacyConfigServers || false,
+                              enableEncryption: TestData.enableEncryption,
+                              encryptionKeyFile: TestData.encryptionKeyFile,
+                            }
+                        );
     }
     return _jsTestOptions;
 }
@@ -316,7 +336,7 @@ replSetMemberStatePrompt = function() {
          if ( info && info.length < 20 ) {
              state = info; // "mongos", "configsvr"
          } else {
-             throw Error("Failed:" + info);
+             throw _getErrorWithCode(stateInfo, "Failed:" + info);
          }
     }
     return state + '> ';
@@ -346,7 +366,7 @@ isMasterStatePrompt = function() {
         }
         state = state + role;
     } else {
-        throw Error("Failed: " + tojson(isMaster));
+        throw _getErrorWithCode(isMaster, "Failed: " + tojson(isMaster));
     }
     return state + '> ';
 }
@@ -392,6 +412,9 @@ shellPrintHelper = function (x) {
         return;
     }
 
+    if (x === MinKey || x === MaxKey)
+        return x.tojson();
+
     if (typeof x != "object")
         return print(x);
 
@@ -428,6 +451,9 @@ shellAutocomplete = function ( /*prefix*/ ) { // outer scope function called on 
     builtinMethods[BinData] = "hex base64 length subtype".split(' ');
 
     var extraGlobals = "Infinity NaN undefined null true false decodeURI decodeURIComponent encodeURI encodeURIComponent escape eval isFinite isNaN parseFloat parseInt unescape Array Boolean Date Math Number RegExp String print load gc MinKey MaxKey Mongo NumberInt NumberLong ObjectId DBPointer UUID BinData HexData MD5 Map Timestamp JSON".split( ' ' );
+    if (typeof NumberDecimal !== 'undefined') {
+        extraGlobals[extraGlobals.length] = "NumberDecimal";
+    }
 
     var isPrivate = function( name ) {
         if ( shellAutocomplete.showPrivate ) return false;

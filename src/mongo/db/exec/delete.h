@@ -41,7 +41,6 @@ class PlanExecutor;
 struct DeleteStageParams {
     DeleteStageParams()
         : isMulti(false),
-          shouldCallLogOp(false),
           fromMigrate(false),
           isExplain(false),
           returnDeleted(false),
@@ -50,9 +49,6 @@ struct DeleteStageParams {
     // Should we delete all documents returned from the child (a "multi delete"), or at most one
     // (a "single delete")?
     bool isMulti;
-
-    // Should we write each delete to the oplog?
-    bool shouldCallLogOp;
 
     // Is this delete part of a migrate operation that is essentially like a no-op
     // when the cluster is observed by an external client.
@@ -73,10 +69,10 @@ struct DeleteStageParams {
  * document was requested to be returned, then ADVANCED is returned after deleting a document.
  * Otherwise, NEED_TIME is returned after deleting a document.
  *
- * Callers of work() must be holding a write lock (and, for shouldCallLogOp=true deletes,
- * callers must have had the replication coordinator approve the write).
+ * Callers of work() must be holding a write lock (and, for replicated deletes, callers must have
+ * had the replication coordinator approve the write).
  */
-class DeleteStage : public PlanStage {
+class DeleteStage final : public PlanStage {
     MONGO_DISALLOW_COPYING(DeleteStage);
 
 public:
@@ -86,19 +82,18 @@ public:
                 Collection* collection,
                 PlanStage* child);
 
-    virtual bool isEOF();
-    virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState work(WorkingSetID* out) final;
 
-    virtual void doRestoreState();
-    virtual void doReattachToOperationContext(OperationContext* opCtx);
+    void doRestoreState() final;
 
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_DELETE;
     }
 
-    virtual std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
@@ -110,9 +105,6 @@ public:
     static long long getNumDeleted(const PlanExecutor& exec);
 
 private:
-    // Transactional context.  Not owned by us.
-    OperationContext* _txn;
-
     DeleteStageParams _params;
 
     // Not owned by us.

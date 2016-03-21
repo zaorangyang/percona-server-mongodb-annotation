@@ -54,8 +54,8 @@ Shard::Shard(const ShardId& id,
 
 Shard::~Shard() = default;
 
-ShardPtr Shard::lookupRSName(const string& name) {
-    return grid.shardRegistry()->lookupRSName(name);
+bool Shard::isConfig() const {
+    return _id == "config";
 }
 
 std::string Shard::toString() const {

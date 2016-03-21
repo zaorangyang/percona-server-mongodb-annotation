@@ -31,43 +31,41 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/executor/network_interface_asio.h"
+#include "mongo/executor/async_stream_interface.h"
+#include "mongo/rpc/factory.h"
+#include "mongo/rpc/request_builder_interface.h"
 
 namespace mongo {
 namespace executor {
 
 using asio::ip::tcp;
 
+namespace {
+
+std::unique_ptr<Message> messageFromRequest(const RemoteCommandRequest& request,
+                                            rpc::Protocol protocol) {
+    BSONObj query = request.cmdObj;
+    auto requestBuilder = rpc::makeRequestBuilder(protocol);
+
+    // TODO: handle metadata writers
+    auto toSend = rpc::makeRequestBuilder(protocol)
+                      ->setDatabase(request.dbname)
+                      .setCommandName(request.cmdObj.firstElementFieldName())
+                      .setMetadata(request.metadata)
+                      .setCommandArgs(request.cmdObj)
+                      .done();
+
+    toSend->header().setId(nextMessageId());
+    return toSend;
+}
+
+}  // namespace
+
 NetworkInterfaceASIO::AsyncOp::AsyncOp(const TaskExecutor::CallbackHandle& cbHandle,
                                        const RemoteCommandRequest& request,
                                        const RemoteCommandCompletionFn& onFinish,
                                        Date_t now)
-    : _cbHandle(cbHandle),
-      _request(request),
-      _onFinish(onFinish),
-      _start(now),
-      _state(OpState::kReady),
-      _canceled(0) {}
-
-std::string NetworkInterfaceASIO::AsyncOp::toString() const {
-    str::stream output;
-    output << "Operation state: ";
-    if (_state == OpState::kReady) {
-        output << "kReady";
-    } else if (_state == OpState::kConnectionAcquired) {
-        output << "kConnectionAcquired";
-    } else if (_state == OpState::kConnectionVerified) {
-        output << "kConnectionVerified";
-    } else if (_state == OpState::kConnected) {
-        output << "kConnected";
-    } else if (_state == OpState::kCompleted) {
-        output << "kCompleted";
-    } else {
-        MONGO_UNREACHABLE;
-    }
-
-    output << "\n";
-    return output;
-}
+    : _cbHandle(cbHandle), _request(request), _onFinish(onFinish), _start(now), _canceled(0) {}
 
 void NetworkInterfaceASIO::AsyncOp::cancel() {
     // An operation may be in mid-flight when it is canceled, so we
@@ -83,61 +81,31 @@ const TaskExecutor::CallbackHandle& NetworkInterfaceASIO::AsyncOp::cbHandle() co
     return _cbHandle;
 }
 
-void NetworkInterfaceASIO::AsyncOp::connect(ConnectionPool* const pool,
-                                            asio::io_service* service,
-                                            Date_t now) {
-    // TODO(amidvidy): why is this hardcoded to 1 second? That seems too low.
-    ConnectionPool::ConnectionPtr conn(pool, _request.target, now, Milliseconds(1000));
-
-    _state = OpState::kConnectionAcquired;
-
-    // TODO: Add a case here for unix domain sockets.
-    int protocol = conn.get()->port().localAddr().getType();
-    if (protocol != AF_INET && protocol != AF_INET6) {
-        throw SocketException(SocketException::CONNECT_ERROR, "Unsupported family");
-    }
-
-    _state = OpState::kConnectionVerified;
-
-    tcp::socket sock{
-        *service, protocol == AF_INET ? tcp::v4() : tcp::v6(), conn.get()->port().psock->rawFD()};
-
-    _connection.emplace(std::move(sock), conn.get()->getServerRPCProtocols(), std::move(conn));
-
-    _state = OpState::kConnected;
-}
-
-NetworkInterfaceASIO::AsyncConnection* NetworkInterfaceASIO::AsyncOp::connection() {
+NetworkInterfaceASIO::AsyncConnection& NetworkInterfaceASIO::AsyncOp::connection() {
     invariant(_connection.is_initialized());
-    return _connection.get_ptr();
+    return *_connection;
 }
 
 void NetworkInterfaceASIO::AsyncOp::setConnection(AsyncConnection&& conn) {
     invariant(!_connection.is_initialized());
     _connection = std::move(conn);
-    _state = OpState::kConnected;
-}
-
-bool NetworkInterfaceASIO::AsyncOp::connected() const {
-    return (_state == OpState::kConnected ||
-            // NOTE: if we fail at kConnectionVerified,
-            // ASIO will have closed the socket, don't disconnect
-            _state == OpState::kConnectionAcquired);
 }
 
 NetworkInterfaceASIO::AsyncCommand& NetworkInterfaceASIO::AsyncOp::beginCommand(
-    Message&& newCommand) {
+    Message&& newCommand, Date_t now) {
     // NOTE: We operate based on the assumption that AsyncOp's
     // AsyncConnection does not change over its lifetime.
     invariant(_connection.is_initialized());
-    if (_command.is_initialized()) {
-        // We can just reset our state if initialized.
-        _command->reset();
-    } else {
-        _command.emplace(_connection.get_ptr());
-    }
-    _command->setToSend(std::move(newCommand));
+
+    // Construct a new AsyncCommand object for each command.
+    _command.emplace(_connection.get_ptr(), std::move(newCommand), now);
     return _command.get();
+}
+
+NetworkInterfaceASIO::AsyncCommand& NetworkInterfaceASIO::AsyncOp::beginCommand(
+    const RemoteCommandRequest& request, rpc::Protocol protocol, Date_t now) {
+    auto newCommand = messageFromRequest(request, protocol);
+    return beginCommand(std::move(*newCommand), now);
 }
 
 NetworkInterfaceASIO::AsyncCommand& NetworkInterfaceASIO::AsyncOp::command() {
@@ -147,7 +115,6 @@ NetworkInterfaceASIO::AsyncCommand& NetworkInterfaceASIO::AsyncOp::command() {
 
 void NetworkInterfaceASIO::AsyncOp::finish(const ResponseStatus& status) {
     _onFinish(status);
-    _state = OpState::kCompleted;
 }
 
 const RemoteCommandRequest& NetworkInterfaceASIO::AsyncOp::request() const {

@@ -34,6 +34,11 @@
 
 #include <utility>
 
+#include "mongo/config.h"
+#include "mongo/executor/async_stream.h"
+#include "mongo/executor/async_stream_factory.h"
+#include "mongo/executor/async_stream_interface.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/sock.h"
 
@@ -42,35 +47,27 @@ namespace executor {
 
 using asio::ip::tcp;
 
-NetworkInterfaceASIO::AsyncConnection::AsyncConnection(asio::ip::tcp::socket&& sock,
+NetworkInterfaceASIO::AsyncConnection::AsyncConnection(std::unique_ptr<AsyncStreamInterface> stream,
                                                        rpc::ProtocolSet protocols)
-    : AsyncConnection(std::move(sock), protocols, boost::none) {}
-
-NetworkInterfaceASIO::AsyncConnection::AsyncConnection(
-    asio::ip::tcp::socket&& sock,
-    rpc::ProtocolSet protocols,
-    boost::optional<ConnectionPool::ConnectionPtr>&& bootstrapConn)
-    : _sock(std::move(sock)),
-      _serverProtocols(protocols),
-      _bootstrapConn(std::move(bootstrapConn)) {}
+    : _stream(std::move(stream)), _serverProtocols(protocols) {}
 
 #if defined(_MSC_VER) && _MSC_VER < 1900
 NetworkInterfaceASIO::AsyncConnection::AsyncConnection(AsyncConnection&& other)
-    : _sock(std::move(other._sock)),
+    : _stream(std::move(other._stream)),
       _serverProtocols(other._serverProtocols),
       _clientProtocols(other._clientProtocols) {}
 
 NetworkInterfaceASIO::AsyncConnection& NetworkInterfaceASIO::AsyncConnection::operator=(
     AsyncConnection&& other) {
-    _sock = std::move(other._sock);
+    _stream = std::move(other._stream);
     _serverProtocols = other._serverProtocols;
     _clientProtocols = other._clientProtocols;
     return *this;
 }
 #endif
 
-asio::ip::tcp::socket& NetworkInterfaceASIO::AsyncConnection::sock() {
-    return _sock;
+AsyncStreamInterface& NetworkInterfaceASIO::AsyncConnection::stream() {
+    return *_stream;
 }
 
 rpc::ProtocolSet NetworkInterfaceASIO::AsyncConnection::serverProtocols() const {
@@ -85,59 +82,30 @@ void NetworkInterfaceASIO::AsyncConnection::setServerProtocols(rpc::ProtocolSet 
     _serverProtocols = protocols;
 }
 
-void NetworkInterfaceASIO::_connectASIO(AsyncOp* op) {
+void NetworkInterfaceASIO::_connect(AsyncOp* op) {
     tcp::resolver::query query(op->request().target.host(),
                                std::to_string(op->request().target.port()));
     // TODO: Investigate how we might hint or use shortcuts to resolve when possible.
-    _resolver.async_resolve(
-        query,
-        [this, op](std::error_code ec, asio::ip::basic_resolver_iterator<tcp> endpoints) {
-            _validateAndRun(op, ec, [this, op, endpoints]() { _setupSocket(op, endpoints); });
-        });
+    const auto thenConnect = [this, op](std::error_code ec, tcp::resolver::iterator endpoints) {
+        _validateAndRun(
+            op, ec, [this, op, endpoints]() { _setupSocket(op, std::move(endpoints)); });
+    };
+    _resolver.async_resolve(query, std::move(thenConnect));
 }
 
-void NetworkInterfaceASIO::_connectWithDBClientConnection(AsyncOp* op) {
-    // connect in a separate thread to avoid blocking the rest of the system
-    stdx::thread t([this, op]() {
-        try {
-            // The call to connect() will throw if:
-            // - we cannot get a new connection from the pool
-            // - we get a connection from the pool, but cannot use it
-            // - we fail to transfer the connection's socket to an ASIO wrapper
-            op->connect(_connPool.get(), &_io_service, now());
-        } catch (...) {
-            LOG(3) << "failed to connect, posting mock completion";
-
-            if (inShutdown()) {
-                return;
-            }
-
-            auto status = exceptionToStatus();
-
-            asio::post(_io_service,
-                       [this, op, status]() { return _completeOperation(op, status); });
-            return;
-        }
-
-        // send control back to main thread(pool)
-        asio::post(_io_service, [this, op]() { _beginCommunication(op); });
-    });
-
-    t.detach();
-}
-
-void NetworkInterfaceASIO::_setupSocket(AsyncOp* op, const tcp::resolver::iterator& endpoints) {
-    tcp::socket sock(_io_service);
-    AsyncConnection conn(std::move(sock), rpc::supports::kOpQueryOnly);
-
+void NetworkInterfaceASIO::_setupSocket(AsyncOp* op, tcp::resolver::iterator endpoints) {
     // TODO: Consider moving this call to post-auth so we only assign completed connections.
-    op->setConnection(std::move(conn));
+    {
+        auto stream = _streamFactory->makeStream(&_io_service, op->request().target);
+        op->setConnection({std::move(stream), rpc::supports::kOpQueryOnly});
+    }
 
-    asio::async_connect(op->connection()->sock(),
-                        std::move(endpoints),
-                        [this, op](std::error_code ec, tcp::resolver::iterator iter) {
-                            _validateAndRun(op, ec, [this, op]() { _sslHandshake(op); });
-                        });
+    auto& stream = op->connection().stream();
+
+    stream.connect(std::move(endpoints),
+                   [this, op](std::error_code ec) {
+                       _validateAndRun(op, ec, [this, op]() { _runIsMaster(op); });
+                   });
 }
 
 }  // namespace executor

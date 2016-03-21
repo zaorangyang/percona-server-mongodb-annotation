@@ -31,14 +31,16 @@
 #include <string>
 #include <vector>
 
+#include "mongo/s/catalog/forwarding_catalog_manager.h"
+#include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 class BSONObj;
 class CatalogCache;
-class CatalogManager;
 class DBConfig;
+class OperationContext;
 class SettingsType;
 class ShardRegistry;
 template <typename T>
@@ -54,20 +56,21 @@ public:
     Grid();
 
     /**
-     * Called at startup time so the global sharding services (catalog manager, shard registry)
-     * can be set. This method must be called once and once only for the lifetime of the
-     * service.
+     * Called at startup time so the global sharding services can be set. This method must be called
+     * once and once only for the lifetime of the service.
      *
      * NOTE: Unit-tests are allowed to call it more than once, provided they reset the object's
      *       state using clearForUnitTests.
      */
-    void init(std::unique_ptr<CatalogManager> catalogManager,
-              std::unique_ptr<ShardRegistry> shardRegistry);
+    void init(std::unique_ptr<ForwardingCatalogManager> catalogManager,
+              std::unique_ptr<ShardRegistry> shardRegistry,
+              std::unique_ptr<ClusterCursorManager> cursorManager);
 
     /**
      * Implicitly creates the specified database as non-sharded.
      */
-    StatusWith<std::shared_ptr<DBConfig>> implicitCreateDb(const std::string& dbName);
+    StatusWith<std::shared_ptr<DBConfig>> implicitCreateDb(OperationContext* txn,
+                                                           const std::string& dbName);
 
     /**
      * @return true if shards and config servers are allowed to use 'localhost' in address
@@ -88,16 +91,20 @@ public:
     /**
      * Returns true if the config server settings indicate that the balancer should be active.
      */
-    bool getConfigShouldBalance() const;
+    bool getConfigShouldBalance(OperationContext* txn) const;
 
-    CatalogManager* catalogManager() const {
-        return _catalogManager.get();
-    }
-    CatalogCache* catalogCache() const {
+    ForwardingCatalogManager* catalogManager(OperationContext* txn);
+    ForwardingCatalogManager* catalogManager();  // TODO(spencer): remove
+
+    CatalogCache* catalogCache() {
         return _catalogCache.get();
     }
-    ShardRegistry* shardRegistry() const {
+    ShardRegistry* shardRegistry() {
         return _shardRegistry.get();
+    }
+
+    ClusterCursorManager* getCursorManager() {
+        return _cursorManager.get();
     }
 
     /**
@@ -110,9 +117,10 @@ public:
     void clearForUnitTests();
 
 private:
-    std::unique_ptr<CatalogManager> _catalogManager;
+    std::unique_ptr<ForwardingCatalogManager> _catalogManager;
     std::unique_ptr<CatalogCache> _catalogCache;
     std::unique_ptr<ShardRegistry> _shardRegistry;
+    std::unique_ptr<ClusterCursorManager> _cursorManager;
 
     // can 'localhost' be used in shard addresses?
     bool _allowLocalShard;

@@ -53,6 +53,10 @@ using std::string;
 using std::stringstream;
 using std::vector;
 
+namespace {
+SyncClusterConnection::ConnectionValidationHook connectionHook;
+}  // namespace
+
 SyncClusterConnection::SyncClusterConnection(const list<HostAndPort>& L, double socketTimeout)
     : _socketTimeout(socketTimeout) {
     {
@@ -105,6 +109,10 @@ SyncClusterConnection::~SyncClusterConnection() {
     _conns.clear();
 }
 
+void SyncClusterConnection::setConnectionValidationHook(ConnectionValidationHook hook) {
+    connectionHook = std::move(hook);
+}
+
 bool SyncClusterConnection::prepare(string& errmsg) {
     _lastErrors.clear();
 
@@ -120,7 +128,10 @@ bool SyncClusterConnection::prepare(string& errmsg) {
             if (singleErr.size() == 0)
                 continue;
 
-        } catch (DBException& e) {
+        } catch (const DBException& e) {
+            if (e.getCode() == ErrorCodes::IncompatibleCatalogManager) {
+                throw;
+            }
             singleErr = e.toString();
         }
         ok = false;
@@ -180,16 +191,34 @@ BSONObj SyncClusterConnection::getLastErrorDetailed(
     return DBClientBase::getLastErrorDetailed(db, fsync, j, w, wtimeout);
 }
 
-void SyncClusterConnection::_connect(const std::string& host) {
-    log() << "SyncClusterConnection connecting to [" << host << "]" << endl;
-    DBClientConnection* c = new DBClientConnection(true);
+void SyncClusterConnection::_connect(const std::string& hostStr) {
+    log() << "SyncClusterConnection connecting to [" << hostStr << "]" << endl;
+    const HostAndPort host(hostStr);
+    DBClientConnection* c;
+    if (connectionHook) {
+        c = new DBClientConnection(
+            true,  // auto reconnect
+            0,     // socket timeout
+            [this, host](const executor::RemoteCommandResponse& isMasterReply) {
+                return connectionHook(host, isMasterReply);
+            });
+    } else {
+        c = new DBClientConnection(true);
+    }
+
     c->setRequestMetadataWriter(getRequestMetadataWriter());
     c->setReplyMetadataReader(getReplyMetadataReader());
     c->setSoTimeout(_socketTimeout);
-    string errmsg;
-    if (!c->connect(HostAndPort(host), errmsg))
-        log() << "SyncClusterConnection connect fail to: " << host << " errmsg: " << errmsg << endl;
-    _connAddresses.push_back(host);
+    Status status = c->connect(host);
+    if (!status.isOK()) {
+        log() << "SyncClusterConnection connect fail to: " << hostStr << causedBy(status);
+        if (status == ErrorCodes::IncompatibleCatalogManager) {
+            // Make sure to propagate IncompatibleCatalogManager errors to trigger catalog manager
+            // swapping.
+            uassertStatusOK(status);
+        }
+    }
+    _connAddresses.push_back(hostStr);
     _conns.push_back(c);
 }
 
@@ -578,10 +607,6 @@ void SyncClusterConnection::say(Message& toSend, bool isRetry, string* actualSer
     // TODO: should we set actualServer??
 
     _checkLast();
-}
-
-void SyncClusterConnection::sayPiggyBack(Message& toSend) {
-    verify(0);
 }
 
 int SyncClusterConnection::_lockType(const string& name) {

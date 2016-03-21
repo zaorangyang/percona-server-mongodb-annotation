@@ -45,7 +45,7 @@ namespace mongo {
  * Only returns NEED_TIME until hitting EOF. The count result can be obtained by examining
  * the specific stats.
  */
-class CountStage : public PlanStage {
+class CountStage final : public PlanStage {
 public:
     CountStage(OperationContext* txn,
                Collection* collection,
@@ -53,18 +53,16 @@ public:
                WorkingSet* ws,
                PlanStage* child);
 
-    virtual bool isEOF();
-    virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState work(WorkingSetID* out) final;
 
-    virtual void doReattachToOperationContext(OperationContext* opCtx);
-
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_COUNT;
     }
 
     std::unique_ptr<PlanStageStats> getStats();
 
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
@@ -74,9 +72,6 @@ private:
      * limit if necessary. The result is stored in '_specificStats'.
      */
     void trivialCount();
-
-    // Transactional context for read locks. Not owned by us.
-    OperationContext* _txn;
 
     // The collection over which we are counting.
     Collection* _collection;

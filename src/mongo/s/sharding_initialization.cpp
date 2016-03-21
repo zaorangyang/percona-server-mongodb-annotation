@@ -32,34 +32,70 @@
 
 #include "mongo/s/sharding_initialization.h"
 
+#include <string>
+
+#include "mongo/base/status.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
+#include "mongo/client/syncclusterconnection.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/db/repl/replication_executor.h"
-#include "mongo/s/catalog/legacy/catalog_manager_legacy.h"
+#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/catalog/forwarding_catalog_manager.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/client/sharding_network_connection_hook.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/sock.h"
 
 namespace mongo {
 
-Status initializeGlobalShardingState(const ConnectionString& configCS) {
-    auto network = executor::makeNetworkInterface();
-    auto networkPtr = network.get();
-    auto shardRegistry(stdx::make_unique<ShardRegistry>(
-        stdx::make_unique<RemoteCommandTargeterFactoryImpl>(),
-        stdx::make_unique<repl::ReplicationExecutor>(network.release(), nullptr, 0),
-        networkPtr));
+namespace {
 
-    auto catalogManager = stdx::make_unique<CatalogManagerLegacy>();
-    Status status = catalogManager->init(configCS);
-    if (!status.isOK()) {
-        return status;
+using executor::NetworkInterface;
+using executor::ThreadPoolTaskExecutor;
+
+std::unique_ptr<ThreadPoolTaskExecutor> makeTaskExecutor(std::unique_ptr<NetworkInterface> net) {
+    ThreadPool::Options tpOptions;
+    tpOptions.poolName = "ShardWork";
+    return stdx::make_unique<ThreadPoolTaskExecutor>(stdx::make_unique<ThreadPool>(tpOptions),
+                                                     std::move(net));
+}
+
+}  // namespace
+
+Status initializeGlobalShardingState(const ConnectionString& configCS) {
+    SyncClusterConnection::setConnectionValidationHook(
+        [](const HostAndPort& target, const executor::RemoteCommandResponse& isMasterReply) {
+            return ShardingNetworkConnectionHook::validateHostImpl(target, isMasterReply);
+        });
+    auto network =
+        executor::makeNetworkInterface(stdx::make_unique<ShardingNetworkConnectionHook>());
+    auto networkPtr = network.get();
+    auto shardRegistry(
+        stdx::make_unique<ShardRegistry>(stdx::make_unique<RemoteCommandTargeterFactoryImpl>(),
+                                         makeTaskExecutor(std::move(network)),
+                                         networkPtr,
+                                         configCS));
+
+    std::unique_ptr<ForwardingCatalogManager> catalogManager;
+    try {
+        catalogManager = stdx::make_unique<ForwardingCatalogManager>(
+            getGlobalServiceContext(),
+            configCS,
+            shardRegistry.get(),
+            HostAndPort(getHostName(), serverGlobalParams.port));
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
-    shardRegistry->init(catalogManager.get());
     shardRegistry->startup();
-    grid.init(std::move(catalogManager), std::move(shardRegistry));
+    grid.init(std::move(catalogManager),
+              std::move(shardRegistry),
+              stdx::make_unique<ClusterCursorManager>(getGlobalServiceContext()->getClockSource()));
 
     return Status::OK();
 }

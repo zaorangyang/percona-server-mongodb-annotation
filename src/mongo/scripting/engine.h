@@ -80,6 +80,7 @@ public:
     virtual long long getNumberLongLong(const char* field) {
         return static_cast<long long>(getNumber(field));
     }
+    virtual Decimal128 getNumberDecimal(const char* field) = 0;
 
     virtual void setElement(const char* field, const BSONElement& e) = 0;
     virtual void setNumber(const char* field, double val) = 0;
@@ -239,6 +240,7 @@ public:
     virtual bool utf8Ok() const = 0;
 
     static void setup();
+    static void dropScopeCache();
 
     /** gets a scope from the pool or a new one if pool is empty
      * @param db The db name

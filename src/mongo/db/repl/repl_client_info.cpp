@@ -33,6 +33,7 @@
 #include "mongo/base/init.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/decorable.h"
 
@@ -42,11 +43,11 @@ namespace repl {
 const Client::Decoration<ReplClientInfo> ReplClientInfo::forClient =
     Client::declareDecoration<ReplClientInfo>();
 
-long long ReplClientInfo::getTerm() {
-    if (_cachedTerm == kUninitializedTerm) {
-        _cachedTerm = getGlobalReplicationCoordinator()->getTerm();
+void ReplClientInfo::setLastOpToSystemLastOpTime(OperationContext* txn) {
+    ReplicationCoordinator* replCoord = repl::ReplicationCoordinator::get(txn->getServiceContext());
+    if (replCoord->isReplEnabled()) {
+        setLastOp(replCoord->getMyLastOptime());
     }
-    return _cachedTerm;
 }
 
 }  // namespace repl

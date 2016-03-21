@@ -35,6 +35,7 @@
 #include "mongo/bson/bson_validate.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/decimal128.h"
 
 namespace mongo {
 
@@ -206,10 +207,12 @@ Status validateElementInfo(Buffer* buffer, ValidationState::State* nextState, BS
             return Status::OK();
 
         case Bool:
-            if (!buffer->skip(sizeof(int8_t)))
+            uint8_t val;
+            if (!buffer->readNumber(&val))
                 return makeError("invalid bson", idElem);
+            if ((val != 0) && (val != 1))
+                return makeError("invalid boolean value", idElem);
             return Status::OK();
-
 
         case NumberDouble:
         case NumberLong:
@@ -218,6 +221,17 @@ Status validateElementInfo(Buffer* buffer, ValidationState::State* nextState, BS
             if (!buffer->skip(sizeof(int64_t)))
                 return makeError("invalid bson", idElem);
             return Status::OK();
+
+        case NumberDecimal:
+            if (Decimal128::enabled) {
+                if (!buffer->skip(sizeof(Decimal128::Value)))
+                    return makeError("Invalid bson", idElem);
+                return Status::OK();
+            } else {
+                return Status(ErrorCodes::InvalidBSON,
+                              "Attempt to use a decimal BSON type when experimental decimal "
+                              "server support is not currently enabled.");
+            }
 
         case DBRef:
             status = buffer->readUTF8String(NULL);

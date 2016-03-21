@@ -69,7 +69,7 @@ Tee* migrateLog = RamLog::get("migrate");
 class DeleteNotificationStage final : public PlanStage {
 public:
     DeleteNotificationStage(MigrationSourceManager* migrationSourceManager)
-        : PlanStage("NOTIFY_DELETE"), _migrationSourceManager(migrationSourceManager) {}
+        : PlanStage("NOTIFY_DELETE", nullptr), _migrationSourceManager(migrationSourceManager) {}
 
     void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) override {
         if (type == INVALIDATION_DELETION) {
@@ -81,19 +81,19 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual bool isEOF() {
+    bool isEOF() final {
         MONGO_UNREACHABLE;
     }
 
-    virtual unique_ptr<PlanStageStats> getStats() {
+    unique_ptr<PlanStageStats> getStats() final {
         MONGO_UNREACHABLE;
     }
 
-    virtual SpecificStats* getSpecificStats() const {
+    SpecificStats* getSpecificStats() const final {
         MONGO_UNREACHABLE;
     }
 
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_NOTIFY_DELETE;
     }
 
@@ -225,7 +225,7 @@ void MigrationSourceManager::logOp(OperationContext* txn,
                                    const BSONObj& obj,
                                    BSONObj* patt,
                                    bool notInActiveChunk) {
-    ensureShardVersionOKOrThrow(txn->getClient(), ns);
+    ensureShardVersionOKOrThrow(txn, ns);
 
     const char op = opstr[0];
 
@@ -364,8 +364,13 @@ bool MigrationSourceManager::storeCurrentLocs(OperationContext* txn,
         max = Helpers::toKeyFormat(kp.extendRangeBound(_max, false));
     }
 
-    unique_ptr<PlanExecutor> exec(
-        InternalPlanner::indexScan(txn, collection, idx, min, max, false));
+    unique_ptr<PlanExecutor> exec(InternalPlanner::indexScan(txn,
+                                                             collection,
+                                                             idx,
+                                                             min,
+                                                             max,
+                                                             false,  // endKeyInclusive
+                                                             PlanExecutor::YIELD_MANUAL));
 
     // We can afford to yield here because any change to the base data that we might miss is already
     // being queued and will migrate in the 'transferMods' stage.

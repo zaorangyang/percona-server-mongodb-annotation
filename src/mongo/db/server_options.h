@@ -29,6 +29,7 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/util/net/listen.h"  // For DEFAULT_MAX_CONN
 
 namespace mongo {
@@ -43,6 +44,7 @@ struct ServerGlobalParams {
           indexBuildRetry(true),
           quiet(false),
           configsvr(false),
+          configsvrMode(CatalogManager::ConfigServerMode::NONE),
           cpu(false),
           objcheck(true),
           defaultProfile(0),
@@ -78,7 +80,8 @@ struct ServerGlobalParams {
 
     bool quiet;  // --quiet
 
-    bool configsvr;  // --configsvr
+    bool configsvr;                                  // --configsvr
+    CatalogManager::ConfigServerMode configsvrMode;  // -- configsvrMode
 
     bool cpu;  // --cpu show cpu time periodically
 
@@ -117,8 +120,7 @@ struct ServerGlobalParams {
      * Switches to enable experimental (unsupported) features.
      */
     struct ExperimentalFeatures {
-        ExperimentalFeatures() : indexStatsCmdEnabled(false), storageDetailsCmdEnabled(false) {}
-        bool indexStatsCmdEnabled;      // -- enableExperimentalIndexStatsCmd
+        ExperimentalFeatures() : storageDetailsCmdEnabled(false) {}
         bool storageDetailsCmdEnabled;  // -- enableExperimentalStorageDetailsCmd
     } experimental;
 

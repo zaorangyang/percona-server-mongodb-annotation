@@ -29,6 +29,7 @@
 #pragma once
 
 #include "mongo/base/status_with.h"
+#include "mongo/client/fetcher.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/stdx/condition_variable.h"
@@ -92,6 +93,8 @@ public:
 
     void shutdown();
     void notify(OperationContext* txn);
+
+    bool isPaused() const;
 
     // Blocks until _pause becomes true from a call to stop() or shutdown()
     void waitUntilPaused();
@@ -167,13 +170,14 @@ private:
     void _produce(OperationContext* txn, executor::TaskExecutor* taskExecutor);
 
     /**
-     * Checks the criteria for rolling back.
-     * 'getNextOperation' returns the first result of the oplog tailing query.
-     * Returns RemoteOplogStale if the oplog query has no results.
-     * Returns OplogStartMissing if we cannot find the timestamp of the last fetched operation in
-     * the remote oplog.
+     * Processes query responses from fetcher.
      */
-    Status _checkRemoteOplogStart(stdx::function<StatusWith<BSONObj>()> getNextOperation);
+    void _fetcherCallback(const StatusWith<Fetcher::QueryResponse>& result,
+                          BSONObjBuilder* bob,
+                          const HostAndPort& source,
+                          OpTime lastOpTimeFetched,
+                          long long lastFetchedHash,
+                          Status* remoteOplogStartStatus);
 
     /**
      * Executes a rollback.

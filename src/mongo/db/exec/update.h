@@ -71,7 +71,7 @@ private:
  *
  * Callers of work() must be holding a write lock.
  */
-class UpdateStage : public PlanStage {
+class UpdateStage final : public PlanStage {
     MONGO_DISALLOW_COPYING(UpdateStage);
 
 public:
@@ -81,19 +81,18 @@ public:
                 Collection* collection,
                 PlanStage* child);
 
-    virtual bool isEOF();
-    virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState work(WorkingSetID* out) final;
 
-    virtual void doRestoreState();
-    virtual void doReattachToOperationContext(OperationContext* opCtx);
+    void doRestoreState() final;
 
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_UPDATE;
     }
 
-    virtual std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
@@ -165,9 +164,6 @@ private:
      * Helper for restoring the state of this update.
      */
     Status restoreUpdateState();
-
-    // Transactional context.  Not owned by us.
-    OperationContext* _txn;
 
     UpdateStageParams _params;
 

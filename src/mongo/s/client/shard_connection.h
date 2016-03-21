@@ -103,7 +103,7 @@ public:
     }
 
     /** checks all of my thread local connections for the version of this ns */
-    static void checkMyConnectionVersions(const std::string& ns);
+    static void checkMyConnectionVersions(OperationContext* txn, const std::string& ns);
 
     /**
      * Returns all the current sharded connections to the pool.
@@ -123,13 +123,11 @@ public:
     static void forgetNS(const std::string& ns);
 
 private:
-    void _init();
     void _finishInit();
 
     const ConnectionString _cs;
     const std::string _ns;
-
-    std::shared_ptr<ChunkManager> _manager;
+    const std::shared_ptr<ChunkManager> _manager;
 
     bool _finishedInit;
 

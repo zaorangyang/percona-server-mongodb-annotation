@@ -104,7 +104,8 @@ class OperationContext;
  */
 class PlanStage {
 public:
-    PlanStage(const char* typeName) : _commonStats(typeName) {}
+    PlanStage(const char* typeName, OperationContext* opCtx)
+        : _commonStats(typeName), _opCtx(opCtx) {}
 
     virtual ~PlanStage() {}
 
@@ -268,6 +269,16 @@ public:
     }
 
     /**
+     * Returns the only child.
+     *
+     * Convenience method for PlanStages that have exactly one child.
+     */
+    const std::unique_ptr<PlanStage>& child() const {
+        dassert(_children.size() == 1);
+        return _children.front();
+    }
+
+    /**
      * What type of stage is this?
      */
     virtual StageType stageType() const = 0;
@@ -323,35 +334,33 @@ protected:
 
     /**
      * Does stage-specific detaching.
+     *
+     * Implementations of this method cannot use the pointer returned from getOpCtx().
      */
     virtual void doDetachFromOperationContext() {}
 
     /**
      * Does stage-specific attaching.
      *
-     * If the stage needs an OperationContext during its execution, it may keep a handle to the
-     * provided OperationContext (which is valid until the next call to
-     * doDetachFromOperationContext()).
+     * If an OperationContext* is needed, use getOpCtx(), which will return a valid
+     * OperationContext* (the one to which the stage is reattaching).
      */
-    virtual void doReattachToOperationContext(OperationContext* opCtx) {}
+    virtual void doReattachToOperationContext() {}
 
     /**
      * Does the stage-specific invalidation work.
      */
     virtual void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {}
 
-    /**
-     * Returns the only child.
-     *
-     * Convenience method for PlanStages that have exactly one child.
-     */
-    const std::unique_ptr<PlanStage>& child() const {
-        dassert(_children.size() == 1);
-        return _children.front();
+    OperationContext* getOpCtx() const {
+        return _opCtx;
     }
 
     Children _children;
     CommonStats _commonStats;
+
+private:
+    OperationContext* _opCtx;
 };
 
 }  // namespace mongo

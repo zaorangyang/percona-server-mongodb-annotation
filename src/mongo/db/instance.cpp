@@ -76,6 +76,7 @@
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/service_context.h"
@@ -634,6 +635,8 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
     uassertStatusOK(userAllowedWriteNS(nsString));
     int flags = d.pullInt();
     BSONObj query = d.nextJsObj();
+    auto client = txn->getClient();
+    auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
 
     verify(d.moreJSObjs());
     verify(query.objsize() < m.header().dataLen());
@@ -647,15 +650,14 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
 
     op.debug().query = query;
     {
-        stdx::lock_guard<Client> lk(*txn->getClient());
+        stdx::lock_guard<Client> lk(*client);
         op.setNS_inlock(nsString.ns());
         op.setQuery_inlock(query);
     }
 
-    Status status = AuthorizationSession::get(txn->getClient())
-                        ->checkAuthForUpdate(nsString, query, toupdate, upsert);
-    audit::logUpdateAuthzCheck(
-        txn->getClient(), nsString, query, toupdate, upsert, multi, status.code());
+    Status status =
+        AuthorizationSession::get(client)->checkAuthForUpdate(nsString, query, toupdate, upsert);
+    audit::logUpdateAuthzCheck(client, nsString, query, toupdate, upsert, multi, status.code());
     uassertStatusOK(status);
 
     UpdateRequest request(nsString);
@@ -695,8 +697,13 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
                 UpdateResult res = UpdateStage::makeUpdateResult(*exec, &op.debug());
 
                 // for getlasterror
-                LastError::get(txn->getClient())
-                    .recordUpdate(res.existing, res.numMatched, res.upserted);
+                LastError::get(client).recordUpdate(res.existing, res.numMatched, res.upserted);
+
+                // No-ops need to reset lastOp in the client, for write concern.
+                if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
+                    repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
+                }
+
                 return;
             }
             break;
@@ -741,7 +748,12 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
         uassertStatusOK(exec->executePlan());
         UpdateResult res = UpdateStage::makeUpdateResult(*exec, &op.debug());
 
-        LastError::get(txn->getClient()).recordUpdate(res.existing, res.numMatched, res.upserted);
+        LastError::get(client).recordUpdate(res.existing, res.numMatched, res.upserted);
+
+        // No-ops need to reset lastOp in the client, for write concern.
+        if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
+            repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
+        }
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "update", nsString.ns());
 }
@@ -755,16 +767,18 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
     verify(d.moreJSObjs());
     BSONObj pattern = d.nextJsObj();
 
+    auto client = txn->getClient();
+    auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
+
     op.debug().query = pattern;
     {
-        stdx::lock_guard<Client> lk(*txn->getClient());
+        stdx::lock_guard<Client> lk(*client);
         op.setQuery_inlock(pattern);
         op.setNS_inlock(nsString.ns());
     }
 
-    Status status =
-        AuthorizationSession::get(txn->getClient())->checkAuthForDelete(nsString, pattern);
-    audit::logDeleteAuthzCheck(txn->getClient(), nsString, pattern, status.code());
+    Status status = AuthorizationSession::get(client)->checkAuthForDelete(nsString, pattern);
+    audit::logDeleteAuthzCheck(client, nsString, pattern, status.code());
     uassertStatusOK(status);
 
     DeleteRequest request(nsString);
@@ -795,8 +809,13 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
             // Run the plan and get the number of docs deleted.
             uassertStatusOK(exec->executePlan());
             long long n = DeleteStage::getNumDeleted(*exec);
-            LastError::get(txn->getClient()).recordDelete(n);
+            LastError::get(client).recordDelete(n);
             op.debug().ndeleted = n;
+
+            // No-ops need to reset lastOp in the client, for write concern.
+            if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
+                repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
+            }
 
             break;
         } catch (const WriteConflictException& dle) {
@@ -1009,6 +1028,25 @@ static void insertSystemIndexes(OperationContext* txn, DbMessage& d, CurOp& curO
     }
 }
 
+bool _receivedInsert(OperationContext* txn,
+                     const NamespaceString& nsString,
+                     const char* ns,
+                     vector<BSONObj>& docs,
+                     bool keepGoing,
+                     CurOp& op,
+                     bool checkCollection) {
+    // CONCURRENCY TODO: is being read locked in big log sufficient here?
+    // writelock is used to synchronize stepdowns w/ writes
+    uassert(
+        10058, "not master", repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nsString));
+
+    OldClientContext ctx(txn, ns);
+    if (checkCollection && !ctx.db()->getCollection(nsString))
+        return false;
+    insertMulti(txn, ctx, keepGoing, ns, docs, op);
+    return true;
+}
+
 void receivedInsert(OperationContext* txn, const NamespaceString& nsString, Message& m, CurOp& op) {
     DbMessage d(m);
     const char* ns = d.getns();
@@ -1041,32 +1079,16 @@ void receivedInsert(OperationContext* txn, const NamespaceString& nsString, Mess
         uassertStatusOK(status);
     }
 
-    const int notMasterCodeForInsert = 10058;  // This is different from ErrorCodes::NotMaster
+    const bool keepGoing = d.reservedField() & InsertOption_ContinueOnError;
     {
         ScopedTransaction transaction(txn, MODE_IX);
         Lock::DBLock dbLock(txn->lockState(), nsString.db(), MODE_IX);
         Lock::CollectionLock collLock(txn->lockState(), nsString.ns(), MODE_IX);
 
-        // CONCURRENCY TODO: is being read locked in big log sufficient here?
-        // writelock is used to synchronize stepdowns w/ writes
-        uassert(notMasterCodeForInsert,
-                "not master",
-                repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nsString));
-
         // OldClientContext may implicitly create a database, so check existence
         if (dbHolder().get(txn, nsString.db()) != NULL) {
-            OldClientContext ctx(txn, ns);
-            if (ctx.db()->getCollection(nsString)) {
-                if (multi.size() > 1) {
-                    const bool keepGoing = d.reservedField() & InsertOption_ContinueOnError;
-                    insertMulti(txn, ctx, keepGoing, ns, multi, op);
-                } else {
-                    checkAndInsert(txn, ctx, ns, multi[0]);
-                    globalOpCounters.incInsertInWriteLock(1);
-                    op.debug().ninserted = 1;
-                }
+            if (_receivedInsert(txn, nsString, ns, multi, keepGoing, op, true))
                 return;
-            }
         }
     }
 
@@ -1074,22 +1096,7 @@ void receivedInsert(OperationContext* txn, const NamespaceString& nsString, Mess
     ScopedTransaction transaction(txn, MODE_IX);
     Lock::DBLock dbLock(txn->lockState(), nsString.db(), MODE_X);
 
-    // CONCURRENCY TODO: is being read locked in big log sufficient here?
-    // writelock is used to synchronize stepdowns w/ writes
-    uassert(notMasterCodeForInsert,
-            "not master",
-            repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nsString));
-
-    OldClientContext ctx(txn, ns);
-
-    if (multi.size() > 1) {
-        const bool keepGoing = d.reservedField() & InsertOption_ContinueOnError;
-        insertMulti(txn, ctx, keepGoing, ns, multi, op);
-    } else {
-        checkAndInsert(txn, ctx, ns, multi[0]);
-        globalOpCounters.incInsertInWriteLock(1);
-        op.debug().ninserted = 1;
-    }
+    _receivedInsert(txn, nsString, ns, multi, keepGoing, op, false);
 }
 
 static AtomicUInt32 shutdownInProgress(0);
@@ -1113,6 +1120,11 @@ static void shutdownServer() {
     log(LogComponent::kNetwork) << "shutdown: going to close sockets..." << endl;
     stdx::thread close_socket_thread(stdx::bind(MessagingPort::closeAllSockets, 0));
     close_socket_thread.detach();
+
+    // We drop the scope cache because leak sanitizer can't see across the
+    // thread we use for proxying MozJS requests. Dropping the cache cleans up
+    // the memory and makes leak sanitizer happy.
+    ScriptEngine::dropScopeCache();
 
     getGlobalServiceContext()->shutdownGlobalStorageEngineCleanly();
 }
@@ -1147,7 +1159,16 @@ void exitCleanly(ExitCode code) {
     getGlobalServiceContext()->setKillAllOperations();
 
     repl::getGlobalReplicationCoordinator()->shutdown();
-    auto catalogMgr = grid.catalogManager();
+
+    Client& client = cc();
+    ServiceContext::UniqueOperationContext uniqueTxn;
+    OperationContext* txn = client.getOperationContext();
+    if (!txn) {
+        uniqueTxn = client.makeOperationContext();
+        txn = uniqueTxn.get();
+    }
+
+    auto catalogMgr = grid.catalogManager(txn);
     if (catalogMgr) {
         catalogMgr->shutDown();
     }

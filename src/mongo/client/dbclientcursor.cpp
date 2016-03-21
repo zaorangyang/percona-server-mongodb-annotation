@@ -501,38 +501,27 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
       wasError(false) {}
 
 DBClientCursor::~DBClientCursor() {
+    kill();
+}
+
+void DBClientCursor::kill() {
     DESTRUCTOR_GUARD(
 
         if (cursorId && _ownCursor && !inShutdown()) {
-            BufBuilder b;
-            b.appendNum((int)0);  // reserved
-            b.appendNum((int)1);  // number
-            b.appendNum(cursorId);
-
-            Message m;
-            m.setData(dbKillCursors, b.buf(), b.len());
-
             if (_client) {
-                // Kill the cursor the same way the connection itself would.  Usually, non-lazily
-                if (DBClientConnection::getLazyKillCursor())
-                    _client->sayPiggyBack(m);
-                else
-                    _client->say(m);
-
+                _client->killCursor(cursorId);
             } else {
                 verify(_scopedHost.size());
                 ScopedDbConnection conn(_scopedHost);
-
-                if (DBClientConnection::getLazyKillCursor())
-                    conn->sayPiggyBack(m);
-                else
-                    conn->say(m);
-
+                conn->killCursor(cursorId);
                 conn.done();
             }
         }
 
         );
+
+    // Mark this cursor as dead since we can't do any getMores.
+    cursorId = 0;
 }
 
 

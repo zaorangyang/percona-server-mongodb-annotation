@@ -32,14 +32,19 @@
 
 #include "mongo/executor/network_interface_asio.h"
 
+#include <type_traits>
 #include <utility>
 
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/executor/async_stream_interface.h"
 #include "mongo/rpc/factory.h"
+#include "mongo/rpc/protocol.h"
+#include "mongo/rpc/reply_interface.h"
 #include "mongo/rpc/request_builder_interface.h"
-#include "mongo/util/log.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -53,38 +58,54 @@ namespace executor {
 namespace {
 
 using asio::ip::tcp;
-using NetworkOpHandler = stdx::function<void(std::error_code, size_t)>;
+using ResponseStatus = TaskExecutor::ResponseStatus;
 
-// TODO: Consider templatizing on handler here to avoid using stdx::functions.
-void asyncSendMessage(tcp::socket& sock, Message* m, NetworkOpHandler handler) {
+// A type conforms to the NetworkHandler concept if it is a callable type that takes a
+// std::error_code and std::size_t and returns void. The std::error_code parameter is used
+// to inform the handler if the asynchronous operation it was waiting on succeeded, and the size_t
+// parameter conveys how many bytes were read or written.
+template <typename FunctionLike>
+using IsNetworkHandler =
+    std::is_convertible<FunctionLike, stdx::function<void(std::error_code, std::size_t)>>;
+
+template <typename Handler>
+void asyncSendMessage(AsyncStreamInterface& stream, Message* m, Handler&& handler) {
+    static_assert(IsNetworkHandler<Handler>::value,
+                  "Handler passed to asyncSendMessage does not conform to NetworkHandler concept");
     // TODO: Some day we may need to support vector messages.
     fassert(28708, m->buf() != 0);
-    asio::const_buffer buf(m->buf(), m->size());
-    asio::async_write(sock, asio::buffer(buf), handler);
+    stream.write(asio::buffer(m->buf(), m->size()), std::forward<Handler>(handler));
 }
 
-void asyncRecvMessageHeader(tcp::socket& sock, MSGHEADER::Value* header, NetworkOpHandler handler) {
-    asio::async_read(
-        sock, asio::buffer(header->view().view2ptr(), sizeof(MSGHEADER::Value)), handler);
+template <typename Handler>
+void asyncRecvMessageHeader(AsyncStreamInterface& stream,
+                            MSGHEADER::Value* header,
+                            Handler&& handler) {
+    static_assert(
+        IsNetworkHandler<Handler>::value,
+        "Handler passed to asyncRecvMessageHeader does not conform to NetworkHandler concept");
+    stream.read(asio::buffer(header->view().view2ptr(), sizeof(decltype(*header))),
+                std::forward<Handler>(handler));
 }
 
-void asyncRecvMessageBody(tcp::socket& sock,
+template <typename Handler>
+void asyncRecvMessageBody(AsyncStreamInterface& stream,
                           MSGHEADER::Value* header,
                           Message* m,
-                          NetworkOpHandler handler) {
-    // TODO: This error code should be more meaningful.
-    std::error_code ec;
-
+                          Handler&& handler) {
+    static_assert(
+        IsNetworkHandler<Handler>::value,
+        "Handler passed to asyncRecvMessageBody does not conform to NetworkHandler concept");
     // validate message length
     int len = header->constView().getMessageLength();
     if (len == 542393671) {
         LOG(3) << "attempt to access MongoDB over HTTP on the native driver port.";
-        return handler(ec, 0);
+        return handler(make_error_code(ErrorCodes::ProtocolError), 0);
     } else if (static_cast<size_t>(len) < sizeof(MSGHEADER::Value) ||
                static_cast<size_t>(len) > MaxMessageSizeBytes) {
         warning() << "recv(): message len " << len << " is invalid. "
                   << "Min " << sizeof(MSGHEADER::Value) << " Max: " << MaxMessageSizeBytes;
-        return handler(ec, 0);
+        return handler(make_error_code(ErrorCodes::InvalidLength), 0);
     }
 
     int z = (len + 1023) & 0xfffffc00;
@@ -99,17 +120,16 @@ void asyncRecvMessageBody(tcp::socket& sock,
     invariant(bodyLength >= 0);
 
     // receive remaining data into md->data
-    asio::async_read(sock, asio::buffer(mdView.data(), bodyLength), handler);
+    stream.read(asio::buffer(mdView.data(), bodyLength), std::forward<Handler>(handler));
 }
 
 }  // namespace
 
-NetworkInterfaceASIO::AsyncCommand::AsyncCommand(AsyncConnection* conn) : _conn(conn) {}
-
-void NetworkInterfaceASIO::AsyncCommand::reset() {
-    // TODO: Optimize reuse of Messages to be more space-efficient.
-    _toSend.reset();
-    _toRecv.reset();
+NetworkInterfaceASIO::AsyncCommand::AsyncCommand(AsyncConnection* conn,
+                                                 Message&& command,
+                                                 Date_t now)
+    : _conn(conn), _toSend(std::move(command)), _start(now) {
+    _toSend.header().setResponseTo(0);
 }
 
 NetworkInterfaceASIO::AsyncConnection& NetworkInterfaceASIO::AsyncCommand::conn() {
@@ -120,16 +140,40 @@ Message& NetworkInterfaceASIO::AsyncCommand::toSend() {
     return _toSend;
 }
 
-void NetworkInterfaceASIO::AsyncCommand::setToSend(Message&& message) {
-    _toSend = std::move(message);
-}
-
 Message& NetworkInterfaceASIO::AsyncCommand::toRecv() {
     return _toRecv;
 }
 
 MSGHEADER::Value& NetworkInterfaceASIO::AsyncCommand::header() {
     return _header;
+}
+
+ResponseStatus NetworkInterfaceASIO::AsyncCommand::response(rpc::Protocol protocol, Date_t now) {
+    auto& received = _toRecv;
+    try {
+        auto reply = rpc::makeReply(&received);
+
+        if (reply->getProtocol() != protocol) {
+            auto requestProtocol = rpc::toString(static_cast<rpc::ProtocolSet>(protocol));
+            if (!requestProtocol.isOK())
+                return requestProtocol.getStatus();
+
+            return Status(ErrorCodes::RPCProtocolNegotiationFailed,
+                          str::stream() << "Mismatched RPC protocols - request was '"
+                                        << requestProtocol.getValue().toString() << "' '"
+                                        << " but reply was '" << opToString(received.operation())
+                                        << "'");
+        }
+
+        // unavoidable copy
+        auto ownedCommandReply = reply->getCommandReply().getOwned();
+        auto ownedReplyMetadata = reply->getMetadata().getOwned();
+        return ResponseStatus(RemoteCommandResponse(
+            std::move(ownedCommandReply), std::move(ownedReplyMetadata), now - _start));
+    } catch (...) {
+        // makeReply can throw if the reply was invalid.
+        return exceptionToStatus();
+    }
 }
 
 void NetworkInterfaceASIO::_startCommand(AsyncOp* op) {
@@ -139,41 +183,12 @@ void NetworkInterfaceASIO::_startCommand(AsyncOp* op) {
         return;
     }
 
-    // _connect...() will continue the state machine.
-    _connectWithDBClientConnection(op);
-}
-
-std::unique_ptr<Message> NetworkInterfaceASIO::_messageFromRequest(
-    const RemoteCommandRequest& request, rpc::Protocol protocol) {
-    BSONObj query = request.cmdObj;
-    auto requestBuilder = rpc::makeRequestBuilder(protocol);
-
-    // TODO: handle metadata writers
-    auto toSend = rpc::makeRequestBuilder(protocol)
-                      ->setDatabase(request.dbname)
-                      .setCommandName(request.cmdObj.firstElementFieldName())
-                      .setMetadata(request.metadata)
-                      .setCommandArgs(request.cmdObj)
-                      .done();
-
-    toSend->header().setId(nextMessageId());
-    toSend->header().setResponseTo(0);
-
-    return toSend;
+    // _connect() will continue the state machine.
+    _connect(op);
 }
 
 void NetworkInterfaceASIO::_beginCommunication(AsyncOp* op) {
-    auto negotiatedProtocol =
-        rpc::negotiate(op->connection()->serverProtocols(), op->connection()->clientProtocols());
-
-    if (!negotiatedProtocol.isOK()) {
-        return _completeOperation(op, negotiatedProtocol.getStatus());
-    }
-
-    op->setOperationProtocol(negotiatedProtocol.getValue());
-
-    auto& cmd = op->beginCommand(
-        std::move(*_messageFromRequest(op->request(), negotiatedProtocol.getValue())));
+    auto& cmd = op->beginCommand(op->request(), op->operationProtocol(), now());
 
     _asyncRunCommand(&cmd,
                      [this, op](std::error_code ec, size_t bytes) {
@@ -182,47 +197,24 @@ void NetworkInterfaceASIO::_beginCommunication(AsyncOp* op) {
 }
 
 void NetworkInterfaceASIO::_completedOpCallback(AsyncOp* op) {
-    // If we were told to send an empty message, toRecv will be empty here.
-
-    // TODO: handle metadata readers
-    const auto elapsed = [this, op]() { return now() - op->start(); };
-
-    if (op->command().toRecv().empty()) {
-        LOG(3) << "received an empty message";
-        return _completeOperation(op, RemoteCommandResponse(BSONObj(), BSONObj(), elapsed()));
-    }
-
-    try {
-        auto reply = rpc::makeReply(&(op->command().toRecv()));
-
-        if (reply->getProtocol() != op->operationProtocol()) {
-            return _completeOperation(
-                op,
-                Status(ErrorCodes::RPCProtocolNegotiationFailed,
-                       str::stream() << "Mismatched RPC protocols - request was '"
-                                     << opToString(op->command().toSend().operation()) << "' '"
-                                     << " but reply was '"
-                                     << opToString(op->command().toRecv().operation()) << "'"));
-        }
-
-        _completeOperation(op,
-                           // unavoidable copy
-                           RemoteCommandResponse(reply->getCommandReply().getOwned(),
-                                                 reply->getMetadata().getOwned(),
-                                                 elapsed()));
-    } catch (...) {
-        // makeReply can throw if the reply was invalid.
-        _completeOperation(op, exceptionToStatus());
-    }
+    // TODO: handle metadata readers.
+    auto response = op->command().response(op->operationProtocol(), now());
+    _completeOperation(op, response);
 }
 
 void NetworkInterfaceASIO::_networkErrorCallback(AsyncOp* op, const std::error_code& ec) {
     LOG(3) << "networking error occurred";
-    _completeOperation(op, Status(ErrorCodes::HostUnreachable, ec.message()));
+    if (ec.category() == mongoErrorCategory()) {
+        // If we get a Mongo error code, we can preserve it.
+        _completeOperation(op, Status(ErrorCodes::fromInt(ec.value()), ec.message()));
+    } else {
+        // If we get an asio or system error, we just convert it to a network error.
+        _completeOperation(op, Status(ErrorCodes::HostUnreachable, ec.message()));
+    }
 }
 
 // NOTE: This method may only be called by ASIO threads
-// (do not call from methods entered by ReplicationExecutor threads)
+// (do not call from methods entered by TaskExecutor threads)
 void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus& resp) {
     op->finish(resp);
 
@@ -264,7 +256,7 @@ void NetworkInterfaceASIO::_asyncRunCommand(AsyncCommand* cmd, NetworkOpHandler 
         }
 
         asyncRecvMessageBody(
-            cmd->conn().sock(), &cmd->header(), &cmd->toRecv(), std::move(recvMessageCallback));
+            cmd->conn().stream(), &cmd->header(), &cmd->toRecv(), std::move(recvMessageCallback));
     };
 
     // Step 2
@@ -273,12 +265,55 @@ void NetworkInterfaceASIO::_asyncRunCommand(AsyncCommand* cmd, NetworkOpHandler 
         if (ec)
             return handler(ec, bytes);
 
-        asyncRecvMessageHeader(cmd->conn().sock(), &cmd->header(), std::move(recvHeaderCallback));
+        asyncRecvMessageHeader(cmd->conn().stream(), &cmd->header(), std::move(recvHeaderCallback));
     };
 
     // Step 1
-    asyncSendMessage(cmd->conn().sock(), &cmd->toSend(), std::move(sendMessageCallback));
+    asyncSendMessage(cmd->conn().stream(), &cmd->toSend(), std::move(sendMessageCallback));
 }
+
+void NetworkInterfaceASIO::_runConnectionHook(AsyncOp* op) {
+    if (!_hook) {
+        return _beginCommunication(op);
+    }
+
+    auto swOptionalRequest = _hook->makeRequest(op->request().target);
+
+    if (!swOptionalRequest.isOK()) {
+        return _completeOperation(op, swOptionalRequest.getStatus());
+    }
+
+    auto optionalRequest = std::move(swOptionalRequest.getValue());
+
+    if (optionalRequest == boost::none) {
+        return _beginCommunication(op);
+    }
+
+    auto& cmd = op->beginCommand(*optionalRequest, op->operationProtocol(), now());
+
+    auto finishHook = [this, op]() {
+        auto response = op->command().response(op->operationProtocol(), now());
+
+        if (!response.isOK()) {
+            return _completeOperation(op, response.getStatus());
+        }
+
+        auto handleStatus =
+            _hook->handleReply(op->request().target, std::move(response.getValue()));
+
+        if (!handleStatus.isOK()) {
+            return _completeOperation(op, handleStatus);
+        }
+
+        return _beginCommunication(op);
+    };
+
+    return _asyncRunCommand(&cmd,
+                            [this, op, finishHook](std::error_code ec, std::size_t bytes) {
+                                _validateAndRun(op, ec, finishHook);
+                            });
+}
+
 
 }  // namespace executor
 }  // namespace mongo

@@ -30,10 +30,16 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
+#include "mongo/config.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/executor/async_secure_stream_factory.h"
+#include "mongo/executor/async_stream_factory.h"
+#include "mongo/executor/async_stream_interface.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_asio.h"
 #include "mongo/executor/network_interface_impl.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/net/ssl_manager.h"
 
 namespace mongo {
 namespace executor {
@@ -55,10 +61,27 @@ MONGO_INITIALIZER(outboundNetworkImpl)(InitializerContext*) {
 }
 
 std::unique_ptr<NetworkInterface> makeNetworkInterface() {
+    return makeNetworkInterface(nullptr);
+}
+
+std::unique_ptr<NetworkInterface> makeNetworkInterface(
+    std::unique_ptr<NetworkConnectionHook> hook) {
     if (outboundNetworkImpl == kNetworkImplASIO) {
-        return stdx::make_unique<NetworkInterfaceASIO>();
+#ifdef MONGO_CONFIG_SSL
+        if (SSLManagerInterface* manager = getSSLManager()) {
+            auto factory = stdx::make_unique<AsyncSecureStreamFactory>(manager);
+            return stdx::make_unique<NetworkInterfaceASIO>(std::move(factory));
+        }
+#endif
+        auto factory = stdx::make_unique<AsyncStreamFactory>();
+        return stdx::make_unique<NetworkInterfaceASIO>(std::move(factory));
+
     } else {
-        return stdx::make_unique<NetworkInterfaceImpl>();
+        if (hook) {
+            return stdx::make_unique<NetworkInterfaceImpl>(std::move(hook));
+        } else {
+            return stdx::make_unique<NetworkInterfaceImpl>();
+        }
     }
 }
 

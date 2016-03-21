@@ -140,8 +140,8 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::dropCollection
         << ActionType::dropDatabase  // clusterAdmin gets this also TODO(spencer): should
                                      // readWriteAnyDatabase?
-        << ActionType::dropIndex << ActionType::createIndex << ActionType::indexStats
-        << ActionType::enableProfiler << ActionType::listCollections << ActionType::listIndexes
+        << ActionType::dropIndex << ActionType::createIndex << ActionType::enableProfiler
+        << ActionType::listCollections << ActionType::listIndexes
         << ActionType::planCacheIndexFilter << ActionType::planCacheRead
         << ActionType::planCacheWrite << ActionType::reIndex
         << ActionType::renameCollectionSameDB  // read_write gets this also
@@ -154,8 +154,8 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::listDatabases << ActionType::listShards  // clusterManager gets this also
         << ActionType::netstat << ActionType::replSetGetConfig  // clusterManager gets this also
         << ActionType::replSetGetStatus                         // clusterManager gets this also
-        << ActionType::serverStatus << ActionType::top << ActionType::cursorInfo
-        << ActionType::inprog << ActionType::shardingState;
+        << ActionType::serverStatus << ActionType::top << ActionType::inprog
+        << ActionType::shardingState;
 
     // clusterMonitor role actions that target a database (or collection) resource
     clusterMonitorRoleDatabaseActions << ActionType::collStats  // dbAdmin gets this also
@@ -392,6 +392,10 @@ void addClusterManagerPrivileges(PrivilegeVector* privileges) {
         privileges,
         Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "system.replset")),
                   readRoleActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("config", "tags")),
+                  configSettingsActions));
 }
 
 void addClusterAdminPrivileges(PrivilegeVector* privileges) {
@@ -541,6 +545,9 @@ void addRootRolePrivileges(PrivilegeVector* privileges) {
     addUserAdminAnyDbPrivileges(privileges);
     addDbAdminAnyDbPrivileges(privileges);
     addReadWriteAnyDbPrivileges(privileges);
+
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::validate));
 }
 
 void addInternalRolePrivileges(PrivilegeVector* privileges) {

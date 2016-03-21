@@ -54,13 +54,13 @@ using std::string;
 using std::unique_ptr;
 using std::vector;
 
-static const char* ns = "somebogusns";
+static const NamespaceString nss("test.collection");
 
 /**
  * Utility functions to create a CanonicalQuery
  */
 unique_ptr<CanonicalQuery> canonicalize(const BSONObj& queryObj) {
-    auto statusWithCQ = CanonicalQuery::canonicalize(ns, queryObj);
+    auto statusWithCQ = CanonicalQuery::canonicalize(nss, queryObj);
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -76,7 +76,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     BSONObj queryObj = fromjson(queryStr);
     BSONObj sortObj = fromjson(sortStr);
     BSONObj projObj = fromjson(projStr);
-    auto statusWithCQ = CanonicalQuery::canonicalize(ns, queryObj, sortObj, projObj);
+    auto statusWithCQ = CanonicalQuery::canonicalize(nss, queryObj, sortObj, projObj);
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -95,7 +95,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     BSONObj hintObj = fromjson(hintStr);
     BSONObj minObj = fromjson(minStr);
     BSONObj maxObj = fromjson(maxStr);
-    auto statusWithCQ = CanonicalQuery::canonicalize(ns,
+    auto statusWithCQ = CanonicalQuery::canonicalize(nss,
                                                      queryObj,
                                                      sortObj,
                                                      projObj,
@@ -127,7 +127,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     BSONObj minObj = fromjson(minStr);
     BSONObj maxObj = fromjson(maxStr);
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        ns, queryObj, sortObj, projObj, skip, limit, hintObj, minObj, maxObj, snapshot, explain);
+        nss, queryObj, sortObj, projObj, skip, limit, hintObj, minObj, maxObj, snapshot, explain);
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -388,46 +388,6 @@ TEST(PlanCacheTest, AddValidSolution) {
     ASSERT_EQUALS(planCache.size(), 1U);
 }
 
-TEST(PlanCacheTest, NotifyOfWriteOp) {
-    PlanCache planCache;
-    unique_ptr<CanonicalQuery> cq(canonicalize("{a: 1}"));
-    QuerySolution qs;
-    qs.cacheData.reset(new SolutionCacheData());
-    qs.cacheData->tree.reset(new PlanCacheIndexTree());
-    std::vector<QuerySolution*> solns;
-    solns.push_back(&qs);
-    ASSERT_OK(planCache.add(*cq, solns, createDecision(1U)));
-    ASSERT_EQUALS(planCache.size(), 1U);
-
-    // First (N - 1) write ops should have no effect on cache contents.
-    for (int i = 0; i < (internalQueryCacheWriteOpsBetweenFlush - 1); ++i) {
-        planCache.notifyOfWriteOp();
-    }
-    ASSERT_EQUALS(planCache.size(), 1U);
-
-    // N-th notification will cause cache to be cleared.
-    planCache.notifyOfWriteOp();
-    ASSERT_EQUALS(planCache.size(), 0U);
-
-    // Clearing the cache should reset the internal write
-    // operation counter.
-    // Repopulate cache. Write (N - 1) times.
-    // Clear cache.
-    // Add cache entry again.
-    // After clearing and adding a new entry, the next write operation should not
-    // clear the cache.
-    ASSERT_OK(planCache.add(*cq, solns, createDecision(1U)));
-    for (int i = 0; i < (internalQueryCacheWriteOpsBetweenFlush - 1); ++i) {
-        planCache.notifyOfWriteOp();
-    }
-    ASSERT_EQUALS(planCache.size(), 1U);
-    planCache.clear();
-    ASSERT_OK(planCache.add(*cq, solns, createDecision(1U)));
-    // Notification after clearing will not flush cache.
-    planCache.notifyOfWriteOp();
-    ASSERT_EQUALS(planCache.size(), 1U);
-}
-
 /**
  * Each test in the CachePlanSelectionTest suite goes through
  * the following flow:
@@ -547,7 +507,7 @@ protected:
         solns.clear();
 
 
-        auto statusWithCQ = CanonicalQuery::canonicalize(ns,
+        auto statusWithCQ = CanonicalQuery::canonicalize(nss,
                                                          query,
                                                          sort,
                                                          proj,
@@ -628,7 +588,7 @@ protected:
                                       const BSONObj& sort,
                                       const BSONObj& proj,
                                       const QuerySolution& soln) const {
-        auto statusWithCQ = CanonicalQuery::canonicalize(ns, query, sort, proj);
+        auto statusWithCQ = CanonicalQuery::canonicalize(nss, query, sort, proj);
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
 
@@ -980,8 +940,11 @@ TEST_F(CachePlanSelectionTest, CollscanMergeSort) {
     BSONObj sort = BSON("c" << 1);
     runQuerySortProj(query, sort, BSONObj());
 
-    assertPlanCacheRecoversSolution(
-        query, sort, BSONObj(), "{sort: {pattern: {c: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+    assertPlanCacheRecoversSolution(query,
+                                    sort,
+                                    BSONObj(),
+                                    "{sort: {pattern: {c: 1}, limit: 0, node: {sortKeyGen: "
+                                    "{node: {cscan: {dir: 1}}}}}}");
 }
 
 //
@@ -1016,8 +979,8 @@ TEST_F(CachePlanSelectionTest, NaturalHintNotCached) {
     addIndex(BSON("b" << 1));
     runQuerySortHint(BSON("a" << 1), BSON("b" << 1), BSON("$natural" << 1));
     assertNotCached(
-        "{sort: {pattern: {b: 1}, limit: 0, node: "
-        "{cscan: {filter: {a: 1}, dir: 1}}}}");
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {filter: {a: 1}, dir: 1}}}}}}");
 }
 
 TEST_F(CachePlanSelectionTest, HintValidNotCached) {

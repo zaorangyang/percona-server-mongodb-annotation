@@ -300,12 +300,11 @@ public:
             configObj = cmdObj["replSetInitiate"].Obj();
         }
 
-        std::string replSetString = getGlobalReplicationCoordinator()->getSettings().replSet;
+        std::string replSetString = ReplicationCoordinator::get(txn)->getSettings().replSet;
         if (replSetString.empty()) {
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::NoReplicationEnabled,
-                                              "This node was not started with the replSet "
-                                              "option"));
+            return appendCommandStatus(
+                result,
+                ReplicationCoordinator::get(txn)->processReplSetInitiate(txn, configObj, &result));
         }
 
         if (configObj.isEmpty()) {
@@ -660,6 +659,12 @@ bool replHasDatabases(OperationContext* txn) {
     return false;
 }
 
+const std::string kHeartbeatConfigVersion = "configVersion";
+
+bool isHeartbeatRequestV1(const BSONObj& cmdObj) {
+    return cmdObj.hasField(kHeartbeatConfigVersion);
+}
+
 }  // namespace
 
 MONGO_FP_DECLARE(rsDelayHeartbeatResponse);
@@ -695,7 +700,9 @@ public:
                 mp->tag |= executor::NetworkInterface::kMessagingPortKeepOpen;
         }
 
-        if (getGlobalReplicationCoordinator()->isV1ElectionProtocol()) {
+        // Process heartbeat based on the version of request. The missing fields in mismatched
+        // version will be empty.
+        if (isHeartbeatRequestV1(cmdObj)) {
             ReplSetHeartbeatArgsV1 args;
             status = args.initialize(cmdObj);
             if (status.isOK()) {

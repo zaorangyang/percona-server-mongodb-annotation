@@ -232,7 +232,7 @@ Status refetch(FixUpInfo& fixUpInfo, const BSONObj& ourObj) {
                     continue;  // Skipping command name.
                 }
 
-                if (modification == "validator" || modification == "validationState" ||
+                if (modification == "validator" || modification == "validationAction" ||
                     modification == "validationLevel" || modification == "usePowerOf2Sizes" ||
                     modification == "noPadding") {
                     fixUpInfo.collectionsToResyncMetadata.insert(ns.ns());
@@ -323,7 +323,7 @@ void syncFixUp(OperationContext* txn,
 
     // we have items we are writing that aren't from a point-in-time.  thus best not to come
     // online until we get to that point in freshness.
-    OpTime minValid = extractOpTime(newMinValid);
+    OpTime minValid = fassertStatusOK(28774, OpTime::parseFromBSON(newMinValid));
     log() << "minvalid=" << minValid;
     setMinValid(txn, minValid);
 
@@ -401,10 +401,10 @@ void syncFixUp(OperationContext* txn,
                 throw RSFatalException(str::stream()
                                        << "Failed to set validator: " << status.toString());
             }
-            status = collection->setValidationState(txn, options.validationState);
+            status = collection->setValidationAction(txn, options.validationAction);
             if (!status.isOK()) {
                 throw RSFatalException(str::stream()
-                                       << "Failed to set validationState: " << status.toString());
+                                       << "Failed to set validationAction: " << status.toString());
             }
 
             status = collection->setValidationLevel(txn, options.validationLevel);
@@ -426,7 +426,7 @@ void syncFixUp(OperationContext* txn,
             if (newMinValid.isEmpty()) {
                 err = "can't get minvalid from sync source";
             } else {
-                OpTime minValid = extractOpTime(newMinValid);
+                OpTime minValid = fassertStatusOK(28775, OpTime::parseFromBSON(newMinValid));
                 log() << "minvalid=" << minValid;
                 setMinValid(txn, minValid);
             }
@@ -468,8 +468,8 @@ void syncFixUp(OperationContext* txn,
                 removeSaver.reset(new Helpers::RemoveSaver("rollback", "", *it));
 
             // perform a collection scan and write all documents in the collection to disk
-            std::unique_ptr<PlanExecutor> exec(
-                InternalPlanner::collectionScan(txn, *it, db->getCollection(*it)));
+            std::unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
+                txn, *it, db->getCollection(*it), PlanExecutor::YIELD_MANUAL));
             BSONObj curObj;
             PlanExecutor::ExecState execState;
             while (PlanExecutor::ADVANCED == (execState = exec->getNext(&curObj, NULL))) {
@@ -817,7 +817,7 @@ Status syncRollback(OperationContext* txn,
                         localOplog,
                         rollbackSource,
                         replCoord,
-                        [](Seconds seconds) { sleepsecs(seconds.count()); });
+                        [](Seconds seconds) { sleepsecs(durationCount<Seconds>(seconds)); });
 }
 
 }  // namespace repl

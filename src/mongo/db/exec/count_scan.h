@@ -64,32 +64,29 @@ struct CountScanParams {
  * Only created through the getExecutorCount path, as count is the only operation that doesn't
  * care about its data.
  */
-class CountScan : public PlanStage {
+class CountScan final : public PlanStage {
 public:
     CountScan(OperationContext* txn, const CountScanParams& params, WorkingSet* workingSet);
 
-    virtual StageState work(WorkingSetID* out);
-    virtual bool isEOF();
-    virtual void doSaveState();
-    virtual void doRestoreState();
-    virtual void doDetachFromOperationContext();
-    virtual void doReattachToOperationContext(OperationContext* opCtx);
-    virtual void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    StageState work(WorkingSetID* out) final;
+    bool isEOF() final;
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_COUNT_SCAN;
     }
 
-    virtual std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
 private:
-    // transactional context for read locks. Not owned by us
-    OperationContext* _txn;
-
     // The WorkingSet we annotate with results.  Not owned by us.
     WorkingSet* _workingSet;
 

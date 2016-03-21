@@ -8,7 +8,9 @@ env.Library(
         "framework_options.cpp",
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/storage/mmap_v1/storage_mmapv1',
         '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
+        '$BUILD_DIR/mongo/unittest/unittest',
     ],
 )
 
@@ -44,6 +46,7 @@ dbtest = env.Program(
     source=[
         'basictests.cpp',
         'chunktests.cpp',
+        'chunk_manager_tests.cpp',
         'clienttests.cpp',
         'commandtests.cpp',
         'config_server_fixture.cpp',
@@ -70,7 +73,7 @@ dbtest = env.Program(
         'pdfiletests.cpp',
         'perftests.cpp',
         'plan_ranking.cpp',
-        'query_multi_plan_runner.cpp',
+        'query_stage_multiplan.cpp',
         'query_plan_executor.cpp',
         'query_stage_and.cpp',
         'query_stage_cached_plan.cpp',
@@ -93,7 +96,6 @@ dbtest = env.Program(
         'replica_set_monitor_test.cpp',
         'repltests.cpp',
         'rollbacktests.cpp',
-        'sharding.cpp',
         'socktests.cpp',
         'threadedtests.cpp',
         'updatetests.cpp',
@@ -106,11 +108,9 @@ dbtest = env.Program(
         "$BUILD_DIR/mongo/db/repl/repl_coordinator_global",
         "$BUILD_DIR/mongo/db/repl/replmocks",
         "$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils",
-        "$BUILD_DIR/mongo/s/cluster_ops",
-        "$BUILD_DIR/mongo/s/cluster_ops_impl",
+        "$BUILD_DIR/mongo/platform/platform",
         "$BUILD_DIR/mongo/db/serveronly",
         "$BUILD_DIR/mongo/util/concurrency/rwlock",
-        "$BUILD_DIR/mongo/util/signal_handlers_synchronous",
         "mocklib",
         "testframework",
     ],

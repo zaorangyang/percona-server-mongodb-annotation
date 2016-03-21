@@ -31,7 +31,7 @@ var Explainable = (function() {
 
     var throwOrReturn = function(explainResult) {
         if (("ok" in explainResult && !explainResult.ok) || explainResult.$err) {
-            throw Error("explain failed: " + tojson(explainResult));
+            throw _getErrorWithCode(explainResult, "explain failed: " + tojson(explainResult));
         }
 
         return explainResult;
@@ -138,6 +138,15 @@ var Explainable = (function() {
             params.ns = this._collection.getName();
             var grpCmd = {"group": this._collection.getDB()._groupFixParms(params)};
             var explainCmd = {"explain": grpCmd, "verbosity": this._verbosity};
+            var explainResult = this._collection.runCommand(explainCmd);
+            return throwOrReturn(explainResult);
+        }
+
+        this.distinct = function(keyString, query) {
+            var distinctCmd = {distinct: this._collection.getName(),
+                               key: keyString,
+                               query: query || {}};
+            var explainCmd = {explain: distinctCmd, verbosity: this._verbosity};
             var explainResult = this._collection.runCommand(explainCmd);
             return throwOrReturn(explainResult);
         }

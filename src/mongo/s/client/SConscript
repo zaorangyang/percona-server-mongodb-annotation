@@ -15,6 +15,7 @@ env.Library(
         '$BUILD_DIR/mongo/client/fetcher',
         '$BUILD_DIR/mongo/client/remote_command_runner_impl',
         '$BUILD_DIR/mongo/client/remote_command_targeter',
+        '$BUILD_DIR/mongo/rpc/metadata',
     ]
 )
 
@@ -24,9 +25,11 @@ env.Library(
         'multi_host_query.cpp',
         'scc_fast_query_handler.cpp',
         'sharding_connection_hook.cpp',
+        'sharding_network_connection_hook.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/s/coreshard',
     ]
 )
 

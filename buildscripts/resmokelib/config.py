@@ -41,12 +41,15 @@ DEFAULTS = {
     "jobs": 1,
     "mongo": None,
     "mongod": None,
+    "mongodSetParameters": None,
     "mongos": None,
+    "mongosSetParameters": None,
     "nojournal": None,
     "nopreallocj": None,
     "repeat": 1,
     "reportFile": None,
     "seed": long(time.time() * 256),  # Taken from random.py code in Python 2.7.
+    "shellReadMode": None,
     "shellWriteMode": None,
     "shuffle": False,
     "storageEngine": None,
@@ -86,8 +89,14 @@ MONGO_EXECUTABLE = None
 # The path to the mongod executable used by resmoke.py.
 MONGOD_EXECUTABLE = None
 
+# The --setParameter options passed to mongod.
+MONGOD_SET_PARAMETERS = None
+
 # The path to the mongos executable used by resmoke.py.
 MONGOS_EXECUTABLE = None
+
+# The --setParameter options passed to mongos.
+MONGOS_SET_PARAMETERS = None
 
 # If true, then all mongod's started by resmoke.py and by the mongo shell will not have journaling
 # enabled.
@@ -106,6 +115,9 @@ REPEAT = None
 
 # If set, then resmoke.py will write out a report file with the status of each test that ran.
 REPORT_FILE = None
+
+# If set, then mongo shells started by resmoke.py will use the specified read mode.
+SHELL_READ_MODE = None
 
 # If set, then mongo shells started by resmoke.py will use the specified write mode.
 SHELL_WRITE_MODE = None

@@ -35,6 +35,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/optime_pair.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -80,14 +81,16 @@ enum ShardDrainingStatus {
  */
 class CatalogManager {
     MONGO_DISALLOW_COPYING(CatalogManager);
+    friend class ForwardingCatalogManager;
 
 public:
-    virtual ~CatalogManager() = default;
+    enum class ConfigServerMode {
+        NONE,
+        SCCC,
+        CSRS,
+    };
 
-    /**
-     * Retrieves the connection string for the catalog manager's backing server.
-     */
-    virtual ConnectionString connectionString() const = 0;
+    virtual ~CatalogManager() = default;
 
     /**
      * Performs implementation-specific startup tasks. Must be run after the catalog manager
@@ -98,7 +101,13 @@ public:
     /**
      * Performs necessary cleanup when shutting down cleanly.
      */
-    virtual void shutDown() = 0;
+    virtual void shutDown(bool allowNetworking = true) = 0;
+
+    /**
+     * Returns what type of catalog manager this is - CSRS for the CatalogManagerReplicaSet and
+     * SCCC for the CatalogManagerLegacy.
+     */
+    virtual ConfigServerMode getMode() = 0;
 
     /**
      * Creates a new database or updates the sharding status for an existing one. Cannot be
@@ -110,7 +119,7 @@ public:
      *  - DatabaseDifferCase - database already exists, but with a different case
      *  - ShardNotFound - could not find a shard to place the DB on
      */
-    Status enableSharding(const std::string& dbName);
+    virtual Status enableSharding(const std::string& dbName) = 0;
 
     /**
      * Shards a collection. Assumes that the database is enabled for sharding.
@@ -150,7 +159,7 @@ public:
     virtual StatusWith<std::string> addShard(OperationContext* txn,
                                              const std::string* shardProposedName,
                                              const ConnectionString& shardConnectionString,
-                                             const long long maxSize);
+                                             const long long maxSize) = 0;
 
     /**
      * Tries to remove a shard. To completely remove a shard from a sharded cluster,
@@ -166,34 +175,36 @@ public:
     /**
      * Updates or creates the metadata for a given database.
      */
-    virtual Status updateDatabase(const std::string& dbName, const DatabaseType& db);
+    virtual Status updateDatabase(const std::string& dbName, const DatabaseType& db) = 0;
 
     /**
      * Retrieves the metadata for a given database, if it exists.
      *
      * @param dbName name of the database (case sensitive)
      *
-     * Returns Status::OK along with the database information or any error code indicating the
-     * failure. These are some of the known failures:
+     * Returns Status::OK along with the database information and the OpTime of the config server
+     * which the database information was based upon. Otherwise, returns an error code indicating
+     * the failure. These are some of the known failures:
      *  - DatabaseNotFound - database does not exist
      */
-    virtual StatusWith<DatabaseType> getDatabase(const std::string& dbName) = 0;
+    virtual StatusWith<OpTimePair<DatabaseType>> getDatabase(const std::string& dbName) = 0;
 
     /**
      * Updates or creates the metadata for a given collection.
      */
-    virtual Status updateCollection(const std::string& collNs, const CollectionType& coll);
+    virtual Status updateCollection(const std::string& collNs, const CollectionType& coll) = 0;
 
     /**
      * Retrieves the metadata for a given collection, if it exists.
      *
      * @param collectionNs fully qualified name of the collection (case sensitive)
      *
-     * Returns Status::OK along with the collection information or any error code indicating
+     * Returns Status::OK along with the collection information and the OpTime of the config server
+     * which the collection information was based upon. Otherwise, returns an error code indicating
      * the failure. These are some of the known failures:
      *  - NamespaceNotFound - collection does not exist
      */
-    virtual StatusWith<CollectionType> getCollection(const std::string& collNs) = 0;
+    virtual StatusWith<OpTimePair<CollectionType>> getCollection(const std::string& collNs) = 0;
 
     /**
      * Retrieves all collections undera specified database (or in the system).
@@ -201,11 +212,15 @@ public:
      * @param dbName an optional database name. Must be nullptr or non-empty. If nullptr is
      *      specified, all collections on the system are returned.
      * @param collections variable to receive the set of collections.
+     * @param optime an out parameter that will contain the opTime of the config server.
+     *      Can be null. Note that collections can be fetched in multiple batches and each batch
+     *      can have a unique opTime. This opTime will be the one from the last batch.
      *
      * Returns a !OK status if an error occurs.
      */
     virtual Status getCollections(const std::string* dbName,
-                                  std::vector<CollectionType>* collections) = 0;
+                                  std::vector<CollectionType>* collections,
+                                  repl::OpTime* optime) = 0;
 
     /**
      * Drops the specified collection from the collection metadata store.
@@ -214,7 +229,7 @@ public:
      * some of the known failures:
      *  - NamespaceNotFound - collection does not exist
      */
-    Status dropCollection(OperationContext* txn, const NamespaceString& ns);
+    virtual Status dropCollection(OperationContext* txn, const NamespaceString& ns) = 0;
 
     /**
      * Retrieves all databases for a shard.
@@ -231,13 +246,17 @@ public:
      * @param sort Fields to use for sorting the results. Pass empty BSON object for no sort.
      * @param limit The number of chunk entries to return. Pass boost::none for no limit.
      * @param chunks Vector entry to receive the results
+     * @param optime an out parameter that will contain the opTime of the config server.
+     *      Can be null. Note that chunks can be fetched in multiple batches and each batch
+     *      can have a unique opTime. This opTime will be the one from the last batch.
      *
      * Returns a !OK status if an error occurs.
      */
     virtual Status getChunks(const BSONObj& filter,
                              const BSONObj& sort,
                              boost::optional<int> limit,
-                             std::vector<ChunkType>* chunks) = 0;
+                             std::vector<ChunkType>* chunks,
+                             repl::OpTime* opTime) = 0;
 
     /**
      * Retrieves all tags for the specified collection.
@@ -274,11 +293,18 @@ public:
                                                BSONObjBuilder* result) = 0;
 
     /**
-     * Runs a read-only command on a single config server.
+     * Runs a read-only command on a config server.
      */
     virtual bool runReadCommand(const std::string& dbname,
                                 const BSONObj& cmdObj,
                                 BSONObjBuilder* result) = 0;
+
+    /**
+     * Runs a user management related read-only command on a config server.
+     */
+    virtual bool runUserManagementReadCommand(const std::string& dbname,
+                                              const BSONObj& cmdObj,
+                                              BSONObjBuilder* result) = 0;
 
     /**
      * Applies oplog entries to the config servers.
@@ -338,15 +364,6 @@ public:
                                          BatchedCommandResponse* response) = 0;
 
     /**
-     * Obtains a reference to the distributed lock manager instance to use for synchronizing
-     * system-wide changes.
-     *
-     * The returned reference is valid only as long as the catalog manager is valid and should not
-     * be cached.
-     */
-    virtual DistLockManager* getDistLockManager() const = 0;
-
-    /**
      * Creates a new database entry for the specified database name in the configuration
      * metadata and sets the specified shard as primary.
      *
@@ -358,12 +375,14 @@ public:
      *  - DatabaseDifferCase - database already exists, but with a different case
      *  - ShardNotFound - could not find a shard to place the DB on
      */
-    Status createDatabase(const std::string& dbName);
+    virtual Status createDatabase(const std::string& dbName) = 0;
 
     /**
      * Directly inserts a document in the specified namespace on the config server (only the
      * config or admin databases). If the document does not have _id field, the field will be
      * added.
+     *
+     * This is a thin wrapper around writeConfigServerDirect.
      *
      * NOTE: Should not be used in new code. Instead add a new metadata operation to the
      *       interface.
@@ -373,6 +392,8 @@ public:
     /**
      * Updates a document in the specified namespace on the config server (only the config or
      * admin databases).
+     *
+     * This is a thin wrapper around writeConfigServerDirect.
      *
      * NOTE: Should not be used in new code. Instead add a new metadata operation to the
      *       interface.
@@ -387,6 +408,8 @@ public:
     /**
      * Removes a document from the specified namespace on the config server (only the config
      * or admin databases).
+     *
+     * This is a thin wrapper around writeConfigServerDirect.
      *
      * NOTE: Should not be used in new code. Instead add a new metadata operation to the
      *       interface.
@@ -407,28 +430,13 @@ protected:
     CatalogManager() = default;
 
     /**
-     * Selects an optimal shard on which to place a newly created database from the set of
-     * available shards. Will return ShardNotFound if shard could not be found.
-     */
-    static StatusWith<ShardId> selectShardForNewDatabase(ShardRegistry* shardRegistry);
-
-private:
-    /**
-     * Checks that the given database name doesn't already exist in the config.databases
-     * collection, including under different casing. Optional db can be passed and will
-     * be set with the database details if the given dbName exists.
+     * Obtains a reference to the distributed lock manager instance to use for synchronizing
+     * system-wide changes.
      *
-     * Returns OK status if the db does not exist.
-     * Some known errors include:
-     *  NamespaceExists if it exists with the same casing
-     *  DatabaseDifferCase if it exists under different casing.
+     * The returned reference is valid only as long as the catalog manager is valid and should not
+     * be cached.
      */
-    virtual Status _checkDbDoesNotExist(const std::string& dbName, DatabaseType* db) const = 0;
-
-    /**
-     * Generates a unique name to be given to a newly added shard.
-     */
-    virtual StatusWith<std::string> _generateNewShardName() const = 0;
+    virtual DistLockManager* getDistLockManager() = 0;
 };
 
 }  // namespace mongo

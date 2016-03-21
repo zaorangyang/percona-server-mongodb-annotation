@@ -31,8 +31,10 @@
 #include "mongo/db/db_raii.h"
 
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/s/d_state.h"
 
@@ -81,7 +83,7 @@ void AutoGetCollectionForRead::_init(const std::string& ns, StringData coll) {
 
     // We have both the DB and collection locked, which the prerequisite to do a stable shard
     // version check.
-    ensureShardVersionOKOrThrow(_txn->getClient(), ns);
+    ensureShardVersionOKOrThrow(_txn, ns);
 
     auto curOp = CurOp::get(_txn);
     stdx::lock_guard<Client> lk(*_txn->getClient());
@@ -96,6 +98,23 @@ void AutoGetCollectionForRead::_init(const std::string& ns, StringData coll) {
         curOp->enter_inlock(ns.c_str(), _db.getDb()->getProfilingLevel());
 
         _coll = _db.getDb()->getCollection(ns);
+    }
+
+    if (_coll) {
+        if (auto minSnapshot = _coll->getMinimumVisibleSnapshot()) {
+            if (auto mySnapshot = _txn->recoveryUnit()->getMajorityCommittedSnapshot()) {
+                while (mySnapshot < minSnapshot) {
+                    // Wait until a snapshot is available.
+                    repl::ReplicationCoordinator::get(_txn)->waitForNewSnapshot(_txn);
+
+                    Status status = _txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+                    uassert(28786,
+                            "failed to set read from majority-committed snapshot",
+                            status.isOK());
+                    mySnapshot = _txn->recoveryUnit()->getMajorityCommittedSnapshot();
+                }
+            }
+        }
     }
 }
 
@@ -158,7 +177,7 @@ void OldClientContext::_checkNotStale() const {
         case dbDelete:   // here as well.
             break;
         default:
-            ensureShardVersionOKOrThrow(_txn->getClient(), _ns);
+            ensureShardVersionOKOrThrow(_txn, _ns);
     }
 }
 

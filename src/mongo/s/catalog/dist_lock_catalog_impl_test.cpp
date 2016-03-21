@@ -38,9 +38,10 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/find_and_modify_request.h"
-#include "mongo/db/repl/replication_executor.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/network_test_env.h"
+#include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/s/catalog/catalog_manager_mock.h"
 #include "mongo/s/catalog/dist_lock_catalog_impl.h"
 #include "mongo/s/catalog/type_lockpings.h"
@@ -59,6 +60,7 @@ using executor::NetworkInterfaceMock;
 using executor::NetworkTestEnv;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
+using repl::ReadConcernArgs;
 
 namespace {
 
@@ -105,14 +107,16 @@ private:
     void setUp() override {
         auto networkUniquePtr = stdx::make_unique<executor::NetworkInterfaceMock>();
         executor::NetworkInterfaceMock* network = networkUniquePtr.get();
-        auto executor =
-            stdx::make_unique<repl::ReplicationExecutor>(networkUniquePtr.release(), nullptr, 0);
+        auto executor = executor::makeThreadPoolTestExecutor(std::move(networkUniquePtr));
 
         _networkTestEnv = stdx::make_unique<NetworkTestEnv>(executor.get(), network);
 
-        _shardRegistry = stdx::make_unique<ShardRegistry>(
-            stdx::make_unique<RemoteCommandTargeterFactoryMock>(), std::move(executor), network);
-        _shardRegistry->init(&_catalogMgr);
+        ConnectionString configCS(HostAndPort("dummy:1234"));
+        _shardRegistry =
+            stdx::make_unique<ShardRegistry>(stdx::make_unique<RemoteCommandTargeterFactoryMock>(),
+                                             std::move(executor),
+                                             network,
+                                             configCS);
         _shardRegistry->startup();
 
         _distLockCatalog = stdx::make_unique<DistLockCatalogImpl>(_shardRegistry.get(), kWTimeout);
@@ -134,6 +138,12 @@ private:
     std::unique_ptr<DistLockCatalogImpl> _distLockCatalog;
 };
 
+void checkReadConcern(const BSONObj& findCmd) {
+    auto readConcernElem = findCmd[ReadConcernArgs::kReadConcernFieldName];
+    ASSERT_EQ(Object, readConcernElem.type());
+    ASSERT_EQ(BSON(ReadConcernArgs::kLevelFieldName << "majority"), readConcernElem.Obj());
+}
+
 TEST_F(DistLockCatalogFixture, BasicPing) {
     auto future = launchAsync([this] {
         Date_t ping(dateFromISOString("2014-03-11T09:17:18.098Z").getValue());
@@ -154,7 +164,7 @@ TEST_F(DistLockCatalogFixture, BasicPing) {
                     }
                 },
                 upsert: true,
-                writeConcern: { w: "majority", j: true, wtimeout: 100 }
+                writeConcern: { w: "majority", wtimeout: 100 }
             })"));
 
         ASSERT_EQUALS(expectedCmd, request.cmdObj);
@@ -206,15 +216,15 @@ TEST_F(DistLockCatalogFixture, PingCommandError) {
 TEST_F(DistLockCatalogFixture, PingWriteError) {
     auto future = launchAsync([this] {
         auto status = catalog()->ping("abcd", Date_t::now());
-        ASSERT_EQUALS(ErrorCodes::DuplicateKey, status.code());
+        ASSERT_EQUALS(ErrorCodes::Unauthorized, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
         return fromjson(R"({
                 ok: 0,
-                code: 11000,
-                errmsg: "E11000 duplicate key error"
+                code: 13,
+                errmsg: "not authorized"
             })");
     });
 
@@ -307,7 +317,7 @@ TEST_F(DistLockCatalogFixture, GrabLockNoOp) {
                 },
                 upsert: true,
                 new: true,
-                writeConcern: { w: "majority", j: true, wtimeout: 100 }
+                writeConcern: { w: "majority", wtimeout: 100 }
             })"));
 
         ASSERT_EQUALS(expectedCmd, request.cmdObj);
@@ -353,7 +363,7 @@ TEST_F(DistLockCatalogFixture, GrabLockWithNewDoc) {
                 },
                 upsert: true,
                 new: true,
-                writeConcern: { w: "majority", j: true, wtimeout: 100 }
+                writeConcern: { w: "majority", wtimeout: 100 }
             })"));
 
         ASSERT_EQUALS(expectedCmd, request.cmdObj);
@@ -444,18 +454,36 @@ TEST_F(DistLockCatalogFixture, GrabLockCommandError) {
     future.timed_get(kFutureTimeout);
 }
 
-TEST_F(DistLockCatalogFixture, GrabLockWriteError) {
+TEST_F(DistLockCatalogFixture, GrabLockDupKeyError) {
     auto future = launchAsync([this] {
         auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_EQUALS(ErrorCodes::DuplicateKey, status.code());
+        ASSERT_EQUALS(ErrorCodes::LockStateChangeFailed, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
         return fromjson(R"({
                 ok: 0,
-                code: 11000,
-                errmsg: "E11000 duplicate key error"
+                errmsg: "duplicate key error",
+                code: 11000
+            })");
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(DistLockCatalogFixture, GrabLockWriteError) {
+    auto future = launchAsync([this] {
+        auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
+        ASSERT_EQUALS(ErrorCodes::Unauthorized, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
+
+    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        return fromjson(R"({
+                ok: 0,
+                code: 13,
+                errmsg: "not authorized"
             })");
     });
 
@@ -590,7 +618,7 @@ TEST_F(DistLockCatalogFixture, OvertakeLockNoOp) {
                     }
                 },
                 new: true,
-                writeConcern: { w: "majority", j: true, wtimeout: 100 }
+                writeConcern: { w: "majority", wtimeout: 100 }
             })"));
 
         ASSERT_EQUALS(expectedCmd, request.cmdObj);
@@ -642,7 +670,7 @@ TEST_F(DistLockCatalogFixture, OvertakeLockWithNewDoc) {
                     }
                 },
                 new: true,
-                writeConcern: { w: "majority", j: true, wtimeout: 100 }
+                writeConcern: { w: "majority", wtimeout: 100 }
             })"));
 
         ASSERT_EQUALS(expectedCmd, request.cmdObj);
@@ -739,15 +767,15 @@ TEST_F(DistLockCatalogFixture, OvertakeLockWriteError) {
     auto future = launchAsync([this] {
         auto status =
             catalog()->overtakeLock("", OID(), OID(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_EQUALS(ErrorCodes::DuplicateKey, status.code());
+        ASSERT_EQUALS(ErrorCodes::Unauthorized, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
         return fromjson(R"({
                 ok: 0,
-                code: 11000,
-                errmsg: "E11000 duplicate key error"
+                code: 13,
+                errmsg: "not authorized"
             })");
     });
 
@@ -828,7 +856,7 @@ TEST_F(DistLockCatalogFixture, BasicUnlock) {
                 findAndModify: "locks",
                 query: { ts: ObjectId("555f99712c99a78c5b083358") },
                 update: { $set: { state: 0 }},
-                writeConcern: { w: "majority", j: true, wtimeout: 100 }
+                writeConcern: { w: "majority", wtimeout: 100 }
             })"));
 
         ASSERT_EQUALS(expectedCmd, request.cmdObj);
@@ -860,7 +888,7 @@ TEST_F(DistLockCatalogFixture, UnlockWithNoNewDoc) {
                 findAndModify: "locks",
                 query: { ts: ObjectId("555f99712c99a78c5b083358") },
                 update: { $set: { state: 0 }},
-                writeConcern: { w: "majority", j: true, wtimeout: 100 }
+                writeConcern: { w: "majority", wtimeout: 100 }
             })"));
 
         ASSERT_EQUALS(expectedCmd, request.cmdObj);
@@ -909,15 +937,15 @@ TEST_F(DistLockCatalogFixture, UnlockCommandError) {
 TEST_F(DistLockCatalogFixture, UnlockWriteError) {
     auto future = launchAsync([this] {
         auto status = catalog()->unlock(OID());
-        ASSERT_EQUALS(ErrorCodes::DuplicateKey, status.code());
+        ASSERT_EQUALS(ErrorCodes::Unauthorized, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
         return fromjson(R"({
                 ok: 0,
-                code: 11000,
-                errmsg: "E11000 duplicate key error"
+                code: 13,
+                errmsg: "not authorized"
             })");
     });
 
@@ -1139,7 +1167,7 @@ TEST_F(DistLockCatalogFixture, BasicStopPing) {
                 findAndModify: "lockpings",
                 query: { _id: "test" },
                 remove: true,
-                writeConcern: { w: "majority", j: true, wtimeout: 100 }
+                writeConcern: { w: "majority", wtimeout: 100 }
             })"));
 
         ASSERT_EQUALS(expectedCmd, request.cmdObj);
@@ -1274,28 +1302,29 @@ TEST_F(DistLockCatalogFixture, BasicGetPing) {
         ASSERT_EQUALS(ping, pingDoc.getPing());
     });
 
-    onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
-        ASSERT_EQUALS(dummyHost, request.target);
-        ASSERT_EQUALS("config", request.dbname);
+    onFindCommand(
+        [](const RemoteCommandRequest& request) {
+            ASSERT_EQUALS(dummyHost, request.target);
+            ASSERT_EQUALS("config", request.dbname);
 
-        BSONObj expectedCmd(fromjson(R"({
-            find: "lockpings",
-            filter: { _id: "test" },
-            limit: 1
-        })"));
+            const auto& findCmd = request.cmdObj;
+            ASSERT_EQUALS("lockpings", findCmd["find"].str());
+            ASSERT_EQUALS(BSON("_id"
+                               << "test"),
+                          findCmd["filter"].Obj());
+            ASSERT_EQUALS(1, findCmd["limit"].numberLong());
+            checkReadConcern(findCmd);
 
-        ASSERT_EQUALS(expectedCmd, request.cmdObj);
+            BSONObj pingDoc(fromjson(R"({
+                _id: "test",
+                ping: { $date: "2015-05-26T13:06:27.293Z" }
+            })"));
 
-        BSONObj pingDoc(fromjson(R"({
-            _id: "test",
-            ping: { $date: "2015-05-26T13:06:27.293Z" }
-        })"));
+            std::vector<BSONObj> result;
+            result.push_back(pingDoc);
 
-        std::vector<BSONObj> result;
-        result.push_back(pingDoc);
-
-        return result;
-    });
+            return result;
+        });
 
     future.timed_get(kFutureTimeout);
 }
@@ -1365,13 +1394,11 @@ TEST_F(DistLockCatalogFixture, BasicGetLockByTS) {
         ASSERT_EQUALS(dummyHost, request.target);
         ASSERT_EQUALS("config", request.dbname);
 
-        BSONObj expectedCmd(fromjson(R"({
-            find: "locks",
-            filter: { ts: ObjectId("555f99712c99a78c5b083358") },
-            limit: 1
-        })"));
-
-        ASSERT_EQUALS(expectedCmd, request.cmdObj);
+        const auto& findCmd = request.cmdObj;
+        ASSERT_EQUALS("locks", findCmd["find"].str());
+        ASSERT_EQUALS(BSON("ts" << OID("555f99712c99a78c5b083358")), findCmd["filter"].Obj());
+        ASSERT_EQUALS(1, findCmd["limit"].numberLong());
+        checkReadConcern(findCmd);
 
         BSONObj lockDoc(fromjson(R"({
             _id: "test",
@@ -1447,28 +1474,29 @@ TEST_F(DistLockCatalogFixture, BasicGetLockByName) {
         ASSERT_EQUALS(ts, lockDoc.getLockID());
     });
 
-    onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
-        ASSERT_EQUALS(dummyHost, request.target);
-        ASSERT_EQUALS("config", request.dbname);
+    onFindCommand(
+        [](const RemoteCommandRequest& request) {
+            ASSERT_EQUALS(dummyHost, request.target);
+            ASSERT_EQUALS("config", request.dbname);
 
-        BSONObj expectedCmd(fromjson(R"({
-            find: "locks",
-            filter: { _id: "abc" },
-            limit: 1
-        })"));
+            const auto& findCmd = request.cmdObj;
+            ASSERT_EQUALS("locks", findCmd["find"].str());
+            ASSERT_EQUALS(BSON("_id"
+                               << "abc"),
+                          findCmd["filter"].Obj());
+            ASSERT_EQUALS(1, findCmd["limit"].numberLong());
+            checkReadConcern(findCmd);
 
-        ASSERT_EQUALS(expectedCmd, request.cmdObj);
+            BSONObj lockDoc(fromjson(R"({
+                _id: "abc",
+                state: 2,
+                ts: ObjectId("555f99712c99a78c5b083358")
+            })"));
 
-        BSONObj lockDoc(fromjson(R"({
-            _id: "abc",
-            state: 2,
-            ts: ObjectId("555f99712c99a78c5b083358")
-        })"));
-
-        std::vector<BSONObj> result;
-        result.push_back(lockDoc);
-        return result;
-    });
+            std::vector<BSONObj> result;
+            result.push_back(lockDoc);
+            return result;
+        });
 
     future.timed_get(kFutureTimeout);
 }

@@ -37,12 +37,14 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/platform/decimal128.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/threadlocal.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 using namespace mongoutils;
 
@@ -114,10 +116,9 @@ void MozJSImplScope::_reportError(JSContext* cx, const char* message, JSErrorRep
             ss << " :\n" << ValueWriter(cx, stack).toString();
         }
 
-        scope->_status =
-            Status(report->errorNumber ? static_cast<ErrorCodes::Error>(report->errorNumber)
-                                       : ErrorCodes::JSInterpreterFailure,
-                   ss);
+        scope->_status = Status(
+            JSErrorReportToStatus(cx, report, ErrorCodes::JSInterpreterFailure, message).code(),
+            ss);
     }
 }
 
@@ -156,8 +157,14 @@ OperationContext* MozJSImplScope::getOpContext() const {
 bool MozJSImplScope::_interruptCallback(JSContext* cx) {
     auto scope = getScope(cx);
 
+    JS_SetInterruptCallback(scope->_runtime, nullptr);
+    auto guard = MakeGuard([&]() { JS_SetInterruptCallback(scope->_runtime, _interruptCallback); });
+
     if (scope->_pendingGC.load()) {
+        scope->_pendingGC.store(false);
         JS_GC(scope->_runtime);
+    } else {
+        JS_MaybeGC(cx);
     }
 
     bool kill = scope->isKillPending();
@@ -165,6 +172,8 @@ bool MozJSImplScope::_interruptCallback(JSContext* cx) {
     if (kill) {
         scope->_engine->getDeadlineMonitor().stopDeadline(scope);
         scope->unregisterOperation();
+
+        scope->_status = Status(ErrorCodes::JSInterpreterFailure, "Interrupted by the host");
     }
 
     return !kill;
@@ -224,23 +233,28 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _pendingGC(false),
       _connectState(ConnectState::Not),
       _status(Status::OK()),
+      _quickExit(false),
       _binDataProto(_context),
       _bsonProto(_context),
       _countDownLatchProto(_context),
       _cursorProto(_context),
+      _cursorHandleProto(_context),
       _dbCollectionProto(_context),
       _dbPointerProto(_context),
       _dbQueryProto(_context),
       _dbProto(_context),
       _dbRefProto(_context),
+      _errorProto(_context),
       _jsThreadProto(_context),
       _maxKeyProto(_context),
       _minKeyProto(_context),
       _mongoExternalProto(_context),
+      _mongoHelpersProto(_context),
       _mongoLocalProto(_context),
       _nativeFunctionProto(_context),
       _numberIntProto(_context),
       _numberLongProto(_context),
+      _numberDecimalProto(_context),
       _objectProto(_context),
       _oidProto(_context),
       _regExpProto(_context),
@@ -273,6 +287,7 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
 
     // install global utility functions
     installGlobalUtils(*this);
+    _mongoHelpersProto.install(_global);
 }
 
 MozJSImplScope::~MozJSImplScope() {
@@ -352,6 +367,12 @@ long long MozJSImplScope::getNumberLongLong(const char* field) {
     return ObjectWrapper(_context, _global).getNumberLongLong(field);
 }
 
+Decimal128 MozJSImplScope::getNumberDecimal(const char* field) {
+    MozJSEntry entry(this);
+
+    return ObjectWrapper(_context, _global).getNumberDecimal(field);
+}
+
 std::string MozJSImplScope::getString(const char* field) {
     MozJSEntry entry(this);
 
@@ -402,16 +423,7 @@ BSONObj MozJSImplScope::callThreadArgs(const BSONObj& args) {
     JS::RootedValue out(_context);
     JS::RootedObject thisv(_context);
 
-    bool success = JS::Call(_context, thisv, function, argv, &out);
-
-    if (!success) {
-        auto status = currentJSExceptionToStatus(
-            _context, ErrorCodes::JSInterpreterFailure, "Unknown callThread failure");
-
-        log() << "js thread raised js exception: " << status;
-
-        uasserted(status.code(), status.reason());
-    }
+    _checkErrorState(JS::Call(_context, thisv, function, argv, &out), false, true);
 
     BSONObjBuilder b;
     ValueWriter(_context, out).writeThis(&b, "ret");
@@ -426,22 +438,11 @@ bool hasFunctionIdentifier(StringData code) {
     return code[8] == ' ' || code[8] == '(';
 }
 
-// TODO: This function identification code is broken.  Fix it up to be more robust
-//
-// See: SERVER-16703 for more info
 void MozJSImplScope::_MozJSCreateFunction(const char* raw,
                                           ScriptingFunction functionNumber,
                                           JS::MutableHandleValue fun) {
-    std::string code = jsSkipWhiteSpace(raw);
-    if (!hasFunctionIdentifier(code)) {
-        if (code.find('\n') == std::string::npos && !hasJSReturn(code) &&
-            (code.find(';') == std::string::npos || code.find(';') == code.size() - 1)) {
-            code = "return " + code;
-        }
-        code = "function(){ " + code + "}";
-    }
-
-    code = str::stream() << "_funcs" << functionNumber << " = " << code;
+    std::string code = str::stream() << "_funcs" << functionNumber << " = "
+                                     << parseJSFunctionOrExpression(_context, StringData(raw));
 
     JS::CompileOptions co(_context);
     setCompileOptions(&co);
@@ -552,6 +553,7 @@ bool MozJSImplScope::exec(StringData code,
 
     JS::CompileOptions co(_context);
     setCompileOptions(&co);
+    co.setFile(name.c_str());
     JS::RootedScript script(_context);
 
     bool success = JS::Compile(_context, _global, co, code.rawData(), code.size(), &script);
@@ -575,11 +577,8 @@ bool MozJSImplScope::exec(StringData code,
     ObjectWrapper(_context, _global).setValue(kExecResult, out);
 
     if (printResult && !out.isUndefined()) {
-        // TODO: We seem to use this productively in v8, but it seems
-        // unecessary under sm.  That probably means somethings off
-        //
         // appears to only be used by shell
-        // std::cout << ValueWriter(_context, out).toString() << std::endl;
+        std::cout << ValueWriter(_context, out).toString() << std::endl;
     }
 
     return true;
@@ -672,11 +671,15 @@ void MozJSImplScope::installBSONTypes() {
     _bsonProto.install(_global);
     _dbPointerProto.install(_global);
     _dbRefProto.install(_global);
+    _errorProto.install(_global);
     _maxKeyProto.install(_global);
     _minKeyProto.install(_global);
     _nativeFunctionProto.install(_global);
     _numberIntProto.install(_global);
     _numberLongProto.install(_global);
+    if (Decimal128::enabled) {
+        _numberDecimalProto.install(_global);
+    }
     _objectProto.install(_global);
     _oidProto.install(_global);
     _regExpProto.install(_global);
@@ -689,6 +692,7 @@ void MozJSImplScope::installBSONTypes() {
 
 void MozJSImplScope::installDBAccess() {
     _cursorProto.install(_global);
+    _cursorHandleProto.install(_global);
     _dbProto.install(_global);
     _dbQueryProto.install(_global);
     _dbCollectionProto.install(_global);
@@ -701,6 +705,9 @@ void MozJSImplScope::installFork() {
 
 bool MozJSImplScope::_checkErrorState(bool success, bool reportError, bool assertOnError) {
     if (success)
+        return false;
+
+    if (_quickExit)
         return false;
 
     if (_status.isOK()) {
@@ -732,8 +739,29 @@ MozJSImplScope* MozJSImplScope::getThreadScope() {
     return kCurrentScope;
 }
 
+void MozJSImplScope::setQuickExit(int exitCode) {
+    _quickExit = true;
+    _exitCode = exitCode;
+}
+
+bool MozJSImplScope::getQuickExit(int* exitCode) {
+    if (_quickExit) {
+        *exitCode = _exitCode;
+    }
+
+    return _quickExit;
+}
+
 void MozJSImplScope::setOOM() {
     _status = Status(ErrorCodes::JSInterpreterFailure, "Out of memory");
+}
+
+void MozJSImplScope::setParentStack(std::string parentStack) {
+    _parentStack = std::move(parentStack);
+}
+
+const std::string& MozJSImplScope::getParentStack() const {
+    return _parentStack;
 }
 
 }  // namespace mozjs

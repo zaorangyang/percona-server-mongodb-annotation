@@ -78,7 +78,7 @@ struct GroupRequest {
  *
  * Only created through the getExecutorGroup path.
  */
-class GroupStage : public PlanStage {
+class GroupStage final : public PlanStage {
     MONGO_DISALLOW_COPYING(GroupStage);
 
 public:
@@ -86,19 +86,17 @@ public:
                const GroupRequest& request,
                WorkingSet* workingSet,
                PlanStage* child);
-    virtual ~GroupStage() {}
 
-    virtual StageState work(WorkingSetID* out);
-    virtual bool isEOF();
-    virtual void doReattachToOperationContext(OperationContext* opCtx);
+    StageState work(WorkingSetID* out) final;
+    bool isEOF() final;
 
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_GROUP;
     }
 
-    virtual std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
@@ -128,9 +126,6 @@ private:
     // Finalize the results for this group operation.  Returns an owned BSONObj with the results
     // array.
     BSONObj finalizeResults();
-
-    // Transactional context for read locks.  Not owned by us.
-    OperationContext* _txn;
 
     GroupRequest _request;
 

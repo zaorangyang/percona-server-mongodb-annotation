@@ -444,11 +444,17 @@ __wt_stat_init_connection_stats(WT_CONNECTION_STATS *stats)
 	stats->cursor_search.desc = "cursor: cursor search calls";
 	stats->cursor_search_near.desc = "cursor: cursor search near calls";
 	stats->cursor_update.desc = "cursor: cursor update calls";
-	stats->dh_conn_ref.desc =
-	    "data-handle: connection candidate referenced";
-	stats->dh_conn_handles.desc = "data-handle: connection dhandles swept";
-	stats->dh_conn_sweeps.desc = "data-handle: connection sweeps";
-	stats->dh_conn_tod.desc = "data-handle: connection time-of-death sets";
+	stats->dh_conn_handle_count.desc =
+	    "data-handle: connection data handles currently active";
+	stats->dh_sweep_ref.desc =
+	    "data-handle: connection sweep candidate became referenced";
+	stats->dh_sweep_close.desc =
+	    "data-handle: connection sweep dhandles closed";
+	stats->dh_sweep_remove.desc =
+	    "data-handle: connection sweep dhandles removed from hash list";
+	stats->dh_sweep_tod.desc =
+	    "data-handle: connection sweep time-of-death sets";
+	stats->dh_sweeps.desc = "data-handle: connection sweeps";
 	stats->dh_session_handles.desc = "data-handle: session dhandles swept";
 	stats->dh_session_sweeps.desc = "data-handle: session sweep attempts";
 	stats->log_slot_closes.desc = "log: consolidated slot closures";
@@ -484,12 +490,11 @@ __wt_stat_init_connection_stats(WT_CONNECTION_STATS *stats)
 	stats->log_prealloc_used.desc = "log: pre-allocated log files used";
 	stats->log_slot_toobig.desc = "log: record size exceeded maximum";
 	stats->log_scan_records.desc = "log: records processed by log scan";
-	stats->log_slot_switch_fails.desc =
-	    "log: slots selected for switching that were unavailable";
 	stats->log_compress_mem.desc =
 	    "log: total in-memory size of compressed records";
 	stats->log_buffer_size.desc = "log: total log buffer size";
 	stats->log_compress_len.desc = "log: total size of compressed records";
+	stats->log_slot_coalesced.desc = "log: written slots coalesced";
 	stats->log_close_yields.desc =
 	    "log: yields waiting for previous log file close";
 	stats->lsm_work_queue_app.desc =
@@ -619,10 +624,11 @@ __wt_stat_refresh_connection_stats(void *stats_arg)
 	stats->cursor_search.v = 0;
 	stats->cursor_search_near.v = 0;
 	stats->cursor_update.v = 0;
-	stats->dh_conn_ref.v = 0;
-	stats->dh_conn_handles.v = 0;
-	stats->dh_conn_sweeps.v = 0;
-	stats->dh_conn_tod.v = 0;
+	stats->dh_sweep_ref.v = 0;
+	stats->dh_sweep_close.v = 0;
+	stats->dh_sweep_remove.v = 0;
+	stats->dh_sweep_tod.v = 0;
+	stats->dh_sweeps.v = 0;
 	stats->dh_session_handles.v = 0;
 	stats->dh_session_sweeps.v = 0;
 	stats->log_slot_closes.v = 0;
@@ -647,9 +653,9 @@ __wt_stat_refresh_connection_stats(void *stats_arg)
 	stats->log_prealloc_used.v = 0;
 	stats->log_slot_toobig.v = 0;
 	stats->log_scan_records.v = 0;
-	stats->log_slot_switch_fails.v = 0;
 	stats->log_compress_mem.v = 0;
 	stats->log_compress_len.v = 0;
+	stats->log_slot_coalesced.v = 0;
 	stats->log_close_yields.v = 0;
 	stats->lsm_rows_merged.v = 0;
 	stats->lsm_checkpoint_throttle.v = 0;

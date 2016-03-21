@@ -29,6 +29,7 @@
 #pragma once
 
 #include <asio.hpp>
+
 #include <boost/optional.hpp>
 #include <memory>
 #include <string>
@@ -36,13 +37,15 @@
 #include <unordered_map>
 
 #include "mongo/base/status.h"
-#include "mongo/client/connection_pool.h"
+#include "mongo/base/system_error.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/net/message.h"
@@ -50,13 +53,18 @@
 namespace mongo {
 namespace executor {
 
+class AsyncStreamFactoryInterface;
+class AsyncStreamInterface;
+
 /**
  * Implementation of the replication system's network interface using Christopher
  * Kohlhoff's ASIO library instead of existing MongoDB networking primitives.
  */
 class NetworkInterfaceASIO final : public NetworkInterface {
 public:
-    NetworkInterfaceASIO();
+    NetworkInterfaceASIO(std::unique_ptr<AsyncStreamFactoryInterface> streamFactory,
+                         std::unique_ptr<NetworkConnectionHook> networkConnectionHook);
+    NetworkInterfaceASIO(std::unique_ptr<AsyncStreamFactoryInterface> streamFactory);
     std::string getDiagnosticString() override;
     std::string getHostName() override;
     void startup() override;
@@ -85,13 +93,9 @@ private:
      */
     class AsyncConnection {
     public:
-        AsyncConnection(asio::ip::tcp::socket&& sock, rpc::ProtocolSet serverProtocols);
+        AsyncConnection(std::unique_ptr<AsyncStreamInterface>, rpc::ProtocolSet serverProtocols);
 
-        AsyncConnection(asio::ip::tcp::socket&& sock,
-                        rpc::ProtocolSet serverProtocols,
-                        boost::optional<ConnectionPool::ConnectionPtr>&& bootstrapConn);
-
-        asio::ip::tcp::socket& sock();
+        AsyncStreamInterface& stream();
 
         rpc::ProtocolSet serverProtocols() const;
         rpc::ProtocolSet clientProtocols() const;
@@ -107,17 +111,10 @@ private:
 #endif
 
     private:
-        asio::ip::tcp::socket _sock;
+        std::unique_ptr<AsyncStreamInterface> _stream;
 
         rpc::ProtocolSet _serverProtocols;
         rpc::ProtocolSet _clientProtocols{rpc::supports::kAll};
-
-        /**
-         * The bootstrap connection we use to run auth. This will eventually go away when we finish
-         * implementing async auth, but for now we need to keep it alive so that the socket it
-         * creates stays open.
-         */
-        boost::optional<ConnectionPool::ConnectionPtr> _bootstrapConn;
     };
 
     /**
@@ -125,19 +122,15 @@ private:
      */
     class AsyncCommand {
     public:
-        AsyncCommand(AsyncConnection* conn);
-
-        // This method resets the Messages and associated information held inside
-        // an AsyncCommand so that it may be reused to run a new network roundtrip.
-        void reset();
+        AsyncCommand(AsyncConnection* conn, Message&& command, Date_t now);
 
         NetworkInterfaceASIO::AsyncConnection& conn();
 
         Message& toSend();
-        void setToSend(Message&& message);
-
         Message& toRecv();
         MSGHEADER::Value& header();
+
+        ResponseStatus response(rpc::Protocol protocol, Date_t now);
 
     private:
         NetworkInterfaceASIO::AsyncConnection* const _conn;
@@ -147,6 +140,8 @@ private:
 
         // TODO: Investigate efficiency of storing header separately.
         MSGHEADER::Value _header;
+
+        const Date_t _start;
     };
 
     /**
@@ -159,23 +154,22 @@ private:
                 const RemoteCommandCompletionFn& onFinish,
                 Date_t now);
 
-        std::string toString() const;
-
         void cancel();
         bool canceled() const;
 
         const TaskExecutor::CallbackHandle& cbHandle() const;
 
-        AsyncConnection* connection();
+        AsyncConnection& connection();
 
-        void connect(ConnectionPool* const pool, asio::io_service* service, Date_t now);
         void setConnection(AsyncConnection&& conn);
-        bool connected() const;
 
         // AsyncOp may run multiple commands over its lifetime (for example, an ismaster
         // command, the command provided to the NetworkInterface via startCommand(), etc.)
         // Calling beginCommand() resets internal state to prepare to run newCommand.
-        AsyncCommand& beginCommand(Message&& newCommand);
+        AsyncCommand& beginCommand(const RemoteCommandRequest& request,
+                                   rpc::Protocol protocol,
+                                   Date_t now);
+        AsyncCommand& beginCommand(Message&& newCommand, Date_t now);
         AsyncCommand& command();
 
         void finish(const TaskExecutor::ResponseStatus& status);
@@ -189,14 +183,6 @@ private:
         void setOperationProtocol(rpc::Protocol proto);
 
     private:
-        enum class OpState {
-            kReady,
-            kConnectionAcquired,
-            kConnectionVerified,
-            kConnected,
-            kCompleted
-        };
-
         // Information describing a task enqueued on the NetworkInterface
         // via a call to startCommand().
         TaskExecutor::CallbackHandle _cbHandle;
@@ -217,7 +203,6 @@ private:
 
         const Date_t _start;
 
-        OpState _state;
         AtomicUInt64 _canceled;
 
         /**
@@ -249,16 +234,15 @@ private:
         handler();
     }
 
-    std::unique_ptr<Message> _messageFromRequest(const RemoteCommandRequest& request,
-                                                 rpc::Protocol protocol);
-
     // Connection
-    void _connectASIO(AsyncOp* op);
-    void _connectWithDBClientConnection(AsyncOp* op);
-    void _setupSocket(AsyncOp* op, const asio::ip::tcp::resolver::iterator& endpoints);
+    void _connect(AsyncOp* op);
+
+    // setup plaintext TCP socket
+    void _setupSocket(AsyncOp* op, asio::ip::tcp::resolver::iterator endpoints);
+
     void _runIsMaster(AsyncOp* op);
+    void _runConnectionHook(AsyncOp* op);
     void _authenticate(AsyncOp* op);
-    void _sslHandshake(AsyncOp* op);
 
     // Communication state machine
     void _beginCommunication(AsyncOp* op);
@@ -273,9 +257,13 @@ private:
     asio::io_service _io_service;
     stdx::thread _serviceRunner;
 
+    std::unique_ptr<NetworkConnectionHook> _hook;
+
     asio::ip::tcp::resolver _resolver;
 
     std::atomic<State> _state;
+
+    std::unique_ptr<AsyncStreamFactoryInterface> _streamFactory;
 
     stdx::mutex _inProgressMutex;
     std::unordered_map<AsyncOp*, std::unique_ptr<AsyncOp>> _inProgress;
@@ -283,8 +271,6 @@ private:
     stdx::mutex _executorMutex;
     bool _isExecutorRunnable;
     stdx::condition_variable _isExecutorRunnableCondition;
-
-    std::unique_ptr<ConnectionPool> _connPool;
 };
 
 }  // namespace executor

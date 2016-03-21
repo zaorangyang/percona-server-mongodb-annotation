@@ -79,6 +79,25 @@ var runner = (function() {
         return options;
     }
 
+    function validateCleanupOptions(options) {
+        var allowedKeys = [
+            'dropDatabaseBlacklist'
+        ];
+
+        Object.keys(options).forEach(function(option) {
+            assert.contains(option, allowedKeys,
+                            'invalid option: ' + tojson(option) +
+                            '; valid options are: ' + tojson(allowedKeys));
+        });
+
+        if (typeof options.dropDatabaseBlacklist !== 'undefined') {
+            assert(Array.isArray(options.dropDatabaseBlacklist),
+                   'expected dropDatabaseBlacklist to be an array');
+        }
+
+        return options;
+    }
+
     /**
      * Returns an array containing sets of workloads.
      * Each set of workloads is executed together according to the execution mode.
@@ -262,6 +281,12 @@ var runner = (function() {
 
         if (workerErrs.length > 0) {
             var stackTraces = workerErrs.map(function(e) {
+                if (e.err && e.stack) {
+                    // Prepend the error message to the stack trace because it
+                    // isn't automatically included in SpiderMonkey stack traces
+                    // (see: SERVER-18781).
+                    return e.err + '\n\n' + e.stack;
+                }
                 return e.stack || e.err;
             });
 
@@ -297,7 +322,11 @@ var runner = (function() {
         config.teardown.call(config.data, myDB, collName, cluster);
     }
 
-    function runWorkloads(workloads, clusterOptions, executionMode, executionOptions) {
+    function runWorkloads(workloads,
+                          clusterOptions,
+                          executionMode,
+                          executionOptions,
+                          cleanupOptions) {
         assert.gt(workloads.length, 0, 'need at least one workload to run');
 
         executionMode = validateExecutionMode(executionMode);
@@ -305,6 +334,9 @@ var runner = (function() {
 
         Object.freeze(executionOptions); // immutable prior to validation
         validateExecutionOptions(executionMode, executionOptions);
+
+        Object.freeze(cleanupOptions); // immutable prior to validation
+        validateCleanupOptions(cleanupOptions);
 
         if (executionMode.composed) {
             clusterOptions.sameDB = true;
@@ -340,14 +372,30 @@ var runner = (function() {
 
         // Clean up the state left behind by other tests in the concurrency suite
         // to avoid having too many open files
-        dropAllDatabases(cluster.getDB('test'),
-                         ['admin', 'config', 'local', '$external'] /* blacklist */);
+
+        // List of DBs that will not be dropped
+        var dbBlacklist = ['admin', 'config', 'local', '$external'];
+        if (cleanupOptions.dropDatabaseBlacklist) {
+            dbBlacklist = dbBlacklist.concat(cleanupOptions.dropDatabaseBlacklist);
+        }
+        dropAllDatabases(cluster.getDB('test'), dbBlacklist);
 
         var maxAllowedConnections = 100;
         Random.setRandomSeed(clusterOptions.seed);
 
         try {
             var schedule = scheduleWorkloads(workloads, executionMode, executionOptions);
+
+            // Print out the entire schedule of workloads to make it easier to run the same
+            // schedule when debugging test failures.
+            jsTest.log('The entire schedule of FSM workloads:');
+
+            // Note: We use printjsononeline (instead of just plain printjson) to make it
+            // easier to reuse the output in variable assignments.
+            printjsononeline(schedule);
+
+            jsTest.log('End of schedule');
+
             schedule.forEach(function(workloads) {
                 var cleanup = [];
                 var errors = [];
@@ -367,10 +415,15 @@ var runner = (function() {
 
                     startTime = new Date();
                     threadMgr.init(workloads, context, maxAllowedConnections);
-                    threadMgr.spawnAll(cluster, executionOptions);
-                    threadMgr.checkFailed(0.2);
 
-                    errors = threadMgr.joinAll();
+                    try {
+                        threadMgr.spawnAll(cluster, executionOptions);
+                        threadMgr.checkFailed(0.2);
+                    } finally {
+                        // Threads must be joined before destruction, so do this
+                        // even in the presence of exceptions.
+                        errors = threadMgr.joinAll();
+                    }
                 } finally {
                     endTime = new Date();
                     cleanup.forEach(function(workload) {
@@ -408,25 +461,36 @@ var runner = (function() {
     }
 
     return {
-        serial: function serial(workloads, clusterOptions, executionOptions) {
+        serial: function serial(workloads, clusterOptions, executionOptions, cleanupOptions) {
             clusterOptions = clusterOptions || {};
             executionOptions = executionOptions || {};
+            cleanupOptions = cleanupOptions || {};
 
-            runWorkloads(workloads, clusterOptions, {}, executionOptions);
+            runWorkloads(workloads, clusterOptions, {}, executionOptions, cleanupOptions);
         },
 
-        parallel: function parallel(workloads, clusterOptions, executionOptions) {
+        parallel: function parallel(workloads, clusterOptions, executionOptions, cleanupOptions) {
             clusterOptions = clusterOptions || {};
             executionOptions = executionOptions || {};
+            cleanupOptions = cleanupOptions || {};
 
-            runWorkloads(workloads, clusterOptions, { parallel: true }, executionOptions);
+            runWorkloads(workloads,
+                         clusterOptions,
+                         { parallel: true },
+                         executionOptions,
+                         cleanupOptions);
         },
 
-        composed: function composed(workloads, clusterOptions, executionOptions) {
+        composed: function composed(workloads, clusterOptions, executionOptions, cleanupOptions) {
             clusterOptions = clusterOptions || {};
             executionOptions = executionOptions || {};
+            cleanupOptions = cleanupOptions || {};
 
-            runWorkloads(workloads, clusterOptions, { composed: true }, executionOptions);
+            runWorkloads(workloads,
+                         clusterOptions,
+                         { composed: true },
+                         executionOptions,
+                         cleanupOptions);
         }
     };
 

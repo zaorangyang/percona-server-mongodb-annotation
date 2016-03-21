@@ -278,7 +278,7 @@ public:
         }
     }
 
-    void checkVersions(const string& ns) {
+    void checkVersions(OperationContext* txn, const string& ns) {
         vector<ShardId> all;
         grid.shardRegistry()->getAllShardIds(&all);
 
@@ -301,7 +301,7 @@ public:
                     s->created++;  // After, so failed creation doesn't get counted
                 }
 
-                versionManager.checkShardVersionCB(s->avail, ns, false, 1);
+                versionManager.checkShardVersionCB(txn, s->avail, ns, false, 1);
             } catch (const DBException& ex) {
                 warning() << "problem while initially checking shard versions on"
                           << " " << shardId << causedBy(ex);
@@ -409,12 +409,19 @@ DBConnectionPool shardConnectionPool;
 // Different between mongos and mongod
 void usingAShardConnection(const string& addr);
 
-
 ShardConnection::ShardConnection(const ConnectionString& connectionString,
                                  const string& ns,
                                  std::shared_ptr<ChunkManager> manager)
-    : _cs(connectionString), _ns(ns), _manager(manager) {
-    _init();
+    : _cs(connectionString), _ns(ns), _manager(manager), _finishedInit(false) {
+    invariant(_cs.isValid());
+
+    // Make sure we specified a manager for the correct namespace
+    if (_ns.size() && _manager) {
+        invariant(_manager->getns() == _ns);
+    }
+
+    _conn = ClientConnections::threadInstance()->get(_cs.toString(), _ns);
+    usingAShardConnection(_cs.toString());
 }
 
 ShardConnection::~ShardConnection() {
@@ -437,23 +444,16 @@ ShardConnection::~ShardConnection() {
     }
 }
 
-void ShardConnection::_init() {
-    invariant(_cs.isValid());
-    _conn = ClientConnections::threadInstance()->get(_cs.toString(), _ns);
-    _finishedInit = false;
-    usingAShardConnection(_cs.toString());
-}
-
 void ShardConnection::_finishInit() {
     if (_finishedInit)
         return;
     _finishedInit = true;
 
     if (versionManager.isVersionableCB(_conn)) {
-        // Make sure we specified a manager for the correct namespace
-        if (_ns.size() && _manager)
-            verify(_manager->getns() == _ns);
-        _setVersion = versionManager.checkShardVersionCB(this, false, 1);
+        auto& client = cc();
+        auto txn = client.getOperationContext();
+        invariant(txn);
+        _setVersion = versionManager.checkShardVersionCB(txn, this, false, 1);
     } else {
         // Make sure we didn't specify a manager for a non-versionable connection (i.e. config)
         verify(!_manager);
@@ -491,8 +491,8 @@ void ShardConnection::sync() {
     ClientConnections::threadInstance()->sync();
 }
 
-void ShardConnection::checkMyConnectionVersions(const string& ns) {
-    ClientConnections::threadInstance()->checkVersions(ns);
+void ShardConnection::checkMyConnectionVersions(OperationContext* txn, const string& ns) {
+    ClientConnections::threadInstance()->checkVersions(txn, ns);
 }
 
 void ShardConnection::releaseMyConnections() {

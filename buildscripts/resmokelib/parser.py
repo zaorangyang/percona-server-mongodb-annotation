@@ -25,12 +25,15 @@ DEST_TO_CONFIG = {
     "jobs": "jobs",
     "mongo_executable": "mongo",
     "mongod_executable": "mongod",
+    "mongod_parameters": "mongodSetParameters",
     "mongos_executable": "mongos",
+    "mongos_parameters": "mongosSetParameters",
     "no_journal": "nojournal",
     "no_prealloc_journal": "nopreallocj",
     "repeat": "repeat",
     "report_file": "reportFile",
     "seed": "seed",
+    "shell_read_mode": "shellReadMode",
     "shell_write_mode": "shellWriteMode",
     "shuffle": "shuffle",
     "storage_engine": "storageEngine",
@@ -103,8 +106,20 @@ def parse_command_line():
     parser.add_option("--mongod", dest="mongod_executable", metavar="PATH",
                       help="The path to the mongod executable for resmoke.py to use.")
 
+    parser.add_option("--mongodSetParameters", dest="mongod_parameters",
+                      metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
+                      help=("Pass one or more --setParameter options to all mongod processes"
+                            " started by resmoke.py. The argument is specified as bracketed YAML -"
+                            " i.e. JSON with support for single quoted and unquoted keys."))
+
     parser.add_option("--mongos", dest="mongos_executable", metavar="PATH",
                       help="The path to the mongos executable for resmoke.py to use.")
+
+    parser.add_option("--mongosSetParameters", dest="mongos_parameters",
+                      metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
+                      help=("Pass one or more --setParameter options to all mongos processes"
+                            " started by resmoke.py. The argument is specified as bracketed YAML -"
+                            " i.e. JSON with support for single quoted and unquoted keys."))
 
     parser.add_option("--nojournal", action="store_true", dest="no_journal",
                       help="Disable journaling for all mongod's.")
@@ -121,6 +136,10 @@ def parse_command_line():
     parser.add_option("--seed", type="int", dest="seed", metavar="SEED",
                       help=("Seed for the random number generator. Useful in combination with the"
                             " --shuffle option for producing a consistent test execution order."))
+
+    parser.add_option("--shellReadMode", type="choice", action="store", dest="shell_read_mode",
+                      choices=("commands", "compatibility"), metavar="READ_MODE",
+                      help="The read mode used by the mongo shell.")
 
     parser.add_option("--shellWriteMode", type="choice", action="store", dest="shell_write_mode",
                       choices=("commands", "compatibility", "legacy"), metavar="WRITE_MODE",
@@ -175,12 +194,15 @@ def update_config_vars(values):
     _config.JOBS = config.pop("jobs")
     _config.MONGO_EXECUTABLE = _expand_user(config.pop("mongo"))
     _config.MONGOD_EXECUTABLE = _expand_user(config.pop("mongod"))
+    _config.MONGOD_SET_PARAMETERS = config.pop("mongodSetParameters")
     _config.MONGOS_EXECUTABLE = _expand_user(config.pop("mongos"))
+    _config.MONGOS_SET_PARAMETERS = config.pop("mongosSetParameters")
     _config.NO_JOURNAL = config.pop("nojournal")
     _config.NO_PREALLOC_JOURNAL = config.pop("nopreallocj")
     _config.RANDOM_SEED = config.pop("seed")
     _config.REPEAT = config.pop("repeat")
     _config.REPORT_FILE = config.pop("reportFile")
+    _config.SHELL_READ_MODE = config.pop("shellReadMode")
     _config.SHELL_WRITE_MODE = config.pop("shellWriteMode")
     _config.SHUFFLE = config.pop("shuffle")
     _config.STORAGE_ENGINE = config.pop("storageEngine")
