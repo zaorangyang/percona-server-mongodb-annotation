@@ -12,7 +12,7 @@ auditTestShard(
         var port = allocatePorts(10)[9];
         var conn1 = MongoRunner.runMongod({dbpath: '/data/db/' + jsTestName() + '-extraShard-' + port, port: port});
 
-        var hostandport = 'localhost' + ':' + port;
+        var hostandport = conn1.host;
         assert.commandWorked(st.s0.adminCommand({addshard: hostandport}));
 
         auditColl = loadAuditEventsIntoCollection(st.s0, '/data/db/auditLog-s0.json', jsTestName(), 'auditEvents');
