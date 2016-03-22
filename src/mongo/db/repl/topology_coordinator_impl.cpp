@@ -104,7 +104,8 @@ void PingStats::start(Date_t now) {
 void PingStats::hit(Milliseconds millis) {
     _numFailuresSinceLastStart = std::numeric_limits<int>::max();
     ++count;
-    value = value == Milliseconds() ? millis : Milliseconds((value * 4 + millis) / 5);
+
+    value = value == UninitializedPing ? millis : Milliseconds((value * 4 + millis) / 5);
 }
 
 void PingStats::miss() {
@@ -859,35 +860,27 @@ std::pair<ReplSetHeartbeatArgsV1, Milliseconds> TopologyCoordinatorImpl::prepare
         alreadyElapsed = Milliseconds(0);
     }
     ReplSetHeartbeatArgsV1 hbArgs;
-    hbArgs.setSetName(_rsConfig.getReplSetName());
-    hbArgs.setConfigVersion(_rsConfig.getConfigVersion());
-    if (_selfIndex >= 0) {
-        const MemberConfig& me = _selfConfig();
-        hbArgs.setSenderId(me.getId());
-        hbArgs.setSenderHost(me.getHostAndPort());
+    if (_rsConfig.isInitialized()) {
+        hbArgs.setSetName(_rsConfig.getReplSetName());
+        hbArgs.setConfigVersion(_rsConfig.getConfigVersion());
+        if (_selfIndex >= 0) {
+            const MemberConfig& me = _selfConfig();
+            hbArgs.setSenderId(me.getId());
+            hbArgs.setSenderHost(me.getHostAndPort());
+        }
+        hbArgs.setTerm(_term);
+    } else {
+        hbArgs.setSetName(ourSetName);
+        // Config version -2 is for uninitialized config.
+        hbArgs.setConfigVersion(-2);
+        hbArgs.setTerm(OpTime::kInitialTerm);
     }
-    hbArgs.setTerm(_term);
 
     const Milliseconds timeoutPeriod(_rsConfig.isInitialized()
                                          ? _rsConfig.getHeartbeatTimeoutPeriodMillis()
                                          : ReplicaSetConfig::kDefaultHeartbeatTimeoutPeriod);
     const Milliseconds timeout(timeoutPeriod - alreadyElapsed);
     return std::make_pair(hbArgs, timeout);
-}
-
-Milliseconds TopologyCoordinatorImpl::getTimeoutDelayForMember(int memberId) {
-    const MemberConfig* member = _rsConfig.findMemberByID(memberId);
-    if (!member) {
-        return Milliseconds();
-    }
-
-    HostAndPort target = member->getHostAndPort();
-    if (_pings.find(target) == _pings.end()) {
-        return Milliseconds();
-    }
-
-    Milliseconds pingTime = _pings[target].getMillis();
-    return pingTime * (_rsConfig.getVoterPosition(_selfIndex) + 1);
 }
 
 HeartbeatResponseAction TopologyCoordinatorImpl::processHeartbeatResponse(
@@ -925,10 +918,7 @@ HeartbeatResponseAction TopologyCoordinatorImpl::processHeartbeatResponse(
     Milliseconds heartbeatInterval;
     if (_rsConfig.getProtocolVersion() == 1 &&
         (getMemberState().arbiter() || (getSyncSourceAddress().empty() && !_iAmPrimary()))) {
-        // We want to delay by ping time times our position relative to other voters, in order to
-        // avoid having two nodes stand for election at the same time.
-        heartbeatInterval = _rsConfig.getElectionTimeoutPeriod() / 2 +
-            hbStats.getMillis() * _rsConfig.getVoterPosition(_selfIndex);
+        heartbeatInterval = _rsConfig.getElectionTimeoutPeriod() / 2;
     } else {
         heartbeatInterval = _rsConfig.getHeartbeatInterval();
     }
@@ -1089,13 +1079,10 @@ HeartbeatResponseAction TopologyCoordinatorImpl::_updatePrimaryFromHBDataV1(
             }
 
             if (it->getState().primary() && it->up()) {
-                if (remotePrimaryIndex != -1) {
-                    // Two other nodes think they are primary (asynchronously polled)
-                    // -- wait for things to settle down.
-                    warning() << "two remote primaries (transiently)";
-                    return HeartbeatResponseAction::makeNoAction();
+                if (remotePrimaryIndex == -1 ||
+                    _hbdata[remotePrimaryIndex].getTerm() < it->getTerm()) {
+                    remotePrimaryIndex = itIndex;
                 }
-                remotePrimaryIndex = itIndex;
             }
         }
 
@@ -1152,7 +1139,7 @@ HeartbeatResponseAction TopologyCoordinatorImpl::_updatePrimaryFromHBDataV1(
     if (!checkShouldStandForElection(now, lastOpApplied)) {
         return HeartbeatResponseAction::makeNoAction();
     }
-    return HeartbeatResponseAction::makeElectAction();
+    return HeartbeatResponseAction::makeScheduleElectionAction();
 }
 
 HeartbeatResponseAction TopologyCoordinatorImpl::_updatePrimaryFromHBData(
@@ -1341,10 +1328,12 @@ HeartbeatResponseAction TopologyCoordinatorImpl::_updatePrimaryFromHBData(
     if (!checkShouldStandForElection(now, lastOpApplied)) {
         return HeartbeatResponseAction::makeNoAction();
     }
+    fassert(28816, becomeCandidateIfElectable(now, lastOpApplied));
     return HeartbeatResponseAction::makeElectAction();
 }
 
-bool TopologyCoordinatorImpl::checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) {
+bool TopologyCoordinatorImpl::checkShouldStandForElection(Date_t now,
+                                                          const OpTime& lastOpApplied) const {
     if (_currentPrimaryIndex != -1) {
         return false;
     }
@@ -1378,8 +1367,7 @@ bool TopologyCoordinatorImpl::checkShouldStandForElection(Date_t now, const OpTi
         }
         return false;
     }
-    // All checks passed, become a candidate and start election proceedings.
-    _role = Role::candidate;
+    // All checks passed. Start election proceedings.
     return true;
 }
 
@@ -1554,7 +1542,7 @@ void TopologyCoordinatorImpl::prepareStatusResponse(const ReplicationExecutor::C
         if (_rsConfig.getProtocolVersion() == 1) {
             BSONObjBuilder opTime(response->subobjStart("optime"));
             opTime.append("ts", lastOpApplied.getTimestamp());
-            opTime.append("term", lastOpApplied.getTerm());
+            opTime.append("t", lastOpApplied.getTerm());
             opTime.done();
         } else {
             response->append("optime", lastOpApplied.getTimestamp());
@@ -1589,7 +1577,7 @@ void TopologyCoordinatorImpl::prepareStatusResponse(const ReplicationExecutor::C
                 if (_rsConfig.getProtocolVersion() == 1) {
                     BSONObjBuilder opTime(bb.subobjStart("optime"));
                     opTime.append("ts", lastOpApplied.getTimestamp());
-                    opTime.append("term", lastOpApplied.getTerm());
+                    opTime.append("t", lastOpApplied.getTerm());
                     opTime.done();
                 } else {
                     bb.append("optime", lastOpApplied.getTimestamp());
@@ -1644,7 +1632,7 @@ void TopologyCoordinatorImpl::prepareStatusResponse(const ReplicationExecutor::C
                 if (_rsConfig.getProtocolVersion() == 1) {
                     BSONObjBuilder opTime(bb.subobjStart("optime"));
                     opTime.append("ts", it->getOpTime().getTimestamp());
-                    opTime.append("term", it->getOpTime().getTerm());
+                    opTime.append("t", it->getOpTime().getTerm());
                     opTime.done();
                 } else {
                     bb.append("optime", it->getOpTime().getTimestamp());
@@ -2379,7 +2367,6 @@ void TopologyCoordinatorImpl::summarizeAsHtml(ReplSetHtmlSummary* output) {
 void TopologyCoordinatorImpl::processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
                                                          ReplSetRequestVotesResponse* response,
                                                          const OpTime& lastAppliedOpTime) {
-    response->setOk(true);
     response->setTerm(_term);
 
     if (args.getTerm() < _term) {
@@ -2400,7 +2387,7 @@ void TopologyCoordinatorImpl::processReplSetRequestVotes(const ReplSetRequestVot
     } else {
         if (!args.isADryRun()) {
             _lastVote.setTerm(args.getTerm());
-            _lastVote.setCandidateId(args.getCandidateId());
+            _lastVote.setCandidateIndex(args.getCandidateIndex());
         }
         response->setVoteGranted(true);
     }
@@ -2428,15 +2415,15 @@ void TopologyCoordinatorImpl::loadLastVote(const LastVote& lastVote) {
 
 void TopologyCoordinatorImpl::voteForMyselfV1() {
     _lastVote.setTerm(_term);
-    _lastVote.setCandidateId(_selfConfig().getId());
+    _lastVote.setCandidateIndex(_selfIndex);
 }
 
 void TopologyCoordinatorImpl::setPrimaryIndex(long long primaryIndex) {
     _currentPrimaryIndex = primaryIndex;
 }
 
-bool TopologyCoordinatorImpl::stagePriorityTakeoverIfElectable(const Date_t now,
-                                                               const OpTime& lastOpApplied) {
+bool TopologyCoordinatorImpl::becomeCandidateIfElectable(const Date_t now,
+                                                         const OpTime& lastOpApplied) {
     if (_role == Role::leader) {
         LOG(2) << "Not standing for election again; already primary";
         return false;

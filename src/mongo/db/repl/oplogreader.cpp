@@ -165,7 +165,7 @@ void OplogReader::connectToSyncSource(OperationContext* txn,
             log() << "our last optime : " << lastOpTimeFetched;
             log() << "oldest available is " << oldestOpTimeSeen;
             log() << "See http://dochub.mongodb.org/core/resyncingaverystalereplicasetmember";
-            setMinValid(txn, oldestOpTimeSeen);
+            setMinValid(txn, {lastOpTimeFetched, oldestOpTimeSeen});
             bool worked = replCoord->setFollowerMode(MemberState::RS_RECOVERING);
             if (!worked) {
                 warning() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING)
@@ -183,7 +183,8 @@ void OplogReader::connectToSyncSource(OperationContext* txn,
         // Read the first (oldest) op and confirm that it's not newer than our last
         // fetched op. Otherwise, we have fallen off the back of that source's oplog.
         BSONObj remoteOldestOp(findOne(rsOplogName.c_str(), Query()));
-        OpTime remoteOldOpTime = fassertStatusOK(28776, OpTime::parseFromBSON(remoteOldestOp));
+        OpTime remoteOldOpTime =
+            fassertStatusOK(28776, OpTime::parseFromOplogEntry(remoteOldestOp));
 
         // remoteOldOpTime may come from a very old config, so we cannot compare their terms.
         if (!lastOpTimeFetched.isNull() &&

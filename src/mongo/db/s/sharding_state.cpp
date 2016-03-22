@@ -32,15 +32,18 @@
 
 #include "mongo/db/s/sharding_state.h"
 
+#include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/metadata_loader.h"
 #include "mongo/db/s/operation_shard_version.h"
 #include "mongo/db/s/sharded_connection_info.h"
+#include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
@@ -61,6 +64,9 @@ using std::vector;
 namespace {
 
 const auto getShardingState = ServiceContext::declareDecoration<ShardingState>();
+
+// Max number of concurrent config server refresh threads
+const int kMaxConfigServerRefreshThreads = 3;
 
 enum class VersionChoice { Local, Remote, Unknown };
 
@@ -111,8 +117,8 @@ bool isMongos() {
 }
 
 ShardingState::ShardingState()
-    : _enabled(false),
-      _configServerTickets(3 /* max number of concurrent config server refresh threads */) {}
+    : _initializationState(static_cast<uint32_t>(InitializationState::kUninitialized)),
+      _configServerTickets(kMaxConfigServerRefreshThreads) {}
 
 ShardingState::~ShardingState() = default;
 
@@ -124,22 +130,27 @@ ShardingState* ShardingState::get(OperationContext* operationContext) {
     return ShardingState::get(operationContext->getServiceContext());
 }
 
-bool ShardingState::enabled() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _enabled;
+InitializationState ShardingState::_getInitializationState() const {
+    return static_cast<InitializationState>(_initializationState.load());
 }
 
-string ShardingState::getConfigServer(OperationContext* txn) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    invariant(_enabled);
+void ShardingState::_setInitializationState_inlock(InitializationState newState) {
+    _initializationState.store(static_cast<uint32_t>(newState));
+}
 
-    return grid.shardRegistry()->getConfigServerConnectionString().toString();
+bool ShardingState::enabled() const {
+    return _getInitializationState() == InitializationState::kInitialized;
+}
+
+ConnectionString ShardingState::getConfigServer(OperationContext* txn) {
+    invariant(enabled());
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return grid.shardRegistry()->getConfigServerConnectionString();
 }
 
 string ShardingState::getShardName() {
+    invariant(enabled());
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    invariant(_enabled);
-
     return _shardName;
 }
 
@@ -148,22 +159,76 @@ void ShardingState::initialize(OperationContext* txn, const string& server) {
             "Unable to obtain host name during sharding initialization.",
             !getHostName().empty());
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-    if (_enabled) {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);  // Take mutex before enabled check to avoid race
+    if (enabled()) {
         // TODO: Do we need to throw exception if the config servers have changed from what we
         // already have in place? How do we test for that?
         return;
     }
 
+    if (_getInitializationState() == InitializationState::kInitializing) {
+        while (_getInitializationState() == InitializationState::kInitializing) {
+            _initializationFinishedCondition.wait(lk);
+        }
+        invariant(_getInitializationState() == InitializationState::kInitialized);
+        return;
+    }
+
+    invariant(_getInitializationState() == InitializationState::kUninitialized);
+    _setInitializationState_inlock(InitializationState::kInitializing);
+
     ShardedConnectionInfo::addHook();
     ReplicaSetMonitor::setSynchronousConfigChangeHook(
         &ConfigServer::replicaSetChangeShardRegistryUpdateHook);
 
+    lk.unlock();
+
+    // Initialize sharding state outside the lock to prevent doing network traffic traffic to the
+    // config servers in the lock (and deadlocking dbtest).
     ConnectionString configServerCS = uassertStatusOK(ConnectionString::parse(server));
     uassertStatusOK(initializeGlobalShardingState(txn, configServerCS, false));
 
-    _enabled = true;
+    lk.lock();
+
+    invariant(_getInitializationState() == InitializationState::kInitializing);
+    _updateConfigServerOpTimeFromMetadata_inlock(txn);
+    _setInitializationState_inlock(InitializationState::kInitialized);
+    _initializationFinishedCondition.notify_all();
+}
+
+void ShardingState::shutDown(OperationContext* txn) {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    if (_getInitializationState() == InitializationState::kUninitialized) {
+        return;
+    }
+    while (_getInitializationState() == InitializationState::kInitializing) {
+        _initializationFinishedCondition.wait(lk);
+    }
+    invariant(_getInitializationState() == InitializationState::kInitialized);
+    auto catalogMgr = grid.catalogManager(txn);
+    if (catalogMgr) {
+        catalogMgr->shutDown(txn);
+    }
+}
+
+void ShardingState::updateConfigServerOpTimeFromMetadata(OperationContext* txn) {
+    invariant(enabled());
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    _updateConfigServerOpTimeFromMetadata_inlock(txn);
+}
+
+void ShardingState::_updateConfigServerOpTimeFromMetadata_inlock(OperationContext* txn) {
+    if (serverGlobalParams.configsvrMode != CatalogManager::ConfigServerMode::NONE) {
+        // Nothing to do if we're a config server ourselves.
+        return;
+    }
+
+    boost::optional<repl::OpTime> opTime = rpc::ConfigServerMetadata::get(txn).getOpTime();
+
+    if (opTime) {
+        grid.shardRegistry()->advanceConfigOpTime(*opTime);
+    }
 }
 
 void ShardingState::setShardName(const string& name) {
@@ -468,20 +533,20 @@ Status ShardingState::refreshMetadataIfNeeded(OperationContext* txn,
                << ", need to verify with config server";
     }
 
-    return doRefreshMetadata(txn, ns, reqShardVersion, true, latestShardVersion);
+    return _refreshMetadata(txn, ns, reqShardVersion, true, latestShardVersion);
 }
 
 Status ShardingState::refreshMetadataNow(OperationContext* txn,
                                          const string& ns,
                                          ChunkVersion* latestShardVersion) {
-    return doRefreshMetadata(txn, ns, ChunkVersion(0, 0, OID()), false, latestShardVersion);
+    return _refreshMetadata(txn, ns, ChunkVersion(0, 0, OID()), false, latestShardVersion);
 }
 
-Status ShardingState::doRefreshMetadata(OperationContext* txn,
-                                        const string& ns,
-                                        const ChunkVersion& reqShardVersion,
-                                        bool useRequestedVersion,
-                                        ChunkVersion* latestShardVersion) {
+Status ShardingState::_refreshMetadata(OperationContext* txn,
+                                       const string& ns,
+                                       const ChunkVersion& reqShardVersion,
+                                       bool useRequestedVersion,
+                                       ChunkVersion* latestShardVersion) {
     // The idea here is that we're going to reload the metadata from the config server, but
     // we need to do so outside any locks.  When we get our result back, if the current metadata
     // has changed, we may not be able to install the new metadata.
@@ -494,10 +559,8 @@ Status ShardingState::doRefreshMetadata(OperationContext* txn,
     shared_ptr<CollectionMetadata> beforeMetadata;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-
         // We can't reload if sharding is not enabled - i.e. without a config server location
-        if (!_enabled) {
+        if (!enabled()) {
             string errMsg = str::stream() << "cannot refresh metadata for " << ns
                                           << " before sharding has been enabled";
 
@@ -505,6 +568,7 @@ Status ShardingState::doRefreshMetadata(OperationContext* txn,
             return Status(ErrorCodes::NotYetInitialized, errMsg);
         }
 
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         // We also can't reload if a shard name has not yet been set.
         if (_shardName.empty()) {
             string errMsg = str::stream() << "cannot refresh metadata for " << ns
@@ -616,16 +680,16 @@ Status ShardingState::doRefreshMetadata(OperationContext* txn,
         // Get the metadata now that the load has completed
         //
 
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-
         // Don't reload if our config server has changed or sharding is no longer enabled
-        if (!_enabled) {
+        if (!enabled()) {
             string errMsg = str::stream() << "could not refresh metadata for " << ns
                                           << ", sharding is no longer enabled";
 
             warning() << errMsg;
             return Status(ErrorCodes::NotYetInitialized, errMsg);
         }
+
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
 
         CollectionMetadataMap::iterator it = _collMetadata.find(ns);
         if (it != _collMetadata.end())
@@ -757,12 +821,12 @@ Status ShardingState::doRefreshMetadata(OperationContext* txn,
 }
 
 void ShardingState::appendInfo(OperationContext* txn, BSONObjBuilder& builder) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-    builder.appendBool("enabled", _enabled);
-    if (!_enabled) {
+    const bool isEnabled = enabled();
+    builder.appendBool("enabled", isEnabled);
+    if (!isEnabled)
         return;
-    }
+
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     builder.append("configServer",
                    grid.shardRegistry()->getConfigServerConnectionString().toString());
@@ -779,8 +843,10 @@ void ShardingState::appendInfo(OperationContext* txn, BSONObjBuilder& builder) {
     versionB.done();
 }
 
-bool ShardingState::needCollectionMetadata(OperationContext* txn, const string& ns) const {
-    if (!_enabled)
+bool ShardingState::needCollectionMetadata(OperationContext* txn, const string& ns) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    if (!enabled())
         return false;
 
     Client* client = txn->getClient();

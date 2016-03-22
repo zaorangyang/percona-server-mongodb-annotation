@@ -23,6 +23,7 @@ env.Library(
     target='sharding',
     source=[
         'migration_destination_manager.cpp',
+        'migration_impl.cpp',
         'migration_source_manager.cpp',
         'sharded_connection_info.cpp',
         'sharding_state.cpp',
@@ -44,6 +45,7 @@ env.Library(
     target='commands',
     source=[
         'merge_chunks_command.cpp',
+        'move_chunk_command.cpp',
         'set_shard_version_command.cpp',
     ],
     LIBDEPS=[
@@ -51,7 +53,11 @@ env.Library(
         '$BUILD_DIR/mongo/s/serveronly',
         'metadata',
         'sharding',
-    ]
+    ],
+    LIBDEPS_TAGS=[
+        # Depends on getDeleter, defined in s/serveronly, which would be circular.
+        'incomplete',
+    ],
 )
 
 env.CppUnitTest(

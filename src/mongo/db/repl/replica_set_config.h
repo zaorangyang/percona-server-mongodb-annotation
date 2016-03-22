@@ -59,15 +59,18 @@ public:
     static const size_t kMaxMembers = 50;
     static const size_t kMaxVotingMembers = 7;
 
-    // TODO: Consider returning different default heartbeat interval based on protocol version.
     static const Milliseconds kDefaultElectionTimeoutPeriod;
     static const Milliseconds kDefaultHeartbeatInterval;
     static const Seconds kDefaultHeartbeatTimeoutPeriod;
+    static const int kDefaultElectionTimeoutOffsetLimit;
+    static const bool kDefaultChainingAllowed;
 
     /**
      * Initializes this ReplicaSetConfig from the contents of "cfg".
+     * The default protocol version is 0 to keep backward-compatibility.
+     * If usePV1ByDefault is true, the protocol version will be 1 when it's not specified in "cfg".
      */
-    Status initialize(const BSONObj& cfg);
+    Status initialize(const BSONObj& cfg, bool usePV1ByDefault = false);
 
     /**
      * Returns true if this object has been successfully initialized or copied from
@@ -284,9 +287,11 @@ public:
     Milliseconds getPriorityTakeoverDelay(int memberIdx) const;
 
     /**
-     * Returns the position of the node at "memberIdx" relative to all voting nodes.
+     * Returns the upper bound (in Milliseconds) of the election timeout's random offset.
      */
-    int getVoterPosition(int memberIdx) const;
+    int getElectionTimeoutOffsetLimit() const {
+        return _electionTimeoutOffsetLimit;
+    }
 
 private:
     /**
@@ -310,17 +315,18 @@ private:
     void _addInternalWriteConcernModes();
 
     bool _isInitialized = false;
-    long long _version;
+    long long _version = 1;
     std::string _replSetName;
     std::vector<MemberConfig> _members;
     WriteConcernOptions _defaultWriteConcern;
-    Milliseconds _electionTimeoutPeriod = Milliseconds(2000);
+    Milliseconds _electionTimeoutPeriod = kDefaultElectionTimeoutPeriod;
     Milliseconds _heartbeatInterval = kDefaultHeartbeatInterval;
     Seconds _heartbeatTimeoutPeriod = Seconds(0);
-    bool _chainingAllowed;
-    int _majorityVoteCount;
-    int _writeMajority;
-    int _totalVotingMembers;
+    bool _chainingAllowed = kDefaultChainingAllowed;
+    int _electionTimeoutOffsetLimit = kDefaultElectionTimeoutOffsetLimit;
+    int _majorityVoteCount = 0;
+    int _writeMajority = 0;
+    int _totalVotingMembers = 0;
     ReplicaSetTagConfig _tagConfig;
     StringMap<ReplicaSetTagPattern> _customWriteConcernModes;
     long long _protocolVersion = 0;

@@ -40,8 +40,9 @@ RemoteCommandTargeterMock::RemoteCommandTargeterMock()
 
 RemoteCommandTargeterMock::~RemoteCommandTargeterMock() = default;
 
-RemoteCommandTargeterMock* RemoteCommandTargeterMock::get(RemoteCommandTargeter* targeter) {
-    auto mock = dynamic_cast<RemoteCommandTargeterMock*>(targeter);
+std::shared_ptr<RemoteCommandTargeterMock> RemoteCommandTargeterMock::get(
+    std::shared_ptr<RemoteCommandTargeter> targeter) {
+    auto mock = std::dynamic_pointer_cast<RemoteCommandTargeterMock>(targeter);
     invariant(mock);
 
     return mock;
@@ -56,6 +57,8 @@ StatusWith<HostAndPort> RemoteCommandTargeterMock::findHost(const ReadPreference
 }
 
 void RemoteCommandTargeterMock::markHostNotMaster(const HostAndPort& host) {}
+
+void RemoteCommandTargeterMock::markHostUnreachable(const HostAndPort& host) {}
 
 void RemoteCommandTargeterMock::setConnectionStringReturnValue(const ConnectionString returnValue) {
     _connectionStringReturnValue = std::move(returnValue);

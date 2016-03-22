@@ -80,6 +80,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/sharded_connection_info.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -105,6 +106,7 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/quick_exit.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -317,8 +319,19 @@ void receivedPseudoCommand(OperationContext* txn,
                            Message& message,
                            StringData realCommandName) {
     DbMessage originalDbm(message);
-    originalDbm.pullInt();  // ntoskip
-    originalDbm.pullInt();  // ntoreturn
+
+    auto originalNToSkip = originalDbm.pullInt();
+
+    uassert(ErrorCodes::InvalidOptions,
+            str::stream() << "invalid nToSkip - expected 0, but got " << originalNToSkip,
+            originalNToSkip == 0);
+
+    auto originalNToReturn = originalDbm.pullInt();
+
+    uassert(ErrorCodes::InvalidOptions,
+            str::stream() << "invalid nToReturn - expected -1 or 1, but got " << originalNToSkip,
+            originalNToReturn == -1 || originalNToReturn == 1);
+
     auto cmdParams = originalDbm.nextJsObj();
 
     Message interposed;
@@ -639,7 +652,11 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
     int flags = d.pullInt();
     BSONObj query = d.nextJsObj();
     auto client = txn->getClient();
+    auto lastOpHolder = repl::ReplClientInfo::forClient(client);
     auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
+    ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
+                                                &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
+                                                txn);
 
     verify(d.moreJSObjs());
     verify(query.objsize() < m.header().dataLen());
@@ -708,9 +725,11 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
                 Explain::getSummaryStats(*exec, &summary);
                 collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
 
-                // No-ops need to reset lastOp in the client, for write concern.
-                if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
-                    repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
+                if (lastOpHolder.getLastOp() != lastOpAtOperationStart) {
+                    // If this operation has already generated a new lastOp, don't bother setting it
+                    // here. No-op updates will not generate a new lastOp, so we still need the
+                    // guard to fire in that case.
+                    lastOpSetterGuard.Dismiss();
                 }
                 return;
             }
@@ -763,9 +782,11 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
         Explain::getSummaryStats(*exec, &summary);
         collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
 
-        // No-ops need to reset lastOp in the client, for write concern.
-        if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
-            repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
+        if (lastOpHolder.getLastOp() != lastOpAtOperationStart) {
+            // If this operation has already generated a new lastOp, don't bother setting it
+            // here. No-op updates will not generate a new lastOp, so we still need the
+            // guard to fire in that case.
+            lastOpSetterGuard.Dismiss();
         }
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "update", nsString.ns());
@@ -781,7 +802,11 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
     BSONObj pattern = d.nextJsObj();
 
     auto client = txn->getClient();
+    auto lastOpHolder = repl::ReplClientInfo::forClient(client);
     auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
+    ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
+                                                &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
+                                                txn);
 
     op.debug().query = pattern;
     {
@@ -831,9 +856,11 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
             Explain::getSummaryStats(*exec, &summary);
             collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
 
-            // No-ops need to reset lastOp in the client, for write concern.
-            if (repl::ReplClientInfo::forClient(client).getLastOp() == lastOpAtOperationStart) {
-                repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(txn);
+            if (lastOpHolder.getLastOp() != lastOpAtOperationStart) {
+                // If this operation has already generated a new lastOp, don't bother setting it
+                // here. No-op updates will not generate a new lastOp, so we still need the
+                // guard to fire in that case.
+                lastOpSetterGuard.Dismiss();
             }
             break;
         } catch (const WriteConflictException& dle) {
@@ -1002,7 +1029,10 @@ NOINLINE_DECL void insertMulti(OperationContext* txn,
         // but smaller chunk sizes allow yielding to other threads and lower chance of WCEs
         if ((++chunkCount >= internalQueryExecYieldIterations / 2) ||
             (chunkSize >= maxInsertGroupSize)) {
-            insertMultiVector(txn, ctx, keepGoing, ns, op, chunkBegin, it + 1);
+            if (it == chunkBegin)  // there is only one doc to process, so avoid retry on failure
+                insertMultiSingletons(txn, ctx, keepGoing, ns, op, chunkBegin, it + 1);
+            else
+                insertMultiVector(txn, ctx, keepGoing, ns, op, chunkBegin, it + 1);
             chunkBegin = it + 1;
             chunkCount = 0;
             chunkSize = 0;
@@ -1232,10 +1262,7 @@ void exitCleanly(ExitCode code) {
         txn = uniqueTxn.get();
     }
 
-    auto catalogMgr = grid.catalogManager(txn);
-    if (catalogMgr) {
-        catalogMgr->shutDown(txn);
-    }
+    ShardingState::get(txn)->shutDown(txn);
 
     // We should always be able to acquire the global lock at shutdown.
     //

@@ -36,7 +36,6 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/query/find_and_modify_request.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -60,7 +59,6 @@ namespace {
 const char kCmdResponseWriteConcernField[] = "writeConcernError";
 const char kFindAndModifyResponseResultDocField[] = "value";
 const char kLocalTimeField[] = "localTime";
-const BSONObj kReplMetadata = BSON(rpc::kReplSetMetadataFieldName << 1);
 const ReadPreferenceSetting kReadPref(ReadPreference::PrimaryOnly, TagSet());
 
 /**
@@ -155,22 +153,9 @@ DistLockCatalogImpl::DistLockCatalogImpl(ShardRegistry* shardRegistry,
 
 DistLockCatalogImpl::~DistLockCatalogImpl() = default;
 
-RemoteCommandTargeter* DistLockCatalogImpl::_targeter() {
-    return _client->getConfigShard()->getTargeter();
-}
-
 StatusWith<LockpingsType> DistLockCatalogImpl::getPing(StringData processID) {
-    auto targetStatus = _targeter()->findHost(kReadPref);
-
-    if (!targetStatus.isOK()) {
-        return targetStatus.getStatus();
-    }
-
-    auto findResult = _findOnConfig(targetStatus.getValue(),
-                                    _lockPingNS,
-                                    BSON(LockpingsType::process() << processID),
-                                    BSONObj(),
-                                    1);
+    auto findResult = _findOnConfig(
+        kReadPref, _lockPingNS, BSON(LockpingsType::process() << processID), BSONObj(), 1);
 
     if (!findResult.isOK()) {
         return findResult.getStatus();
@@ -340,20 +325,13 @@ Status DistLockCatalogImpl::unlock(const OID& lockSessionID) {
 }
 
 StatusWith<DistLockCatalog::ServerInfo> DistLockCatalogImpl::getServerInfo() {
-    auto targetStatus = _targeter()->findHost(kReadPref);
-
-    if (!targetStatus.isOK()) {
-        return targetStatus.getStatus();
-    }
-
-    auto resultStatus = _client->runCommandOnConfig(
-        targetStatus.getValue(), "admin", BSON("serverStatus" << 1), rpc::makeEmptyMetadata());
+    auto resultStatus = _client->runCommandOnConfig(kReadPref, "admin", BSON("serverStatus" << 1));
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
     }
 
-    BSONObj responseObj(resultStatus.getValue().response);
+    BSONObj responseObj(resultStatus.getValue());
 
     auto cmdStatus = getStatusFromCommandResult(responseObj);
 
@@ -379,14 +357,8 @@ StatusWith<DistLockCatalog::ServerInfo> DistLockCatalogImpl::getServerInfo() {
 }
 
 StatusWith<LocksType> DistLockCatalogImpl::getLockByTS(const OID& lockSessionID) {
-    auto targetStatus = _targeter()->findHost(kReadPref);
-
-    if (!targetStatus.isOK()) {
-        return targetStatus.getStatus();
-    }
-
-    auto findResult = _findOnConfig(
-        targetStatus.getValue(), _locksNS, BSON(LocksType::lockID(lockSessionID)), BSONObj(), 1);
+    auto findResult =
+        _findOnConfig(kReadPref, _locksNS, BSON(LocksType::lockID(lockSessionID)), BSONObj(), 1);
 
     if (!findResult.isOK()) {
         return findResult.getStatus();
@@ -411,14 +383,8 @@ StatusWith<LocksType> DistLockCatalogImpl::getLockByTS(const OID& lockSessionID)
 }
 
 StatusWith<LocksType> DistLockCatalogImpl::getLockByName(StringData name) {
-    auto targetStatus = _targeter()->findHost(kReadPref);
-
-    if (!targetStatus.isOK()) {
-        return targetStatus.getStatus();
-    }
-
-    auto findResult = _findOnConfig(
-        targetStatus.getValue(), _locksNS, BSON(LocksType::name() << name), BSONObj(), 1);
+    auto findResult =
+        _findOnConfig(kReadPref, _locksNS, BSON(LocksType::name() << name), BSONObj(), 1);
 
     if (!findResult.isOK()) {
         return findResult.getStatus();
@@ -460,14 +426,14 @@ Status DistLockCatalogImpl::stopPing(StringData processId) {
     return findAndModifyStatus.getStatus();
 }
 
-StatusWith<vector<BSONObj>> DistLockCatalogImpl::_findOnConfig(const HostAndPort& host,
-                                                               const NamespaceString& nss,
-                                                               const BSONObj& query,
-                                                               const BSONObj& sort,
-                                                               boost::optional<long long> limit) {
+StatusWith<vector<BSONObj>> DistLockCatalogImpl::_findOnConfig(
+    const ReadPreferenceSetting& readPref,
+    const NamespaceString& nss,
+    const BSONObj& query,
+    const BSONObj& sort,
+    boost::optional<long long> limit) {
     repl::ReadConcernArgs readConcern(boost::none, repl::ReadConcernLevel::kMajorityReadConcern);
-    auto result = _client->exhaustiveFindOnConfigNode(
-        host, nss, query, sort, limit, readConcern, kReplMetadata);
+    auto result = _client->exhaustiveFindOnConfig(readPref, nss, query, sort, limit, readConcern);
 
     if (!result.isOK()) {
         return result.getStatus();

@@ -45,6 +45,7 @@
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/replset/catalog_manager_replica_set.h"
 #include "mongo/s/catalog/type_changelog.h"
@@ -234,7 +235,7 @@ void CatalogManagerReplSetTestFixture::expectGetShards(const std::vector<ShardTy
         ASSERT_EQ(query->getSort(), BSONObj());
         ASSERT_FALSE(query->getLimit().is_initialized());
 
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), 0);
+        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
         vector<BSONObj> shardsToReturn;
 
@@ -412,7 +413,7 @@ void CatalogManagerReplSetTestFixture::expectCount(const HostAndPort& configHost
             return BSON("ok" << 1 << "n" << response.getValue());
         }
 
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), 0);
+        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
         BSONObjBuilder responseBuilder;
         Command::appendCommandStatus(responseBuilder, response.getStatus());
@@ -429,15 +430,15 @@ void CatalogManagerReplSetTestFixture::checkReadConcern(const BSONObj& cmdObj,
     auto readConcernObj = readConcernElem.Obj();
     ASSERT_EQ("majority", readConcernObj[repl::ReadConcernArgs::kLevelFieldName].str());
 
-    auto afterElem = readConcernObj[repl::ReadConcernArgs::kOpTimeFieldName];
+    auto afterElem = readConcernObj[repl::ReadConcernArgs::kAfterOpTimeFieldName];
     ASSERT_EQ(Object, afterElem.type());
 
     auto afterObj = afterElem.Obj();
 
-    ASSERT_TRUE(afterObj.hasField(repl::ReadConcernArgs::kOpTimestampFieldName));
-    ASSERT_EQ(expectedTS, afterObj[repl::ReadConcernArgs::kOpTimestampFieldName].timestamp());
-    ASSERT_TRUE(afterObj.hasField(repl::ReadConcernArgs::kOpTermFieldName));
-    ASSERT_EQ(expectedTerm, afterObj[repl::ReadConcernArgs::kOpTermFieldName].numberLong());
+    ASSERT_TRUE(afterObj.hasField(repl::OpTime::kTimestampFieldName));
+    ASSERT_EQ(expectedTS, afterObj[repl::OpTime::kTimestampFieldName].timestamp());
+    ASSERT_TRUE(afterObj.hasField(repl::OpTime::kTermFieldName));
+    ASSERT_EQ(expectedTerm, afterObj[repl::OpTime::kTermFieldName].numberLong());
 }
 
 }  // namespace mongo

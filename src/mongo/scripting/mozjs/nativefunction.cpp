@@ -36,6 +36,7 @@
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
+#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -45,7 +46,7 @@ const char* const NativeFunctionInfo::inheritFrom = "Function";
 const char* const NativeFunctionInfo::className = "NativeFunction";
 
 const JSFunctionSpec NativeFunctionInfo::methods[2] = {
-    MONGO_ATTACH_JS_FUNCTION(toString), JS_FS_END,
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, NativeFunctionInfo), JS_FS_END,
 };
 
 namespace {
@@ -67,16 +68,18 @@ NativeHolder* getHolder(JS::CallArgs args) {
 
 }  // namespace
 
-void NativeFunctionInfo::construct(JSContext* cx, JS::CallArgs args) {
-    auto scope = getScope(cx);
-
-    scope->getNativeFunctionProto().newObject(args.rval());
-}
-
 void NativeFunctionInfo::call(JSContext* cx, JS::CallArgs args) {
     auto holder = getHolder(args);
 
+    if (!holder) {
+        // Calling the prototype
+        args.rval().setUndefined();
+        return;
+    }
+
     BSONObjBuilder bob;
+    JS::RootedObject robj(cx, JS_NewPlainObject(cx));
+    ObjectWrapper wobj(cx, robj);
 
     for (unsigned i = 0; i < args.length(); i++) {
         // 11 is enough here.  unsigned's are only 32 bits, and 1 << 32 is only
@@ -84,10 +87,10 @@ void NativeFunctionInfo::call(JSContext* cx, JS::CallArgs args) {
         char buf[11];
         std::sprintf(buf, "%i", i);
 
-        ValueWriter(cx, args.get(i)).writeThis(&bob, buf);
+        wobj.setValue(buf, args.get(i));
     }
 
-    BSONObj out = holder->_func(bob.obj(), holder->_ctx);
+    BSONObj out = holder->_func(wobj.toBSON(), holder->_ctx);
 
     ValueReader(cx, args.rval()).fromBSONElement(out.firstElement(), false);
 }
@@ -99,7 +102,7 @@ void NativeFunctionInfo::finalize(JSFreeOp* fop, JSObject* obj) {
         delete holder;
 }
 
-void NativeFunctionInfo::Functions::toString(JSContext* cx, JS::CallArgs args) {
+void NativeFunctionInfo::Functions::toString::call(JSContext* cx, JS::CallArgs args) {
     ObjectWrapper o(cx, args.thisv());
 
     str::stream ss;
@@ -115,7 +118,7 @@ void NativeFunctionInfo::make(JSContext* cx,
                               void* data) {
     auto scope = getScope(cx);
 
-    scope->getNativeFunctionProto().newInstance(obj);
+    scope->getProto<NativeFunctionInfo>().newObject(obj);
 
     JS_SetPrivate(obj, new NativeHolder(function, data));
 }

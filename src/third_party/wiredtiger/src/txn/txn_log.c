@@ -66,9 +66,9 @@ static int
 __txn_commit_printlog(
     WT_SESSION_IMPL *session, const uint8_t **pp, const uint8_t *end, FILE *out)
 {
-	int firstrecord;
+	bool firstrecord;
 
-	firstrecord = 1;
+	firstrecord = true;
 	WT_RET(__wt_fprintf(out, "    \"ops\": [\n"));
 
 	/* The logging subsystem zero-pads records. */
@@ -77,7 +77,7 @@ __txn_commit_printlog(
 			WT_RET(__wt_fprintf(out, ",\n"));
 		WT_RET(__wt_fprintf(out, "      {"));
 
-		firstrecord = 0;
+		firstrecord = false;
 
 		WT_RET(__wt_txn_op_printlog(session, pp, end, out));
 		WT_RET(__wt_fprintf(out, "\n      }"));
@@ -226,7 +226,8 @@ __txn_log_file_sync(WT_SESSION_IMPL *session, uint32_t flags, WT_LSN *lsnp)
 	WT_DECL_RET;
 	size_t header_size;
 	uint32_t rectype = WT_LOGREC_FILE_SYNC;
-	int start, need_sync;
+	int start;
+	bool need_sync;
 	const char *fmt = WT_UNCHECKED_STRING(III);
 
 	btree = S2BT(session);
@@ -276,7 +277,7 @@ __wt_txn_checkpoint_logread(
  */
 int
 __wt_txn_checkpoint_log(
-    WT_SESSION_IMPL *session, int full, uint32_t flags, WT_LSN *lsnp)
+    WT_SESSION_IMPL *session, bool full, uint32_t flags, WT_LSN *lsnp)
 {
 	WT_DECL_ITEM(logrec);
 	WT_DECL_RET;
@@ -306,8 +307,8 @@ __wt_txn_checkpoint_log(
 
 	switch (flags) {
 	case WT_TXN_LOG_CKPT_PREPARE:
-		txn->full_ckpt = 1;
-		WT_ERR(__wt_log_ckpt_lsn(session, ckpt_lsn));
+		txn->full_ckpt = true;
+		WT_ERR(__wt_log_flush_lsn(session, ckpt_lsn, true));
 		/*
 		 * We need to make sure that the log records in the checkpoint
 		 * LSN are on disk.  In particular to make sure that the
@@ -336,7 +337,7 @@ __wt_txn_checkpoint_log(
 			txn->ckpt_nsnapshot = 0;
 			WT_CLEAR(empty);
 			ckpt_snapshot = &empty;
-			WT_ERR(__wt_log_ckpt_lsn(session, ckpt_lsn));
+			WT_ERR(__wt_log_flush_lsn(session, ckpt_lsn, true));
 		} else
 			ckpt_snapshot = txn->ckpt_snapshot;
 
@@ -358,9 +359,13 @@ __wt_txn_checkpoint_log(
 		/*
 		 * If this full checkpoint completed successfully and there is
 		 * no hot backup in progress, tell the logging subsystem the
-		 * checkpoint LSN so that it can archive.
+		 * checkpoint LSN so that it can archive.  Do not update the
+		 * logging checkpoint LSN if this is during a clean connection
+		 * close, only during a full checkpoint.  A clean close may not
+		 * update any metadata LSN and we do not want to archive in
+		 * that case.
 		 */
-		if (!S2C(session)->hot_backup)
+		if (!S2C(session)->hot_backup && txn->full_ckpt)
 			WT_ERR(__wt_log_ckpt(session, ckpt_lsn));
 
 		/* FALLTHROUGH */
@@ -369,7 +374,7 @@ __wt_txn_checkpoint_log(
 		WT_INIT_LSN(ckpt_lsn);
 		txn->ckpt_nsnapshot = 0;
 		__wt_scr_free(session, &txn->ckpt_snapshot);
-		txn->full_ckpt = 0;
+		txn->full_ckpt = false;
 		break;
 	WT_ILLEGAL_VALUE_ERR(session);
 	}
@@ -454,12 +459,12 @@ __txn_printlog(WT_SESSION_IMPL *session,
 	FILE *out;
 	WT_LOG_RECORD *logrec;
 	WT_LSN ckpt_lsn;
-	int compressed;
+	const uint8_t *end, *p;
+	const char *msg;
 	uint64_t txnid;
 	uint32_t fileid, rectype;
 	int32_t start;
-	const uint8_t *end, *p;
-	const char *msg;
+	bool compressed;
 
 	WT_UNUSED(next_lsnp);
 	out = cookie;

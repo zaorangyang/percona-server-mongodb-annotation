@@ -109,20 +109,9 @@ public:
     CappedInsertNotifier();
 
     /**
-     * Wakes up threads waiting on this object for the arrival of new data.
-     */
-    void notifyOfInsert(int count);
-
-    /**
-     * Wakes up all threads waiting but doesn't increment the count.
+     * Wakes up all threads waiting.
      */
     void notifyAll();
-
-    /**
-     * Get a counter value which is incremented on every insert into a capped collection.
-     * The return value should be used as a reference value to pass into waitForCappedInsert().
-     */
-    uint64_t getCount() const;
 
     /**
      * Waits for 'timeout' microseconds, or until notifyAll() is called to indicate that new
@@ -130,12 +119,24 @@ public:
      *
      * NOTE: Waiting threads can be signaled by calling kill or notify* methods.
      */
-    void waitForInsert(uint64_t referenceCount, Microseconds timeout) const;
+    void wait(Microseconds timeout) const;
+
+    /**
+     * Same as above but also ensures that if the version has changed, it also returns.
+     */
+    void wait(uint64_t prevVersion, Microseconds timeout) const;
+
+    /**
+     * Returns the version for use as an additional wake condition when used above.
+     */
+    uint64_t getVersion() const {
+        return _version;
+    }
 
     /**
      * Same as above but without a timeout.
      */
-    void waitForInsert(uint64_t referenceCount) const;
+    void wait() const;
 
     /**
      * Cancels the notifier if the collection is dropped/invalidated, and wakes all waiting.
@@ -148,17 +149,22 @@ public:
     bool isDead();
 
 private:
-    // Signalled when a successful insert is made into a capped collection.
-    mutable stdx::condition_variable _cappedNewDataNotifier;
+    // Helper for wait impls.
+    void _wait(stdx::unique_lock<stdx::mutex>& lk,
+               uint64_t prevVersion,
+               Microseconds timeout) const;
 
-    // Mutex used with '_cappedNewDataNotifier'. Protects access to '_cappedInsertCount'.
-    mutable stdx::mutex _cappedNewDataMutex;
+    // Signalled when a successful insert is made into a capped collection.
+    mutable stdx::condition_variable _notifier;
+
+    // Mutex used with '_notifier'. Protects access to '_version'.
+    mutable stdx::mutex _mutex;
 
     // A counter, incremented on insertion of new data into the capped collection.
     //
     // The condition which '_cappedNewDataNotifier' is being notified of is an increment of this
-    // counter. Access to this counter is synchronized with '_cappedNewDataMutex'.
-    uint64_t _cappedInsertCount;
+    // counter. Access to this counter is synchronized with '_mutex'.
+    uint64_t _version;
 
     // True once the notifier is dead.
     bool _dead;
@@ -168,7 +174,7 @@ private:
  * this is NOT safe through a yield right now
  * not sure if it will be, or what yet
  */
-class Collection : CappedDocumentDeleteCallback, UpdateNotifier {
+class Collection final : CappedCallback, UpdateNotifier {
 public:
     Collection(OperationContext* txn,
                StringData fullNS,
@@ -400,6 +406,11 @@ public:
     void setMinimumVisibleSnapshot(SnapshotName name) {
         _minVisibleSnapshot = name;
     }
+
+    /**
+     * Notify (capped collection) waiters of data changes, like an insert.
+     */
+    void notifyCappedWaitersIfNeeded();
 
 private:
     /**

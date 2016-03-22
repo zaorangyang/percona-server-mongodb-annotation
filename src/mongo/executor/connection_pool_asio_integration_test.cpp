@@ -32,7 +32,9 @@
 
 #include "mongo/client/connection_string.h"
 #include "mongo/executor/async_stream_factory.h"
+#include "mongo/executor/async_timer_asio.h"
 #include "mongo/executor/network_connection_hook.h"
+#include "mongo/executor/network_interface_asio_test_utils.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
@@ -82,11 +84,11 @@ TEST(ConnectionPoolASIO, TestPing) {
     auto fixture = unittest::getFixtureConnectionString();
 
     NetworkInterfaceASIO::Options options;
+    options.streamFactory = stdx::make_unique<AsyncStreamFactory>();
+    options.networkConnectionHook = stdx::make_unique<MyNetworkConnectionHook>();
     options.connectionPoolOptions.maxConnections = 10;
-
-    NetworkInterfaceASIO net{stdx::make_unique<AsyncStreamFactory>(),
-                             stdx::make_unique<MyNetworkConnectionHook>(),
-                             options};
+    options.timerFactory = stdx::make_unique<AsyncTimerFactoryASIO>();
+    NetworkInterfaceASIO net{std::move(options)};
 
     net.startup();
     auto guard = MakeGuard([&] { net.shutdown(); });
@@ -98,21 +100,16 @@ TEST(ConnectionPoolASIO, TestPing) {
     for (auto& thread : threads) {
         thread = stdx::thread([&net, &fixture]() {
             auto status = Status::OK();
-            stdx::promise<void> result;
+            Deferred<StatusWith<RemoteCommandResponse>> deferred;
 
-            net.startCommand(TaskExecutor::CallbackHandle(),
+            net.startCommand(makeCallbackHandle(),
                              RemoteCommandRequest{
                                  fixture.getServers()[0], "admin", BSON("ping" << 1), BSONObj()},
-                             [&result, &status](StatusWith<RemoteCommandResponse> resp) {
-                                 if (!resp.isOK()) {
-                                     status = std::move(resp.getStatus());
-                                 }
-                                 result.set_value();
+                             [&deferred](StatusWith<RemoteCommandResponse> resp) {
+                                 deferred.emplace(std::move(resp));
                              });
 
-            result.get_future().get();
-
-            ASSERT_OK(status);
+            ASSERT_OK(deferred.get().getStatus());
         });
     }
 

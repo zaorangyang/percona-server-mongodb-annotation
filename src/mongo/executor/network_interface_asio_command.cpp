@@ -35,13 +35,14 @@
 #include <type_traits>
 #include <utility>
 
-#include "mongo/executor/connection_pool_asio.h"
-#include "mongo/executor/async_stream_interface.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/executor/async_stream_interface.h"
+#include "mongo/executor/async_stream_interface.h"
+#include "mongo/executor/connection_pool_asio.h"
 #include "mongo/executor/downconvert_find_and_getmore_commands.h"
 #include "mongo/rpc/factory.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/reply_interface.h"
 #include "mongo/rpc/request_builder_interface.h"
@@ -75,6 +76,8 @@ template <typename Handler>
 void asyncSendMessage(AsyncStreamInterface& stream, Message* m, Handler&& handler) {
     static_assert(IsNetworkHandler<Handler>::value,
                   "Handler passed to asyncSendMessage does not conform to NetworkHandler concept");
+    m->header().setResponseTo(0);
+    m->header().setId(nextMessageId());
     // TODO: Some day we may need to support vector messages.
     fassert(28708, m->buf() != 0);
     stream.write(asio::buffer(m->buf(), m->size()), std::forward<Handler>(handler));
@@ -126,7 +129,11 @@ void asyncRecvMessageBody(AsyncStreamInterface& stream,
     stream.read(asio::buffer(mdView.data(), bodyLength), std::forward<Handler>(handler));
 }
 
-ResponseStatus decodeRPC(Message* received, rpc::Protocol protocol, Milliseconds elapsed) {
+ResponseStatus decodeRPC(Message* received,
+                         rpc::Protocol protocol,
+                         Milliseconds elapsed,
+                         const HostAndPort& source,
+                         rpc::EgressMetadataHook* metadataHook) {
     try {
         // makeReply will throw if the reply is invalid
         auto reply = rpc::makeReply(received);
@@ -143,6 +150,18 @@ ResponseStatus decodeRPC(Message* received, rpc::Protocol protocol, Milliseconds
         }
         auto ownedCommandReply = reply->getCommandReply().getOwned();
         auto ownedReplyMetadata = reply->getMetadata().getOwned();
+
+        // Handle incoming reply metadata.
+        if (metadataHook) {
+            auto listenStatus = callNoexcept(*metadataHook,
+                                             &rpc::EgressMetadataHook::readReplyMetadata,
+                                             source,
+                                             ownedReplyMetadata);
+            if (!listenStatus.isOK()) {
+                return listenStatus;
+            }
+        }
+
         return {RemoteCommandResponse(
             std::move(ownedCommandReply), std::move(ownedReplyMetadata), elapsed)};
     } catch (...) {
@@ -155,8 +174,9 @@ ResponseStatus decodeRPC(Message* received, rpc::Protocol protocol, Milliseconds
 NetworkInterfaceASIO::AsyncCommand::AsyncCommand(AsyncConnection* conn,
                                                  CommandType type,
                                                  Message&& command,
-                                                 Date_t now)
-    : _conn(conn), _type(type), _toSend(std::move(command)), _start(now) {
+                                                 Date_t now,
+                                                 const HostAndPort& target)
+    : _conn(conn), _type(type), _toSend(std::move(command)), _start(now), _target(target) {
     _toSend.header().setResponseTo(0);
 }
 
@@ -176,11 +196,13 @@ MSGHEADER::Value& NetworkInterfaceASIO::AsyncCommand::header() {
     return _header;
 }
 
-ResponseStatus NetworkInterfaceASIO::AsyncCommand::response(rpc::Protocol protocol, Date_t now) {
+ResponseStatus NetworkInterfaceASIO::AsyncCommand::response(rpc::Protocol protocol,
+                                                            Date_t now,
+                                                            rpc::EgressMetadataHook* metadataHook) {
     auto& received = _toRecv;
     switch (_type) {
         case CommandType::kRPC: {
-            return decodeRPC(&received, protocol, now - _start);
+            return decodeRPC(&received, protocol, now - _start, _target, metadataHook);
         }
         case CommandType::kDownConvertedFind: {
             auto ns = DbMessage(_toSend).getns();
@@ -213,26 +235,26 @@ void NetworkInterfaceASIO::_beginCommunication(AsyncOp* op) {
     // return to the connection pool's get() callback with _inSetup == false,
     // so we can proceed with user operations after they return to this
     // codepath.
+
     if (op->_inSetup) {
         op->_inSetup = false;
         op->finish(RemoteCommandResponse());
         return;
     }
 
-    auto beginStatus = op->beginCommand(op->request());
+    auto beginStatus = op->beginCommand(op->request(), _metadataHook.get());
     if (!beginStatus.isOK()) {
         return _completeOperation(op, beginStatus);
     }
 
-    _asyncRunCommand(op->command(),
+    _asyncRunCommand(op,
                      [this, op](std::error_code ec, size_t bytes) {
                          _validateAndRun(op, ec, [this, op]() { _completedOpCallback(op); });
                      });
 }
 
 void NetworkInterfaceASIO::_completedOpCallback(AsyncOp* op) {
-    // TODO: handle metadata readers.
-    auto response = op->command()->response(op->operationProtocol(), now());
+    auto response = op->command()->response(op->operationProtocol(), now(), _metadataHook.get());
     _completeOperation(op, response);
 }
 
@@ -250,6 +272,12 @@ void NetworkInterfaceASIO::_networkErrorCallback(AsyncOp* op, const std::error_c
 // NOTE: This method may only be called by ASIO threads
 // (do not call from methods entered by TaskExecutor threads)
 void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus& resp) {
+    // Cancel this operation's timeout. Note that the timeout callback may already be running,
+    // may have run, or may have already been scheduled to run in the near future.
+    if (op->_timeoutAlarm) {
+        op->_timeoutAlarm->cancel();
+    }
+
     op->finish(resp);
 
     std::unique_ptr<AsyncOp> ownedOp;
@@ -259,10 +287,9 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
 
         auto iter = _inProgress.find(op);
 
-        // We're in connection start
-        if (iter == _inProgress.end()) {
+        // This can happen if we fail during setup.
+        if (iter == _inProgress.end())
             return;
-        }
 
         ownedOp = std::move(iter->second);
         _inProgress.erase(iter);
@@ -272,6 +299,19 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
 
     auto conn = std::move(op->_connectionPoolHandle);
     auto asioConn = static_cast<connection_pool_asio::ASIOConnection*>(conn.get());
+
+    // Prevent any other threads or callbacks from accessing this op so we may safely complete and
+    // destroy it. It is key that we do this after we remove the op from the _inProgress map or
+    // someone else in cancelCommand could read the bumped generation and cancel the next command
+    // that uses this op. See SERVER-20556.
+    {
+        stdx::lock_guard<stdx::mutex> lk(op->_access->mutex);
+        ++(op->_access->id);
+    }
+
+    // We need to bump the generation BEFORE we call reset() or we could flip the timeout in the
+    // timeout callback before returning the AsyncOp to the pool.
+    ownedOp->reset();
 
     asioConn->bindAsyncOp(std::move(ownedOp));
     if (!resp.isOK()) {
@@ -283,45 +323,58 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
     signalWorkAvailable();
 }
 
-void NetworkInterfaceASIO::_asyncRunCommand(AsyncCommand* cmd, NetworkOpHandler handler) {
+void NetworkInterfaceASIO::_asyncRunCommand(AsyncOp* op, NetworkOpHandler handler) {
     // We invert the following steps below to run a command:
     // 1 - send the given command
     // 2 - receive a header for the response
     // 3 - validate and receive response body
     // 4 - advance the state machine by calling handler()
+    auto cmd = op->command();
 
     // Step 4
-    auto recvMessageCallback =
-        [this, cmd, handler](std::error_code ec, size_t bytes) { handler(ec, bytes); };
+    auto recvMessageCallback = [this, cmd, handler, op](std::error_code ec, size_t bytes) {
+        // We don't call _validateAndRun here as we assume the caller will.
+        handler(ec, bytes);
+    };
 
     // Step 3
-    auto recvHeaderCallback = [this, cmd, handler, recvMessageCallback](std::error_code ec,
-                                                                        size_t bytes) {
-        if (ec)
-            return handler(ec, bytes);
+    auto recvHeaderCallback = [this, cmd, handler, recvMessageCallback, op](std::error_code ec,
+                                                                            size_t bytes) {
+        // The operation could have been canceled after starting the command, but before receiving
+        // the header
+        _validateAndRun(op,
+                        ec,
+                        [this, op, recvMessageCallback, ec, bytes, cmd, handler] {
+                            // validate response id
+                            uint32_t expectedId = cmd->toSend().header().getId();
+                            uint32_t actualId = cmd->header().constView().getResponseTo();
+                            if (actualId != expectedId) {
+                                LOG(3) << "got wrong response:"
+                                       << " expected response id: " << expectedId
+                                       << ", got response id: " << actualId;
+                                return handler(make_error_code(ErrorCodes::ProtocolError), bytes);
+                            }
 
-        // validate response id
-        uint32_t expectedId = cmd->toSend().header().getId();
-        uint32_t actualId = cmd->header().constView().getResponseTo();
-        if (actualId != expectedId) {
-            LOG(3) << "got wrong response:"
-                   << " expected response id: " << expectedId << ", got response id: " << actualId;
-            // TODO: This error code should be more meaningful.
-            return handler(ec, bytes);
-        }
-
-        asyncRecvMessageBody(
-            cmd->conn().stream(), &cmd->header(), &cmd->toRecv(), std::move(recvMessageCallback));
+                            asyncRecvMessageBody(cmd->conn().stream(),
+                                                 &cmd->header(),
+                                                 &cmd->toRecv(),
+                                                 std::move(recvMessageCallback));
+                        });
     };
 
     // Step 2
-    auto sendMessageCallback = [this, cmd, handler, recvHeaderCallback](std::error_code ec,
-                                                                        size_t bytes) {
-        if (ec)
-            return handler(ec, bytes);
+    auto sendMessageCallback =
+        [this, cmd, handler, recvHeaderCallback, op](std::error_code ec, size_t bytes) {
+            _validateAndRun(op,
+                            ec,
+                            [this, cmd, op, recvHeaderCallback] {
+                                asyncRecvMessageHeader(cmd->conn().stream(),
+                                                       &cmd->header(),
+                                                       std::move(recvHeaderCallback));
+                            });
 
-        asyncRecvMessageHeader(cmd->conn().stream(), &cmd->header(), std::move(recvHeaderCallback));
-    };
+
+        };
 
     // Step 1
     asyncSendMessage(cmd->conn().stream(), &cmd->toSend(), std::move(sendMessageCallback));
@@ -345,13 +398,14 @@ void NetworkInterfaceASIO::_runConnectionHook(AsyncOp* op) {
         return _beginCommunication(op);
     }
 
-    auto beginStatus = op->beginCommand(*optionalRequest);
+    auto beginStatus = op->beginCommand(*optionalRequest, _metadataHook.get());
     if (!beginStatus.isOK()) {
         return _completeOperation(op, beginStatus);
     }
 
     auto finishHook = [this, op]() {
-        auto response = op->command()->response(op->operationProtocol(), now());
+        auto response =
+            op->command()->response(op->operationProtocol(), now(), _metadataHook.get());
 
         if (!response.isOK()) {
             return _completeOperation(op, response.getStatus());
@@ -369,7 +423,7 @@ void NetworkInterfaceASIO::_runConnectionHook(AsyncOp* op) {
         return _beginCommunication(op);
     };
 
-    return _asyncRunCommand(op->command(),
+    return _asyncRunCommand(op,
                             [this, op, finishHook](std::error_code ec, std::size_t bytes) {
                                 _validateAndRun(op, ec, finishHook);
                             });

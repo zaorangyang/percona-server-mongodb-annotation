@@ -32,6 +32,7 @@
 
 #include "mongo/s/query/async_results_merger.h"
 
+#include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/killcursors_request.h"
@@ -229,7 +230,8 @@ Status AsyncResultsMerger::askForNextBatch_inlock(size_t remoteIndex) {
     }
 
     BSONObj cmdObj = remote.cursorId
-        ? GetMoreRequest(_params.nsString, *remote.cursorId, adjustedBatchSize, boost::none)
+        ? GetMoreRequest(
+              _params.nsString, *remote.cursorId, adjustedBatchSize, boost::none, boost::none)
               .toBSON()
         : *remote.cmdObj;
 
@@ -297,6 +299,27 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() 
     return eventToReturn;
 }
 
+StatusWith<CursorResponse> AsyncResultsMerger::parseCursorResponse(const BSONObj& responseObj,
+                                                                   const RemoteCursorData& remote) {
+    auto getMoreParseStatus = CursorResponse::parseFromBSON(responseObj);
+    if (!getMoreParseStatus.isOK()) {
+        return getMoreParseStatus.getStatus();
+    }
+
+    auto cursorResponse = getMoreParseStatus.getValue();
+
+    // If we have a cursor established, and we get a non-zero cursor id that is not equal to the
+    // established cursor id, we will fail the operation.
+    if (remote.cursorId && cursorResponse.cursorId != 0 &&
+        *remote.cursorId != cursorResponse.cursorId) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Expected cursorid " << *remote.cursorId << " but received "
+                                    << cursorResponse.cursorId);
+    }
+
+    return cursorResponse;
+}
+
 void AsyncResultsMerger::handleBatchResponse(
     const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData, size_t remoteIndex) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -313,6 +336,15 @@ void AsyncResultsMerger::handleBatchResponse(
 
         // Make sure to wake up anyone waiting on '_currentEvent' if we're shutting down.
         signalCurrentEventIfReady_inlock();
+
+        // Make a best effort to parse the response and retrieve the cursor id. We need the cursor
+        // id in order to issue a killCursors command against it.
+        if (cbData.response.isOK()) {
+            auto cursorResponse = parseCursorResponse(cbData.response.getValue().data, remote);
+            if (cursorResponse.isOK()) {
+                remote.cursorId = cursorResponse.getValue().cursorId;
+            }
+        }
 
         // If we're killed and we're not waiting on any more batches to come back, then we are ready
         // to kill the cursors on the remote hosts and clean up this cursor. Schedule the
@@ -337,27 +369,47 @@ void AsyncResultsMerger::handleBatchResponse(
 
     if (!cbData.response.isOK()) {
         remote.status = cbData.response.getStatus();
+
+        // Errors other than HostUnreachable have no special handling.
+        if (remote.status != ErrorCodes::HostUnreachable) {
+            return;
+        }
+
+        // Notify that targeter that the host is unreachable. The caller can then retry on a new
+        // host.
+        if (remote.shardId) {
+            auto shard = _params.shardRegistry->getShard(_params.txn, *remote.shardId);
+            if (!shard) {
+                remote.status =
+                    Status(ErrorCodes::HostUnreachable,
+                           str::stream() << "Could not find shard " << *remote.shardId
+                                         << " containing host " << remote.hostAndPort.toString());
+            } else {
+                shard->getTargeter()->markHostUnreachable(remote.hostAndPort);
+            }
+        }
+
+        // Unreachable host errors are swallowed if the 'allowPartialResults' option is set. We
+        // remove the unreachable host entirely from consideration by marking it as exhausted.
+        if (_params.isAllowPartialResults) {
+            remote.status = Status::OK();
+
+            // Clear the results buffer and cursor id.
+            std::queue<BSONObj> emptyBuffer;
+            std::swap(remote.docBuffer, emptyBuffer);
+            remote.cursorId = 0;
+        }
+
         return;
     }
 
-    auto getMoreParseStatus = CursorResponse::parseFromBSON(cbData.response.getValue().data);
-    if (!getMoreParseStatus.isOK()) {
-        remote.status = getMoreParseStatus.getStatus();
+    auto cursorResponseStatus = parseCursorResponse(cbData.response.getValue().data, remote);
+    if (!cursorResponseStatus.isOK()) {
+        remote.status = cursorResponseStatus.getStatus();
         return;
     }
 
-    auto cursorResponse = getMoreParseStatus.getValue();
-
-    // If we have a cursor established, and we get a non-zero cursorid that is not equal to the
-    // established cursorid, we will fail the operation.
-    if (remote.cursorId && cursorResponse.cursorId != 0 &&
-        *remote.cursorId != cursorResponse.cursorId) {
-        remote.status = Status(ErrorCodes::BadValue,
-                               str::stream() << "Expected cursorid " << *remote.cursorId
-                                             << " but received " << cursorResponse.cursorId);
-        return;
-    }
-
+    auto cursorResponse = cursorResponseStatus.getValue();
     remote.cursorId = cursorResponse.cursorId;
     remote.cmdObj = boost::none;
 
@@ -460,13 +512,6 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill() {
 
     _lifecycleState = kKillStarted;
 
-    // Cancel callbacks.
-    for (const auto& remote : _remotes) {
-        if (remote.cbHandle.isValid()) {
-            _executor->cancel(remote.cbHandle);
-        }
-    }
-
     // Make '_killCursorsScheduledEvent', which we will signal as soon as we have scheduled a
     // killCursors command to run on all the remote shards.
     auto statusWithEvent = _executor->makeEvent();
@@ -498,7 +543,10 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill() {
 
 AsyncResultsMerger::RemoteCursorData::RemoteCursorData(
     const ClusterClientCursorParams::Remote& params)
-    : hostAndPort(params.hostAndPort), cmdObj(params.cmdObj), cursorId(params.cursorId) {
+    : hostAndPort(params.hostAndPort),
+      shardId(params.shardId),
+      cmdObj(params.cmdObj),
+      cursorId(params.cursorId) {
     // Either cmdObj or cursorId can be provided, but not both.
     invariant(static_cast<bool>(cmdObj) != static_cast<bool>(cursorId));
 }

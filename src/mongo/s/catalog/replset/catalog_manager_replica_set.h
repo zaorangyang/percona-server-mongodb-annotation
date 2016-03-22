@@ -149,6 +149,9 @@ private:
 
     StatusWith<std::string> _generateNewShardName(OperationContext* txn) override;
 
+    /**
+     * Helper method for running a read command against the config server.
+     */
     bool _runReadCommand(OperationContext* txn,
                          const std::string& dbname,
                          const BSONObj& cmdObj,
@@ -156,22 +159,15 @@ private:
                          BSONObjBuilder* result);
 
     /**
-     * Helper method for running a count command against a given target server with appropriate
+     * Helper method for running a count command against the config server with appropriate
      * error handling.
      */
-    StatusWith<long long> _runCountCommandOnConfig(const HostAndPort& target,
+    StatusWith<long long> _runCountCommandOnConfig(OperationContext* txn,
                                                    const NamespaceString& ns,
                                                    BSONObj query);
 
-    StatusWith<BSONObj> _runCommandOnConfig(const HostAndPort& target,
-                                            const std::string& dbName,
-                                            BSONObj cmdObj);
-
-    StatusWith<BSONObj> _runCommandOnConfigWithNotMasterRetries(const std::string& dbName,
-                                                                BSONObj cmdObj);
-
     StatusWith<OpTimePair<std::vector<BSONObj>>> _exhaustiveFindOnConfig(
-        const HostAndPort& host,
+        OperationContext* txn,
         const NamespaceString& nss,
         const BSONObj& query,
         const BSONObj& sort,
@@ -186,16 +182,6 @@ private:
      * Returns the current cluster schema/protocol version.
      */
     StatusWith<VersionType> _getConfigVersion(OperationContext* txn);
-
-    /**
-     * Returns the highest last known config server opTime.
-     */
-    repl::OpTime _getConfigOpTime();
-
-    /**
-     * Updates the last known config server opTime if the given opTime is newer.
-     */
-    void _updateLastSeenConfigOpTime(const repl::OpTime& optime);
 
     //
     // All member variables are labeled with one of the following codes indicating the

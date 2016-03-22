@@ -78,7 +78,7 @@ function getMine(printInprog) {
     // Find all the where queries
     var mine = [];
     for (var x=0; x<inprog.length; x++) {
-        if (inprog[x].query && inprog[x].query.$where) {
+        if (inprog[x].query && inprog[x].query.filter && inprog[x].query.filter.$where) {
             mine.push(inprog[x]);
         }
     }

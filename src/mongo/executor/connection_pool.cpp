@@ -384,12 +384,12 @@ void ConnectionPool::SpecificPool::fulfillRequests(stdx::unique_lock<stdx::mutex
         auto cb = std::move(_requests.top().second);
         _requests.pop();
 
-        updateStateInLock();
-
         auto connPtr = conn.get();
 
         // check out the connection
         _checkedOutPool[connPtr] = std::move(conn);
+
+        updateStateInLock();
 
         // pass it to the user
         lk.unlock();

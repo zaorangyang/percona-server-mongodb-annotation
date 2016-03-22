@@ -302,6 +302,7 @@ UnixLib
 Unmap
 UnmapViewOfFile
 Unmarshall
+Unordered
 Uryyb
 VARCHAR
 VLDB
@@ -841,6 +842,7 @@ rectype
 recurse
 refp
 reinitialization
+relocked
 resize
 resizing
 ret
@@ -967,6 +969,7 @@ unmarshall
 unmarshalled
 unmerged
 unmodify
+unordered
 unpackv
 unpadded
 unreferenced

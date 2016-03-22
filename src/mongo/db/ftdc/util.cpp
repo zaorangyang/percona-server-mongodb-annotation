@@ -49,6 +49,7 @@
 namespace mongo {
 
 const char kFTDCInterimFile[] = "metrics.interim";
+const char kFTDCInterimTempFile[] = "metrics.interim.temp";
 const char kFTDCArchiveFile[] = "metrics";
 
 const char kFTDCIdField[] = "_id";
@@ -68,15 +69,25 @@ const std::size_t kMaxRecursion = 10;
 
 namespace FTDCUtil {
 
-boost::filesystem::path getInterimFile(const boost::filesystem::path& file) {
+namespace {
+boost::filesystem::path appendFileName(const boost::filesystem::path& file, const char* filename) {
     if (boost::filesystem::is_directory(file)) {
-        return file / kFTDCInterimFile;
+        return file / filename;
     }
 
     auto p = file.parent_path();
-    p /= kFTDCInterimFile;
+    p /= filename;
 
     return p;
+}
+}  // namespace
+
+boost::filesystem::path getInterimFile(const boost::filesystem::path& file) {
+    return appendFileName(file, kFTDCInterimFile);
+}
+
+boost::filesystem::path getInterimTempFile(const boost::filesystem::path& file) {
+    return appendFileName(file, kFTDCInterimTempFile);
 }
 
 Date_t roundTime(Date_t now, Milliseconds period) {
@@ -102,12 +113,12 @@ namespace {
 StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
                                             const BSONObj& currentDoc,
                                             std::vector<std::uint64_t>* metrics,
+                                            bool matches,
                                             size_t recursion) {
     if (recursion > kMaxRecursion) {
         return {ErrorCodes::BadValue, "Recursion limit reached."};
     }
 
-    bool matches = true;
     BSONObjIterator itCurrent(currentDoc);
     BSONObjIterator itReference(referenceDoc);
 
@@ -169,8 +180,8 @@ StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
 
             case bsonTimestamp:
                 // very slightly more space efficient to treat these as two separate metrics
-                metrics->emplace_back(currentElement.timestampValue());
-                metrics->emplace_back(currentElement.timestampInc());
+                metrics->emplace_back(currentElement.timestamp().getSecs());
+                metrics->emplace_back(currentElement.timestamp().getInc());
                 break;
 
             case Object:
@@ -180,6 +191,7 @@ StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
                 auto sw = extractMetricsFromDocument(matches ? referenceElement.Obj() : BSONObj(),
                                                      currentElement.Obj(),
                                                      metrics,
+                                                     matches,
                                                      recursion + 1);
                 if (!sw.isOK()) {
                     return sw;
@@ -207,7 +219,7 @@ StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
 StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
                                             const BSONObj& currentDoc,
                                             std::vector<std::uint64_t>* metrics) {
-    return extractMetricsFromDocument(referenceDoc, currentDoc, metrics, 0);
+    return extractMetricsFromDocument(referenceDoc, currentDoc, metrics, true, 0);
 }
 
 namespace {

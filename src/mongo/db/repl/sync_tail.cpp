@@ -40,15 +40,15 @@
 #include "mongo/base/counter.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/global_timestamp.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/prefetch.h"
 #include "mongo/db/repl/bgsync.h"
@@ -59,6 +59,7 @@
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
@@ -80,20 +81,20 @@ const int replPrefetcherThreadCount = 2;
 #error need to include something that defines MONGO_PLATFORM_XX
 #endif
 
-class ExportedWriterThreadCountParameter : public ExportedServerParameter<int> {
+class ExportedWriterThreadCountParameter
+    : public ExportedServerParameter<int, ServerParameterType::kStartupOnly> {
 public:
     ExportedWriterThreadCountParameter()
-        : ExportedServerParameter<int>(ServerParameterSet::getGlobal(),
-                                       "replWriterThreadCount",
-                                       &SyncTail::replWriterThreadCount,
-                                       true,   // allowedToChangeAtStartup
-                                       false)  // allowedToChangeAtRuntime
-    {}
+        : ExportedServerParameter<int, ServerParameterType::kStartupOnly>(
+              ServerParameterSet::getGlobal(),
+              "replWriterThreadCount",
+              &SyncTail::replWriterThreadCount) {}
 
     virtual Status validate(const int& potentialNewValue) {
         if (potentialNewValue < 1 || potentialNewValue > 256) {
             return Status(ErrorCodes::BadValue, "replWriterThreadCount must be between 1 and 256");
         }
+
         return Status::OK();
     }
 
@@ -350,23 +351,14 @@ void fillWriterVectors(const std::deque<BSONObj>& ops,
 
 }  // namespace
 
-// Doles out all the work to the writer pool threads and waits for them to complete
-// static
-OpTime SyncTail::multiApply(OperationContext* txn,
-                            const OpQueue& ops,
-                            OldThreadPool* prefetcherPool,
-                            OldThreadPool* writerPool,
-                            MultiSyncApplyFunc func,
-                            SyncTail* sync,
-                            bool supportsWaitingUntilDurable) {
-    invariant(prefetcherPool);
-    invariant(writerPool);
-    invariant(func);
-    invariant(sync);
+// Applies a batch of oplog entries, by using a set of threads to apply the operations and then
+// writes the oplog entries to the local oplog. At the end we update the lastOpTime.
+OpTime SyncTail::multiApply(OperationContext* txn, const OpQueue& ops) {
+    invariant(_applyFunc);
 
     if (getGlobalServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
         // Use a ThreadPool to prefetch all the operations in a batch.
-        prefetchOps(ops.getDeque(), prefetcherPool);
+        prefetchOps(ops.getDeque(), &_prefetcherPool);
     }
 
     std::vector<std::vector<BSONObj>> writerVectors(replWriterThreadCount);
@@ -387,23 +379,14 @@ OpTime SyncTail::multiApply(OperationContext* txn,
         fassertFailed(28527);
     }
 
-    applyOps(writerVectors, writerPool, func, sync);
+    applyOps(writerVectors, &_writerPool, _applyFunc, this);
 
     if (inShutdown()) {
         return OpTime();
     }
 
-    const bool mustWaitUntilDurable =
-        replCoord->isV1ElectionProtocol() && supportsWaitingUntilDurable;
-    if (mustWaitUntilDurable) {
-        txn->recoveryUnit()->goingToWaitUntilDurable();
-    }
-
     OpTime lastOpTime = writeOpsToOplog(txn, ops.getDeque());
 
-    if (mustWaitUntilDurable) {
-        txn->recoveryUnit()->waitUntilDurable();
-    }
     ReplClientInfo::forClient(txn->getClient()).setLastOp(lastOpTime);
     replCoord->setMyLastOptime(lastOpTime);
     setNewTimestamp(lastOpTime.getTimestamp());
@@ -411,74 +394,6 @@ OpTime SyncTail::multiApply(OperationContext* txn,
     BackgroundSync::get()->notify(txn);
 
     return lastOpTime;
-}
-
-void SyncTail::oplogApplication(OperationContext* txn, const OpTime& endOpTime) {
-    _applyOplogUntil(txn, endOpTime);
-}
-
-/* applies oplog from "now" until endOpTime using the applier threads for initial sync*/
-void SyncTail::_applyOplogUntil(OperationContext* txn, const OpTime& endOpTime) {
-    unsigned long long bytesApplied = 0;
-    unsigned long long entriesApplied = 0;
-    while (true) {
-        OpQueue ops;
-
-        while (!tryPopAndWaitForMore(txn, &ops, getGlobalReplicationCoordinator())) {
-            // nothing came back last time, so go again
-            if (ops.empty())
-                continue;
-
-            // Check if we reached the end
-            const BSONObj currentOp = ops.back();
-            const OpTime currentOpTime = fassertStatusOK(28772, OpTime::parseFromBSON(currentOp));
-
-            // When we reach the end return this batch
-            if (currentOpTime == endOpTime) {
-                break;
-            } else if (currentOpTime > endOpTime) {
-                severe() << "Applied past expected end " << endOpTime << " to " << currentOpTime
-                         << " without seeing it. Rollback?";
-                fassertFailedNoTrace(18693);
-            }
-
-            // apply replication batch limits
-            if (ops.getSize() > replBatchLimitBytes)
-                break;
-            if (ops.getDeque().size() > replBatchLimitOperations)
-                break;
-        };
-
-        if (ops.empty()) {
-            severe() << "got no ops for batch...";
-            fassertFailedNoTrace(18692);
-        }
-
-        const BSONObj lastOp = ops.back().getOwned();
-
-        // Tally operation information
-        bytesApplied += ops.getSize();
-        entriesApplied += ops.getDeque().size();
-
-        const OpTime lastOpTime = multiApply(txn,
-                                             ops,
-                                             &_prefetcherPool,
-                                             &_writerPool,
-                                             _applyFunc,
-                                             this,
-                                             supportsWaitingUntilDurable());
-        if (inShutdown()) {
-            return;
-        }
-
-        // if the last op applied was our end, return
-        if (lastOpTime == endOpTime) {
-            LOG(1) << "SyncTail applied " << entriesApplied << " entries (" << bytesApplied
-                   << " bytes)"
-                   << " and finished at opTime " << endOpTime;
-            return;
-        }
-    }  // end of while (true)
 }
 
 namespace {
@@ -501,8 +416,8 @@ void tryToGoLiveAsASecondary(OperationContext* txn, ReplicationCoordinator* repl
         return;
     }
 
-    OpTime minvalid = getMinValid(txn);
-    if (minvalid > replCoord->getMyLastOptime()) {
+    BatchBoundaries boundaries = getMinValid(txn);
+    if (!boundaries.start.isNull() || boundaries.end > replCoord->getMyLastOptime()) {
         return;
     }
 
@@ -518,9 +433,10 @@ void tryToGoLiveAsASecondary(OperationContext* txn, ReplicationCoordinator* repl
 void SyncTail::oplogApplication() {
     ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
 
+    OperationContextImpl txn;
+    OpTime originalEndOpTime(getMinValid(&txn).end);
     while (!inShutdown()) {
         OpQueue ops;
-        OperationContextImpl txn;
 
         Timer batchTimer;
         int lastTimeChecked = 0;
@@ -579,6 +495,8 @@ void SyncTail::oplogApplication() {
         // For pausing replication in tests
         while (MONGO_FAIL_POINT(rsSyncApplyStop)) {
             sleepmillis(0);
+            if (inShutdown())
+                return;
         }
 
         if (ops.empty()) {
@@ -588,17 +506,43 @@ void SyncTail::oplogApplication() {
         const BSONObj lastOp = ops.back();
         handleSlaveDelay(lastOp);
 
-        // Set minValid to the last op to be applied in this next batch.
+        // Set minValid to the last OpTime that needs to be applied, in this batch or from the
+        // (last) failed batch, whichever is larger.
         // This will cause this node to go into RECOVERING state
-        // if we should crash and restart before updating the oplog
-        setMinValid(&txn, fassertStatusOK(28773, OpTime::parseFromBSON(lastOp)));
-        multiApply(&txn,
-                   ops,
-                   &_prefetcherPool,
-                   &_writerPool,
-                   _applyFunc,
-                   this,
-                   supportsWaitingUntilDurable());
+        // if we should crash and restart before updating finishing.
+        const OpTime start(getLastSetTimestamp(), OpTime::kUninitializedTerm);
+
+        // Take the max of the first endOptime (if we recovered) and the end of our batch.
+        const auto lastOpTime = fassertStatusOK(28773, OpTime::parseFromOplogEntry(lastOp));
+
+        // Setting end to the max of originalEndOpTime and lastOpTime (the end of the batch)
+        // ensures that we keep pushing out the point where we can become consistent
+        // and allow reads. If we recover and end up doing smaller batches we must pass the
+        // originalEndOpTime before we are good.
+        //
+        // For example:
+        // batch apply, 20-40, end = 40
+        // batch failure,
+        // restart
+        // batch apply, 20-25, end = max(25, 40) = 40
+        // batch apply, 25-45, end = 45
+        const OpTime end(std::max(originalEndOpTime, lastOpTime));
+
+        // This write will not journal/checkpoint.
+        setMinValid(&txn, {start, end});
+
+        const bool mustWaitUntilDurable =
+            shouldEnsureDurability() && replCoord->isV1ElectionProtocol();
+        if (mustWaitUntilDurable) {
+            txn.recoveryUnit()->goingToWaitUntilDurable();
+        }
+
+        multiApply(&txn, ops);
+
+        // This write will journal/checkpoint, and finish the batch.
+        setMinValid(&txn,
+                    end,
+                    mustWaitUntilDurable ? DurableRequirement::Strong : DurableRequirement::None);
     }
 }
 
@@ -819,8 +763,6 @@ bool SyncTail::shouldRetry(OperationContext* txn, const BSONObj& o) {
     // fixes compile errors on GCC - see SERVER-18219 for details
     MONGO_UNREACHABLE;
 }
-
-static AtomicUInt32 replWriterWorkerId;
 
 static void initializeWriterThread() {
     // Only do this once per thread

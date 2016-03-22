@@ -52,7 +52,7 @@ class ReplSetMetadata;
 
 namespace repl {
 
-static const Milliseconds UninitializedPing{};
+static const Milliseconds UninitializedPing{-1};
 
 /**
  * Represents a latency measurement for each replica set member based on heartbeat requests.
@@ -90,9 +90,10 @@ public:
 
     /**
      * Gets the weighted average round trip time for heartbeat messages to the target.
+     * Returns 0 if there have been no pings recorded yet.
      */
     Milliseconds getMillis() const {
-        return value;
+        return value == UninitializedPing ? Milliseconds(0) : value;
     }
 
     /**
@@ -212,7 +213,7 @@ public:
     virtual bool voteForMyself(Date_t now);
     virtual void processWinElection(OID electionId, Timestamp electionOpTime);
     virtual void processLoseElection();
-    virtual bool checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied);
+    virtual bool checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) const;
     virtual void setMyHeartbeatMessage(const Date_t now, const std::string& message);
     virtual bool stepDown(Date_t until, bool force, const OpTime& lastOpApplied);
     virtual bool stepDownIfPending();
@@ -233,8 +234,7 @@ public:
     virtual HeartbeatResponseAction setMemberAsDown(Date_t now,
                                                     const int memberIndex,
                                                     const OpTime& myLastOpApplied);
-    virtual Milliseconds getTimeoutDelayForMember(int memberId);
-    virtual bool stagePriorityTakeoverIfElectable(const Date_t now, const OpTime& lastOpApplied);
+    virtual bool becomeCandidateIfElectable(const Date_t now, const OpTime& lastOpApplied);
 
     ////////////////////////////////////////////////////////////
     //

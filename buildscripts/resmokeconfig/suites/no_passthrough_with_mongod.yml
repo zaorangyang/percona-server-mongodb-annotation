@@ -3,19 +3,22 @@ selector:
     roots:
     - jstests/noPassthroughWithMongod/*.js
     exclude_files:
-    # Skip the passthrough test because it is run separately.
-    - jstests/noPassthroughWithMongod/fluent_gle_passthrough.js
     # SERVER-19093
     - jstests/noPassthroughWithMongod/httpinterface.js
+    # stale_clustered.js temporarily disabled due to intermittent failures that are currently
+    # undergoing investigation.  TODO: Re-enable as part of SERVER-20646 work.
+    - jstests/noPassthroughWithMongod/stale_clustered.js
 
 executor:
   js_test:
+    config:
+      shell_options:
+        readMode: commands
     hooks:
     - class: CleanEveryN
       n: 20
     fixture:
       class: MongoDFixture
       mongod_options:
-        nopreallocj: ''
         set_parameters:
           enableTestCommands: 1

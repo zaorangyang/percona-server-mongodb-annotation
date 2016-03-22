@@ -69,7 +69,7 @@ namespace mongo {
                                               RecordId end,
                                               bool inclusive);
 
-        virtual void setCappedDeleteCallback(CappedDocumentDeleteCallback* cb) {
+        virtual void setCappedCallback(CappedCallback* cb) {
             _cappedDeleteCallback = cb;
         }
 
@@ -92,7 +92,7 @@ namespace mongo {
         const int64_t _cappedMaxSizeSlack; // when to start applying backpressure
         const int64_t _cappedMaxDocs;
         RecordId _lastDeletedId;
-        CappedDocumentDeleteCallback* _cappedDeleteCallback;
+        CappedCallback* _cappedDeleteCallback;
         boost::mutex _cappedDeleteMutex;
 
         const bool _engineSupportsDocLocking;

@@ -35,6 +35,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/replset/catalog_manager_replica_set.h"
 #include "mongo/s/catalog/replset/catalog_manager_replica_set_test_fixture.h"
@@ -78,11 +79,11 @@ public:
 
         setupShards({_shard1, _shard2});
 
-        RemoteCommandTargeterMock* shard1Targeter = RemoteCommandTargeterMock::get(
+        auto shard1Targeter = RemoteCommandTargeterMock::get(
             shardRegistry()->getShard(operationContext(), _shard1.getName())->getTargeter());
         shard1Targeter->setFindHostReturnValue(HostAndPort(_shard1.getHost()));
 
-        RemoteCommandTargeterMock* shard2Targeter = RemoteCommandTargeterMock::get(
+        auto shard2Targeter = RemoteCommandTargeterMock::get(
             shardRegistry()->getShard(operationContext(), _shard2.getName())->getTargeter());
         shard2Targeter->setFindHostReturnValue(HostAndPort(_shard2.getHost()));
     }
@@ -104,8 +105,6 @@ public:
             ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
             ASSERT_EQ(_configHost, request.target);
             ASSERT_EQ("config", request.dbname);
-
-            ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
             BSONObj expectedCmd(fromjson(R"({
                 delete: "chunks",
@@ -292,7 +291,7 @@ TEST_F(DropColl2ShardTest, DistLockBusy) {
 }
 
 TEST_F(DropColl2ShardTest, FirstShardTargeterError) {
-    RemoteCommandTargeterMock* shard1Targeter = RemoteCommandTargeterMock::get(
+    auto shard1Targeter = RemoteCommandTargeterMock::get(
         shardRegistry()->getShard(operationContext(), shard1().getName())->getTargeter());
     shard1Targeter->setFindHostReturnValue({ErrorCodes::HostUnreachable, "bad test network"});
 
@@ -368,7 +367,7 @@ TEST_F(DropColl2ShardTest, FirstShardDropCmdError) {
 }
 
 TEST_F(DropColl2ShardTest, SecondShardTargeterError) {
-    RemoteCommandTargeterMock* shard2Targeter = RemoteCommandTargeterMock::get(
+    auto shard2Targeter = RemoteCommandTargeterMock::get(
         shardRegistry()->getShard(operationContext(), shard2().getHost())->getTargeter());
     shard2Targeter->setFindHostReturnValue({ErrorCodes::HostUnreachable, "bad test network"});
 

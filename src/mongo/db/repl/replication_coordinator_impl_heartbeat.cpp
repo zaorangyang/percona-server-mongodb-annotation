@@ -143,6 +143,11 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     if (responseStatus.isOK()) {
         networkTime = cbData.response.getValue().elapsedMillis;
         _updateTerm_incallback(hbStatusResponse.getValue().getTerm());
+        // Postpone election timeout if we have a successful heartbeat response from the primary.
+        const auto& hbResponse = hbStatusResponse.getValue();
+        if (hbResponse.hasState() && hbResponse.getState().primary()) {
+            cancelAndRescheduleElectionTimeout();
+        }
     } else {
         log() << "Error in heartbeat request to " << target << "; " << responseStatus;
         if (!resp.isEmpty()) {
@@ -206,12 +211,15 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponseAction(
             invariant(responseStatus.isOK());
             _scheduleHeartbeatReconfig(responseStatus.getValue().getConfig());
             break;
-        case HeartbeatResponseAction::StartElection:
-            if (isV1ElectionProtocol()) {
-                _startElectSelfV1();
-            } else {
-                _startElectSelf();
+        case HeartbeatResponseAction::ScheduleElection:
+            DEV {
+                // Election timer should already be periodically scheduled at this point.
+                stdx::unique_lock<stdx::mutex> lk(_mutex);
+                fassert(28813, _handleElectionTimeoutCbh.isValid());
             }
+            break;
+        case HeartbeatResponseAction::StartElection:
+            _startElectSelf();
             break;
         case HeartbeatResponseAction::StepDownSelf:
             invariant(action.getPrimaryConfigIndex() == _selfIndex);
@@ -227,17 +235,10 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponseAction(
         case HeartbeatResponseAction::PriorityTakeover: {
             stdx::unique_lock<stdx::mutex> lk(_mutex);
             if (!_priorityTakeoverCbh.isValid()) {
-                Milliseconds delay = _rsConfig.getPriorityTakeoverDelay(_selfIndex);
-                auto cbh = _replExecutor.scheduleWorkAt(
-                    _replExecutor.now() + delay,
-                    stdx::bind(&ReplicationCoordinatorImpl::_priorityTakeover,
-                               this,
-                               stdx::placeholders::_1));
-                if (cbh.getStatus() == ErrorCodes::ShutdownInProgress) {
-                    return;
-                }
-                fassert(28806, cbh.getStatus());
-                _priorityTakeoverCbh = cbh.getValue();
+                auto when = _replExecutor.now() + _rsConfig.getPriorityTakeoverDelay(_selfIndex);
+                _priorityTakeoverCbh = _scheduleWorkAt(
+                    when,
+                    stdx::bind(&ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1, this));
             }
             break;
         }
@@ -423,7 +424,11 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
 
         lk.unlock();
 
-        _externalState->startThreads();
+        bool isArbiter = myIndex.isOK() && myIndex.getValue() != -1 &&
+            newConfig.getMemberAt(myIndex.getValue()).isArbiter();
+        if (!isArbiter) {
+            _externalState->startThreads();
+        }
     }
 
     const stdx::function<void(const ReplicationExecutor::CallbackArgs&)> reconfigFinishFn(
@@ -535,6 +540,10 @@ void ReplicationCoordinatorImpl::_startHeartbeats_inlock(
         _scheduleHeartbeatToTarget(_rsConfig.getMemberAt(i).getHostAndPort(), i, now);
     }
     if (isV1ElectionProtocol()) {
+        for (auto&& slaveInfo : _slaveInfo) {
+            slaveInfo.lastUpdate = _replExecutor.now();
+            slaveInfo.down = false;
+        }
         _scheduleNextLivenessUpdate_inlock(cbData);
     }
 }
@@ -618,8 +627,7 @@ void ReplicationCoordinatorImpl::_scheduleNextLivenessUpdate_inlock(
         return;
     }
 
-    auto nextTimeout = earliestDate + _rsConfig.getElectionTimeoutPeriod() +
-        _topCoord->getTimeoutDelayForMember(earliestMemberId);
+    auto nextTimeout = earliestDate + _rsConfig.getElectionTimeoutPeriod();
     if (nextTimeout > _replExecutor.now()) {
         LOG(3) << "scheduling next check at " << nextTimeout;
         auto cbh = _replExecutor.scheduleWorkAt(
@@ -646,15 +654,59 @@ void ReplicationCoordinatorImpl::_cancelAndRescheduleLivenessUpdate_inlock(int u
         &ReplicationCoordinatorImpl::_scheduleNextLivenessUpdate, this, stdx::placeholders::_1));
 }
 
-void ReplicationCoordinatorImpl::_priorityTakeover(
-    const ReplicationExecutor::CallbackArgs& cbData) {
-    if (!cbData.status.isOK()) {
-        return;
+void ReplicationCoordinatorImpl::_cancelPriorityTakeover_inlock() {
+    if (_priorityTakeoverCbh.isValid()) {
+        _replExecutor.cancel(_priorityTakeoverCbh);
+        _priorityTakeoverCbh = CallbackHandle();
     }
+}
+
+void ReplicationCoordinatorImpl::_cancelAndRescheduleElectionTimeout_inlock() {
+    if (_handleElectionTimeoutCbh.isValid()) {
+        _replExecutor.cancel(_handleElectionTimeoutCbh);
+        _handleElectionTimeoutCbh = CallbackHandle();
+        _handleElectionTimeoutWhen = Date_t();
+    }
+
     if (!isV1ElectionProtocol()) {
         return;
     }
-    if (!_topCoord->stagePriorityTakeoverIfElectable(_replExecutor.now(), getMyLastOptime())) {
+
+    if (!_memberState.secondary()) {
+        return;
+    }
+
+    if (_selfIndex < 0) {
+        return;
+    }
+
+    if (!_rsConfig.getMemberAt(_selfIndex).isElectable()) {
+        return;
+    }
+
+    Milliseconds randomOffset =
+        Milliseconds(_replExecutor.nextRandomInt64(_rsConfig.getElectionTimeoutOffsetLimit()));
+    auto now = _replExecutor.now();
+    auto when = now + _rsConfig.getElectionTimeoutPeriod() + randomOffset;
+    invariant(when > now);
+    _handleElectionTimeoutWhen = when;
+    _handleElectionTimeoutCbh = _scheduleWorkAt(
+        when, stdx::bind(&ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1, this));
+}
+
+void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1() {
+    if (!isV1ElectionProtocol()) {
+        return;
+    }
+
+    // We should always reschedule this callback even if we do not make it to the election process.
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        _cancelPriorityTakeover_inlock();
+        _cancelAndRescheduleElectionTimeout_inlock();
+    }
+
+    if (!_topCoord->becomeCandidateIfElectable(_replExecutor.now(), getMyLastOptime())) {
         return;
     }
     _startElectSelfV1();

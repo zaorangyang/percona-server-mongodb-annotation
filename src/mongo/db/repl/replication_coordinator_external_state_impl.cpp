@@ -307,7 +307,7 @@ StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(Opera
                                                     << " entry to have type Timestamp, but found "
                                                     << typeName(tsElement.type()));
         }
-        return OpTime::parseFromBSON(oplogEntry);
+        return OpTime::parseFromOplogEntry(oplogEntry);
     } catch (const DBException& ex) {
         return StatusWith<OpTime>(ex.toStatus());
     }
@@ -388,5 +388,10 @@ void ReplicationCoordinatorExternalStateImpl::forceSnapshotCreation() {
 bool ReplicationCoordinatorExternalStateImpl::snapshotsEnabled() const {
     return _snapshotThread != nullptr;
 }
+
+void ReplicationCoordinatorExternalStateImpl::notifyOplogMetadataWaiters() {
+    signalOplogWaiters();
+}
+
 }  // namespace repl
 }  // namespace mongo

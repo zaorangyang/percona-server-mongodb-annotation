@@ -161,7 +161,7 @@ namespace mongo {
             invariant(false);
         }
 
-        void setCappedDeleteCallback(CappedDocumentDeleteCallback* cb) {
+        void setCappedCallback(CappedCallback* cb) {
             invariant(false);
         }
 

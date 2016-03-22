@@ -67,10 +67,22 @@ public:
      * Constructs a ReplicaSetConfig from the given BSON, or raises a test failure exception.
      */
     static ReplicaSetConfig assertMakeRSConfig(const BSONObj& configBSON);
+    static ReplicaSetConfig assertMakeRSConfigV0(const BSONObj& configBson);
+
+    /**
+     * Adds { protocolVersion: 0 or 1 } to the config.
+     */
+    static BSONObj addProtocolVersion(const BSONObj& configDoc, int protocolVersion);
 
 protected:
     virtual void setUp();
     virtual void tearDown();
+
+    /**
+     * Asserts that calling start(configDoc, selfHost) successfully initiates the
+     * ReplicationCoordinator under test.
+     */
+    virtual void assertStartSuccess(const BSONObj& configDoc, const HostAndPort& selfHost);
 
     /**
      * Gets the network mock.
@@ -162,6 +174,19 @@ protected:
     void start(const HostAndPort& selfHost);
 
     /**
+     * Brings the TopologyCoordinator from follower to candidate by simulating a period of time in
+     * which the election timer expires and starts a dry run election.
+     * Returns after dry run is completed but before actual election starts.
+     * If 'onDryRunRequest' is provided, this function is invoked with the
+     * replSetRequestVotes network request before simulateSuccessfulDryRun() simulates
+     * a successful dry run vote response.
+     * Applicable to protocol version 1 only.
+     */
+    void simulateSuccessfulDryRun(
+        stdx::function<void(const executor::RemoteCommandRequest& request)> onDryRunRequest);
+    void simulateSuccessfulDryRun();
+
+    /**
      * Brings the repl coord from SECONDARY to PRIMARY by simulating the messages required to
      * elect it.
      *
@@ -171,26 +196,9 @@ protected:
     void simulateSuccessfulV1Election();
 
     /**
-     * Brings the repl coord from PRIMARY to SECONDARY by simulating a period of time in which
-     * all heartbeats respond with an error condition, such as time out.
-     */
-    void simulateStepDownOnIsolation();
-
-    /**
-     * Asserts that calling start(configDoc, selfHost) successfully initiates the
-     * ReplicationCoordinator under test.
-     */
-    void assertStartSuccess(const BSONObj& configDoc, const HostAndPort& selfHost);
-
-    /**
      * Shuts down the objects under test.
      */
     void shutdown();
-
-    /**
-     * Returns the number of collected log lines containing "needle".
-     */
-    int64_t countLogLinesContaining(const std::string& needle);
 
     /**
      * Receive the heartbeat request from replication coordinator and reply with a response.

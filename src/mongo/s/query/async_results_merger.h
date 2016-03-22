@@ -43,6 +43,8 @@
 
 namespace mongo {
 
+struct CursorResponse;
+
 /**
  * AsyncResultsMerger is used to generate results from cursor-generating commands on one or more
  * remote hosts. A cursor-generating command (e.g. the find command) is one that establishes a
@@ -167,6 +169,7 @@ private:
         bool exhausted() const;
 
         HostAndPort hostAndPort;
+        boost::optional<ShardId> shardId;
 
         // The command object for sending to the remote to establish the cursor. If a remote cursor
         // has not been established yet, this member will be set to a valid command object. If a
@@ -208,6 +211,14 @@ private:
      */
     static void handleKillCursorsResponse(
         const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData);
+
+    /**
+     * Parses the find or getMore command response object to a CursorResponse.
+     *
+     * Returns a non-OK response if the response fails to parse or if there is a cursor id mismatch.
+     */
+    static StatusWith<CursorResponse> parseCursorResponse(const BSONObj& responseObj,
+                                                          const RemoteCursorData& remote);
 
     /**
      * Helper to schedule a command asking the remote node for another batch of results.

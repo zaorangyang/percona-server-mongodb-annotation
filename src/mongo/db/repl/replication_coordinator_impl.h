@@ -30,9 +30,11 @@
 
 #include <vector>
 #include <memory>
+#include <utility>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/data_replicator.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
@@ -81,6 +83,10 @@ class ReplicationCoordinatorImpl : public ReplicationCoordinator, public KillOpL
     MONGO_DISALLOW_COPYING(ReplicationCoordinatorImpl);
 
 public:
+    // For testing only.
+    using StepDownNonBlockingResult =
+        std::pair<std::unique_ptr<mongo::Lock::GlobalLock>, ReplicationExecutor::EventHandle>;
+
     // Takes ownership of the "externalState", "topCoord" and "network" objects.
     ReplicationCoordinatorImpl(const ReplSettings& settings,
                                ReplicationCoordinatorExternalState* externalState,
@@ -194,7 +200,7 @@ public:
 
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
 
-    virtual void signalPrimaryUnavailable() override;
+    virtual void cancelAndRescheduleElectionTimeout() override;
 
     virtual Status setMaintenanceMode(bool activate) override;
 
@@ -304,9 +310,31 @@ public:
     ReplicaSetConfig getReplicaSetConfig_forTest();
 
     /**
+     * Returns scheduled time of election timeout callback.
+     * Returns Date_t() if callback is not scheduled.
+     */
+    Date_t getElectionTimeout_forTest() const;
+
+    /**
      * Simple wrapper around _setLastOptime_inlock to make it easier to test.
      */
     Status setLastOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
+
+    /**
+     * Non-blocking version of stepDown.
+     * Returns a pair of global shared lock and event handle which are used to wait for the step
+     * down operation to complete. The global shared lock prevents writes until the step down has
+     * completed (or failed).
+     * When the operation is complete (wait() returns), 'result' will be set to the
+     * final status of the operation.
+     * If the handle is invalid, step down failed before we could schedule the rest of
+     * the step down processing and the error will be available immediately in 'result'.
+     */
+    StepDownNonBlockingResult stepDown_nonBlocking(OperationContext* txn,
+                                                   bool force,
+                                                   const Milliseconds& waitTime,
+                                                   const Milliseconds& stepdownTime,
+                                                   Status* result);
 
     /**
      * Non-blocking version of setFollowerMode.
@@ -316,6 +344,11 @@ public:
      */
     ReplicationExecutor::EventHandle setFollowerMode_nonBlocking(const MemberState& newState,
                                                                  bool* success);
+
+    /**
+     * Waits until _memberState becomes 'expectedState'.
+     */
+    void waitForMemberState_forTest(const MemberState& expectedState);
 
     /**
      * If called after _startElectSelfV1(), blocks until all asynchronous
@@ -674,10 +707,13 @@ private:
      *
      * This function has the same rules for "opTime" as setMyLastOptime(), unless
      * "isRollbackAllowed" is true.
+     *
+     * This function will also report our position externally (like upstream) if necessary.
      */
-    void _setMyLastOptime_inlock(stdx::unique_lock<stdx::mutex>* lock,
-                                 const OpTime& opTime,
-                                 bool isRollbackAllowed);
+    void _setMyLastOptimeAndReport_inlock(stdx::unique_lock<stdx::mutex>* lock,
+                                          const OpTime& opTime,
+                                          bool isRollbackAllowed);
+    void _setMyLastOptime_inlock(const OpTime& opTime, bool isRollbackAllowed);
 
     /**
      * Schedules a heartbeat to be sent to "target" at "when". "targetIndex" is the index
@@ -1041,9 +1077,20 @@ private:
     void _cancelAndRescheduleLivenessUpdate_inlock(int updatedMemberId);
 
     /**
+     * Cancels all outstanding _priorityTakeover callbacks.
+     */
+    void _cancelPriorityTakeover_inlock();
+
+    /**
+     * Cancels the current _handleElectionTimeout callback and reschedules a new callback.
+     * Returns immediately otherwise.
+     */
+    void _cancelAndRescheduleElectionTimeout_inlock();
+
+    /**
      * Callback which starts an election if this node is electable and using protocolVersion 1.
      */
-    void _priorityTakeover(const ReplicationExecutor::CallbackArgs& cbData);
+    void _startElectSelfIfEligibleV1();
 
     /**
      * Reset the term of last vote to 0 to prevent any node from voting for term 0.
@@ -1168,6 +1215,9 @@ private:
     // the entry for ourself will be at _thisMemberConfigIndex.
     SlaveInfoVector _slaveInfo;  // (M)
 
+    // Used to signal threads waiting for changes to _memberState.
+    stdx::condition_variable _memberStateChange;  // (M)
+
     // Current ReplicaSet state.
     MemberState _memberState;  // (MX)
 
@@ -1262,8 +1312,21 @@ private:
     // Callback Handle used to cancel a scheduled LivenessTimeout callback.
     ReplicationExecutor::CallbackHandle _handleLivenessTimeoutCbh;  // (M)
 
+    // Callback Handle used to cancel a scheduled ElectionTimeout callback.
+    ReplicationExecutor::CallbackHandle _handleElectionTimeoutCbh;  // (M)
+
+    // Election timeout callback will not run before this time.
+    // If this date is Date_t(), the callback is either unscheduled or canceled.
+    // Used for testing only.
+    Date_t _handleElectionTimeoutWhen;  // (M)
+
     // Callback Handle used to cancel a scheduled PriorityTakover callback.
     ReplicationExecutor::CallbackHandle _priorityTakeoverCbh;  // (M)
+
+    // Callback handle used by waitForStartUpComplete() to block until configuration
+    // is loaded and external state threads have been started (unless this node is an arbiter).
+    // Used for testing only.
+    CallbackHandle _finishLoadLocalConfigCbh;  // (M)
 
     // The id of the earliest member, for which the handleLivenessTimeout callback has been
     // scheduled.  We need this so that we don't needlessly cancel and reschedule the callback on

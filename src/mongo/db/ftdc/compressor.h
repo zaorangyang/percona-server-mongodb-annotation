@@ -99,7 +99,10 @@ public:
      * from the reference document.
      */
     std::size_t getSampleCount() const {
-        return _sampleCount;
+        // TODO: This method should probably be renamed, since it currently
+        // returns the number of deltas, which does not include the sample
+        // implicitly contained in the reference document.
+        return _deltaCount;
     }
 
     /**
@@ -110,7 +113,7 @@ public:
      * the reference document is reset.
      */
     bool hasDataToFlush() const {
-        return !_referenceDoc.isEmpty() || _chunkBuffer.len() > 0;
+        return !_referenceDoc.isEmpty();
     }
 
     /**
@@ -156,18 +159,21 @@ private:
     // Number of Metrics for the reference document
     std::uint32_t _metricsCount{0};
 
-    // Number of samples recorded
-    std::uint32_t _sampleCount{0};
+    // Number of deltas recorded
+    std::uint32_t _deltaCount{0};
 
-    // Max samples for the current chunk
-    std::size_t _maxSamples{0};
+    // Max deltas for the current chunk
+    std::size_t _maxDeltas{0};
 
     // Array of deltas - M x S
     // _deltas[Metrics][Samples]
     std::vector<std::uint64_t> _deltas;
 
-    // Buffer for metric chunk = header + zlib compressed array
-    BufBuilder _chunkBuffer;
+    // Buffer for metric chunk compressed = uncompressed length + compressed data
+    BufBuilder _compressedChunkBuffer;
+
+    // Buffer for uncompressed metric chunk
+    BufBuilder _uncompressedChunkBuffer;
 
     // Buffer to hold metrics
     std::vector<std::uint64_t> _metrics;

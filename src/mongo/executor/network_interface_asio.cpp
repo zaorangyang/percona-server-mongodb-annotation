@@ -34,9 +34,13 @@
 
 #include <utility>
 
-#include "mongo/executor/async_stream_interface.h"
 #include "mongo/executor/async_stream_factory.h"
+#include "mongo/executor/async_stream_interface.h"
+#include "mongo/executor/async_timer_asio.h"
+#include "mongo/executor/async_timer_interface.h"
+#include "mongo/executor/async_timer_mock.h"
 #include "mongo/executor/connection_pool_asio.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -47,20 +51,33 @@
 namespace mongo {
 namespace executor {
 
-NetworkInterfaceASIO::NetworkInterfaceASIO(
-    std::unique_ptr<AsyncStreamFactoryInterface> streamFactory, Options options)
-    : NetworkInterfaceASIO(std::move(streamFactory), nullptr, std::move(options)) {}
+#if defined(_MSC_VER) && _MSC_VER < 1900
+NetworkInterfaceASIO::Options::Options(Options&& other)
+    : connectionPoolOptions(std::move(other.connectionPoolOptions)),
+      timerFactory(std::move(other.timerFactory)),
+      networkConnectionHook(std::move(other.networkConnectionHook)),
+      streamFactory(std::move(other.streamFactory)),
+      metadataHook(std::move(other.metadataHook)) {}
 
-NetworkInterfaceASIO::NetworkInterfaceASIO(
-    std::unique_ptr<AsyncStreamFactoryInterface> streamFactory,
-    std::unique_ptr<NetworkConnectionHook> networkConnectionHook,
-    Options options)
+NetworkInterfaceASIO::Options& NetworkInterfaceASIO::Options::operator=(Options&& other) {
+    connectionPoolOptions = std::move(other.connectionPoolOptions);
+    timerFactory = std::move(other.timerFactory);
+    networkConnectionHook = std::move(other.networkConnectionHook);
+    streamFactory = std::move(other.streamFactory);
+    metadataHook = std::move(other.metadataHook);
+    return *this;
+}
+#endif
+
+NetworkInterfaceASIO::NetworkInterfaceASIO(Options options)
     : _options(std::move(options)),
       _io_service(),
-      _hook(std::move(networkConnectionHook)),
+      _metadataHook(std::move(_options.metadataHook)),
+      _hook(std::move(_options.networkConnectionHook)),
       _resolver(_io_service),
       _state(State::kReady),
-      _streamFactory(std::move(streamFactory)),
+      _timerFactory(std::move(_options.timerFactory)),
+      _streamFactory(std::move(_options.streamFactory)),
       _connectionPool(stdx::make_unique<connection_pool_asio::ASIOImpl>(this),
                       _options.connectionPoolOptions),
       _isExecutorRunnable(false) {}
@@ -78,8 +95,14 @@ std::string NetworkInterfaceASIO::getHostName() {
 
 void NetworkInterfaceASIO::startup() {
     _serviceRunner = stdx::thread([this]() {
-        asio::io_service::work work(_io_service);
-        _io_service.run();
+        try {
+            asio::io_service::work work(_io_service);
+            _io_service.run();
+        } catch (...) {
+            severe() << "Uncaught exception in NetworkInterfaceASIO IO worker thread of type: "
+                     << exceptionToStatus();
+            fassertFailed(28820);
+        }
     });
     _state.store(State::kRunning);
 }
@@ -131,9 +154,12 @@ Date_t NetworkInterfaceASIO::now() {
 void NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cbHandle,
                                         const RemoteCommandRequest& request,
                                         const RemoteCommandCompletionFn& onFinish) {
+    invariant(onFinish);
     {
         stdx::lock_guard<stdx::mutex> lk(_inProgressMutex);
-        _inGetConnection.push_back(cbHandle);
+        const auto insertResult = _inGetConnection.emplace(cbHandle);
+        // We should never see the same CallbackHandle added twice
+        invariant(insertResult.second);
     }
 
     auto startTime = now();
@@ -142,43 +168,86 @@ void NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cbHa
         StatusWith<ConnectionPool::ConnectionHandle> swConn) {
 
         if (!swConn.isOK()) {
+            bool wasPreviouslyCanceled = false;
             {
                 stdx::lock_guard<stdx::mutex> lk(_inProgressMutex);
-
-                auto& v = _inGetConnection;
-                auto iter = std::find(v.begin(), v.end(), cbHandle);
-                if (iter != v.end())
-                    v.erase(iter);
+                wasPreviouslyCanceled = _inGetConnection.erase(cbHandle) == 0;
             }
 
-            onFinish(swConn.getStatus());
+            onFinish(wasPreviouslyCanceled
+                         ? Status(ErrorCodes::CallbackCanceled, "Callback canceled")
+                         : swConn.getStatus());
             signalWorkAvailable();
             return;
         }
 
         auto conn = static_cast<connection_pool_asio::ASIOConnection*>(swConn.getValue().get());
 
-        auto ownedOp = conn->releaseAsyncOp();
-        AsyncOp* op = ownedOp.get();
+        AsyncOp* op = nullptr;
 
         {
-            stdx::lock_guard<stdx::mutex> lk(_inProgressMutex);
+            stdx::unique_lock<stdx::mutex> lk(_inProgressMutex);
 
-            auto iter = std::find(_inGetConnection.begin(), _inGetConnection.end(), cbHandle);
+            const auto eraseCount = _inGetConnection.erase(cbHandle);
 
             // If we didn't find the request, we've been canceled
-            if (iter == _inGetConnection.end())
+            if (eraseCount == 0) {
+                lk.unlock();
+                onFinish({ErrorCodes::CallbackCanceled, "Callback canceled"});
+                signalWorkAvailable();
                 return;
+            }
 
-            _inGetConnection.erase(iter);
+            // We can't release the AsyncOp until we know we were not canceled.
+            auto ownedOp = conn->releaseAsyncOp();
+            op = ownedOp.get();
+
+            // Sanity check that we are getting a clean AsyncOp.
+            invariant(!op->canceled());
+            invariant(!op->timedOut());
+
             _inProgress.emplace(op, std::move(ownedOp));
         }
 
-        op->_cbHandle = cbHandle;
-        op->_request = request;
-        op->_onFinish = onFinish;
+        op->_cbHandle = std::move(cbHandle);
+        op->_request = std::move(request);
+        op->_onFinish = std::move(onFinish);
         op->_connectionPoolHandle = std::move(swConn.getValue());
         op->_start = startTime;
+
+        // Set timeout now that we have the correct request object
+        if (op->_request.timeout != RemoteCommandRequest::kNoTimeout) {
+            op->_timeoutAlarm = op->_owner->_timerFactory->make(&_io_service, op->_request.timeout);
+
+            std::shared_ptr<AsyncOp::AccessControl> access;
+            std::size_t generation;
+            {
+                stdx::lock_guard<stdx::mutex> lk(op->_access->mutex);
+                access = op->_access;
+                generation = access->id;
+            }
+
+            op->_timeoutAlarm->asyncWait([this, op, access, generation](std::error_code ec) {
+                if (!ec) {
+                    // We must pass a check for safe access before using op inside the
+                    // callback or we may attempt access on an invalid pointer.
+                    stdx::lock_guard<stdx::mutex> lk(access->mutex);
+                    if (generation != access->id) {
+                        // The operation has been cleaned up, do not access.
+                        return;
+                    }
+
+                    // An operation may be in mid-flight when it times out, so we
+                    // cancel any in-progress async calls but do not complete the operation now.
+                    if (op->_connection) {
+                        op->_connection->cancel();
+                    }
+                    op->_timedOut.store(1);
+                } else {
+                    LOG(4) << "failed to time operation out: " << ec.message();
+                }
+            });
+        }
 
         _beginCommunication(op);
     };
@@ -192,18 +261,33 @@ void NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cbHa
 
 void NetworkInterfaceASIO::cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) {
     stdx::lock_guard<stdx::mutex> lk(_inProgressMutex);
-    for (auto iter = _inProgress.begin(); iter != _inProgress.end(); ++iter) {
-        if (iter->first->cbHandle() == cbHandle) {
-            iter->first->cancel();
+
+    // If we found a matching cbHandle in _inGetConnection, then
+    // simply removing it has the same effect as cancelling it, so we
+    // can just return.
+    if (_inGetConnection.erase(cbHandle) != 0)
+        return;
+
+    // TODO: This linear scan is unfortunate. It is here because our
+    // primary data structure is to keep the AsyncOps in an
+    // unordered_map by pointer, but here we only have the
+    // callback. We could keep two data structures at the risk of
+    // having them diverge.
+    for (auto&& kv : _inProgress) {
+        if (kv.first->cbHandle() == cbHandle) {
+            kv.first->cancel();
             break;
         }
     }
 }
 
 void NetworkInterfaceASIO::cancelAllCommands() {
-    stdx::lock_guard<stdx::mutex> lk(_inProgressMutex);
-    for (auto iter = _inProgress.begin(); iter != _inProgress.end(); ++iter) {
-        iter->first->cancel();
+    decltype(_inGetConnection) newInGetConnection;
+    {
+        stdx::lock_guard<stdx::mutex> lk(_inProgressMutex);
+        _inGetConnection.swap(newInGetConnection);
+        for (auto&& kv : _inProgress)
+            kv.first->cancel();
     }
 }
 

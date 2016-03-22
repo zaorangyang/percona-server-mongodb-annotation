@@ -52,6 +52,8 @@ const std::string ReplicaSetConfig::kMajorityWriteConcernModeName = "$majority";
 const Milliseconds ReplicaSetConfig::kDefaultHeartbeatInterval(2000);
 const Seconds ReplicaSetConfig::kDefaultHeartbeatTimeoutPeriod(10);
 const Milliseconds ReplicaSetConfig::kDefaultElectionTimeoutPeriod(10000);
+const int ReplicaSetConfig::kDefaultElectionTimeoutOffsetLimit(2000);
+const bool ReplicaSetConfig::kDefaultChainingAllowed(true);
 
 namespace {
 
@@ -69,6 +71,7 @@ const std::string kLegalConfigTopFieldNames[] = {kIdFieldName,
                                                  ReplicaSetConfig::kConfigServerFieldName};
 
 const std::string kElectionTimeoutFieldName = "electionTimeoutMillis";
+const std::string kElectionTimeoutOffsetLimitFieldName = "electionTimeoutOffsetLimitMillis";
 const std::string kHeartbeatIntervalFieldName = "heartbeatIntervalMillis";
 const std::string kHeartbeatTimeoutFieldName = "heartbeatTimeoutSecs";
 const std::string kChainingAllowedFieldName = "chainingAllowed";
@@ -77,7 +80,7 @@ const std::string kGetLastErrorModesFieldName = "getLastErrorModes";
 
 }  // namespace
 
-Status ReplicaSetConfig::initialize(const BSONObj& cfg) {
+Status ReplicaSetConfig::initialize(const BSONObj& cfg, bool usePV1ByDefault) {
     _isInitialized = false;
     _members.clear();
     Status status =
@@ -126,7 +129,8 @@ Status ReplicaSetConfig::initialize(const BSONObj& cfg) {
     //
     // Parse configServer
     //
-    status = bsonExtractBooleanFieldWithDefault(cfg, kConfigServerFieldName, false, &_configServer);
+    status = bsonExtractBooleanFieldWithDefault(
+        cfg, kConfigServerFieldName, serverGlobalParams.configsvr, &_configServer);
     if (!status.isOK()) {
         return status;
     }
@@ -135,8 +139,14 @@ Status ReplicaSetConfig::initialize(const BSONObj& cfg) {
     // Parse protocol version
     //
     status = bsonExtractIntegerField(cfg, kProtocolVersionFieldName, &_protocolVersion);
-    if (!status.isOK() && status != ErrorCodes::NoSuchKey) {
-        return status;
+    if (!status.isOK()) {
+        if (status != ErrorCodes::NoSuchKey) {
+            return status;
+        }
+
+        if (usePV1ByDefault) {
+            _protocolVersion = 1;
+        }
     }
 
     //
@@ -175,6 +185,7 @@ Status ReplicaSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
     }
     _heartbeatInterval = Milliseconds(heartbeatIntervalMillis);
 
+    //
     // Parse electionTimeoutMillis
     //
     BSONElement electionTimeoutMillisElement = settings[kElectionTimeoutFieldName];
@@ -189,6 +200,23 @@ Status ReplicaSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
                                     << " to be a number, but found a value of type "
                                     << typeName(electionTimeoutMillisElement.type()));
     }
+
+    //
+    // Parse electionTimeoutOffsetLimit
+    //
+    auto greaterThanZero = stdx::bind(std::greater<long long>(), stdx::placeholders::_1, 0);
+    long long electionTimeoutOffsetLimitMillis;
+    auto electionTimeoutOffsetLimitStatus =
+        bsonExtractIntegerFieldWithDefaultIf(settings,
+                                             kElectionTimeoutOffsetLimitFieldName,
+                                             kDefaultElectionTimeoutOffsetLimit,
+                                             greaterThanZero,
+                                             "election timeout offset limit must be greater than 0",
+                                             &electionTimeoutOffsetLimitMillis);
+    if (!electionTimeoutOffsetLimitStatus.isOK()) {
+        return electionTimeoutOffsetLimitStatus;
+    }
+    _electionTimeoutOffsetLimit = electionTimeoutOffsetLimitMillis;
 
     //
     // Parse heartbeatTimeoutSecs
@@ -210,7 +238,7 @@ Status ReplicaSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
     // Parse chainingAllowed
     //
     Status status = bsonExtractBooleanFieldWithDefault(
-        settings, kChainingAllowedFieldName, true, &_chainingAllowed);
+        settings, kChainingAllowedFieldName, kDefaultChainingAllowed, &_chainingAllowed);
     if (!status.isOK())
         return status;
 
@@ -625,6 +653,8 @@ BSONObj ReplicaSetConfig::toBSON() const {
                                   durationCount<Seconds>(_heartbeatTimeoutPeriod));
     settingsBuilder.appendIntOrLL(kElectionTimeoutFieldName,
                                   durationCount<Milliseconds>(_electionTimeoutPeriod));
+    settingsBuilder.appendIntOrLL(kElectionTimeoutOffsetLimitFieldName,
+                                  _electionTimeoutOffsetLimit);
 
 
     BSONObjBuilder gleModes(settingsBuilder.subobjStart(kGetLastErrorModesFieldName));
@@ -664,9 +694,7 @@ std::vector<std::string> ReplicaSetConfig::getWriteConcernNames() const {
 Milliseconds ReplicaSetConfig::getPriorityTakeoverDelay(int memberIdx) const {
     auto member = getMemberAt(memberIdx);
     int priorityRank = _calculatePriorityRank(member.getPriority());
-    Milliseconds nodeSpecificDelay =
-        getVoterPosition(memberIdx) * getElectionTimeoutPeriod() / getTotalVotingMembers();
-    return (priorityRank + 1) * getElectionTimeoutPeriod() + nodeSpecificDelay;
+    return (priorityRank + 1) * getElectionTimeoutPeriod();
 }
 
 int ReplicaSetConfig::_calculatePriorityRank(int priority) const {
@@ -677,22 +705,6 @@ int ReplicaSetConfig::_calculatePriorityRank(int priority) const {
         }
     }
     return count;
-}
-
-int ReplicaSetConfig::getVoterPosition(int memberIdx) const {
-    int pos = 0;
-    int idx = 0;
-    for (auto mem = membersBegin(); mem != membersEnd(); ++mem) {
-        if (idx == memberIdx) {
-            break;
-        }
-
-        if (mem->isVoter()) {
-            pos++;
-        }
-        idx++;
-    }
-    return pos;
 }
 
 }  // namespace repl

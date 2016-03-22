@@ -102,12 +102,12 @@ void _logOp(OperationContext* txn,
             ReplicationCoordinator::Mode replicationMode,
             bool updateReplOpTime);
 
-void _logOp(OperationContext* txn,
-            const char* opstr,
-            const char* ns,
-            const BSONObj& obj,
-            BSONObj* o2,
-            bool fromMigrate);
+void logOp(OperationContext* txn,
+           const char* opstr,
+           const char* ns,
+           const BSONObj& obj,
+           BSONObj* o2,
+           bool fromMigrate);
 
 // Flush out the cached pointers to the local database and oplog.
 // Used by the closeDatabase command to ensure we don't cache closed things.
@@ -145,5 +145,11 @@ void setNewTimestamp(const Timestamp& newTime);
  * Detects the current replication mode and sets the "_oplogCollectionName" accordingly.
  */
 void setOplogCollectionName();
+
+/**
+ * Signal any waiting AwaitData queries on the oplog that there is new data or metadata available.
+ */
+void signalOplogWaiters();
+
 }  // namespace repl
 }  // namespace mongo

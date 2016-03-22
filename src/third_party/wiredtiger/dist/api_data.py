@@ -271,7 +271,10 @@ file_config = format_meta + [
         leaf pages''',
         min=0),
     Config('split_deepen_min_child', '0', r'''
-        minimum entries in a page to consider deepening the tree''',
+        minimum entries in a page to consider deepening the tree. Pages
+        will be considered for splitting and deepening the search tree
+        as soon as there are more than the configured number of children
+        ''',
         type='int', undoc=True),
     Config('split_deepen_per_child', '0', r'''
         entries allocated per child when deepening the tree''',
@@ -725,6 +728,17 @@ methods = {
         type='boolean'),
 ]),
 
+'WT_SESSION.log_flush' : Method([
+    Config('sync', 'on', r'''
+        forcibly flush the log and wait for it to achieve the synchronization
+        level specified.  The \c background setting initiates a background
+        synchronization intended to be used with a later call to
+        WT_SESSION::transaction_sync.  The \c off setting forces any
+        buffered log records to be written to the file system.  The
+        \c on setting forces log records to be written to the storage device''',
+        choices=['background', 'off', 'on']),
+]),
+
 'WT_SESSION.log_printf' : Method([]),
 
 'WT_SESSION.open_cursor' : Method(cursor_runtime_config + [
@@ -811,10 +825,10 @@ methods = {
 ]),
 'WT_SESSION.strerror' : Method([]),
 'WT_SESSION.transaction_sync' : Method([
-    Config('timeout_ms', '', r'''
+    Config('timeout_ms', '1200000', r'''
         maximum amount of time to wait for background sync to complete in
         milliseconds.  A value of zero disables the timeout and returns
-        immediately.  The default waits forever.''',
+        immediately.''',
         type='int'),
 ]),
 
@@ -871,7 +885,12 @@ methods = {
 'WT_SESSION.commit_transaction' : Method([
     Config('sync', '', r'''
         override whether to sync log records when the transaction commits,
-        inherited from ::wiredtiger_open \c transaction_sync''',
+        inherited from ::wiredtiger_open \c transaction_sync.
+        The \c background setting initiates a background
+        synchronization intended to be used with a later call to
+        WT_SESSION::transaction_sync.  The \c off setting does not
+        wait for record to be written or synchronized.  The
+        \c on setting forces log records to be written to the storage device''',
         choices=['background', 'off', 'on']),
 ]),
 'WT_SESSION.rollback_transaction' : Method([]),

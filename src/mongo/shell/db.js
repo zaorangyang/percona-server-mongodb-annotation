@@ -109,6 +109,11 @@ DB.prototype.commandHelp = function( name ){
      return this.runCommand(cmdObjWithReadPref, null, options);
  };
 
+ // runCommand uses this impl to actually execute the command
+ DB.prototype._runCommandImpl = function(name, obj, options){
+     return this.getMongo().runCommand(name, obj, options);
+ }
+
  DB.prototype.runCommand = function( obj, extra, queryOptions ){
      var mergedObj = (typeof(obj) === "string") ? this._mergeCommandOptions(obj, extra) : obj;
      // if options were passed (i.e. because they were overridden on a collection), use them.
@@ -116,7 +121,7 @@ DB.prototype.commandHelp = function( name ){
      var options = (typeof(queryOptions) !== "undefined") ? queryOptions : this.getQueryOptions();
      var res;
      try {
-         res = this.getMongo().runCommand(this._name, mergedObj, options);
+         res = this._runCommandImpl(this._name, mergedObj, options);
      }
      catch (ex) {
          // When runCommand flowed through query, a connection error resulted in the message
@@ -232,7 +237,7 @@ DB.prototype.createCollection = function(name, opt) {
  *  @return SOMETHING_FIXME or null on error
  */
 DB.prototype.getProfilingLevel  = function() {
-    var res = this._dbCommand( { profile: -1 } );
+    var res = assert.commandWorked(this._dbCommand( { profile: -1 } ));
     return res ? res.was : null;
 }
 
@@ -510,7 +515,7 @@ DB.prototype.setProfilingLevel = function(level,slowms) {
     var cmd = { profile: level };
     if ( isNumber( slowms ) )
         cmd["slowms"] = slowms;
-    return this._dbCommand( cmd );
+    return assert.commandWorked(this._dbCommand( cmd ));
 }
 
 /**
@@ -1150,7 +1155,10 @@ DB.prototype.getQueryOptions = function() {
 /* Loads any scripts contained in system.js into the client shell.
 */
 DB.prototype.loadServerScripts = function(){
-    this.system.js.find().forEach(function(u){eval(u._id + " = " + u.value);});
+    var global = Function('return this')();
+    this.system.js.find().forEach(function(u) {
+        global[u._id] = u.value;
+    });
 }
 
 

@@ -62,6 +62,7 @@
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -389,13 +390,13 @@ long long Helpers::removeRange(OperationContext* txn,
 
                 // We should never be able to turn off the sharding state once enabled, but
                 // in the future we might want to.
-                verify(ShardingState::get(getGlobalServiceContext())->enabled());
+                verify(ShardingState::get(txn)->enabled());
 
                 bool docIsOrphan;
 
                 // In write lock, so will be the most up-to-date version
                 std::shared_ptr<CollectionMetadata> metadataNow =
-                    ShardingState::get(getGlobalServiceContext())->getCollectionMetadata(ns);
+                    ShardingState::get(txn)->getCollectionMetadata(ns);
                 if (metadataNow) {
                     ShardKeyPattern kp(metadataNow->getKeyPattern());
                     BSONObj key = kp.extractShardKeyFromDoc(obj);
@@ -564,7 +565,7 @@ void Helpers::emptyCollection(OperationContext* txn, const char* ns) {
     deleteObjects(txn, context.db(), ns, BSONObj(), PlanExecutor::YIELD_MANUAL, false);
 }
 
-Helpers::RemoveSaver::RemoveSaver(const string& a, const string& b, const string& why) : _out(0) {
+Helpers::RemoveSaver::RemoveSaver(const string& a, const string& b, const string& why) {
     static int NUM = 0;
 
     _root = storageGlobalParams.dbpath;
@@ -581,27 +582,27 @@ Helpers::RemoveSaver::RemoveSaver(const string& a, const string& b, const string
     _file /= ss.str();
 }
 
-Helpers::RemoveSaver::~RemoveSaver() {
-    if (_out) {
-        _out->close();
-        delete _out;
-        _out = 0;
-    }
-}
-
-void Helpers::RemoveSaver::goingToDelete(const BSONObj& o) {
+Status Helpers::RemoveSaver::goingToDelete(const BSONObj& o) {
     if (!_out) {
         boost::filesystem::create_directories(_root);
-        _out = new ofstream();
-        _out->open(_file.string().c_str(), ios_base::out | ios_base::binary);
-        if (!_out->good()) {
-            error() << "couldn't create file: " << _file.string() << " for remove saving" << endl;
-            delete _out;
+        _out.reset(new ofstream(_file.string().c_str(), ios_base::out | ios_base::binary));
+        if (_out->fail()) {
+            string msg = str::stream() << "couldn't create file: " << _file.string()
+                                       << " for remove saving: " << errnoWithDescription();
+            error() << msg;
+            _out.reset();
             _out = 0;
-            return;
+            return Status(ErrorCodes::FileNotOpen, msg);
         }
     }
     _out->write(o.objdata(), o.objsize());
+    if (_out->fail()) {
+        string msg = str::stream() << "couldn't write document to file: " << _file.string()
+                                   << " for remove saving: " << errnoWithDescription();
+        error() << msg;
+        return Status(ErrorCodes::OperationFailed, msg);
+    }
+    return Status::OK();
 }
 
 

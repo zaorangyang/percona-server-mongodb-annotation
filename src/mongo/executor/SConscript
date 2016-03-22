@@ -23,6 +23,26 @@ env.Library(target='task_executor_interface',
                 'remote_command',
             ])
 
+env.Library(target='async_timer_mock',
+            source=['async_timer_mock.cpp'],
+            LIBDEPS=[
+                '$BUILD_DIR/mongo/base',
+                '$BUILD_DIR/third_party/shim_asio',
+            ])
+
+env.CppUnitTest(target='async_timer_mock_test',
+                source=['async_timer_mock_test.cpp'],
+                LIBDEPS=[
+                    'async_timer_mock',
+                ])
+
+env.Library(target='async_timer_asio',
+            source=['async_timer_asio.cpp'],
+            LIBDEPS=[
+                '$BUILD_DIR/mongo/base',
+                '$BUILD_DIR/third_party/shim_asio',
+            ])
+
 env.Library(target='network_interface',
             source=['network_interface.cpp',],
             LIBDEPS=[
@@ -108,6 +128,7 @@ env.Library(
         'async_secure_stream.cpp',
         'async_secure_stream_factory.cpp',
         'async_stream.cpp',
+        'async_stream_common.cpp',
         'async_stream_factory.cpp',
         'connection_pool_asio.cpp',
         'network_interface_asio.cpp',
@@ -122,6 +143,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/auth/authcommon',
         '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/third_party/shim_asio',
+        'async_timer_asio',
         'connection_pool',
         'downconvert_find_and_getmore_commands',
         'network_interface',
@@ -135,6 +157,7 @@ env.CppUnitTest(
         'network_interface_asio_test.cpp',
     ],
     LIBDEPS=[
+        'async_timer_mock',
         'network_interface_asio',
     ],
 )
@@ -145,10 +168,25 @@ env.CppIntegrationTest(
         'network_interface_asio_integration_test.cpp',
     ],
     LIBDEPS=[
-        'network_interface_asio',
         '$BUILD_DIR/mongo/rpc/command_status',
+        '$BUILD_DIR/mongo/util/concurrency/thread_pool',
+        'network_interface_asio',
     ],
 )
+
+env.CppIntegrationTest(
+    target='network_interface_perf_test',
+    source=[
+        'network_interface_perf_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/rpc/command_status',
+        'network_interface_asio',
+        'network_interface_impl',
+    ],
+)
+
 
 env.Library(
     target='network_interface_factory',

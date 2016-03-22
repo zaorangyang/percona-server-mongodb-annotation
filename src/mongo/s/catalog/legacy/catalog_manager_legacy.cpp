@@ -43,6 +43,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/server_options.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -74,6 +75,7 @@
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/log.h"
@@ -81,6 +83,8 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
+MONGO_FP_DECLARE(setSCCCDropCollDistLockWait);
 
 using std::set;
 using std::shared_ptr;
@@ -469,7 +473,7 @@ StatusWith<OpTimePair<DatabaseType>> CatalogManagerLegacy::getDatabase(Operation
     BSONObj dbObj = conn->findOne(DatabaseType::ConfigNS, BSON(DatabaseType::name(dbName)));
     if (dbObj.isEmpty()) {
         conn.done();
-        return {ErrorCodes::DatabaseNotFound, stream() << "database " << dbName << " not found"};
+        return {ErrorCodes::NamespaceNotFound, stream() << "database " << dbName << " not found"};
     }
 
     conn.done();
@@ -554,7 +558,13 @@ Status CatalogManagerLegacy::dropCollection(OperationContext* txn, const Namespa
     LOG(1) << "dropCollection " << ns << " started";
 
     // Lock the collection globally so that split/migrate cannot run
-    auto scopedDistLock = getDistLockManager()->lock(ns.ns(), "drop");
+    stdx::chrono::seconds waitFor(2);
+    MONGO_FAIL_POINT_BLOCK(setSCCCDropCollDistLockWait, customWait) {
+        const BSONObj& data = customWait.getData();
+        waitFor = stdx::chrono::seconds(data["waitForSecs"].numberInt());
+    }
+    const stdx::chrono::milliseconds lockTryInterval(500);
+    auto scopedDistLock = getDistLockManager()->lock(ns.ns(), "drop", waitFor, lockTryInterval);
     if (!scopedDistLock.isOK()) {
         return scopedDistLock.getStatus();
     }
@@ -627,7 +637,7 @@ Status CatalogManagerLegacy::dropCollection(OperationContext* txn, const Namespa
             shardEntry.getName(),
             fassertStatusOK(28753, ConnectionString::parse(shardEntry.getHost())),
             ns,
-            ChunkVersionAndOpTime(ChunkVersion::DROPPED()),
+            ChunkVersion::DROPPED(),
             true);
 
         auto ssvResult = shardRegistry->runCommandWithNotMasterRetries(

@@ -1193,6 +1193,8 @@ elif env.TargetOSIs('solaris'):
 # ---- other build setup -----
 if debugBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_DEBUG_BUILD")
+else:
+    env.AppendUnique( CPPDEFINES=[ 'NDEBUG' ] )
 
 if env.TargetOSIs('linux'):
     env.Append( LIBS=['m'] )
@@ -1333,15 +1335,20 @@ elif env.TargetOSIs('windows'):
     # This gives 32-bit programs 4 GB of user address space in WOW64, ignored in 64-bit builds
     env.Append( LINKFLAGS=["/LARGEADDRESSAWARE"] )
 
-    env.Append(LIBS=['ws2_32.lib',
-                     'kernel32.lib',
-                     'advapi32.lib',
-                     'Psapi.lib',
-                     'DbgHelp.lib',
-                     'shell32.lib',
-                     'Iphlpapi.lib',
-                     'winmm.lib',
-                     'version.lib'])
+    env.Append(
+        LIBS=[
+            'DbgHelp.lib',
+            'Iphlpapi.lib',
+            'Psapi.lib',
+            'advapi32.lib',
+            'bcrypt.lib',
+            'kernel32.lib',
+            'shell32.lib',
+            'version.lib',
+            'winmm.lib',
+            'ws2_32.lib',
+        ],
+    )
 
 # When building on visual studio, this sets the name of the debug symbols file
 if env.ToolchainIs('msvc'):

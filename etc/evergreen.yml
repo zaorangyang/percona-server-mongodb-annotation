@@ -184,7 +184,7 @@ functions:
             set -o igncr
         fi;
 
-        git checkout r3.1.8
+        git checkout r3.1.9
         . ./${set_tools_gopath|set_gopath.sh}
 
         # In RHEL 5.5, /usr/bin/ld can't handle --build-id parameters, so
@@ -276,7 +276,7 @@ functions:
         set -o verbose
 
         cd kernel-tools/releases/release_tickets/
-        virtualenv venv-release
+        virtualenv --system-site-packages venv-release
         . venv-release/bin/activate
         pip install jira==0.16 requests==2.7.0
 
@@ -287,7 +287,7 @@ pre:
       silent: true
       script: |
         ${killall_mci|pkill -9 mongod; pkill -9 mongos; pkill -9 mongo; pkill -9 bsondump; pkill -9 mongoimport; pkill -9 mongoexport; pkill -9 mongodump; pkill -9 mongorestore; pkill -9 mongostat; pkill -9 mongofiles; pkill -9 mongooplog; pkill -9 mongotop; pkill -9 mongobridge; pkill -9 mongod-2.6; pkill -9 mongos-2.6; pkill -9 mongo-2.6; pkill -9 bsondump-2.6; pkill -9 mongoimport-2.6; pkill -9 mongoexport-2.6; pkill -9 mongodump-2.6; pkill -9 mongorestore-2.6; pkill -9 mongostat-2.6; pkill -9 mongofiles-2.6; pkill -9 mongooplog-2.6; pkill -9 mongotop-2.6; pkill -9 mongobridge-2.6; pkill -9 mongod-2.4; pkill -9 mongos-2.4; pkill -9 mongo-2.4; pkill -9 bsondump-2.4; pkill -9 mongoimport-2.4; pkill -9 mongoexport-2.4; pkill -9 mongodump-2.4; pkill -9 mongorestore-2.4; pkill -9 mongostat-2.4; pkill -9 mongofiles-2.4; pkill -9 mongooplog-2.4; pkill -9 mongotop-2.4; pkill -9 resmoke.py; pkill -9 python; pkill -9 cl; pkill -9 lldb; pkill -9 _test} >/dev/null 2>&1
-        rm -rf src /data/db/*
+        rm -rf src /data/db/* mongo-coredumps.tgz
         exit 0
 
 post:
@@ -300,6 +300,23 @@ post:
       script: |
         ${killall_mci|pkill -9 mongod; pkill -9 mongos; pkill -9 mongo; pkill -9 bsondump; pkill -9 mongoimport; pkill -9 mongoexport; pkill -9 mongodump; pkill -9 mongorestore; pkill -9 mongostat; pkill -9 mongofiles; pkill -9 mongooplog; pkill -9 mongotop; pkill -9 mongobridge; pkill -9 mongod-2.6; pkill -9 mongos-2.6; pkill -9 mongo-2.6; pkill -9 bsondump-2.6; pkill -9 mongoimport-2.6; pkill -9 mongoexport-2.6; pkill -9 mongodump-2.6; pkill -9 mongorestore-2.6; pkill -9 mongostat-2.6; pkill -9 mongofiles-2.6; pkill -9 mongooplog-2.6; pkill -9 mongotop-2.6; pkill -9 mongobridge-2.6; pkill -9 mongod-2.4; pkill -9 mongos-2.4; pkill -9 mongo-2.4; pkill -9 bsondump-2.4; pkill -9 mongoimport-2.4; pkill -9 mongoexport-2.4; pkill -9 mongodump-2.4; pkill -9 mongorestore-2.4; pkill -9 mongostat-2.4; pkill -9 mongofiles-2.4; pkill -9 mongooplog-2.4; pkill -9 mongotop-2.4; pkill -9 resmoke.py; pkill -9 python; pkill -9 cl; pkill -9 lldb; pkill -9 _test} >/dev/null 2>&1
         exit 0
+  - command: archive.targz_pack
+    params:
+      target: "mongo-coredumps.tgz"
+      source_dir: "./"
+      include:
+        - "./**.mdmp"
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: mongo-coredumps.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/coredumps/mongo-coredumps-${build_id}-${task_name}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Core Dumps - Execution ${execution}
+      optional: true
   - command: shell.cleanup
 
 timeout:
@@ -320,9 +337,13 @@ tasks:
 - name: compile
   depends_on: []
   commands:
+    - command: manifest.load
     - command: git.get_project
       params:
         directory: src
+        revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
+          enterprise: ${enterprise_rev}
+          rocksdb: ${rocksdb_rev}
     - command: git.apply_patch
       params:
         directory: src
@@ -426,9 +447,13 @@ tasks:
 - name: lint
   depends_on: []
   commands:
+    - command: manifest.load
     - command: git.get_project
       params:
         directory: src
+        revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
+          enterprise: ${enterprise_rev}
+          rocksdb: ${rocksdb_rev}
     - command: git.apply_patch
       params:
         directory: src
@@ -653,7 +678,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=gle_auth --shellWriteMode=legacy --storageEngine=mmapv1
+      resmoke_args: --suites=gle_auth --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
 
 - <<: *task_template
   name: gle_auth_WT
@@ -661,7 +686,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=gle_auth --shellWriteMode=legacy --storageEngine=wiredTiger
+      resmoke_args: --suites=gle_auth --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
 
 - <<: *task_template
   name: gle_auth_write_cmd
@@ -685,7 +710,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --storageEngine=mmapv1
+      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
 
 - <<: *task_template
   name: gle_auth_basics_passthrough_WT
@@ -693,7 +718,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --storageEngine=wiredTiger
+      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
 
 - <<: *task_template
   name: gle_auth_basics_passthrough_write_cmd
@@ -733,7 +758,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --storageEngine=mmapv1
+      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
 
 - <<: *task_template
   name: sharding_gle_auth_basics_passthrough_WT
@@ -741,7 +766,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --storageEngine=wiredTiger
+      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
 
 - <<: *task_template
   name: sharding_gle_auth_basics_passthrough_write_cmd
@@ -791,7 +816,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core --shellReadMode=compatibility --shellWriteMode=compatibility --storageEngine=mmapv1
+      resmoke_args: --suites=core --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=mmapv1
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -800,7 +825,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core --shellReadMode=compatibility --shellWriteMode=compatibility --storageEngine=wiredTiger
+      resmoke_args: --suites=core --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -985,6 +1010,26 @@ tasks:
       resmoke_args: --suites=slow2 --storageEngine=wiredTiger
 
 - <<: *task_template
+  name: sharded_collections_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharded_collections_jscore_passthrough --storageEngine=mmapv1
+
+- <<: *task_template
+  name: sharded_collections_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharded_collections_jscore_passthrough --storageEngine=wiredTiger
+
+- <<: *task_template
   name: sharding_jscore_passthrough
   commands:
   - func: "do setup"
@@ -1022,7 +1067,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=parallel --shellReadMode=compatibility --shellWriteMode=compatibility --storageEngine=mmapv1
+      resmoke_args: --suites=parallel --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=mmapv1
 
 - <<: *task_template
   name: parallel_compatibility_WT
@@ -1030,7 +1075,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=parallel --shellReadMode=compatibility --shellWriteMode=compatibility --storageEngine=wiredTiger
+      resmoke_args: --suites=parallel --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=wiredTiger
 
 - <<: *task_template
   name: concurrency
@@ -1097,6 +1142,14 @@ tasks:
       resmoke_args: --suites=rlp --storageEngine=wiredTiger
 
 - <<: *task_template
+  name: read_concern_majority_passthrough_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=read_concern_majority_passthrough --storageEngine=wiredTiger
+
+- <<: *task_template
   name: replicasets
   commands:
   - func: "do setup"
@@ -1113,7 +1166,7 @@ tasks:
       resmoke_args: --suites=replica_sets --storageEngine=wiredTiger
 
 - <<: *task_template
-  name: replica_sets_WT_ese
+  name: replicasets_WT_ese
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -1127,6 +1180,14 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=replica_sets_auth
+
+- <<: *task_template
+  name: replicasets_legacy
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_legacy
 
 - <<: *task_template
   name: replication
@@ -1732,7 +1793,8 @@ tasks:
 #######################################
 #               Modules               #
 #######################################
-
+# if a module is added and to be added to the manifest
+# be sure to add the module to git.get_project revisions parameter
 modules:
 - name: enterprise
   repo: git@github.com:10gen/mongo-enterprise-modules.git
@@ -1758,6 +1820,7 @@ buildvariants:
   display_name: Linux
   modules: ~
   run_on:
+  - rhel55
   - rhel55-test
   expansions:
     gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
@@ -1833,9 +1896,11 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
+  - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replicasets_auth
+  - name: replicasets_legacy
   - name: replication
   - name: replication_WT
   - name: replication_auth
@@ -1847,6 +1912,8 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: tool
@@ -1873,6 +1940,10 @@ buildvariants:
   - name: compile
     distros:
     - rhel55
+  - name: dbtest
+  - name: dbtest_WT
+  - name: integration_tests_standalone
+  - name: integration_tests_replset
   - name: jsCore
   - name: jsCore_WT
   - name: jstestfuzz
@@ -1886,6 +1957,7 @@ buildvariants:
   display_name: Linux DEBUG
   modules: ~
   run_on:
+  - rhel55
   - rhel55-test
   batchtime: 1440 # 1 day
   expansions:
@@ -1941,9 +2013,11 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
+  - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replicasets_auth
+  - name: replicasets_legacy
   - name: replication
   - name: replication_WT
   - name: replication_auth
@@ -1955,6 +2029,8 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: tool
@@ -1964,6 +2040,7 @@ buildvariants:
   display_name: Linux (No Journal)
   modules: ~
   run_on:
+  - rhel55
   - rhel55-test
   batchtime: 1440 # 1 day
   expansions:
@@ -2021,6 +2098,7 @@ buildvariants:
   stepback: false
   display_name: Linux LSM
   run_on:
+  - rhel55
   - rhel55-test
   batchtime: 1440 # 1 day
   expansions:
@@ -2061,6 +2139,7 @@ buildvariants:
   - name: sharding_WT
   - name: slow1_WT
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough_WT
   - name: tool_WT
 
@@ -2295,6 +2374,8 @@ buildvariants:
   - name: dbtest_WT
   - name: ese_WT
   - name: failpoints_auth
+  - name: jsCore
+  - name: jsCore_WT
   - name: jsCore_auth
   - name: jsCore_WT_ese
   - name: jstestfuzz
@@ -2305,8 +2386,8 @@ buildvariants:
   - name: noPassthroughWithMongod_WT
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
-  - name: replica_sets_WT_ese
   - name: replicasets_auth
+  - name: replicasets_WT_ese
   - name: replication_auth
   - name: sasl
   - name: sharding_auth
@@ -2315,6 +2396,8 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: snmp
@@ -2411,6 +2494,8 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: ssl
@@ -2455,7 +2540,7 @@ buildvariants:
   display_name: Linux (Decimal Enabled)
   modules: ~
   run_on:
-  - rhel55-test
+  - rhel55
   batchtime: 1440 # 1 day
   expansions:
     gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
@@ -2563,6 +2648,8 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: tool
@@ -2641,6 +2728,7 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
+  - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replication
@@ -2651,6 +2739,8 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: tool
@@ -2717,6 +2807,7 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
+  - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replication
@@ -2757,11 +2848,11 @@ buildvariants:
   - name: dbtest_WT
   - name: ese_WT
   - name: jsCore_WT_ese
-  - name: replica_sets_WT_ese
   - name: sharding_WT_ese
   - name: jsCore_auth
   - name: mmap
   - name: replicasets_auth
+  - name: replicasets_WT_ese
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -2842,6 +2933,8 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: tool
@@ -2963,6 +3056,8 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: tool
@@ -3036,6 +3131,7 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
+  - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replication
@@ -3119,6 +3215,7 @@ buildvariants:
   - name: audit_WT
   - name: dbtest
   - name: dbtest_WT
+  - name: ese_WT
   - name: jsCore_auth
   - name: mmap
   - name: replicasets_auth
@@ -3274,6 +3371,7 @@ buildvariants:
   display_name: SSL RHEL 5.5
   modules: ~
   run_on:
+  - rhel55
   - rhel55-test
   batchtime: 1440 # 1 day
   expansions:
@@ -3871,6 +3969,8 @@ buildvariants:
   - name: replication
   - name: replication_WT
   - name: sharding
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: sharding_WT
@@ -4022,6 +4122,8 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: ssl
@@ -4099,6 +4201,8 @@ buildvariants:
 
 - name: ubuntu1410-debug-asan
   display_name: ~ ASAN SSL Ubuntu 14.10 DEBUG
+  modules:
+  - enterprise
   run_on:
   - ubuntu1410-build
   stepback: false
@@ -4116,26 +4220,35 @@ buildvariants:
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
+  - name: audit
+  - name: audit_WT
   - name: auth
   - name: auth_WT
+  - name: bulk_gle_passthrough
+  - name: bulk_gle_passthrough_WT
+  - name: concurrency
+  - name: concurrency_WT
+  - name: concurrency_replication
+  - name: concurrency_replication_WT
+  - name: concurrency_sharded
+  - name: concurrency_sharded_WT
   - name: dbtest
   - name: dbtest_WT
   - name: disk
   - name: durability
+  - name: ese_WT
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
   - name: gle_auth_WT
-  - name: gle_auth_write_cmd
-  - name: gle_auth_write_cmd_WT
   - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_WT
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  - name: gle_auth_write_cmd
+  - name: gle_auth_write_cmd_WT
+  - name: integration_tests_standalone
+  - name: integration_tests_replset
   - name: jsCore
   - name: jsCore_WT
   - name: jsCore_auth
@@ -4145,40 +4258,40 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: jsCore_small_oplog_rs
   - name: jsCore_small_oplog_rs_WT
+  - name: jstestfuzz
   - name: mmap
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
-  - name: noPassthrough_WT
   - name: noPassthroughWithMongod
   - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
+  - name: noPassthrough_WT
   - name: parallel
   - name: parallel_WT
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replicasets_auth
   - name: replication
   - name: replication_WT
   - name: replication_auth
+  - name: sasl
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_WT
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  - name: sharding_jscore_passthrough
+  - name: sharding_jscore_passthrough_WT
   - name: slow1
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_passthrough_WT
+  - name: snmp
+  - name: snmp_WT
   - name: ssl
   - name: sslSpecial
   - name: tool
@@ -4288,6 +4401,8 @@ buildvariants:
   - name: slow1_WT
   - name: slow2
   - name: slow2_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: ssl
@@ -4297,90 +4412,6 @@ buildvariants:
   - name: push
     distros:
     - rhel55-test
-
-- name: ubuntu1404-asio
-  display_name: ~ ASIO SSL Ubuntu 14.04
-  modules: ~
-  run_on:
-  - ubuntu1404-test
-  stepback: false
-  batchtime: 1440 # 1 day
-  expansions:
-    tooltags: "-tags ssl"
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
-    num_cores: $(grep -c ^processor /proc/cpuinfo)
-    num_jobs_unittests: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: "--continueOnFailure --mongosSetParameters='{outboundNetworkImpl: 'ASIO'}' --mongodSetParameters='{outboundNetworkImpl: 'ASIO'}'"
-  tasks:
-  - name: compile
-    distros:
-    - ubuntu1404-build
-  - name: aggregation_WT
-  - name: aggregation_auth
-  - name: auth_WT
-  - name: jsCore_small_oplog_rs_WT
-  - name: jstestfuzz
-  - name: mongosTest
-  - name: multiversion
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough_WT
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded_WT
-  - name: replicasets_WT
-  #- name: replicasets_auth
-  - name: replication_WT
-  - name: replication_auth
-  - name: sharding_WT
-  - name: sharding_auth
-  - name: slow1_WT
-  - name: slow2_WT
-  - name: sharding_jscore_passthrough_WT
-  - name: ssl
-  - name: sslSpecial
-  - name: tool_WT
-
-- name: windows-64-2k8-ssl-asio
-  display_name: ~ ASIO SSL Windows 2008R2
-  modules: ~
-  run_on:
-  - windows-64-vs2013-test
-  stepback: false
-  batchtime: 1440 # 1 day
-  expansions:
-    exe: ".exe"
-    gorootvars: 'PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH"'
-    tooltags: "-tags ssl"
-    msi_target: msi
-    content_type: application/zip
-    compile_flags: --release --ssl MONGO_DISTMOD=2008plus-ssl CPPPATH="c:/openssl/include" LIBPATH="c:/openssl/lib" -j$(grep -c ^processor /proc/cpuinfo) --dynamic-windows --win-version-min=ws08r2 VARIANT_DIR=win32
-    num_cores: $(grep -c ^processor /proc/cpuinfo)
-    num_jobs_unittests: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: "--continueOnFailure --mongosSetParameters='{outboundNetworkImpl: 'ASIO'}' --mongodSetParameters='{outboundNetworkImpl: 'ASIO'}'"
-    ext: zip
-  tasks:
-  - name: compile
-    distros:
-    - windows-64-vs2013-compile
-  - name: aggregation_WT
-  - name: auth_WT
-  - name: dbtest_WT
-  - name: jsCore_small_oplog_rs_WT
-  - name: mongosTest
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough_WT
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded_WT
-  - name: replicasets_WT
-  - name: replication_WT
-  - name: sharding_WT
-  - name: slow1_WT
-  - name: slow2_WT
-  - name: sharding_jscore_passthrough_WT
-  - name: tool_WT
-  - name: ssl
-  - name: sslSpecial
 
 - name: release
   display_name: ~~ Release Process

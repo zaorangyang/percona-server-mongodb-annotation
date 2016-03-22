@@ -67,9 +67,9 @@ public:
     virtual void abortUnitOfWork() = 0;
 
     /**
-     * Waits until all writes prior to this call are durable. Returns true, unless the storage
-     * engine cannot guarantee durability, which should never happen when isDurable() returned
-     * true.
+     * Waits until all commits that happened before this call are durable. Returns true, unless the
+     * storage engine cannot guarantee durability, which should never happen when isDurable()
+     * returned true. This cannot be called from inside a unit of work, and should fail if it is.
      */
     virtual bool waitUntilDurable() = 0;
 

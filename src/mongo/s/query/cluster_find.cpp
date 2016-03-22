@@ -86,12 +86,17 @@ std::unique_ptr<LiteParsedQuery> transformQueryForShards(const LiteParsedQuery& 
     // Similarly, if nToReturn is set, we forward the sum of nToReturn and the skip.
     boost::optional<long long> newNToReturn;
     if (lpq.getNToReturn()) {
-        newNToReturn = *lpq.getNToReturn() + lpq.getSkip().value_or(0);
+        // !wantMore and ntoreturn mean the same as !wantMore and limit, so perform the conversion.
+        if (!lpq.wantMore()) {
+            newLimit = *lpq.getNToReturn() + lpq.getSkip().value_or(0);
+        } else {
+            newNToReturn = *lpq.getNToReturn() + lpq.getSkip().value_or(0);
+        }
     }
 
-    // If there is a sort, we send a sortKey meta-projection to the remote node.
+    // If there is a sort other than $natural, we send a sortKey meta-projection to the remote node.
     BSONObj newProjection = lpq.getProj();
-    if (!lpq.getSort().isEmpty()) {
+    if (!lpq.getSort().isEmpty() && !lpq.getSort()["$natural"]) {
         BSONObjBuilder projectionBuilder;
         projectionBuilder.appendElements(lpq.getProj());
         projectionBuilder.append(ClusterClientCursorParams::kSortKeyField, kSortKeyMetaProjection);
@@ -103,6 +108,7 @@ std::unique_ptr<LiteParsedQuery> transformQueryForShards(const LiteParsedQuery& 
                                           newProjection,
                                           lpq.getSort(),
                                           lpq.getHint(),
+                                          lpq.getReadConcern(),
                                           boost::none,  // Don't forward skip.
                                           newLimit,
                                           lpq.getBatchSize(),
@@ -155,6 +161,9 @@ StatusWith<CursorId> runConfigServerQuerySCCC(const CanonicalQuery& query,
                               0,        // nToSkip
                               nullptr,  // fieldsToReturn
                               0);       // options
+    if (!cursor || !cursor->more()) {
+        return {ErrorCodes::OperationFailed, "failed to run find command against config shard"};
+    }
     BSONObj result = cursor->nextSafe().getOwned();
     conn.done();
 
@@ -163,7 +172,7 @@ StatusWith<CursorId> runConfigServerQuerySCCC(const CanonicalQuery& query,
         throw RecvStaleConfigException("find command failed because of stale config", result);
     }
 
-    auto transformedResult = storePossibleCursor(cursor->originalHost(),
+    auto transformedResult = storePossibleCursor(HostAndPort(cursor->originalHost()),
                                                  result,
                                                  grid.shardRegistry()->getExecutor(),
                                                  grid.getCursorManager());
@@ -207,11 +216,14 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
     }
 
     ClusterClientCursorParams params(query.nss());
+    params.txn = txn;
+    params.shardRegistry = shardRegistry;
     params.limit = query.getParsed().getLimit();
     params.batchSize = query.getParsed().getEffectiveBatchSize();
     params.skip = query.getParsed().getSkip();
     params.isTailable = query.getParsed().isTailable();
     params.isSecondaryOk = (readPref.pref != ReadPreference::PrimaryOnly);
+    params.isAllowPartialResults = query.getParsed().isAllowPartialResults();
 
     // This is the batchSize passed to each subsequent getMore command issued by the cursor. We
     // usually use the batchSize associated with the initial find, but as it is illegal to send a
@@ -253,11 +265,15 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
         lpqToForward->asFindCommand(&cmdBuilder);
 
         if (chunkManager) {
-            auto shardVersion = chunkManager->getVersion(shard->getId());
-            cmdBuilder.appendArray(LiteParsedQuery::kShardVersionField, shardVersion.toBSON());
+            ChunkVersion version(chunkManager->getVersion(shard->getId()));
+            version.appendForCommands(&cmdBuilder);
+        } else if (!query.nss().isOnInternalDb()) {
+            ChunkVersion version(ChunkVersion::UNSHARDED());
+            version.appendForCommands(&cmdBuilder);
         }
 
-        params.remotes.emplace_back(std::move(hostAndPort.getValue()), cmdBuilder.obj());
+        params.remotes.emplace_back(
+            std::move(hostAndPort.getValue()), shard->getId(), cmdBuilder.obj());
     }
 
     auto ccc =
@@ -305,6 +321,10 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
         results->push_back(std::move(*next.getValue()));
     }
 
+    if (!query.getParsed().wantMore() && !pinnedCursor.isTailable()) {
+        cursorState = ClusterCursorManager::CursorState::Exhausted;
+    }
+
     CursorId idToReturn = (cursorState == ClusterCursorManager::CursorState::Exhausted)
         ? CursorId(0)
         : pinnedCursor.getCursorId();
@@ -334,7 +354,7 @@ StatusWith<CursorId> ClusterFind::runQuery(OperationContext* txn,
     }
 
     auto dbConfig = grid.catalogCache()->getDatabase(txn, query.nss().db().toString());
-    if (dbConfig.getStatus() == ErrorCodes::DatabaseNotFound) {
+    if (dbConfig.getStatus() == ErrorCodes::NamespaceNotFound) {
         // If the database doesn't exist, we successfully return an empty result set without
         // creating a cursor.
         return CursorId(0);
@@ -356,22 +376,26 @@ StatusWith<CursorId> ClusterFind::runQuery(OperationContext* txn,
         }
         auto status = std::move(cursorId.getStatus());
 
-        if (status != ErrorCodes::SendStaleConfig && status != ErrorCodes::RecvStaleConfig) {
-            // Errors other than receiving a stale config message from mongoD are fatal to the
-            // operation.
+        if (status != ErrorCodes::SendStaleConfig && status != ErrorCodes::RecvStaleConfig &&
+            status != ErrorCodes::HostUnreachable) {
+            // Errors other than receiving a stale config message from mongoD or an unreachable host
+            // are fatal to the operation.
             return status;
         }
 
-        LOG(1) << "Received stale config for query " << query.toStringShort() << " on attempt "
-               << retries << " of " << kMaxStaleConfigRetries << ": " << status.reason();
+        LOG(1) << "Received error status for query " << query.toStringShort() << " on attempt "
+               << retries << " of " << kMaxStaleConfigRetries << ": " << status;
 
-        invariant(chunkManager);
-        chunkManager = chunkManager->reload(txn);
+        chunkManager = dbConfig.getValue()->getChunkManagerIfExists(txn, query.nss().ns(), true);
+        if (!chunkManager) {
+            dbConfig.getValue()->getChunkManagerOrPrimary(
+                txn, query.nss().ns(), chunkManager, primary);
+        }
     }
 
     return {ErrorCodes::StaleShardVersion,
             str::stream() << "Retried " << kMaxStaleConfigRetries
-                          << " times without establishing shard version."};
+                          << " times without establishing shard version on a reachable host."};
 }
 
 StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* txn,

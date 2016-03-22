@@ -99,7 +99,6 @@ var doTest = function(useDollarQuerySyntax) {
         return false;
     });
 
-
     var getExplain = function(readPrefMode, readPrefTags) {
         if (useDollarQuerySyntax) {
             var readPrefObj = {
@@ -119,16 +118,8 @@ var doTest = function(useDollarQuerySyntax) {
     };
 
     var getExplainServer = function(explain) {
-        var serverInfo;
-
-        if (useDollarQuerySyntax) {
-            serverInfo = explain.serverInfo;
-        }
-        else {
-            assert.eq("SINGLE_SHARD", explain.queryPlanner.winningPlan.stage);
-            serverInfo = explain.queryPlanner.winningPlan.shards[0].serverInfo;
-        }
-
+        assert.eq("SINGLE_SHARD", explain.queryPlanner.winningPlan.stage);
+        var serverInfo = explain.queryPlanner.winningPlan.shards[0].serverInfo;
         return serverInfo.host + ":" + serverInfo.port.toString();
     };
 

@@ -61,12 +61,12 @@
  *	If deleting a range, try to delete the page without instantiating it.
  */
 int
-__wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, int *skipp)
+__wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, bool *skipp)
 {
 	WT_DECL_RET;
 	WT_PAGE *parent;
 
-	*skipp = 0;
+	*skipp = false;
 
 	/* If we have a clean page in memory, attempt to evict it. */
 	if (ref->state == WT_REF_MEM &&
@@ -126,7 +126,7 @@ __wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, int *skipp)
 	 * future reconciliation of the child leaf page that will dirty it as
 	 * we write the tree.
 	 */
-	WT_ERR(__wt_page_parent_modify_set(session, ref, 0));
+	WT_ERR(__wt_page_parent_modify_set(session, ref, false));
 
 	/*
 	 * Record the change in the transaction structure and set the change's
@@ -137,7 +137,7 @@ __wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, int *skipp)
 
 	WT_ERR(__wt_txn_modify_ref(session, ref));
 
-	*skipp = 1;
+	*skipp = true;
 	WT_PUBLISH(ref->state, WT_REF_DELETED);
 	return (0);
 
@@ -245,8 +245,8 @@ __wt_delete_page_skip(WT_SESSION_IMPL *session, WT_REF *ref)
 	if (!__wt_atomic_casv32(&ref->state, WT_REF_DELETED, WT_REF_LOCKED))
 		return (false);
 
-	skip = (ref->page_del == NULL ||
-	    __wt_txn_visible(session, ref->page_del->txnid));
+	skip = ref->page_del == NULL ||
+	    __wt_txn_visible(session, ref->page_del->txnid);
 
 	WT_PUBLISH(ref->state, WT_REF_DELETED);
 	return (skip);

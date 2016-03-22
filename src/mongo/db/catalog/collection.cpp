@@ -37,6 +37,7 @@
 
 #include "mongo/base/counter.h"
 #include "mongo/base/owned_pointer_map.h"
+#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
@@ -66,6 +67,7 @@ namespace {
 const auto bannedExpressionsInValidators = std::set<StringData>{
     "$geoNear", "$near", "$nearSphere", "$text", "$where",
 };
+
 Status checkValidatorForBannedExpressions(const BSONObj& validator) {
     for (auto field : validator) {
         const auto name = field.fieldNameStringData();
@@ -115,50 +117,49 @@ std::string CompactOptions::toString() const {
 // CappedInsertNotifier
 //
 
-CappedInsertNotifier::CappedInsertNotifier() : _cappedInsertCount(0), _dead(false) {}
-
-void CappedInsertNotifier::notifyOfInsert(int count) {
-    stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
-    if (!_dead) {
-        _cappedInsertCount += count;
-    }
-    _cappedNewDataNotifier.notify_all();
-}
+CappedInsertNotifier::CappedInsertNotifier() : _version(0), _dead(false) {}
 
 void CappedInsertNotifier::notifyAll() {
-    stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
-    _cappedNewDataNotifier.notify_all();
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    ++_version;
+    _notifier.notify_all();
 }
 
-uint64_t CappedInsertNotifier::getCount() const {
-    stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
-    return _cappedInsertCount;
-}
-
-void CappedInsertNotifier::waitForInsert(uint64_t referenceCount, Microseconds timeout) const {
-    stdx::unique_lock<stdx::mutex> lk(_cappedNewDataMutex);
-    while (!_dead && referenceCount == _cappedInsertCount) {
-        if (stdx::cv_status::timeout == _cappedNewDataNotifier.wait_for(lk, timeout)) {
+void CappedInsertNotifier::_wait(stdx::unique_lock<stdx::mutex>& lk,
+                                 uint64_t prevVersion,
+                                 Microseconds timeout) const {
+    while (!_dead && prevVersion == _version) {
+        if (timeout == Microseconds::max()) {
+            _notifier.wait(lk);
+        } else if (stdx::cv_status::timeout == _notifier.wait_for(lk, timeout)) {
             return;
         }
     }
 }
 
-void CappedInsertNotifier::waitForInsert(uint64_t referenceCount) const {
-    stdx::unique_lock<stdx::mutex> lk(_cappedNewDataMutex);
-    while (!_dead && referenceCount == _cappedInsertCount) {
-        _cappedNewDataNotifier.wait(lk);
-    }
+void CappedInsertNotifier::wait(uint64_t prevVersion, Microseconds timeout) const {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    _wait(lk, prevVersion, timeout);
+}
+
+void CappedInsertNotifier::wait(Microseconds timeout) const {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    _wait(lk, _version, timeout);
+}
+
+void CappedInsertNotifier::wait() const {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    _wait(lk, _version, Microseconds::max());
 }
 
 void CappedInsertNotifier::kill() {
-    stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _dead = true;
-    _cappedNewDataNotifier.notify_all();
+    _notifier.notify_all();
 }
 
 bool CappedInsertNotifier::isDead() {
-    stdx::lock_guard<stdx::mutex> lk(_cappedNewDataMutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _dead;
 }
 
@@ -187,7 +188,7 @@ Collection::Collection(OperationContext* txn,
     _magic = 1357924;
     _indexCatalog.init(txn);
     if (isCapped())
-        _recordStore->setCappedDeleteCallback(this);
+        _recordStore->setCappedCallback(this);
 
     _infoCache.init(txn);
 }
@@ -323,11 +324,7 @@ Status Collection::insertDocument(OperationContext* txn, const DocWriter* doc, b
     // we cannot call into the OpObserver here because the document being written is not present
     // fortunately, this is currently only used for adding entries to the oplog.
 
-    // If there is a notifier object and another thread is waiting on it, then we notify waiters
-    // of this document insert. Waiters keep a shared_ptr to '_cappedNotifier', so there are
-    // waiters if this Collection's shared_ptr is not unique.
-    if (_cappedNotifier && !_cappedNotifier.unique())
-        _cappedNotifier->notifyOfInsert(1);
+    txn->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
     return loc.getStatus();
 }
@@ -369,11 +366,7 @@ Status Collection::insertDocuments(OperationContext* txn,
         inserted++;
     }
 
-    // If there is a notifier object and another thread is waiting on it, then we notify
-    // waiters of this document insert. Waiters keep a shared_ptr to '_cappedNotifier', so
-    // there are waiters if this Collection's shared_ptr is not unique.
-    if (_cappedNotifier && !_cappedNotifier.unique())
-        _cappedNotifier->notifyOfInsert(inserted);
+    txn->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
     return Status::OK();
 }
@@ -414,12 +407,7 @@ Status Collection::insertDocument(OperationContext* txn,
 
     getGlobalServiceContext()->getOpObserver()->onInsert(txn, ns(), doc);
 
-    // If there is a notifier object and another thread is waiting on it, then we notify waiters
-    // of this document insert. Waiters keep a shared_ptr to '_cappedNotifier', so there are
-    // waiters if this Collection's shared_ptr is not unique.
-    if (_cappedNotifier && !_cappedNotifier.unique()) {
-        _cappedNotifier->notifyOfInsert(1);
-    }
+    txn->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
     return loc.getStatus();
 }
@@ -434,20 +422,35 @@ Status Collection::_insertDocuments(OperationContext* txn,
     //       under the RecordStore, this feels broken since that should be a
     //       collection access method probably
 
-    // These will be vectorized (insertRecords, indexRecords) in a future patch
+    std::vector<Record> records;
     for (vector<BSONObj>::iterator it = begin; it != end; it++) {
-        StatusWith<RecordId> loc = _recordStore->insertRecord(
-            txn, it->objdata(), it->objsize(), _enforceQuota(enforceQuota));
-        if (!loc.isOK())
-            return loc.getStatus();
-        invariant(RecordId::min() < loc.getValue());
-        invariant(loc.getValue() < RecordId::max());
-
-        Status status = _indexCatalog.indexRecord(txn, *it, loc.getValue());
-        if (!status.isOK())
-            return status;
+        Record record = {RecordId(), RecordData(it->objdata(), it->objsize())};
+        records.push_back(record);
     }
-    return Status::OK();
+    Status status = _recordStore->insertRecords(txn, &records, _enforceQuota(enforceQuota));
+    if (!status.isOK())
+        return status;
+
+    std::vector<BsonRecord> bsonRecords;
+    int recordIndex = 0;
+    for (vector<BSONObj>::iterator it = begin; it != end; it++) {
+        RecordId loc = records[recordIndex++].id;
+        invariant(RecordId::min() < loc);
+        invariant(loc < RecordId::max());
+
+        BsonRecord bsonRecord = {loc, &(*it)};
+        bsonRecords.push_back(bsonRecord);
+    }
+
+    return _indexCatalog.indexRecords(txn, bsonRecords);
+}
+
+void Collection::notifyCappedWaitersIfNeeded() {
+    // If there is a notifier object and another thread is waiting on it, then we notify
+    // waiters of this document insert. Waiters keep a shared_ptr to '_cappedNotifier', so
+    // there are waiters if this Collection's shared_ptr is not unique (use_count > 1).
+    if (_cappedNotifier && !_cappedNotifier.unique())
+        _cappedNotifier->notifyAll();
 }
 
 Status Collection::aboutToDeleteCapped(OperationContext* txn,
@@ -580,7 +583,10 @@ StatusWith<RecordId> Collection::updateDocument(OperationContext* txn,
                 debug->nmoved += 1;
         }
 
-        Status s = _indexCatalog.indexRecord(txn, newDoc, newLocation.getValue());
+        std::vector<BsonRecord> bsonRecords;
+        BsonRecord bsonRecord = {newLocation.getValue(), &newDoc};
+        bsonRecords.push_back(bsonRecord);
+        Status s = _indexCatalog.indexRecords(txn, bsonRecords);
         if (!s.isOK())
             return StatusWith<RecordId>(s);
         invariant(sid == txn->recoveryUnit()->getSnapshotId());
@@ -729,7 +735,8 @@ uint64_t Collection::getIndexSize(OperationContext* opCtx, BSONObjBuilder* detai
  */
 Status Collection::truncate(OperationContext* txn) {
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_X));
-    massert(17445, "index build in progress", _indexCatalog.numIndexesInProgress(txn) == 0);
+    BackgroundOperation::assertNoBgOpInProgForNs(ns());
+    invariant(_indexCatalog.numIndexesInProgress(txn) == 0);
 
     // 1) store index specs
     vector<BSONObj> indexSpecs;
@@ -765,6 +772,8 @@ Status Collection::truncate(OperationContext* txn) {
 void Collection::temp_cappedTruncateAfter(OperationContext* txn, RecordId end, bool inclusive) {
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
     invariant(isCapped());
+    BackgroundOperation::assertNoBgOpInProgForNs(ns());
+    invariant(_indexCatalog.numIndexesInProgress(txn) == 0);
 
     _cursorManager.invalidateAll(false, "capped collection truncated");
     _recordStore->temp_cappedTruncateAfter(txn, end, inclusive);

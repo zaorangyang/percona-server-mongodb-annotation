@@ -416,7 +416,6 @@ std::shared_ptr<ChunkManager> DBConfig::getChunkManager(OperationContext* txn,
 
     if (shouldReset) {
         const auto cmOpTime = tempChunkManager->getConfigOpTime();
-        invariant(cmOpTime >= _configOpTime);
 
         // The existing ChunkManager could have been updated since we last checked, so
         // replace the existing chunk manager only if it is strictly newer.
@@ -448,7 +447,7 @@ bool DBConfig::load(OperationContext* txn) {
 
 bool DBConfig::_load(OperationContext* txn) {
     auto status = grid.catalogManager(txn)->getDatabase(txn, _name);
-    if (status == ErrorCodes::DatabaseNotFound) {
+    if (status == ErrorCodes::NamespaceNotFound) {
         return false;
     }
 

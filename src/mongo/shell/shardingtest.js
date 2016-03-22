@@ -19,6 +19,8 @@
  *       contain:
  *       {
  *         nodes {number}: number of replica members. Defaults to 3.
+ *         protocolVersion {number}: protocol version of replset used by the
+ *             replset initiation.
  *         For other options, @see ReplSetTest#start
  *       }
  * 
@@ -64,10 +66,10 @@
  *         specify options that are common all replica members.
  *       useHostname {boolean}: if true, use hostname of machine,
  *         otherwise use localhost
- *       numReplicas {number} 
+ *       numReplicas {number}
  *     }
  *   }
- * 
+ *
  * Member variables:
  * s {Mongo} - connection to the first mongos
  * s0, s1, ... {Mongo} - connection to different mongos
@@ -184,7 +186,7 @@ ShardingTest = function( testName , numShards , verboseLevel , numMongos , other
 
             rsDefaults = { useHostname : otherParams.useHostname,
                            noJournalPrealloc : otherParams.nopreallocj, 
-                           oplogSize : 40,
+                           oplogSize : 16,
                            pathOpts : Object.merge( pathOpts, { shard : i } )}
 
             rsDefaults = Object.merge( rsDefaults, ShardingTest.rsOptions || {} )
@@ -193,8 +195,10 @@ ShardingTest = function( testName , numShards , verboseLevel , numMongos , other
             rsDefaults = Object.merge( rsDefaults, otherParams["rs" + i] )
             rsDefaults.nodes = rsDefaults.nodes || otherParams.numReplicas
 
-            var numReplicas = rsDefaults.nodes || 3
-            delete rsDefaults.nodes
+            var numReplicas = rsDefaults.nodes || 3;
+            delete rsDefaults.nodes;
+            var protocolVersion = rsDefaults.protocolVersion;
+            delete rsDefaults.protocolVersion;
 
             print( "Replica set test!" )
 
@@ -202,6 +206,7 @@ ShardingTest = function( testName , numShards , verboseLevel , numMongos , other
                                        nodes : numReplicas,
                                        useHostName : otherParams.useHostname,
                                        keyFile : keyFile,
+                                       protocolVersion: protocolVersion,
                                        shardSvr : true });
 
             this._rs[i] = { setName : setName,
@@ -348,6 +353,7 @@ ShardingTest = function( testName , numShards , verboseLevel , numMongos , other
 
         var config = this.configRS.getReplSetConfig();
         config.configsvr = true;
+        config.settings = config.settings || {};
         this.configRS.initiate(config);
 
         this.configRS.getMaster(); // Wait for master to be elected before starting mongos
@@ -735,6 +741,54 @@ printShardingStatus = function( configDB , verbose ){
         }
     );
 
+    // (most recently) active mongoses
+    var mongosActiveThresholdMs = 60000;
+    var mostRecentMongos = configDB.mongos.find().sort( { ping : -1 } ).limit(1);
+    var mostRecentMongosTime = null;
+    var mongosAdjective = "most recently active";
+    if (mostRecentMongos.hasNext()) {
+        mostRecentMongosTime = mostRecentMongos.next().ping;
+        // Mongoses older than the threshold are the most recent, but cannot be
+        // considered "active" mongoses. (This is more likely to be an old(er)
+        // configdb dump, or all the mongoses have been stopped.)
+        if (mostRecentMongosTime.getTime() >= Date.now() - mongosActiveThresholdMs) {
+            mongosAdjective = "active";
+        }
+    }
+
+    output( "  " + mongosAdjective + " mongoses:" );
+    if (mostRecentMongosTime === null) {
+        output( "\tnone" );
+    } else {
+        var recentMongosQuery = {
+            ping: {
+                $gt: (function () {
+                    var d = mostRecentMongosTime;
+                    d.setTime(d.getTime() - mongosActiveThresholdMs);
+                    return d;
+                } )()
+            }
+        };
+
+        if ( verbose ) {
+            configDB.mongos.find( recentMongosQuery ).sort( { ping : -1 } ).forEach(
+                function (z) {
+                    output( "\t" + tojsononeline( z ) );
+                }
+            );
+        } else {
+            configDB.mongos.aggregate( [
+                        { $match: recentMongosQuery },
+                        { $group: { _id: "$mongoVersion", num: { $sum: 1 } } },
+                        { $sort: { num: -1 } }
+                    ] ).forEach(
+                function (z) {
+                    output( "\t" + tojson( z._id ) + " : " + z.num );
+                }
+            );
+        }
+    }
+
     output( "  balancer:" );
 
     //Is the balancer currently enabled
@@ -809,6 +863,20 @@ printShardingStatus = function( configDB , verbose ){
     output( "  databases:" );
     configDB.databases.find().sort( { name : 1 } ).forEach( 
         function(db){
+            var truthy = function (value) {
+                return !!value;
+            }
+            var nonBooleanNote = function (name, value) {
+                // If the given value is not a boolean, return a string of the
+                // form " (<name>: <value>)", where <value> is converted to JSON.
+                var t = typeof(value);
+                var s = "";
+                if (t != "boolean" && t != "undefined") {
+                    s = " (" + name + ": " + tojson(value) + ")";
+                }
+                return s;
+            }
+
             output( "\t" + tojsononeline(db,"",true) );
         
             if (db.partitioned){
@@ -818,6 +886,10 @@ printShardingStatus = function( configDB , verbose ){
                         if ( ! coll.dropped ){
                             output( "\t\t" + coll._id );
                             output( "\t\t\tshard key: " + tojson(coll.key) );
+                            output( "\t\t\tunique: " + truthy(coll.unique)
+                                    + nonBooleanNote("unique", coll.unique) );
+                            output( "\t\t\tbalancing: " + !truthy(coll.noBalance)
+                                    + nonBooleanNote("noBalance", coll.noBalance) );
                             output( "\t\t\tchunks:" );
 
                             res = configDB.chunks.aggregate( { $match : { ns : coll._id } } ,

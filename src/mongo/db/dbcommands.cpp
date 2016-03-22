@@ -90,8 +90,11 @@
 #include "mongo/rpc/request_interface.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/rpc/metadata.h"
+#include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
 #include "mongo/scripting/engine.h"
 #include "mongo/util/fail_point_service.h"
@@ -111,12 +114,10 @@ using std::unique_ptr;
 // This is a special flag that allows for testing of snapshot behavior by skipping the replication
 // related checks and isolating the storage/query side of snapshotting.
 bool testingSnapshotBehaviorInIsolation = false;
-ExportedServerParameter<bool> TestingSnapshotBehaviorInIsolation(
+ExportedServerParameter<bool, ServerParameterType::kStartupOnly> TestingSnapshotBehaviorInIsolation(
     ServerParameterSet::getGlobal(),
     "testingSnapshotBehaviorInIsolation",
-    &testingSnapshotBehaviorInIsolation,
-    true,
-    false);
+    &testingSnapshotBehaviorInIsolation);
 
 
 class CmdShutdownMongoD : public CmdShutdown {
@@ -209,7 +210,7 @@ public:
         }
 
         Status status = dropDatabase(txn, dbname);
-        if (status == ErrorCodes::DatabaseNotFound) {
+        if (status == ErrorCodes::NamespaceNotFound) {
             return appendCommandStatus(result, Status::OK());
         }
         if (status.isOK()) {
@@ -340,20 +341,23 @@ public:
         // Needs to be locked exclusively, because creates the system.profile collection
         // in the local database.
         ScopedTransaction transaction(txn, MODE_IX);
-        Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-        OldClientContext ctx(txn, dbname);
+        AutoGetDb ctx(txn, dbname, MODE_X);
+        Database* db = ctx.getDb();
 
         BSONElement e = cmdObj.firstElement();
-        result.append("was", ctx.db()->getProfilingLevel());
+        result.append("was", db ? db->getProfilingLevel() : serverGlobalParams.defaultProfile);
         result.append("slowms", serverGlobalParams.slowMS);
 
         int p = (int)e.number();
         Status status = Status::OK();
 
-        if (p == -1)
-            status = Status::OK();
-        else if (p >= 0 && p <= 2) {
-            status = ctx.db()->setProfilingLevel(txn, p);
+        if (p >= 0 && p <= 2) {
+            if (!db) {
+                // When setting the profiling level, create the database if it didn't already exist.
+                // When just reading the profiling level, we do not create the database.
+                db = dbHolder().openDb(txn, dbname);
+            }
+            status = db->setProfilingLevel(txn, p);
         }
 
         const BSONElement slow = cmdObj["slowms"];
@@ -1190,15 +1194,15 @@ void Command::execCommand(OperationContext* txn,
             return;
         }
 
-        repl::ReplicationCoordinator* replCoord =
-            repl::ReplicationCoordinator::get(txn->getClient()->getServiceContext());
         ImpersonationSessionGuard guard(txn);
-
         uassertStatusOK(
             _checkAuthorization(command, txn->getClient(), dbname, request.getCommandArgs()));
 
+        repl::ReplicationCoordinator* replCoord =
+            repl::ReplicationCoordinator::get(txn->getClient()->getServiceContext());
+        const bool iAmPrimary = replCoord->canAcceptWritesForDatabase(dbname);
+
         {
-            bool iAmPrimary = replCoord->canAcceptWritesForDatabase(dbname);
             bool commandCanRunOnSecondary = command->slaveOk();
 
             bool commandIsOverriddenToRunOnSecondary = command->slaveOverrideOk() &&
@@ -1251,10 +1255,31 @@ void Command::execCommand(OperationContext* txn,
 
         CurOp::get(txn)->setMaxTimeMicros(static_cast<unsigned long long>(maxTimeMS) * 1000);
 
-        // Handle shard version that may have been sent along with the command.
-        OperationShardVersion::get(txn).initializeFromCommand(
-            NamespaceString(command->parseNs(dbname, request.getCommandArgs())),
-            request.getCommandArgs());
+        if (iAmPrimary) {
+            // Handle shard version and config optime information that may have been sent along with
+            // the command.
+            auto& operationShardVersion = OperationShardVersion::get(txn);
+            invariant(!operationShardVersion.hasShardVersion());
+
+            auto commandNS = NamespaceString(command->parseNs(dbname, request.getCommandArgs()));
+            operationShardVersion.initializeFromCommand(commandNS, request.getCommandArgs());
+
+            auto shardingState = ShardingState::get(txn);
+            if (shardingState->enabled()) {
+                // TODO(spencer): Do this unconditionally once all nodes are sharding aware
+                // by default.
+                shardingState->updateConfigServerOpTimeFromMetadata(txn);
+            } else {
+                massert(
+                    28807,
+                    str::stream()
+                        << "Received a command with sharding chunk version information but this "
+                           "node is not sharding aware: " << request.getCommandArgs().jsonString(),
+                    !operationShardVersion.hasShardVersion() ||
+                        ChunkVersion::isIgnoredVersion(
+                            operationShardVersion.getShardVersion(commandNS)));
+            }
+        }
 
         // Can throw
         txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
@@ -1273,7 +1298,15 @@ void Command::execCommand(OperationContext* txn,
             command->_commandsFailed.increment();
         }
     } catch (const DBException& exception) {
-        Command::generateErrorResponse(txn, replyBuilder, exception, request, command);
+        BSONObj metadata = rpc::makeEmptyMetadata();
+        if (ShardingState::get(txn)->enabled()) {
+            auto opTime = grid.shardRegistry()->getConfigOpTime();
+            BSONObjBuilder metadataBob;
+            rpc::ConfigServerMetadata(opTime).writeToMetadata(&metadataBob);
+            metadata = metadataBob.obj();
+        }
+
+        Command::generateErrorResponse(txn, replyBuilder, exception, request, command, metadata);
     }
 }
 
@@ -1356,6 +1389,7 @@ bool Command::run(OperationContext* txn,
 
     BSONObjBuilder metadataBob;
 
+    const bool isShardingAware = ShardingState::get(txn)->enabled();
     bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
     if (isReplSet) {
         repl::OpTime lastOpTimeFromClient =
@@ -1365,10 +1399,15 @@ bool Command::run(OperationContext* txn,
 
         // For commands from mongos, append some info to help getLastError(w) work.
         // TODO: refactor out of here as part of SERVER-18326
-        if (ShardingState::get(txn)->enabled()) {
-            rpc::ShardingMetadata(lastOpTimeFromClient.getTimestamp(), replCoord->getElectionId())
+        if (isShardingAware || serverGlobalParams.configsvr) {
+            rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
                 .writeToMetadata(&metadataBob);
         }
+    }
+
+    if (isShardingAware) {
+        auto opTime = grid.shardRegistry()->getConfigOpTime();
+        rpc::ConfigServerMetadata(opTime).writeToMetadata(&metadataBob);
     }
 
     auto cmdResponse = replyBuilderBob.done();

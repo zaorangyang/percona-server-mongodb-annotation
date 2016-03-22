@@ -41,7 +41,7 @@
 
 namespace mongo {
 
-class CappedDocumentDeleteCallback;
+class CappedCallback;
 class Collection;
 struct CompactOptions;
 struct CompactStats;
@@ -89,6 +89,11 @@ public:
 struct Record {
     RecordId id;
     RecordData data;
+};
+
+struct BsonRecord {
+    RecordId id;
+    const BSONObj* docPtr;
 };
 
 /**
@@ -300,7 +305,7 @@ public:
 
     virtual bool isCapped() const = 0;
 
-    virtual void setCappedDeleteCallback(CappedDocumentDeleteCallback*) {
+    virtual void setCappedCallback(CappedCallback*) {
         invariant(false);
     }
 
@@ -365,6 +370,20 @@ public:
     virtual StatusWith<RecordId> insertRecord(OperationContext* txn,
                                               const DocWriter* doc,
                                               bool enforceQuota) = 0;
+
+    virtual Status insertRecords(OperationContext* txn,
+                                 std::vector<Record>* records,
+                                 bool enforceQuota) {
+        for (auto& record : *records) {
+            StatusWith<RecordId> res =
+                insertRecord(txn, record.data.data(), record.data.size(), enforceQuota);
+            if (!res.isOK())
+                return res.getStatus();
+
+            record.id = res.getValue();
+        }
+        return Status::OK();
+    }
 
     /**
      * @param notifier - Only used by record stores which do not support doc-locking.

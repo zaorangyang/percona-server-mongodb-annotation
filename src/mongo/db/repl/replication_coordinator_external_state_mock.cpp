@@ -53,11 +53,15 @@ ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock
       _storeLocalConfigDocumentShouldHang(false),
       _storeLocalLastVoteDocumentShouldHang(false),
       _isApplierSignaledToCancelFetcher(false),
-      _connectionsClosed(false) {}
+      _connectionsClosed(false),
+      _threadsStarted(false) {}
 
 ReplicationCoordinatorExternalStateMock::~ReplicationCoordinatorExternalStateMock() {}
 
-void ReplicationCoordinatorExternalStateMock::startThreads() {}
+void ReplicationCoordinatorExternalStateMock::startThreads() {
+    _threadsStarted = true;
+}
+
 void ReplicationCoordinatorExternalStateMock::startMasterSlave(OperationContext*) {}
 void ReplicationCoordinatorExternalStateMock::initiateOplog(OperationContext* txn,
                                                             bool updateReplOpTime) {}
@@ -162,6 +166,10 @@ bool ReplicationCoordinatorExternalStateMock::isApplierSignaledToCancelFetcher()
     return _isApplierSignaledToCancelFetcher;
 }
 
+bool ReplicationCoordinatorExternalStateMock::threadsStarted() const {
+    return _threadsStarted;
+}
+
 void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentStatus(Status status) {
     _storeLocalLastVoteDocumentStatus = status;
 }
@@ -205,6 +213,8 @@ void ReplicationCoordinatorExternalStateMock::forceSnapshotCreation() {}
 bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
     return true;
 }
+
+void ReplicationCoordinatorExternalStateMock::notifyOplogMetadataWaiters() {}
 
 void ReplicationCoordinatorExternalStateMock::logTransitionToPrimaryToOplog(OperationContext* txn) {
     _lastOpTime = OpTime(Timestamp(1, 0), 1);

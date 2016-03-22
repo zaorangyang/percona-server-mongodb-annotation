@@ -48,6 +48,7 @@
 #include "mongo/db/exec/oplogstart.h"
 #include "mongo/db/exec/projection.h"
 #include "mongo/db/exec/shard_filter.h"
+#include "mongo/db/exec/sort_key_generator.h"
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/exec/update.h"
 #include "mongo/db/index_names.h"
@@ -170,8 +171,7 @@ void fillOutPlannerParams(OperationContext* txn,
     // If the caller wants a shard filter, make sure we're actually sharded.
     if (plannerParams->options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
         std::shared_ptr<CollectionMetadata> collMetadata =
-            ShardingState::get(getGlobalServiceContext())
-                ->getCollectionMetadata(canonicalQuery->ns());
+            ShardingState::get(txn)->getCollectionMetadata(canonicalQuery->ns());
         if (collMetadata) {
             plannerParams->shardKey = collMetadata->getKeyPattern();
         } else {
@@ -254,11 +254,11 @@ Status prepareExecution(OperationContext* opCtx,
 
         // Might have to filter out orphaned docs.
         if (plannerParams.options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
-            *rootOut = new ShardFilterStage(opCtx,
-                                            ShardingState::get(getGlobalServiceContext())
-                                                ->getCollectionMetadata(collection->ns().ns()),
-                                            ws,
-                                            *rootOut);
+            *rootOut = new ShardFilterStage(
+                opCtx,
+                ShardingState::get(opCtx)->getCollectionMetadata(collection->ns().ns()),
+                ws,
+                *rootOut);
         }
 
         // There might be a projection. The idhack stage will always fetch the full
@@ -268,9 +268,20 @@ Status prepareExecution(OperationContext* opCtx,
             ProjectionStageParams params(WhereCallbackReal(opCtx, collection->ns().db()));
             params.projObj = canonicalQuery->getProj()->getProjObj();
 
+            // Add a SortKeyGeneratorStage if there is a $meta sortKey projection.
+            if (canonicalQuery->getProj()->wantSortKey()) {
+                *rootOut = new SortKeyGeneratorStage(opCtx,
+                                                     *rootOut,
+                                                     ws,
+                                                     collection,
+                                                     canonicalQuery->getParsed().getSort(),
+                                                     canonicalQuery->getParsed().getFilter());
+            }
+
             // Stuff the right data into the params depending on what proj impl we use.
             if (canonicalQuery->getProj()->requiresDocument() ||
-                canonicalQuery->getProj()->wantIndexKey()) {
+                canonicalQuery->getProj()->wantIndexKey() ||
+                canonicalQuery->getProj()->wantSortKey()) {
                 params.fullExpression = canonicalQuery->root();
                 params.projImpl = ProjectionStageParams::NO_FAST_PATH;
             } else {
@@ -436,53 +447,6 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutor(OperationContext* txn,
                               yieldPolicy);
 }
 
-StatusWith<unique_ptr<PlanExecutor>> getExecutor(OperationContext* txn,
-                                                 Collection* collection,
-                                                 const std::string& ns,
-                                                 const BSONObj& unparsedQuery,
-                                                 PlanExecutor::YieldPolicy yieldPolicy,
-                                                 size_t plannerOptions) {
-    if (!collection) {
-        LOG(2) << "Collection " << ns << " does not exist."
-               << " Using EOF stage: " << unparsedQuery.toString();
-        auto eofStage = make_unique<EOFStage>(txn);
-        auto ws = make_unique<WorkingSet>();
-        return PlanExecutor::make(txn, std::move(ws), std::move(eofStage), ns, yieldPolicy);
-    }
-
-    const IndexDescriptor* descriptor = collection->getIndexCatalog()->findIdIndex(txn);
-
-    if (!descriptor || !CanonicalQuery::isSimpleIdQuery(unparsedQuery)) {
-        const WhereCallbackReal whereCallback(txn, collection->ns().db());
-        auto statusWithCQ =
-            CanonicalQuery::canonicalize(collection->ns(), unparsedQuery, whereCallback);
-        if (!statusWithCQ.isOK()) {
-            return statusWithCQ.getStatus();
-        }
-        unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-
-        // Takes ownership of 'cq'.
-        return getExecutor(txn, collection, std::move(cq), yieldPolicy, plannerOptions);
-    }
-
-    LOG(2) << "Using idhack: " << unparsedQuery.toString();
-
-    unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
-    unique_ptr<PlanStage> root = make_unique<IDHackStage>(
-        txn, collection, unparsedQuery["_id"].wrap(), ws.get(), descriptor);
-
-    // Might have to filter out orphaned docs.
-    if (plannerOptions & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
-        root = make_unique<ShardFilterStage>(txn,
-                                             ShardingState::get(getGlobalServiceContext())
-                                                 ->getCollectionMetadata(collection->ns().ns()),
-                                             ws.get(),
-                                             root.release());
-    }
-
-    return PlanExecutor::make(txn, std::move(ws), std::move(root), collection, yieldPolicy);
-}
-
 //
 // Find
 //
@@ -605,7 +569,7 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorFind(OperationContext* txn,
     }
 
     size_t options = QueryPlannerParams::DEFAULT;
-    if (ShardingState::get(getGlobalServiceContext())->needCollectionMetadata(txn, nss.ns())) {
+    if (ShardingState::get(txn)->needCollectionMetadata(txn, nss.ns())) {
         options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
     }
     return getExecutor(
@@ -643,6 +607,12 @@ StatusWith<unique_ptr<PlanStage>> applyProjection(OperationContext* txn,
     if (!allowPositional && pp->requiresMatchDetails()) {
         return {ErrorCodes::BadValue,
                 "cannot use a positional projection and return the new document"};
+    }
+
+    // $meta sortKey is not allowed to be projected in findAndModify commands.
+    if (pp->wantSortKey()) {
+        return {ErrorCodes::BadValue,
+                "Cannot use a $meta sortKey projection in findAndModify commands."};
     }
 
     ProjectionStageParams params(WhereCallbackReal(txn, nsString.db()));

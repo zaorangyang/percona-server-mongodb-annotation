@@ -57,10 +57,12 @@
 #include "mongo/db/range_preserver.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/operation_shard_version.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
 #include "mongo/s/d_state.h"
 #include "mongo/s/grid.h"
@@ -567,7 +569,7 @@ long long State::postProcessCollection(OperationContext* txn, CurOp* op, Progres
  *
  * TODO: make count work with versioning
  */
-unsigned long long _safeCount(Client* client,
+unsigned long long _safeCount(OperationContext* txn,
                               // Can't be const b/c count isn't
                               /* const */ DBDirectClient& db,
                               const string& ns,
@@ -575,7 +577,7 @@ unsigned long long _safeCount(Client* client,
                               int options = 0,
                               int limit = 0,
                               int skip = 0) {
-    ShardForceVersionOkModeBlock ignoreVersion(client);  // ignore versioning here
+    OperationShardVersion::IgnoreVersioningBlock ignoreVersion(txn, NamespaceString(ns));
     return db.count(ns, query, options, limit, skip);
 }
 
@@ -586,13 +588,11 @@ unsigned long long _safeCount(Client* client,
 long long State::postProcessCollectionNonAtomic(OperationContext* txn,
                                                 CurOp* op,
                                                 ProgressMeterHolder& pm) {
-    auto client = txn->getClient();
-
     if (_config.outputOptions.finalNamespace == _config.tempNamespace)
-        return _safeCount(client, _db, _config.outputOptions.finalNamespace);
+        return _safeCount(txn, _db, _config.outputOptions.finalNamespace);
 
     if (_config.outputOptions.outType == Config::REPLACE ||
-        _safeCount(client, _db, _config.outputOptions.finalNamespace) == 0) {
+        _safeCount(txn, _db, _config.outputOptions.finalNamespace) == 0) {
         ScopedTransaction transaction(txn, MODE_X);
         Lock::GlobalWrite lock(txn->lockState());  // TODO(erh): why global???
         // replace: just rename from temp to final collection name, dropping previous collection
@@ -611,7 +611,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
     } else if (_config.outputOptions.outType == Config::MERGE) {
         // merge: upsert new docs into old collection
         {
-            const auto count = _safeCount(client, _db, _config.tempNamespace, BSONObj());
+            const auto count = _safeCount(txn, _db, _config.tempNamespace, BSONObj());
             stdx::lock_guard<Client> lk(*txn->getClient());
             op->setMessage_inlock(
                 "m/r: merge post processing", "M/R Merge Post Processing Progress", count);
@@ -633,7 +633,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
         BSONList values;
 
         {
-            const auto count = _safeCount(client, _db, _config.tempNamespace, BSONObj());
+            const auto count = _safeCount(txn, _db, _config.tempNamespace, BSONObj());
             stdx::lock_guard<Client> lk(*txn->getClient());
             op->setMessage_inlock(
                 "m/r: reduce post processing", "M/R Reduce Post Processing Progress", count);
@@ -669,7 +669,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
         pm.finished();
     }
 
-    return _safeCount(txn->getClient(), _db, _config.outputOptions.finalNamespace);
+    return _safeCount(txn, _db, _config.outputOptions.finalNamespace);
 }
 
 /**
@@ -730,12 +730,8 @@ bool State::sourceExists() {
 }
 
 long long State::incomingDocuments() {
-    return _safeCount(_txn->getClient(),
-                      _db,
-                      _config.ns,
-                      _config.filter,
-                      QueryOption_SlaveOk,
-                      (unsigned)_config.limit);
+    return _safeCount(
+        _txn, _db, _config.ns, _config.filter, QueryOption_SlaveOk, (unsigned)_config.limit);
 }
 
 State::~State() {
@@ -1252,10 +1248,6 @@ public:
         return true;
     }
 
-    bool supportsReadConcern() const final {
-        return true;
-    }
-
     virtual void help(stringstream& help) const {
         help << "Run a map/reduce operation on the server.\n";
         help << "Note this is used for aggregation, not querying, in MongoDB.\n";
@@ -1314,10 +1306,8 @@ public:
 
             // Get metadata before we check our version, to make sure it doesn't increment
             // in the meantime.  Need to do this in the same lock scope as the block.
-            if (ShardingState::get(getGlobalServiceContext())
-                    ->needCollectionMetadata(txn, config.ns)) {
-                collMetadata =
-                    ShardingState::get(getGlobalServiceContext())->getCollectionMetadata(config.ns);
+            if (ShardingState::get(txn)->needCollectionMetadata(txn, config.ns)) {
+                collMetadata = ShardingState::get(txn)->getCollectionMetadata(config.ns);
             }
         }
 
@@ -1573,6 +1563,7 @@ public:
             maybeDisableValidation.emplace(txn);
 
         ShardedConnectionInfo::addHook();
+
         // legacy name
         string shardedOutputCollection = cmdObj["shardedOutputCollection"].valuestrsafe();
         verify(shardedOutputCollection.size() > 0);
@@ -1607,7 +1598,15 @@ public:
             BSONObjIterator i(shardCounts);
             while (i.more()) {
                 BSONElement e = i.next();
-                servers.insert(e.fieldName());
+                std::string server = e.fieldName();
+                servers.insert(server);
+
+                if (!grid.shardRegistry()->getShard(txn, server)) {
+                    return appendCommandStatus(
+                        result,
+                        Status(ErrorCodes::ShardNotFound,
+                               str::stream() << "Shard not found for server: " << server));
+                }
             }
         }
 
@@ -1640,7 +1639,7 @@ public:
 
             // Fetch result from other shards 1 chunk at a time. It would be better to do
             // just one big $or query, but then the sorting would not be efficient.
-            const string shardName = ShardingState::get(getGlobalServiceContext())->getShardName();
+            const string shardName = ShardingState::get(txn)->getShardName();
             const ChunkMap& chunkMap = cm->getChunkMap();
 
             for (ChunkMap::const_iterator it = chunkMap.begin(); it != chunkMap.end(); ++it) {

@@ -24,7 +24,11 @@ env.Library(
         '$BUILD_DIR/mongo/s/catalog/forwarding_catalog_manager',
         'client/sharding_connection_hook',
         'coreshard',
-    ]
+    ],
+    LIBDEPS_TAGS=[
+        # Depends on saveGLEStats, which lacks a unique definition
+        'incomplete',
+    ],
 )
 
 # Functionality shared between mongod and mongos
@@ -39,6 +43,7 @@ env.Library(
         'catalog/catalog_types',
         '$BUILD_DIR/mongo/client/connection_string',
         '$BUILD_DIR/mongo/db/repl/optime',
+        '$BUILD_DIR/mongo/rpc/metadata',
     ]
 )
 
@@ -157,6 +162,7 @@ env.Library(
     target='mongoscore',
     source=[
         'balance.cpp',
+        'cluster_cursor_stats.cpp',
         'cluster_last_error_info.cpp',
         'cursors.cpp',
         'request.cpp',

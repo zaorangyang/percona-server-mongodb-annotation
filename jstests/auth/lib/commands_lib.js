@@ -1533,6 +1533,7 @@ var authCommandsLib = {
                         dbOwner: 1,
                         hostManager: 1,
                         clusterAdmin: 1,
+                        backup: 1,
                         root: 1,
                         __system: 1
                     },
@@ -1548,6 +1549,7 @@ var authCommandsLib = {
                         readWriteAnyDatabase: 1,
                         hostManager: 1,
                         clusterAdmin: 1,
+                        backup: 1,
                         root: 1,
                         __system: 1
                     },
@@ -1662,7 +1664,7 @@ var authCommandsLib = {
                         }
                     ]
                 },
-                // test legacy (pre 3.0) way of authorizing listCollections
+                // Test legacy (pre 3.0) way of authorizing listCollections.
                 {
                     runOnDb: firstDbName,
                     privileges: [
@@ -1701,6 +1703,16 @@ var authCommandsLib = {
                         {
                             resource: {db: firstDbName, collection: ""},
                             actions: ["listIndexes"]
+                        }
+                    ]
+                },
+                // Test legacy (pre 3.0) way of authorizing listIndexes.
+                {
+                    runOnDb: firstDbName,
+                    privileges: [
+                        {
+                            resource: {db: firstDbName, collection: "system.indexes"},
+                            actions: ["find"]
                         }
                     ]
                 }

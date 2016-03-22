@@ -78,6 +78,7 @@ public:
     virtual void updateCommittedSnapshot(SnapshotName newCommitPoint);
     virtual void forceSnapshotCreation();
     virtual bool snapshotsEnabled() const;
+    virtual void notifyOplogMetadataWaiters();
 
     /**
      * Adds "host" to the list of hosts that this mock will match when responding to "isSelf"
@@ -134,6 +135,11 @@ public:
      */
     bool isApplierSignaledToCancelFetcher() const;
 
+    /**
+     * Returns true if startThreads() has been called.
+     */
+    bool threadsStarted() const;
+
 private:
     StatusWith<BSONObj> _localRsConfigDocument;
     StatusWith<LastVote> _localRsLastVoteDocument;
@@ -153,6 +159,7 @@ private:
     bool _isApplierSignaledToCancelFetcher;
     bool _connectionsClosed;
     HostAndPort _clientHostAndPort;
+    bool _threadsStarted;
 };
 
 }  // namespace repl

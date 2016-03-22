@@ -384,7 +384,7 @@ public:
      * Considers whether or not this node should stand for election, and returns true
      * if the node has transitioned to candidate role as a result of the call.
      */
-    virtual bool checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) = 0;
+    virtual bool checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) const = 0;
 
     /**
      * Set the outgoing heartbeat message from self
@@ -438,19 +438,9 @@ public:
     virtual void setPrimaryIndex(long long primaryIndex) = 0;
 
     /**
-     * Returns the additional delay to be added to election related timeouts pertaining to the
-     * member with the id "memberId".
-     * If the additional delay could not be calculated (for example, because the  member is absent
-     * from the config or the ping table), Milliseconds() is returned.
+     * Transitions to the candidate role if the node is electable.
      */
-    virtual Milliseconds getTimeoutDelayForMember(int memberId) = 0;
-
-    /**
-     * Returns true if the node is able to take over the primary because of a higher priority and
-     * the node has transitioned to the candidate role as a result of the call.
-     */
-    virtual bool stagePriorityTakeoverIfElectable(const Date_t now,
-                                                  const OpTime& lastOpApplied) = 0;
+    virtual bool becomeCandidateIfElectable(const Date_t now, const OpTime& lastOpApplied) = 0;
 
 protected:
     TopologyCoordinator() {}

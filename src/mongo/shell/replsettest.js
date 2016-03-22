@@ -41,6 +41,7 @@
  *        as the replica set name (overrides the name property). Default: false
  *     keyFile {string}
  *     shardSvr {boolean}: Whether this replica set serves as a shard in a cluster. Default: false.
+ *     protocolVersion {number}: protocol version of replset used by the replset initiation.
  *   }
  * 
  * Member variables:
@@ -55,6 +56,7 @@ ReplSetTest = function(opts) {
     this.useSeedList = opts.useSeedList || false;
     this.keyFile = opts.keyFile;
     this.shardSvr = opts.shardSvr || false;
+    this.protocolVersion = opts.protocolVersion;
 
     this.nodeOptions = {};
 
@@ -154,6 +156,10 @@ ReplSetTest.prototype.getReplSetConfig = function() {
     var cfg = {};
 
     cfg['_id']  = this.name;
+    if (this.protocolVersion !== undefined && this.protocolVersion !== null) {
+        cfg.protocolVersion = this.protocolVersion;
+    }
+
     cfg.members = [];
 
     for (var i=0; i<this.ports.length; i++) {
@@ -175,6 +181,9 @@ ReplSetTest.prototype.getReplSetConfig = function() {
         cfg.members.push(member);
     }
 
+    if (jsTestOptions().useLegacyReplicationProtocol) {
+        cfg.protocolVersion = 0;
+    }
     return cfg;
 }
 
@@ -446,6 +455,9 @@ ReplSetTest.prototype.initiate = function( cfg , initCmd , timeout ) {
     var cmdKey  = initCmd || 'replSetInitiate';
     var timeout = timeout || 60000;
     var ex;
+    if (jsTestOptions().useLegacyReplicationProtocol && !config.hasOwnProperty("protocolVersion")) {
+        config.protocolVersion = 0;
+    }
     cmd[cmdKey] = config;
     printjson(cmd);
 
@@ -472,13 +484,26 @@ ReplSetTest.prototype.initiate = function( cfg , initCmd , timeout ) {
     }
 }
 
-ReplSetTest.prototype.reInitiate = function(timeout) {
-    var master  = this.nodes[0];
-    var c = master.getDB("local")['system.replset'].findOne();
-    var config  = this.getReplSetConfig();
-    var timeout = timeout || 60000;
-    config.version = c.version + 1;
-    this.initiate( config , 'replSetReconfig', timeout );
+ReplSetTest.prototype.reInitiate = function() {
+    "use strict";
+
+    var master = this.getMaster();
+    var res = master.adminCommand({ replSetGetConfig: 1 });
+    assert.commandWorked(res);
+    var config = this.getReplSetConfig();
+    config.version = res.config.version + 1;
+
+    if (jsTestOptions().useLegacyReplicationProtocol && !config.hasOwnProperty("protocolVersion")) {
+        config.protocolVersion = 0;
+    }
+    try {
+        assert.commandWorked(master.adminCommand({replSetReconfig: config}));
+    }
+    catch (e) {
+        if (tojson(e).indexOf("error doing query: failed") < 0) {
+            throw e;
+        }
+    }
 }
 
 ReplSetTest.prototype.getLastOpTimeWritten = function() {
@@ -498,64 +523,128 @@ ReplSetTest.prototype.getLastOpTimeWritten = function() {
     }, "awaiting oplog query", 30000);
 };
 
+/**
+ * Waits for the last oplog entry on the primary to be visible in the committed snapshop view
+ * of the oplog on *all* secondaries.
+ */
+ReplSetTest.prototype.awaitLastOpCommitted = function() {
+    var rst = this;
+    var master = rst.getMaster();
+    var lastOp = master.getDB('local').oplog.rs.find().sort({ $natural: -1 }).limit(1).next();
+
+    var opTime;
+    var filter;
+    if (this.getReplSetConfig().protocolVersion === 1) {
+        opTime = {ts: lastOp.ts, t: lastOp.t};
+        filter = opTime;
+    } else {
+        opTime = {ts: lastOp.ts, t: -1};
+        filter = {ts: lastOp.ts};
+    }
+    print("Waiting for op with OpTime " + tojson(opTime) + " to be committed on all secondaries");
+
+    var isLastOpCommitted = function() {
+        for (var i = 0; i < rst.nodes.length; i++) {
+            var node = rst.nodes[i];
+
+            // Continue if we're connected to an arbiter
+            var res = node.getDB("admin").runCommand({replSetGetStatus: 1});
+            assert.commandWorked(res);
+            if (res.myState == 7) {
+                continue;
+            }
+
+            res = node.getDB('local').runCommand({find: 'oplog.rs',
+                                                  filter: filter,
+                                                  readConcern: {level: "majority",
+                                                                afterOpTime: opTime},
+                                                  maxTimeMS: 1000});
+            if (!res.ok) {
+                printjson(res);
+                return false;
+            }
+            var cursor = new DBCommandCursor(node, res);
+            if (!cursor.hasNext()) {
+                return false;
+            }
+        }
+        return true;
+    }
+    assert.soon(isLastOpCommitted,
+                "Op failed to become committed on all secondaries: " + tojson(lastOp));
+}
+
 ReplSetTest.prototype.awaitReplication = function(timeout) {
     timeout = timeout || 30000;
 
     this.getLastOpTimeWritten();
 
-    var name = this.liveNodes.master.toString().substr(14); // strip "connection to "
-    print("ReplSetTest awaitReplication: starting: timestamp for primary, " +
-          name + ", is " + tojson(this.latest));
-
     // get the latest config version from master. if there is a problem, grab master and try again
     var configVersion;
+    var newestOplogEntry;
+    var masterName;
     try {
-        configVersion = this.liveNodes.master.getDB("local")['system.replset'].findOne().version;
+        var master = this.getMaster();
+        configVersion = master.getDB("local")['system.replset'].findOne().version;
+        newestOplogEntry = master.getDB("local")['oplog.rs'].findOne();
+        masterName = master.toString().substr(14); // strip "connection to "
     }
-    catch(e) {
-        this.getMaster();
-        configVersion = this.liveNodes.master.getDB("local")['system.replset'].findOne().version;
+    catch (e) {
+        var master = this.getMaster();
+        configVersion = master.getDB("local")['system.replset'].findOne().version;
+        newestOplogEntry = master.getDB("local")['oplog.rs'].findOne();
+        masterName = master.toString().substr(14); // strip "connection to "
     }
 
+    print("ReplSetTest awaitReplication: starting: timestamp for primary, " + masterName +
+            ", is " + tojson(this.latest) +
+            ", last oplog entry is " + tojsononeline(newestOplogEntry));
+
     var self = this;
-    assert.soon( function() {
+    assert.soon(function() {
          try {
              print("ReplSetTest awaitReplication: checking secondaries against timestamp " +
                    tojson(self.latest));
              var secondaryCount = 0;
              for (var i=0; i < self.liveNodes.slaves.length; i++) {
                  var slave = self.liveNodes.slaves[i];
+                 var slaveName = slave.toString().substr(14); // strip "connection to "
 
                  var slaveConfigVersion =
                         slave.getDB("local")['system.replset'].findOne().version;
 
                  if (configVersion != slaveConfigVersion) {
-                     print("ReplSetTest awaitReplication: secondary #" + secondaryCount
-                           + ", " + name + ", has config version #" + slaveConfigVersion
+                    print("ReplSetTest awaitReplication: secondary #" + secondaryCount
+                           + ", " + slaveName + ", has config version #" + slaveConfigVersion
                            + ", but expected config version #" + configVersion);
-                     master = self.getMaster();
-                     var masterVersion = master.getDB("local")['system.replset'].findOne().version;
-                     if (slaveConfigVersion > configVersion
-                         && slaveConfigVersion === masterVersion) {
-                         configVersion = slaveConfigVersion;
-                         print ("changing expected config version # since secondary # "
-                                + "was higher and the master # now matches it");
-                     }
-                     return false;
+
+                    if (slaveConfigVersion > configVersion) {
+                        var master = this.getMaster();
+                        configVersion = master.getDB("local")['system.replset'].findOne().version;
+                        newestOplogEntry = master.getDB("local")['oplog.rs'].findOne();
+                        masterName = master.toString().substr(14); // strip "connection to "
+
+                        print("ReplSetTest awaitReplication: timestamp for primary, " + masterName
+                                + ", is " + tojson(this.latest)
+                                + ", last oplog entry is " + tojsononeline(newestOplogEntry));
+                    }
+
+                    return false;
                  }
 
                  // Continue if we're connected to an arbiter
                  if (res = slave.getDB("admin").runCommand({replSetGetStatus: 1})) {
-                     if (res.myState == 7) {
+                     if (res.myState == self.ARBITER) {
                          continue;
                      }
                  }
 
                  ++secondaryCount;
-                 var name = slave.toString().substr(14); // strip "connection to "
                  print("ReplSetTest awaitReplication: checking secondary #" +
-                       secondaryCount + ": " + name);
+                       secondaryCount + ": " + slaveName);
+
                  slave.getDB("admin").getMongo().setSlaveOk();
+
                  var log = slave.getDB("local")['oplog.rs'];
                  if (log.find({}).sort({'$natural': -1}).limit(1).hasNext()) {
                      var entry = log.find({}).sort({'$natural': -1}).limit(1).next();
@@ -567,27 +656,29 @@ ReplSetTest.prototype.awaitReplication = function(timeout) {
                                             sort({'$natural': -1}).
                                             limit(1).
                                             next()['ts'];
-                         print("ReplSetTest awaitReplication: timestamp for " + name +
+                         print("ReplSetTest awaitReplication: timestamp for " + slaveName +
                                " is newer, resetting latest to " + tojson(self.latest));
                          return false;
                      }
+
                      if (!friendlyEqual(self.latest, ts)) {
                          print("ReplSetTest awaitReplication: timestamp for secondary #" +
-                               secondaryCount + ", " + name + ", is " + tojson(ts) +
+                               secondaryCount + ", " + slaveName + ", is " + tojson(ts) +
                                " but latest is " + tojson(self.latest));
                          print("ReplSetTest awaitReplication: last oplog entry (of " +
                                log.count() + ") for secondary #" + secondaryCount +
-                               ", " + name + ", is " + tojsononeline(entry));
+                               ", " + slaveName + ", is " + tojsononeline(entry));
                          print("ReplSetTest awaitReplication: secondary #" +
-                               secondaryCount + ", " + name + ", is NOT synced");
+                               secondaryCount + ", " + slaveName + ", is NOT synced");
                          return false;
                      }
+
                      print("ReplSetTest awaitReplication: secondary #" +
-                           secondaryCount + ", " + name + ", is synced");
+                           secondaryCount + ", " + slaveName + ", is synced");
                  }
                  else {
                      print("ReplSetTest awaitReplication: waiting for secondary #" +
-                           secondaryCount + ", " + name + ", to have an oplog built");
+                           secondaryCount + ", " + slaveName + ", to have an oplog built");
                      return false;
                  }
              }
@@ -1065,41 +1156,44 @@ ReplSetTest.State.REMOVED = 10;
 /** 
  * Overflows a replica set secondary or secondaries, specified by id or conn.
  */
-ReplSetTest.prototype.overflow = function( secondaries ){
-    
+ReplSetTest.prototype.overflow = function( secondaries ) {
     // Create a new collection to overflow, allow secondaries to replicate
     var master = this.getMaster()
     var overflowColl = master.getCollection( "_overflow.coll" )
     overflowColl.insert({ replicated : "value" })
     this.awaitReplication()
-    
+
     this.stop(secondaries);
-        
+
     var count = master.getDB("local").oplog.rs.count();
     var prevCount = -1;
-    
+
     // Insert batches of documents until we exceed the capped size for the oplog and truncate it.
+
     while (count > prevCount) {
-      
       print("ReplSetTest overflow inserting 10000");
       var bulk = overflowColl.initializeUnorderedBulkOp();
       for (var i = 0; i < 10000; i++) {
-          bulk.insert({ overflow : "value" });
+        bulk.insert({ overflow : "Insert some large overflow value to eat oplog space faster." });
       }
-      bulk.execute();
+      assert.writeOK(bulk.execute());
+
       prevCount = count;
       this.awaitReplication();
       
       count = master.getDB("local").oplog.rs.count();
-      
+
       print( "ReplSetTest overflow count : " + count + " prev : " + prevCount );
-      
     }
-    
+
+    // Do one writeConcern:2 write in order to ensure that all of the oplog gets propagated to the
+    // secondary which is online
+    assert.writeOK(
+        overflowColl.insert({ overflow: "Last overflow value" }, { writeConcern: { w: 2 } }));
+
     // Restart all our secondaries and wait for recovery state
     this.start( secondaries, { remember : true }, true, true )
     this.waitForState( secondaries, this.RECOVERING, 5 * 60 * 1000 )
-    
 }
 
 

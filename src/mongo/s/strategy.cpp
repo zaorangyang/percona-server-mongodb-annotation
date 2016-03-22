@@ -78,7 +78,7 @@ using std::string;
 using std::stringstream;
 using std::vector;
 
-MONGO_EXPORT_SERVER_PARAMETER(useClusterClientCursor, bool, false);
+MONGO_EXPORT_SERVER_PARAMETER(useClusterClientCursor, bool, true);
 
 static bool _isSystemIndexes(const char* ns) {
     return nsToCollectionSubstring(ns) == "system.indexes";
@@ -559,7 +559,7 @@ void Strategy::getMore(OperationContext* txn, Request& request) {
     // for now has same semantics as legacy request
     const NamespaceString nss(ns);
     auto statusGetDb = grid.catalogCache()->getDatabase(txn, nss.db().toString());
-    if (statusGetDb == ErrorCodes::DatabaseNotFound) {
+    if (statusGetDb == ErrorCodes::NamespaceNotFound) {
         cursorCache.remove(id);
         replyToQuery(ResultFlag_CursorNotFound, request.p(), request.m(), 0, 0, 0);
         return;
@@ -576,7 +576,7 @@ void Strategy::getMore(OperationContext* txn, Request& request) {
         if (ntoreturn) {
             batchSize = ntoreturn;
         }
-        GetMoreRequest getMoreRequest(NamespaceString(ns), id, batchSize, boost::none);
+        GetMoreRequest getMoreRequest(NamespaceString(ns), id, batchSize, boost::none, boost::none);
 
         auto cursorResponse = ClusterFind::runGetMore(txn, getMoreRequest);
         if (cursorResponse == ErrorCodes::CursorNotFound) {

@@ -218,8 +218,13 @@ public:
         }
 
         // Fill out curop information.
-        long long ntoreturn = lpq->getNToReturn().value_or(0);
-        beginQueryOp(txn, nss, cmdObj, ntoreturn, lpq->getSkip().value_or(0));
+        //
+        // We pass negative values for 'ntoreturn' and 'ntoskip' to indicate that these values
+        // should be omitted from the log line. Limit and skip information is already present in the
+        // find command parameters, so these fields are redundant.
+        const int ntoreturn = -1;
+        const int ntoskip = -1;
+        beginQueryOp(txn, nss, cmdObj, ntoreturn, ntoskip);
 
         // 1b) Finish the parsing step by using the LiteParsedQuery to create a CanonicalQuery.
         WhereCallbackReal whereCallback(txn, nss.db());
@@ -229,13 +234,25 @@ public:
         }
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-        // If the received version is newer than the version cached in 'shardingState', then we have
-        // to refresh 'shardingState' from the config servers. We do this before acquiring locks so
-        // that we don't hold locks while waiting on the network.
         ShardingState* const shardingState = ShardingState::get(txn);
+
         if (OperationShardVersion::get(txn).hasShardVersion() && shardingState->enabled()) {
             ChunkVersion receivedVersion = OperationShardVersion::get(txn).getShardVersion(nss);
             ChunkVersion latestVersion;
+            // Wait for migration completion to get the correct chunk version.
+            const int maxTimeoutSec = 30;
+            int timeoutSec = cq->getParsed().getMaxTimeMS() / 1000;
+            if (!timeoutSec || timeoutSec > maxTimeoutSec) {
+                timeoutSec = maxTimeoutSec;
+            }
+
+            if (!shardingState->waitTillNotInCriticalSection(timeoutSec)) {
+                uasserted(ErrorCodes::LockTimeout, "Timeout while waiting for migration commit");
+            }
+
+            // If the received version is newer than the version cached in 'shardingState', then we
+            // have to refresh 'shardingState' from the config servers. We do this before acquiring
+            // locks so that we don't hold locks while waiting on the network.
             uassertStatusOK(shardingState->refreshMetadataIfNeeded(
                 txn, nss.ns(), receivedVersion, &latestVersion));
         }

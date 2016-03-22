@@ -71,12 +71,15 @@
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
+MONGO_FP_DECLARE(setDropCollDistLockWait);
 
 using repl::OpTime;
 using std::set;
@@ -88,17 +91,14 @@ using str::stream;
 
 namespace {
 
-// Until read committed is supported always write to the primary with majority write and read
-// from the secondary. That way we ensure that reads will see a consistent data.
-// TODO: switch back to SecondaryPreferred once SERVER-19675 is fixed
-const ReadPreferenceSetting kConfigReadSelector(ReadPreference::PrimaryOnly, TagSet{});
+const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
 const ReadPreferenceSetting kConfigPrimaryPreferredSelector(ReadPreference::PrimaryPreferred,
                                                             TagSet{});
-const BSONObj kReplMetadata(BSON(rpc::kReplSetMetadataFieldName << 1));
 const int kInitialSSVRetries = 3;
 const int kActionLogCollectionSize = 1024 * 1024 * 2;
 const int kChangeLogCollectionSize = 1024 * 1024 * 10;
 const int kMaxConfigVersionInitRetry = 3;
+const int kMaxReadRetry = 3;
 
 void _toBatchError(const Status& status, BatchedCommandResponse* response) {
     response->clear();
@@ -159,14 +159,8 @@ Status CatalogManagerReplicaSet::shardCollection(OperationContext* txn,
         // toes.  Now we take the distributed lock so going forward this check won't be necessary
         // but we leave it around for compatibility with other mongoses from 3.0.
         // TODO(spencer): Remove this after 3.2 ships.
-        const auto configShard = grid.shardRegistry()->getShard(txn, "config");
-        const auto readHost = configShard->getTargeter()->findHost(kConfigReadSelector);
-        if (!readHost.isOK()) {
-            return readHost.getStatus();
-        }
-
         auto countStatus = _runCountCommandOnConfig(
-            readHost.getValue(), NamespaceString(ChunkType::ConfigNS), BSON(ChunkType::ns(ns)));
+            txn, NamespaceString(ChunkType::ConfigNS), BSON(ChunkType::ns(ns)));
         if (!countStatus.isOK()) {
             return countStatus.getStatus();
         }
@@ -217,7 +211,7 @@ Status CatalogManagerReplicaSet::shardCollection(OperationContext* txn,
         dbPrimaryShardId,
         primaryShard->getConnString(),
         NamespaceString(ns),
-        ChunkVersionAndOpTime(manager->getVersion(), manager->getConfigOpTime()),
+        manager->getVersion(),
         true);
 
     auto ssvStatus = grid.shardRegistry()->runCommandWithNotMasterRetries(
@@ -238,15 +232,9 @@ Status CatalogManagerReplicaSet::shardCollection(OperationContext* txn,
 
 StatusWith<ShardDrainingStatus> CatalogManagerReplicaSet::removeShard(OperationContext* txn,
                                                                       const std::string& name) {
-    const auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    const auto readHost = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHost.isOK()) {
-        return readHost.getStatus();
-    }
-
     // Check preconditions for removing the shard
     auto countStatus = _runCountCommandOnConfig(
-        readHost.getValue(),
+        txn,
         NamespaceString(ShardType::ConfigNS),
         BSON(ShardType::name() << NE << name << ShardType::draining(true)));
     if (!countStatus.isOK()) {
@@ -257,9 +245,8 @@ StatusWith<ShardDrainingStatus> CatalogManagerReplicaSet::removeShard(OperationC
                       "Can't have more than one draining shard at a time");
     }
 
-    countStatus = _runCountCommandOnConfig(readHost.getValue(),
-                                           NamespaceString(ShardType::ConfigNS),
-                                           BSON(ShardType::name() << NE << name));
+    countStatus = _runCountCommandOnConfig(
+        txn, NamespaceString(ShardType::ConfigNS), BSON(ShardType::name() << NE << name));
     if (!countStatus.isOK()) {
         return countStatus.getStatus();
     }
@@ -269,7 +256,7 @@ StatusWith<ShardDrainingStatus> CatalogManagerReplicaSet::removeShard(OperationC
 
     // Figure out if shard is already draining
     countStatus =
-        _runCountCommandOnConfig(readHost.getValue(),
+        _runCountCommandOnConfig(txn,
                                  NamespaceString(ShardType::ConfigNS),
                                  BSON(ShardType::name() << name << ShardType::draining(true)));
     if (!countStatus.isOK()) {
@@ -304,15 +291,14 @@ StatusWith<ShardDrainingStatus> CatalogManagerReplicaSet::removeShard(OperationC
     // Draining has already started, now figure out how many chunks and databases are still on the
     // shard.
     countStatus = _runCountCommandOnConfig(
-        readHost.getValue(), NamespaceString(ChunkType::ConfigNS), BSON(ChunkType::shard(name)));
+        txn, NamespaceString(ChunkType::ConfigNS), BSON(ChunkType::shard(name)));
     if (!countStatus.isOK()) {
         return countStatus.getStatus();
     }
     const long long chunkCount = countStatus.getValue();
 
-    countStatus = _runCountCommandOnConfig(readHost.getValue(),
-                                           NamespaceString(DatabaseType::ConfigNS),
-                                           BSON(DatabaseType::primary(name)));
+    countStatus = _runCountCommandOnConfig(
+        txn, NamespaceString(DatabaseType::ConfigNS), BSON(DatabaseType::primary(name)));
     if (!countStatus.isOK()) {
         return countStatus.getStatus();
     }
@@ -357,13 +343,7 @@ StatusWith<OpTimePair<DatabaseType>> CatalogManagerReplicaSet::getDatabase(
         return OpTimePair<DatabaseType>(dbt);
     }
 
-    const auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    const auto readHost = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHost.isOK()) {
-        return readHost.getStatus();
-    }
-
-    auto findStatus = _exhaustiveFindOnConfig(readHost.getValue(),
+    auto findStatus = _exhaustiveFindOnConfig(txn,
                                               NamespaceString(DatabaseType::ConfigNS),
                                               BSON(DatabaseType::name(dbName)),
                                               BSONObj(),
@@ -374,7 +354,7 @@ StatusWith<OpTimePair<DatabaseType>> CatalogManagerReplicaSet::getDatabase(
 
     const auto& docsWithOpTime = findStatus.getValue();
     if (docsWithOpTime.value.empty()) {
-        return {ErrorCodes::DatabaseNotFound, stream() << "database " << dbName << " not found"};
+        return {ErrorCodes::NamespaceNotFound, stream() << "database " << dbName << " not found"};
     }
 
     invariant(docsWithOpTime.value.size() == 1);
@@ -391,12 +371,7 @@ StatusWith<OpTimePair<CollectionType>> CatalogManagerReplicaSet::getCollection(
     OperationContext* txn, const std::string& collNs) {
     auto configShard = grid.shardRegistry()->getShard(txn, "config");
 
-    auto readHostStatus = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHostStatus.isOK()) {
-        return readHostStatus.getStatus();
-    }
-
-    auto statusFind = _exhaustiveFindOnConfig(readHostStatus.getValue(),
+    auto statusFind = _exhaustiveFindOnConfig(txn,
                                               NamespaceString(CollectionType::ConfigNS),
                                               BSON(CollectionType::fullNs(collNs)),
                                               BSONObj(),
@@ -433,13 +408,7 @@ Status CatalogManagerReplicaSet::getCollections(OperationContext* txn,
                       string(str::stream() << "^" << pcrecpp::RE::QuoteMeta(*dbName) << "\\."));
     }
 
-    auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    auto readHost = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHost.isOK()) {
-        return readHost.getStatus();
-    }
-
-    auto findStatus = _exhaustiveFindOnConfig(readHost.getValue(),
+    auto findStatus = _exhaustiveFindOnConfig(txn,
                                               NamespaceString(CollectionType::ConfigNS),
                                               b.obj(),
                                               BSONObj(),
@@ -483,7 +452,13 @@ Status CatalogManagerReplicaSet::dropCollection(OperationContext* txn, const Nam
     LOG(1) << "dropCollection " << ns << " started";
 
     // Lock the collection globally so that split/migrate cannot run
-    auto scopedDistLock = getDistLockManager()->lock(ns.ns(), "drop");
+    stdx::chrono::seconds waitFor(2);
+    MONGO_FAIL_POINT_BLOCK(setDropCollDistLockWait, customWait) {
+        const BSONObj& data = customWait.getData();
+        waitFor = stdx::chrono::seconds(data["waitForSecs"].numberInt());
+    }
+    const stdx::chrono::milliseconds lockTryInterval(500);
+    auto scopedDistLock = getDistLockManager()->lock(ns.ns(), "drop", waitFor, lockTryInterval);
     if (!scopedDistLock.isOK()) {
         return scopedDistLock.getStatus();
     }
@@ -550,18 +525,13 @@ Status CatalogManagerReplicaSet::dropCollection(OperationContext* txn, const Nam
 
     LOG(1) << "dropCollection " << ns << " collection marked as dropped";
 
-    // We just called updateCollection above and this would have advanced the config op time, so use
-    // the latest value. On the MongoD side, we need to load the latest config metadata, which
-    // indicates that the collection was dropped.
-    const ChunkVersionAndOpTime droppedVersion(ChunkVersion::DROPPED(), _getConfigOpTime());
-
     for (const auto& shardEntry : allShards) {
         SetShardVersionRequest ssv = SetShardVersionRequest::makeForVersioningNoPersist(
             grid.shardRegistry()->getConfigServerConnectionString(),
             shardEntry.getName(),
             fassertStatusOK(28781, ConnectionString::parse(shardEntry.getHost())),
             ns,
-            droppedVersion,
+            ChunkVersion::DROPPED(),
             true);
 
         auto ssvResult = shardRegistry->runCommandWithNotMasterRetries(
@@ -600,7 +570,8 @@ void CatalogManagerReplicaSet::logAction(OperationContext* txn, const ActionLogT
     if (_actionLogCollectionCreated.load() == 0) {
         BSONObj createCmd = BSON("create" << ActionLogType::ConfigNS << "capped" << true << "size"
                                           << kActionLogCollectionSize);
-        auto result = _runCommandOnConfigWithNotMasterRetries("config", createCmd);
+        auto result =
+            grid.shardRegistry()->runCommandOnConfigWithNotMasterRetries("config", createCmd);
         if (!result.isOK()) {
             LOG(1) << "couldn't create actionlog collection: " << causedBy(result.getStatus());
             return;
@@ -629,7 +600,8 @@ void CatalogManagerReplicaSet::logChange(OperationContext* txn,
     if (_changeLogCollectionCreated.load() == 0) {
         BSONObj createCmd = BSON("create" << ChangeLogType::ConfigNS << "capped" << true << "size"
                                           << kChangeLogCollectionSize);
-        auto result = _runCommandOnConfigWithNotMasterRetries("config", createCmd);
+        auto result =
+            grid.shardRegistry()->runCommandOnConfigWithNotMasterRetries("config", createCmd);
         if (!result.isOK()) {
             LOG(1) << "couldn't create changelog collection: " << causedBy(result.getStatus());
             return;
@@ -669,17 +641,8 @@ void CatalogManagerReplicaSet::logChange(OperationContext* txn,
 
 StatusWith<SettingsType> CatalogManagerReplicaSet::getGlobalSettings(OperationContext* txn,
                                                                      const string& key) {
-    const auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    const auto readHost = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHost.isOK()) {
-        return readHost.getStatus();
-    }
-
-    auto findStatus = _exhaustiveFindOnConfig(readHost.getValue(),
-                                              NamespaceString(SettingsType::ConfigNS),
-                                              BSON(SettingsType::key(key)),
-                                              BSONObj(),
-                                              1);
+    auto findStatus = _exhaustiveFindOnConfig(
+        txn, NamespaceString(SettingsType::ConfigNS), BSON(SettingsType::key(key)), BSONObj(), 1);
     if (!findStatus.isOK()) {
         return findStatus.getStatus();
     }
@@ -711,13 +674,7 @@ StatusWith<SettingsType> CatalogManagerReplicaSet::getGlobalSettings(OperationCo
 Status CatalogManagerReplicaSet::getDatabasesForShard(OperationContext* txn,
                                                       const string& shardName,
                                                       vector<string>* dbs) {
-    auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    auto readHost = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHost.isOK()) {
-        return readHost.getStatus();
-    }
-
-    auto findStatus = _exhaustiveFindOnConfig(readHost.getValue(),
+    auto findStatus = _exhaustiveFindOnConfig(txn,
                                               NamespaceString(DatabaseType::ConfigNS),
                                               BSON(DatabaseType::primary(shardName)),
                                               BSONObj(),
@@ -748,16 +705,10 @@ Status CatalogManagerReplicaSet::getChunks(OperationContext* txn,
                                            OpTime* opTime) {
     chunks->clear();
 
-    auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    auto readHostStatus = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHostStatus.isOK()) {
-        return readHostStatus.getStatus();
-    }
-
     // Convert boost::optional<int> to boost::optional<long long>.
     auto longLimit = limit ? boost::optional<long long>(*limit) : boost::none;
-    auto findStatus = _exhaustiveFindOnConfig(
-        readHostStatus.getValue(), NamespaceString(ChunkType::ConfigNS), query, sort, longLimit);
+    auto findStatus =
+        _exhaustiveFindOnConfig(txn, NamespaceString(ChunkType::ConfigNS), query, sort, longLimit);
     if (!findStatus.isOK()) {
         return findStatus.getStatus();
     }
@@ -788,13 +739,7 @@ Status CatalogManagerReplicaSet::getTagsForCollection(OperationContext* txn,
                                                       std::vector<TagsType>* tags) {
     tags->clear();
 
-    auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    auto readHostStatus = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHostStatus.isOK()) {
-        return readHostStatus.getStatus();
-    }
-
-    auto findStatus = _exhaustiveFindOnConfig(readHostStatus.getValue(),
+    auto findStatus = _exhaustiveFindOnConfig(txn,
                                               NamespaceString(TagsType::ConfigNS),
                                               BSON(TagsType::ns(collectionNs)),
                                               BSON(TagsType::min() << 1),
@@ -820,17 +765,11 @@ Status CatalogManagerReplicaSet::getTagsForCollection(OperationContext* txn,
 StatusWith<string> CatalogManagerReplicaSet::getTagForChunk(OperationContext* txn,
                                                             const std::string& collectionNs,
                                                             const ChunkType& chunk) {
-    auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    auto readHostStatus = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHostStatus.isOK()) {
-        return readHostStatus.getStatus();
-    }
-
     BSONObj query =
         BSON(TagsType::ns(collectionNs) << TagsType::min() << BSON("$lte" << chunk.getMin())
                                         << TagsType::max() << BSON("$gte" << chunk.getMax()));
-    auto findStatus = _exhaustiveFindOnConfig(
-        readHostStatus.getValue(), NamespaceString(TagsType::ConfigNS), query, BSONObj(), 1);
+    auto findStatus =
+        _exhaustiveFindOnConfig(txn, NamespaceString(TagsType::ConfigNS), query, BSONObj(), 1);
     if (!findStatus.isOK()) {
         return findStatus.getStatus();
     }
@@ -853,13 +792,7 @@ StatusWith<string> CatalogManagerReplicaSet::getTagForChunk(OperationContext* tx
 }
 
 Status CatalogManagerReplicaSet::getAllShards(OperationContext* txn, vector<ShardType>* shards) {
-    const auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    const auto readHost = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHost.isOK()) {
-        return readHost.getStatus();
-    }
-
-    auto findStatus = _exhaustiveFindOnConfig(readHost.getValue(),
+    auto findStatus = _exhaustiveFindOnConfig(txn,
                                               NamespaceString(ShardType::ConfigNS),
                                               BSONObj(),     // no query filter
                                               BSONObj(),     // no sort
@@ -894,7 +827,7 @@ bool CatalogManagerReplicaSet::runUserManagementWriteCommand(OperationContext* t
         return Command::appendCommandStatus(*result, scopedDistLock.getStatus());
     }
 
-    auto response = _runCommandOnConfigWithNotMasterRetries(dbname, cmdObj);
+    auto response = grid.shardRegistry()->runCommandOnConfigWithNotMasterRetries(dbname, cmdObj);
     if (!response.isOK()) {
         return Command::appendCommandStatus(*result, response.getStatus());
     }
@@ -924,7 +857,7 @@ Status CatalogManagerReplicaSet::applyChunkOpsDeprecated(OperationContext* txn,
                                                          const BSONArray& updateOps,
                                                          const BSONArray& preCondition) {
     BSONObj cmd = BSON("applyOps" << updateOps << "preCondition" << preCondition);
-    auto response = _runCommandOnConfigWithNotMasterRetries("config", cmd);
+    auto response = grid.shardRegistry()->runCommandOnConfigWithNotMasterRetries("config", cmd);
 
     if (!response.isOK()) {
         return response.getStatus();
@@ -952,7 +885,7 @@ void CatalogManagerReplicaSet::writeConfigServerDirect(OperationContext* txn,
     invariant(dbname == "config" || dbname == "admin");
     const BSONObj cmdObj = batchRequest.toBSON();
 
-    auto response = _runCommandOnConfigWithNotMasterRetries(dbname, cmdObj);
+    auto response = grid.shardRegistry()->runCommandOnConfigWithNotMasterRetries(dbname, cmdObj);
     if (!response.isOK()) {
         _toBatchError(response.getStatus(), batchResponse);
         return;
@@ -973,17 +906,8 @@ Status CatalogManagerReplicaSet::_checkDbDoesNotExist(OperationContext* txn,
     queryBuilder.appendRegex(
         DatabaseType::name(), (string) "^" + pcrecpp::RE::QuoteMeta(dbName) + "$", "i");
 
-    const auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    const auto readHost = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHost.isOK()) {
-        return readHost.getStatus();
-    }
-
-    auto findStatus = _exhaustiveFindOnConfig(readHost.getValue(),
-                                              NamespaceString(DatabaseType::ConfigNS),
-                                              queryBuilder.obj(),
-                                              BSONObj(),
-                                              1);
+    auto findStatus = _exhaustiveFindOnConfig(
+        txn, NamespaceString(DatabaseType::ConfigNS), queryBuilder.obj(), BSONObj(), 1);
     if (!findStatus.isOK()) {
         return findStatus.getStatus();
     }
@@ -1015,16 +939,10 @@ Status CatalogManagerReplicaSet::_checkDbDoesNotExist(OperationContext* txn,
 }
 
 StatusWith<std::string> CatalogManagerReplicaSet::_generateNewShardName(OperationContext* txn) {
-    const auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    const auto readHost = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHost.isOK()) {
-        return readHost.getStatus();
-    }
-
     BSONObjBuilder shardNameRegex;
     shardNameRegex.appendRegex(ShardType::name(), "^shard");
 
-    auto findStatus = _exhaustiveFindOnConfig(readHost.getValue(),
+    auto findStatus = _exhaustiveFindOnConfig(txn,
                                               NamespaceString(ShardType::ConfigNS),
                                               shardNameRegex.obj(),
                                               BSON(ShardType::name() << -1),
@@ -1057,7 +975,7 @@ StatusWith<std::string> CatalogManagerReplicaSet::_generateNewShardName(Operatio
     return Status(ErrorCodes::OperationFailed, "unable to generate new shard name");
 }
 
-StatusWith<long long> CatalogManagerReplicaSet::_runCountCommandOnConfig(const HostAndPort& target,
+StatusWith<long long> CatalogManagerReplicaSet::_runCountCommandOnConfig(OperationContext* txn,
                                                                          const NamespaceString& ns,
                                                                          BSONObj query) {
     BSONObjBuilder countBuilder;
@@ -1065,20 +983,16 @@ StatusWith<long long> CatalogManagerReplicaSet::_runCountCommandOnConfig(const H
     countBuilder.append("query", query);
     _appendReadConcern(&countBuilder);
 
-    auto responseStatus = _runCommandOnConfig(target, ns.db().toString(), countBuilder.done());
-
-    if (!responseStatus.isOK()) {
-        return responseStatus.getStatus();
+    BSONObjBuilder resultBuilder;
+    if (!_runReadCommand(
+            txn, ns.db().toString(), countBuilder.done(), kConfigReadSelector, &resultBuilder)) {
+        return Command::getStatusFromCommandResult(resultBuilder.obj());
     }
 
-    auto responseObj = responseStatus.getValue();
-    Status status = Command::getStatusFromCommandResult(responseObj);
-    if (!status.isOK()) {
-        return status;
-    }
+    auto responseObj = resultBuilder.obj();
 
     long long result;
-    status = bsonExtractIntegerField(responseObj, "n", &result);
+    auto status = bsonExtractIntegerField(responseObj, "n", &result);
     if (!status.isOK()) {
         return status;
     }
@@ -1152,14 +1066,7 @@ Status CatalogManagerReplicaSet::initConfigVersion(OperationContext* txn) {
 }
 
 StatusWith<VersionType> CatalogManagerReplicaSet::_getConfigVersion(OperationContext* txn) {
-    const auto configShard = grid.shardRegistry()->getShard(txn, "config");
-    const auto readHostStatus = configShard->getTargeter()->findHost(kConfigReadSelector);
-    if (!readHostStatus.isOK()) {
-        return readHostStatus.getStatus();
-    }
-
-    auto readHost = readHostStatus.getValue();
-    auto findStatus = _exhaustiveFindOnConfig(readHost,
+    auto findStatus = _exhaustiveFindOnConfig(txn,
                                               NamespaceString(VersionType::ConfigNS),
                                               BSONObj(),
                                               BSONObj(),
@@ -1177,7 +1084,7 @@ StatusWith<VersionType> CatalogManagerReplicaSet::_getConfigVersion(OperationCon
 
     if (queryResults.empty()) {
         auto countStatus =
-            _runCountCommandOnConfig(readHost, NamespaceString(ShardType::ConfigNS), BSONObj());
+            _runCountCommandOnConfig(txn, NamespaceString(ShardType::ConfigNS), BSONObj());
 
         if (!countStatus.isOK()) {
             return countStatus.getStatus();
@@ -1210,76 +1117,39 @@ StatusWith<VersionType> CatalogManagerReplicaSet::_getConfigVersion(OperationCon
     return versionTypeResult.getValue();
 }
 
-StatusWith<BSONObj> CatalogManagerReplicaSet::_runCommandOnConfig(const HostAndPort& target,
-                                                                  const string& dbName,
-                                                                  BSONObj cmdObj) {
-    auto result = grid.shardRegistry()->runCommandOnConfig(target, dbName, cmdObj, kReplMetadata);
-
-    if (!result.isOK()) {
-        return result.getStatus();
-    }
-
-    const auto& response = result.getValue();
-
-    _updateLastSeenConfigOpTime(response.opTime);
-
-    return response.response;
-}
-
-StatusWith<BSONObj> CatalogManagerReplicaSet::_runCommandOnConfigWithNotMasterRetries(
-    const std::string& dbName, BSONObj cmdObj) {
-    auto result =
-        grid.shardRegistry()->runCommandOnConfigWithNotMasterRetries(dbName, cmdObj, kReplMetadata);
-
-    if (!result.isOK()) {
-        return result.getStatus();
-    }
-
-    const auto& response = result.getValue();
-
-    _updateLastSeenConfigOpTime(response.opTime);
-
-    return response.response;
-}
-
 StatusWith<OpTimePair<vector<BSONObj>>> CatalogManagerReplicaSet::_exhaustiveFindOnConfig(
-    const HostAndPort& host,
+    OperationContext* txn,
     const NamespaceString& nss,
     const BSONObj& query,
     const BSONObj& sort,
     boost::optional<long long> limit) {
-    repl::ReadConcernArgs readConcern(_getConfigOpTime(),
-                                      repl::ReadConcernLevel::kMajorityReadConcern);
+    Status lastStatus = Status::OK();
 
-    auto result = grid.shardRegistry()->exhaustiveFindOnConfigNode(
-        host, nss, query, sort, limit, readConcern, kReplMetadata);
+    for (int retry = 0; retry < kMaxReadRetry; retry++) {
+        repl::ReadConcernArgs readConcern{grid.shardRegistry()->getConfigOpTime(),
+                                          repl::ReadConcernLevel::kMajorityReadConcern};
 
-    if (!result.isOK()) {
-        return result.getStatus();
+        auto result = grid.shardRegistry()->exhaustiveFindOnConfig(
+            kConfigReadSelector, nss, query, sort, limit, readConcern);
+
+        if (ErrorCodes::isNetworkError(result.getStatus().code())) {
+            lastStatus = result.getStatus();
+            continue;
+        }
+
+        if (!result.isOK()) {
+            return result.getStatus();
+        }
+
+        auto response = std::move(result.getValue());
+        return OpTimePair<vector<BSONObj>>(std::move(response.docs), response.opTime);
     }
 
-    auto response = std::move(result.getValue());
-
-    _updateLastSeenConfigOpTime(response.opTime);
-
-    return OpTimePair<vector<BSONObj>>(std::move(response.docs), response.opTime);
-}
-
-OpTime CatalogManagerReplicaSet::_getConfigOpTime() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _configOpTime;
-}
-
-void CatalogManagerReplicaSet::_updateLastSeenConfigOpTime(const OpTime& optime) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-    if (_configOpTime < optime) {
-        _configOpTime = optime;
-    }
+    return lastStatus;
 }
 
 void CatalogManagerReplicaSet::_appendReadConcern(BSONObjBuilder* builder) {
-    repl::ReadConcernArgs readConcern(_getConfigOpTime(),
+    repl::ReadConcernArgs readConcern(grid.shardRegistry()->getConfigOpTime(),
                                       repl::ReadConcernLevel::kMajorityReadConcern);
     readConcern.appendInfo(builder);
 }
@@ -1289,20 +1159,25 @@ bool CatalogManagerReplicaSet::_runReadCommand(OperationContext* txn,
                                                const BSONObj& cmdObj,
                                                const ReadPreferenceSetting& settings,
                                                BSONObjBuilder* result) {
-    auto targeter = grid.shardRegistry()->getShard(txn, "config")->getTargeter();
-    auto target = targeter->findHost(settings);
-    if (!target.isOK()) {
-        return Command::appendCommandStatus(*result, target.getStatus());
+    Status lastStatus = Status::OK();
+    for (int retry = 0; retry < kMaxReadRetry; retry++) {
+        auto resultStatus = grid.shardRegistry()->runCommandOnConfig(settings, dbname, cmdObj);
+
+        if (ErrorCodes::isNetworkError(resultStatus.getStatus().code())) {
+            lastStatus = resultStatus.getStatus();
+            continue;
+        }
+
+        if (!resultStatus.isOK()) {
+            return Command::appendCommandStatus(*result, resultStatus.getStatus());
+        }
+
+        result->appendElements(resultStatus.getValue());
+
+        return Command::getStatusFromCommandResult(resultStatus.getValue()).isOK();
     }
 
-    auto resultStatus = _runCommandOnConfig(target.getValue(), dbname, cmdObj);
-    if (!resultStatus.isOK()) {
-        return Command::appendCommandStatus(*result, resultStatus.getStatus());
-    }
-
-    result->appendElements(resultStatus.getValue());
-
-    return Command::getStatusFromCommandResult(resultStatus.getValue()).isOK();
+    return Command::appendCommandStatus(*result, lastStatus);
 }
 
 }  // namespace mongo

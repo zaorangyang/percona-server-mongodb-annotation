@@ -374,10 +374,6 @@ struct __wt_page_modify {
 	/*
 	 * The write generation is incremented when a page is modified, a page
 	 * is clean if the write generation is 0.
-	 *
-	 * !!!
-	 * 4B values are probably larger than required, but I'm more confident
-	 * 4B types will always be backed by atomic writes to memory.
 	 */
 	uint32_t write_gen;
 
@@ -387,14 +383,11 @@ struct __wt_page_modify {
 	__wt_spin_unlock((s), &S2C(s)->page_lock[(p)->modify->page_lock])
 	uint8_t page_lock;		/* Page's spinlock */
 
-#define	WT_PM_REC_EMPTY		0x01	/* Reconciliation: no replacement */
-#define	WT_PM_REC_MULTIBLOCK	0x02	/* Reconciliation: multiple blocks */
-#define	WT_PM_REC_REPLACE	0x04	/* Reconciliation: single block */
-#define	WT_PM_REC_REWRITE	0x08	/* Reconciliation: rewrite in place */
-#define	WT_PM_REC_MASK							\
-	(WT_PM_REC_EMPTY | WT_PM_REC_MULTIBLOCK |			\
-	 WT_PM_REC_REPLACE | WT_PM_REC_REWRITE)
-	uint8_t flags;			/* Page flags */
+#define	WT_PM_REC_EMPTY		1	/* Reconciliation: no replacement */
+#define	WT_PM_REC_MULTIBLOCK	2	/* Reconciliation: multiple blocks */
+#define	WT_PM_REC_REPLACE	3	/* Reconciliation: single block */
+#define	WT_PM_REC_REWRITE	4	/* Reconciliation: rewrite in place */
+	uint8_t rec_result;		/* Reconciliation state */
 };
 
 /*
@@ -584,8 +577,9 @@ struct __wt_page {
 #define	WT_PAGE_DISK_ALLOC	0x02	/* Disk image in allocated memory */
 #define	WT_PAGE_DISK_MAPPED	0x04	/* Disk image in mapped memory */
 #define	WT_PAGE_EVICT_LRU	0x08	/* Page is on the LRU queue */
-#define	WT_PAGE_RECONCILIATION	0x10	/* Page reconciliation lock */
-#define	WT_PAGE_SPLIT_INSERT	0x20	/* A leaf page was split for append */
+#define	WT_PAGE_OVERFLOW_KEYS	0x10	/* Page has overflow keys */
+#define	WT_PAGE_RECONCILIATION	0x20	/* Page reconciliation lock */
+#define	WT_PAGE_SPLIT_INSERT	0x40	/* A leaf page was split for append */
 	uint8_t flags_atomic;		/* Atomic flags, use F_*_ATOMIC */
 
 	/*

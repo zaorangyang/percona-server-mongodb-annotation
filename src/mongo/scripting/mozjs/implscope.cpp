@@ -113,7 +113,14 @@ void MozJSImplScope::_reportError(JSContext* cx, const char* message, JSErrorRep
 
             ObjectWrapper(cx, excn).getValue("stack", &stack);
 
-            ss << " :\n" << ValueWriter(cx, stack).toString();
+            auto str = ValueWriter(cx, stack).toString();
+
+            if (str.empty()) {
+                ss << " @" << report->filename << ":" << report->lineno << ":" << report->column
+                   << "\n";
+            } else {
+                ss << " :\n" << str;
+            }
         }
 
         scope->_status = Status(
@@ -278,6 +285,9 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
     _checkErrorState(JS_InitStandardClasses(_context, _global));
 
     installBSONTypes();
+
+    JS_FireOnNewGlobalObject(_context, _global);
+
     execSetup(JSFiles::assert);
     execSetup(JSFiles::types);
 
@@ -425,10 +435,11 @@ BSONObj MozJSImplScope::callThreadArgs(const BSONObj& args) {
 
     _checkErrorState(JS::Call(_context, thisv, function, argv, &out), false, true);
 
-    BSONObjBuilder b;
-    ValueWriter(_context, out).writeThis(&b, "ret");
+    JS::RootedObject rout(_context, JS_NewPlainObject(_context));
+    ObjectWrapper wout(_context, rout);
+    wout.setValue("ret", out);
 
-    return b.obj();
+    return wout.toBSON();
 }
 
 bool hasFunctionIdentifier(StringData code) {

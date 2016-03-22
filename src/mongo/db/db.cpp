@@ -373,6 +373,15 @@ static void repairDatabasesAndCheckVersion() {
                       << " For more info see"
                       << " http://dochub.mongodb.org/core/index-validation" << startupWarningsLog;
             }
+
+            if (index["v"].isNumber() && index["v"].numberInt() == 0) {
+                log() << "WARNING: The index: " << index << " was created with the deprecated"
+                      << " v:0 format.  This format will not be supported in a future release."
+                      << startupWarningsLog;
+                log() << "\t To fix this, you need to rebuild this index."
+                      << " For instructions, see http://dochub.mongodb.org/core/rebuild-v0-indexes"
+                      << startupWarningsLog;
+            }
         }
 
         if (PlanExecutor::IS_EOF != state) {
@@ -406,13 +415,19 @@ static void _initAndListen(int listenPort) {
 
     // This is what actually creates the sockets, but does not yet listen on them because we
     // do not want connections to just hang if recovery takes a very long time.
-    server->setupSockets();
+    if (!server->setupSockets()) {
+        error() << "Failed to set up sockets during startup.";
+        return;
+    }
 
     std::shared_ptr<DbWebServer> dbWebServer;
     if (serverGlobalParams.isHttpInterfaceEnabled) {
         dbWebServer.reset(new DbWebServer(
             serverGlobalParams.bind_ip, serverGlobalParams.port + 1000, new RestAdminAccess()));
-        dbWebServer->setupSockets();
+        if (!dbWebServer->setupSockets()) {
+            error() << "Failed to set up sockets for HTTP interface during startup.";
+            return;
+        }
     }
 
     getGlobalServiceContext()->initializeGlobalStorageEngine();

@@ -34,6 +34,7 @@
 #include "mongo/bson/json.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/replset/catalog_manager_replica_set.h"
 #include "mongo/s/catalog/replset/catalog_manager_replica_set_test_fixture.h"
@@ -58,14 +59,15 @@ TEST_F(CatalogManagerReplSetTestFixture, UpgradeNotNeeded) {
         launchAsync([this] { ASSERT_OK(catalogManager()->initConfigVersion(operationContext())); });
 
     onFindCommand([this](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_EQUALS(BSON(rpc::kSecondaryOkFieldName << 1 << rpc::kReplSetMetadataFieldName << 1),
+                      request.metadata);
 
         ASSERT_EQ(HostAndPort("config:123"), request.target);
         ASSERT_EQ("config", request.dbname);
 
         const auto& findCmd = request.cmdObj;
         ASSERT_EQ("version", findCmd["find"].str());
-        checkReadConcern(findCmd, Timestamp(0, 0), 0);
+        checkReadConcern(findCmd, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
         BSONObj versionDoc(BSON("_id" << 1 << "minCompatibleVersion"
                                       << MIN_COMPATIBLE_CONFIG_VERSION << "currentVersion"
@@ -352,14 +354,15 @@ TEST_F(CatalogManagerReplSetTestFixture, InitVersionDuplicateKeyNoOpAfterRetry) 
     // Retry starts here
 
     onFindCommand([this](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_EQUALS(BSON(rpc::kSecondaryOkFieldName << 1 << rpc::kReplSetMetadataFieldName << 1),
+                      request.metadata);
 
         ASSERT_EQ(HostAndPort("config:123"), request.target);
         ASSERT_EQ("config", request.dbname);
 
         const auto& findCmd = request.cmdObj;
         ASSERT_EQ("version", findCmd["find"].str());
-        checkReadConcern(findCmd, Timestamp(0, 0), 0);
+        checkReadConcern(findCmd, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
         BSONObj versionDoc(fromjson(R"({
                 _id: 1,
@@ -483,14 +486,15 @@ TEST_F(CatalogManagerReplSetTestFixture, InitVersionDuplicateKeyTooNewAfterRetry
     // Retry starts here
 
     onFindCommand([this](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_EQUALS(BSON(rpc::kSecondaryOkFieldName << 1 << rpc::kReplSetMetadataFieldName << 1),
+                      request.metadata);
 
         ASSERT_EQ(HostAndPort("config:123"), request.target);
         ASSERT_EQ("config", request.dbname);
 
         const auto& findCmd = request.cmdObj;
         ASSERT_EQ("version", findCmd["find"].str());
-        checkReadConcern(findCmd, Timestamp(0, 0), 0);
+        checkReadConcern(findCmd, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
         BSONObj versionDoc(fromjson(R"({
                 _id: 1,
@@ -568,14 +572,15 @@ TEST_F(CatalogManagerReplSetTestFixture, InitVersionUpsertNoMatchNoOpAfterRetry)
     // Retry starts here
 
     onFindCommand([this](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_EQUALS(BSON(rpc::kSecondaryOkFieldName << 1 << rpc::kReplSetMetadataFieldName << 1),
+                      request.metadata);
 
         ASSERT_EQ(HostAndPort("config:123"), request.target);
         ASSERT_EQ("config", request.dbname);
 
         const auto& findCmd = request.cmdObj;
         ASSERT_EQ("version", findCmd["find"].str());
-        checkReadConcern(findCmd, Timestamp(0, 0), 0);
+        checkReadConcern(findCmd, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
         BSONObj versionDoc(fromjson(R"({
                 _id: 1,

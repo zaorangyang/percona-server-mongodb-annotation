@@ -385,43 +385,36 @@ void IndexCatalog::IndexBuildBlock::fail() {
     }
 }
 
-namespace {
-class IndexCompletionChange final : public RecoveryUnit::Change {
-public:
-    IndexCompletionChange(OperationContext* txn, IndexCatalogEntry* entry)
-        : _txn(txn), _entry(entry) {}
-
-    void rollback() final {}  // Handled elsewhere by retrying or deleting the index.
-    void commit() final {
-        // Note: this runs after the WUOW commits but before we release our X lock on the
-        // collection. This means that any snapshot created after this must include the full index,
-        // and no one can try to read this index before we set the visibility.
-        auto replCoord = repl::ReplicationCoordinator::get(_txn);
-        auto snapshotName = replCoord->reserveSnapshotName(_txn);
-        replCoord->forceSnapshotCreation();  // Ensures a newer snapshot gets created even if idle.
-        _entry->setMinimumVisibleSnapshot(snapshotName);
-    }
-
-private:
-    OperationContext* const _txn;
-    IndexCatalogEntry* const _entry;
-};
-}
-
 void IndexCatalog::IndexBuildBlock::success() {
-    fassert(17207, _catalog->_collection->ok());
+    Collection* collection = _catalog->_collection;
+    fassert(17207, collection->ok());
 
-    _catalog->_collection->getCatalogEntry()->indexBuildSuccess(_txn, _indexName);
+    collection->getCatalogEntry()->indexBuildSuccess(_txn, _indexName);
 
     IndexDescriptor* desc = _catalog->findIndexByName(_txn, _indexName, true);
     fassert(17330, desc);
     IndexCatalogEntry* entry = _catalog->_entries.find(desc);
     fassert(17331, entry && entry == _entry);
 
-    _txn->recoveryUnit()->registerChange(new IndexCompletionChange(_txn, entry));
+    OperationContext* txn = _txn;
+    _txn->recoveryUnit()->onCommit([txn, entry, collection] {
+        // Note: this runs after the WUOW commits but before we release our X lock on the
+        // collection. This means that any snapshot created after this must include the full index,
+        // and no one can try to read this index before we set the visibility.
+        auto replCoord = repl::ReplicationCoordinator::get(txn);
+        auto snapshotName = replCoord->reserveSnapshotName(txn);
+        replCoord->forceSnapshotCreation();  // Ensures a newer snapshot gets created even if idle.
+        entry->setMinimumVisibleSnapshot(snapshotName);
+
+        // TODO remove this once SERVER-20439 is implemented. It is a stopgap solution for
+        // SERVER-20260 to make sure that reads with majority readConcern level can see indexes that
+        // are created with w:majority by making the readers block.
+        collection->setMinimumVisibleSnapshot(snapshotName);
+    });
+
     entry->setIsReady(true);
 
-    _catalog->_collection->infoCache()->addedIndex(_txn, _indexName);
+    collection->infoCache()->addedIndex(_txn, _indexName);
 }
 
 namespace {
@@ -831,10 +824,15 @@ Status IndexCatalog::_dropIndex(OperationContext* txn, IndexCatalogEntry* entry)
     string indexName = entry->descriptor()->indexName();
     string indexNamespace = entry->descriptor()->indexNamespace();
 
-    // there may be pointers pointing at keys in the btree(s).  kill them.
-    // TODO: can this can only clear cursors on this index?
-    _collection->getCursorManager()->invalidateAll(
-        false, str::stream() << "index '" << indexName << "' dropped");
+    // If any cursors could be using this index, invalidate them. Note that we do not use indexes
+    // until they are ready, so we do not need to invalidate anything if the index fails while it is
+    // being built.
+    // TODO only kill cursors that are actually using the index rather than everything on this
+    // collection.
+    if (entry->isReady(txn)) {
+        _collection->getCursorManager()->invalidateAll(
+            false, str::stream() << "index '" << indexName << "' dropped");
+    }
 
     // --------- START REAL WORK ----------
     audit::logDropIndex(&cc(), indexName, _collection->ns().ns());
@@ -1067,6 +1065,7 @@ const IndexCatalogEntry* IndexCatalog::getEntry(const IndexDescriptor* desc) con
 const IndexDescriptor* IndexCatalog::refreshEntry(OperationContext* txn,
                                                   const IndexDescriptor* oldDesc) {
     invariant(txn->lockState()->isCollectionLockedForMode(_collection->ns().ns(), MODE_X));
+    invariant(!BackgroundOperation::inProgForNs(_collection->ns()));
 
     const std::string indexName = oldDesc->indexName();
     invariant(_collection->getCatalogEntry()->isIndexReady(txn, indexName));
@@ -1109,21 +1108,38 @@ bool isDupsAllowed(IndexDescriptor* desc) {
 }
 }
 
-Status IndexCatalog::_indexRecord(OperationContext* txn,
-                                  IndexCatalogEntry* index,
-                                  const BSONObj& obj,
-                                  const RecordId& loc) {
-    const MatchExpression* filter = index->getFilterExpression();
-    if (filter && !filter->matchesBSON(obj)) {
-        return Status::OK();
-    }
-
+Status IndexCatalog::_indexFilteredRecords(OperationContext* txn,
+                                           IndexCatalogEntry* index,
+                                           const std::vector<BsonRecord>& bsonRecords) {
     InsertDeleteOptions options;
     options.logIfError = false;
     options.dupsAllowed = isDupsAllowed(index->descriptor());
 
-    int64_t inserted;
-    return index->accessMethod()->insert(txn, obj, loc, options, &inserted);
+    for (auto bsonRecord : bsonRecords) {
+        int64_t inserted;
+        invariant(bsonRecord.id != RecordId());
+        Status status = index->accessMethod()->insert(
+            txn, *bsonRecord.docPtr, bsonRecord.id, options, &inserted);
+        if (!status.isOK())
+            return status;
+    }
+    return Status::OK();
+}
+
+Status IndexCatalog::_indexRecords(OperationContext* txn,
+                                   IndexCatalogEntry* index,
+                                   const std::vector<BsonRecord>& bsonRecords) {
+    const MatchExpression* filter = index->getFilterExpression();
+    if (!filter)
+        return _indexFilteredRecords(txn, index, bsonRecords);
+
+    std::vector<BsonRecord> filteredBsonRecords;
+    for (auto bsonRecord : bsonRecords) {
+        if (filter->matchesBSON(*(bsonRecord.docPtr)))
+            filteredBsonRecords.push_back(bsonRecord);
+    }
+
+    return _indexFilteredRecords(txn, index, filteredBsonRecords);
 }
 
 Status IndexCatalog::_unindexRecord(OperationContext* txn,
@@ -1152,10 +1168,11 @@ Status IndexCatalog::_unindexRecord(OperationContext* txn,
 }
 
 
-Status IndexCatalog::indexRecord(OperationContext* txn, const BSONObj& obj, const RecordId& loc) {
+Status IndexCatalog::indexRecords(OperationContext* txn,
+                                  const std::vector<BsonRecord>& bsonRecords) {
     for (IndexCatalogEntryContainer::const_iterator i = _entries.begin(); i != _entries.end();
          ++i) {
-        Status s = _indexRecord(txn, *i, obj, loc);
+        Status s = _indexRecords(txn, *i, bsonRecords);
         if (!s.isOK())
             return s;
     }

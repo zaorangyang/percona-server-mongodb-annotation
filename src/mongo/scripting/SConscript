@@ -1,6 +1,7 @@
 # -*- mode: python -*-
 
 Import([
+    'debugBuild',
     'env',
     'serverJs',
     'usemozjs',
@@ -85,12 +86,20 @@ if usemozjs:
         'STATIC_JS_API=1',
     ])
 
+    if debugBuild:
+        scriptingEnv.Prepend(CPPDEFINES=[
+            'DEBUG',
+            'JS_DEBUG',
+        ])
+
     scriptingEnv.JSHeader(
         target='mozjs/mongohelpers_js.cpp',
         source=[
             'mozjs/mongohelpers.js'
         ]
     )
+
+    env.Alias('generated-sources', 'mozjs/mongohelpers_js.cpp')
 
     scriptingEnv.Library(
         target='scripting',

@@ -30,6 +30,7 @@
 
 #include <string>
 #include <memory>
+#include <functional>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
@@ -270,6 +271,9 @@ class TaskExecutor::CallbackHandle {
 public:
     CallbackHandle();
 
+    // Exposed solely for testing.
+    explicit CallbackHandle(std::shared_ptr<CallbackState> cbData);
+
     bool operator==(const CallbackHandle& other) const {
         return _callback == other._callback;
     }
@@ -289,8 +293,11 @@ public:
         return isValid();
     }
 
+    std::size_t hash() const {
+        return std::hash<decltype(_callback)>()(_callback);
+    }
+
 private:
-    explicit CallbackHandle(std::shared_ptr<CallbackState> cbData);
     void setCallback(std::shared_ptr<CallbackState> callback) {
         _callback = callback;
     }
@@ -392,3 +399,14 @@ struct TaskExecutor::RemoteCommandCallbackArgs {
 
 }  // namespace executor
 }  // namespace mongo
+
+// Provide a specialization for std::hash<CallbackHandle> so it can easily
+// be stored in unordered_set.
+namespace std {
+template <>
+struct hash<::mongo::executor::TaskExecutor::CallbackHandle> {
+    size_t operator()(const ::mongo::executor::TaskExecutor::CallbackHandle& x) const {
+        return x.hash();
+    }
+};
+}  // namespace std

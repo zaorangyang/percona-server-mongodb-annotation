@@ -135,6 +135,23 @@ shellPrint = function( x ){
     }
 }
 
+print.captureAllOutput = function (fn, args) {
+    var res = {};
+    res.output = [];
+    var __orig_print = print;
+    print = function () {
+        Array.prototype.push.apply(res.output, Array.prototype.slice.call(arguments).join(" ").split("\n"));
+    };
+    try {
+        res.result = fn.apply(undefined, args);
+    }
+    finally {
+        // Stop capturing print() output
+        print = __orig_print;
+    }
+    return res;
+};
+
 if ( typeof TestData == "undefined" ){
     TestData = undefined
 }
@@ -175,6 +192,8 @@ jsTestOptions = function(){
                               adminUser : TestData.adminUser || "admin",
                               adminPassword : TestData.adminPassword || "password",
                               useLegacyConfigServers: TestData.useLegacyConfigServers || false,
+                              useLegacyReplicationProtocol:
+                                    TestData.useLegacyReplicationProtocol || false,
                               enableEncryption: TestData.enableEncryption,
                               encryptionKeyFile: TestData.encryptionKeyFile,
                               minPort: TestData.minPort,
@@ -385,7 +404,7 @@ if (typeof(_writeMode) == 'undefined') {
 
 if (typeof(_readMode) == 'undefined') {
     // This is for cases when the v8 engine is used other than the mongo shell, like map reduce.
-    _readMode = function() { return "compatibility"; };
+    _readMode = function() { return "legacy"; };
 };
 
 shellPrintHelper = function (x) {

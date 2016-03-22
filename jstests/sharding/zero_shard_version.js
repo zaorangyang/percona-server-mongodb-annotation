@@ -110,7 +110,7 @@ checkShardMajorVersion(st.d1, 2);
 // refresh it's metadata correctly.
 assert.neq(null, testDB_s2.user.findOne({ x: 1 }));
 
-checkShardMajorVersion(st.d0, 0);
+checkShardMajorVersion(st.d0, 2);
 checkShardMajorVersion(st.d1, 2);
 
 // Set shard metadata to 2|0|b

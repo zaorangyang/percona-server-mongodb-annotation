@@ -45,8 +45,8 @@
 namespace mongo {
 namespace mozjs {
 
-ValueReader::ValueReader(JSContext* cx, JS::MutableHandleValue value, int depth)
-    : _context(cx), _value(value), _depth(depth) {}
+ValueReader::ValueReader(JSContext* cx, JS::MutableHandleValue value)
+    : _context(cx), _value(value) {}
 
 void ValueReader::fromBSONElement(const BSONElement& elem, bool readOnly) {
     auto scope = getScope(_context);
@@ -70,7 +70,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, bool readOnly) {
 
             ValueReader(_context, args[0]).fromStringData(elem.OID().toString());
 
-            scope->getOidProto().newInstance(args, _value);
+            scope->getProto<OIDInfo>().newInstance(args, _value);
             return;
         }
         case mongo::NumberDouble:
@@ -92,8 +92,8 @@ void ValueReader::fromBSONElement(const BSONElement& elem, bool readOnly) {
                 sprintf(str, "%i", i++);
                 JS::RootedValue member(_context);
 
-                ValueReader(_context, &member, _depth + 1).fromBSONElement(subElem, readOnly);
-                ObjectWrapper(_context, array, _depth + 1).setValue(str, member);
+                ValueReader(_context, &member).fromBSONElement(subElem, readOnly);
+                ObjectWrapper(_context, array).setValue(str, member);
             }
             _value.setObjectOrNull(array);
             return;
@@ -122,7 +122,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, bool readOnly) {
             ValueReader(_context, args[1]).fromStringData(elem.regexFlags());
 
             JS::RootedObject obj(_context);
-            scope->getRegExpProto().newInstance(args, &obj);
+            scope->getProto<RegExpInfo>().newInstance(args, &obj);
 
             _value.setObjectOrNull(obj);
 
@@ -140,7 +140,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, bool readOnly) {
 
             ValueReader(_context, args[1]).fromStringData(ss.str());
 
-            scope->getBinDataProto().newInstance(args, _value);
+            scope->getProto<BinDataInfo>().newInstance(args, _value);
             return;
         }
         case mongo::bsonTimestamp: {
@@ -149,7 +149,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, bool readOnly) {
             args[0].setDouble(elem.timestampTime().toMillisSinceEpoch() / 1000);
             args[1].setNumber(elem.timestampInc());
 
-            scope->getTimestampProto().newInstance(args, _value);
+            scope->getProto<TimestampInfo>().newInstance(args, _value);
 
             return;
         }
@@ -163,14 +163,14 @@ void ValueReader::fromBSONElement(const BSONElement& elem, bool readOnly) {
                 JS::AutoValueArray<1> args(_context);
                 args[0].setNumber(static_cast<double>(static_cast<long long>(nativeUnsignedLong)));
 
-                scope->getNumberLongProto().newInstance(args, _value);
+                scope->getProto<NumberLongInfo>().newInstance(args, _value);
             } else {
                 JS::AutoValueArray<3> args(_context);
                 args[0].setNumber(static_cast<double>(static_cast<long long>(nativeUnsignedLong)));
                 args[1].setDouble(nativeUnsignedLong >> 32);
                 args[2].setDouble(
                     static_cast<unsigned long>(nativeUnsignedLong & 0x00000000ffffffff));
-                scope->getNumberLongProto().newInstance(args, _value);
+                scope->getProto<NumberLongInfo>().newInstance(args, _value);
             }
 
             return;
@@ -181,16 +181,16 @@ void ValueReader::fromBSONElement(const BSONElement& elem, bool readOnly) {
             ValueReader(_context, args[0]).fromDecimal128(decimal);
             JS::RootedObject obj(_context);
 
-            scope->getNumberDecimalProto().newInstance(args, &obj);
+            scope->getProto<NumberDecimalInfo>().newInstance(args, &obj);
             _value.setObjectOrNull(obj);
 
             return;
         }
         case mongo::MinKey:
-            scope->getMinKeyProto().newInstance(_value);
+            scope->getProto<MinKeyInfo>().newInstance(_value);
             return;
         case mongo::MaxKey:
-            scope->getMaxKeyProto().newInstance(_value);
+            scope->getProto<MaxKeyInfo>().newInstance(_value);
             return;
         case mongo::DBRef: {
             JS::AutoValueArray<1> oidArgs(_context);
@@ -198,9 +198,9 @@ void ValueReader::fromBSONElement(const BSONElement& elem, bool readOnly) {
 
             JS::AutoValueArray<2> dbPointerArgs(_context);
             ValueReader(_context, dbPointerArgs[0]).fromStringData(elem.dbrefNS());
-            scope->getOidProto().newInstance(oidArgs, dbPointerArgs[1]);
+            scope->getProto<OIDInfo>().newInstance(oidArgs, dbPointerArgs[1]);
 
-            scope->getDbPointerProto().newInstance(dbPointerArgs, _value);
+            scope->getProto<DBPointerInfo>().newInstance(dbPointerArgs, _value);
             return;
         }
         default:
@@ -225,13 +225,13 @@ void ValueReader::fromBSON(const BSONObj& obj, bool readOnly) {
             ValueReader(_context, args[0]).fromBSONElement(ref, readOnly);
 
             // id can be a subobject
-            ValueReader(_context, args[1], _depth + 1).fromBSONElement(id, readOnly);
+            ValueReader(_context, args[1]).fromBSONElement(id, readOnly);
 
             JS::RootedObject obj(_context);
 
             auto scope = getScope(_context);
 
-            scope->getDbRefProto().newInstance(args, &obj);
+            scope->getProto<DBRefInfo>().newInstance(args, &obj);
             ObjectWrapper o(_context, obj);
 
             while (it.more()) {

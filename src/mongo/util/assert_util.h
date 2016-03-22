@@ -142,7 +142,7 @@ private:
     static void traceIfNeeded(const DBException& e);
 
 public:
-    static bool traceExceptions;
+    static std::atomic<bool> traceExceptions;
 
 protected:
     ExceptionInfo _ei;
@@ -268,6 +268,12 @@ inline T fassertStatusOK(int msgid, StatusWith<T> sw) {
         fassertFailedWithStatus(msgid, sw.getStatus());
     }
     return std::move(sw.getValue());
+}
+
+inline void fassertStatusOK(int msgid, const Status& s) {
+    if (MONGO_unlikely(!s.isOK())) {
+        fassertFailedWithStatus(msgid, s);
+    }
 }
 
 /* warning only - keeps going */
