@@ -4,3 +4,9 @@
 [submodule "Jemalloc"]
 	path = src/third_party/jemalloc
 	url = https://github.com/percona/jemalloc.git
+[submodule "rocksdb"]
+	path = src/third_party/rocksdb
+	url = https://github.com/facebook/rocksdb.git
+[submodule "mongo-rocks"]
+	path = src/mongo/db/storage/rocks
+	url = https://github.com/mongodb-partners/mongo-rocks.git
