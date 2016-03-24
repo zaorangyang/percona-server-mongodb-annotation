@@ -62,7 +62,6 @@ public:
     static const Milliseconds kDefaultElectionTimeoutPeriod;
     static const Milliseconds kDefaultHeartbeatInterval;
     static const Seconds kDefaultHeartbeatTimeoutPeriod;
-    static const int kDefaultElectionTimeoutOffsetLimit;
     static const bool kDefaultChainingAllowed;
 
     /**
@@ -71,6 +70,12 @@ public:
      * If usePV1ByDefault is true, the protocol version will be 1 when it's not specified in "cfg".
      */
     Status initialize(const BSONObj& cfg, bool usePV1ByDefault = false);
+
+    /**
+     * Same as the generic initialize() above except will default "configsvr" setting to the value
+     * of serverGlobalParams.configsvr.
+     */
+    Status initializeForInitiate(const BSONObj& cfg, bool usePV1ByDefault = false);
 
     /**
      * Returns true if this object has been successfully initialized or copied from
@@ -286,13 +291,6 @@ public:
      */
     Milliseconds getPriorityTakeoverDelay(int memberIdx) const;
 
-    /**
-     * Returns the upper bound (in Milliseconds) of the election timeout's random offset.
-     */
-    int getElectionTimeoutOffsetLimit() const {
-        return _electionTimeoutOffsetLimit;
-    }
-
 private:
     /**
      * Parses the "settings" subdocument of a replica set configuration.
@@ -302,7 +300,7 @@ private:
     /**
      * Return the number of members with a priority greater than "priority".
      */
-    int _calculatePriorityRank(int priority) const;
+    int _calculatePriorityRank(double priority) const;
 
     /**
      * Calculates and stores the majority for electing a primary (_majorityVoteCount).
@@ -314,6 +312,8 @@ private:
      */
     void _addInternalWriteConcernModes();
 
+    Status _initialize(const BSONObj& cfg, bool forInitiate, bool usePV1ByDefault);
+
     bool _isInitialized = false;
     long long _version = 1;
     std::string _replSetName;
@@ -321,9 +321,8 @@ private:
     WriteConcernOptions _defaultWriteConcern;
     Milliseconds _electionTimeoutPeriod = kDefaultElectionTimeoutPeriod;
     Milliseconds _heartbeatInterval = kDefaultHeartbeatInterval;
-    Seconds _heartbeatTimeoutPeriod = Seconds(0);
+    Seconds _heartbeatTimeoutPeriod = kDefaultHeartbeatTimeoutPeriod;
     bool _chainingAllowed = kDefaultChainingAllowed;
-    int _electionTimeoutOffsetLimit = kDefaultElectionTimeoutOffsetLimit;
     int _majorityVoteCount = 0;
     int _writeMajority = 0;
     int _totalVotingMembers = 0;

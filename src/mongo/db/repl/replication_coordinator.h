@@ -67,6 +67,8 @@ class OplogReader;
 class OpTime;
 class ReadConcernArgs;
 class ReadConcernResponse;
+class ReplicaSetConfig;
+class ReplicationExecutor;
 class ReplSetDeclareElectionWinnerArgs;
 class ReplSetDeclareElectionWinnerResponse;
 class ReplSetHeartbeatArgs;
@@ -75,7 +77,6 @@ class ReplSetHeartbeatResponse;
 class ReplSetHtmlSummary;
 class ReplSetRequestVotesArgs;
 class ReplSetRequestVotesResponse;
-class ReplicaSetConfig;
 class UpdatePositionArgs;
 
 /**
@@ -130,6 +131,11 @@ public:
     virtual void shutdown() = 0;
 
     /**
+     * Returns a pointer to the ReplicationExecutor.
+     */
+    virtual ReplicationExecutor* getExecutor() = 0;
+
+    /**
      * Returns a reference to the parsed command line arguments that are related to replication.
      */
     virtual const ReplSettings& getSettings() const = 0;
@@ -155,6 +161,14 @@ public:
     virtual MemberState getMemberState() const = 0;
 
     /**
+     * Waits for 'timeout' ms for member state to become 'state'.
+     * Returns OK if member state is 'state'.
+     * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the state change.
+     * Returns ErrorCodes::BadValue if timeout is negative.
+     */
+    virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) = 0;
+
+    /**
      * Returns true if this node is in state PRIMARY or SECONDARY.
      *
      * It is invalid to call this unless getReplicationMode() == modeReplSet.
@@ -166,10 +180,8 @@ public:
 
 
     /**
-     * Returns how slave delayed this node is configured to be.
-     *
-     * Raises a DBException if this node is not a member of the current replica set
-     * configuration.
+     * Returns how slave delayed this node is configured to be, or 0 seconds if this node is not a
+     * member of the current replica set configuration.
      */
     virtual Seconds getSlaveDelaySecs() const = 0;
 
@@ -372,6 +384,15 @@ public:
     virtual void signalDrainComplete(OperationContext* txn) = 0;
 
     /**
+     * Waits duration of 'timeout' for applier to finish draining its buffer of operations.
+     * Returns OK if isWaitingForApplierToDrain() returns false.
+     * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the applier to drain its
+     * buffer.
+     * Returns ErrorCodes::BadValue if timeout is negative.
+     */
+    virtual Status waitForDrainFinish(Milliseconds timeout) = 0;
+
+    /**
      * Signals the sync source feedback thread to wake up and send a handshake and
      * replSetUpdatePosition command to our sync source.
      */
@@ -542,7 +563,7 @@ public:
      * Returns Status::OK() if all updates are processed correctly, NodeNotFound
      * if any updating node cannot be found in the config, InvalidReplicaSetConfig if the
      * "configVersion" sent in any of the updates doesn't match our config version, or
-     * NotMasterOrSecondaryCode if we are in state REMOVED or otherwise don't have a valid
+     * NotMasterOrSecondary if we are in state REMOVED or otherwise don't have a valid
      * replica set config.
      * If a non-OK status is returned, it is unspecified whether none or some of the updates
      * were applied.
@@ -628,7 +649,6 @@ public:
      */
     virtual void prepareReplResponseMetadata(const rpc::RequestInterface& request,
                                              const OpTime& lastOpTimeFromClient,
-                                             const ReadConcernArgs& readConcern,
                                              BSONObjBuilder* builder) = 0;
 
     /**
@@ -654,7 +674,7 @@ public:
      * the rest of the work, because the term is still the same).
      * Returns StaleTerm if the supplied term was higher than the current term.
      */
-    virtual Status updateTerm(long long term) = 0;
+    virtual Status updateTerm(OperationContext* txn, long long term) = 0;
 
     /**
      * Reserves a unique SnapshotName.
@@ -686,10 +706,12 @@ public:
     virtual void onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name) = 0;
 
     /**
-     * Called by threads that wish to be alerted of the creation of a new snapshot. "txn" is used
-     * to checkForInterrupt and enforce maxTimeMS.
+     * Blocks until either the current committed snapshot is at least as high as 'untilSnapshot',
+     * or we are interrupted for any reason, including shutdown or maxTimeMs expiration.
+     * 'txn' is used to checkForInterrupt and enforce maxTimeMS.
      */
-    virtual void waitForNewSnapshot(OperationContext* txn) = 0;
+    virtual void waitUntilSnapshotCommitted(OperationContext* txn,
+                                            const SnapshotName& untilSnapshot) = 0;
 
     /**
      * Resets all information related to snapshotting.
@@ -700,6 +722,18 @@ public:
      * Gets the latest OpTime of the currentCommittedSnapshot.
      */
     virtual OpTime getCurrentCommittedSnapshotOpTime() = 0;
+
+    /**
+     * Appends connection information to the provided BSONObjBuilder.
+     */
+    virtual void appendConnectionStats(BSONObjBuilder* b) = 0;
+
+    /**
+     * Gets the number of uncommitted snapshots currently held.
+     * Warning: This value can change at any time and may not even be accurate at the time of
+     * return. It should not be used when an exact amount is needed.
+     */
+    virtual size_t getNumUncommittedSnapshots() = 0;
 
 protected:
     ReplicationCoordinator();

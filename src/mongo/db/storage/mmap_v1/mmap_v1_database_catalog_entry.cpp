@@ -69,7 +69,7 @@ namespace {
  * - setting to false will fail.
  */
 // Unused, needed for server parameter.
-std::atomic<bool> newCollectionsUsePowerOf2SizesFlag(true);
+std::atomic<bool> newCollectionsUsePowerOf2SizesFlag(true);  // NOLINT
 
 class NewCollectionsUsePowerOf2SizesParameter
     : public ExportedServerParameter<bool, ServerParameterType::kStartupAndRuntime> {
@@ -711,7 +711,8 @@ IndexAccessMethod* MMAPV1DatabaseCatalogEntry::getIndex(OperationContext* txn,
                            &rs->savedCursors,
                            entry->ordering(),
                            entry->descriptor()->indexNamespace(),
-                           entry->descriptor()->version()));
+                           entry->descriptor()->version(),
+                           entry->descriptor()->unique()));
 
     if (IndexNames::HASHED == type)
         return new HashAccessMethod(entry, btree.release());

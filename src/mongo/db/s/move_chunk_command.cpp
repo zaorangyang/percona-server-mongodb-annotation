@@ -43,6 +43,7 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logger/ramlog.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/fail_point_service.h"
@@ -64,36 +65,6 @@ MONGO_FP_DECLARE(moveChunkHangAtStep5);
 MONGO_FP_DECLARE(moveChunkHangAtStep6);
 
 Tee* const migrateLog = RamLog::get("migrate");
-
-class MigrateStatusHolder {
-public:
-    MigrateStatusHolder(OperationContext* txn,
-                        MigrationSourceManager* migrateSourceManager,
-                        const std::string& ns,
-                        const BSONObj& min,
-                        const BSONObj& max,
-                        const BSONObj& shardKeyPattern)
-        : _txn(txn), _migrateSourceManager(migrateSourceManager) {
-        _isAnotherMigrationActive =
-            !_migrateSourceManager->start(txn, ns, min, max, shardKeyPattern);
-    }
-
-    ~MigrateStatusHolder() {
-        if (!_isAnotherMigrationActive) {
-            _migrateSourceManager->done(_txn);
-        }
-    }
-
-    bool isAnotherMigrationActive() const {
-        return _isAnotherMigrationActive;
-    }
-
-private:
-    OperationContext* const _txn;
-    MigrationSourceManager* const _migrateSourceManager;
-
-    bool _isAnotherMigrationActive;
-};
 
 /**
  * This is the main entry for moveChunk, which is called to initiate a move by a donor side. It can
@@ -141,8 +112,7 @@ public:
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::moveChunk)) {
+                ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
@@ -201,8 +171,8 @@ public:
             shardingState->initialize(txn, configdb);
         }
 
-        ChunkMoveOperationState chunkMoveState{NamespaceString(ns)};
-        uassertStatusOK(chunkMoveState.initialize(txn, cmdObj));
+        ChunkMoveOperationState chunkMoveState{txn, NamespaceString(ns)};
+        uassertStatusOK(chunkMoveState.initialize(cmdObj));
 
         // Initialize our current shard name in the shard state if needed
         shardingState->setShardName(chunkMoveState.getFromShard());
@@ -252,14 +222,13 @@ public:
                                        Status(ErrorCodes::ConflictingOperationInProgress, msg));
         }
 
-        auto distLock = uassertStatusOK(chunkMoveState.acquireMoveMetadata(txn));
+        auto distLock = uassertStatusOK(chunkMoveState.acquireMoveMetadata());
 
         BSONObj chunkInfo = BSON(
             "min" << chunkMoveState.getMinKey() << "max" << chunkMoveState.getMaxKey() << "from"
                   << chunkMoveState.getFromShard() << "to" << chunkMoveState.getToShard());
 
-        grid.catalogManager(txn)->logChange(
-            txn, txn->getClient()->clientAddress(true), "moveChunk.start", ns, chunkInfo);
+        grid.catalogManager(txn)->logChange(txn, "moveChunk.start", ns, chunkInfo);
 
         const auto origCollMetadata = chunkMoveState.getCollMetadata();
         BSONObj shardKeyPattern = origCollMetadata->getKeyPattern();
@@ -279,20 +248,11 @@ public:
 
         // 3.
 
-        MigrateStatusHolder statusHolder(txn,
-                                         shardingState->migrationSourceManager(),
-                                         ns,
-                                         chunkMoveState.getMinKey(),
-                                         chunkMoveState.getMaxKey(),
-                                         shardKeyPattern);
+        auto moveChunkStartStatus = chunkMoveState.start(shardKeyPattern);
 
-        if (statusHolder.isAnotherMigrationActive()) {
-            const std::string msg =
-                "Not starting chunk migration because another migration is already in progress "
-                "from this shard";
-            warning() << msg;
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::ConflictingOperationInProgress, msg));
+        if (!moveChunkStartStatus.isOK()) {
+            warning() << moveChunkStartStatus.toString();
+            return appendCommandStatus(result, moveChunkStartStatus);
         }
 
         {
@@ -326,7 +286,9 @@ public:
             BSONObj res;
 
             try {
-                ScopedDbConnection connTo(chunkMoveState.getToShardCS());
+                // Use ShardConnection even though this operation isn't versioned to ensure that
+                // the ConfigServerMetadata gets sent along with the command.
+                ShardConnection connTo(chunkMoveState.getToShardCS(), "");
                 connTo->runCommand("admin", recvChunkStartBuilder.done(), res);
                 connTo.done();
             } catch (const DBException& e) {
@@ -504,12 +466,7 @@ public:
             return appendCommandStatus(result, Status(lockStatus.code(), msg));
         }
 
-        log() << "About to enter migrate critical section";
-
-        uassertStatusOK(chunkMoveState.commitMigration(txn));
-
-        shardingState->migrationSourceManager()->done(txn);
-
+        uassertStatusOK(chunkMoveState.commitMigration());
         timing.done(5);
 
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep5);

@@ -43,6 +43,7 @@
 
 namespace mongo {
 
+class BSONObjBuilder;
 class OperationContext;
 
 namespace executor {
@@ -230,20 +231,27 @@ public:
      */
     virtual void wait(const CallbackHandle& cbHandle) = 0;
 
-protected:
-    TaskExecutor();
+    /**
+     * Appends information about the underlying network interface's connections to the given
+     * builder.
+     */
+    virtual void appendConnectionStats(BSONObjBuilder* b) = 0;
 
+protected:
     // Retrieves the Callback from a given CallbackHandle
-    CallbackState* getCallbackFromHandle(const CallbackHandle& cbHandle);
+    static CallbackState* getCallbackFromHandle(const CallbackHandle& cbHandle);
 
     // Retrieves the Event from a given EventHandle
-    EventState* getEventFromHandle(const EventHandle& eventHandle);
+    static EventState* getEventFromHandle(const EventHandle& eventHandle);
 
     // Sets the given CallbackHandle to point to the given callback.
-    void setCallbackForHandle(CallbackHandle* cbHandle, std::shared_ptr<CallbackState> callback);
+    static void setCallbackForHandle(CallbackHandle* cbHandle,
+                                     std::shared_ptr<CallbackState> callback);
 
     // Sets the given EventHandle to point to the given event.
-    void setEventForHandle(EventHandle* eventHandle, std::shared_ptr<EventState> event);
+    static void setEventForHandle(EventHandle* eventHandle, std::shared_ptr<EventState> event);
+
+    TaskExecutor();
 };
 
 /**
@@ -257,6 +265,7 @@ public:
 
     virtual void cancel() = 0;
     virtual void waitForCompletion() = 0;
+    virtual bool isCanceled() const = 0;
 
 protected:
     CallbackState();
@@ -295,6 +304,10 @@ public:
 
     std::size_t hash() const {
         return std::hash<decltype(_callback)>()(_callback);
+    }
+
+    bool isCanceled() const {
+        return getCallback()->isCanceled();
     }
 
 private:

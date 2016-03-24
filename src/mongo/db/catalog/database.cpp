@@ -58,7 +58,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/util/log.h"
@@ -501,6 +501,7 @@ Collection* Database::createCollection(OperationContext* txn,
 
     NamespaceString nss(ns);
     uassert(17316, "cannot create a blank collection", nss.coll() > 0);
+    uassert(28838, "cannot create a non-capped oplog collection", options.capped || !nss.isOplog());
 
     audit::logCreateCollection(&cc(), ns);
 

@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -36,6 +36,7 @@
 
 #include "mongo/base/system_error.h"
 #include "mongo/config.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/executor/async_stream.h"
 #include "mongo/executor/async_stream_factory.h"
 #include "mongo/executor/async_stream_interface.h"
@@ -50,7 +51,10 @@ using asio::ip::tcp;
 
 NetworkInterfaceASIO::AsyncConnection::AsyncConnection(std::unique_ptr<AsyncStreamInterface> stream,
                                                        rpc::ProtocolSet protocols)
-    : _stream(std::move(stream)), _serverProtocols(protocols) {}
+    : _stream(std::move(stream)),
+      _serverProtocols(protocols),
+      _clientProtocols(rpc::computeProtocolSet(WireSpec::instance().minWireVersionOutgoing,
+                                               WireSpec::instance().maxWireVersionOutgoing)) {}
 
 #if defined(_MSC_VER) && _MSC_VER < 1900
 NetworkInterfaceASIO::AsyncConnection::AsyncConnection(AsyncConnection&& other)
@@ -88,6 +92,8 @@ void NetworkInterfaceASIO::AsyncConnection::setServerProtocols(rpc::ProtocolSet 
 }
 
 void NetworkInterfaceASIO::_connect(AsyncOp* op) {
+    LOG(1) << "Connecting to " << op->request().target.toString();
+
     tcp::resolver::query query(op->request().target.host(),
                                std::to_string(op->request().target.port()));
     // TODO: Investigate how we might hint or use shortcuts to resolve when possible.
@@ -100,13 +106,13 @@ void NetworkInterfaceASIO::_connect(AsyncOp* op) {
         _validateAndRun(
             op, ec, [this, op, endpoints]() { _setupSocket(op, std::move(endpoints)); });
     };
-    _resolver.async_resolve(query, std::move(thenConnect));
+    op->resolver().async_resolve(query, op->_strand.wrap(std::move(thenConnect)));
 }
 
 void NetworkInterfaceASIO::_setupSocket(AsyncOp* op, tcp::resolver::iterator endpoints) {
     // TODO: Consider moving this call to post-auth so we only assign completed connections.
     {
-        auto stream = _streamFactory->makeStream(&_io_service, op->request().target);
+        auto stream = _streamFactory->makeStream(&op->strand(), op->request().target);
         op->setConnection({std::move(stream), rpc::supports::kOpQueryOnly});
     }
 

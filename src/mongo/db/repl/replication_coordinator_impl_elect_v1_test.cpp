@@ -85,27 +85,7 @@ void ReplCoordElectV1Test::simulateEnoughHeartbeatsForElectability() {
     net->exitNetwork();
 }
 
-TEST_F(ReplCoordElectV1Test, ElectTooSoon) {
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
-    // Election never starts because we haven't set a lastOpTimeApplied value yet, via a
-    // heartbeat.
-    startCapturingLogMessages();
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version" << 1 << "members"
-                            << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                     << "node1:12345")
-                                          << BSON("_id" << 2 << "host"
-                                                        << "node2:12345")) << "protocolVersion"
-                            << 1),
-                       HostAndPort("node1", 12345));
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    simulateEnoughHeartbeatsForElectability();
-    stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("node has no applied oplog entries"));
-}
-
-TEST_F(ReplCoordElectV1Test, ElectTwoNodesWithOneZeroVoter) {
+TEST_F(ReplCoordElectV1Test, ElectionSucceedsWhenNodeIsTheOnlyElectableNode) {
     OperationContextReplMock txn;
     assertStartSuccess(
         BSON("_id"
@@ -164,7 +144,30 @@ TEST_F(ReplCoordElectV1Test, ElectTwoNodesWithOneZeroVoter) {
     ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
 }
 
-TEST_F(ReplCoordElectV1Test, Elect1NodeSuccess) {
+TEST_F(ReplCoordElectV1Test, StartElectionDoesNotStartAnElectionWhenNodeIsRecovering) {
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 1 << "members"
+                            << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                     << "node1:12345")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "node2:12345")) << "protocolVersion"
+                            << 1),
+                       HostAndPort("node1", 12345));
+
+    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_RECOVERING));
+
+    ASSERT(getReplCoord()->getMemberState().recovering())
+        << getReplCoord()->getMemberState().toString();
+
+    getReplCoord()->setMyLastOptime(OpTime(Timestamp(10, 0), 0));
+    simulateEnoughHeartbeatsForElectability();
+
+    auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
+    ASSERT_EQUALS(Date_t(), electionTimeoutWhen);
+}
+
+TEST_F(ReplCoordElectV1Test, ElectionSucceedsWhenNodeIsTheOnlyNode) {
     OperationContextReplMock txn;
     startCapturingLogMessages();
     assertStartSuccess(BSON("_id"
@@ -192,7 +195,7 @@ TEST_F(ReplCoordElectV1Test, Elect1NodeSuccess) {
     ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
 }
 
-TEST_F(ReplCoordElectV1Test, ElectManyNodesSuccess) {
+TEST_F(ReplCoordElectV1Test, ElectionSucceedsWhenAllNodesVoteYea) {
     BSONObj configObj = BSON("_id"
                              << "mySet"
                              << "version" << 1 << "members"
@@ -221,7 +224,42 @@ TEST_F(ReplCoordElectV1Test, ElectManyNodesSuccess) {
     ASSERT_EQUALS(1, countLogLinesContaining("election succeeded"));
 }
 
-TEST_F(ReplCoordElectV1Test, ElectNotEnoughVotesInDryRun) {
+TEST_F(ReplCoordElectV1Test, ElectionSucceedsWhenMaxSevenNodesVoteYea) {
+    BSONObj configObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 1 << "members"
+                             << BSON_ARRAY(
+                                    BSON("_id" << 1 << "host"
+                                               << "node1:12345")
+                                    << BSON("_id" << 2 << "host"
+                                                  << "node2:12345") << BSON("_id" << 3 << "host"
+                                                                                  << "node3:12345")
+                                    << BSON("_id" << 4 << "host"
+                                                  << "node4:12345") << BSON("_id" << 5 << "host"
+                                                                                  << "node5:12345")
+                                    << BSON("_id" << 6 << "host"
+                                                  << "node6:12345") << BSON("_id" << 7 << "host"
+                                                                                  << "node7:12345"))
+                             << "protocolVersion" << 1);
+    assertStartSuccess(configObj, HostAndPort("node1", 12345));
+    OperationContextNoop txn;
+    getReplCoord()->setMyLastOptime(OpTime(Timestamp(100, 1), 0));
+    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    startCapturingLogMessages();
+    simulateSuccessfulV1Election();
+    getReplCoord()->waitForElectionFinish_forTest();
+
+    // Check last vote
+    auto lastVote = getExternalState()->loadLocalLastVoteDocument(nullptr);
+    ASSERT(lastVote.isOK());
+    ASSERT_EQ(0, lastVote.getValue().getCandidateIndex());
+    ASSERT_EQ(1, lastVote.getValue().getTerm());
+
+    stopCapturingLogMessages();
+    ASSERT_EQUALS(1, countLogLinesContaining("election succeeded"));
+}
+
+TEST_F(ReplCoordElectV1Test, ElectionFailsWhenInsufficientVotesAreReceivedDuringDryRun) {
     startCapturingLogMessages();
     BSONObj configObj = BSON("_id"
                              << "mySet"
@@ -276,7 +314,7 @@ TEST_F(ReplCoordElectV1Test, ElectNotEnoughVotesInDryRun) {
         1, countLogLinesContaining("not running for primary, we received insufficient votes"));
 }
 
-TEST_F(ReplCoordElectV1Test, ElectStaleTermInDryRun) {
+TEST_F(ReplCoordElectV1Test, ElectionFailsWhenDryRunResponseContainsANewerTerm) {
     startCapturingLogMessages();
     BSONObj configObj = BSON("_id"
                              << "mySet"
@@ -333,7 +371,7 @@ TEST_F(ReplCoordElectV1Test, ElectStaleTermInDryRun) {
         1, countLogLinesContaining("not running for primary, we have been superceded already"));
 }
 
-TEST_F(ReplCoordElectV1Test, ElectionDuringHBReconfigFails) {
+TEST_F(ReplCoordElectV1Test, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
     // start up, receive reconfig via heartbeat while at the same time, become candidate.
     // candidate state should be cleared.
     OperationContextNoop txn;
@@ -501,7 +539,7 @@ TEST_F(ReplCoordElectV1Test, ElectionDuringHBReconfigFails) {
 //}
 
 
-TEST_F(ReplCoordElectV1Test, ElectNotEnoughVotes) {
+TEST_F(ReplCoordElectV1Test, ElectionFailsWhenInsufficientVotesAreReceivedDuringRequestVotes) {
     startCapturingLogMessages();
     BSONObj configObj = BSON("_id"
                              << "mySet"
@@ -549,7 +587,7 @@ TEST_F(ReplCoordElectV1Test, ElectNotEnoughVotes) {
                   countLogLinesContaining("not becoming primary, we received insufficient votes"));
 }
 
-TEST_F(ReplCoordElectV1Test, RollbackDuringElection) {
+TEST_F(ReplCoordElectV1Test, ElectionsAbortWhenNodeTransitionsToRollbackState) {
     BSONObj configObj = BSON("_id"
                              << "mySet"
                              << "version" << 1 << "members"
@@ -582,7 +620,7 @@ TEST_F(ReplCoordElectV1Test, RollbackDuringElection) {
     ASSERT_TRUE(getReplCoord()->getMemberState().rollback());
 }
 
-TEST_F(ReplCoordElectV1Test, ElectStaleTerm) {
+TEST_F(ReplCoordElectV1Test, ElectionFailsWhenVoteRequestResponseContainsANewerTerm) {
     startCapturingLogMessages();
     BSONObj configObj = BSON("_id"
                              << "mySet"
@@ -631,7 +669,7 @@ TEST_F(ReplCoordElectV1Test, ElectStaleTerm) {
                   countLogLinesContaining("not becoming primary, we have been superceded already"));
 }
 
-TEST_F(ReplCoordElectV1Test, ElectTermChangeDuringDryRun) {
+TEST_F(ReplCoordElectV1Test, ElectionFailsWhenTermChangesDuringDryRun) {
     startCapturingLogMessages();
     BSONObj configObj = BSON("_id"
                              << "mySet"
@@ -643,6 +681,7 @@ TEST_F(ReplCoordElectV1Test, ElectTermChangeDuringDryRun) {
                                            << BSON("_id" << 3 << "host"
                                                          << "node3:12345")) << "protocolVersion"
                              << 1);
+
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
     ReplicaSetConfig config = assertMakeRSConfig(configObj);
 
@@ -656,7 +695,8 @@ TEST_F(ReplCoordElectV1Test, ElectTermChangeDuringDryRun) {
     auto onDryRunRequest = [this](const RemoteCommandRequest& request) {
         // Update to a future term before dry run completes.
         ASSERT_EQUALS(0, request.cmdObj.getIntField("candidateIndex"));
-        ASSERT_TRUE(getTopoCoord().updateTerm(1000, getNet()->now()));
+        ASSERT(getTopoCoord().updateTerm(1000, getNet()->now()) ==
+               TopologyCoordinator::UpdateTermResult::kUpdatedTerm);
     };
     simulateSuccessfulDryRun(onDryRunRequest);
 
@@ -665,7 +705,7 @@ TEST_F(ReplCoordElectV1Test, ElectTermChangeDuringDryRun) {
         1, countLogLinesContaining("not running for primary, we have been superceded already"));
 }
 
-TEST_F(ReplCoordElectV1Test, ElectTermChangeDuringActualElection) {
+TEST_F(ReplCoordElectV1Test, ElectionFailsWhenTermChangesDuringActualElection) {
     startCapturingLogMessages();
     BSONObj configObj = BSON("_id"
                              << "mySet"
@@ -688,7 +728,7 @@ TEST_F(ReplCoordElectV1Test, ElectTermChangeDuringActualElection) {
     simulateEnoughHeartbeatsForElectability();
     simulateSuccessfulDryRun();
     // update to a future term before the election completes
-    getReplCoord()->updateTerm(1000);
+    getReplCoord()->updateTerm(&txn, 1000);
 
     NetworkInterfaceMock* net = getNet();
     net->enterNetwork();
@@ -715,13 +755,14 @@ TEST_F(ReplCoordElectV1Test, ElectTermChangeDuringActualElection) {
                   countLogLinesContaining("not becoming primary, we have been superceded already"));
 }
 
-TEST_F(ReplCoordElectV1Test, LearningAboutNewTermDelaysElection) {
+TEST_F(ReplCoordElectV1Test, SchedulesPriorityTakeoverIfNodeHasHigherPriorityThanCurrentPrimary) {
     startCapturingLogMessages();
     BSONObj configObj = BSON("_id"
                              << "mySet"
                              << "version" << 1 << "members"
                              << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                      << "node1:12345")
+                                                      << "node1:12345"
+                                                      << "priority" << 2)
                                            << BSON("_id" << 2 << "host"
                                                          << "node2:12345")
                                            << BSON("_id" << 3 << "host"
@@ -730,26 +771,54 @@ TEST_F(ReplCoordElectV1Test, LearningAboutNewTermDelaysElection) {
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
     ReplicaSetConfig config = assertMakeRSConfig(configObj);
 
+    auto replCoord = getReplCoord();
+
     OperationContextNoop txn;
     OpTime time1(Timestamp(100, 1), 0);
-    getReplCoord()->setMyLastOptime(time1);
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    replCoord->setMyLastOptime(time1);
+    ASSERT(replCoord->setFollowerMode(MemberState::RS_SECONDARY));
 
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(2));
-    // Learned about a new term. The following HB won't trigger election during a timeout interval.
-    getReplCoord()->updateTerm(10);
-    simulateEnoughHeartbeatsForElectability();
-    stopCapturingLogMessages();
-    ASSERT(getReplCoord()->getMemberState().secondary())
-        << getReplCoord()->getMemberState().toString();
-    ASSERT_EQ(
-        2, countLogLinesContaining("because I stood up or learned about a new term too recently"));
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Log());
+    ASSERT_EQUALS(Date_t(), replCoord->getPriorityTakeover_forTest());
 
-    simulateSuccessfulV1Election();
-    ASSERT(getReplCoord()->getMemberState().primary())
-        << getReplCoord()->getMemberState().toString();
+    auto net = getNet();
+    net->enterNetwork();
+    auto now = net->now();
+    while (net->hasReadyRequests()) {
+        auto noi = net->getNextReadyRequest();
+        auto&& request = noi->getRequest();
+        log() << request.target << " processing " << request.cmdObj;
+        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
+        ReplSetHeartbeatArgsV1 hbArgs;
+        if (hbArgs.initialize(request.cmdObj).isOK()) {
+            ReplSetHeartbeatResponse hbResp;
+            hbResp.setSetName(config.getReplSetName());
+            if (request.target == HostAndPort("node2", 12345)) {
+                hbResp.setState(MemberState::RS_PRIMARY);
+            } else {
+                hbResp.setState(MemberState::RS_SECONDARY);
+            }
+            hbResp.setConfigVersion(config.getConfigVersion());
+            hbResp.setTerm(replCoord->getTerm());
+            auto response = makeResponseStatus(hbResp.toBSON(replCoord->isV1ElectionProtocol()));
+            net->scheduleResponse(noi, net->now(), response);
+        } else {
+            error() << "Black holing unexpected request to " << request.target << ": "
+                    << request.cmdObj;
+            net->blackHole(noi);
+        }
+    }
+    net->runReadyNetworkOperations();
+    net->exitNetwork();
+
+    ASSERT_NOT_EQUALS(Date_t(), replCoord->getPriorityTakeover_forTest());
+    ASSERT_EQUALS(now + config.getPriorityTakeoverDelay(0),
+                  replCoord->getPriorityTakeover_forTest());
+
+    // Updating term cancels priority takeover callback.
+    ASSERT_EQUALS(ErrorCodes::StaleTerm, replCoord->updateTerm(&txn, replCoord->getTerm() + 1));
+    ASSERT_EQUALS(Date_t(), replCoord->getPriorityTakeover_forTest());
 }
-}
-}
-}
+
+}  // namespace
+}  // namespace repl
+}  // namespace mongo

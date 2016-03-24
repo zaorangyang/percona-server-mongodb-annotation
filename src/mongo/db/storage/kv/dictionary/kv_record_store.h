@@ -221,7 +221,7 @@ namespace mongo {
 
             RecordId getNext();
 
-            void invalidate(const RecordId& loc);
+            void invalidate(OperationContext* OpCtx, const RecordId& loc);
 
             void saveState();
 

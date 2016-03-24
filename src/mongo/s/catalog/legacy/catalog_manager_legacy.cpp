@@ -47,13 +47,10 @@
 #include "mongo/db/server_options.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/legacy/cluster_client_internal.h"
 #include "mongo/s/catalog/legacy/config_coordinator.h"
 #include "mongo/s/catalog/legacy/config_upgrade.h"
-#include "mongo/s/catalog/type_actionlog.h"
-#include "mongo/s/catalog/type_changelog.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_config_version.h"
@@ -219,9 +216,15 @@ Status CatalogManagerLegacy::init(const ConnectionString& configDBCS) {
 }
 
 Status CatalogManagerLegacy::startup(OperationContext* txn, bool allowNetworking) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    if (_started) {
+        return Status::OK();
+    }
+
     if (!allowNetworking) {
         // Config servers shouldn't call dbHash on themselves and shards don't need to
         // run the checker.
+        _started = true;
         return Status::OK();
     }
 
@@ -230,7 +233,8 @@ Status CatalogManagerLegacy::startup(OperationContext* txn, bool allowNetworking
         return status;
     }
 
-    return status;
+    _started = true;
+    return Status::OK();
 }
 
 Status CatalogManagerLegacy::initConfigVersion(OperationContext* txn) {
@@ -262,7 +266,7 @@ void CatalogManagerLegacy::shutDown(OperationContext* txn, bool allowNetworking)
         _consistencyCheckerThread.join();
 
     invariant(_distLockManager);
-    _distLockManager->shutDown(allowNetworking);
+    _distLockManager->shutDown(txn, allowNetworking);
 }
 
 Status CatalogManagerLegacy::shardCollection(OperationContext* txn,
@@ -273,7 +277,7 @@ Status CatalogManagerLegacy::shardCollection(OperationContext* txn,
                                              const set<ShardId>& initShardIds) {
     // Lock the collection globally so that no other mongos can try to shard or drop the collection
     // at the same time.
-    auto scopedDistLock = getDistLockManager()->lock(ns, "shardCollection");
+    auto scopedDistLock = getDistLockManager()->lock(txn, ns, "shardCollection");
     if (!scopedDistLock.isOK()) {
         return scopedDistLock.getStatus();
     }
@@ -324,11 +328,7 @@ Status CatalogManagerLegacy::shardCollection(OperationContext* txn,
 
     collectionDetail.append("numChunks", static_cast<int>(initPoints.size() + 1));
 
-    logChange(txn,
-              txn->getClient()->clientAddress(true),
-              "shardCollection.start",
-              ns,
-              collectionDetail.obj());
+    logChange(txn, "shardCollection.start", ns, collectionDetail.obj());
 
     shared_ptr<ChunkManager> manager(new ChunkManager(ns, fieldsAndOrder, unique));
     manager->createFirstChunks(txn, dbPrimaryShardId, &initPoints, &initShardIds);
@@ -374,8 +374,7 @@ Status CatalogManagerLegacy::shardCollection(OperationContext* txn,
 
     finishDetail.append("version", manager->getVersion().toString());
 
-    logChange(
-        txn, txn->getClient()->clientAddress(true), "shardCollection", ns, finishDetail.obj());
+    logChange(txn, "shardCollection.end", ns, finishDetail.obj());
 
     return Status::OK();
 }
@@ -396,30 +395,27 @@ StatusWith<ShardDrainingStatus> CatalogManagerLegacy::removeShard(OperationConte
         return Status(ErrorCodes::IllegalOperation, "Can't remove last shard");
     }
 
-    BSONObj searchDoc = BSON(ShardType::name() << name);
-
     // Case 1: start draining chunks
-    BSONObj drainingDoc = BSON(ShardType::name() << name << ShardType::draining(true));
-    BSONObj shardDoc = conn->findOne(ShardType::ConfigNS, drainingDoc);
+    BSONObj shardDoc = conn->findOne(ShardType::ConfigNS,
+                                     BSON(ShardType::name() << name << ShardType::draining(true)));
     if (shardDoc.isEmpty()) {
         log() << "going to start draining shard: " << name;
-        BSONObj newStatus = BSON("$set" << BSON(ShardType::draining(true)));
 
-        Status status = update(txn, ShardType::ConfigNS, searchDoc, newStatus, false, false, NULL);
-        if (!status.isOK()) {
-            log() << "error starting removeShard: " << name << "; err: " << status.reason();
-            return status;
+        auto updateStatus = updateConfigDocument(txn,
+                                                 ShardType::ConfigNS,
+                                                 BSON(ShardType::name() << name),
+                                                 BSON("$set" << BSON(ShardType::draining(true))),
+                                                 false);
+        if (!updateStatus.isOK()) {
+            log() << "error starting removeShard: " << name << causedBy(updateStatus.getStatus());
+            return updateStatus.getStatus();
         }
 
         grid.shardRegistry()->reload(txn);
         conn.done();
 
         // Record start in changelog
-        logChange(txn,
-                  txn->getClient()->clientAddress(true),
-                  "removeShard.start",
-                  "",
-                  BSON("shard" << name));
+        logChange(txn, "removeShard.start", "", BSON("shard" << name));
         return ShardDrainingStatus::STARTED;
     }
 
@@ -433,7 +429,8 @@ StatusWith<ShardDrainingStatus> CatalogManagerLegacy::removeShard(OperationConte
         log() << "going to remove shard: " << name;
         audit::logRemoveShard(txn->getClient(), name);
 
-        Status status = remove(txn, ShardType::ConfigNS, searchDoc, 0, NULL);
+        Status status =
+            removeConfigDocuments(txn, ShardType::ConfigNS, BSON(ShardType::name() << name));
         if (!status.isOK()) {
             log() << "Error concluding removeShard operation on: " << name
                   << "; err: " << status.reason();
@@ -445,8 +442,7 @@ StatusWith<ShardDrainingStatus> CatalogManagerLegacy::removeShard(OperationConte
         conn.done();
 
         // Record finish in changelog
-        logChange(
-            txn, txn->getClient()->clientAddress(true), "removeShard", "", BSON("shard" << name));
+        logChange(txn, "removeShard", "", BSON("shard" << name));
         return ShardDrainingStatus::COMPLETED;
     }
 
@@ -456,7 +452,9 @@ StatusWith<ShardDrainingStatus> CatalogManagerLegacy::removeShard(OperationConte
 
 StatusWith<OpTimePair<DatabaseType>> CatalogManagerLegacy::getDatabase(OperationContext* txn,
                                                                        const std::string& dbName) {
-    invariant(nsIsDbOnly(dbName));
+    if (!NamespaceString::validDBName(dbName)) {
+        return {ErrorCodes::InvalidNamespace, stream() << dbName << " is not a valid db name"};
+    }
 
     // The two databases that are hosted on the config server are config and admin
     if (dbName == "config" || dbName == "admin") {
@@ -546,14 +544,13 @@ Status CatalogManagerLegacy::getCollections(OperationContext* txn,
 }
 
 Status CatalogManagerLegacy::dropCollection(OperationContext* txn, const NamespaceString& ns) {
-    logChange(
-        txn, txn->getClient()->clientAddress(true), "dropCollection.start", ns.ns(), BSONObj());
+    logChange(txn, "dropCollection.start", ns.ns(), BSONObj());
 
-    vector<ShardType> allShards;
-    Status status = getAllShards(txn, &allShards);
-    if (!status.isOK()) {
-        return status;
+    auto shardsStatus = getAllShards(txn);
+    if (!shardsStatus.isOK()) {
+        return shardsStatus.getStatus();
     }
+    vector<ShardType> allShards = std::move(shardsStatus.getValue().value);
 
     LOG(1) << "dropCollection " << ns << " started";
 
@@ -564,7 +561,8 @@ Status CatalogManagerLegacy::dropCollection(OperationContext* txn, const Namespa
         waitFor = stdx::chrono::seconds(data["waitForSecs"].numberInt());
     }
     const stdx::chrono::milliseconds lockTryInterval(500);
-    auto scopedDistLock = getDistLockManager()->lock(ns.ns(), "drop", waitFor, lockTryInterval);
+    auto scopedDistLock =
+        getDistLockManager()->lock(txn, ns.ns(), "drop", waitFor, lockTryInterval);
     if (!scopedDistLock.isOK()) {
         return scopedDistLock.getStatus();
     }
@@ -610,7 +608,7 @@ Status CatalogManagerLegacy::dropCollection(OperationContext* txn, const Namespa
     LOG(1) << "dropCollection " << ns << " shard data deleted";
 
     // Remove chunk data
-    Status result = remove(txn, ChunkType::ConfigNS, BSON(ChunkType::ns(ns.ns())), 0, nullptr);
+    Status result = removeConfigDocuments(txn, ChunkType::ConfigNS, BSON(ChunkType::ns(ns.ns())));
     if (!result.isOK()) {
         return result;
     }
@@ -667,90 +665,9 @@ Status CatalogManagerLegacy::dropCollection(OperationContext* txn, const Namespa
 
     LOG(1) << "dropCollection " << ns << " completed";
 
-    logChange(txn, txn->getClient()->clientAddress(true), "dropCollection", ns.ns(), BSONObj());
+    logChange(txn, "dropCollection", ns.ns(), BSONObj());
 
     return Status::OK();
-}
-
-void CatalogManagerLegacy::logAction(OperationContext* txn, const ActionLogType& actionLog) {
-    // Create the action log collection and ensure that it is capped. Wrap in try/catch,
-    // because creating an existing collection throws.
-    if (_actionLogCollectionCreated.load() == 0) {
-        try {
-            ScopedDbConnection conn(_configServerConnectionString, 30.0);
-            conn->createCollection(ActionLogType::ConfigNS, 1024 * 1024 * 2, true);
-            conn.done();
-
-            _actionLogCollectionCreated.store(1);
-        } catch (const DBException& ex) {
-            if (ex.toStatus() == ErrorCodes::NamespaceExists) {
-                _actionLogCollectionCreated.store(1);
-            } else {
-                LOG(1) << "couldn't create actionlog collection: " << ex;
-                // If we couldn't create the collection don't attempt the insert otherwise we might
-                // implicitly create the collection without it being capped.
-                return;
-            }
-        }
-    }
-
-    Status result = insert(txn, ActionLogType::ConfigNS, actionLog.toBSON(), NULL);
-    if (!result.isOK()) {
-        log() << "error encountered while logging action: " << result;
-    }
-}
-
-void CatalogManagerLegacy::logChange(OperationContext* txn,
-                                     const string& clientAddress,
-                                     const string& what,
-                                     const string& ns,
-                                     const BSONObj& detail) {
-    // Create the change log collection and ensure that it is capped. Wrap in try/catch,
-    // because creating an existing collection throws.
-    if (_changeLogCollectionCreated.load() == 0) {
-        try {
-            ScopedDbConnection conn(_configServerConnectionString, 30.0);
-            conn->createCollection(ChangeLogType::ConfigNS, 1024 * 1024 * 10, true);
-            conn.done();
-
-            _changeLogCollectionCreated.store(1);
-        } catch (const DBException& ex) {
-            if (ex.toStatus() == ErrorCodes::NamespaceExists) {
-                _changeLogCollectionCreated.store(1);
-            } else {
-                LOG(1) << "couldn't create changelog collection: " << ex;
-                // If we couldn't create the collection don't attempt the insert otherwise we might
-                // implicitly create the collection without it being capped.
-                return;
-            }
-        }
-    }
-
-    ChangeLogType changeLog;
-    {
-        // Store this entry's ID so we can use on the exception code path too
-        StringBuilder changeIdBuilder;
-        changeIdBuilder << getHostNameCached() << "-" << Date_t::now().toString() << "-"
-                        << OID::gen();
-        changeLog.setChangeId(changeIdBuilder.str());
-    }
-    changeLog.setServer(getHostNameCached());
-    changeLog.setClientAddr(clientAddress);
-    changeLog.setTime(Date_t::now());
-    changeLog.setWhat(what);
-    changeLog.setNS(ns);
-    changeLog.setDetails(detail);
-
-    BSONObj changeLogBSON = changeLog.toBSON();
-    // Send a copy of the message to the local log in case it doesn't manage to reach
-    // config.changelog
-    log() << "about to log metadata event: " << changeLogBSON;
-
-    Status result = insert(txn, ChangeLogType::ConfigNS, changeLogBSON, NULL);
-    if (!result.isOK()) {
-        warning() << "Error encountered while logging config change with ID "
-                  << changeLog.getChangeId() << ": " << result;
-    }
 }
 
 StatusWith<SettingsType> CatalogManagerLegacy::getGlobalSettings(OperationContext* txn,
@@ -934,7 +851,9 @@ StatusWith<string> CatalogManagerLegacy::getTagForChunk(OperationContext* txn,
     return status.getStatus();
 }
 
-Status CatalogManagerLegacy::getAllShards(OperationContext* txn, vector<ShardType>* shards) {
+StatusWith<OpTimePair<std::vector<ShardType>>> CatalogManagerLegacy::getAllShards(
+    OperationContext* txn) {
+    std::vector<ShardType> shards;
     ScopedDbConnection conn(_configServerConnectionString, 30.0);
     std::unique_ptr<DBClientCursor> cursor(
         _safeCursor(conn->query(ShardType::ConfigNS, BSONObj())));
@@ -943,7 +862,7 @@ Status CatalogManagerLegacy::getAllShards(OperationContext* txn, vector<ShardTyp
 
         StatusWith<ShardType> shardRes = ShardType::fromBSON(shardObj);
         if (!shardRes.isOK()) {
-            shards->clear();
+            shards.clear();
             conn.done();
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Failed to parse shard with id ("
@@ -951,11 +870,11 @@ Status CatalogManagerLegacy::getAllShards(OperationContext* txn, vector<ShardTyp
                                         << "): " << shardRes.getStatus().toString());
         }
 
-        shards->push_back(shardRes.getValue());
+        shards.push_back(shardRes.getValue());
     }
     conn.done();
 
-    return Status::OK();
+    return OpTimePair<std::vector<ShardType>>{std::move(shards)};
 }
 
 bool CatalogManagerLegacy::runUserManagementWriteCommand(OperationContext* txn,
@@ -968,7 +887,8 @@ bool CatalogManagerLegacy::runUserManagementWriteCommand(OperationContext* txn,
         dispatcher.addCommand(configServer, dbname, cmdObj);
     }
 
-    auto scopedDistLock = getDistLockManager()->lock("authorizationData", commandName, Seconds{5});
+    auto scopedDistLock =
+        getDistLockManager()->lock(txn, "authorizationData", commandName, Seconds{5});
     if (!scopedDistLock.isOK()) {
         return Command::appendCommandStatus(*result, scopedDistLock.getStatus());
     }
@@ -1041,13 +961,13 @@ bool CatalogManagerLegacy::runUserManagementReadCommand(OperationContext* txn,
                                                         const string& dbname,
                                                         const BSONObj& cmdObj,
                                                         BSONObjBuilder* result) {
-    return runReadCommand(txn, dbname, cmdObj, result);
+    return _runReadCommand(txn, dbname, cmdObj, result);
 }
 
-bool CatalogManagerLegacy::runReadCommand(OperationContext* txn,
-                                          const std::string& dbname,
-                                          const BSONObj& cmdObj,
-                                          BSONObjBuilder* result) {
+bool CatalogManagerLegacy::_runReadCommand(OperationContext* txn,
+                                           const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           BSONObjBuilder* result) {
     try {
         // let SyncClusterConnection handle connecting to the first config server
         // that is reachable and returns data
@@ -1134,6 +1054,83 @@ void CatalogManagerLegacy::writeConfigServerDirect(OperationContext* txn,
     exec.executeBatch(request, response);
 }
 
+Status CatalogManagerLegacy::insertConfigDocument(OperationContext* txn,
+                                                  const std::string& ns,
+                                                  const BSONObj& doc) {
+    const NamespaceString nss(ns);
+    invariant(nss.db() == "config");
+    invariant(doc.hasField("_id"));
+
+    auto insert(stdx::make_unique<BatchedInsertRequest>());
+    insert->addToDocuments(doc);
+
+    BatchedCommandRequest request(insert.release());
+    request.setNS(nss);
+
+    BatchedCommandResponse response;
+    writeConfigServerDirect(txn, request, &response);
+
+    return response.toStatus();
+}
+
+StatusWith<bool> CatalogManagerLegacy::updateConfigDocument(OperationContext* txn,
+                                                            const string& ns,
+                                                            const BSONObj& query,
+                                                            const BSONObj& update,
+                                                            bool upsert) {
+    const NamespaceString nss(ns);
+    invariant(nss.db() == "config");
+
+    const BSONElement idField = query.getField("_id");
+    invariant(!idField.eoo());
+
+    unique_ptr<BatchedUpdateDocument> updateDoc(new BatchedUpdateDocument());
+    updateDoc->setQuery(query);
+    updateDoc->setUpdateExpr(update);
+    updateDoc->setUpsert(upsert);
+    updateDoc->setMulti(false);
+
+    unique_ptr<BatchedUpdateRequest> updateRequest(new BatchedUpdateRequest());
+    updateRequest->addToUpdates(updateDoc.release());
+
+    BatchedCommandRequest request(updateRequest.release());
+    request.setNS(nss);
+
+    BatchedCommandResponse response;
+    writeConfigServerDirect(txn, request, &response);
+
+    Status status = response.toStatus();
+    if (!status.isOK()) {
+        return status;
+    }
+
+    const auto nSelected = response.getN();
+    invariant(nSelected == 0 || nSelected == 1);
+    return (nSelected == 1);
+}
+
+Status CatalogManagerLegacy::removeConfigDocuments(OperationContext* txn,
+                                                   const string& ns,
+                                                   const BSONObj& query) {
+    const NamespaceString nss(ns);
+    invariant(nss.db() == "config");
+
+    auto deleteDoc(stdx::make_unique<BatchedDeleteDocument>());
+    deleteDoc->setQuery(query);
+    deleteDoc->setLimit(0);
+
+    auto deleteRequest(stdx::make_unique<BatchedDeleteRequest>());
+    deleteRequest->addToDeletes(deleteDoc.release());
+
+    BatchedCommandRequest request(deleteRequest.release());
+    request.setNS(nss);
+
+    BatchedCommandResponse response;
+    writeConfigServerDirect(txn, request, &response);
+
+    return response.toStatus();
+}
+
 Status CatalogManagerLegacy::_checkDbDoesNotExist(OperationContext* txn,
                                                   const std::string& dbName,
                                                   DatabaseType* db) {
@@ -1199,6 +1196,24 @@ StatusWith<string> CatalogManagerLegacy::_generateNewShardName(OperationContext*
     return Status(ErrorCodes::OperationFailed, "unable to generate new shard name");
 }
 
+Status CatalogManagerLegacy::_createCappedConfigCollection(OperationContext* txn,
+                                                           StringData collName,
+                                                           int cappedSize) {
+    try {
+        const NamespaceString nss("config", collName);
+        ScopedDbConnection conn(_configServerConnectionString, 30.0);
+
+        BSONObj result;
+        const int maxNumDocuments = 0;
+        conn->createCollection(nss.ns(), cappedSize, true, maxNumDocuments, &result);
+        conn.done();
+
+        return getStatusFromCommandResult(result);
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
 size_t CatalogManagerLegacy::_getShardCount(const BSONObj& query) const {
     ScopedDbConnection conn(_configServerConnectionString, 30.0);
     long long shardCount = conn->count(ShardType::ConfigNS, query);
@@ -1220,6 +1235,9 @@ Status CatalogManagerLegacy::_checkConfigServersConsistent(const unsigned tries)
 
     unsigned firstGood = 0;
     int up = 0;
+    // becomes false if we are able to get any response (even a failed one) from any of the config
+    // servers
+    bool networkError = true;
     vector<BSONObj> res;
 
     // The last error we saw on a config server
@@ -1254,6 +1272,8 @@ Status CatalogManagerLegacy::_checkConfigServersConsistent(const unsigned tries)
                     firstGood = i;
                 up++;
             }
+            // Network errors throw, so if we got this far there wasn't a network error
+            networkError = false;
             conn->done();
         } catch (const DBException& excep) {
             if (conn) {
@@ -1279,7 +1299,7 @@ Status CatalogManagerLegacy::_checkConfigServersConsistent(const unsigned tries)
     }
 
     if (up == 0) {
-        return {ErrorCodes::ConfigServersInconsistent,
+        return {networkError ? ErrorCodes::HostUnreachable : ErrorCodes::UnknownError,
                 str::stream() << "no config servers successfully contacted" << causedBy(&errMsg)};
     } else if (up == 1) {
         warning() << "only 1 config server reachable, continuing";
@@ -1347,6 +1367,39 @@ void CatalogManagerLegacy::_consistencyChecker() {
 bool CatalogManagerLegacy::_isConsistentFromLastCheck() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     return _consistentFromLastCheck;
+}
+
+Status CatalogManagerLegacy::appendInfoForConfigServerDatabases(OperationContext* txn,
+                                                                BSONArrayBuilder* builder) {
+    BSONObjBuilder resultBuilder;
+    if (!_runReadCommand(txn, "admin", BSON("listDatabases" << 1), &resultBuilder)) {
+        return getStatusFromCommandResult(resultBuilder.obj());
+    }
+
+    auto listDBResponse = resultBuilder.done();
+    BSONElement dbListArray;
+    auto dbListStatus = bsonExtractTypedField(listDBResponse, "databases", Array, &dbListArray);
+    if (!dbListStatus.isOK()) {
+        return dbListStatus;
+    }
+
+    BSONObjIterator iter(dbListArray.Obj());
+
+    while (iter.more()) {
+        auto dbEntry = iter.next().Obj();
+        string name;
+        auto parseStatus = bsonExtractStringField(dbEntry, "name", &name);
+
+        if (!parseStatus.isOK()) {
+            return parseStatus;
+        }
+
+        if (name == "config" || name == "admin") {
+            builder->append(dbEntry);
+        }
+    }
+
+    return Status::OK();
 }
 
 }  // namespace mongo

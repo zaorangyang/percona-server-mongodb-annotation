@@ -30,6 +30,7 @@
 
 #include "mongo/scripting/mozjs/minkey.h"
 
+#include "mongo/scripting/mozjs/internedstring.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
@@ -43,10 +44,6 @@ const JSFunctionSpec MinKeyInfo::methods[2] = {
 };
 
 const char* const MinKeyInfo::className = "MinKey";
-
-namespace {
-const char* const kSingleton = "singleton";
-}  // namespace
 
 void MinKeyInfo::construct(JSContext* cx, JS::CallArgs args) {
     call(cx, args);
@@ -64,20 +61,27 @@ void MinKeyInfo::call(JSContext* cx, JS::CallArgs args) {
 
     JS::RootedValue val(cx);
 
-    if (!o.hasField(kSingleton)) {
+    if (!o.hasField(InternedString::singleton)) {
         JS::RootedObject thisv(cx);
         scope->getProto<MinKeyInfo>().newObject(&thisv);
 
         val.setObjectOrNull(thisv);
-        o.setValue(kSingleton, val);
+        o.setValue(InternedString::singleton, val);
     } else {
-        o.getValue(kSingleton, &val);
+        o.getValue(InternedString::singleton, &val);
 
         if (!getScope(cx)->getProto<MinKeyInfo>().instanceOf(val))
             uasserted(ErrorCodes::BadValue, "MinKey singleton not of type MinKey");
     }
 
     args.rval().set(val);
+}
+
+void MinKeyInfo::hasInstance(JSContext* cx,
+                             JS::HandleObject obj,
+                             JS::MutableHandleValue vp,
+                             bool* bp) {
+    *bp = getScope(cx)->getProto<MinKeyInfo>().instanceOf(vp);
 }
 
 void MinKeyInfo::Functions::tojson::call(JSContext* cx, JS::CallArgs args) {
@@ -90,8 +94,8 @@ void MinKeyInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::HandleO
     JS::RootedValue value(cx);
     getScope(cx)->getProto<MinKeyInfo>().newObject(&value);
 
-    ObjectWrapper(cx, global).setValue("MinKey", value);
-    protoWrapper.setValue(kSingleton, value);
+    ObjectWrapper(cx, global).setValue(InternedString::MinKey, value);
+    protoWrapper.setValue(InternedString::singleton, value);
 }
 
 }  // namespace mozjs

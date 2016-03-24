@@ -79,14 +79,17 @@ public:
      * Note that even if this function returns an OK status, WT_SESSION:create() may still
      * fail with the constructed configuration string.
      */
-    static StatusWith<std::string> generateCreateString(StringData ns,
+    static StatusWith<std::string> generateCreateString(const std::string& engineName,
+                                                        StringData ns,
                                                         const CollectionOptions& options,
                                                         StringData extraStrings);
 
     WiredTigerRecordStore(OperationContext* txn,
                           StringData ns,
                           StringData uri,
-                          bool isCapped = false,
+                          std::string engineName,
+                          bool isCapped,
+                          bool isEphemeral,
                           int64_t cappedMaxSize = -1,
                           int64_t cappedMaxDocs = -1,
                           CappedCallback* cappedCallback = nullptr,
@@ -152,7 +155,7 @@ public:
     virtual Status truncate(OperationContext* txn);
 
     virtual bool compactSupported() const {
-        return true;
+        return !_isEphemeral;
     }
     virtual bool compactsInPlace() const {
         return true;
@@ -173,6 +176,8 @@ public:
     virtual void appendCustomStats(OperationContext* txn,
                                    BSONObjBuilder* result,
                                    double scale) const;
+
+    virtual Status touch(OperationContext* txn, BSONObjBuilder* output) const;
 
     virtual void temp_cappedTruncateAfter(OperationContext* txn, RecordId end, bool inclusive);
 
@@ -261,13 +266,18 @@ private:
     const std::string _uri;
     const uint64_t _tableId;  // not persisted
 
+    // Canonical engine name to use for retrieving options
+    const std::string _engineName;
     // The capped settings should not be updated once operations have started
     const bool _isCapped;
+    // True if the storage engine is an in-memory storage engine
+    const bool _isEphemeral;
     // True if the namespace of this record store starts with "local.oplog.", and false otherwise.
     const bool _isOplog;
     const int64_t _cappedMaxSize;
     const int64_t _cappedMaxSizeSlack;  // when to start applying backpressure
     const int64_t _cappedMaxDocs;
+    RecordId _cappedFirstRecord;
     AtomicInt64 _cappedSleep;
     AtomicInt64 _cappedSleepMS;
     CappedCallback* _cappedCallback;

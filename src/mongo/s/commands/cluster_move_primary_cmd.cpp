@@ -161,11 +161,7 @@ public:
             _buildMoveEntry(dbname, fromShard->toString(), toShard->toString(), shardedColls);
 
         auto catalogManager = grid.catalogManager(txn);
-        catalogManager->logChange(txn,
-                                  txn->getClient()->clientAddress(true),
-                                  "movePrimary.start",
-                                  dbname,
-                                  moveStartDetails);
+        catalogManager->logChange(txn, "movePrimary.start", dbname, moveStartDetails);
 
         BSONArrayBuilder barr;
         barr.append(shardedColls);
@@ -192,7 +188,7 @@ public:
 
         ScopedDbConnection fromconn(fromShard->getConnString());
 
-        config->setPrimary(txn, toShard->getConnString().toString());
+        config->setPrimary(txn, toShard->getId());
         config->reload(txn);
 
         if (shardedColls.empty()) {
@@ -244,8 +240,7 @@ public:
         BSONObj moveFinishDetails =
             _buildMoveEntry(dbname, oldPrimary, toShard->toString(), shardedColls);
 
-        catalogManager->logChange(
-            txn, txn->getClient()->clientAddress(true), "movePrimary", dbname, moveFinishDetails);
+        catalogManager->logChange(txn, "movePrimary", dbname, moveFinishDetails);
         return true;
     }
 

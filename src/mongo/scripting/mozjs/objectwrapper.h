@@ -34,6 +34,8 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/scripting/mozjs/exception.h"
+#include "mongo/scripting/mozjs/internedstring.h"
+#include "mongo/scripting/mozjs/jsstringwrapper.h"
 #include "mongo/scripting/mozjs/lifetimestack.h"
 
 namespace mongo {
@@ -68,25 +70,30 @@ public:
             Field,
             Index,
             Id,
+            InternedString,
         };
 
     public:
         Key(const char* field) : _field(field), _type(Type::Field) {}
         Key(uint32_t idx) : _idx(idx), _type(Type::Index) {}
         Key(JS::HandleId id) : _id(id), _type(Type::Id) {}
+        Key(InternedString id) : _internedString(id), _type(Type::InternedString) {}
 
     private:
         void get(JSContext* cx, JS::HandleObject o, JS::MutableHandleValue value);
         void set(JSContext* cx, JS::HandleObject o, JS::HandleValue value);
         bool has(JSContext* cx, JS::HandleObject o);
+        bool hasOwn(JSContext* cx, JS::HandleObject o);
         void define(JSContext* cx, JS::HandleObject o, JS::HandleValue value, unsigned attrs);
         void del(JSContext* cx, JS::HandleObject o);
         std::string toString(JSContext* cx);
+        StringData toStringData(JSContext* cx, JSStringWrapper* jsstr);
 
         union {
             const char* _field;
             uint32_t _idx;
             jsid _id;
+            InternedString _internedString;
         };
         Type _type;
     };
@@ -106,7 +113,7 @@ public:
     void setNumber(Key key, double val);
     void setString(Key key, StringData val);
     void setBoolean(Key key, bool val);
-    void setBSONElement(Key key, const BSONElement& elem, bool readOnly);
+    void setBSONElement(Key key, const BSONElement& elem, const BSONObj& obj, bool readOnly);
     void setBSON(Key key, const BSONObj& obj, bool readOnly);
     void setValue(Key key, JS::HandleValue value);
     void setObject(Key key, JS::HandleObject value);
@@ -126,6 +133,7 @@ public:
     void rename(Key key, const char* to);
 
     bool hasField(Key key);
+    bool hasOwnField(Key key);
 
     void callMethod(const char* name, const JS::HandleValueArray& args, JS::MutableHandleValue out);
     void callMethod(const char* name, JS::MutableHandleValue out);
@@ -148,7 +156,8 @@ public:
         JS::RootedId rid(_context);
         for (size_t i = 0; i < ids.length(); ++i) {
             rid.set(ids[i]);
-            callback(rid);
+            if (!callback(rid))
+                break;
         }
     }
 

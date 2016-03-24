@@ -28,11 +28,18 @@ namespace mongo {
 
     class KVSortedDataImplHarness : public HarnessHelper {
     public:
-        virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unqiue) {
+        virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique) {
             std::unique_ptr<OperationContext> opCtx(newOperationContext());
             IndexEntryComparison iec(Ordering::make(BSONObj()));
             std::auto_ptr<KVDictionary> db(new KVHeapDictionary(KVDictionary::Encoding::forIndex(Ordering::make(BSONObj()))));
-            return std::unique_ptr<SortedDataInterface>(new KVSortedDataImpl(db.release(), opCtx.get(), NULL));
+            KVSortedDataImpl *p = new KVSortedDataImpl(db.release(), opCtx.get(), NULL);
+            if (unique) {
+                p->DuplicatesAreNotAllowed();
+            } else {
+                p->DuplicatesAreAllowed();
+            }
+
+            return std::unique_ptr<SortedDataInterface>(p);//new KVSortedDataImpl(db.release(), opCtx.get(), NULL));
         }
 
         virtual std::unique_ptr<RecoveryUnit> newRecoveryUnit() {

@@ -54,8 +54,8 @@ namespace mongo {
 TEST(FTDCFileManagerTest, TestFull) {
     Client* client = &cc();
     FTDCConfig c;
-    c.maxFileSizeBytes = 1000;
-    c.maxDirectorySizeBytes = 3000;
+    c.maxFileSizeBytes = 300;
+    c.maxDirectorySizeBytes = 1000;
     c.maxSamplesPerInterimMetricChunk = 1;
 
     unittest::TempDir tempdir("metrics_testpath");
@@ -68,12 +68,13 @@ TEST(FTDCFileManagerTest, TestFull) {
     auto mgr = std::move(swMgr.getValue());
 
     // Test a large numbers of zeros, and incremental numbers in a full buffer
-    for (int j = 0; j < 4; j++) {
+    for (int j = 0; j < 10; j++) {
         ASSERT_OK(
             mgr->writeSampleAndRotateIfNeeded(client,
                                               BSON("name"
                                                    << "joe"
-                                                   << "key1" << 3230792343LL << "key2" << 235135)));
+                                                   << "key1" << 3230792343LL << "key2" << 235135),
+                                              Date_t()));
 
         for (size_t i = 0; i <= FTDCConfig::kMaxSamplesPerArchiveMetricChunkDefault - 2; i++) {
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(
@@ -81,19 +82,22 @@ TEST(FTDCFileManagerTest, TestFull) {
                 BSON("name"
                      << "joe"
                      << "key1" << static_cast<long long int>(i * j * 37) << "key2"
-                     << static_cast<long long int>(i * (645 << j)))));
+                     << static_cast<long long int>(i * (645 << j))),
+                Date_t()));
         }
 
         ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                     BSON("name"
                                                          << "joe"
-                                                         << "key1" << 34 << "key2" << 45)));
+                                                         << "key1" << 34 << "key2" << 45),
+                                                    Date_t()));
 
         // Add Value
         ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                     BSON("name"
                                                          << "joe"
-                                                         << "key1" << 34 << "key2" << 45)));
+                                                         << "key1" << 34 << "key2" << 45),
+                                                    Date_t()));
     }
 
     mgr->close();
@@ -104,12 +108,14 @@ TEST(FTDCFileManagerTest, TestFull) {
     for (auto& file : files) {
         int fs = boost::filesystem::file_size(file);
         ASSERT_TRUE(fs < c.maxFileSizeBytes * 1.10);
+        unittest::log() << "File " << file.generic_string() << " has size " << fs;
         if (file.generic_string().find("interim") == std::string::npos) {
             sum += fs;
         }
     }
 
-    ASSERT_TRUE(sum < c.maxDirectorySizeBytes * 1.10);
+    ASSERT_LESS_THAN_OR_EQUALS(sum, c.maxDirectorySizeBytes * 1.10);
+    ASSERT_GREATER_THAN_OR_EQUALS(sum, c.maxDirectorySizeBytes * 0.90);
 }
 
 void ValidateInterimFileHasData(const boost::filesystem::path& dir, bool hasData) {
@@ -156,7 +162,8 @@ TEST(FTDCFileManagerTest, TestNormalRestart) {
                                                         BSON("name"
                                                              << "joe"
                                                              << "key1" << 3230792343LL << "key2"
-                                                             << 235135)));
+                                                             << 235135),
+                                                        Date_t()));
 
             for (size_t i = 0; i <= FTDCConfig::kMaxSamplesPerArchiveMetricChunkDefault - 2; i++) {
                 ASSERT_OK(
@@ -165,19 +172,22 @@ TEST(FTDCFileManagerTest, TestNormalRestart) {
                         BSON("name"
                              << "joe"
                              << "key1" << static_cast<long long int>(i * j * 37) << "key2"
-                             << static_cast<long long int>(i * (645 << j)))));
+                             << static_cast<long long int>(i * (645 << j))),
+                        Date_t()));
             }
 
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                         BSON("name"
                                                              << "joe"
-                                                             << "key1" << 34 << "key2" << 45)));
+                                                             << "key1" << 34 << "key2" << 45),
+                                                        Date_t()));
 
             // Add Value
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                         BSON("name"
                                                              << "joe"
-                                                             << "key1" << 34 << "key2" << 45)));
+                                                             << "key1" << 34 << "key2" << 45),
+                                                        Date_t()));
         }
 
         mgr->close();
@@ -212,7 +222,8 @@ TEST(FTDCFileManagerTest, TestCorruptCrashRestart) {
                                                         BSON("name"
                                                              << "joe"
                                                              << "key1" << 3230792343LL << "key2"
-                                                             << 235135)));
+                                                             << 235135),
+                                                        Date_t()));
 
             for (size_t i = 0; i <= FTDCConfig::kMaxSamplesPerArchiveMetricChunkDefault - 2; i++) {
                 ASSERT_OK(
@@ -221,24 +232,27 @@ TEST(FTDCFileManagerTest, TestCorruptCrashRestart) {
                         BSON("name"
                              << "joe"
                              << "key1" << static_cast<long long int>(i * j * 37) << "key2"
-                             << static_cast<long long int>(i * (645 << j)))));
+                             << static_cast<long long int>(i * (645 << j))),
+                        Date_t()));
             }
 
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                         BSON("name"
                                                              << "joe"
-                                                             << "key1" << 34 << "key2" << 45)));
+                                                             << "key1" << 34 << "key2" << 45),
+                                                        Date_t()));
 
             // Add Value
             ASSERT_OK(mgr->writeSampleAndRotateIfNeeded(client,
                                                         BSON("name"
                                                              << "joe"
-                                                             << "key1" << 34 << "key2" << 45)));
+                                                             << "key1" << 34 << "key2" << 45),
+                                                        Date_t()));
         }
 
         mgr->close();
 
-        auto swFile = FTDCFileManager::generateArchiveFileName(dir, "0test-crash");
+        auto swFile = mgr->generateArchiveFileName(dir, "0test-crash");
         ASSERT_OK(swFile);
 
         std::ofstream stream(swFile.getValue().c_str());
@@ -261,8 +275,6 @@ TEST(FTDCFileManagerTest, TestNormalCrashInterim) {
     unittest::TempDir tempdir("metrics_testpath");
     boost::filesystem::path dir(tempdir.path());
 
-    createDirectoryClean(dir);
-
     BSONObj mdoc1 = BSON("name"
                          << "some_metadata"
                          << "key1" << 34 << "something" << 98);
@@ -274,22 +286,33 @@ TEST(FTDCFileManagerTest, TestNormalCrashInterim) {
                          << "joe"
                          << "key3" << 34 << "key5" << 45);
 
-    auto swFile = FTDCFileManager::generateArchiveFileName(dir, "0test-crash");
-    ASSERT_OK(swFile);
+    boost::filesystem::path fileOut;
+
+    {
+        FTDCCollectorCollection rotate;
+        auto swMgr = FTDCFileManager::create(&c, dir, &rotate, client);
+        ASSERT_OK(swMgr.getStatus());
+        auto swFile = swMgr.getValue()->generateArchiveFileName(dir, "0test-crash");
+        ASSERT_OK(swFile);
+        fileOut = swFile.getValue();
+        ASSERT_OK(swMgr.getValue()->close());
+    }
+
+    createDirectoryClean(dir);
 
     {
         FTDCFileWriter writer(&c);
 
-        ASSERT_OK(writer.open(swFile.getValue()));
+        ASSERT_OK(writer.open(fileOut));
 
-        ASSERT_OK(writer.writeMetadata(mdoc1));
+        ASSERT_OK(writer.writeMetadata(mdoc1, Date_t()));
 
-        ASSERT_OK(writer.writeSample(sdoc1));
-        ASSERT_OK(writer.writeSample(sdoc1));
-        ASSERT_OK(writer.writeSample(sdoc2));
-        ASSERT_OK(writer.writeSample(sdoc2));
-        ASSERT_OK(writer.writeSample(sdoc2));
-        ASSERT_OK(writer.writeSample(sdoc2));
+        ASSERT_OK(writer.writeSample(sdoc1, Date_t()));
+        ASSERT_OK(writer.writeSample(sdoc1, Date_t()));
+        ASSERT_OK(writer.writeSample(sdoc2, Date_t()));
+        ASSERT_OK(writer.writeSample(sdoc2, Date_t()));
+        ASSERT_OK(writer.writeSample(sdoc2, Date_t()));
+        ASSERT_OK(writer.writeSample(sdoc2, Date_t()));
 
         // leave some data in the interim file
         writer.closeWithoutFlushForTest();

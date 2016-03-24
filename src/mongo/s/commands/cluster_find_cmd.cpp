@@ -33,6 +33,7 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/query/cluster_find.h"
@@ -142,7 +143,7 @@ public:
             return appendCommandStatus(result, lpq.getStatus());
         }
 
-        auto cq = CanonicalQuery::canonicalize(lpq.getValue().release(), WhereCallbackNoop());
+        auto cq = CanonicalQuery::canonicalize(lpq.getValue().release(), ExtensionsCallbackNoop());
         if (!cq.isOK()) {
             return appendCommandStatus(result, cq.getStatus());
         }
@@ -164,11 +165,11 @@ public:
         }
 
         // Build the response document.
-        BSONArrayBuilder arr;
+        CursorResponseBuilder firstBatch(/*firstBatch*/ true, &result);
         for (const auto& obj : batch) {
-            arr.append(obj);
+            firstBatch.append(obj);
         }
-        appendCursorResponseObject(cursorId.getValue(), nss.ns(), arr.arr(), &result);
+        firstBatch.done(cursorId.getValue(), nss.ns());
         return true;
     }
 

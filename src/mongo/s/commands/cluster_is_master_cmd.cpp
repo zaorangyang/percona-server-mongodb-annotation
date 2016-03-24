@@ -74,8 +74,8 @@ public:
 
         // Mongos tries to keep exactly the same version range of the server for which
         // it is compiled.
-        result.append("maxWireVersion", maxWireVersion);
-        result.append("minWireVersion", minWireVersion);
+        result.append("maxWireVersion", WireSpec::instance().maxWireVersionIncoming);
+        result.append("minWireVersion", WireSpec::instance().minWireVersionIncoming);
 
         return true;
     }

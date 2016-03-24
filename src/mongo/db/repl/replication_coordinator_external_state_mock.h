@@ -52,10 +52,12 @@ public:
 
     ReplicationCoordinatorExternalStateMock();
     virtual ~ReplicationCoordinatorExternalStateMock();
-    virtual void startThreads() override;
+    virtual void startThreads(const ReplSettings& settings) override;
     virtual void startMasterSlave(OperationContext*);
     virtual void shutdown();
-    virtual void initiateOplog(OperationContext* txn, bool updateReplOpTime);
+    virtual Status initializeReplSetStorage(OperationContext* txn,
+                                            const BSONObj& config,
+                                            bool updateReplOpTime);
     virtual void logTransitionToPrimaryToOplog(OperationContext* txn);
     virtual void forwardSlaveProgress();
     virtual OID ensureMe(OperationContext*);
@@ -67,9 +69,11 @@ public:
     virtual Status storeLocalLastVoteDocument(OperationContext* txn, const LastVote& lastVote);
     virtual void setGlobalTimestamp(const Timestamp& newTime);
     virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn);
+    virtual void cleanUpLastApplyBatch(OperationContext* txn);
     virtual void closeConnections();
     virtual void killAllUserOperations(OperationContext* txn);
     virtual void clearShardingState();
+    virtual void recoverShardingState(OperationContext* txn);
     virtual void signalApplierToChooseNewSyncSource();
     virtual void signalApplierToCancelFetcher();
     virtual OperationContext* createOperationContext(const std::string& threadName);
@@ -79,6 +83,8 @@ public:
     virtual void forceSnapshotCreation();
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters();
+    virtual double getElectionTimeoutOffsetLimitFraction() const;
+    virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* txn) const;
 
     /**
      * Adds "host" to the list of hosts that this mock will match when responding to "isSelf"

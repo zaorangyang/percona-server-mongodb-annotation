@@ -39,6 +39,7 @@
 #include "mongo/db/ftdc/config.h"
 #include "mongo/db/ftdc/util.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/rpc/object_check.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -70,6 +71,13 @@ StatusWith<bool> FTDCFileReader::hasNext() {
             if (!swType.isOK()) {
                 return swType.getStatus();
             }
+
+            auto swId = FTDCBSONUtil::getBSONDocumentId(_parent);
+            if (!swId.isOK()) {
+                return swId.getStatus();
+            }
+
+            _dateId = swId.getValue();
 
             FTDCBSONUtil::FTDCType type = swType.getValue();
 
@@ -120,17 +128,17 @@ StatusWith<bool> FTDCFileReader::hasNext() {
     }
 }
 
-std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&> FTDCFileReader::next() {
+std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t> FTDCFileReader::next() {
     dassert(_state == State::kMetricChunk || _state == State::kMetadataDoc);
 
     if (_state == State::kMetadataDoc) {
-        return std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&>(FTDCBSONUtil::FTDCType::kMetadata,
-                                                                  _metadata);
+        return std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t>(
+            FTDCBSONUtil::FTDCType::kMetadata, _metadata, _dateId);
     }
 
     if (_state == State::kMetricChunk) {
-        return std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&>(
-            FTDCBSONUtil::FTDCType::kMetricChunk, _docs[_pos]);
+        return std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t>(
+            FTDCBSONUtil::FTDCType::kMetricChunk, _docs[_pos], _dateId);
     }
 
     MONGO_UNREACHABLE;

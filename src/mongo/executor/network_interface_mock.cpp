@@ -63,6 +63,8 @@ std::string NetworkInterfaceMock::getDiagnosticString() {
     return "NetworkInterfaceMock diagnostics here";
 }
 
+void NetworkInterfaceMock::appendConnectionStats(BSONObjBuilder* b) {}
+
 Date_t NetworkInterfaceMock::now() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _now_inlock();
@@ -143,6 +145,10 @@ void NetworkInterfaceMock::setAlarm(const Date_t when, const stdx::function<void
         return;
     }
     _alarms.emplace(when, action);
+}
+
+bool NetworkInterfaceMock::onNetworkThread() {
+    return _currentlyRunning == kNetworkThread;
 }
 
 void NetworkInterfaceMock::startup() {

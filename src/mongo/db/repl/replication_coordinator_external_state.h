@@ -49,6 +49,7 @@ class StatusWith;
 namespace repl {
 
 class LastVote;
+class ReplSettings;
 
 /**
  * This class represents the interface the ReplicationCoordinator uses to interact with the
@@ -68,7 +69,7 @@ public:
      *
      * NOTE: Only starts threads if they are not already started,
      */
-    virtual void startThreads() = 0;
+    virtual void startThreads(const ReplSettings& settings) = 0;
 
     /**
      * Starts the Master/Slave threads and sets up logOp
@@ -82,10 +83,12 @@ public:
     virtual void shutdown() = 0;
 
     /**
-     * Creates the oplog and writes the first entry.
-     * Sets replCoord last optime if 'updateReplOpTime' is true.
+     * Creates the oplog, writes the first entry and stores the replica set config document.  Sets
+     * replCoord last optime if 'updateReplOpTime' is true.
      */
-    virtual void initiateOplog(OperationContext* txn, bool updateReplOpTime) = 0;
+    virtual Status initializeReplSetStorage(OperationContext* txn,
+                                            const BSONObj& config,
+                                            bool updateReplOpTime) = 0;
 
     /**
      * Writes a message about our transition to primary to the oplog.
@@ -144,6 +147,13 @@ public:
     virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn) = 0;
 
     /**
+     * Cleaning up the oplog, by potentially truncating:
+     * If we are recovering from a failed batch then minvalid.start though minvalid.end need
+     * to be removed from the oplog before we can start applying operations.
+     */
+    virtual void cleanUpLastApplyBatch(OperationContext* txn) = 0;
+
+    /**
      * Returns the HostAndPort of the remote client connected to us that initiated the operation
      * represented by "txn".
      */
@@ -168,6 +178,14 @@ public:
      * version of the sharding data.
      */
     virtual void clearShardingState() = 0;
+
+    /**
+     * Called when the instance transitions to primary in order to notify a potentially sharded
+     * host to recover its sharding state.
+     *
+     * Throws on errors.
+     */
+    virtual void recoverShardingState(OperationContext* txn) = 0;
 
     /**
      * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.
@@ -219,6 +237,17 @@ public:
     virtual bool snapshotsEnabled() const = 0;
 
     virtual void notifyOplogMetadataWaiters() = 0;
+
+    /**
+     * Returns multiplier to apply to election timeout to obtain upper bound
+     * on randomized offset.
+     */
+    virtual double getElectionTimeoutOffsetLimitFraction() const = 0;
+
+    /**
+     * Returns true if the current storage engine supports read committed.
+     */
+    virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* txn) const = 0;
 };
 
 }  // namespace repl

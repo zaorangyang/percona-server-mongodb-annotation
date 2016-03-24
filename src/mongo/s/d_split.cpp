@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -49,6 +50,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/operation_shard_version.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -57,6 +59,7 @@
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
@@ -508,6 +511,10 @@ public:
             result.append("timeMillis", timer.millis());
         }
 
+        // Make sure splitKeys is in ascending order
+        std::sort(splitKeys.begin(),
+                  splitKeys.end(),
+                  [](const BSONObj& lhs, const BSONObj& rhs) -> bool { return lhs < rhs; });
         result.append("splitKeys", splitKeys);
         return true;
     }
@@ -537,8 +544,7 @@ public:
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::splitChunk)) {
+                ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
@@ -660,10 +666,21 @@ public:
             return false;
         }
 
-        // From mongos >= v3.0.
-        BSONElement epochElem(cmdObj["epoch"]);
-        if (epochElem.type() == jstOID) {
-            OID cmdEpoch = epochElem.OID();
+        ChunkVersion cmdVersion;
+        {
+            // Mongos >= v3.2 sends the full version, v3.0 only sends the epoch.
+            // TODO(SERVER-20742): Stop parsing epoch separately after 3.2.
+            OID cmdEpoch;
+            auto& operationVersion = OperationShardVersion::get(txn);
+            if (operationVersion.hasShardVersion()) {
+                cmdVersion = operationVersion.getShardVersion(nss);
+                cmdEpoch = cmdVersion.epoch();
+            } else {
+                BSONElement epochElem(cmdObj["epoch"]);
+                if (epochElem.type() == jstOID) {
+                    cmdEpoch = epochElem.OID();
+                }
+            }
 
             if (cmdEpoch != shardVersion.epoch()) {
                 std::string msg = str::stream() << "splitChunk cannot split chunk "
@@ -672,7 +689,7 @@ public:
                                                 << "current epoch: " << shardVersion.epoch()
                                                 << ", cmd epoch: " << cmdEpoch;
                 warning() << msg;
-                return appendCommandStatus(result, Status(ErrorCodes::SendStaleConfig, msg));
+                throw SendStaleConfigException(nss.toString(), msg, cmdVersion, shardVersion);
             }
         }
 
@@ -694,7 +711,7 @@ public:
                                             << "[" << min << "," << max << ")"
                                             << " to split, the chunk boundaries may be stale";
             warning() << msg;
-            return appendCommandStatus(result, Status(ErrorCodes::SendStaleConfig, msg));
+            throw SendStaleConfigException(nss.toString(), msg, cmdVersion, shardVersion);
         }
 
         log() << "splitChunk accepted at version " << shardVersion;
@@ -831,8 +848,7 @@ public:
             appendShortVersion(logDetail.subobjStart("left"), *newChunks[0]);
             appendShortVersion(logDetail.subobjStart("right"), *newChunks[1]);
 
-            grid.catalogManager(txn)->logChange(
-                txn, txn->getClient()->clientAddress(true), "split", nss.ns(), logDetail.obj());
+            grid.catalogManager(txn)->logChange(txn, "split", nss.ns(), logDetail.obj());
         } else {
             BSONObj beforeDetailObj = logDetail.obj();
             BSONObj firstDetailObj = beforeDetailObj.getOwned();
@@ -845,11 +861,8 @@ public:
                 chunkDetail.append("of", newChunksSize);
                 appendShortVersion(chunkDetail.subobjStart("chunk"), *newChunks[i]);
 
-                grid.catalogManager(txn)->logChange(txn,
-                                                    txn->getClient()->clientAddress(true),
-                                                    "multi-split",
-                                                    nss.ns(),
-                                                    chunkDetail.obj());
+                grid.catalogManager(txn)
+                    ->logChange(txn, "multi-split", nss.ns(), chunkDetail.obj());
             }
         }
 

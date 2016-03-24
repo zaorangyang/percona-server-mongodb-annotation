@@ -60,6 +60,7 @@
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/password.h"
 #include "mongo/util/quick_exit.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/startup_test.h"
@@ -584,7 +585,7 @@ static void edit(const string& whatToEdit) {
 }
 
 int _main(int argc, char* argv[], char** envp) {
-    setupSignalHandlers(true);
+    setupSignalHandlers();
     setupSignals();
 
     mongo::shell_utils::RecordMyLocation(argv[0]);
@@ -681,6 +682,10 @@ int _main(int argc, char* argv[], char** envp) {
     mongo::ScriptEngine::setConnectCallback(mongo::shell_utils::onConnect);
     mongo::ScriptEngine::setup();
     mongo::globalScriptEngine->setScopeInitCallback(mongo::shell_utils::initScope);
+    mongo::globalScriptEngine->enableJIT(!shellGlobalParams.nojit);
+
+    auto poolGuard = MakeGuard([] { ScriptEngine::dropScopeCache(); });
+
     unique_ptr<mongo::Scope> scope(mongo::globalScriptEngine->newScope());
     shellMainScope = scope.get();
 

@@ -7,6 +7,7 @@ selector:
     # mongos. This command or functionality is placed in a comment next to the failing test.
     - jstests/core/apitest_db.js  # profiling.
     - jstests/core/apply_ops*.js  # applyOps, SERVER-1439.
+    - jstests/core/bypass_doc_validation.js  # copyDatabase
     - jstests/core/capped*.js  # capped collections.
     - jstests/core/check_shard_index.js  # checkShardingIndex.
     - jstests/core/collection_truncate.js  # emptycapped.
@@ -29,6 +30,7 @@ selector:
     - jstests/core/profile*.js  # profiling.
     - jstests/core/rename*.js # renameCollection.
     - jstests/core/stages*.js  # stageDebug.
+    - jstests/core/startup_log.js  # "local" database.
     - jstests/core/storageDetailsCommand.js  # diskStorageStats.
     - jstests/core/tailable_skip_limit.js # capped collections.
     - jstests/core/top.js  # top.
@@ -59,6 +61,12 @@ selector:
     - jstests/core/dbcase2.js
     - jstests/core/no_db_created.js
     - jstests/core/ns_length.js
+    # If one of these tests runs before a database is created by another test, then these tests will fail.
+    # See: SERVER-20852, db.eval doesn't implicitly create databases on mongos nodes.
+    - jstests/core/constructors.js
+    - jstests/core/eval0.js
+    - jstests/core/eval7.js
+    - jstests/core/eval9.js
 
 executor:
   js_test:

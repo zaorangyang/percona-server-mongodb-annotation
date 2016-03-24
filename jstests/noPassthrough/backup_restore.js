@@ -8,6 +8,10 @@
  * - fsyncUnlock (or start) Secondary
  * - Start mongod as hidden secondary
  * - Wait until new hidden node becomes secondary
+ *
+ * Some methods for backup used in this test checkpoint the files in the dbpath. This technique will
+ * not work for ephemeral storage engines, as they do not store any data in the dbpath.
+ * @tags: [requires_persistence]
  */
 
 (function() {
@@ -155,7 +159,10 @@
             }
         });
         var nodes = rst.startSet();
-        rst.initiate();
+
+        // Wait up to 5 minutes for the replica set to initiate. We allow extra time because
+        // allocating 1GB oplogs on test hosts can be slow with mmapv1.
+        rst.initiate(null, null, 5 * 60 * 1000);
         var primary = rst.getPrimary();
         var secondary = rst.getSecondary();
 
@@ -264,8 +271,8 @@
         // Note the dbhash can only run when the DB is inactive to get a result
         // that can be compared, which is only in the fsyncLock/fsynUnlock case
         if (dbHash !== undefined) {
-            assert(dbHash, rst.nodes[numNodes].getDB(crudDb).runCommand({dbhash: 1}).md5,
-                   testName + ' dbHash');
+            assert.eq(dbHash, rst.nodes[numNodes].getDB(crudDb).runCommand({dbhash: 1}).md5,
+                      testName + ' dbHash');
         }
 
         // Add new hidden secondary to replica set
@@ -281,14 +288,19 @@
         assert.commandWorked(primary.adminCommand({replSetReconfig : rsConfig}), testName +
                              ' failed to reconfigure replSet ' + tojson(rsConfig));
 
-        // Wait up to 60 seconds until the new hidden node is in state secondary
-        rst.waitForState(rst.nodes[numNodes], rst.SECONDARY, 60 * 1000);
+        // Wait up to 60 seconds until the new hidden node is in state RECOVERING.
+        rst.waitForState(rst.nodes[numNodes], [rst.RECOVERING, rst.SECONDARY], 60 * 1000);
 
-        // Stop CRUD client, FSM client & replica set mongods
+        // Stop CRUD client and FSM client.
         assert(checkProgram(crudPid), testName + ' CRUD client was not running at end of test');
         assert(checkProgram(fsmPid), testName + ' FSM client was not running at end of test');
         stopMongoProgramByPid(crudPid);
         stopMongoProgramByPid(fsmPid);
+
+        // Wait up to 60 seconds until the new hidden node is in state SECONDARY.
+        rst.waitForState(rst.nodes[numNodes], rst.SECONDARY, 60 * 1000);
+
+        // Stop set.
         rst.stopSet();
 
         // Cleanup the files from the test

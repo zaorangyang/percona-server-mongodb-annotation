@@ -54,12 +54,12 @@ class AsyncMockStreamFactory final : public AsyncStreamFactoryInterface {
 public:
     AsyncMockStreamFactory() = default;
 
-    std::unique_ptr<AsyncStreamInterface> makeStream(asio::io_service* io_service,
+    std::unique_ptr<AsyncStreamInterface> makeStream(asio::io_service::strand* strand,
                                                      const HostAndPort& host) override;
 
     class MockStream final : public AsyncStreamInterface {
     public:
-        MockStream(asio::io_service* io_service,
+        MockStream(asio::io_service::strand* strand,
                    AsyncMockStreamFactory* factory,
                    const HostAndPort& target);
 
@@ -79,6 +79,8 @@ public:
         void write(asio::const_buffer buf, StreamHandler&& writeHandler) override;
         void read(asio::mutable_buffer buf, StreamHandler&& readHandler) override;
 
+        bool isOpen() override;
+
         HostAndPort target();
 
         StreamState waitUntilBlocked();
@@ -87,6 +89,8 @@ public:
 
         std::vector<uint8_t> popWrite();
         void pushRead(std::vector<uint8_t> toRead);
+
+        void setError(std::error_code ec);
 
         void unblock();
 
@@ -101,7 +105,7 @@ public:
         void _defer_inlock(StreamState state, Action&& handler);
         void _unblock_inlock();
 
-        asio::io_service* _io_service;
+        asio::io_service::strand* _strand;
 
         AsyncMockStreamFactory* _factory;
         HostAndPort _target;
@@ -113,6 +117,8 @@ public:
 
         std::queue<std::vector<uint8_t>> _readQueue;
         std::queue<std::vector<uint8_t>> _writeQueue;
+
+        std::error_code _error;
 
         Action _deferredAction;
     };

@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -145,25 +145,23 @@ ResponseStatus decodeRPC(Message* received,
             return Status(ErrorCodes::RPCProtocolNegotiationFailed,
                           str::stream() << "Mismatched RPC protocols - request was '"
                                         << requestProtocol.getValue().toString() << "' '"
-                                        << " but reply was '" << opToString(received->operation())
-                                        << "'");
+                                        << " but reply was '"
+                                        << networkOpToString(received->operation()) << "'");
         }
-        auto ownedCommandReply = reply->getCommandReply().getOwned();
-        auto ownedReplyMetadata = reply->getMetadata().getOwned();
+        auto commandReply = reply->getCommandReply();
+        auto replyMetadata = reply->getMetadata();
 
         // Handle incoming reply metadata.
         if (metadataHook) {
-            auto listenStatus = callNoexcept(*metadataHook,
-                                             &rpc::EgressMetadataHook::readReplyMetadata,
-                                             source,
-                                             ownedReplyMetadata);
+            auto listenStatus = callNoexcept(
+                *metadataHook, &rpc::EgressMetadataHook::readReplyMetadata, source, replyMetadata);
             if (!listenStatus.isOK()) {
                 return listenStatus;
             }
         }
 
         return {RemoteCommandResponse(
-            std::move(ownedCommandReply), std::move(ownedReplyMetadata), elapsed)};
+            std::move(*received), std::move(commandReply), std::move(replyMetadata), elapsed)};
     } catch (...) {
         return exceptionToStatus();
     }
@@ -237,10 +235,13 @@ void NetworkInterfaceASIO::_beginCommunication(AsyncOp* op) {
     // codepath.
 
     if (op->_inSetup) {
+        log() << "Successfully connected to " << op->request().target.toString();
         op->_inSetup = false;
         op->finish(RemoteCommandResponse());
         return;
     }
+
+    LOG(3) << "Initiating asynchronous command: " << op->request().toString();
 
     auto beginStatus = op->beginCommand(op->request(), _metadataHook.get());
     if (!beginStatus.isOK()) {
@@ -259,7 +260,6 @@ void NetworkInterfaceASIO::_completedOpCallback(AsyncOp* op) {
 }
 
 void NetworkInterfaceASIO::_networkErrorCallback(AsyncOp* op, const std::error_code& ec) {
-    LOG(3) << "networking error occurred";
     if (ec.category() == mongoErrorCategory()) {
         // If we get a Mongo error code, we can preserve it.
         _completeOperation(op, Status(ErrorCodes::fromInt(ec.value()), ec.message()));
@@ -278,6 +278,21 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
         op->_timeoutAlarm->cancel();
     }
 
+    if (op->_inSetup) {
+        // If we are in setup we should only be here if we failed to connect.
+        invariant(!resp.isOK());
+        // If we fail during connection, we won't be able to access any of our members after calling
+        // op->finish().
+        LOG(1) << "Failed to connect to " << op->request().target << " - " << resp.getStatus();
+    }
+
+    if (!resp.isOK()) {
+        // In the case that resp is not OK, but _inSetup is false, we are using a connection that
+        // we got from the pool to execute a command, but it failed for some reason.
+        LOG(2) << "Failed to execute command: " << op->request().toString()
+               << " reason: " << resp.getStatus();
+    }
+
     op->finish(resp);
 
     std::unique_ptr<AsyncOp> ownedOp;
@@ -288,8 +303,9 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
         auto iter = _inProgress.find(op);
 
         // This can happen if we fail during setup.
-        if (iter == _inProgress.end())
+        if (iter == _inProgress.end()) {
             return;
+        }
 
         ownedOp = std::move(iter->second);
         _inProgress.erase(iter);
@@ -315,15 +331,16 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
 
     asioConn->bindAsyncOp(std::move(ownedOp));
     if (!resp.isOK()) {
-        asioConn->indicateFailed(resp.getStatus());
+        asioConn->indicateFailure(resp.getStatus());
     } else {
-        asioConn->indicateUsed();
+        asioConn->indicateSuccess();
     }
 
     signalWorkAvailable();
 }
 
 void NetworkInterfaceASIO::_asyncRunCommand(AsyncOp* op, NetworkOpHandler handler) {
+    LOG(2) << "Starting asynchronous command on host " << op->request().target.toString();
     // We invert the following steps below to run a command:
     // 1 - send the given command
     // 2 - receive a header for the response

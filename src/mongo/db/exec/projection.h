@@ -37,6 +37,8 @@
 
 namespace mongo {
 
+class ExtensionsCallback;
+
 struct ProjectionStageParams {
     enum ProjectionImplementation {
         // The default case.  Will handle every projection.
@@ -49,8 +51,8 @@ struct ProjectionStageParams {
         SIMPLE_DOC
     };
 
-    ProjectionStageParams(const MatchExpressionParser::WhereCallback& wc)
-        : projImpl(NO_FAST_PATH), fullExpression(NULL), whereCallback(&wc) {}
+    ProjectionStageParams(const ExtensionsCallback& wc)
+        : projImpl(NO_FAST_PATH), fullExpression(NULL), extensionsCallback(&wc) {}
 
     ProjectionImplementation projImpl;
 
@@ -66,8 +68,8 @@ struct ProjectionStageParams {
     // from.  Otherwise, this field is ignored.
     BSONObj coveredKeyObj;
 
-    // Used for creating context for the $where clause processing. Not owned.
-    const MatchExpressionParser::WhereCallback* whereCallback;
+    // Used for creating context for the match extensions processing. Not owned.
+    const ExtensionsCallback* extensionsCallback;
 };
 
 /**

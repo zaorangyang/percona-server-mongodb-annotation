@@ -194,7 +194,8 @@ __wt_conn_btree_sync_and_close(WT_SESSION_IMPL *session, bool final, bool force)
 		if (force && (btree->bm == NULL || btree->bm->map == NULL))  {
 			WT_ERR(__conn_dhandle_mark_dead(session));
 			marked_dead = true;
-		} else
+		}
+		if (!marked_dead || final)
 			WT_ERR(__wt_checkpoint_close(session, final));
 	}
 
@@ -678,11 +679,15 @@ __wt_conn_dhandle_discard(WT_SESSION_IMPL *session)
 	conn = S2C(session);
 
 	/*
-	 * Close open data handles: first, everything but the metadata file
-	 * (as closing a normal file may open and write the metadata file),
-	 * then the metadata file.  This function isn't called often, and I
-	 * don't want to "know" anything about the metadata file's position on
-	 * the list, so we do it the hard way.
+	 * Empty the session cache: any data handles created in a connection
+	 * method may be cached here, and we're about to close them.
+	 */
+	__wt_session_close_cache(session);
+
+	/*
+	 * Close open data handles: first, everything but the metadata file (as
+	 * closing a normal file may open and write the metadata file), then
+	 * the metadata file.
 	 */
 restart:
 	TAILQ_FOREACH(dhandle, &conn->dhqh, q) {
@@ -691,7 +696,7 @@ restart:
 
 		WT_WITH_DHANDLE(session, dhandle,
 		    WT_TRET(__wt_conn_dhandle_discard_single(
-		    session, true, false)));
+		    session, true, F_ISSET(conn, WT_CONN_IN_MEMORY))));
 		goto restart;
 	}
 
@@ -708,7 +713,7 @@ restart:
 	while ((dhandle = TAILQ_FIRST(&conn->dhqh)) != NULL)
 		WT_WITH_DHANDLE(session, dhandle,
 		    WT_TRET(__wt_conn_dhandle_discard_single(
-		    session, true, false)));
+		    session, true, F_ISSET(conn, WT_CONN_IN_MEMORY))));
 
 	return (ret);
 }

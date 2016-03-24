@@ -306,12 +306,12 @@ void Chunk::pickSplitVector(OperationContext* txn,
     cmd.append("maxChunkSizeBytes", chunkSize);
     cmd.append("maxSplitPoints", maxPoints);
     cmd.append("maxChunkObjects", maxObjs);
+
     BSONObj cmdObj = cmd.obj();
 
-    const auto primaryShard = grid.shardRegistry()->getShard(txn, getShardId());
     auto result = grid.shardRegistry()->runCommandOnShard(
         txn,
-        primaryShard,
+        getShardId(),
         ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
         "admin",
         cmdObj);
@@ -443,6 +443,8 @@ Status Chunk::multiSplit(OperationContext* txn, const vector<BSONObj>& m, BSONOb
     cmd.append("from", getShardId());
     cmd.append("splitKeys", m);
     cmd.append("configdb", grid.shardRegistry()->getConfigServerConnectionString().toString());
+    _manager->getVersion().appendForCommands(&cmd);
+    // TODO(SERVER-20742): Remove this after 3.2, now that we're sending version it is redundant
     cmd.append("epoch", _manager->getVersion().epoch());
     BSONObj cmdObj = cmd.obj();
 
@@ -510,6 +512,8 @@ bool Chunk::moveAndCommit(OperationContext* txn,
 
     builder.append("waitForDelete", waitForDelete);
     builder.append(LiteParsedQuery::cmdOptionMaxTimeMS, maxTimeMS);
+    _manager->getVersion().appendForCommands(&builder);
+    // TODO(SERVER-20742): Remove this after 3.2, now that we're sending version it is redundant
     builder.append("epoch", _manager->getVersion().epoch());
 
     ShardConnection fromconn(_getShardConnectionString(txn), "");
@@ -639,27 +643,6 @@ bool Chunk::operator==(const Chunk& s) const {
     return _min.woCompare(s._min) == 0 && _max.woCompare(s._max) == 0;
 }
 
-void Chunk::serialize(BSONObjBuilder& to, ChunkVersion myLastMod) {
-    to.append("_id", genID(_manager->getns(), _min));
-
-    if (myLastMod.isSet()) {
-        myLastMod.addToBSON(to, ChunkType::DEPRECATED_lastmod());
-    } else if (_lastmod.isSet()) {
-        _lastmod.addToBSON(to, ChunkType::DEPRECATED_lastmod());
-    } else {
-        verify(0);
-    }
-
-    to << ChunkType::ns(_manager->getns());
-    to << ChunkType::min(_min);
-    to << ChunkType::max(_max);
-    to << ChunkType::shard(_shardId);
-}
-
-string Chunk::genID() const {
-    return genID(_manager->getns(), _min);
-}
-
 string Chunk::genID(const string& ns, const BSONObj& o) {
     StringBuilder buf;
     buf << ns << "-";
@@ -687,15 +670,16 @@ void Chunk::markAsJumbo(OperationContext* txn) const {
     // at least this mongos won't try and keep moving
     _jumbo = true;
 
-    Status result = grid.catalogManager(txn)->update(txn,
-                                                     ChunkType::ConfigNS,
-                                                     BSON(ChunkType::name(genID())),
-                                                     BSON("$set" << BSON(ChunkType::jumbo(true))),
-                                                     false,  // upsert
-                                                     false,  // multi
-                                                     NULL);
-    if (!result.isOK()) {
-        warning() << "couldn't set jumbo for chunk: " << genID() << result.reason();
+    const string chunkName = genID(_manager->getns(), _min);
+
+    auto status =
+        grid.catalogManager(txn)->updateConfigDocument(txn,
+                                                       ChunkType::ConfigNS,
+                                                       BSON(ChunkType::name(chunkName)),
+                                                       BSON("$set" << BSON(ChunkType::jumbo(true))),
+                                                       false);
+    if (!status.isOK()) {
+        warning() << "couldn't set jumbo for chunk: " << chunkName << causedBy(status.getStatus());
     }
 }
 

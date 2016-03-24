@@ -387,10 +387,8 @@ StatusWith<RecordId> RecordStoreV1Base::updateRecord(OperationContext* txn,
         return StatusWith<RecordId>(oldLocation);
     }
 
-    if (isCapped()) {
-        return {ErrorCodes::CannotGrowDocumentInCappedNamespace,
-                "failing update: objects in a capped ns cannot grow"};
-    }
+    // We enforce the restriction of unchanging capped doc sizes above the storage layer.
+    invariant(!isCapped());
 
     // we have to move
     if (dataSize + MmapV1RecordHeader::HeaderSize > MaxAllowedAllocation) {
@@ -921,8 +919,13 @@ void RecordStoreV1Base::IntraExtentIterator::advance() {
     _curr = (nextOfs == DiskLoc::NullOfs ? DiskLoc() : DiskLoc(_curr.a(), nextOfs));
 }
 
-void RecordStoreV1Base::IntraExtentIterator::invalidate(const RecordId& rid) {
+void RecordStoreV1Base::IntraExtentIterator::invalidate(OperationContext* txn,
+                                                        const RecordId& rid) {
     if (rid == _curr.toRecordId()) {
+        const DiskLoc origLoc = _curr;
+
+        // Undo the advance on rollback, as the deletion that forced it "never happened".
+        txn->recoveryUnit()->onRollback([this, origLoc]() { this->_curr = origLoc; });
         advance();
     }
 }

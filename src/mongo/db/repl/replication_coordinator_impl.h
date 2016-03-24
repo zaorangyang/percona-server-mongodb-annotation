@@ -43,6 +43,7 @@
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/snapshot_name.h"
@@ -108,11 +109,17 @@ public:
 
     virtual void shutdown() override;
 
+    virtual ReplicationExecutor* getExecutor() override {
+        return &_replExecutor;
+    }
+
     virtual const ReplSettings& getSettings() const override;
 
     virtual Mode getReplicationMode() const override;
 
     virtual MemberState getMemberState() const override;
+
+    virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) override;
 
     virtual bool isInPrimaryOrSecondaryState() const override;
 
@@ -183,6 +190,8 @@ public:
     virtual bool isWaitingForApplierToDrain() override;
 
     virtual void signalDrainComplete(OperationContext* txn) override;
+
+    virtual Status waitForDrainFinish(Milliseconds timeout) override;
 
     virtual void signalUpstreamUpdater() override;
 
@@ -255,7 +264,9 @@ public:
 
     virtual void resetLastOpTimeFromOplog(OperationContext* txn) override;
 
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource) override;
+    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
+                                        const OpTime& syncSourceLastOpTime,
+                                        bool syncSourceHasSyncSource) override;
 
     virtual OpTime getLastCommittedOpTime() const override;
 
@@ -268,7 +279,6 @@ public:
 
     void prepareReplResponseMetadata(const rpc::RequestInterface&,
                                      const OpTime& lastOpTimeFromClient,
-                                     const ReadConcernArgs& readConcern,
                                      BSONObjBuilder* builder) override;
 
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
@@ -284,7 +294,7 @@ public:
      */
     virtual long long getTerm() override;
 
-    virtual Status updateTerm(long long term) override;
+    virtual Status updateTerm(OperationContext* txn, long long term) override;
 
     virtual SnapshotName reserveSnapshotName(OperationContext* txn) override;
 
@@ -294,7 +304,12 @@ public:
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() override;
 
-    virtual void waitForNewSnapshot(OperationContext* txn) override;
+    virtual void waitUntilSnapshotCommitted(OperationContext* txn,
+                                            const SnapshotName& untilSnapshot) override;
+
+    virtual void appendConnectionStats(BSONObjBuilder* b) override;
+
+    virtual size_t getNumUncommittedSnapshots() override;
 
     // ================== Test support API ===================
 
@@ -314,6 +329,12 @@ public:
      * Returns Date_t() if callback is not scheduled.
      */
     Date_t getElectionTimeout_forTest() const;
+
+    /**
+     * Returns scheduled time of priority takeover callback.
+     * Returns Date_t() if callback is not scheduled.
+     */
+    Date_t getPriorityTakeover_forTest() const;
 
     /**
      * Simple wrapper around _setLastOptime_inlock to make it easier to test.
@@ -346,9 +367,14 @@ public:
                                                                  bool* success);
 
     /**
-     * Waits until _memberState becomes 'expectedState'.
+     * Non-blocking version of updateTerm.
+     * Returns event handle that we can use to wait for the operation to complete.
+     * When the operation is complete (waitForEvent() returns), 'updateResult' will be set
+     * to a status telling if the term increased or a stepdown was triggered.
+
      */
-    void waitForMemberState_forTest(const MemberState& expectedState);
+    ReplicationExecutor::EventHandle updateTerm_forTest(
+        long long term, TopologyCoordinator::UpdateTermResult* updateResult);
 
     /**
      * If called after _startElectSelfV1(), blocks until all asynchronous
@@ -363,16 +389,12 @@ public:
      */
     void waitForElectionDryRunFinish_forTest();
 
-    /**
-     * If called after a stepdown starts, blocks until all asynchronous activities associated with
-     * stepdown complete.
-     */
-    void waitForStepDownFinish_forTest();
-
 private:
     using CallbackFn = executor::TaskExecutor::CallbackFn;
 
     using CallbackHandle = executor::TaskExecutor::CallbackHandle;
+
+    using EventHandle = executor::TaskExecutor::EventHandle;
 
     using ScheduleFn = stdx::function<StatusWith<executor::TaskExecutor::CallbackHandle>(
         const executor::TaskExecutor::CallbackFn& work)>;
@@ -606,7 +628,6 @@ private:
      */
     void _prepareReplResponseMetadata_finish(const ReplicationExecutor::CallbackArgs& cbData,
                                              const OpTime& lastOpTimeFromClient,
-                                             const ReadConcernArgs& readConcern,
                                              rpc::ReplSetMetadata* metadata);
     /**
      * Scheduled to cause the ReplicationCoordinator to reconsider any state that might
@@ -670,6 +691,7 @@ private:
                            Date_t waitUntil,
                            Date_t stepdownUntil,
                            bool force,
+                           bool restartHeartbeats,
                            Status* result);
 
     OID _getMyRID_inlock() const;
@@ -753,7 +775,13 @@ private:
     /**
      * Cancels all heartbeats.  Called within executor context.
      */
-    void _cancelHeartbeats();
+    void _cancelHeartbeats_inlock();
+
+    /**
+     * Cancels all heartbeats, then starts a heartbeat for each member in the current config.
+     * Called within the executor context.
+     */
+    void _restartHeartbeats_inlock(const ReplicationExecutor::CallbackArgs& cbData);
 
     /**
      * Asynchronously sends a heartbeat to "target". "targetIndex" is the index
@@ -896,12 +924,6 @@ private:
     void _onVoteRequestComplete(long long originalTerm);
 
     /**
-     * Callback called when the ElectWinnerDeclarer has completed; checks the results and
-     * if we received any negative responses, relinquish primary.
-     */
-    void _onElectionWinnerDeclarerComplete();
-
-    /**
      * Callback called after a random delay, to prevent repeated election ties.
      */
     void _recoverFromElectionTie(const ReplicationExecutor::CallbackArgs& cbData);
@@ -943,6 +965,8 @@ private:
      */
     void _shouldChangeSyncSource(const ReplicationExecutor::CallbackArgs& cbData,
                                  const HostAndPort& currentSource,
+                                 const OpTime& syncSourceLastOpTime,
+                                 bool syncSourceHasSyncSource,
                                  bool* shouldChange);
 
     /**
@@ -950,13 +974,15 @@ private:
      */
     void _requestRemotePrimaryStepdown(const HostAndPort& target);
 
-    void _stepDownStart();
+    ReplicationExecutor::EventHandle _stepDownStart();
 
     /**
      * Completes a step-down of the current node.  Must be run with a global
      * shared or global exclusive lock.
+     * Signals 'finishedEvent' on successful completion.
      */
-    void _stepDownFinish(const ReplicationExecutor::CallbackArgs& cbData);
+    void _stepDownFinish(const ReplicationExecutor::CallbackArgs& cbData,
+                         const ReplicationExecutor::EventHandle& finishedEvent);
 
     /**
      * Schedules a replica set config change.
@@ -1030,16 +1056,20 @@ private:
     /**
      * Callback that attempts to set the current term in topology coordinator and
      * relinquishes primary if the term actually changes and we are primary.
-     * Returns true if the term increased.
+     * *updateTermResult will be the result of the update term attempt.
+     * Returns the finish event if it does not finish in this function, for example,
+     * due to stepdown, otherwise the returned EventHandle is invalid.
      */
-    bool _updateTerm_incallback(long long term);
+    EventHandle _updateTerm_incallback(
+        long long term, TopologyCoordinator::UpdateTermResult* updateTermResult = nullptr);
 
     /**
      * Callback that processes the ReplSetMetadata returned from a command run against another
      * replica set member and updates protocol version 1 information (most recent optime that is
      * committed, member id of the current PRIMARY, the current config version and the current term)
+     * Returns the finish event which is invalid if the process has already finished.
      */
-    void _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata);
+    EventHandle _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata);
 
     /**
      * Blesses a snapshot to be used for new committed reads.
@@ -1089,8 +1119,10 @@ private:
 
     /**
      * Callback which starts an election if this node is electable and using protocolVersion 1.
+     * "isPriorityTakeover" is used to determine if the caller was a priority takeover or not and
+     * log messages accordingly.
      */
-    void _startElectSelfIfEligibleV1();
+    void _startElectSelfIfEligibleV1(bool isPriorityTakeover);
 
     /**
      * Reset the term of last vote to 0 to prevent any node from voting for term 0.
@@ -1130,6 +1162,13 @@ private:
      * Do not call this function directly.
      */
     static CallbackHandle _wrapAndScheduleWork(ScheduleFn scheduleFn, const CallbackFn& work);
+
+    /**
+     * Creates an event.
+     * Returns invalid event handle if the executor is shutting down.
+     * Otherwise aborts on non-shutdown error.
+     */
+    EventHandle _makeEvent();
 
     /**
      * Schedule notification of election win.
@@ -1221,14 +1260,14 @@ private:
     // Current ReplicaSet state.
     MemberState _memberState;  // (MX)
 
+    // Used to signal threads waiting for changes to _memberState.
+    stdx::condition_variable _drainFinishedCond;  // (M)
+
     // True if we are waiting for the applier to finish draining.
     bool _isWaitingForDrainToComplete;  // (M)
 
     // Used to signal threads waiting for changes to _rsConfigState.
     stdx::condition_variable _rsConfigStateChange;  // (M)
-
-    // Used to signal threads that are waiting for new snapshots.
-    stdx::condition_variable _snapshotCreatedCond;  // (M)
 
     // Represents the configuration state of the coordinator, which controls how and when
     // _rsConfig may change.  See the state transition diagram in the type definition of
@@ -1298,13 +1337,20 @@ private:
     AtomicUInt64 _snapshotNameGenerator;  // (S)
 
     // The OpTimes and SnapshotNames for all snapshots newer than the current commit point, kept in
-    // sorted order.
+    // sorted order. Any time this is changed, you must also update _uncommitedSnapshotsSize.
     std::deque<SnapshotInfo> _uncommittedSnapshots;  // (M)
+
+    // A cache of the size of _uncommittedSnaphots that can be read without any locking.
+    // May only be written to while holding _mutex.
+    AtomicUInt64 _uncommittedSnapshotsSize;  // (I)
 
     // The non-null OpTime and SnapshotName of the current snapshot used for committed reads, if
     // there is one.
     // When engaged, this must be <= _lastCommittedOpTime and < _uncommittedSnapshots.front().
     boost::optional<SnapshotInfo> _currentCommittedSnapshot;  // (M)
+
+    // Used to signal threads that are waiting for new committed snapshots.
+    stdx::condition_variable _currentCommittedSnapshotCond;  // (M)
 
     // The cached current term. It's in sync with the term in topology coordinator.
     long long _cachedTerm = OpTime::kUninitializedTerm;  // (M)
@@ -1323,6 +1369,11 @@ private:
     // Callback Handle used to cancel a scheduled PriorityTakover callback.
     ReplicationExecutor::CallbackHandle _priorityTakeoverCbh;  // (M)
 
+    // Priority takeover callback will not run before this time.
+    // If this date is Date_t(), the callback is either unscheduled or canceled.
+    // Used for testing only.
+    Date_t _priorityTakeoverWhen;  // (M)
+
     // Callback handle used by waitForStartUpComplete() to block until configuration
     // is loaded and external state threads have been started (unless this node is an arbiter).
     // Used for testing only.
@@ -1335,9 +1386,6 @@ private:
 
     // Cached copy of the current config protocol version.
     AtomicInt64 _protVersion;  // (S)
-
-    // Prevents a busy loop of cancelling heartbeats when we have no sync source.
-    bool _justLostSyncSource = true;  // (M)
 };
 
 }  // namespace repl

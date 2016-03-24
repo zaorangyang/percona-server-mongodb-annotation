@@ -322,7 +322,6 @@ public:
     boost::optional<Document> getNext() final;
     const char* getSourceName() const final;
     Value serialize(bool explain = false) const final;
-    void setSource(DocumentSource* pSource) final;
     bool coalesce(const boost::intrusive_ptr<DocumentSource>& nextSource) final;
     bool isValidInitialSource() const final {
         return true;
@@ -557,7 +556,6 @@ private:
     std::string _processName;
 };
 
-
 class DocumentSourceMatch final : public DocumentSource {
 public:
     // virtuals from DocumentSource
@@ -611,7 +609,6 @@ public:
 
     // virtuals from DocumentSource
     boost::optional<Document> getNext();
-    void setSource(DocumentSource* pSource) final;
     const char* getSourceName() const final;
     void dispose() final;
     Value serialize(bool explain = false) const final;
@@ -674,7 +671,6 @@ public:
     boost::optional<Document> getNext() override;
     const char* getSourceName() const override;
     Value serialize(bool explain = false) const override;
-    void setSource(DocumentSource* pSource) override;
     void dispose() override;
     bool isValidInitialSource() const override {
         return true;
@@ -1158,7 +1154,7 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const std::string& path,
         bool includeNullIfEmptyOrMissing,
-        bool includeArrayIndex);
+        const boost::optional<std::string>& includeArrayIndex);
 
     std::string getUnwindPath() const {
         return _unwindPath.getPath(false);
@@ -1168,24 +1164,24 @@ public:
         return _preserveNullAndEmptyArrays;
     }
 
-    bool includeArrayIndex() const {
-        return _includeArrayIndex;
+    const boost::optional<FieldPath>& indexPath() const {
+        return _indexPath;
     }
 
 private:
     DocumentSourceUnwind(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
                          const FieldPath& fieldPath,
                          bool includeNullIfEmptyOrMissing,
-                         bool includeArrayIndex);
+                         const boost::optional<FieldPath>& includeArrayIndex);
 
     // Configuration state.
     const FieldPath _unwindPath;
     // Documents that have a nullish value, or an empty array for the field '_unwindPath', will pass
     // through the $unwind stage unmodified if '_preserveNullAndEmptyArrays' is true.
     const bool _preserveNullAndEmptyArrays;
-    // If set, the $unwind stage will replace the unwound field with a sub-document with structure
-    // {index: <array index>, value: <array value>} instead of just the array value.
-    const bool _includeArrayIndex;
+    // If set, the $unwind stage will include the array index in the specified path, overwriting any
+    // existing value, setting to null when the value was a non-array or empty array.
+    const boost::optional<FieldPath> _indexPath;
 
     // Iteration state.
     class Unwinder;
@@ -1199,7 +1195,6 @@ public:
     // virtuals from DocumentSource
     boost::optional<Document> getNext() final;
     const char* getSourceName() const final;
-    void setSource(DocumentSource* pSource) final;
     bool coalesce(const boost::intrusive_ptr<DocumentSource>& pNextSource) final;
     bool isValidInitialSource() const final {
         return true;
@@ -1246,5 +1241,66 @@ private:
     // these fields are used while processing the results
     BSONObj cmdOutput;
     std::unique_ptr<BSONObjIterator> resultsIterator;  // iterator over cmdOutput["results"]
+};
+
+/**
+ * Queries separate collection for equality matches with documents in the pipeline collection.
+ * Adds matching documents to a new array field in the input document.
+ */
+class DocumentSourceLookUp final : public DocumentSource,
+                                   public SplittableDocumentSource,
+                                   public DocumentSourceNeedsMongod {
+public:
+    boost::optional<Document> getNext() final;
+    const char* getSourceName() const final;
+    bool coalesce(const boost::intrusive_ptr<DocumentSource>& pNextSource) final;
+    void serializeToArray(std::vector<Value>& array, bool explain = false) const final;
+    GetDepsReturn getDependencies(DepsTracker* deps) const final;
+    void dispose() final;
+
+    bool needsPrimaryShard() const final {
+        return true;
+    }
+
+    boost::intrusive_ptr<DocumentSource> getShardSource() final {
+        return nullptr;
+    }
+
+    boost::intrusive_ptr<DocumentSource> getMergeSource() final {
+        return this;
+    }
+
+    void addInvolvedCollections(std::vector<NamespaceString>* collections) const final {
+        collections->push_back(_fromNs);
+    }
+
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+private:
+    DocumentSourceLookUp(NamespaceString fromNs,
+                         std::string as,
+                         std::string localField,
+                         std::string foreignField,
+                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    Value serialize(bool explain = false) const final {
+        invariant(false);
+    }
+
+    boost::optional<Document> unwindResult();
+    BSONObj queryForInput(const Document& input) const;
+
+    NamespaceString _fromNs;
+    FieldPath _as;
+    FieldPath _localField;
+    FieldPath _foreignField;
+    std::string _foreignFieldFieldName;
+
+    boost::intrusive_ptr<DocumentSourceUnwind> _unwindSrc;
+    bool _handlingUnwind = false;
+    std::unique_ptr<DBClientCursor> _cursor;
+    long long _cursorIndex = 0;
+    boost::optional<Document> _input;
 };
 }

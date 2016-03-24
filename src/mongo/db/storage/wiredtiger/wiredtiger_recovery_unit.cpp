@@ -151,8 +151,13 @@ void WiredTigerRecoveryUnit::_ensureSession() {
 
 bool WiredTigerRecoveryUnit::waitUntilDurable() {
     invariant(!_inUnitOfWork);
-    _ensureSession();
-    _sessionCache->waitUntilDurable(_session);
+    // For inMemory storage engines, the data is "as durable as it's going to get".
+    // That is, a restart is equivalent to a complete node failure.
+    if (_sessionCache->isEphemeral()) {
+        return true;
+    }
+    // _session may be nullptr. We cannot _ensureSession() here as that needs shutdown protection.
+    _sessionCache->waitUntilDurable(false);
     return true;
 }
 
@@ -176,6 +181,11 @@ WiredTigerSession* WiredTigerRecoveryUnit::getSession(OperationContext* opCtx) {
     if (!_active) {
         _txnOpen(opCtx);
     }
+    return _session;
+}
+
+WiredTigerSession* WiredTigerRecoveryUnit::getSessionNoTxn(OperationContext* opCtx) {
+    _ensureSession();
     return _session;
 }
 

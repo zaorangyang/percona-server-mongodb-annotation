@@ -26,7 +26,6 @@ env.Library(
         "$BUILD_DIR/mongo/db/index/expression_params",
         "$BUILD_DIR/mongo/db/matcher/expression_algo",
         "$BUILD_DIR/mongo/db/matcher/expressions",
-        "$BUILD_DIR/mongo/db/matcher/expressions_text",
         "$BUILD_DIR/mongo/db/index_names",
         "$BUILD_DIR/mongo/db/server_parameters",
         "command_request_response",
@@ -83,7 +82,6 @@ env.CppUnitTest(
     LIBDEPS=[
         "query",
         "$BUILD_DIR/mongo/db/serveronly",
-        "$BUILD_DIR/mongo/db/coredb",
         "$BUILD_DIR/mongo/dbtests/mocklib",
         "$BUILD_DIR/mongo/util/ntservice_mock",
     ],
@@ -126,6 +124,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/repl/optime',
         '$BUILD_DIR/mongo/rpc/command_status',
+        'lite_parsed_query',
     ]
 )
 
@@ -199,7 +198,6 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "query_planner",
-        "$BUILD_DIR/mongo/db/matcher/expressions_text",
     ],
 )
 
@@ -352,7 +350,6 @@ env.CppUnitTest(
         "query",
         "query_planner_test_fixture",
         "$BUILD_DIR/mongo/db/serveronly",
-        "$BUILD_DIR/mongo/db/coredb",
         "$BUILD_DIR/mongo/dbtests/mocklib",
         "$BUILD_DIR/mongo/util/ntservice_mock",
     ],

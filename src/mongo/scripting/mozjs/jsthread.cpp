@@ -88,17 +88,12 @@ public:
                 "first argument must be a function",
                 args.get(0).isObject() && JS_ObjectIsFunction(cx, args.get(0).toObjectOrNull()));
 
-        JS::RootedObject robj(cx, JS_NewPlainObject(cx));
-        ObjectWrapper wobj(cx, robj);
-        for (unsigned i = 0; i < args.length(); ++i) {
-            // 10 decimal digits for a 32 bit unsigned, then 1 for the null
-            char buf[11];
-            std::sprintf(buf, "%i", i);
-
-            wobj.setValue(buf, args.get(i));
+        JS::RootedObject robj(cx, JS_NewArrayObject(cx, args));
+        if (!robj) {
+            uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_NewArrayObject");
         }
 
-        _sharedData->_args = wobj.toBSON();
+        _sharedData->_args = ObjectWrapper(cx, robj).toBSON();
 
         _sharedData->_stack = currentJSStackToString(cx);
 
@@ -225,7 +220,7 @@ namespace {
 
 JSThreadConfig* getConfig(JSContext* cx, JS::CallArgs args) {
     JS::RootedValue value(cx);
-    ObjectWrapper(cx, args.thisv()).getValue("_JSThreadConfig", &value);
+    ObjectWrapper(cx, args.thisv()).getValue(InternedString::_JSThreadConfig, &value);
 
     if (!value.isObject())
         uasserted(ErrorCodes::BadValue, "_JSThreadConfig not an object");
@@ -255,7 +250,7 @@ void JSThreadInfo::Functions::init::call(JSContext* cx, JS::CallArgs args) {
     JSThreadConfig* config = new JSThreadConfig(cx, args);
     JS_SetPrivate(obj, config);
 
-    ObjectWrapper(cx, args.thisv()).setObject("_JSThreadConfig", obj);
+    ObjectWrapper(cx, args.thisv()).setObject(InternedString::_JSThreadConfig, obj);
 
     args.rval().setUndefined();
 }
@@ -277,8 +272,8 @@ void JSThreadInfo::Functions::hasFailed::call(JSContext* cx, JS::CallArgs args) 
 }
 
 void JSThreadInfo::Functions::returnData::call(JSContext* cx, JS::CallArgs args) {
-    ValueReader(cx, args.rval())
-        .fromBSONElement(getConfig(cx, args)->returnData().firstElement(), true);
+    auto obj = getConfig(cx, args)->returnData();
+    ValueReader(cx, args.rval()).fromBSONElement(obj.firstElement(), obj, true);
 }
 
 void JSThreadInfo::Functions::_threadInject::call(JSContext* cx, JS::CallArgs args) {

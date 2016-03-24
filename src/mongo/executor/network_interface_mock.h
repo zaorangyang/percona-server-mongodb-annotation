@@ -75,6 +75,7 @@ public:
 
     NetworkInterfaceMock();
     virtual ~NetworkInterfaceMock();
+    virtual void appendConnectionStats(BSONObjBuilder* b);
     virtual std::string getDiagnosticString();
 
     ////////////////////////////////////////////////////////////////////////////////
@@ -100,6 +101,8 @@ public:
      */
     void cancelAllCommands() override {}
     virtual void setAlarm(Date_t when, const stdx::function<void()>& action);
+
+    virtual bool onNetworkThread();
 
 
     ////////////////////////////////////////////////////////////////////////////////

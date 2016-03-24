@@ -46,7 +46,7 @@
 #include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/mmap_v1/file_allocator.h"
 #include "mongo/util/log.h"
 
@@ -58,6 +58,8 @@ using std::ifstream;
 using std::string;
 using std::stringstream;
 using std::vector;
+
+MMAPV1Options mmapv1GlobalOptions;
 
 namespace {
 

@@ -37,7 +37,7 @@ namespace executor {
 
 class AsyncStream final : public AsyncStreamInterface {
 public:
-    AsyncStream(asio::io_service* io_service);
+    AsyncStream(asio::io_service::strand* strand);
 
     ~AsyncStream();
 
@@ -49,7 +49,10 @@ public:
 
     void cancel() override;
 
+    bool isOpen() override;
+
 private:
+    asio::io_service::strand* const _strand;
     asio::ip::tcp::socket _stream;
     bool _connected = false;
 };

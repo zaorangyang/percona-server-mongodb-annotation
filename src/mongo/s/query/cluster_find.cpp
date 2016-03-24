@@ -39,7 +39,6 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/find_common.h"
@@ -172,9 +171,10 @@ StatusWith<CursorId> runConfigServerQuerySCCC(const CanonicalQuery& query,
         throw RecvStaleConfigException("find command failed because of stale config", result);
     }
 
+    auto executorPool = grid.shardRegistry()->getExecutorPool();
     auto transformedResult = storePossibleCursor(HostAndPort(cursor->originalHost()),
                                                  result,
-                                                 grid.shardRegistry()->getExecutor(),
+                                                 executorPool->getArbitraryExecutor(),
                                                  grid.getCursorManager());
     if (!transformedResult.isOK()) {
         return transformedResult.getStatus();
@@ -185,11 +185,11 @@ StatusWith<CursorId> runConfigServerQuerySCCC(const CanonicalQuery& query,
         return outgoingCursorResponse.getStatus();
     }
 
-    for (const auto& doc : outgoingCursorResponse.getValue().batch) {
+    for (const auto& doc : outgoingCursorResponse.getValue().getBatch()) {
         results->push_back(doc.getOwned());
     }
 
-    return outgoingCursorResponse.getValue().cursorId;
+    return outgoingCursorResponse.getValue().getCursorId();
 }
 
 StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
@@ -208,21 +208,19 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
         invariant(chunkManager);
 
         std::set<ShardId> shardIds;
-        chunkManager->getShardIdsForQuery(shardIds, query.getParsed().getFilter());
+        chunkManager->getShardIdsForQuery(txn, query.getParsed().getFilter(), &shardIds);
 
         for (auto id : shardIds) {
             shards.emplace_back(shardRegistry->getShard(txn, id));
         }
     }
 
-    ClusterClientCursorParams params(query.nss());
-    params.txn = txn;
-    params.shardRegistry = shardRegistry;
+    ClusterClientCursorParams params(query.nss(), readPref);
     params.limit = query.getParsed().getLimit();
     params.batchSize = query.getParsed().getEffectiveBatchSize();
     params.skip = query.getParsed().getSkip();
     params.isTailable = query.getParsed().isTailable();
-    params.isSecondaryOk = (readPref.pref != ReadPreference::PrimaryOnly);
+    params.isAwaitData = query.getParsed().isAwaitData();
     params.isAllowPartialResults = query.getParsed().isAllowPartialResults();
 
     // This is the batchSize passed to each subsequent getMore command issued by the cursor. We
@@ -254,12 +252,6 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
             return runConfigServerQuerySCCC(query, *shard, results);
         }
 
-        auto targeter = shard->getTargeter();
-        auto hostAndPort = targeter->findHost(readPref);
-        if (!hostAndPort.isOK()) {
-            return hostAndPort.getStatus();
-        }
-
         // Build the find command, and attach shard version if necessary.
         BSONObjBuilder cmdBuilder;
         lpqToForward->asFindCommand(&cmdBuilder);
@@ -272,34 +264,26 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
             version.appendForCommands(&cmdBuilder);
         }
 
-        params.remotes.emplace_back(
-            std::move(hostAndPort.getValue()), shard->getId(), cmdBuilder.obj());
+        params.remotes.emplace_back(shard->getId(), cmdBuilder.obj());
     }
 
-    auto ccc =
-        stdx::make_unique<ClusterClientCursorImpl>(shardRegistry->getExecutor(), std::move(params));
-
-    // Register the cursor with the cursor manager.
-    auto cursorManager = grid.getCursorManager();
-    const auto cursorType = chunkManager ? ClusterCursorManager::CursorType::NamespaceSharded
-                                         : ClusterCursorManager::CursorType::NamespaceNotSharded;
-    const auto cursorLifetime = query.getParsed().isNoCursorTimeout()
-        ? ClusterCursorManager::CursorLifetime::Immortal
-        : ClusterCursorManager::CursorLifetime::Mortal;
-    auto pinnedCursor =
-        cursorManager->registerCursor(std::move(ccc), query.nss(), cursorType, cursorLifetime);
+    auto ccc = ClusterClientCursorImpl::make(
+        shardRegistry->getExecutorPool()->getArbitraryExecutor(), std::move(params));
 
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
     int bytesBuffered = 0;
     while (!FindCommon::enoughForFirstBatch(query.getParsed(), results->size(), bytesBuffered)) {
-        auto next = pinnedCursor.next();
+        auto next = ccc->next();
         if (!next.isOK()) {
             return next.getStatus();
         }
 
         if (!next.getValue()) {
-            // We reached end-of-stream.
-            if (!pinnedCursor.isTailable()) {
+            // We reached end-of-stream. If the cursor is not tailable, then we mark it as
+            // exhausted. If it is tailable, usually we keep it open (i.e. "NotExhausted") even
+            // when we reach end-of-stream. However, if all the remote cursors are exhausted, there
+            // is no hope of returning data and thus we need to close the mongos cursor as well.
+            if (!ccc->isTailable() || ccc->remotesExhausted()) {
                 cursorState = ClusterCursorManager::CursorState::Exhausted;
             }
             break;
@@ -312,7 +296,7 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
         int sizeEstimate = bytesBuffered + next.getValue()->objsize() +
             ((results->size() + 1U) * kPerDocumentOverheadBytesUpperBound);
         if (sizeEstimate > BSONObjMaxUserSize && !results->empty()) {
-            pinnedCursor.queueResult(*next.getValue());
+            ccc->queueResult(*next.getValue());
             break;
         }
 
@@ -321,18 +305,25 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
         results->push_back(std::move(*next.getValue()));
     }
 
-    if (!query.getParsed().wantMore() && !pinnedCursor.isTailable()) {
+    if (!query.getParsed().wantMore() && !ccc->isTailable()) {
         cursorState = ClusterCursorManager::CursorState::Exhausted;
     }
 
-    CursorId idToReturn = (cursorState == ClusterCursorManager::CursorState::Exhausted)
-        ? CursorId(0)
-        : pinnedCursor.getCursorId();
+    // If the cursor is exhausted, then there are no more results to return and we don't need to
+    // allocate a cursor id.
+    if (cursorState == ClusterCursorManager::CursorState::Exhausted) {
+        return CursorId(0);
+    }
 
-    // Transfer ownership of the cursor back to the cursor manager.
-    pinnedCursor.returnCursor(cursorState);
-
-    return idToReturn;
+    // Register the cursor with the cursor manager.
+    auto cursorManager = grid.getCursorManager();
+    const auto cursorType = chunkManager ? ClusterCursorManager::CursorType::NamespaceSharded
+                                         : ClusterCursorManager::CursorType::NamespaceNotSharded;
+    const auto cursorLifetime = query.getParsed().isNoCursorTimeout()
+        ? ClusterCursorManager::CursorLifetime::Immortal
+        : ClusterCursorManager::CursorLifetime::Mortal;
+    return cursorManager->registerCursor(
+        ccc.releaseCursor(), query.nss(), cursorType, cursorLifetime);
 }
 
 }  // namespace
@@ -376,17 +367,26 @@ StatusWith<CursorId> ClusterFind::runQuery(OperationContext* txn,
         }
         auto status = std::move(cursorId.getStatus());
 
-        if (status != ErrorCodes::SendStaleConfig && status != ErrorCodes::RecvStaleConfig &&
-            status != ErrorCodes::HostUnreachable) {
-            // Errors other than receiving a stale config message from mongoD or an unreachable host
-            // are fatal to the operation.
+        if (!ErrorCodes::isStaleShardingError(status.code())) {
+            // Errors other than receiving a stale metadata message from MongoD are fatal to the
+            // operation. Network errors and replication retries happen at the level of the
+            // AsyncResultsMerger.
             return status;
         }
 
         LOG(1) << "Received error status for query " << query.toStringShort() << " on attempt "
                << retries << " of " << kMaxStaleConfigRetries << ": " << status;
 
-        chunkManager = dbConfig.getValue()->getChunkManagerIfExists(txn, query.nss().ns(), true);
+        const bool staleEpoch = (status == ErrorCodes::StaleEpoch);
+        if (staleEpoch) {
+            if (!dbConfig.getValue()->reload(txn)) {
+                // If the reload failed that means the database wasn't found, so successfully return
+                // an empty result set without creating a cursor.
+                return CursorId(0);
+            }
+        }
+        chunkManager =
+            dbConfig.getValue()->getChunkManagerIfExists(txn, query.nss().ns(), true, staleEpoch);
         if (!chunkManager) {
             dbConfig.getValue()->getChunkManagerOrPrimary(
                 txn, query.nss().ns(), chunkManager, primary);
@@ -395,7 +395,7 @@ StatusWith<CursorId> ClusterFind::runQuery(OperationContext* txn,
 
     return {ErrorCodes::StaleShardVersion,
             str::stream() << "Retried " << kMaxStaleConfigRetries
-                          << " times without establishing shard version on a reachable host."};
+                          << " times without successfully establishing shard version."};
 }
 
 StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* txn,
@@ -407,6 +407,13 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* txn,
         return pinnedCursor.getStatus();
     }
     invariant(request.cursorid == pinnedCursor.getValue().getCursorId());
+
+    if (request.awaitDataTimeout) {
+        auto status = pinnedCursor.getValue().setAwaitDataTimeout(*request.awaitDataTimeout);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
 
     std::vector<BSONObj> batch;
     int bytesBuffered = 0;

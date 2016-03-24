@@ -77,8 +77,8 @@ baseSource=[
     'logger/log_component.cpp',
     'logger/log_component_settings.cpp',
     'logger/log_manager.cpp',
-    'logger/logger.cpp',
     'logger/log_severity.cpp',
+    'logger/logger.cpp',
     'logger/logstream_builder.cpp',
     'logger/message_event_utf8_encoder.cpp',
     'logger/message_log_domain.cpp',
@@ -93,10 +93,11 @@ baseSource=[
     'util/concurrency/thread_name.cpp',
     'util/exception_filter_win32.cpp',
     'util/hex.cpp',
+    'util/itoa.cpp',
     'util/log.cpp',
     'util/signal_handlers_synchronous.cpp',
-    'util/stacktrace_${TARGET_OS_FAMILY}.cpp',
     'util/stacktrace.cpp',
+    'util/stacktrace_${TARGET_OS_FAMILY}.cpp',
     'util/static_observer.cpp',
     'util/stringutils.cpp',
     'util/system_clock_source.cpp',
@@ -161,6 +162,7 @@ version_extra = version_parts[3] if version_parts[3] else ""
 if version_parts[4] == 'rc':
     version_parts[3] = int(version_parts[5]) + -50
 elif version_parts[3]:
+    version_parts[2] = int(version_parts[2]) + 1
     version_parts[3] = -100
 else:
     version_parts[3] = 0
@@ -236,24 +238,29 @@ generateConfigHeaderFile = env.Substfile(
 )
 env.Alias('generated-sources', generateConfigHeaderFile)
 
+mongodLibDeps = [
+    "db/commands/core",
+    "db/conn_pool_options",
+    "db/mongod_options",
+    "db/mongodandmongos",
+    "db/mongodwebserver",
+    "db/serveronly",
+    "db/repl/storage_interface_impl",
+    "executor/network_interface_factory",
+    's/commands/shared_cluster_commands',
+    "util/ntservice",
+]
+
+if has_option('use-cpu-profiler'):
+    mongodLibDeps.append('db/cpuprofiler')
+
 mongod = env.Program(
     target="mongod",
     source=[
         "db/db.cpp",
         "db/mongod_options_init.cpp",
     ],
-    LIBDEPS=[
-        "db/coredb",
-        "db/conn_pool_options",
-        "db/mongod_options",
-        "db/mongodandmongos",
-        "db/mongodwebserver",
-        "db/serveronly",
-        "db/repl/storage_interface_impl",
-        "executor/network_interface_factory",
-        's/commands/shared_cluster_commands',
-        "util/ntservice",
-    ],
+    LIBDEPS=mongodLibDeps,
 )
 
 env.Default(env.Install('#/', mongod))
@@ -270,7 +277,6 @@ env.Install(
                         "client/examples/mongoperf.cpp",
                     ],
                     LIBDEPS=[
-                        "db/coredb",
                         "db/serveronly",
                         "util/ntservice_mock",
                     ]),
@@ -288,7 +294,7 @@ env.Install(
         ],
         LIBDEPS=[
             'db/conn_pool_options',
-            'db/coredb',
+            'db/commands/core',
             'db/mongodandmongos',
             's/client/sharding_connection_hook',
             's/commands/cluster_commands',
@@ -320,7 +326,6 @@ if env.TargetOSIs('osx') or env["_HAVEPCAP"]:
     sniffEnv.Install( '#/', sniffEnv.Program( "mongosniff", "tools/sniffer.cpp",
                                               LIBDEPS = [
                                                  "db/serveronly",
-                                                 "db/coredb",
                                               ] ) )
 
 # --- shell ---
@@ -342,13 +347,15 @@ if not has_option('noshell') and usemozjs:
                     "shell/shell_options_init.cpp"
                 ],
                 LIBDEPS=[
-                    'db/index/external_key_generator',
                     'db/catalog/index_key_validate',
+                    'db/index/external_key_generator',
+                    'db/query/command_request_response',
+                    'db/query/lite_parsed_query',
+                    'linenoise_utf8',
                     'scripting/scripting',
+                    'shell/mongojs',
                     'util/processinfo',
                     'util/signal_handlers',
-                    'linenoise_utf8',
-                    'shell/mongojs',
                 ],
                 LIBDEPS_TAGS=[
                     # Circular with shell_options below. It is unclear
@@ -513,6 +520,9 @@ for full_dir, archive_dir in env["ARCHIVE_ADDITION_DIR_MAP"].items():
   archive_addition_transforms.append("--transform \"%s=$SERVER_DIST_BASENAME/%s\"" %
                                      (full_dir, archive_dir))
 
+for target in env["DIST_BINARIES"]:
+    installBinary(env, "db/modules/" + target)
+
 # "dist" target is valid only when --use-new-tools is specified
 # Attempts to build release artifacts without tools must fail
 if has_option("use-new-tools"):
@@ -524,6 +534,8 @@ if has_option("use-new-tools"):
             archive_addition_transforms +
             module_banner_transforms +
             [
+                '--transform $BUILD_DIR/mongo/db/modules/enterprise=$SERVER_DIST_BASENAME/bin',
+                '--transform $BUILD_DIR/mongo/stripped/db/modules/enterprise=$SERVER_DIST_BASENAME/bin',
                 '--transform $BUILD_DIR/mongo/stripped=$SERVER_DIST_BASENAME/bin',
                 '--transform $BUILD_DIR/mongo=$SERVER_DIST_BASENAME/bin',
                 '--transform $BUILD_DIR/mongo/stripped/src/mongo-tools=$SERVER_DIST_BASENAME/bin',
@@ -544,7 +556,14 @@ else:
 debug_symbols_dist = env.Command(
     target='#/${SERVER_DIST_BASENAME}-debugsymbols${DIST_ARCHIVE_SUFFIX}',
     source=['#buildscripts/make_archive.py'] + distDebugSymbols,
-    action='$PYTHON ${SOURCES[0]} -o $TARGET --transform $BUILD_DIR/mongo=$SERVER_DIST_BASENAME ${TEMPFILE(SOURCES[1:])}',
+    action=' '.join(
+        [
+            '$PYTHON ${SOURCES[0]} -o $TARGET',
+            '--transform $BUILD_DIR/mongo/db/modules/enterprise=$SERVER_DIST_BASENAME',
+            '--transform $BUILD_DIR/mongo=$SERVER_DIST_BASENAME',
+            '${TEMPFILE(SOURCES[1:])}',
+        ]
+    ),
     BUILD_DIR=env.Dir('$BUILD_DIR').path
 )
 env.Alias('dist-debugsymbols', debug_symbols_dist)

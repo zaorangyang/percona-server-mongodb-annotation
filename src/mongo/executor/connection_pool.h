@@ -38,6 +38,9 @@
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
+
+class BSONObjBuilder;
+
 namespace executor {
 
 /**
@@ -65,6 +68,8 @@ public:
     static const Milliseconds kDefaultRefreshTimeout;
     static const Milliseconds kDefaultRefreshRequirement;
     static const Milliseconds kDefaultHostTimeout;
+
+    static const Status kConnectionStateUnknown;
 
     struct Options {
         Options() {}
@@ -110,9 +115,7 @@ public:
 
     void get(const HostAndPort& hostAndPort, Milliseconds timeout, GetConnectionCallback cb);
 
-    /**
-     * TODO add a function returning connection pool stats
-     */
+    void appendConnectionStats(BSONObjBuilder* b);
 
 private:
     void returnConnection(ConnectionInterface* connection);
@@ -187,22 +190,28 @@ public:
     virtual ~ConnectionInterface() = default;
 
     /**
-     * Intended to be called whenever a socket is used in a way which indicates
-     * liveliness. I.e. if an operation is executed over the connection.
+     * Indicates that the user is now done with this connection. Users MUST call either
+     * this method or indicateFailure() before returning the connection to its pool.
      */
-    virtual void indicateUsed() = 0;
+    virtual void indicateSuccess() = 0;
 
     /**
      * Indicates that a connection has failed. This will prevent the connection
-     * from re-entering the connection pool.
+     * from re-entering the connection pool. Users MUST call either this method or
+     * indicateSuccess() before returning connections to the pool.
      */
-    virtual void indicateFailed(Status status) = 0;
+    virtual void indicateFailure(Status status) = 0;
 
     /**
      * The HostAndPort for the connection. This should be the same as the
      * HostAndPort passed to DependentTypeFactoryInterface::makeConnection.
      */
     virtual const HostAndPort& getHostAndPort() const = 0;
+
+    /**
+     * Check if the connection is healthy using some implementation defined condition.
+     */
+    virtual bool isHealthy() = 0;
 
 protected:
     /**
@@ -213,6 +222,12 @@ protected:
     using RefreshCallback = stdx::function<void(ConnectionInterface*, Status)>;
 
 private:
+    /**
+     * This method updates a 'liveness' timestamp to avoid unnecessarily refreshing
+     * the connection.
+     */
+    virtual void indicateUsed() = 0;
+
     /**
      * Returns the last used time point for the connection
      */
@@ -229,6 +244,11 @@ private:
      * other associated hooks.
      */
     virtual void setup(Milliseconds timeout, SetupCallback cb) = 0;
+
+    /**
+     * Resets the connection's state to kConnectionStateUnknown for the next user.
+     */
+    virtual void resetToUnknown() = 0;
 
     /**
      * Refreshes the connection. This should involve a network round trip and

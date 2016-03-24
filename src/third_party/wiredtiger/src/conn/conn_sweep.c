@@ -136,7 +136,8 @@ __sweep_expire(WT_SESSION_IMPL *session, time_t now)
 		    !F_ISSET(dhandle, WT_DHANDLE_OPEN) ||
 		    dhandle->session_inuse != 0 ||
 		    dhandle->timeofdeath == 0 ||
-		    now <= dhandle->timeofdeath + conn->sweep_idle_time)
+		    difftime(now, dhandle->timeofdeath) <=
+		    conn->sweep_idle_time)
 			continue;
 
 		WT_WITH_DHANDLE(session, dhandle,
@@ -276,8 +277,8 @@ __sweep_server(void *arg)
 	while (F_ISSET(conn, WT_CONN_SERVER_RUN) &&
 	    F_ISSET(conn, WT_CONN_SERVER_SWEEP)) {
 		/* Wait until the next event. */
-		WT_ERR(__wt_cond_wait(session, conn->sweep_cond,
-		    (uint64_t)conn->sweep_interval * WT_MILLION));
+		WT_ERR(__wt_cond_wait(session,
+		    conn->sweep_cond, conn->sweep_interval * WT_MILLION));
 		WT_ERR(__wt_seconds(session, &now));
 
 		WT_STAT_FAST_CONN_INCR(session, dh_sweeps);
@@ -329,18 +330,25 @@ __wt_sweep_config(WT_SESSION_IMPL *session, const char *cfg[])
 
 	conn = S2C(session);
 
-	/* Pull out the sweep configurations. */
-	WT_RET(__wt_config_gets(session,
-	    cfg, "file_manager.close_idle_time", &cval));
-	conn->sweep_idle_time = (time_t)cval.val;
+	/*
+	 * A non-zero idle time is incompatible with in-memory, and the default
+	 * is non-zero; set the in-memory configuration idle time to zero.
+	 */
+	conn->sweep_idle_time = 0;
+	WT_RET(__wt_config_gets(session, cfg, "in_memory", &cval));
+	if (cval.val == 0) {
+		WT_RET(__wt_config_gets(session,
+		    cfg, "file_manager.close_idle_time", &cval));
+		conn->sweep_idle_time = (uint64_t)cval.val;
+	}
 
 	WT_RET(__wt_config_gets(session,
 	    cfg, "file_manager.close_scan_interval", &cval));
-	conn->sweep_interval = (time_t)cval.val;
+	conn->sweep_interval = (uint64_t)cval.val;
 
 	WT_RET(__wt_config_gets(session,
 	    cfg, "file_manager.close_handle_minimum", &cval));
-	conn->sweep_handles_min = (u_int)cval.val;
+	conn->sweep_handles_min = (uint64_t)cval.val;
 
 	return (0);
 }
@@ -353,15 +361,12 @@ int
 __wt_sweep_create(WT_SESSION_IMPL *session)
 {
 	WT_CONNECTION_IMPL *conn;
+	uint32_t session_flags;
 
 	conn = S2C(session);
 
 	/* Set first, the thread might run before we finish up. */
 	F_SET(conn, WT_CONN_SERVER_SWEEP);
-
-	WT_RET(__wt_open_internal_session(
-	    conn, "sweep-server", true, true, &conn->sweep_session));
-	session = conn->sweep_session;
 
 	/*
 	 * Handle sweep does enough I/O it may be called upon to perform slow
@@ -372,8 +377,11 @@ __wt_sweep_create(WT_SESSION_IMPL *session)
 	 *
 	 * Don't tap the sweep thread for eviction.
 	 */
-	F_SET(session, WT_SESSION_CAN_WAIT |
-	    WT_SESSION_LOOKASIDE_CURSOR | WT_SESSION_NO_EVICTION);
+	session_flags = WT_SESSION_CAN_WAIT |
+	    WT_SESSION_LOOKASIDE_CURSOR | WT_SESSION_NO_EVICTION;
+	WT_RET(__wt_open_internal_session(
+	    conn, "sweep-server", true, session_flags, &conn->sweep_session));
+	session = conn->sweep_session;
 
 	WT_RET(__wt_cond_alloc(
 	    session, "handle sweep server", false, &conn->sweep_cond));

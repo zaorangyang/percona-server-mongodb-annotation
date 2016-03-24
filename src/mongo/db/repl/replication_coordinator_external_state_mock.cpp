@@ -58,13 +58,17 @@ ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock
 
 ReplicationCoordinatorExternalStateMock::~ReplicationCoordinatorExternalStateMock() {}
 
-void ReplicationCoordinatorExternalStateMock::startThreads() {
+void ReplicationCoordinatorExternalStateMock::startThreads(const ReplSettings& settings) {
     _threadsStarted = true;
 }
 
 void ReplicationCoordinatorExternalStateMock::startMasterSlave(OperationContext*) {}
-void ReplicationCoordinatorExternalStateMock::initiateOplog(OperationContext* txn,
-                                                            bool updateReplOpTime) {}
+Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(OperationContext* txn,
+                                                                         const BSONObj& config,
+                                                                         bool updateReplOpTime) {
+    return storeLocalConfigDocument(txn, config);
+}
+
 void ReplicationCoordinatorExternalStateMock::shutdown() {}
 void ReplicationCoordinatorExternalStateMock::forwardSlaveProgress() {}
 
@@ -142,6 +146,8 @@ void ReplicationCoordinatorExternalStateMock::setLocalLastVoteDocument(
 
 void ReplicationCoordinatorExternalStateMock::setGlobalTimestamp(const Timestamp& newTime) {}
 
+void ReplicationCoordinatorExternalStateMock::cleanUpLastApplyBatch(OperationContext* txn) {}
+
 StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::loadLastOpTime(OperationContext* txn) {
     return _lastOpTime;
 }
@@ -190,6 +196,8 @@ void ReplicationCoordinatorExternalStateMock::killAllUserOperations(OperationCon
 
 void ReplicationCoordinatorExternalStateMock::clearShardingState() {}
 
+void ReplicationCoordinatorExternalStateMock::recoverShardingState(OperationContext* txn) {}
+
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
 
 void ReplicationCoordinatorExternalStateMock::signalApplierToCancelFetcher() {
@@ -215,6 +223,15 @@ bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
 }
 
 void ReplicationCoordinatorExternalStateMock::notifyOplogMetadataWaiters() {}
+
+double ReplicationCoordinatorExternalStateMock::getElectionTimeoutOffsetLimitFraction() const {
+    return 0.15;
+}
+
+bool ReplicationCoordinatorExternalStateMock::isReadCommittedSupportedByStorageEngine(
+    OperationContext* txn) const {
+    return true;
+}
 
 void ReplicationCoordinatorExternalStateMock::logTransitionToPrimaryToOplog(OperationContext* txn) {
     _lastOpTime = OpTime(Timestamp(1, 0), 1);

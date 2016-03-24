@@ -122,6 +122,46 @@ TEST(RouterStageRemoveSortKeyTest, ToleratesMidStreamEOF) {
     ASSERT(!fourthResult.getValue());
 }
 
+TEST(RouterStageRemoveSortKeyTest, RemotesExhausted) {
+    auto mockStage = stdx::make_unique<RouterStageMock>();
+    mockStage->queueResult(BSON("a" << 1 << "$sortKey" << 1 << "b" << 1));
+    mockStage->queueResult(BSON("a" << 2 << "$sortKey" << 1 << "b" << 2));
+    mockStage->markRemotesExhausted();
+
+    auto sortKeyStage = stdx::make_unique<RouterStageRemoveSortKey>(std::move(mockStage));
+    ASSERT_TRUE(sortKeyStage->remotesExhausted());
+
+    auto firstResult = sortKeyStage->next();
+    ASSERT_OK(firstResult.getStatus());
+    ASSERT(firstResult.getValue());
+    ASSERT_EQ(*firstResult.getValue(), BSON("a" << 1 << "b" << 1));
+    ASSERT_TRUE(sortKeyStage->remotesExhausted());
+
+    auto secondResult = sortKeyStage->next();
+    ASSERT_OK(secondResult.getStatus());
+    ASSERT(secondResult.getValue());
+    ASSERT_EQ(*secondResult.getValue(), BSON("a" << 2 << "b" << 2));
+    ASSERT_TRUE(sortKeyStage->remotesExhausted());
+
+    auto thirdResult = sortKeyStage->next();
+    ASSERT_OK(thirdResult.getStatus());
+    ASSERT(!thirdResult.getValue());
+    ASSERT_TRUE(sortKeyStage->remotesExhausted());
+}
+
+TEST(RouterStageRemoveSortKeyTest, ForwardsAwaitDataTimeout) {
+    auto mockStage = stdx::make_unique<RouterStageMock>();
+    auto mockStagePtr = mockStage.get();
+    ASSERT_NOT_OK(mockStage->getAwaitDataTimeout().getStatus());
+
+    auto sortKeyStage = stdx::make_unique<RouterStageRemoveSortKey>(std::move(mockStage));
+    ASSERT_OK(sortKeyStage->setAwaitDataTimeout(Milliseconds(789)));
+
+    auto awaitDataTimeout = mockStagePtr->getAwaitDataTimeout();
+    ASSERT_OK(awaitDataTimeout.getStatus());
+    ASSERT_EQ(789, durationCount<Milliseconds>(awaitDataTimeout.getValue()));
+}
+
 }  // namespace
 
 }  // namespace mongo

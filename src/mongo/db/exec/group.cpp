@@ -137,6 +137,8 @@ Status GroupStage::processObject(const BSONObj& obj) {
         return getKeyStatus;
     }
 
+    _scope->advanceGeneration();
+
     int& n = _groupMap[key];
     if (n == 0) {
         n = _groupMap.size();
@@ -288,7 +290,7 @@ unique_ptr<PlanStageStats> GroupStage::getStats() {
     _commonStats.isEOF = isEOF();
     unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_GROUP);
     ret->specific = make_unique<GroupStats>(_specificStats);
-    ret->children.push_back(child()->getStats().release());
+    ret->children.emplace_back(child()->getStats());
     return ret;
 }
 

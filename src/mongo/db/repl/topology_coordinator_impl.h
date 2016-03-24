@@ -130,9 +130,6 @@ public:
         // Whether or not this node is running as a config server, and if so whether it was started
         // with --configsvrMode=SCCC.
         CatalogManager::ConfigServerMode configServerMode{CatalogManager::ConfigServerMode::NONE};
-
-        // Whether or not the storage engine supports read committed.
-        bool storageEngineSupportsReadCommitted{true};
     };
 
     /**
@@ -152,13 +149,17 @@ public:
     virtual std::vector<HostAndPort> getMaybeUpHostAndPorts() const;
     virtual int getMaintenanceCount() const;
     virtual long long getTerm();
-    virtual bool updateTerm(long long term, Date_t now);
+    virtual UpdateTermResult updateTerm(long long term, Date_t now);
     virtual void setForceSyncSourceIndex(int index);
     virtual HostAndPort chooseNewSyncSource(Date_t now, const Timestamp& lastTimestampApplied);
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
     virtual void unblacklistSyncSource(const HostAndPort& host, Date_t now);
     virtual void clearSyncSourceBlacklist();
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource, Date_t now) const;
+    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
+                                        const OpTime& myLastOpTime,
+                                        const OpTime& syncSourceLastOpTime,
+                                        bool syncSourceHasSyncSource,
+                                        Date_t now) const;
     virtual bool becomeCandidateIfStepdownPeriodOverAndSingleNodeSet(Date_t now);
     virtual void setElectionSleepUntil(Date_t newTime);
     virtual void setFollowerMode(MemberState::MS newMode);
@@ -235,6 +236,7 @@ public:
                                                     const int memberIndex,
                                                     const OpTime& myLastOpApplied);
     virtual bool becomeCandidateIfElectable(const Date_t now, const OpTime& lastOpApplied);
+    virtual void setStorageEngineSupportsReadCommitted(bool supported);
 
     ////////////////////////////////////////////////////////////
     //
@@ -449,6 +451,15 @@ private:
 
     // V1 last vote info for elections
     LastVote _lastVote;
+
+    enum class ReadCommittedSupport {
+        kUnknown,
+        kNo,
+        kYes,
+    };
+
+    // Whether or not the storage engine supports read committed.
+    ReadCommittedSupport _storageEngineSupportsReadCommitted{ReadCommittedSupport::kUnknown};
 };
 
 }  // namespace repl

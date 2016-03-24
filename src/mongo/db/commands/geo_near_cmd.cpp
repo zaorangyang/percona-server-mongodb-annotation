@@ -46,7 +46,9 @@
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/range_preserver.h"
 #include "mongo/platform/unordered_map.h"
@@ -72,6 +74,10 @@ public:
     }
     bool supportsReadConcern() const final {
         return true;
+    }
+
+    std::size_t reserveBytesForReply() const override {
+        return FindCommon::kInitReplyBufferSize;
     }
 
     void help(stringstream& h) const {
@@ -185,9 +191,9 @@ public:
         BSONObj projObj = BSON("$pt" << BSON("$meta" << LiteParsedQuery::metaGeoNearPoint) << "$dis"
                                      << BSON("$meta" << LiteParsedQuery::metaGeoNearDistance));
 
-        const WhereCallbackReal whereCallback(txn, nss.db());
+        const ExtensionsCallbackReal extensionsCallback(txn, &nss);
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, rewritten, BSONObj(), projObj, 0, numWanted, BSONObj(), whereCallback);
+            nss, rewritten, BSONObj(), projObj, 0, numWanted, BSONObj(), extensionsCallback);
         if (!statusWithCQ.isOK()) {
             errmsg = "Can't parse filter / create query";
             return false;

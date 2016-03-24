@@ -84,7 +84,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/rpc/command_reply_builder.h"
@@ -153,8 +153,6 @@ MONGO_FP_DECLARE(rsStopGetMore);
 
 namespace {
 
-const int64_t maxInsertGroupSize = 256 * 1024;
-
 unique_ptr<AuthzManagerExternalState> createAuthzManagerExternalStateMongod() {
     return stdx::make_unique<AuthzManagerExternalStateMongod>();
 }
@@ -179,7 +177,7 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
                                   << " ntoreturn:" << queryMessage.ntoreturn;
     }
 
-    const SendStaleConfigException* scex = (exception->getCode() == SendStaleConfigCode)
+    const SendStaleConfigException* scex = (exception->getCode() == ErrorCodes::SendStaleConfig)
         ? static_cast<const SendStaleConfigException*>(exception)
         : NULL;
 
@@ -262,9 +260,9 @@ static void receivedCommand(OperationContext* txn,
 
     auto response = builder.done();
 
-    op->debug().responseLength = response->header().dataLen();
+    op->debug().responseLength = response.header().dataLen();
 
-    dbResponse.response = response.release();
+    dbResponse.response = std::move(response);
     dbResponse.responseTo = responseTo;
 }
 
@@ -303,9 +301,9 @@ void receivedRpc(OperationContext* txn, Client& client, DbResponse& dbResponse, 
 
     auto response = replyBuilder.done();
 
-    curOp->debug().responseLength = response->header().dataLen();
+    curOp->debug().responseLength = response.header().dataLen();
 
-    dbResponse.response = response.release();
+    dbResponse.response = std::move(response);
     dbResponse.responseTo = responseTo;
 }
 
@@ -380,7 +378,6 @@ static void receivedQuery(OperationContext* txn,
 
     DbMessage d(m);
     QueryMessage q(d);
-    unique_ptr<Message> resp(new Message());
 
     CurOp& op = *CurOp::get(txn);
 
@@ -390,16 +387,13 @@ static void receivedQuery(OperationContext* txn,
         audit::logQueryAuthzCheck(client, nss, q.query, status.code());
         uassertStatusOK(status);
 
-        dbResponse.exhaustNS = runQuery(txn, q, nss, *resp);
-        verify(!resp->empty());
+        dbResponse.exhaustNS = runQuery(txn, q, nss, dbResponse.response);
     } catch (const AssertionException& exception) {
-        resp.reset(new Message());
-        generateLegacyQueryErrorResponse(&exception, q, &op, resp.get());
+        dbResponse.response.reset();
+        generateLegacyQueryErrorResponse(&exception, q, &op, &dbResponse.response);
     }
 
-    op.debug().responseLength = resp->header().dataLen();
-
-    dbResponse.response = resp.release();
+    op.debug().responseLength = dbResponse.response.header().dataLen();
     dbResponse.responseTo = responseTo;
 }
 
@@ -419,7 +413,7 @@ void assembleResponse(OperationContext* txn,
                       DbResponse& dbresponse,
                       const HostAndPort& remote) {
     // before we lock...
-    int op = m.operation();
+    NetworkOp op = m.operation();
     bool isCommand = false;
 
     DbMessage dbmsg(m);
@@ -492,16 +486,20 @@ void assembleResponse(OperationContext* txn,
         case dbDelete:
             globalOpCounters.gotDelete();
             break;
+        default:
+            break;
     }
 
     CurOp& currentOp = *CurOp::get(txn);
     {
         stdx::lock_guard<Client> lk(*txn->getClient());
-        currentOp.setOp_inlock(op);
+        // Commands handling code will reset this if the operation is a command
+        // which is logically a basic CRUD operation like query, insert, etc.
+        currentOp.setNetworkOp_inlock(op);
+        currentOp.setLogicalOp_inlock(networkOpToLogicalOp(op));
     }
 
     OpDebug& debug = currentOp.debug();
-    debug.op = op;
 
     long long logThreshold = serverGlobalParams.slowMS;
     LogComponent responseComponent(LogComponent::kQuery);
@@ -534,13 +532,11 @@ void assembleResponse(OperationContext* txn,
             log(LogComponent::kQuery) << curTimeMillis64() % 10000
                                       << " long msg received, len:" << len << endl;
 
-        Message* resp = new Message();
         if (strcmp("end", p) == 0)
-            resp->setData(opReply, "dbMsg end no longer supported");
+            dbresponse.response.setData(opReply, "dbMsg end no longer supported");
         else
-            resp->setData(opReply, "i am fine - dbMsg deprecated");
+            dbresponse.response.setData(opReply, "i am fine - dbMsg deprecated");
 
-        dbresponse.response = resp;
         dbresponse.responseTo = m.header().getId();
     } else {
         try {
@@ -552,7 +548,8 @@ void assembleResponse(OperationContext* txn,
                 logThreshold = 10;
                 receivedKillCursors(txn, m);
             } else if (op != dbInsert && op != dbUpdate && op != dbDelete) {
-                log(LogComponent::kQuery) << "    operation isn't supported: " << op << endl;
+                log(LogComponent::kQuery)
+                    << "    operation isn't supported: " << static_cast<int>(op) << endl;
                 currentOp.done();
                 shouldLog = true;
             } else {
@@ -561,7 +558,7 @@ void assembleResponse(OperationContext* txn,
                     uassert(18663,
                             str::stream() << "legacy writeOps not longer supported for "
                                           << "versioned connections, ns: " << nsString.ns()
-                                          << ", op: " << opToString(op)
+                                          << ", op: " << networkOpToString(op)
                                           << ", remote: " << remote.toString(),
                             connInfo == NULL);
                 }
@@ -580,13 +577,15 @@ void assembleResponse(OperationContext* txn,
             }
         } catch (const UserException& ue) {
             LastError::get(c).setLastError(ue.getCode(), ue.getInfo().msg);
-            MONGO_LOG_COMPONENT(3, responseComponent) << " Caught Assertion in " << opToString(op)
-                                                      << ", continuing " << ue.toString() << endl;
+            MONGO_LOG_COMPONENT(3, responseComponent) << " Caught Assertion in "
+                                                      << networkOpToString(op) << ", continuing "
+                                                      << ue.toString() << endl;
             debug.exceptionInfo = ue.getInfo();
         } catch (const AssertionException& e) {
             LastError::get(c).setLastError(e.getCode(), e.getInfo().msg);
-            MONGO_LOG_COMPONENT(3, responseComponent) << " Caught Assertion in " << opToString(op)
-                                                      << ", continuing " << e.toString() << endl;
+            MONGO_LOG_COMPONENT(3, responseComponent) << " Caught Assertion in "
+                                                      << networkOpToString(op) << ", continuing "
+                                                      << e.toString() << endl;
             debug.exceptionInfo = e.getInfo();
             shouldLog = true;
         }
@@ -618,7 +617,6 @@ void assembleResponse(OperationContext* txn,
     }
 
     recordCurOpMetrics(txn);
-    debug.reset();
 }
 
 void receivedKillCursors(OperationContext* txn, Message& m) {
@@ -652,7 +650,6 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
     int flags = d.pullInt();
     BSONObj query = d.nextJsObj();
     auto client = txn->getClient();
-    auto lastOpHolder = repl::ReplClientInfo::forClient(client);
     auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
     ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
                                                 &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
@@ -725,7 +722,7 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
                 Explain::getSummaryStats(*exec, &summary);
                 collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
 
-                if (lastOpHolder.getLastOp() != lastOpAtOperationStart) {
+                if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
                     // If this operation has already generated a new lastOp, don't bother setting it
                     // here. No-op updates will not generate a new lastOp, so we still need the
                     // guard to fire in that case.
@@ -782,7 +779,7 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
         Explain::getSummaryStats(*exec, &summary);
         collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
 
-        if (lastOpHolder.getLastOp() != lastOpAtOperationStart) {
+        if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
             // If this operation has already generated a new lastOp, don't bother setting it
             // here. No-op updates will not generate a new lastOp, so we still need the
             // guard to fire in that case.
@@ -802,7 +799,6 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
     BSONObj pattern = d.nextJsObj();
 
     auto client = txn->getClient();
-    auto lastOpHolder = repl::ReplClientInfo::forClient(client);
     auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
     ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
                                                 &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
@@ -856,7 +852,7 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
             Explain::getSummaryStats(*exec, &summary);
             collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
 
-            if (lastOpHolder.getLastOp() != lastOpAtOperationStart) {
+            if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
                 // If this operation has already generated a new lastOp, don't bother setting it
                 // here. No-op updates will not generate a new lastOp, so we still need the
                 // guard to fire in that case.
@@ -920,17 +916,15 @@ bool receivedGetMore(OperationContext* txn, DbResponse& dbresponse, Message& m, 
         curop.debug().exceptionInfo = e.getInfo();
 
         replyToQuery(ResultFlag_ErrSet, m, dbresponse, errObj);
-        curop.debug().responseLength = dbresponse.response->header().dataLen();
+        curop.debug().responseLength = dbresponse.response.header().dataLen();
         curop.debug().nreturned = 1;
         return false;
     }
 
-    Message* resp = new Message();
-    resp->setData(msgdata.view2ptr(), true);
-    curop.debug().responseLength = resp->header().dataLen();
+    dbresponse.response.setData(msgdata.view2ptr(), true);
+    curop.debug().responseLength = dbresponse.response.header().dataLen();
     curop.debug().nreturned = msgdata.getNReturned();
 
-    dbresponse.response = resp;
     dbresponse.responseTo = m.header().getId();
 
     if (exhaust) {
@@ -1028,7 +1022,7 @@ NOINLINE_DECL void insertMulti(OperationContext* txn,
         // Limit chunk size, actual size chosen is a tradeoff: larger sizes are more efficient,
         // but smaller chunk sizes allow yielding to other threads and lower chance of WCEs
         if ((++chunkCount >= internalQueryExecYieldIterations / 2) ||
-            (chunkSize >= maxInsertGroupSize)) {
+            (chunkSize >= insertVectorMaxBytes)) {
             if (it == chunkBegin)  // there is only one doc to process, so avoid retry on failure
                 insertMultiSingletons(txn, ctx, keepGoing, ns, op, chunkBegin, it + 1);
             else
@@ -1100,14 +1094,14 @@ static void insertSystemIndexes(OperationContext* txn, DbMessage& d, CurOp& curO
             auto indexNs = NamespaceString(d.getns());
             auto cmdRequestMsg = requestBuilder.setDatabase(indexNs.db())
                                      .setCommandName("createIndexes")
-                                     .setMetadata(rpc::makeEmptyMetadata())
                                      .setCommandArgs(cmdObj)
+                                     .setMetadata(rpc::makeEmptyMetadata())
                                      .done();
-            rpc::LegacyRequest cmdRequest{cmdRequestMsg.get()};
+            rpc::LegacyRequest cmdRequest{&cmdRequestMsg};
             rpc::LegacyReplyBuilder cmdReplyBuilder{};
             Command::execCommand(txn, createIndexesCmd, cmdRequest, &cmdReplyBuilder);
             auto cmdReplyMsg = cmdReplyBuilder.done();
-            rpc::LegacyReply cmdReply{cmdReplyMsg.get()};
+            rpc::LegacyReply cmdReply{&cmdReplyMsg};
             uassertStatusOK(Command::getStatusFromCommandResult(cmdReply.getCommandReply()));
         } catch (const DBException& ex) {
             LastError::get(txn->getClient()).setLastError(ex.getCode(), ex.getInfo().msg);

@@ -75,6 +75,7 @@ BSONObj ReplCoordTest::addProtocolVersion(const BSONObj& configDoc, int protocol
 
 void ReplCoordTest::setUp() {
     _settings.replSet = "mySet/node1:12345,node2:54321";
+    _settings.majorityReadConcernEnabled = true;
 }
 
 void ReplCoordTest::tearDown() {
@@ -171,8 +172,15 @@ void ReplCoordTest::assertStartSuccess(const BSONObj& configDoc, const HostAndPo
 }
 
 ResponseStatus ReplCoordTest::makeResponseStatus(const BSONObj& doc, Milliseconds millis) {
-    log() << "Responding with " << doc;
-    return ResponseStatus(RemoteCommandResponse(doc, BSONObj(), millis));
+    return makeResponseStatus(doc, BSONObj(), millis);
+}
+
+ResponseStatus ReplCoordTest::makeResponseStatus(const BSONObj& doc,
+                                                 const BSONObj& metadata,
+                                                 Milliseconds millis) {
+    log() << "Responding with " << doc << " (metadata: " << metadata << "; elapsed: " << millis
+          << ")";
+    return ResponseStatus(RemoteCommandResponse(doc, metadata, millis));
 }
 
 void ReplCoordTest::simulateSuccessfulDryRun(

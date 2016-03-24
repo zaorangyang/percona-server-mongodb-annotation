@@ -252,11 +252,11 @@ public:
     /*
      * Inserts all documents inside one WUOW.
      * Caller should ensure vector is appropriately sized for this.
-     * If errors occor (including WCE), caller should retry documents individually.
+     * If any errors occur (including WCE), caller should retry documents individually.
      */
     Status insertDocuments(OperationContext* txn,
-                           std::vector<BSONObj>::iterator begin,
-                           std::vector<BSONObj>::iterator end,
+                           std::vector<BSONObj>::const_iterator begin,
+                           std::vector<BSONObj>::const_iterator end,
                            bool enforceQuota,
                            bool fromMigrate = false);
 
@@ -440,18 +440,19 @@ private:
     Status _insertDocument(OperationContext* txn, const BSONObj& doc, bool enforceQuota);
 
     Status _insertDocuments(OperationContext* txn,
-                            std::vector<BSONObj>::iterator begin,
-                            std::vector<BSONObj>::iterator end,
+                            std::vector<BSONObj>::const_iterator begin,
+                            std::vector<BSONObj>::const_iterator end,
                             bool enforceQuota);
 
     bool _enforceQuota(bool userEnforeQuota) const;
 
     int _magic;
 
-    NamespaceString _ns;
-    CollectionCatalogEntry* _details;
-    RecordStore* _recordStore;
-    DatabaseCatalogEntry* _dbce;
+    const NamespaceString _ns;
+    CollectionCatalogEntry* const _details;
+    RecordStore* const _recordStore;
+    DatabaseCatalogEntry* const _dbce;
+    const bool _needCappedLock;
     CollectionInfoCache _infoCache;
     IndexCatalog _indexCatalog;
 
@@ -474,7 +475,7 @@ private:
     // on this object until notified of the arrival of new data.
     //
     // This is non-null if and only if the collection is a capped collection.
-    std::shared_ptr<CappedInsertNotifier> _cappedNotifier;
+    const std::shared_ptr<CappedInsertNotifier> _cappedNotifier;
 
     const bool _mustTakeCappedLockOnInsert;
 

@@ -88,7 +88,7 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
     auto interimDocs = mgr->recoverInterimFile();
 
     // Open the archive file for writing
-    auto swFile = generateArchiveFileName(path, terseUTCCurrentTime());
+    auto swFile = mgr->generateArchiveFileName(path, terseUTCCurrentTime());
     if (!swFile.isOK()) {
         return swFile.getStatus();
     }
@@ -113,7 +113,7 @@ std::vector<boost::filesystem::path> FTDCFileManager::scanDirectory() {
         auto filename = de.path().filename();
 
         std::string str = filename.generic_string();
-        if (str.compare(0, strlen(kFTDCArchiveFile) - 1, kFTDCArchiveFile) == 0 &&
+        if (str.compare(0, strlen(kFTDCArchiveFile), kFTDCArchiveFile) == 0 &&
             str != kFTDCInterimFile) {
             files.emplace_back(_path / filename);
         }
@@ -131,14 +131,18 @@ StatusWith<boost::filesystem::path> FTDCFileManager::generateArchiveFileName(
     fileName += std::string(".");
     fileName += suffix.toString();
 
+    if (_previousArchiveFileSuffix != suffix) {
+        // If the suffix has changed, reset the uniquifier counter to zero
+        _previousArchiveFileSuffix = suffix.toString();
+        _fileNameUniquifier = 0;
+    }
+
     if (boost::filesystem::exists(path)) {
-        // TODO: keep track of a high watermark for the current suffix so that after rotate the
-        // counter does not reset.
-        for (std::uint32_t i = 0; i < FTDCConfig::kMaxFileUniqifier; ++i) {
+        for (; _fileNameUniquifier < FTDCConfig::kMaxFileUniqifier; ++_fileNameUniquifier) {
             char buf[20];
 
             // Use leading zeros so the numbers sort lexigraphically
-            int ret = snprintf(&buf[0], sizeof(buf), "%05u", i);
+            int ret = snprintf(&buf[0], sizeof(buf), "%05u", _fileNameUniquifier);
             invariant(ret > 0 && ret < static_cast<int>((sizeof(buf) - 1)));
 
             auto fileNameUnique = fileName;
@@ -160,22 +164,22 @@ StatusWith<boost::filesystem::path> FTDCFileManager::generateArchiveFileName(
 Status FTDCFileManager::openArchiveFile(
     Client* client,
     const boost::filesystem::path& path,
-    const std::vector<std::tuple<FTDCBSONUtil::FTDCType, BSONObj>>& docs) {
+    const std::vector<std::tuple<FTDCBSONUtil::FTDCType, BSONObj, Date_t>>& docs) {
     auto sOpen = _writer.open(path);
     if (!sOpen.isOK()) {
         return sOpen;
     }
 
     // Append any old interim records
-    for (auto& pair : docs) {
-        if (std::get<0>(pair) == FTDCBSONUtil::FTDCType::kMetadata) {
-            Status s = _writer.writeMetadata(std::get<1>(pair));
+    for (auto& triplet : docs) {
+        if (std::get<0>(triplet) == FTDCBSONUtil::FTDCType::kMetadata) {
+            Status s = _writer.writeMetadata(std::get<1>(triplet), std::get<2>(triplet));
 
             if (!s.isOK()) {
                 return s;
             }
         } else {
-            Status s = _writer.writeSample(std::get<1>(pair));
+            Status s = _writer.writeSample(std::get<1>(triplet), std::get<2>(triplet));
 
             if (!s.isOK()) {
                 return s;
@@ -187,9 +191,9 @@ Status FTDCFileManager::openArchiveFile(
     // collect one-time information
     // This is appened after the file is opened to ensure a user can determine which bson objects
     // where collected from which server instance.
-    BSONObj o = _rotateCollectors->collect(client);
-    if (!o.isEmpty()) {
-        Status s = _writer.writeMetadata(o);
+    auto sample = _rotateCollectors->collect(client);
+    if (!std::get<0>(sample).isEmpty()) {
+        Status s = _writer.writeMetadata(std::get<0>(sample), std::get<1>(sample));
 
         if (!s.isOK()) {
             return s;
@@ -206,17 +210,19 @@ void FTDCFileManager::trimDirectory(std::vector<boost::filesystem::path>& files)
     dassert(std::is_sorted(files.begin(), files.end()));
 
     for (auto it = files.rbegin(); it != files.rend(); ++it) {
-        size += boost::filesystem::file_size(*it);
+        std::uint64_t fileSize = boost::filesystem::file_size(*it);
+        size += fileSize;
 
         if (size >= maxSize) {
             LOG(1) << "Cleaning file over full-time diagnostic data capture quota, file: "
-                   << (*it).generic_string();
+                   << (*it).generic_string() << " with size " << fileSize;
             boost::filesystem::remove(*it);
         }
     }
 }
 
-std::vector<std::tuple<FTDCBSONUtil::FTDCType, BSONObj>> FTDCFileManager::recoverInterimFile() {
+std::vector<std::tuple<FTDCBSONUtil::FTDCType, BSONObj, Date_t>>
+FTDCFileManager::recoverInterimFile() {
     decltype(recoverInterimFile()) docs;
 
     auto interimFile = FTDCUtil::getInterimFile(_path);
@@ -245,9 +251,9 @@ std::vector<std::tuple<FTDCBSONUtil::FTDCType, BSONObj>> FTDCFileManager::recove
 
     StatusWith<bool> m = read.hasNext();
     for (; m.isOK() && m.getValue(); m = read.hasNext()) {
-        auto pair = read.next();
-        docs.emplace_back(std::tuple<FTDCBSONUtil::FTDCType, BSONObj>(
-            std::get<0>(pair), std::get<1>(pair).getOwned()));
+        auto triplet = read.next();
+        docs.emplace_back(std::tuple<FTDCBSONUtil::FTDCType, BSONObj, Date_t>(
+            std::get<0>(triplet), std::get<1>(triplet).getOwned(), std::get<2>(triplet)));
     }
 
     // Warn if the interim file was corrupt or we had an unclean shutdown
@@ -280,8 +286,10 @@ Status FTDCFileManager::rotate(Client* client) {
     return openArchiveFile(client, swFile.getValue(), {});
 }
 
-Status FTDCFileManager::writeSampleAndRotateIfNeeded(Client* client, const BSONObj& sample) {
-    Status s = _writer.writeSample(sample);
+Status FTDCFileManager::writeSampleAndRotateIfNeeded(Client* client,
+                                                     const BSONObj& sample,
+                                                     Date_t date) {
+    Status s = _writer.writeSample(sample, date);
 
     if (!s.isOK()) {
         return s;

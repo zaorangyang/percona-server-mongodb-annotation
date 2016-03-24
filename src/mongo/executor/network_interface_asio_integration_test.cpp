@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -57,8 +57,7 @@ namespace {
 
 class NetworkInterfaceASIOIntegrationTest : public mongo::unittest::Test {
 public:
-    void setUp() override {
-        NetworkInterfaceASIO::Options options{};
+    void startNet(NetworkInterfaceASIO::Options options = NetworkInterfaceASIO::Options()) {
         options.streamFactory = stdx::make_unique<AsyncStreamFactory>();
         options.timerFactory = stdx::make_unique<AsyncTimerFactoryASIO>();
         options.connectionPoolOptions.maxConnections = 256u;
@@ -78,6 +77,14 @@ public:
 
     ConnectionString fixture() {
         return unittest::getFixtureConnectionString();
+    }
+
+    void randomNumberGenerator(PseudoRandom* generator) {
+        _rng = generator;
+    }
+
+    PseudoRandom* randomNumberGenerator() {
+        return _rng;
     }
 
     Deferred<StatusWith<RemoteCommandResponse>> runCommand(
@@ -131,47 +138,30 @@ public:
 
 private:
     std::unique_ptr<NetworkInterfaceASIO> _net;
+    PseudoRandom* _rng = nullptr;
 };
 
 TEST_F(NetworkInterfaceASIOIntegrationTest, Ping) {
+    startNet();
     assertCommandOK("admin", BSON("ping" << 1));
 }
 
 TEST_F(NetworkInterfaceASIOIntegrationTest, Timeouts) {
-    // Insert 1 document in collection foo.bar. If we don't do this our queries will return
-    // immediately.
-    assertCommandOK("foo",
-                    BSON("insert"
-                         << "bar"
-                         << "documents" << BSON_ARRAY(BSON("foo" << 1))));
-
-    // Run a find command with a $where with an infinite loop. The remote server should time this
-    // out in 30 seconds, so we should time out client side first given our timeout of 100
-    // milliseconds.
-    assertCommandFailsOnClient("foo",
-                               BSON("find"
-                                    << "bar"
-                                    << "filter" << BSON("$where"
-                                                        << "while(true) { sleep(1); }")),
+    startNet();
+    // This sleep command will take 10 seconds, so we should time out client side first given
+    // our timeout of 100 milliseconds.
+    assertCommandFailsOnClient("admin",
+                               BSON("sleep" << 1 << "lock"
+                                            << "none"
+                                            << "secs" << 10),
                                Milliseconds(100),
                                ErrorCodes::ExceededTimeLimit);
 
-    // Run a find command with a $where with an infinite loop. The server should time out the
-    // command.
-    assertCommandFailsOnServer("foo",
-                               BSON("find"
-                                    << "bar"
-                                    << "filter" << BSON("$where"
-                                                        << "while(true) { sleep(1); };")),
-                               Milliseconds(10000000000),  // big, big timeout.
-                               ErrorCodes::JSInterpreterFailure);
-
-    // Run a find command with a big timeout.It should return before we hit the ASIO
-    // timeout
-    assertCommandOK("foo",
-                    BSON("find"
-                         << "bar"
-                         << "limit" << 1),
+    // Run a sleep command that should return before we hit the ASIO timeout.
+    assertCommandOK("admin",
+                    BSON("sleep" << 1 << "lock"
+                                 << "none"
+                                 << "secs" << 1),
                     Milliseconds(10000000));
 }
 
@@ -180,15 +170,15 @@ public:
     using Fixture = NetworkInterfaceASIOIntegrationTest;
     using Pool = ThreadPoolInterface;
 
-    Deferred<Status> run(Fixture* fixture, Pool* pool) {
+    Deferred<Status> run(Fixture* fixture, Pool* pool, Milliseconds timeout = Milliseconds(5000)) {
         auto cb = makeCallbackHandle();
         auto self = *this;
         auto out =
             fixture->runCommand(cb,
                                 {unittest::getFixtureConnectionString().getServers()[0],
-                                 "foo",
+                                 "admin",
                                  _command,
-                                 Seconds(5)})
+                                 timeout})
                 .then(pool,
                       [self](StatusWith<RemoteCommandResponse> resp) -> Status {
                           auto status = resp.isOK()
@@ -203,36 +193,43 @@ public:
                                                      << " but got " << status.toString()};
                       });
         if (_cancel) {
-            // TODO: have this happen at some random time in the future.
+            invariant(fixture->randomNumberGenerator());
+            sleepmillis(fixture->randomNumberGenerator()->nextInt32(10));
             fixture->net().cancelCommand(cb);
         }
         return out;
     }
 
     static Deferred<Status> runTimeoutOp(Fixture* fixture, Pool* pool) {
-        return StressTestOp(BSON("find"
-                                 << "bar"
-                                 << "filter" << BSON("$where"
-                                                     << "while(true) { sleep(1); }")),
+        return StressTestOp(BSON("sleep" << 1 << "lock"
+                                         << "none"
+                                         << "secs" << 1),
                             ErrorCodes::ExceededTimeLimit,
-                            false).run(fixture, pool);
+                            false).run(fixture, pool, Milliseconds(100));
     }
 
     static Deferred<Status> runCompleteOp(Fixture* fixture, Pool* pool) {
-        return StressTestOp(BSON("find"
-                                 << "baz"
-                                 << "limit" << 1),
+        return StressTestOp(BSON("sleep" << 1 << "lock"
+                                         << "none"
+                                         << "millis" << 100),
                             ErrorCodes::OK,
                             false).run(fixture, pool);
     }
 
     static Deferred<Status> runCancelOp(Fixture* fixture, Pool* pool) {
-        return StressTestOp(BSON("find"
-                                 << "bar"
-                                 << "filter" << BSON("$where"
-                                                     << "while(true) { sleep(1); }")),
+        return StressTestOp(BSON("sleep" << 1 << "lock"
+                                         << "none"
+                                         << "secs" << 10),
                             ErrorCodes::CallbackCanceled,
                             true).run(fixture, pool);
+    }
+
+    static Deferred<Status> runLongOp(Fixture* fixture, Pool* pool) {
+        return StressTestOp(BSON("sleep" << 1 << "lock"
+                                         << "none"
+                                         << "secs" << 30),
+                            ErrorCodes::OK,
+                            false).run(fixture, pool, RemoteCommandRequest::kNoTimeout);
     }
 
 private:
@@ -245,6 +242,7 @@ private:
 };
 
 TEST_F(NetworkInterfaceASIOIntegrationTest, StressTest) {
+    startNet();
     const std::size_t numOps = 10000;
     std::vector<Deferred<Status>> ops;
 
@@ -253,6 +251,7 @@ TEST_F(NetworkInterfaceASIOIntegrationTest, StressTest) {
 
     log() << "Random seed is " << seed;
     auto rng = PseudoRandom(seed);  // TODO: read from command line
+    randomNumberGenerator(&rng);
     log() << "Starting stress test...";
 
     ThreadPool::Options threadPoolOpts;
@@ -269,20 +268,21 @@ TEST_F(NetworkInterfaceASIOIntegrationTest, StressTest) {
     std::generate_n(std::back_inserter(ops),
                     numOps,
                     [&rng, &pool, this] {
-                        switch (rng.nextInt32(3)) {
-                            case 0:
-                                return StressTestOp::runCancelOp(this, &pool);
-                            case 1:
-                                return StressTestOp::runCompleteOp(this, &pool);
 
-                            case 2:
-                                // TODO: Reenable runTimeoutOp after we fix whatever bug causes it
-                                // to hang.
-                                // return StressTestOp::runTimeoutOp(this, &pool);
-                                return StressTestOp::runCompleteOp(this, &pool);
-                            default:
+                        // stagger operations slightly to mitigate connection pool contention
+                        sleepmillis(rng.nextInt32(10));
 
-                                MONGO_UNREACHABLE;
+                        auto i = rng.nextCanonicalDouble();
+
+                        if (i < .3) {
+                            return StressTestOp::runCancelOp(this, &pool);
+                        } else if (i < .7) {
+                            return StressTestOp::runCompleteOp(this, &pool);
+                        } else if (i < .99) {
+                            return StressTestOp::runTimeoutOp(this, &pool);
+                        } else {
+                            // Just a sprinkling of long ops, to mitigate connection pool contention
+                            return StressTestOp::runLongOp(this, &pool);
                         }
                     });
 
@@ -299,6 +299,38 @@ TEST_F(NetworkInterfaceASIOIntegrationTest, StressTest) {
                          })
                    .get();
     ASSERT_OK(res);
+}
+
+// Hook that intentionally never finishes
+class HangingHook : public executor::NetworkConnectionHook {
+    Status validateHost(const HostAndPort&, const RemoteCommandResponse&) final {
+        return Status::OK();
+    }
+
+    StatusWith<boost::optional<RemoteCommandRequest>> makeRequest(
+        const HostAndPort& remoteHost) final {
+        return {boost::make_optional(RemoteCommandRequest(remoteHost,
+                                                          "admin",
+                                                          BSON("sleep" << 1 << "lock"
+                                                                       << "none"
+                                                                       << "secs" << 100000000),
+                                                          BSONObj()))};
+    }
+
+    Status handleReply(const HostAndPort& remoteHost, RemoteCommandResponse&& response) final {
+        MONGO_UNREACHABLE;
+    }
+};
+
+
+// Test that we time out a command if the connection hook hangs.
+TEST_F(NetworkInterfaceASIOIntegrationTest, HookHangs) {
+    NetworkInterfaceASIO::Options options;
+    options.networkConnectionHook = stdx::make_unique<HangingHook>();
+    startNet(std::move(options));
+
+    assertCommandFailsOnClient(
+        "admin", BSON("ping" << 1), Seconds(1), ErrorCodes::ExceededTimeLimit);
 }
 
 }  // namespace

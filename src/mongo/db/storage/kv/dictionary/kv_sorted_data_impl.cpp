@@ -88,7 +88,8 @@ namespace mongo {
                                        OperationContext* opCtx,
                                        const IndexDescriptor* desc)
         : _db(db),
-          _ordering(Ordering::make(desc ? desc->keyPattern() : BSONObj()))
+          _ordering(Ordering::make(desc ? desc->keyPattern() : BSONObj())),
+          _dupsAllowed(false)
     {
         invariant(_db);
     }
@@ -238,6 +239,7 @@ namespace mongo {
         boost::optional<IndexKeyEntry> seek(const BSONObj& key,
                                             bool inclusive,
                                             RequestedInfo parts = kKeyAndLoc) {
+            this->initializeRestoredState();
             this->removeSavedKey();
             struct IndexSeekResult result;
             const auto discriminator = this->isForward() == inclusive ? KeyString::kExclusiveBefore 
@@ -250,6 +252,7 @@ namespace mongo {
 
         boost::optional<IndexKeyEntry> seek(const IndexSeekPoint& seekPoint,
                                             RequestedInfo parts = kKeyAndLoc) {
+            this->initializeRestoredState();
             this->removeSavedKey();
             BSONObj key = IndexEntryComparison::makeQueryObject(seekPoint, this->isForward());
             struct IndexSeekResult result = this->seekUsingDiscriminator(key);
@@ -357,18 +360,29 @@ namespace mongo {
             return this->_seekToKeyString(ks);
         }
 
+        bool keyStringsAreTheSameLength(const KeyString &left, const KeyString &right) const {
+            const int leftKeySize = left.getSize();
+            const int rightKeySize = right.getSize();
+            return (leftKeySize == rightKeySize);
+        }
+
+        int compareKeyStrings(const KeyString &left, const KeyString &right, const int size) const {
+            const char* leftKeyBuffer = left.getBuffer();
+            const char* rightKeyBuffer = right.getBuffer();
+            const int r = memcmp(leftKeyBuffer, rightKeyBuffer, size);
+            return r;
+        }
+
 	bool cursorPositionMatchesGivenKey(const KeyString &ks) {
             if (!isEOF()) {
-		const int keySize = ks.getSize();
-		const int keyFromCursorSize = _cursor->currKey().size();
-		if (keySize == keyFromCursorSize) {
-		    const char* keyBuffer = ks.getBuffer();
-		    const char * keyBufferFromCursor = _cursor->currKey().data();
-                    const int r = memcmp(keyBuffer, keyBufferFromCursor, keySize);
+                KeyString current;
+                current.resetFromBuffer(_cursor->currKey().data(), _cursor->currKey().size());
+                if (this->keyStringsAreTheSameLength(ks, current)) {
+                    const int r = this->compareKeyStrings(ks, current, ks.getSize());
                     if (r == 0) {
-			return true;
-		    }
-		}
+                        return true;
+                    }
+                }
 	    }
 
 	    return false;
@@ -414,6 +428,8 @@ namespace mongo {
         mutable KeyString _endKeyString;
         mutable bool _endPositionIsSet;
         mutable KeyString _savedKeyString;
+        mutable KeyString _savedKeyStringWithoutRecord;
+        mutable BSONObj _savedBson;
         mutable bool _wasRestored;
         mutable bool _restoredPositionFound;
         mutable bool _keyStringWasSaved;
@@ -485,6 +501,7 @@ namespace mongo {
         }
 
     public:
+        mutable bool _dupsAllowed;
         KVSortedDataInterfaceCursor(KVDictionary *db, OperationContext *txn, int direction, const Ordering &ordering)
             : _db(db),
               _dir(direction),
@@ -501,9 +518,12 @@ namespace mongo {
               _endKeyString(),
               _endPositionIsSet(false),
               _savedKeyString(),
+              _savedKeyStringWithoutRecord(),
+              _savedBson(),
               _wasRestored(false),
               _restoredPositionFound(false),
-              _keyStringWasSaved(false)
+              _keyStringWasSaved(false),
+              _dupsAllowed(true)
         {}
 
         virtual ~KVSortedDataInterfaceCursor() {}
@@ -643,8 +663,10 @@ namespace mongo {
         void save() {
             _initialize();
             if (!isEOF() && !_keyStringWasSaved) {
+                _savedBson = this->getKey();
                 Slice key = _cursor->currKey();
                 _savedKeyString.resetFromBuffer(key.data(), key.size());
+                _savedKeyStringWithoutRecord.resetToKey(_savedBson, _ordering);
                 _keyStringWasSaved = true;
             }
 
@@ -652,10 +674,37 @@ namespace mongo {
             _cursor.reset();
         }
 
+        void restoreRespectingDuplicates() {
+            _restoredPositionFound = this->_locateWhilePreservingCache(_savedKeyString);
+        }
+
+        void restoreWithoutDuplicates() {
+            KVDictionary::Cursor * c = _db->getCursor(_txn, Slice::of(_savedKeyStringWithoutRecord), _dir);
+            _cursor.reset(c);
+            invalidateCache();
+            BSONObj currentBson = this->getKey();
+            _restoredPositionFound = false;
+            if (!isEOF()) {
+                KeyString old(_savedBson, _ordering);
+                KeyString current(currentBson, _ordering);
+                if (this->keyStringsAreTheSameLength(old, current)) {
+                    const int r = this->compareKeyStrings(old, current, old.getSize());
+                    if (r == 0) {
+                        _restoredPositionFound = true;
+                    }
+                }
+            }
+        }
+
         void restore() {
             _initialized = true;
             if (_keyStringWasSaved) {
-                _restoredPositionFound = this->_locateWhilePreservingCache(_savedKeyString);
+                if (_dupsAllowed) {
+                    restoreRespectingDuplicates();
+                } else {
+                    restoreWithoutDuplicates();
+                }
+
                 _wasRestored = true;
             } else {
                 invariant(isEOF()); // this is the whole point!
@@ -675,15 +724,18 @@ namespace mongo {
 
     SortedDataInterface::Cursor* KVSortedDataImpl::newCursor(OperationContext* txn,
                                                              int direction) const {
-        return new KVSortedDataInterfaceCursor(_db.get(), txn, direction, _ordering);
+        KVSortedDataInterfaceCursor* c = new KVSortedDataInterfaceCursor(_db.get(), txn, direction, _ordering);
+        c->_dupsAllowed = _dupsAllowed;
+        return c;
     }
 
     std::unique_ptr<SortedDataInterface::Cursor>
     KVSortedDataImpl::newCursor(OperationContext* txn, bool isForward) const {
-	const int direction = isForward ? 1 : -1;
-	KVSortedDataInterfaceCursor *c = NULL;
-	c = new KVSortedDataInterfaceCursor(_db.get(), txn, direction, _ordering);
-	return std::unique_ptr<KVSortedDataInterfaceCursor>(c);
+        const int direction = isForward ? 1 : -1;
+        KVSortedDataInterfaceCursor *c = NULL;
+        c = new KVSortedDataInterfaceCursor(_db.get(), txn, direction, _ordering);
+        c->_dupsAllowed = _dupsAllowed;
+        return std::unique_ptr<KVSortedDataInterfaceCursor>(c);
     }
 
     Status KVSortedDataImpl::dupKeyCheck(OperationContext* txn,

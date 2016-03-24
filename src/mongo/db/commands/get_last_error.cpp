@@ -224,7 +224,7 @@ public:
 
         if (status.isOK()) {
             // Ensure options are valid for this host
-            status = validateWriteConcern(writeConcern);
+            status = validateWriteConcern(txn, writeConcern, dbname);
         }
 
         if (!status.isOK()) {
@@ -271,7 +271,7 @@ public:
         }
 
         WriteConcernResult wcResult;
-        status = waitForWriteConcern(txn, lastOpTime, &wcResult);
+        status = waitForWriteConcern(txn, lastOpTime, txn->getWriteConcern(), &wcResult);
         wcResult.appendTo(writeConcern, &result);
 
         // For backward compatibility with 2.4, wtimeout returns ok : 1.0

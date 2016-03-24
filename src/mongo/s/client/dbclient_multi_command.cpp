@@ -93,10 +93,12 @@ static void sayAsCmd(DBClientBase* conn, StringData dbName, const BSONObj& cmdOb
 
     requestBuilder->setDatabase(dbName);
     requestBuilder->setCommandName(upconvertedCmd.firstElementFieldName());
-    requestBuilder->setMetadata(metadataBob.done());
     requestBuilder->setCommandArgs(upconvertedCmd);
+    requestBuilder->setMetadata(metadataBob.done());
+
     // Send our command
-    conn->say(*requestBuilder->done());
+    auto requestMsg = requestBuilder->done();
+    conn->say(requestMsg);
 }
 
 // THROWS

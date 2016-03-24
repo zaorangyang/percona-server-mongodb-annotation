@@ -34,6 +34,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/client/mongo_uri.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
@@ -117,6 +118,11 @@ Status addMongoShellOptions(moe::OptionSection* options) {
 
     options->addOptionChaining(
         "ipv6", "ipv6", moe::Switch, "enable IPv6 support (disabled by default)");
+
+    options->addOptionChaining("disableJavaScriptJIT",
+                               "disableJavaScriptJIT",
+                               moe::Switch,
+                               "disable the Javascript Just In Time compiler");
 
     Status ret = Status::OK();
 #ifdef MONGO_CONFIG_SSL
@@ -257,6 +263,9 @@ Status storeMongoShellOptions(const moe::Environment& params,
     if (params.count("norc")) {
         shellGlobalParams.norc = true;
     }
+    if (params.count("disableJavaScriptJIT")) {
+        shellGlobalParams.nojit = true;
+    }
     if (params.count("files")) {
         shellGlobalParams.files = params["files"].as<vector<string>>();
     }
@@ -329,6 +338,36 @@ Status storeMongoShellOptions(const moe::Environment& params,
            << "\"*\" is an invalid db address";
         sb << getMongoShellHelp(args[0], moe::startupOptions);
         return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    if (shellGlobalParams.url.find("mongodb://") == 0) {
+        auto cs_status = MongoURI::parse(shellGlobalParams.url);
+        if (!cs_status.isOK()) {
+            return cs_status.getStatus();
+        }
+
+        auto cs = cs_status.getValue();
+        StringBuilder sb;
+        sb << "ERROR: Cannot specify ";
+        auto uriOptions = cs.getOptions();
+        if (!shellGlobalParams.username.empty() && !cs.getUser().empty()) {
+            sb << "username";
+        } else if (!shellGlobalParams.password.empty() && !cs.getPassword().empty()) {
+            sb << "password";
+        } else if (!shellGlobalParams.authenticationMechanism.empty() &&
+                   uriOptions.hasField("authMechanism")) {
+            sb << "the authentication mechanism";
+        } else if (!shellGlobalParams.authenticationDatabase.empty() &&
+                   uriOptions.hasField("authSource")) {
+            sb << "the authentication database";
+        } else if (shellGlobalParams.gssapiServiceName != saslDefaultServiceName &&
+                   uriOptions.hasField("gssapiServiceName")) {
+            sb << "the GSSAPI service name";
+        } else {
+            return Status::OK();
+        }
+        sb << " in connection URI and as a command-line option";
+        return Status(ErrorCodes::InvalidOptions, sb.str());
     }
 
     return Status::OK();

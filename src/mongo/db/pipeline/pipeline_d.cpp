@@ -26,6 +26,8 @@
  * it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/pipeline_d.h"
@@ -35,21 +37,27 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/exec/fetch.h"
+#include "mongo/db/exec/index_iterator.h"
 #include "mongo/db/exec/multi_iterator.h"
-#include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/shard_filter.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -95,19 +103,13 @@ public:
 
     CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
                                           const NamespaceString& ns) final {
-        AutoGetDb autoDb(opCtx, ns.db(), MODE_IS);
+        AutoGetCollectionForRead autoColl(opCtx, ns);
 
-        uassert(28804,
-                str::stream() << "Database not found on index stats retrieval: " << ns.db(),
-                autoDb.getDb());
-
-        Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_IS);
-
-        Collection* collection = autoDb.getDb()->getCollection(ns);
-
-        uassert(28795,
-                str::stream() << "Collection not found on index stats retrieval: " << ns.ns(),
-                collection);
+        Collection* collection = autoColl.getCollection();
+        if (!collection) {
+            LOG(2) << "Collection not found on index stats retrieval: " << ns.ns();
+            return CollectionIndexUsageMap();
+        }
 
         return collection->infoCache()->getIndexUsageStats();
     }
@@ -130,15 +132,43 @@ shared_ptr<PlanExecutor> createRandomCursorExecutor(Collection* collection,
     if (sampleSize > numRecords * kMaxSampleRatioForRandCursor || numRecords <= 100)
         return {};
 
-    // Attempt to get a random cursor from the storage engine.
-    auto randCursor = collection->getRecordStore()->getRandomCursor(txn);
-
-    if (!randCursor)
-        return {};
+    // Attempt to get a random cursor from the RecordStore. If the RecordStore does not support
+    // random cursors, attempt to get one from the _id index.
+    std::unique_ptr<RecordCursor> rsRandCursor = collection->getRecordStore()->getRandomCursor(txn);
 
     auto ws = stdx::make_unique<WorkingSet>();
-    auto stage = stdx::make_unique<MultiIteratorStage>(txn, ws.get(), collection);
-    stage->addIterator(std::move(randCursor));
+    std::unique_ptr<PlanStage> stage;
+
+    if (rsRandCursor) {
+        stage = stdx::make_unique<MultiIteratorStage>(txn, ws.get(), collection);
+        static_cast<MultiIteratorStage*>(stage.get())->addIterator(std::move(rsRandCursor));
+
+    } else {
+        auto indexCatalog = collection->getIndexCatalog();
+        auto indexDescriptor = indexCatalog->findIdIndex(txn);
+
+        if (!indexDescriptor) {
+            // There was no _id index.
+            return {};
+        }
+
+        IndexAccessMethod* idIam = indexCatalog->getIndex(indexDescriptor);
+        auto idxRandCursor = idIam->newRandomCursor(txn);
+
+        if (!idxRandCursor) {
+            // Storage engine does not support any type of random cursor.
+            return {};
+        }
+
+        auto idxIterator = stdx::make_unique<IndexIteratorStage>(txn,
+                                                                 ws.get(),
+                                                                 collection,
+                                                                 idIam,
+                                                                 indexDescriptor->keyPattern(),
+                                                                 std::move(idxRandCursor));
+        stage = stdx::make_unique<FetchStage>(
+            txn, ws.get(), idxIterator.release(), nullptr, collection);
+    }
 
     ShardingState* const shardingState = ShardingState::get(txn);
 
@@ -162,10 +192,10 @@ StatusWith<std::unique_ptr<PlanExecutor>> attemptToGetExecutor(
     BSONObj projectionObj,
     BSONObj sortObj,
     const size_t plannerOpts) {
-    const WhereCallbackReal whereCallback(pExpCtx->opCtx, pExpCtx->ns.db());
+    const ExtensionsCallbackReal extensionsCallback(pExpCtx->opCtx, &pExpCtx->ns);
 
-    auto cq =
-        CanonicalQuery::canonicalize(pExpCtx->ns, queryObj, sortObj, projectionObj, whereCallback);
+    auto cq = CanonicalQuery::canonicalize(
+        pExpCtx->ns, queryObj, sortObj, projectionObj, extensionsCallback);
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of

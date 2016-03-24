@@ -112,12 +112,14 @@ public:
      */
     virtual long long getTerm() = 0;
 
+    enum class UpdateTermResult { kAlreadyUpToDate, kTriggerStepDown, kUpdatedTerm };
+
     /**
      * Sets the latest term this member is aware of to the higher of its current value and
      * the value passed in as "term".
-     * Returns true if the local term value is changed.
+     * Returns the result of setting the term value, or if a stepdown should be triggered.
      */
-    virtual bool updateTerm(long long term, Date_t now) = 0;
+    virtual UpdateTermResult updateTerm(long long term, Date_t now) = 0;
 
     ////////////////////////////////////////////////////////////
     //
@@ -153,12 +155,19 @@ public:
 
     /**
      * Determines if a new sync source should be chosen, if a better candidate sync source is
-     * available.  If the current sync source's last optime is more than _maxSyncSourceLagSecs
-     * behind any syncable source, this function returns true.
+     * available.  If the current sync source's last optime ("syncSourceLastOpTime" under
+     * protocolVersion 1, but pulled from the MemberHeartbeatData in protocolVersion 0) is more than
+     * _maxSyncSourceLagSecs behind any syncable source, this function returns true. If we are
+     * running in ProtocolVersion 1, our current sync source is not primary, has no sync source
+     * ("syncSourceHasSyncSource" is false), and only has data up to "myLastOpTime", returns true.
      *
      * "now" is used to skip over currently blacklisted sync sources.
      */
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource, Date_t now) const = 0;
+    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
+                                        const OpTime& myLastOpTime,
+                                        const OpTime& syncSourceLastOpTime,
+                                        bool syncSourceHasSyncSource,
+                                        Date_t now) const = 0;
 
     /**
      * Checks whether we are a single node set and we are not in a stepdown period.  If so,
@@ -441,6 +450,12 @@ public:
      * Transitions to the candidate role if the node is electable.
      */
     virtual bool becomeCandidateIfElectable(const Date_t now, const OpTime& lastOpApplied) = 0;
+
+    /**
+     * Updates the storage engine read committed support in the TopologyCoordinator options after
+     * creation.
+     */
+    virtual void setStorageEngineSupportsReadCommitted(bool supported) = 0;
 
 protected:
     TopologyCoordinator() {}

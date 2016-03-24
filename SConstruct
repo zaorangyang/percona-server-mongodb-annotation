@@ -330,6 +330,11 @@ add_option('use-system-snappy',
     nargs=0,
 )
 
+add_option('use-system-valgrind',
+    help='use system version of valgrind library',
+    nargs=0,
+)
+
 add_option('use-system-zlib',
     help='use system version of zlib library',
     nargs=0,
@@ -749,7 +754,7 @@ def printLocalInfo():
 
 printLocalInfo()
 
-boostLibs = [ "thread" , "filesystem" , "program_options", "system" ]
+boostLibs = [ "thread" , "filesystem" , "program_options", "system", "regex", "chrono" ]
 
 onlyServer = len( COMMAND_LINE_TARGETS ) == 0 or ( len( COMMAND_LINE_TARGETS ) == 1 and str( COMMAND_LINE_TARGETS[0] ) in [ "mongod" , "mongos" , "test" ] )
 
@@ -793,6 +798,7 @@ if not serverJs and not usemozjs:
 envDict = dict(BUILD_ROOT=buildDir,
                BUILD_DIR=make_variant_dir_generator(),
                DIST_ARCHIVE_SUFFIX='.tgz',
+               DIST_BINARIES=[],
                MODULE_BANNERS=[],
                ARCHIVE_ADDITION_DIR_MAP={},
                ARCHIVE_ADDITIONS=[],
@@ -1114,17 +1120,21 @@ if link_model.startswith("dynamic"):
             env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
     else:
         env.AppendUnique(SHLINKFLAGS=["-Wl,--no-as-needed"])
-        if link_model == "dynamic-strict":
-            env.AppendUnique(SHLINKFLAGS=["-Wl,-z,defs"])
-        else:
-            # On BFD/gold linker environments, which are not strict by
-            # default, we need to add a flag when libraries are not
-            # tagged incomplete.
-            def libdeps_tags_expand_incomplete(source, target, env, for_signature):
-                if 'incomplete' not in target[0].get_env().get("LIBDEPS_TAGS", []):
-                    return ["-Wl,-z,defs"]
-                return []
-            env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
+
+        # Using zdefs doesn't work at all with the sanitizers
+        if not has_option('sanitize'):
+
+            if link_model == "dynamic-strict":
+                env.AppendUnique(SHLINKFLAGS=["-Wl,-z,defs"])
+            else:
+                # On BFD/gold linker environments, which are not strict by
+                # default, we need to add a flag when libraries are not
+                # tagged incomplete.
+                def libdeps_tags_expand_incomplete(source, target, env, for_signature):
+                    if 'incomplete' not in target[0].get_env().get("LIBDEPS_TAGS", []):
+                        return ["-Wl,-z,defs"]
+                    return []
+                env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
 
 if optBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")

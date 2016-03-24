@@ -56,12 +56,13 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/startup_warnings_common.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balance.h"
 #include "mongo/s/catalog/forwarding_catalog_manager.h"
+#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/s/config.h"
-#include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
@@ -76,6 +77,7 @@
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_server.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -139,8 +141,8 @@ public:
             r.process(txn.get());
         } catch (const AssertionException& ex) {
             LOG(ex.isUserAssertion() ? 1 : 0) << "Assertion failed"
-                                              << " while processing " << opToString(m.operation())
-                                              << " op"
+                                              << " while processing "
+                                              << networkOpToString(m.operation()) << " op"
                                               << " for " << r.getnsIfPresent() << causedBy(ex);
 
             if (r.expectResponse()) {
@@ -152,7 +154,7 @@ public:
             LastError::get(cc()).setLastError(ex.getCode(), ex.what());
         } catch (const DBException& ex) {
             log() << "Exception thrown"
-                  << " while processing " << opToString(m.operation()) << " op"
+                  << " while processing " << networkOpToString(m.operation()) << " op"
                   << " for " << r.getnsIfPresent() << causedBy(ex);
 
             if (r.expectResponse()) {
@@ -166,6 +168,10 @@ public:
 
         // Release connections back to pool, if any still cached
         ShardConnection::releaseMyConnections();
+    }
+
+    virtual void close() {
+        Client::destroy();
     }
 };
 
@@ -193,9 +199,21 @@ static Status initializeSharding(OperationContext* txn) {
     return Status::OK();
 }
 
+static void _initWireSpec() {
+    WireSpec& spec = WireSpec::instance();
+    // accept from any version
+    spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
+    spec.maxWireVersionIncoming = FIND_COMMAND;
+    // connect to version supporting Find Command only
+    spec.minWireVersionOutgoing = FIND_COMMAND;
+    spec.maxWireVersionOutgoing = FIND_COMMAND;
+}
+
 static ExitCode runMongosServer() {
     Client::initThread("mongosMain");
     printShardingVersionInfo(false);
+
+    _initWireSpec();
 
     // Add sharding hooks to both connection pools - ShardingConnectionHook includes auth hooks
     globalConnPool.addHook(new ShardingConnectionHook(false));
@@ -238,6 +256,8 @@ static ExitCode runMongosServer() {
         web.detach();
     }
 
+    HostnameCanonicalizationWorker::start(getGlobalServiceContext());
+
     Status status = getGlobalAuthorizationManager()->initialize(NULL);
     if (!status.isOK()) {
         error() << "Initializing authorization data failed: " << status;
@@ -245,7 +265,6 @@ static ExitCode runMongosServer() {
     }
 
     balancer.go();
-    cursorCache.startTimeoutThread();
     clusterCursorCleanupJob.go();
 
     UserCacheInvalidator cacheInvalidatorThread(getGlobalAuthorizationManager());
@@ -371,7 +390,7 @@ int mongoSMain(int argc, char* argv[], char** envp) {
     if (argc < 1)
         return EXIT_FAILURE;
 
-    setupSignalHandlers(false);
+    setupSignalHandlers();
 
     Status status = mongo::runGlobalInitializers(argc, argv, envp);
     if (!status.isOK()) {
@@ -435,11 +454,12 @@ void mongo::exitCleanly(ExitCode code) {
         }
 
         auto catalogMgr = grid.catalogManager(txn);
-        catalogMgr->shutDown(txn);
-
-        auto cursorManager = grid.getCursorManager();
-        cursorManager->killAllCursors();
-        cursorManager->reapZombieCursors();
+        if (catalogMgr) {
+            catalogMgr->shutDown(txn);
+            auto cursorManager = grid.getCursorManager();
+            cursorManager->killAllCursors();
+            cursorManager->reapZombieCursors();
+        }
     }
 
     mongo::dbexit(code);

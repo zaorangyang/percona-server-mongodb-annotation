@@ -58,6 +58,8 @@ public:
         kJournal,
         kWrite,
         kFTDC,
+        kASIO,
+        kBridge,
         kNumLogComponents
     };
 

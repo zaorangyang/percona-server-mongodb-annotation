@@ -88,7 +88,7 @@ void Command::execCommand(OperationContext* txn,
                            cmdObj,
                            result);
 
-    replyBuilder->setMetadata(rpc::makeEmptyMetadata()).setCommandReply(result.done());
+    replyBuilder->setCommandReply(result.done()).setMetadata(rpc::makeEmptyMetadata());
 }
 
 void Command::execCommandClientBasic(OperationContext* txn,
@@ -127,10 +127,11 @@ void Command::execCommandClientBasic(OperationContext* txn,
     try {
         ok = c->run(txn, dbname, cmdObj, queryOptions, errmsg, result);
     } catch (const DBException& e) {
+        result.resetToEmpty();
         const int code = e.getCode();
 
         // Codes for StaleConfigException
-        if (code == RecvStaleConfigCode || code == SendStaleConfigCode) {
+        if (code == ErrorCodes::RecvStaleConfig || code == ErrorCodes::SendStaleConfig) {
             throw;
         }
 

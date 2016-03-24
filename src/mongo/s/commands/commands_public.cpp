@@ -86,6 +86,10 @@ bool cursorCommandPassthrough(OperationContext* txn,
                               int options,
                               BSONObjBuilder* out) {
     const auto shard = grid.shardRegistry()->getShard(txn, conf->getPrimaryId());
+    if (!shard) {
+        return Command::appendCommandStatus(
+            *out, {ErrorCodes::ShardNotFound, "failed to find a valid shard"});
+    }
     ScopedDbConnection conn(shard->getConnString());
     auto cursor = conn->query(str::stream() << conf->name() << ".$cmd",
                               cmdObj,
@@ -110,7 +114,7 @@ bool cursorCommandPassthrough(OperationContext* txn,
     StatusWith<BSONObj> transformedResponse =
         storePossibleCursor(HostAndPort(cursor->originalHost()),
                             response,
-                            grid.shardRegistry()->getExecutor(),
+                            grid.shardRegistry()->getExecutorPool()->getArbitraryExecutor(),
                             grid.getCursorManager());
     if (!transformedResponse.isOK()) {
         return Command::appendCommandStatus(*out, transformedResponse.getStatus());
@@ -566,7 +570,9 @@ public:
              BSONObjBuilder& result) {
         const string todb = cmdObj.getStringField("todb");
         uassert(ErrorCodes::EmptyFieldName, "missing todb argument", !todb.empty());
-        uassert(ErrorCodes::InvalidNamespace, "invalid todb argument", nsIsDbOnly(todb));
+        uassert(ErrorCodes::InvalidNamespace,
+                "invalid todb argument",
+                NamespaceString::validDBName(todb));
 
         auto confTo = uassertStatusOK(grid.implicitCreateDb(txn, todb));
         uassert(ErrorCodes::IllegalOperation,
@@ -991,7 +997,7 @@ public:
 
         BSONObj query = getQuery(cmdObj);
         set<ShardId> shardIds;
-        cm->getShardIdsForQuery(shardIds, query);
+        cm->getShardIdsForQuery(txn, query, &shardIds);
 
         set<BSONObj, BSONObjCmp> all;
         int size = 32;
@@ -1241,7 +1247,7 @@ public:
 
         BSONObj query = getQuery(cmdObj);
         set<ShardId> shardIds;
-        cm->getShardIdsForQuery(shardIds, query);
+        cm->getShardIdsForQuery(txn, query, &shardIds);
 
         // We support both "num" and "limit" options to control limit
         int limit = 100;

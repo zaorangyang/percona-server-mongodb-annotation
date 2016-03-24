@@ -113,7 +113,7 @@ namespace mongo {
         }
     }
 
-#define invariantKVOK(s, expr) massert(28833, expr, s.isOK())
+#define invariantKVOK(s, expr) massert(28933, expr, s.isOK())
 
     long long KVRecordStore::dataSize( OperationContext* txn ) const {
         if (_sizeStorer) {
@@ -186,7 +186,7 @@ namespace mongo {
                 return RecordData(nullptr, 0);
             } else {
                 log() << "storage engine get() failed, operation will fail: " << status.toString();
-                uasserted(28822, status.toString());
+                uasserted(28922, status.toString());
             }
         }
 
@@ -197,7 +197,7 @@ namespace mongo {
     RecordData KVRecordStore::dataFor( OperationContext* txn, const RecordId& loc) const {
         RecordData rd;
         bool found = findRecord(txn, loc, &rd);
-        massert(28823, "Didn't find RecordId in record store", found);
+        massert(28923, "Didn't find RecordId in record store", found);
         return rd;
     }
 
@@ -556,7 +556,7 @@ namespace mongo {
         return _savedLoc;
     }
 
-    void KVRecordStore::KVRecordCursor::invalidate(const RecordId& loc) {
+    void KVRecordStore::KVRecordCursor::invalidate(OperationContext* OpCtx, const RecordId& loc) {
         // this only gets called to invalidate potentially buffered
         // `loc' results between saveState() and restoreState().
         _savedLoc = RecordId();

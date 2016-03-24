@@ -59,10 +59,10 @@ namespace {
 StatusWith<std::tuple<CursorId, BSONArray>> getBatchFromReply(std::uint32_t requestId,
                                                               const Message& response) {
     auto header = response.header();
-    if (header.getOperation() != mongo::opReply) {
+    if (header.getNetworkOp() != mongo::opReply) {
         return {ErrorCodes::ProtocolError,
                 str::stream() << "Expected to be decoding an OP_REPLY but got "
-                              << mongo::opToString(header.getOperation())};
+                              << mongo::networkOpToString(header.getNetworkOp())};
     }
 
     if (header.getResponseTo() != requestId) {
@@ -188,7 +188,8 @@ StatusWith<Message> downconvertFindCommandRequest(const RemoteCommandRequest& re
 
     // We can't downconvert all metadata, since we aren't sending a command, but we do need to
     // downconvert $secondaryOk to the slaveOK bit.
-    auto ssm = rpc::ServerSelectionMetadata::readFromMetadata(request.metadata);
+    auto ssm = rpc::ServerSelectionMetadata::readFromMetadata(
+        request.metadata.getField(rpc::ServerSelectionMetadata::fieldName()));
     if (!ssm.isOK()) {
         return ssm.getStatus();
     }

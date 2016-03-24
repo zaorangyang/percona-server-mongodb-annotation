@@ -1,6 +1,6 @@
-// version2.js
+(function() {
 
-s = new ShardingTest( "version2" , 1 , 2 )
+var s = new ShardingTest({ name: "version2", shards: 1 });
 
 s.adminCommand( { enablesharding : "alleyinsider" } );
 s.adminCommand( { shardcollection : "alleyinsider.foo" , key : { num : 1 } } );
@@ -46,6 +46,7 @@ assert.commandWorked( a2.runCommand({ setShardVersion: "alleyinsider.bar",
                                       configdb: s._configDB,
                                       version: new Timestamp(1, 0),
                                       versionEpoch: barEpoch,
+                                      shard: 'shard0000',
                                       authoritative: true }),
                       "setShardVersion bar temp" );
 
@@ -63,5 +64,6 @@ assert.throws( simpleFindOne , [] , "should complain about not in sharded mode 1
 
 // simpleFindOne(); // newer version is ok
 
-
 s.stop();
+
+})();

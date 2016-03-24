@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -66,26 +66,24 @@ StringData stateToString(AsyncMockStreamFactory::MockStream::StreamState state) 
     MONGO_UNREACHABLE;
 }
 
-template <typename Handler, typename... Args>
-void checkCanceled(asio::io_service* io_service,
+template <typename Handler>
+void checkCanceled(asio::io_service::strand* strand,
                    AsyncMockStreamFactory::MockStream::StreamState* state,
                    Handler&& handler,
-                   std::size_t bytes) {
+                   std::size_t bytes,
+                   std::error_code ec = std::error_code()) {
     auto wasCancelled = (*state == AsyncMockStreamFactory::MockStream::StreamState::kCanceled);
     *state = AsyncMockStreamFactory::MockStream::StreamState::kRunning;
-    asio::post(*io_service,
-               [handler, wasCancelled, bytes] {
-                   handler(wasCancelled ? make_error_code(asio::error::operation_aborted)
-                                        : std::error_code(),
-                           bytes);
-               });
+    strand->post([handler, wasCancelled, bytes, ec] {
+        handler(wasCancelled ? make_error_code(asio::error::operation_aborted) : ec, bytes);
+    });
 }
 
 }  // namespace
 
 std::unique_ptr<AsyncStreamInterface> AsyncMockStreamFactory::makeStream(
-    asio::io_service* io_service, const HostAndPort& target) {
-    return stdx::make_unique<MockStream>(io_service, this, target);
+    asio::io_service::strand* strand, const HostAndPort& target) {
+    return stdx::make_unique<MockStream>(strand, this, target);
 }
 
 void AsyncMockStreamFactory::_createStream(const HostAndPort& host, MockStream* stream) {
@@ -112,10 +110,10 @@ AsyncMockStreamFactory::MockStream* AsyncMockStreamFactory::blockUntilStreamExis
     return iter->second;
 }
 
-AsyncMockStreamFactory::MockStream::MockStream(asio::io_service* io_service,
+AsyncMockStreamFactory::MockStream::MockStream(asio::io_service::strand* strand,
                                                AsyncMockStreamFactory* factory,
                                                const HostAndPort& target)
-    : _io_service(io_service), _factory(factory), _target(target) {
+    : _strand(strand), _factory(factory), _target(target) {
     _factory->_createStream(_target, this);
 }
 
@@ -133,7 +131,7 @@ void AsyncMockStreamFactory::MockStream::connect(asio::ip::tcp::resolver::iterat
                // We shim a lambda to give connectHandler the right signature since it doesn't take
                // a size_t param.
                checkCanceled(
-                   _io_service,
+                   _strand,
                    &_state,
                    [connectHandler](std::error_code ec, std::size_t) { return connectHandler(ec); },
                    0);
@@ -152,7 +150,7 @@ void AsyncMockStreamFactory::MockStream::write(asio::const_buffer buf,
     _defer_inlock(kBlockedAfterWrite,
                   [this, writeHandler, size]() {
                       stdx::unique_lock<stdx::mutex> lk(_mutex);
-                      checkCanceled(_io_service, &_state, std::move(writeHandler), size);
+                      checkCanceled(_strand, &_state, std::move(writeHandler), size);
                   });
 }
 
@@ -174,22 +172,41 @@ void AsyncMockStreamFactory::MockStream::read(asio::mutable_buffer buf,
     _defer(kBlockedBeforeRead,
            [this, buf, readHandler]() {
                stdx::unique_lock<stdx::mutex> lk(_mutex);
+               int nToCopy = 0;
 
-               auto nextRead = std::move(_readQueue.front());
-               _readQueue.pop();
+               // If we've set an error, return that instead of a read.
+               if (!_error) {
+                   auto nextRead = std::move(_readQueue.front());
+                   _readQueue.pop();
 
-               auto beginDst = asio::buffer_cast<uint8_t*>(buf);
-               auto nToCopy = std::min(nextRead.size(), asio::buffer_size(buf));
+                   auto beginDst = asio::buffer_cast<uint8_t*>(buf);
+                   nToCopy = std::min(nextRead.size(), asio::buffer_size(buf));
 
-               auto endSrc = std::begin(nextRead);
-               std::advance(endSrc, nToCopy);
+                   auto endSrc = std::begin(nextRead);
+                   std::advance(endSrc, nToCopy);
 
-               auto endDst = std::copy(std::begin(nextRead), endSrc, beginDst);
-               invariant((endDst - beginDst) == static_cast<std::ptrdiff_t>(nToCopy));
-               log() << "read " << nToCopy << " bytes, " << (nextRead.size() - nToCopy)
-                     << " remaining in buffer";
+                   auto endDst = std::copy(std::begin(nextRead), endSrc, beginDst);
+                   invariant((endDst - beginDst) == static_cast<std::ptrdiff_t>(nToCopy));
+                   log() << "read " << nToCopy << " bytes, " << (nextRead.size() - nToCopy)
+                         << " remaining in buffer";
+               }
 
-               checkCanceled(_io_service, &_state, std::move(readHandler), nToCopy);
+               auto handler = readHandler;
+
+               // If we did not receive all the bytes, we should return an error
+               if (static_cast<size_t>(nToCopy) < asio::buffer_size(buf)) {
+                   handler = [readHandler](std::error_code ec, size_t len) {
+                       // If we have an error here we've been canceled, and that takes precedence
+                       if (ec)
+                           return readHandler(ec, len);
+
+                       // Call the original handler with an error
+                       readHandler(make_error_code(ErrorCodes::InvalidLength), len);
+                   };
+               }
+
+               checkCanceled(_strand, &_state, std::move(handler), nToCopy, _error);
+               _error.clear();
            });
 }
 
@@ -197,6 +214,10 @@ void AsyncMockStreamFactory::MockStream::pushRead(std::vector<uint8_t> toRead) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     invariant(_state != kRunning && _state != kCanceled);
     _readQueue.emplace(std::move(toRead));
+}
+
+void AsyncMockStreamFactory::MockStream::setError(std::error_code ec) {
+    _error = ec;
 }
 
 std::vector<uint8_t> AsyncMockStreamFactory::MockStream::popWrite() {
@@ -236,7 +257,7 @@ void AsyncMockStreamFactory::MockStream::_unblock_inlock() {
     }
     // Post our deferred action to resume state machine execution
     invariant(_deferredAction);
-    _io_service->post(std::move(_deferredAction));
+    _strand->post(std::move(_deferredAction));
     _deferredAction = nullptr;
 }
 
@@ -281,32 +302,36 @@ void AsyncMockStreamFactory::MockStream::simulateServer(
     }
 
     auto replyBuilder = rpc::makeReplyBuilder(proto);
-    replyBuilder->setMetadata(resp.metadata);
     replyBuilder->setCommandReply(resp.data);
+    replyBuilder->setMetadata(resp.metadata);
 
     auto replyMsg = replyBuilder->done();
-    replyMsg->header().setResponseTo(messageId);
+    replyMsg.header().setResponseTo(messageId);
 
     {
         // The first read will be for the header.
         ReadEvent read{this};
-        auto hdrBytes = reinterpret_cast<const uint8_t*>(replyMsg->header().view2ptr());
+        auto hdrBytes = reinterpret_cast<const uint8_t*>(replyMsg.header().view2ptr());
         pushRead({hdrBytes, hdrBytes + sizeof(MSGHEADER::Value)});
     }
 
     {
         // The second read will be for the message data.
         ReadEvent read{this};
-        auto dataBytes = reinterpret_cast<const uint8_t*>(replyMsg->buf());
+        auto dataBytes = reinterpret_cast<const uint8_t*>(replyMsg.buf());
         auto pastHeader = dataBytes;
         std::advance(pastHeader, sizeof(MSGHEADER::Value));
-        pushRead({pastHeader, dataBytes + static_cast<std::size_t>(replyMsg->size())});
+        pushRead({pastHeader, dataBytes + static_cast<std::size_t>(replyMsg.size())});
     }
 
     if (ex) {
         // Rethrow ASSERTS after the NIA completes it's Write-Read-Read sequence.
         std::rethrow_exception(ex);
     }
+}
+
+bool AsyncMockStreamFactory::MockStream::isOpen() {
+    return true;
 }
 
 }  // namespace executor

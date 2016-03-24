@@ -129,7 +129,7 @@ DB.prototype.commandHelp = function( name ){
          // for a command failing due to a connection failure, we preserve it for backwards
          // compatibility. See SERVER-18334 for details.
          if (ex.message.indexOf("network error") >= 0) {
-             throw new Error("error doing query: failed");
+             throw new Error("error doing query: failed: " + ex.message);
          }
          throw ex;
      }
@@ -294,7 +294,7 @@ DB.prototype.shutdownServer = function(opts) {
     }
     catch (e) {
         // we expect the command to not return a response, as the server will shut down immediately.
-        if (e.message === "error doing query: failed") {
+        if (e.message.indexOf("error doing query: failed") >= 0) {
             print('server should be down...');
             return;
         }
@@ -746,9 +746,7 @@ DB.prototype._getCollectionInfosCommand = function(filter) {
         throw _getErrorWithCode(res, "listCollections failed: " + tojson(res));
     }
 
-    // The listCollections command returns its results sorted by collection name.  There's no need
-    // to re-sort.
-    return new DBCommandCursor(this._mongo, res).toArray();
+    return new DBCommandCursor(this._mongo, res).toArray().sort(compareOn("name"));
 }
 
 /**

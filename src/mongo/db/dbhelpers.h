@@ -28,17 +28,18 @@
 
 #pragma once
 
-#include <iosfwd>
 #include <memory>
 #include <boost/filesystem/path.hpp>
 
 #include "mongo/db/db.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/data_protector.h"
 
 namespace mongo {
 
 class Collection;
 class Cursor;
+class DataProtector;
 class OperationContext;
 struct KeyRange;
 struct WriteConcernOptions;
@@ -218,6 +219,7 @@ struct Helpers {
 
     public:
         RemoveSaver(const std::string& type, const std::string& ns, const std::string& why);
+        ~RemoveSaver();
 
         /**
          * Writes document to file. File is created lazily before writing the first document.
@@ -229,6 +231,7 @@ struct Helpers {
     private:
         boost::filesystem::path _root;
         boost::filesystem::path _file;
+        std::unique_ptr<DataProtector> _protector;
         std::unique_ptr<std::ostream> _out;
     };
 };

@@ -30,7 +30,6 @@
 
 #include "mongo/platform/basic.h"
 
-
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -217,7 +216,8 @@ public:
 
         LOG(0) << "CMD: movechunk: " << cmdObj;
 
-        StatusWith<int> maxTimeMS = LiteParsedQuery::parseMaxTimeMSCommand(cmdObj);
+        StatusWith<int> maxTimeMS =
+            LiteParsedQuery::parseMaxTimeMS(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]);
 
         if (!maxTimeMS.isOK()) {
             errmsg = maxTimeMS.getStatus().reason();

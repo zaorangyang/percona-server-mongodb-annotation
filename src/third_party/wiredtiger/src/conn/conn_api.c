@@ -1051,6 +1051,7 @@ __conn_reconfigure(WT_CONNECTION *wt_conn, const char *config)
 	WT_ERR(__wt_async_reconfig(session, cfg));
 	WT_ERR(__wt_cache_config(session, true, cfg));
 	WT_ERR(__wt_checkpoint_server_create(session, cfg));
+	WT_ERR(__wt_logmgr_reconfig(session, cfg));
 	WT_ERR(__wt_lsm_manager_reconfig(session, cfg));
 	WT_ERR(__wt_statlog_create(session, cfg));
 	WT_ERR(__wt_sweep_config(session, cfg));
@@ -1285,6 +1286,11 @@ __conn_config_env(WT_SESSION_IMPL *session, const char *cfg[], WT_ITEM *cbuf)
 	const char *env_config;
 	size_t len;
 
+	/* Only use the environment variable if configured. */
+	WT_RET(__wt_config_gets(session, cfg, "use_environment", &cval));
+	if (cval.val == 0)
+		return (0);
+
 	ret = __wt_getenv(session, "WIREDTIGER_CONFIG", &env_config);
 	if (ret == WT_NOTFOUND)
 		return (0);
@@ -1332,15 +1338,16 @@ err:	__wt_free(session, env_config);
 static int
 __conn_home(WT_SESSION_IMPL *session, const char *home, const char *cfg[])
 {
-	WT_DECL_RET;
 	WT_CONFIG_ITEM cval;
 
 	/* If the application specifies a home directory, use it. */
 	if (home != NULL)
 		goto copy;
 
-	ret = __wt_getenv(session, "WIREDTIGER_HOME", &S2C(session)->home);
-	if (ret == 0)
+	/* Only use the environment variable if configured. */
+	WT_RET(__wt_config_gets(session, cfg, "use_environment", &cval));
+	if (cval.val != 0 &&
+	    __wt_getenv(session, "WIREDTIGER_HOME", &S2C(session)->home) == 0)
 		return (0);
 
 	/* If there's no WIREDTIGER_HOME environment variable, use ".". */
@@ -1725,6 +1732,7 @@ __conn_write_base_config(WT_SESSION_IMPL *session, const char *cfg[])
 	    "create=,"
 	    "encryption=(secretkey=),"
 	    "exclusive=,"
+	    "in_memory=,"
 	    "log=(recover=),"
 	    "use_environment_priv=,"
 	    "verbose=,", &base_config));
@@ -1797,7 +1805,7 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	WT_DECL_RET;
 	const WT_NAME_FLAG *ft;
 	WT_SESSION_IMPL *session;
-	int64_t config_base_set;
+	bool config_base_set;
 	const char *enc_cfg[] = { NULL, NULL };
 	char version[64];
 
@@ -1841,13 +1849,20 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 
 	/* Capture the config_base setting file for later use. */
 	WT_ERR(__wt_config_gets(session, cfg, "config_base", &cval));
-	config_base_set = cval.val;
+	config_base_set = cval.val != 0;
 
 	/* Configure error messages so we get them right early. */
 	WT_ERR(__wt_config_gets(session, cfg, "error_prefix", &cval));
 	if (cval.len != 0)
 		WT_ERR(__wt_strndup(
 		    session, cval.str, cval.len, &conn->error_prefix));
+
+	/*
+	 * XXX ideally, we would check "in_memory" here, so we could completely
+	 * avoid having a database directory.  However, it can be convenient to
+	 * pass "in_memory" via the WIREDTIGER_CONFIG environment variable, and
+	 * we haven't read it yet.
+	 */
 
 	/* Get the database home. */
 	WT_ERR(__conn_home(session, home, cfg));
@@ -1882,7 +1897,7 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	__conn_config_append(cfg, version);
 
 	/* Ignore the base_config file if we config_base set to false. */
-	if (config_base_set != 0)
+	if (config_base_set)
 		WT_ERR(
 		    __conn_config_file(session, WT_BASECONFIG, false, cfg, i1));
 	__conn_config_append(cfg, config);
@@ -1920,6 +1935,10 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	WT_ERR(__wt_config_gets(session, cfg, "session_scratch_max", &cval));
 	conn->session_scratch_max = (size_t)cval.val;
 
+	WT_ERR(__wt_config_gets(session, cfg, "in_memory", &cval));
+	if (cval.val != 0)
+		F_SET(conn, WT_CONN_IN_MEMORY);
+
 	WT_ERR(__wt_config_gets(session, cfg, "checkpoint_sync", &cval));
 	if (cval.val)
 		F_SET(conn, WT_CONN_CKPT_SYNC);
@@ -1930,6 +1949,16 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 		if (ret == 0) {
 			if (sval.val)
 				FLD_SET(conn->direct_io, ft->flag);
+		} else if (ret != WT_NOTFOUND)
+			goto err;
+	}
+
+	WT_ERR(__wt_config_gets(session, cfg, "write_through", &cval));
+	for (ft = file_types; ft->name != NULL; ft++) {
+		ret = __wt_config_subgets(session, &cval, ft->name, &sval);
+		if (ret == 0) {
+			if (sval.val)
+				FLD_SET(conn->write_through, ft->flag);
 		} else if (ret != WT_NOTFOUND)
 			goto err;
 	}
@@ -2036,9 +2065,6 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 
 	/* Start the worker threads and run recovery. */
 	WT_ERR(__wt_connection_workers(session, cfg));
-
-	/* Create the lookaside table. */
-	WT_ERR(__wt_las_create(session));
 
 	WT_STATIC_ASSERT(offsetof(WT_CONNECTION_IMPL, iface) == 0);
 	*wt_connp = &conn->iface;

@@ -119,16 +119,9 @@ public:
     void asFindCommand(BSONObjBuilder* cmdBuilder) const;
 
     /**
-     * Helper functions to parse maxTimeMS from a command object.  Returns the contained value,
-     * or an error on parsing fail.  When passed an EOO-type element, returns 0 (special value
-     * for "allow to run indefinitely").
+     * Parses maxTimeMS from the BSONElement containing its value.
      */
-    static StatusWith<int> parseMaxTimeMSCommand(const BSONObj& cmdObj);
-
-    /**
-     * Same as parseMaxTimeMSCommand, but for a query object.
-     */
-    static StatusWith<int> parseMaxTimeMSQuery(const BSONObj& queryObj);
+    static StatusWith<int> parseMaxTimeMS(BSONElement maxTimeMSElt);
 
     /**
      * Helper function to identify text search sort key
@@ -161,8 +154,9 @@ public:
     static const std::string kUnwrappedReadPrefField;
 
     // Names of the maxTimeMS command and query option.
-    static const std::string cmdOptionMaxTimeMS;
-    static const std::string queryOptionMaxTimeMS;
+    // Char arrays because they are used in static initialization.
+    static const char cmdOptionMaxTimeMS[];
+    static const char queryOptionMaxTimeMS[];
 
     // Names of the $meta projection values.
     static const std::string metaGeoNearDistance;
@@ -314,8 +308,6 @@ private:
                 bool fromQueryMessage);
 
     Status initFullQuery(const BSONObj& top);
-
-    static StatusWith<int> parseMaxTimeMS(const BSONElement& maxTimeMSElt);
 
     /**
      * Updates the projection object with a $meta projection for the returnKey option.

@@ -8,6 +8,7 @@ replTest.startSet();
 
 var config = replTest.getReplSetConfig();
 replTest.initiate(config);
+config = replTest.getConfigFromPrimary();
 
 var runTest = function(testDB, primaryConn) {
     primaryConn.getDB('test').user.insert({ x: 1 }, { writeConcern: { w: 2 }});
@@ -17,11 +18,8 @@ var runTest = function(testDB, primaryConn) {
     var oplogTS = localDB.oplog.rs.find().sort({ $natural: -1 }).limit(1).next();
     var twoSecTS = new Timestamp(oplogTS.ts.getTime() + 2, 0);
 
-    var term;
-    if (config.protocolVersion === 0) {
-        term = -1;
-    }
-    else {
+    var term = -1;
+    if (config.protocolVersion === 1) {
         term = oplogTS.t;
     }
 
@@ -35,7 +33,7 @@ var runTest = function(testDB, primaryConn) {
         maxTimeMS: 1000
     }));
 
-    assert.eq(50, res.code); // ErrorCodes::ExceededTimeLimit
+    assert.eq(50, res.code, tojson(res)); // ErrorCodes::ExceededTimeLimit
     assert.gt(res.waitedMS, 500);
     assert.lt(res.waitedMS, 2500);
 
@@ -49,8 +47,8 @@ var runTest = function(testDB, primaryConn) {
         filter: { x: 1 },
         readConcern: {
             afterOpTime: { ts: twoSecTS, t: term },
-            maxTimeMS: 10 * 1000
-        }
+        },
+        maxTimeMS: 10 * 1000,
     }));
 
     assert.eq(null, res.code);

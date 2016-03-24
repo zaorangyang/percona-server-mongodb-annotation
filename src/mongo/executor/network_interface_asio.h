@@ -41,6 +41,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/system_error.h"
 #include "mongo/executor/async_stream_factory_interface.h"
+#include "mongo/executor/async_stream_interface.h"
 #include "mongo/executor/connection_pool.h"
 #include "mongo/executor/async_timer_interface.h"
 #include "mongo/executor/network_connection_hook.h"
@@ -79,7 +80,7 @@ class NetworkInterfaceASIO final : public NetworkInterface {
 
 public:
     struct Options {
-        Options() = default;
+        Options();
 
 // Explicit move construction and assignment to support MSVC
 #if defined(_MSC_VER) && _MSC_VER < 1900
@@ -90,6 +91,7 @@ public:
         Options& operator=(Options&&) = default;
 #endif
 
+        std::string instanceName = "NetworkInterfaceASIO";
         ConnectionPool::Options connectionPoolOptions;
         std::unique_ptr<AsyncTimerFactoryInterface> timerFactory;
         std::unique_ptr<NetworkConnectionHook> networkConnectionHook;
@@ -100,6 +102,7 @@ public:
     NetworkInterfaceASIO(Options = Options());
 
     std::string getDiagnosticString() override;
+    void appendConnectionStats(BSONObjBuilder* b) override;
     std::string getHostName() override;
     void startup() override;
     void shutdown() override;
@@ -113,6 +116,8 @@ public:
     void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) override;
     void cancelAllCommands() override;
     void setAlarm(Date_t when, const stdx::function<void()>& action) override;
+
+    bool onNetworkThread() override;
 
     bool inShutdown() const;
 
@@ -153,7 +158,10 @@ private:
         std::unique_ptr<AsyncStreamInterface> _stream;
 
         rpc::ProtocolSet _serverProtocols;
-        rpc::ProtocolSet _clientProtocols{rpc::supports::kAll};
+
+        // Dynamically initialized from [min max]WireVersionOutgoing.
+        // Its expected that isMaster response is checked only on the caller.
+        rpc::ProtocolSet _clientProtocols{rpc::supports::kNone};
     };
 
     /**
@@ -277,6 +285,14 @@ private:
 
         void setOnFinish(RemoteCommandCompletionFn&& onFinish);
 
+        asio::io_service::strand& strand() {
+            return _strand;
+        }
+
+        asio::ip::tcp::resolver& resolver() {
+            return _resolver;
+        }
+
     private:
         NetworkInterfaceASIO* const _owner;
         // Information describing a task enqueued on the NetworkInterface
@@ -304,8 +320,10 @@ private:
         Date_t _start;
         std::unique_ptr<AsyncTimerInterface> _timeoutAlarm;
 
-        AtomicUInt64 _canceled;
-        AtomicUInt64 _timedOut;
+        asio::ip::tcp::resolver _resolver;
+
+        bool _canceled = false;
+        bool _timedOut = false;
 
         /**
          * We maintain a shared_ptr to an access control object. This ensures that tangent
@@ -321,6 +339,15 @@ private:
          */
         boost::optional<AsyncCommand> _command;
         bool _inSetup;
+
+        /**
+         * The explicit strand that all operations for this op must run on.
+         * This must be the last member of AsyncOp because any pending
+         * operation for the strand are run when it's dtor is called. Any
+         * members that fall after it will have already been destroyed, which
+         * will make those fields illegal to touch from callbacks.
+         */
+        asio::io_service::strand _strand;
     };
 
     void _startCommand(AsyncOp* op);
@@ -370,15 +397,13 @@ private:
     Options _options;
 
     asio::io_service _io_service;
-    stdx::thread _serviceRunner;
+    std::vector<stdx::thread> _serviceRunners;
 
     const std::unique_ptr<rpc::EgressMetadataHook> _metadataHook;
 
     const std::unique_ptr<NetworkConnectionHook> _hook;
 
-    asio::ip::tcp::resolver _resolver;
-
-    std::atomic<State> _state;
+    std::atomic<State> _state;  // NOLINT
 
     std::unique_ptr<AsyncTimerFactoryInterface> _timerFactory;
 
@@ -395,6 +420,15 @@ private:
     stdx::mutex _executorMutex;
     bool _isExecutorRunnable;
     stdx::condition_variable _isExecutorRunnableCondition;
+
+    /**
+     * The explicit strand that all non-op operations run on. This must be the
+     * last member of NetworkInterfaceASIO because any pending operation for
+     * the strand are run when it's dtor is called. Any members that fall after
+     * it will have already been destroyed, which will make those fields
+     * illegal to touch from callbacks.
+     */
+    asio::io_service::strand _strand;
 };
 
 template <typename T, typename R, typename... MethodArgs, typename... DeducedArgs>

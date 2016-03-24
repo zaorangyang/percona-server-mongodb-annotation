@@ -357,6 +357,67 @@ __wt_log_extract_lognum(
 }
 
 /*
+ * __log_zero --
+ *	Zero a log file.
+ */
+static int
+__log_zero(WT_SESSION_IMPL *session,
+    WT_FH *fh, wt_off_t start_off, wt_off_t len)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_ITEM(zerobuf);
+	WT_DECL_RET;
+	WT_LOG *log;
+	uint32_t allocsize, bufsz, off, partial, wrlen;
+
+	conn = S2C(session);
+	log = conn->log;
+	allocsize = log->allocsize;
+	zerobuf = NULL;
+	if (allocsize < WT_MEGABYTE)
+		bufsz = WT_MEGABYTE;
+	else
+		bufsz = allocsize;
+	/*
+	 * If they're using smaller log files, cap it at the file size.
+	 */
+	if (conn->log_file_max < bufsz)
+		bufsz = (uint32_t)conn->log_file_max;
+	WT_RET(__wt_scr_alloc(session, bufsz, &zerobuf));
+	memset(zerobuf->mem, 0, zerobuf->memsize);
+	WT_STAT_FAST_CONN_INCR(session, log_zero_fills);
+
+	/*
+	 * Read in a chunk starting at the end of the file.  Keep going until
+	 * we reach the beginning or we find a chunk that contains any non-zero
+	 * bytes.  Compare against a known zero byte chunk.
+	 */
+	off = (uint32_t)start_off;
+	while (off < (uint32_t)len) {
+		/*
+		 * Typically we start to zero the file after the log header
+		 * and the bufsz is a sector-aligned size.  So we want to
+		 * align our writes when we can.
+		 */
+		partial = off % bufsz;
+		if (partial != 0)
+			wrlen = bufsz - partial;
+		else
+			wrlen = bufsz;
+		/*
+		 * Check if we're writing a partial amount at the end too.
+		 */
+		if ((uint32_t)len - off < bufsz)
+			wrlen = (uint32_t)len - off;
+		WT_ERR(__wt_write(session,
+		    fh, (wt_off_t)off, wrlen, zerobuf->mem));
+		off += wrlen;
+	}
+err:	__wt_scr_free(session, &zerobuf);
+	return (ret);
+}
+
+/*
  * __log_prealloc --
  *	Pre-allocate a log file.
  */
@@ -370,7 +431,15 @@ __log_prealloc(WT_SESSION_IMPL *session, WT_FH *fh)
 	conn = S2C(session);
 	log = conn->log;
 	ret = 0;
-	if (fh->fallocate_available == WT_FALLOCATE_NOT_AVAILABLE ||
+	/*
+	 * If the user configured zero filling, pre-allocate the log file
+	 * manually.  Otherwise use either fallocate or ftruncate to create
+	 * and zero the log file based on what is available.
+	 */
+	if (FLD_ISSET(conn->log_flags, WT_CONN_LOG_ZERO_FILL))
+		ret = __log_zero(session, fh,
+		    WT_LOG_FIRST_RECORD, conn->log_file_max);
+	else if (fh->fallocate_available == WT_FALLOCATE_NOT_AVAILABLE ||
 	    (ret = __wt_fallocate(session, fh,
 	    WT_LOG_FIRST_RECORD, conn->log_file_max)) == ENOTSUP)
 		ret = __wt_ftruncate(session, fh,
@@ -482,7 +551,6 @@ __log_fill(WT_SESSION_IMPL *session,
 	else
 		/*
 		 * If this is a force or unbuffered write, write it now.
-		 * A forced write sends in a temporary, local slot.
 		 */
 		WT_ERR(__wt_write(session, myslot->slot->slot_fh,
 		    myslot->offset + myslot->slot->slot_start_offset,
@@ -753,7 +821,7 @@ __log_newfile(WT_SESSION_IMPL *session, bool conn_open, bool *created)
 	if (create_log) {
 		log->prep_missed++;
 		WT_RET(__wt_log_allocfile(
-		    session, log->fileid, WT_LOG_FILENAME, true));
+		    session, log->fileid, WT_LOG_FILENAME));
 	}
 	WT_RET(__log_openfile(session,
 	    false, &log->log_fh, WT_LOG_FILENAME, log->fileid));
@@ -904,7 +972,7 @@ err:	WT_TRET(__wt_close(session, &log_fh));
  */
 int
 __wt_log_allocfile(
-    WT_SESSION_IMPL *session, uint32_t lognum, const char *dest, bool prealloc)
+    WT_SESSION_IMPL *session, uint32_t lognum, const char *dest)
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_DECL_ITEM(from_path);
@@ -936,8 +1004,7 @@ __wt_log_allocfile(
 	WT_ERR(__log_openfile(session, true, &log_fh, WT_LOG_TMPNAME, tmp_id));
 	WT_ERR(__log_file_header(session, log_fh, NULL, true));
 	WT_ERR(__wt_ftruncate(session, log_fh, WT_LOG_FIRST_RECORD));
-	if (prealloc)
-		WT_ERR(__log_prealloc(session, log_fh));
+	WT_ERR(__log_prealloc(session, log_fh));
 	WT_ERR(__wt_fsync(session, log_fh));
 	WT_ERR(__wt_close(session, &log_fh));
 	WT_ERR(__wt_verbose(session, WT_VERB_LOG,
@@ -1105,87 +1172,60 @@ __wt_log_close(WT_SESSION_IMPL *session)
 }
 
 /*
- * __log_filesize --
- *	Returns an estimate of the real end of log file.
+ * __log_has_hole --
+ *	Determine if the current offset represents a hole in the log
+ *	file (i.e. there is valid data somewhere after the hole), or
+ *	if this is the end of this log file and the remainder of the
+ *	file is zeroes.
  */
 static int
-__log_filesize(WT_SESSION_IMPL *session, WT_FH *fh, wt_off_t *eof)
+__log_has_hole(WT_SESSION_IMPL *session, WT_FH *fh, wt_off_t offset, bool *hole)
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_DECL_RET;
 	WT_LOG *log;
-	wt_off_t log_size, off, off1;
-	uint32_t allocsize, bufsz;
+	wt_off_t log_size, off, remainder;
+	size_t bufsz, rdlen;
 	char *buf, *zerobuf;
 
 	conn = S2C(session);
 	log = conn->log;
-	if (eof == NULL)
-		return (0);
-	*eof = 0;
-	WT_RET(__wt_filesize(session, fh, &log_size));
-	if (log == NULL)
-		allocsize = WT_LOG_ALIGN;
-	else
-		allocsize = log->allocsize;
+	log_size = fh->size;
+	remainder = log_size - offset;
+	*hole = false;
 
 	/*
 	 * It can be very slow looking for the last real record in the log
-	 * in very small chunks.  Walk backward by a megabyte at a time.  When
-	 * we find a part of the log that is not just zeroes, walk to find
-	 * the last record.
+	 * in very small chunks.  Walk a megabyte at a time.  If we find a
+	 * part of the log that is not just zeroes we know this log file
+	 * has a hole in it.
 	 */
 	buf = zerobuf = NULL;
-	if (allocsize < WT_MEGABYTE && log_size > WT_MEGABYTE)
+	if (log == NULL || log->allocsize < WT_MEGABYTE)
 		bufsz = WT_MEGABYTE;
 	else
-		bufsz = allocsize;
+		bufsz = log->allocsize;
+
+	if ((size_t)remainder < bufsz)
+		bufsz = (size_t)remainder;
 	WT_RET(__wt_calloc_def(session, bufsz, &buf));
 	WT_ERR(__wt_calloc_def(session, bufsz, &zerobuf));
 
 	/*
-	 * Read in a chunk starting at the end of the file.  Keep going until
-	 * we reach the beginning or we find a chunk that contains any non-zero
-	 * bytes.  Compare against a known zero byte chunk.
+	 * Read in a chunk starting at the given offset.
+	 * Compare against a known zero byte chunk.
 	 */
-	for (off = log_size - (wt_off_t)bufsz;
-	    off >= 0;
-	    off -= (wt_off_t)bufsz) {
-		WT_ERR(__wt_read(session, fh, off, bufsz, buf));
-		if (memcmp(buf, zerobuf, bufsz) != 0)
+	for (off = offset; remainder > 0;
+	    remainder -= (wt_off_t)rdlen, off += (wt_off_t)rdlen) {
+		rdlen = WT_MIN(bufsz, (size_t)remainder);
+		WT_ERR(__wt_read(session, fh, off, rdlen, buf));
+		if (memcmp(buf, zerobuf, rdlen) != 0) {
+			*hole = true;
 			break;
+		}
 	}
 
-	/*
-	 * If we're walking by large amounts, now walk by the real allocsize
-	 * to find the real end, if we found something.  Otherwise we reached
-	 * the beginning of the file.  Offset can go negative if the log file
-	 * size is not a multiple of a megabyte.  The first chunk of the log
-	 * file will always be non-zero.
-	 */
-	if (off < 0)
-		off = 0;
-
-	/*
-	 * We know all log records are aligned at log->allocsize.  The first
-	 * item in a log record is always a 32-bit length.  Look for any
-	 * non-zero length at the allocsize boundary.  This may not be a true
-	 * log record since it could be the middle of a large record.  But we
-	 * know no log record starts after it.  Return an estimate of the log
-	 * file size.
-	 */
-	for (off1 = bufsz - allocsize;
-	    off1 > 0; off1 -= (wt_off_t)allocsize)
-		if (memcmp(buf + off1, zerobuf, sizeof(uint32_t)) != 0)
-			break;
-	off = off + off1;
-
-	/*
-	 * Set EOF to the last zero-filled record we saw.
-	 */
-	*eof = off + (wt_off_t)allocsize;
-err:
-	if (buf != NULL)
+err:	if (buf != NULL)
 		__wt_free(session, buf);
 	if (zerobuf != NULL)
 		__wt_free(session, zerobuf);
@@ -1242,7 +1282,7 @@ __wt_log_release(WT_SESSION_IMPL *session, WT_LOGSLOT *slot, bool *freep)
 	 * responsible for freeing the slot in that case.  Otherwise the
 	 * worker thread will free it.
 	 */
-	if (!F_ISSET(slot, WT_SLOT_SYNC | WT_SLOT_SYNC_DIR)) {
+	if (!F_ISSET(slot, WT_SLOT_FLUSH | WT_SLOT_SYNC | WT_SLOT_SYNC_DIR)) {
 		if (freep != NULL)
 			*freep = 0;
 		slot->slot_state = WT_LOG_SLOT_WRITTEN;
@@ -1272,7 +1312,8 @@ __wt_log_release(WT_SESSION_IMPL *session, WT_LOGSLOT *slot, bool *freep)
 		 */
 		if (F_ISSET(session, WT_SESSION_LOCKED_SLOT))
 			__wt_spin_unlock(session, &log->log_slot_lock);
-		if (++yield_count < 1000)
+		WT_ERR(__wt_cond_signal(session, conn->log_wrlsn_cond));
+		if (++yield_count < WT_THOUSAND)
 			__wt_yield();
 		else
 			ret = __wt_cond_wait(session, log->log_write_cond, 200);
@@ -1286,6 +1327,7 @@ __wt_log_release(WT_SESSION_IMPL *session, WT_LOGSLOT *slot, bool *freep)
 
 	WT_ASSERT(session, slot != log->active_slot);
 	WT_ERR(__wt_cond_signal(session, log->log_write_cond));
+	F_CLR(slot, WT_SLOT_FLUSH);
 
 	/*
 	 * Signal the close thread if needed.
@@ -1475,7 +1517,7 @@ __wt_log_scan(WT_SESSION_IMPL *session, WT_LSN *lsnp, uint32_t flags,
 	}
 	WT_ERR(__log_openfile(
 	    session, false, &log_fh, WT_LOG_FILENAME, start_lsn.file));
-	WT_ERR(__log_filesize(session, log_fh, &log_size));
+	WT_ERR(__wt_filesize(session, log_fh, &log_size));
 	rd_lsn = start_lsn;
 
 	WT_ERR(__wt_scr_alloc(session, WT_LOG_ALIGN, &buf));
@@ -1506,7 +1548,7 @@ advance:
 				break;
 			WT_ERR(__log_openfile(session,
 			    false, &log_fh, WT_LOG_FILENAME, rd_lsn.file));
-			WT_ERR(__log_filesize(session, log_fh, &log_size));
+			WT_ERR(__wt_filesize(session, log_fh, &log_size));
 			eol = false;
 			continue;
 		}
@@ -1524,16 +1566,25 @@ advance:
 		 */
 		reclen = *(uint32_t *)buf->mem;
 		/*
-		 * Log files are pre-allocated.  We never expect a zero length
-		 * unless we've reached the end of the log.  The log can be
-		 * written out of order, so when recovery finds the end of
-		 * the log, truncate the file and remove any later log files
-		 * that may exist.
+		 * Log files are pre-allocated.  We need to detect the
+		 * difference between a hole in the file (where this location
+		 * would be considered the end of log) and the last record
+		 * in the log and we're at the zeroed part of the file.
+		 * If we find a zeroed record, scan forward in the log looking
+		 * for any data.  If we detect any we have a hole and stop.
+		 * Otherwise if the rest is all zeroes advance to the next file.
+		 * When recovery finds the end of the log, truncate the file
+		 * and remove any later log files that may exist.
 		 */
 		if (reclen == 0) {
-			/* This LSN is the end. */
-			eol = true;
-			break;
+			WT_ERR(__log_has_hole(
+			    session, log_fh, rd_lsn.offset, &eol));
+			if (eol)
+				/* Found a hole. This LSN is the end. */
+				break;
+			else
+				/* Last record in log.  Look for more. */
+				goto advance;
 		}
 		rdup_len = __wt_rduppo2(reclen, allocsize);
 		if (reclen > allocsize) {
@@ -1809,12 +1860,11 @@ __log_write_internal(WT_SESSION_IMPL *session, WT_ITEM *record, WT_LSN *lsnp,
 
 	conn = S2C(session);
 	log = conn->log;
-	if (record->size > UINT32_MAX) {
-		__wt_errx(session, "Log record size of %" WT_SIZET_FMT
-		    " exceeds the maximum supported size of %" PRIu32,
+	if (record->size > UINT32_MAX)
+		WT_RET_MSG(session, EFBIG,
+		    "Log record size of %" WT_SIZET_FMT " exceeds the maximum "
+		    "supported size of %" PRIu32,
 		    record->size, UINT32_MAX);
-		return (EFBIG);
-	}
 	WT_INIT_LSN(&lsn);
 	myslot.slot = NULL;
 	memset(&myslot, 0, sizeof(myslot));

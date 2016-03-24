@@ -112,6 +112,9 @@ public:
      */
     CatalogManager* getCatalogManagerToUse(OperationContext* txn);
 
+    Status appendInfoForConfigServerDatabases(OperationContext* txn,
+                                              BSONArrayBuilder* builder) override;
+
 private:
     ConfigServerMode getMode() override;
 
@@ -176,18 +179,13 @@ private:
                                            const std::string& collectionNs,
                                            const ChunkType& chunk) override;
 
-    Status getAllShards(OperationContext* txn, std::vector<ShardType>* shards) override;
+    StatusWith<OpTimePair<std::vector<ShardType>>> getAllShards(OperationContext* txn) override;
 
     bool runUserManagementWriteCommand(OperationContext* txn,
                                        const std::string& commandName,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        BSONObjBuilder* result) override;
-
-    bool runReadCommand(OperationContext* txn,
-                        const std::string& dbname,
-                        const BSONObj& cmdObj,
-                        BSONObjBuilder* result) override;
 
     bool runUserManagementReadCommand(OperationContext* txn,
                                       const std::string& dbname,
@@ -198,13 +196,15 @@ private:
                                    const BSONArray& updateOps,
                                    const BSONArray& preCondition) override;
 
-    void logAction(OperationContext* txn, const ActionLogType& actionLog) override;
+    Status logAction(OperationContext* txn,
+                     const std::string& what,
+                     const std::string& ns,
+                     const BSONObj& detail) override;
 
-    void logChange(OperationContext* txn,
-                   const std::string& clientAddress,
-                   const std::string& what,
-                   const std::string& ns,
-                   const BSONObj& detail) override;
+    Status logChange(OperationContext* txn,
+                     const std::string& what,
+                     const std::string& ns,
+                     const BSONObj& detail) override;
 
     StatusWith<SettingsType> getGlobalSettings(OperationContext* txn,
                                                const std::string& key) override;
@@ -212,6 +212,20 @@ private:
     void writeConfigServerDirect(OperationContext* txn,
                                  const BatchedCommandRequest& request,
                                  BatchedCommandResponse* response) override;
+
+    Status insertConfigDocument(OperationContext* txn,
+                                const std::string& ns,
+                                const BSONObj& doc) override;
+
+    StatusWith<bool> updateConfigDocument(OperationContext* txn,
+                                          const std::string& ns,
+                                          const BSONObj& query,
+                                          const BSONObj& update,
+                                          bool upsert) override;
+
+    Status removeConfigDocuments(OperationContext* txn,
+                                 const std::string& ns,
+                                 const BSONObj& query) override;
 
     Status createDatabase(OperationContext* txn, const std::string& dbName) override;
 

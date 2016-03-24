@@ -620,8 +620,10 @@ TEST_F(TopoCoordTest, ForceSyncSource) {
     getTopoCoord().setForceSyncSourceIndex(1);
     // force should cause shouldChangeSyncSource() to return true
     // even if the currentSource is the force target
-    ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("h2"), now()));
-    ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("h3"), now()));
+    ASSERT_TRUE(
+        getTopoCoord().shouldChangeSyncSource(HostAndPort("h2"), OpTime(), OpTime(), false, now()));
+    ASSERT_TRUE(
+        getTopoCoord().shouldChangeSyncSource(HostAndPort("h3"), OpTime(), OpTime(), false, now()));
     getTopoCoord().chooseNewSyncSource(now()++, Timestamp());
     ASSERT_EQUALS(HostAndPort("h2"), getTopoCoord().getSyncSourceAddress());
 
@@ -4189,14 +4191,82 @@ TEST_F(HeartbeatResponseTest, ReconfigNodeRemovedBetweenHeartbeatRequestAndRepso
 TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceMemberNotInConfig) {
     // In this test, the TopologyCoordinator should tell us to change sync sources away from
     // "host4" since "host4" is absent from the config
-    ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host4"), now()));
+    ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host4"), OpTime(), OpTime(), false, now()));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceMemberHasYetToHeartbeat) {
     // In this test, the TopologyCoordinator should not tell us to change sync sources away from
     // "host2" since we do not yet have a heartbeat (and as a result do not yet have an optime)
     // for "host2"
-    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), OpTime(), false, now()));
+}
+
+TEST_F(HeartbeatResponseTest, ShouldNotChangeSyncSourceIfNodeIsFreshByHeartbeatButNotMetadata) {
+    // In this test, the TopologyCoordinator should not tell us to change sync sources away from
+    // "host2" and to "host3" since "host2" is only more than maxSyncSourceLagSecs(30) behind
+    // "host3" according to metadata, not heartbeat data.
+    OpTime election = OpTime();
+    OpTime lastOpTimeApplied = OpTime(Timestamp(4, 0), 0);
+    // ahead by more than maxSyncSourceLagSecs (30)
+    OpTime fresherLastOpTimeApplied = OpTime(Timestamp(3005, 0), 0);
+
+    HeartbeatResponseAction nextAction = receiveUpHeartbeat(HostAndPort("host2"),
+                                                            "rs0",
+                                                            MemberState::RS_SECONDARY,
+                                                            election,
+                                                            fresherLastOpTimeApplied,
+                                                            lastOpTimeApplied);
+    ASSERT_NO_ACTION(nextAction.getAction());
+
+    nextAction = receiveUpHeartbeat(HostAndPort("host3"),
+                                    "rs0",
+                                    MemberState::RS_SECONDARY,
+                                    election,
+                                    fresherLastOpTimeApplied,
+                                    lastOpTimeApplied);
+    ASSERT_NO_ACTION(nextAction.getAction());
+
+    // set up complete, time for actual check
+    startCapturingLogMessages();
+    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), lastOpTimeApplied, false, now()));
+    stopCapturingLogMessages();
+    ASSERT_EQUALS(0, countLogLinesContaining("re-evaluating sync source"));
+}
+
+TEST_F(HeartbeatResponseTest, ShouldNotChangeSyncSourceIfNodeIsStaleByHeartbeatButNotMetadata) {
+    // In this test, the TopologyCoordinator should not tell us to change sync sources away from
+    // "host2" and to "host3" since "host2" is only more than maxSyncSourceLagSecs(30) behind
+    // "host3" according to heartbeat data, not metadata.
+    OpTime election = OpTime();
+    OpTime lastOpTimeApplied = OpTime(Timestamp(4, 0), 0);
+    // ahead by more than maxSyncSourceLagSecs (30)
+    OpTime fresherLastOpTimeApplied = OpTime(Timestamp(3005, 0), 0);
+
+    HeartbeatResponseAction nextAction = receiveUpHeartbeat(HostAndPort("host2"),
+                                                            "rs0",
+                                                            MemberState::RS_SECONDARY,
+                                                            election,
+                                                            lastOpTimeApplied,
+                                                            lastOpTimeApplied);
+    ASSERT_NO_ACTION(nextAction.getAction());
+
+    nextAction = receiveUpHeartbeat(HostAndPort("host3"),
+                                    "rs0",
+                                    MemberState::RS_SECONDARY,
+                                    election,
+                                    fresherLastOpTimeApplied,
+                                    lastOpTimeApplied);
+    ASSERT_NO_ACTION(nextAction.getAction());
+
+    // set up complete, time for actual check
+    startCapturingLogMessages();
+    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), fresherLastOpTimeApplied, false, now()));
+    stopCapturingLogMessages();
+    ASSERT_EQUALS(0, countLogLinesContaining("re-evaluating sync source"));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherHappierMemberExists) {
@@ -4225,9 +4295,10 @@ TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherHappierMemberExists) 
 
     // set up complete, time for actual check
     startCapturingLogMessages();
-    ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+    ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), OpTime(), false, now()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("changing sync target"));
+    ASSERT_EQUALS(1, countLogLinesContaining("re-evaluating sync source"));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberIsBlackListed) {
@@ -4258,18 +4329,21 @@ TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberIsBlackListed) 
     getTopoCoord().blacklistSyncSource(HostAndPort("host3"), now() + Milliseconds(100));
 
     // set up complete, time for actual check
-    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), OpTime(), false, now()));
 
     // unblacklist with too early a time (node should remained blacklisted)
     getTopoCoord().unblacklistSyncSource(HostAndPort("host3"), now() + Milliseconds(90));
-    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), OpTime(), false, now()));
 
     // unblacklist and it should succeed
     getTopoCoord().unblacklistSyncSource(HostAndPort("host3"), now() + Milliseconds(100));
     startCapturingLogMessages();
-    ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+    ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), OpTime(), false, now()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("changing sync target"));
+    ASSERT_EQUALS(1, countLogLinesContaining("re-evaluating sync source"));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberIsDown) {
@@ -4300,7 +4374,8 @@ TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberIsDown) {
     // set up complete, time for actual check
     nextAction = receiveDownHeartbeat(HostAndPort("host3"), "rs0", lastOpTimeApplied);
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), OpTime(), false, now()));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberIsNotReadable) {
@@ -4329,7 +4404,8 @@ TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberIsNotReadable) 
     ASSERT_NO_ACTION(nextAction.getAction());
 
     // set up complete, time for actual check
-    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), OpTime(), false, now()));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberDoesNotBuildIndexes) {
@@ -4368,7 +4444,8 @@ TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberDoesNotBuildInd
     ASSERT_NO_ACTION(nextAction.getAction());
 
     // set up complete, time for actual check
-    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), OpTime(), false, now()));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberDoesNotBuildIndexesNorDoWe) {
@@ -4409,9 +4486,10 @@ TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceFresherMemberDoesNotBuildInd
 
     // set up complete, time for actual check
     startCapturingLogMessages();
-    ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), now()));
+    ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(
+        HostAndPort("host2"), OpTime(), OpTime(), false, now()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("changing sync target"));
+    ASSERT_EQUALS(1, countLogLinesContaining("re-evaluating sync source"));
 }
 
 TEST_F(TopoCoordTest, CheckShouldStandForElectionWithPrimary) {
@@ -4681,7 +4759,8 @@ TEST_F(TopoCoordTest, ProcessRequestVotesBadCommands) {
                                                               << "rs0"
                                                               << "term" << 2 << "winnerId" << 30));
     long long responseTerm;
-    ASSERT(getTopoCoord().updateTerm(winnerArgs.getTerm(), now()));
+    ASSERT(TopologyCoordinator::UpdateTermResult::kUpdatedTerm ==
+           getTopoCoord().updateTerm(winnerArgs.getTerm(), now()));
     ASSERT_OK(getTopoCoord().processReplSetDeclareElectionWinner(winnerArgs, &responseTerm));
     ASSERT_EQUALS(2, responseTerm);
 
@@ -4726,7 +4805,8 @@ TEST_F(TopoCoordTest, ProcessRequestVotesBadCommandsDryRun) {
                  0);
     setSelfMemberState(MemberState::RS_SECONDARY);
     // set term to 1
-    ASSERT(getTopoCoord().updateTerm(1, now()));
+    ASSERT(TopologyCoordinator::UpdateTermResult::kUpdatedTerm ==
+           getTopoCoord().updateTerm(1, now()));
     // and make sure we voted in term 1
     ReplSetRequestVotesArgs argsForRealVote;
     argsForRealVote.initialize(BSON("replSetRequestVotes"
@@ -4839,7 +4919,8 @@ TEST_F(TopoCoordTest, ProcessDeclareElectionWinner) {
                                                               << "rs0"
                                                               << "term" << 2 << "winnerId" << 30));
     long long responseTerm = -1;
-    ASSERT(getTopoCoord().updateTerm(winnerArgs.getTerm(), now()));
+    ASSERT(TopologyCoordinator::UpdateTermResult::kUpdatedTerm ==
+           getTopoCoord().updateTerm(winnerArgs.getTerm(), now()));
     ASSERT_OK(getTopoCoord().processReplSetDeclareElectionWinner(winnerArgs, &responseTerm));
     ASSERT_EQUALS(2, responseTerm);
 
@@ -4891,12 +4972,13 @@ TEST_F(TopoCoordTest, GetMemberStateConfigSvrNoReadCommitted) {
     serverGlobalParams.configsvr = true;
     TopologyCoordinatorImpl::Options options;
     options.configServerMode = CatalogManager::ConfigServerMode::CSRS;
-    options.storageEngineSupportsReadCommitted = false;
     setOptions(options);
+    getTopoCoord().setStorageEngineSupportsReadCommitted(false);
 
     updateConfig(BSON("_id"
                       << "rs0"
-                      << "version" << 1 << "configsvr" << true << "members"
+                      << "protocolVersion" << 1 << "version" << 1 << "configsvr" << true
+                      << "members"
                       << BSON_ARRAY(BSON("_id" << 10 << "host"
                                                << "hself")
                                     << BSON("_id" << 20 << "host"
@@ -4911,12 +4993,13 @@ TEST_F(TopoCoordTest, GetMemberStateConfigSvrNoReadCommittedButInSCCCMode) {
     serverGlobalParams.configsvr = true;
     TopologyCoordinatorImpl::Options options;
     options.configServerMode = CatalogManager::ConfigServerMode::SCCC;
-    options.storageEngineSupportsReadCommitted = false;
     setOptions(options);
+    getTopoCoord().setStorageEngineSupportsReadCommitted(false);
 
     updateConfig(BSON("_id"
                       << "rs0"
-                      << "version" << 1 << "configsvr" << true << "members"
+                      << "protocolVersion" << 1 << "version" << 1 << "configsvr" << true
+                      << "members"
                       << BSON_ARRAY(BSON("_id" << 10 << "host"
                                                << "hself")
                                     << BSON("_id" << 20 << "host"
@@ -4934,12 +5017,13 @@ TEST_F(TopoCoordTest, GetMemberStateValidConfigSvr) {
     serverGlobalParams.configsvr = true;
     TopologyCoordinatorImpl::Options options;
     options.configServerMode = CatalogManager::ConfigServerMode::CSRS;
-    options.storageEngineSupportsReadCommitted = true;
     setOptions(options);
+    getTopoCoord().setStorageEngineSupportsReadCommitted(true);
 
     updateConfig(BSON("_id"
                       << "rs0"
-                      << "version" << 1 << "configsvr" << true << "members"
+                      << "protocolVersion" << 1 << "version" << 1 << "configsvr" << true
+                      << "members"
                       << BSON_ARRAY(BSON("_id" << 10 << "host"
                                                << "hself")
                                     << BSON("_id" << 20 << "host"

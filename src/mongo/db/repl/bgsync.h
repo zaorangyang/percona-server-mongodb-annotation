@@ -87,12 +87,8 @@ public:
 
 
     void shutdown();
-    void notify(OperationContext* txn);
 
     bool isPaused() const;
-
-    // Blocks until _pause becomes true from a call to stop() or shutdown()
-    void waitUntilPaused();
 
     virtual ~BackgroundSync() {}
 
@@ -158,9 +154,6 @@ private:
 
     // if produce thread should be running
     bool _pause;
-    stdx::condition_variable _pausedCondition;
-    bool _appliedBuffer;
-    stdx::condition_variable _appliedBufferCondition;
 
     HostAndPort _syncSourceHost;
 
@@ -191,8 +184,19 @@ private:
                    const HostAndPort& source,
                    stdx::function<DBClientBase*()> getConnection);
 
-    // Evaluate if the current sync target is still good
-    bool _shouldChangeSyncSource(const HostAndPort& syncSource);
+    /**
+     * Evaluate if the current sync source is still good.
+     * "syncSource" is the name of the current sync source, which will be used to look up the
+     * member's heartbeat data.
+     * "syncSourceLastOpTime" is the last OpTime the sync source has. This is passed in because the
+     * data stored from heartbeats could be too stale and would cause unnecessary sync source
+     * changes.
+     * "syncSourceHasSyncSource" indicates whether our sync source is currently syncing from another
+     * member.
+     */
+    bool _shouldChangeSyncSource(const HostAndPort& syncSource,
+                                 const OpTime& syncSourceLastOpTime,
+                                 bool syncSourceHasSyncSource);
 
     // restart syncing
     void start(OperationContext* txn);

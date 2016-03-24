@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -37,10 +37,27 @@
 namespace mongo {
 namespace executor {
 
-void warnCloseFailed(std::error_code ec) {
+void logCloseFailed(std::error_code ec) {
     invariant(ec);
-    warning() << "failed to close stream:" << ec.message();
+    LOG(1) << "failed to close stream: " << ec.message();
 }
+
+void logFailureInSetStreamNonBlocking(std::error_code ec) {
+    invariant(ec);
+    severe() << "Failed to set non-blocking mode on stream: " << ec.message();
+}
+
+void logFailureInSetStreamNoDelay(std::error_code ec) {
+    invariant(ec);
+    severe() << "Failed to set no-delay mode on stream: " << ec.message();
+}
+
+void logUnexpectedErrorInCheckOpen(std::error_code ec) {
+    invariant(ec);
+    log() << "unexpected error when checking if a stream was open: " << ec.message()
+          << ", the only error we expected was EOF";
+}
+
 
 }  // namespace executor
 }  // namespace  mongo

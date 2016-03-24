@@ -29,12 +29,14 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <limits>
 #include <queue>
 
+#include "mongo/base/disallow_copying.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/base/disallow_copying.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -62,20 +64,56 @@ public:
     BlockingQueue(size_t size) : _maxSize(size), _getSize(&_getSizeDefault) {}
     BlockingQueue(size_t size, getSizeFunc f) : _maxSize(size), _getSize(f) {}
 
+    void pushEvenIfFull(T const& t) {
+        stdx::unique_lock<stdx::mutex> lk(_lock);
+        pushImpl_inlock(t, _getSize(t));
+    }
+
     void push(T const& t) {
-        stdx::unique_lock<stdx::mutex> l(_lock);
+        stdx::unique_lock<stdx::mutex> lk(_lock);
         _clearing = false;
         size_t tSize = _getSize(t);
-        while (_currentSize + tSize > _maxSize) {
-            _cvNoLongerFull.wait(l);
+        _waitForSpace_inlock(tSize, lk);
+        pushImpl_inlock(t, tSize);
+    }
+
+    /**
+     * Caller must ensure the BlockingQueue hasSpace before pushing since this function won't block.
+     *
+     * NOTE: Should only be used in a single producer case.
+     */
+    void pushAllNonBlocking(std::vector<T>& objs) {
+        if (objs.empty()) {
+            return;
         }
-        _queue.push(t);
-        _currentSize += tSize;
-        _cvNoLongerEmpty.notify_one();
+
+        stdx::unique_lock<stdx::mutex> lk(_lock);
+        const auto startedEmpty = _queue.empty();
+        _clearing = false;
+        std::for_each(objs.begin(),
+                      objs.end(),
+                      [this](T& obj) {
+                          size_t tSize = _getSize(obj);
+                          _queue.push(obj);
+                          _currentSize += tSize;
+                      });
+        if (startedEmpty) {
+            _cvNoLongerEmpty.notify_one();
+        }
+    }
+
+    /**
+     * Returns when enough space is available.
+     *
+     * NOTE: Should only be used in a single producer case.
+     */
+    void waitForSpace(size_t size) {
+        stdx::unique_lock<stdx::mutex> lk(_lock);
+        _waitForSpace_inlock(size, lk);
     }
 
     bool empty() const {
-        stdx::lock_guard<stdx::mutex> l(_lock);
+        stdx::lock_guard<stdx::mutex> lk(_lock);
         return _queue.empty();
     }
 
@@ -83,7 +121,7 @@ public:
      * The size as measured by the size function. Default to counting each item
      */
     size_t size() const {
-        stdx::lock_guard<stdx::mutex> l(_lock);
+        stdx::lock_guard<stdx::mutex> lk(_lock);
         return _currentSize;
     }
 
@@ -98,12 +136,12 @@ public:
      * The number/count of items in the queue ( _queue.size() )
      */
     size_t count() const {
-        stdx::lock_guard<stdx::mutex> l(_lock);
+        stdx::lock_guard<stdx::mutex> lk(_lock);
         return _queue.size();
     }
 
     void clear() {
-        stdx::lock_guard<stdx::mutex> l(_lock);
+        stdx::lock_guard<stdx::mutex> lk(_lock);
         _clearing = true;
         _queue = std::queue<T>();
         _currentSize = 0;
@@ -112,7 +150,7 @@ public:
     }
 
     bool tryPop(T& t) {
-        stdx::lock_guard<stdx::mutex> l(_lock);
+        stdx::lock_guard<stdx::mutex> lk(_lock);
         if (_queue.empty())
             return false;
 
@@ -125,10 +163,10 @@ public:
     }
 
     T blockingPop() {
-        stdx::unique_lock<stdx::mutex> l(_lock);
+        stdx::unique_lock<stdx::mutex> lk(_lock);
         _clearing = false;
         while (_queue.empty() && !_clearing)
-            _cvNoLongerEmpty.wait(l);
+            _cvNoLongerEmpty.wait(lk);
         if (_clearing) {
             return T{};
         }
@@ -150,10 +188,10 @@ public:
     bool blockingPop(T& t, int maxSecondsToWait) {
         using namespace stdx::chrono;
         const auto deadline = system_clock::now() + seconds(maxSecondsToWait);
-        stdx::unique_lock<stdx::mutex> l(_lock);
+        stdx::unique_lock<stdx::mutex> lk(_lock);
         _clearing = false;
         while (_queue.empty() && !_clearing) {
-            if (stdx::cv_status::timeout == _cvNoLongerEmpty.wait_until(l, deadline))
+            if (stdx::cv_status::timeout == _cvNoLongerEmpty.wait_until(lk, deadline))
                 return false;
         }
 
@@ -172,10 +210,10 @@ public:
     bool blockingPeek(T& t, int maxSecondsToWait) {
         using namespace stdx::chrono;
         const auto deadline = system_clock::now() + seconds(maxSecondsToWait);
-        stdx::unique_lock<stdx::mutex> l(_lock);
+        stdx::unique_lock<stdx::mutex> lk(_lock);
         _clearing = false;
         while (_queue.empty() && !_clearing) {
-            if (stdx::cv_status::timeout == _cvNoLongerEmpty.wait_until(l, deadline))
+            if (stdx::cv_status::timeout == _cvNoLongerEmpty.wait_until(lk, deadline))
                 return false;
         }
         if (_clearing) {
@@ -188,7 +226,7 @@ public:
     // Obviously, this should only be used when you have
     // only one consumer
     bool peek(T& t) {
-        stdx::unique_lock<stdx::mutex> l(_lock);
+        stdx::unique_lock<stdx::mutex> lk(_lock);
         if (_queue.empty()) {
             return false;
         }
@@ -197,7 +235,36 @@ public:
         return true;
     }
 
+    /**
+     * Returns the item most recently added to the queue or nothing if the queue is empty.
+     */
+    boost::optional<T> lastObjectPushed() const {
+        stdx::unique_lock<stdx::mutex> lk(_lock);
+        if (_queue.empty()) {
+            return {};
+        }
+
+        return {_queue.back()};
+    }
+
 private:
+    /**
+     * Returns when enough space is available.
+     */
+    void _waitForSpace_inlock(size_t size, stdx::unique_lock<stdx::mutex>& lk) {
+        while (_currentSize + size > _maxSize) {
+            _cvNoLongerFull.wait(lk);
+        }
+    }
+
+    void pushImpl_inlock(const T& obj, size_t objSize) {
+        _clearing = false;
+        _queue.push(obj);
+        _currentSize += objSize;
+        if (_queue.size() == 1)  // We were empty.
+            _cvNoLongerEmpty.notify_one();
+    }
+
     mutable stdx::mutex _lock;
     std::queue<T> _queue;
     const size_t _maxSize;

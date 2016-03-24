@@ -73,11 +73,11 @@ MozJSProxyScope::~MozJSProxyScope() {
 }
 
 void MozJSProxyScope::init(const BSONObj* data) {
-    runOnImplThread([&] { _implScope->init(data); });
+    run([&] { _implScope->init(data); });
 }
 
 void MozJSProxyScope::reset() {
-    runOnImplThread([&] { _implScope->reset(); });
+    run([&] { _implScope->reset(); });
 }
 
 bool MozJSProxyScope::isKillPending() const {
@@ -85,114 +85,115 @@ bool MozJSProxyScope::isKillPending() const {
 }
 
 void MozJSProxyScope::registerOperation(OperationContext* txn) {
-    runOnImplThread([&] { _implScope->registerOperation(txn); });
+    run([&] { _implScope->registerOperation(txn); });
 }
 
 void MozJSProxyScope::unregisterOperation() {
-    runOnImplThread([&] { _implScope->unregisterOperation(); });
+    run([&] { _implScope->unregisterOperation(); });
 }
 
 void MozJSProxyScope::localConnectForDbEval(OperationContext* txn, const char* dbName) {
-    runOnImplThread([&] { _implScope->localConnectForDbEval(txn, dbName); });
+    run([&] { _implScope->localConnectForDbEval(txn, dbName); });
 }
 
 void MozJSProxyScope::externalSetup() {
-    runOnImplThread([&] { _implScope->externalSetup(); });
+    run([&] { _implScope->externalSetup(); });
 }
 
 std::string MozJSProxyScope::getError() {
     std::string out;
-    runOnImplThread([&] { out = _implScope->getError(); });
+    run([&] { out = _implScope->getError(); });
     return out;
 }
 
-/**
- * This is an artifact of how out of memory errors were communicated in V8.  We
- * just throw out of memory errors from spidermonkey when we get them, rather
- * than setting a flag and having to pick them up here.
- */
 bool MozJSProxyScope::hasOutOfMemoryException() {
-    return false;
+    bool out;
+    run([&] { out = _implScope->hasOutOfMemoryException(); });
+    return out;
 }
 
 void MozJSProxyScope::gc() {
     _implScope->gc();
 }
 
+void MozJSProxyScope::advanceGeneration() {
+    run([&] { _implScope->advanceGeneration(); });
+}
+
 double MozJSProxyScope::getNumber(const char* field) {
     double out;
-    runOnImplThread([&] { out = _implScope->getNumber(field); });
+    run([&] { out = _implScope->getNumber(field); });
     return out;
 }
 
 int MozJSProxyScope::getNumberInt(const char* field) {
     int out;
-    runOnImplThread([&] { out = _implScope->getNumberInt(field); });
+    run([&] { out = _implScope->getNumberInt(field); });
     return out;
 }
 
 long long MozJSProxyScope::getNumberLongLong(const char* field) {
     long long out;
-    runOnImplThread([&] { out = _implScope->getNumberLongLong(field); });
+    run([&] { out = _implScope->getNumberLongLong(field); });
     return out;
 }
 
 Decimal128 MozJSProxyScope::getNumberDecimal(const char* field) {
     Decimal128 out;
-    runOnImplThread([&] { out = _implScope->getNumberDecimal(field); });
+    run([&] { out = _implScope->getNumberDecimal(field); });
     return out;
 }
 
 std::string MozJSProxyScope::getString(const char* field) {
     std::string out;
-    runOnImplThread([&] { out = _implScope->getString(field); });
+    run([&] { out = _implScope->getString(field); });
     return out;
 }
 
 bool MozJSProxyScope::getBoolean(const char* field) {
     bool out;
-    runOnImplThread([&] { out = _implScope->getBoolean(field); });
+    run([&] { out = _implScope->getBoolean(field); });
     return out;
 }
 
 BSONObj MozJSProxyScope::getObject(const char* field) {
     BSONObj out;
-    runOnImplThread([&] { out = _implScope->getObject(field); });
+    run([&] { out = _implScope->getObject(field); });
     return out;
 }
 
 void MozJSProxyScope::setNumber(const char* field, double val) {
-    runOnImplThread([&] { _implScope->setNumber(field, val); });
+    run([&] { _implScope->setNumber(field, val); });
 }
 
 void MozJSProxyScope::setString(const char* field, StringData val) {
-    runOnImplThread([&] { _implScope->setString(field, val); });
+    run([&] { _implScope->setString(field, val); });
 }
 
 void MozJSProxyScope::setBoolean(const char* field, bool val) {
-    runOnImplThread([&] { _implScope->setBoolean(field, val); });
+    run([&] { _implScope->setBoolean(field, val); });
 }
 
-void MozJSProxyScope::setElement(const char* field, const BSONElement& e) {
-    runOnImplThread([&] { _implScope->setElement(field, e); });
+void MozJSProxyScope::setElement(const char* field, const BSONElement& e, const BSONObj& parent) {
+    run([&] { _implScope->setElement(field, e, parent); });
 }
 
 void MozJSProxyScope::setObject(const char* field, const BSONObj& obj, bool readOnly) {
-    runOnImplThread([&] { _implScope->setObject(field, obj, readOnly); });
+    run([&] { _implScope->setObject(field, obj, readOnly); });
 }
 
 void MozJSProxyScope::setFunction(const char* field, const char* code) {
-    runOnImplThread([&] { _implScope->setFunction(field, code); });
+    run([&] { _implScope->setFunction(field, code); });
 }
 
 int MozJSProxyScope::type(const char* field) {
     int out;
-    runOnImplThread([&] { out = _implScope->type(field); });
+    run([&] { out = _implScope->type(field); });
     return out;
 }
 
 void MozJSProxyScope::rename(const char* from, const char* to) {
-    runOnImplThread([&] { _implScope->rename(from, to); });
+    run([&] { _implScope->rename(from, to); });
 }
 
 int MozJSProxyScope::invoke(ScriptingFunction func,
@@ -203,7 +204,7 @@ int MozJSProxyScope::invoke(ScriptingFunction func,
                             bool readOnlyArgs,
                             bool readOnlyRecv) {
     int out;
-    runOnImplThread([&] {
+    run([&] {
         out = _implScope->invoke(
             func, argsObject, recv, timeoutMs, ignoreReturn, readOnlyArgs, readOnlyRecv);
     });
@@ -218,20 +219,20 @@ bool MozJSProxyScope::exec(StringData code,
                            bool assertOnError,
                            int timeoutMs) {
     bool out;
-    runOnImplThread([&] {
+    run([&] {
         out = _implScope->exec(code, name, printResult, reportError, assertOnError, timeoutMs);
     });
     return out;
 }
 
 void MozJSProxyScope::injectNative(const char* field, NativeFunction func, void* data) {
-    runOnImplThread([&] { _implScope->injectNative(field, func, data); });
+    run([&] { _implScope->injectNative(field, func, data); });
 }
 
 ScriptingFunction MozJSProxyScope::_createFunction(const char* raw,
                                                    ScriptingFunction functionNumber) {
     ScriptingFunction out;
-    runOnImplThread([&] { out = _implScope->_createFunction(raw, functionNumber); });
+    run([&] { out = _implScope->_createFunction(raw, functionNumber); });
     return out;
 }
 
@@ -253,16 +254,21 @@ void MozJSProxyScope::kill() {
  *
  * Idle -> ProxyRequest -> ImplResponse -> Idle
  */
-void MozJSProxyScope::runOnImplThread(std::function<void()> f) {
+template <typename Closure>
+void MozJSProxyScope::run(Closure&& closure) {
     // We can end up calling functions on the proxy scope from the impl thread
     // when callbacks from javascript have a handle to the proxy scope and call
     // methods on it from there. If we're on the same thread, it's safe to
     // simply call back in, so let's do that.
 
     if (_thread == PR_GetCurrentThread()) {
-        return f();
+        return closure();
     }
 
+    runOnImplThread(std::move(closure));
+}
+
+void MozJSProxyScope::runOnImplThread(stdx::function<void()> f) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     _function = std::move(f);
 
@@ -277,6 +283,10 @@ void MozJSProxyScope::runOnImplThread(std::function<void()> f) {
 
     // Clear the _status state and throw it if necessary
     auto status = std::move(_status);
+
+    // Can validate the status outside the lock
+    lk.unlock();
+
     uassertStatusOK(status);
 }
 

@@ -95,8 +95,8 @@ public:
         OperationContextNoop txn(ru);
         string uri = "table:" + ns;
 
-        StatusWith<std::string> result =
-            WiredTigerRecordStore::generateCreateString(ns, CollectionOptions(), "");
+        StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
+            kWiredTigerEngineName, ns, CollectionOptions(), "");
         ASSERT_TRUE(result.isOK());
         std::string config = result.getValue();
 
@@ -107,7 +107,8 @@ public:
             uow.commit();
         }
 
-        return stdx::make_unique<WiredTigerRecordStore>(&txn, ns, uri);
+        return stdx::make_unique<WiredTigerRecordStore>(
+            &txn, ns, uri, kWiredTigerEngineName, false, false);
     }
 
     std::unique_ptr<RecordStore> newCappedRecordStore(int64_t cappedSizeBytes,
@@ -126,7 +127,7 @@ public:
         options.capped = true;
 
         StatusWith<std::string> result =
-            WiredTigerRecordStore::generateCreateString(ns, options, "");
+            WiredTigerRecordStore::generateCreateString(kWiredTigerEngineName, ns, options, "");
         ASSERT_TRUE(result.isOK());
         std::string config = result.getValue();
 
@@ -138,7 +139,7 @@ public:
         }
 
         return stdx::make_unique<WiredTigerRecordStore>(
-            &txn, ns, uri, true, cappedMaxSize, cappedMaxDocs);
+            &txn, ns, uri, kWiredTigerEngineName, true, false, cappedMaxSize, cappedMaxDocs);
     }
 
     RecoveryUnit* newRecoveryUnit() final {
@@ -345,7 +346,8 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
 
     {
         unique_ptr<OperationContext> opCtx(harnessHelper->newOperationContext());
-        rs.reset(new WiredTigerRecordStore(opCtx.get(), "a.b", uri, false, -1, -1, NULL, &ss));
+        rs.reset(new WiredTigerRecordStore(
+            opCtx.get(), "a.b", uri, kWiredTigerEngineName, false, false, -1, -1, NULL, &ss));
     }
 
     {
@@ -500,8 +502,16 @@ TEST_F(SizeStorerValidateTest, InvalidSizeStorerAtCreation) {
 
     unique_ptr<OperationContext> opCtx(harnessHelper->newOperationContext());
     sizeStorer->storeToCache(uri, expectedNumRecords * 2, expectedDataSize * 2);
-    rs.reset(
-        new WiredTigerRecordStore(opCtx.get(), "a.b", uri, false, -1, -1, NULL, sizeStorer.get()));
+    rs.reset(new WiredTigerRecordStore(opCtx.get(),
+                                       "a.b",
+                                       uri,
+                                       kWiredTigerEngineName,
+                                       false,
+                                       false,
+                                       -1,
+                                       -1,
+                                       NULL,
+                                       sizeStorer.get()));
     ASSERT_EQUALS(expectedNumRecords * 2, rs->numRecords(NULL));
     ASSERT_EQUALS(expectedDataSize * 2, rs->dataSize(NULL));
 
@@ -785,10 +795,70 @@ TEST(WiredTigerRecordStoreTest, OplogOrder) {
     }
 
     {
-        // now we insert 2 docs, but commit the 2nd one fiirst
-        // we make sure we can't find the 2nd until the first is commited
+        // now we insert 2 docs, but commit the 2nd one first.
+        // we make sure we can't find the 2nd until the first is commited.
+        unique_ptr<OperationContext> earlyReader(harnessHelper->newOperationContext());
+        auto earlyCursor = rs->getCursor(earlyReader.get());
+        ASSERT_EQ(earlyCursor->seekExact(id1)->id, id1);
+        earlyCursor->save();
+        earlyReader->recoveryUnit()->abandonSnapshot();
+
         unique_ptr<OperationContext> t1(harnessHelper->newOperationContext());
-        unique_ptr<WriteUnitOfWork> w1(new WriteUnitOfWork(t1.get()));
+        WriteUnitOfWork w1(t1.get());
+        _oplogOrderInsertOplog(t1.get(), rs, 20);
+        // do not commit yet
+
+        {  // create 2nd doc
+            unique_ptr<OperationContext> t2(harnessHelper->newOperationContext());
+            {
+                WriteUnitOfWork w2(t2.get());
+                _oplogOrderInsertOplog(t2.get(), rs, 30);
+                w2.commit();
+            }
+        }
+
+        {  // Other operations should not be able to see 2nd doc until w1 commits.
+            earlyCursor->restore();
+            ASSERT(!earlyCursor->next());
+
+            unique_ptr<OperationContext> opCtx(harnessHelper->newOperationContext());
+            auto cursor = rs->getCursor(opCtx.get());
+            auto record = cursor->seekExact(id1);
+            ASSERT_EQ(id1, record->id);
+            ASSERT(!cursor->next());
+        }
+
+        w1.commit();
+    }
+
+    {  // now all 3 docs should be visible
+        unique_ptr<OperationContext> opCtx(harnessHelper->newOperationContext());
+        auto cursor = rs->getCursor(opCtx.get());
+        auto record = cursor->seekExact(id1);
+        ASSERT_EQ(id1, record->id);
+        ASSERT(cursor->next());
+        ASSERT(cursor->next());
+        ASSERT(!cursor->next());
+    }
+
+    // Rollback the last two oplog entries, then insert entries with older optimes and ensure that
+    // the visibility rules aren't violated. See SERVER-21645
+    {
+        unique_ptr<OperationContext> txn(harnessHelper->newOperationContext());
+        rs->temp_cappedTruncateAfter(txn.get(), id1, /*inclusive*/ false);
+    }
+
+    {
+        // Now we insert 2 docs with timestamps earlier than before, but commit the 2nd one first.
+        // We make sure we can't find the 2nd until the first is commited.
+        unique_ptr<OperationContext> earlyReader(harnessHelper->newOperationContext());
+        auto earlyCursor = rs->getCursor(earlyReader.get());
+        ASSERT_EQ(earlyCursor->seekExact(id1)->id, id1);
+        earlyCursor->save();
+        earlyReader->recoveryUnit()->abandonSnapshot();
+
+        unique_ptr<OperationContext> t1(harnessHelper->newOperationContext());
+        WriteUnitOfWork w1(t1.get());
         _oplogOrderInsertOplog(t1.get(), rs, 2);
         // do not commit yet
 
@@ -801,7 +871,10 @@ TEST(WiredTigerRecordStoreTest, OplogOrder) {
             }
         }
 
-        {  // state should be the same
+        {  // Other operations should not be able to see 2nd doc until w1 commits.
+            ASSERT(earlyCursor->restore());
+            ASSERT(!earlyCursor->next());
+
             unique_ptr<OperationContext> opCtx(harnessHelper->newOperationContext());
             auto cursor = rs->getCursor(opCtx.get());
             auto record = cursor->seekExact(id1);
@@ -809,7 +882,7 @@ TEST(WiredTigerRecordStoreTest, OplogOrder) {
             ASSERT(!cursor->next());
         }
 
-        w1->commit();
+        w1.commit();
     }
 
     {  // now all 3 docs should be visible
@@ -892,7 +965,7 @@ BSONObj makeBSONObjWithSize(const Timestamp& opTime, int size, char fill = 'x') 
     BSONObj obj = BSON("ts" << opTime << "str" << str);
     ASSERT_EQ(size, obj.objsize());
 
-    return std::move(obj);
+    return obj;
 }
 
 StatusWith<RecordId> insertBSONWithSize(OperationContext* opCtx,
@@ -1279,7 +1352,7 @@ TEST(WiredTigerRecordStoreTest, OplogStones_ReclaimStones) {
     }
 }
 
-// Verify that oplog stones are not reclaimed even if the size of the record store exeeds
+// Verify that oplog stones are not reclaimed even if the size of the record store exceeds
 // 'cappedMaxSize'.
 TEST(WiredTigerRecordStoreTest, OplogStones_ExceedCappedMaxSize) {
     WiredTigerHarnessHelper harnessHelper;
@@ -1318,6 +1391,53 @@ TEST(WiredTigerRecordStoreTest, OplogStones_ExceedCappedMaxSize) {
         ASSERT_EQ(3, rs->numRecords(opCtx.get()));
         ASSERT_EQ(330, rs->dataSize(opCtx.get()));
         ASSERT_EQ(3U, oplogStones->numStones());
+        ASSERT_EQ(0, oplogStones->currentRecords());
+        ASSERT_EQ(0, oplogStones->currentBytes());
+    }
+}
+
+// Verify that an oplog stone isn't created if it would cause the logical representation of the
+// records to not be in increasing order.
+TEST(WiredTigerRecordStoreTest, OplogStones_AscendingOrder) {
+    WiredTigerHarnessHelper harnessHelper;
+
+    const int64_t cappedMaxSize = 10 * 1024;  // 10KB
+    unique_ptr<RecordStore> rs(
+        harnessHelper.newCappedRecordStore("local.oplog.stones", cappedMaxSize, -1));
+
+    WiredTigerRecordStore* wtrs = static_cast<WiredTigerRecordStore*>(rs.get());
+    WiredTigerRecordStore::OplogStones* oplogStones = wtrs->oplogStones();
+
+    oplogStones->setMinBytesPerStone(100);
+
+    {
+        unique_ptr<OperationContext> opCtx(harnessHelper.newOperationContext());
+
+        ASSERT_EQ(0U, oplogStones->numStones());
+        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(2, 2), 50), RecordId(2, 2));
+        ASSERT_EQ(0U, oplogStones->numStones());
+        ASSERT_EQ(1, oplogStones->currentRecords());
+        ASSERT_EQ(50, oplogStones->currentBytes());
+
+        // Inserting a record that has a smaller RecordId than the previously inserted record should
+        // be able to create a new stone when no stones already exist.
+        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(2, 1), 50), RecordId(2, 1));
+        ASSERT_EQ(1U, oplogStones->numStones());
+        ASSERT_EQ(0, oplogStones->currentRecords());
+        ASSERT_EQ(0, oplogStones->currentBytes());
+
+        // However, inserting a record that has a smaller RecordId than most recently created
+        // stone's last record shouldn't cause a new stone to be created, even if the size of the
+        // inserted record exceeds 'minBytesPerStone'.
+        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(1, 1), 100), RecordId(1, 1));
+        ASSERT_EQ(1U, oplogStones->numStones());
+        ASSERT_EQ(1, oplogStones->currentRecords());
+        ASSERT_EQ(100, oplogStones->currentBytes());
+
+        // Inserting a record that has a larger RecordId than the most recently created stone's last
+        // record should then cause a new stone to be created.
+        ASSERT_EQ(insertBSONWithSize(opCtx.get(), rs.get(), Timestamp(2, 3), 50), RecordId(2, 3));
+        ASSERT_EQ(2U, oplogStones->numStones());
         ASSERT_EQ(0, oplogStones->currentRecords());
         ASSERT_EQ(0, oplogStones->currentBytes());
     }

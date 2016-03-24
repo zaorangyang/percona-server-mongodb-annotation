@@ -2,12 +2,6 @@ selector:
   js_test:
     roots:
     - jstests/noPassthroughWithMongod/*.js
-    exclude_files:
-    # SERVER-19093
-    - jstests/noPassthroughWithMongod/httpinterface.js
-    # stale_clustered.js temporarily disabled due to intermittent failures that are currently
-    # undergoing investigation.  TODO: Re-enable as part of SERVER-20646 work.
-    - jstests/noPassthroughWithMongod/stale_clustered.js
 
 executor:
   js_test:

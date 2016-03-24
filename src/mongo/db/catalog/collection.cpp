@@ -174,6 +174,7 @@ Collection::Collection(OperationContext* txn,
       _details(details),
       _recordStore(recordStore),
       _dbce(dbce),
+      _needCappedLock(supportsDocLocking() && _recordStore->isCapped() && _ns.db() != "local"),
       _infoCache(this),
       _indexCatalog(this),
       _validatorDoc(_details->getCollectionOptions(txn).validator.getOwned()),
@@ -331,14 +332,14 @@ Status Collection::insertDocument(OperationContext* txn, const DocWriter* doc, b
 
 
 Status Collection::insertDocuments(OperationContext* txn,
-                                   vector<BSONObj>::iterator begin,
-                                   vector<BSONObj>::iterator end,
+                                   const vector<BSONObj>::const_iterator begin,
+                                   const vector<BSONObj>::const_iterator end,
                                    bool enforceQuota,
                                    bool fromMigrate) {
     // Should really be done in the collection object at creation and updated on index create.
     const bool hasIdIndex = _indexCatalog.findIdIndex(txn);
 
-    for (vector<BSONObj>::iterator it = begin; it != end; it++) {
+    for (auto it = begin; it != end; it++) {
         if (hasIdIndex && (*it)["_id"].eoo()) {
             return Status(ErrorCodes::InternalError,
                           str::stream() << "Collection::insertDocument got "
@@ -360,11 +361,7 @@ Status Collection::insertDocuments(OperationContext* txn,
         return status;
     invariant(sid == txn->recoveryUnit()->getSnapshotId());
 
-    int inserted = 0;
-    for (vector<BSONObj>::iterator it = begin; it != end; it++) {  // TODO: vectorize
-        getGlobalServiceContext()->getOpObserver()->onInsert(txn, ns(), *it, fromMigrate);
-        inserted++;
-    }
+    getGlobalServiceContext()->getOpObserver()->onInserts(txn, ns(), begin, end, fromMigrate);
 
     txn->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
@@ -405,7 +402,9 @@ Status Collection::insertDocument(OperationContext* txn,
     if (!status.isOK())
         return status;
 
-    getGlobalServiceContext()->getOpObserver()->onInsert(txn, ns(), doc);
+    vector<BSONObj> docs;
+    docs.push_back(doc);
+    getGlobalServiceContext()->getOpObserver()->onInserts(txn, ns(), docs.begin(), docs.end());
 
     txn->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
@@ -413,17 +412,29 @@ Status Collection::insertDocument(OperationContext* txn,
 }
 
 Status Collection::_insertDocuments(OperationContext* txn,
-                                    vector<BSONObj>::iterator begin,
-                                    vector<BSONObj>::iterator end,
+                                    const vector<BSONObj>::const_iterator begin,
+                                    const vector<BSONObj>::const_iterator end,
                                     bool enforceQuota) {
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
 
-    // TODO: for now, capped logic lives inside NamespaceDetails, which is hidden
-    //       under the RecordStore, this feels broken since that should be a
-    //       collection access method probably
+    if (isCapped() && _indexCatalog.haveAnyIndexes() && std::distance(begin, end) > 1) {
+        // We require that inserts to indexed capped collections be done one-at-a-time to avoid the
+        // possibility that a later document causes an earlier document to be deleted before it can
+        // be indexed.
+        // TODO SERVER-21512 It would be better to handle this here by just doing single inserts.
+        return {ErrorCodes::OperationCannotBeBatched,
+                "Can't batch inserts into indexed capped collections"};
+    }
+
+    if (_needCappedLock) {
+        // X-lock the metadata resource for this capped collection until the end of the WUOW. This
+        // prevents the primary from executing with more concurrency than secondaries.
+        // See SERVER-21646.
+        Lock::ResourceLock{txn->lockState(), ResourceId(RESOURCE_METADATA, _ns.ns()), MODE_X};
+    }
 
     std::vector<Record> records;
-    for (vector<BSONObj>::iterator it = begin; it != end; it++) {
+    for (auto it = begin; it != end; it++) {
         Record record = {RecordId(), RecordData(it->objdata(), it->objsize())};
         records.push_back(record);
     }
@@ -433,7 +444,7 @@ Status Collection::_insertDocuments(OperationContext* txn,
 
     std::vector<BsonRecord> bsonRecords;
     int recordIndex = 0;
-    for (vector<BSONObj>::iterator it = begin; it != end; it++) {
+    for (auto it = begin; it != end; it++) {
         RecordId loc = records[recordIndex++].id;
         invariant(RecordId::min() < loc);
         invariant(loc < RecordId::max());
@@ -526,12 +537,32 @@ StatusWith<RecordId> Collection::updateDocument(OperationContext* txn,
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
     invariant(oldDoc.snapshotId() == txn->recoveryUnit()->getSnapshotId());
 
+    if (_needCappedLock) {
+        // X-lock the metadata resource for this capped collection until the end of the WUOW. This
+        // prevents the primary from executing with more concurrency than secondaries.
+        // See SERVER-21646.
+        Lock::ResourceLock{txn->lockState(), ResourceId(RESOURCE_METADATA, _ns.ns()), MODE_X};
+    }
+
     SnapshotId sid = txn->recoveryUnit()->getSnapshotId();
 
     BSONElement oldId = oldDoc.value()["_id"];
     if (!oldId.eoo() && (oldId != newDoc["_id"]))
         return StatusWith<RecordId>(
             ErrorCodes::InternalError, "in Collection::updateDocument _id mismatch", 13596);
+
+    // The MMAPv1 storage engine implements capped collections in a way that does not allow records
+    // to grow beyond their original size. If MMAPv1 part of a replicaset with storage engines that
+    // do not have this limitation, replication could result in errors, so it is necessary to set a
+    // uniform rule here. Similarly, it is not sufficient to disallow growing records, because this
+    // happens when secondaries roll back an update shrunk a record. Exactly replicating legacy
+    // MMAPv1 behavior would require padding shrunk documents on all storage engines. Instead forbid
+    // all size changes.
+    const auto oldSize = oldDoc.value().objsize();
+    if (_recordStore->isCapped() && oldSize != newDoc.objsize())
+        return {ErrorCodes::CannotGrowDocumentInCappedNamespace,
+                str::stream() << "Cannot change the size of a document in a capped collection: "
+                              << oldSize << " != " << newDoc.objsize()};
 
     // At the end of this step, we will have a map of UpdateTickets, one per index, which
     // represent the index updates needed to be done, based on the changes between oldDoc and
@@ -893,7 +924,39 @@ public:
         return Status::OK();
     }
 };
+
+void validateIndexKeyCount(OperationContext* txn,
+                           const IndexDescriptor& idx,
+                           int64_t numIdxKeys,
+                           int64_t numRecs,
+                           ValidateResults* results) {
+    if (idx.isIdIndex() && numIdxKeys != numRecs) {
+        string err = str::stream() << "number of _id index entries (" << numIdxKeys
+                                   << ") does not match the number of documents (" << numRecs
+                                   << ")";
+        results->errors.push_back(err);
+        results->valid = false;
+        return;  // Avoid failing the next two checks, they just add redundant/confusing messages
+    }
+    if (!idx.isMultikey(txn) && numIdxKeys > numRecs) {
+        string err = str::stream() << "index " << idx.indexName()
+                                   << " is not multi-key, but has more entries (" << numIdxKeys
+                                   << ") than documents (" << numRecs << ")";
+        results->errors.push_back(err);
+        results->valid = false;
+    }
+    //  If an access method name is given, the index may be a full text, geo or special
+    //  index plugin with different semantics.
+    if (!idx.isSparse() && !idx.isPartial() && idx.getAccessMethodName() == "" &&
+        numIdxKeys < numRecs) {
+        string err = str::stream() << "index " << idx.indexName()
+                                   << " is not sparse or partial, but has fewer entries ("
+                                   << numIdxKeys << ") than documents (" << numRecs << ")";
+        results->errors.push_back(err);
+        results->valid = false;
+    }
 }
+}  // namespace
 
 Status Collection::validate(OperationContext* txn,
                             bool full,
@@ -931,6 +994,9 @@ Status Collection::validate(OperationContext* txn,
                 int64_t keys;
                 iam->validate(txn, full, &keys, bob.get());
                 indexes.appendNumber(descriptor->indexNamespace(), static_cast<long long>(keys));
+
+                validateIndexKeyCount(
+                    txn, *descriptor, keys, _recordStore->numRecords(txn), results);
 
                 if (bob) {
                     BSONObj obj = bob->done();

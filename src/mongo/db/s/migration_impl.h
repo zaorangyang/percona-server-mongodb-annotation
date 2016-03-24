@@ -88,12 +88,13 @@ class ChunkMoveOperationState {
     MONGO_DISALLOW_COPYING(ChunkMoveOperationState);
 
 public:
-    ChunkMoveOperationState(NamespaceString ns);
+    ChunkMoveOperationState(OperationContext* txn, NamespaceString ns);
+    ~ChunkMoveOperationState();
 
     /**
-     * Starts a new chunk move operation from the beginning.
+     * Extracts and validates the move chunk parameters from the given cmdObj.
      */
-    Status initialize(OperationContext* txn, const BSONObj& cmdObj);
+    Status initialize(const BSONObj& cmdObj);
 
     /**
      * Acquires the distributed lock for the collection, whose chunk is being moved and fetches the
@@ -108,8 +109,12 @@ public:
      * TODO: Once the entire chunk move process is moved to be inside this state machine, there
      *       will not be any need to expose the distributed lock.
      */
-    StatusWith<ForwardingCatalogManager::ScopedDistLock*> acquireMoveMetadata(
-        OperationContext* txn);
+    StatusWith<ForwardingCatalogManager::ScopedDistLock*> acquireMoveMetadata();
+
+    /**
+     * Starts the move chunk operation.
+     */
+    Status start(BSONObj shardKeyPattern);
 
     /**
      * Implements the migration critical section. Needs to be invoked after all data has been moved
@@ -120,7 +125,7 @@ public:
      * Since some migration failures are non-recoverable, it may also shut down the server on
      * certain errors.
      */
-    Status commitMigration(OperationContext* txn);
+    Status commitMigration();
 
     const NamespaceString& getNss() const {
         return _nss;
@@ -165,6 +170,8 @@ public:
     std::shared_ptr<CollectionMetadata> getCollMetadata() const;
 
 private:
+    // The context of which the migration is running on.
+    OperationContext* const _txn = nullptr;
     const NamespaceString _nss;
 
     // The source and recipient shard ids
@@ -175,8 +182,12 @@ private:
     ConnectionString _fromShardCS;
     ConnectionString _toShardCS;
 
-    // Expected epoch for the collection, whose chunks are being moved
+    // Epoch for the collection sent along with the command
+    // TODO(SERVER-20742): remove this after 3.2, now that we're sending version it is redundant
     OID _collectionEpoch;
+
+    // ChunkVersion for the collection sent along with the command
+    ChunkVersion _collectionVersion;
 
     // Min and max key of the chunk being moved
     BSONObj _minKey;
@@ -190,6 +201,9 @@ private:
     // completion, because the distributed lock is being held.
     ChunkVersion _shardVersion;
     std::shared_ptr<CollectionMetadata> _collMetadata;
+
+    // True if this migration is running.
+    bool _isRunning = false;
 };
 
 }  // namespace mongo

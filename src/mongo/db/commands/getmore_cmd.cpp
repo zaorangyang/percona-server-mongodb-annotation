@@ -83,10 +83,6 @@ public:
     }
 
     bool slaveOk() const override {
-        return false;
-    }
-
-    bool slaveOverrideOk() const override {
         return true;
     }
 
@@ -105,6 +101,17 @@ public:
 
     void help(std::stringstream& help) const override {
         help << "retrieve more results from an existing cursor";
+    }
+
+    LogicalOp getLogicalOp() const override {
+        return LogicalOp::opGetMore;
+    }
+
+    std::size_t reserveBytesForReply() const override {
+        // The extra 1K is an artifact of how we construct batches. We consider a batch to be full
+        // when it exceeds the goal batch size. In the case that we are just below the limit and
+        // then read a large document, the extra 1K helps prevent a final realloc+memcpy.
+        return FindCommon::kMaxBytesToReturnToClientAtOnce + 1024u;
     }
 
     /**
@@ -154,6 +161,16 @@ public:
 
         // Disable shard version checking - getmore commands are always unversioned
         OperationShardVersion::get(txn).setShardVersion(request.nss, ChunkVersion::IGNORED());
+
+        // Validate term before acquiring locks, if provided.
+        if (request.term) {
+            auto replCoord = repl::ReplicationCoordinator::get(txn);
+            Status status = replCoord->updateTerm(txn, *request.term);
+            // Note: updateTerm returns ok if term stayed the same.
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+        }
 
         // Depending on the type of cursor being operated on, we hold locks for the whole
         // getMore, or none of the getMore, or part of the getMore.  The three cases in detail:
@@ -228,14 +245,10 @@ public:
             }
         }
 
-        // Validate term, if provided.
-        if (request.term) {
-            auto replCoord = repl::ReplicationCoordinator::get(txn);
-            Status status = replCoord->updateTerm(*request.term);
-            // Note: updateTerm returns ok if term stayed the same.
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
+        if (request.awaitDataTimeout && !isCursorAwaitData(cursor)) {
+            Status status(ErrorCodes::BadValue,
+                          "cannot set maxTimeMS on getMore command for a non-awaitData cursor");
+            return appendCommandStatus(result, status);
         }
 
         // On early return, get rid of the cursor.
@@ -288,7 +301,7 @@ public:
         }
 
         CursorId respondWithId = 0;
-        BSONArrayBuilder nextBatch;
+        CursorResponseBuilder nextBatch(/*isInitialResponse*/ false, &result);
         BSONObj obj;
         PlanExecutor::ExecState state;
         long long numResults = 0;
@@ -302,7 +315,8 @@ public:
         if (isCursorAwaitData(cursor) && state == PlanExecutor::IS_EOF && numResults == 0) {
             auto replCoord = repl::ReplicationCoordinator::get(txn);
             // Return immediately if we need to update the commit time.
-            if (request.lastKnownCommittedOpTime == replCoord->getLastCommittedOpTime()) {
+            if (!request.lastKnownCommittedOpTime ||
+                (request.lastKnownCommittedOpTime == replCoord->getLastCommittedOpTime())) {
                 // Retrieve the notifier which we will wait on until new data arrives. We make sure
                 // to do this in the lock because once we drop the lock it is possible for the
                 // collection to become invalid. The notifier itself will outlive the collection if
@@ -353,7 +367,7 @@ public:
             CurOp::get(txn)->debug().cursorExhausted = true;
         }
 
-        appendGetMoreResponseObject(respondWithId, request.nss.ns(), nextBatch.arr(), &result);
+        nextBatch.done(respondWithId, request.nss.ns());
 
         if (respondWithId) {
             cursorFreer.Dismiss();
@@ -383,7 +397,7 @@ public:
      */
     Status generateBatch(ClientCursor* cursor,
                          const GetMoreRequest& request,
-                         BSONArrayBuilder* nextBatch,
+                         CursorResponseBuilder* nextBatch,
                          PlanExecutor::ExecState* state,
                          long long* numResults) {
         PlanExecutor* exec = cursor->getExecutor();
@@ -397,7 +411,8 @@ public:
             while (PlanExecutor::ADVANCED == (*state = exec->getNext(&obj, NULL))) {
                 // If adding this object will cause us to exceed the BSON size limit, then we
                 // stash it for later.
-                if (nextBatch->len() + obj.objsize() > BSONObjMaxUserSize && *numResults > 0) {
+                if (nextBatch->bytesUsed() + obj.objsize() > BSONObjMaxUserSize &&
+                    *numResults > 0) {
                     exec->enqueue(obj);
                     break;
                 }
@@ -407,7 +422,7 @@ public:
                 (*numResults)++;
 
                 if (FindCommon::enoughForGetMore(
-                        request.batchSize.value_or(0), *numResults, nextBatch->len())) {
+                        request.batchSize.value_or(0), *numResults, nextBatch->bytesUsed())) {
                     break;
                 }
             }
@@ -421,6 +436,8 @@ public:
         }
 
         if (PlanExecutor::FAILURE == *state || PlanExecutor::DEAD == *state) {
+            nextBatch->abandon();
+
             const std::unique_ptr<PlanStageStats> stats(exec->getStats());
             error() << "GetMore command executor error: " << PlanExecutor::statestr(*state)
                     << ", stats: " << Explain::statsToBSON(*stats);

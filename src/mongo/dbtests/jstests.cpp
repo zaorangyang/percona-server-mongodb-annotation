@@ -118,7 +118,8 @@ public:
         s->setNumber("notANumberVal", std::numeric_limits<double>::quiet_NaN());
         ASSERT(!s->getBoolean("notANumberVal"));
 
-        s->setElement("nullVal", BSONObjBuilder().appendNull("null").obj().getField("null"));
+        auto obj = BSONObjBuilder().appendNull("null").obj();
+        s->setElement("nullVal", obj.getField("null"), obj);
         ASSERT(!s->getBoolean("nullVal"));
 
         s->setNumber("zeroVal", 0);
@@ -849,12 +850,12 @@ public:
     }
 };
 
-class InvalidTimestamp {
+class MaxTimestamp {
 public:
     void run() {
         unique_ptr<Scope> s(globalScriptEngine->newScope());
 
-        // Timestamp 't' component cannot exceed max for int32_t.
+        // Timestamp 't' component can exceed max for int32_t.
         BSONObj in;
         {
             BSONObjBuilder b;
@@ -866,7 +867,7 @@ public:
         }
         s->setObject("a", in);
 
-        ASSERT_FALSE(s->exec("x = tojson( a ); ", "foo", false, true, false));
+        ASSERT(s->exec("x = tojson( a ); ", "foo", false, true, false));
     }
 };
 
@@ -1504,17 +1505,8 @@ class Undefined : public TestRoundTrip {
         return b.obj();
     }
 
-    // Don't need to return anything because we are overriding both jsonOut and jsonIn
     virtual string json() const {
-        return "";
-    }
-
-    // undefined values come out as null in the shell.  See SERVER-6102.
-    virtual string jsonIn() const {
         return "{ \"a\" : undefined }";
-    }
-    virtual string jsonOut() const {
-        return "{ \"a\" : null }";
     }
 };
 
@@ -2385,7 +2377,7 @@ public:
             add<NumberDecimalBigObject>();
         }
 
-        add<InvalidTimestamp>();
+        add<MaxTimestamp>();
         add<RenameTest>();
 
         add<WeirdObjects>();

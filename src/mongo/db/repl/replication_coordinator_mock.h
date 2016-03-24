@@ -51,6 +51,10 @@ public:
 
     virtual void shutdown();
 
+    virtual ReplicationExecutor* getExecutor() override {
+        return nullptr;
+    };
+
     virtual const ReplSettings& getSettings() const;
 
     virtual bool isReplEnabled() const;
@@ -58,6 +62,8 @@ public:
     virtual Mode getReplicationMode() const;
 
     virtual MemberState getMemberState() const;
+
+    virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) override;
 
     virtual bool isInPrimaryOrSecondaryState() const;
 
@@ -117,6 +123,8 @@ public:
 
     virtual void signalDrainComplete(OperationContext*);
 
+    virtual Status waitForDrainFinish(Milliseconds timeout) override;
+
     virtual void signalUpstreamUpdater();
 
     virtual bool prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder);
@@ -126,6 +134,8 @@ public:
     virtual void fillIsMasterForReplSet(IsMasterResponse* result);
 
     virtual void appendSlaveInfoData(BSONObjBuilder* result);
+
+    void appendConnectionStats(BSONObjBuilder* b) override;
 
     virtual ReplicaSetConfig getConfig() const;
 
@@ -183,7 +193,9 @@ public:
 
     virtual void resetLastOpTimeFromOplog(OperationContext* txn);
 
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource);
+    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
+                                        const OpTime& syncSourceLastOpTime,
+                                        bool syncSourceHasSyncSource);
 
     virtual OpTime getLastCommittedOpTime() const;
 
@@ -196,7 +208,6 @@ public:
 
     void prepareReplResponseMetadata(const rpc::RequestInterface& request,
                                      const OpTime& lastOpTimeFromClient,
-                                     const ReadConcernArgs& readConcern,
                                      BSONObjBuilder* builder) override;
 
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
@@ -208,7 +219,7 @@ public:
 
     virtual long long getTerm();
 
-    virtual Status updateTerm(long long term);
+    virtual Status updateTerm(OperationContext* txn, long long term);
 
     virtual SnapshotName reserveSnapshotName(OperationContext* txn);
 
@@ -220,7 +231,10 @@ public:
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() override;
 
-    virtual void waitForNewSnapshot(OperationContext* txn) override;
+    virtual void waitUntilSnapshotCommitted(OperationContext* txn,
+                                            const SnapshotName& untilSnapshot) override;
+
+    virtual size_t getNumUncommittedSnapshots() override;
 
 private:
     AtomicUInt64 _snapshotNameGenerator;

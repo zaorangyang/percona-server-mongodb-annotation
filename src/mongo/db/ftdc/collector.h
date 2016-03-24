@@ -29,6 +29,7 @@
 #pragma once
 
 #include <memory>
+#include <tuple>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
@@ -37,6 +38,7 @@ namespace mongo {
 
 class BSONObj;
 class BSONObjBuilder;
+class Date_t;
 class Client;
 class OperationContext;
 
@@ -89,17 +91,21 @@ public:
 
     /**
      * Collect a sample from all collectors. Called after all adding is complete.
+     * Returns a tuple of a sample, and the time at which collecting started.
      *
      * Sample schema:
      * {
+     *    "start" : Date_t,    <- Time at which all collecting started
      *    "name" : {           <- name is from name() in FTDCCollectorInterface
-     *       "start" : Date_t,
+     *       "start" : Date_t, <- Time at which name() collection started
      *       "data" : { ... }  <- data comes from collect() in FTDCCollectorInterface
-     *       "end" : Date_t,
-     *    }
+     *       "end" : Date_t,   <- Time at which name() collection ended
+     *    },
+     *    ...
+     *    "end" : Date_t,      <- Time at which all collecting ended
      * }
      */
-    BSONObj collect(Client* client);
+    std::tuple<BSONObj, Date_t> collect(Client* client);
 
 private:
     // collection of collectors

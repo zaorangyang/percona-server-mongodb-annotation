@@ -29,6 +29,7 @@
 #pragma once
 
 #include <jsapi.h>
+#include <vm/PosixNSPR.h>
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/scripting/mozjs/bindata.h"
@@ -44,6 +45,7 @@
 #include "mongo/scripting/mozjs/engine.h"
 #include "mongo/scripting/mozjs/error.h"
 #include "mongo/scripting/mozjs/global.h"
+#include "mongo/scripting/mozjs/internedstring.h"
 #include "mongo/scripting/mozjs/jsthread.h"
 #include "mongo/scripting/mozjs/maxkey.h"
 #include "mongo/scripting/mozjs/minkey.h"
@@ -115,7 +117,7 @@ public:
     void setNumber(const char* field, double val) override;
     void setString(const char* field, StringData val) override;
     void setBoolean(const char* field, bool val) override;
-    void setElement(const char* field, const BSONElement& e) override;
+    void setElement(const char* field, const BSONElement& e, const BSONObj& parent) override;
     void setObject(const char* field, const BSONObj& obj, bool readOnly) override;
     void setFunction(const char* field, const char* code) override;
 
@@ -290,6 +292,14 @@ public:
     void setParentStack(std::string);
     const std::string& getParentStack() const;
 
+    std::size_t getGeneration() const;
+
+    void advanceGeneration() override;
+
+    JS::HandleId getInternedStringId(InternedString name) {
+        return _internedStrings.getInternedString(name);
+    }
+
 private:
     void _MozJSCreateFunction(const char* raw,
                               ScriptingFunction functionNumber,
@@ -303,11 +313,12 @@ private:
      */
     struct MozRuntime {
     public:
-        MozRuntime();
+        MozRuntime(const MozJSScriptEngine* engine);
         ~MozRuntime();
 
-        JSRuntime* _runtime;
-        JSContext* _context;
+        PRThread* _thread = nullptr;
+        JSRuntime* _runtime = nullptr;
+        JSContext* _context = nullptr;
     };
 
     /**
@@ -342,6 +353,7 @@ private:
     WrapType<GlobalInfo> _globalProto;
     JS::HandleObject _global;
     std::vector<JS::PersistentRootedValue> _funcs;
+    InternedStringTable _internedStrings;
     std::atomic<bool> _pendingKill;
     std::string _error;
     unsigned int _opId;        // op id for this scope
@@ -352,6 +364,8 @@ private:
     int _exitCode;
     bool _quickExit;
     std::string _parentStack;
+    std::size_t _generation;
+    bool _hasOutOfMemoryException;
 
     WrapType<BinDataInfo> _binDataProto;
     WrapType<BSONInfo> _bsonProto;

@@ -103,7 +103,7 @@ AutoGetCollectionForRead::~AutoGetCollectionForRead() {
     auto currentOp = CurOp::get(_txn);
     Top::get(_txn->getClient()->getServiceContext())
         .record(currentOp->getNS(),
-                currentOp->getOp(),
+                currentOp->getLogicalOp(),
                 -1,  // "read locked"
                 _timer.micros(),
                 currentOp->isCommand());
@@ -128,9 +128,9 @@ void AutoGetCollectionForRead::_ensureMajorityCommittedSnapshotIsValid(const Nam
         }
 
         // Yield locks.
-        _autoColl = {};
+        _autoColl = boost::none;
 
-        repl::ReplicationCoordinator::get(_txn)->waitForNewSnapshot(_txn);
+        repl::ReplicationCoordinator::get(_txn)->waitUntilSnapshotCommitted(_txn, *minSnapshot);
 
         uassertStatusOK(_txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
 
@@ -141,9 +141,6 @@ void AutoGetCollectionForRead::_ensureMajorityCommittedSnapshotIsValid(const Nam
         _autoColl.emplace(_txn, nss, MODE_IS);
     }
 }
-
-OldClientContext::OldClientContext(OperationContext* txn, const std::string& ns, Database* db)
-    : _justCreated(false), _doVersion(true), _ns(ns), _db(db), _txn(txn) {}
 
 OldClientContext::OldClientContext(OperationContext* txn,
                                    const std::string& ns,
@@ -183,7 +180,7 @@ void OldClientContext::_finishInit() {
 }
 
 void OldClientContext::_checkNotStale() const {
-    switch (CurOp::get(_txn)->getOp()) {
+    switch (CurOp::get(_txn)->getNetworkOp()) {
         case dbGetMore:  // getMore is special and should be handled elsewhere.
         case dbUpdate:   // update & delete check shard version in instance.cpp, so don't check
         case dbDelete:   // here as well.
@@ -200,7 +197,7 @@ OldClientContext::~OldClientContext() {
     auto currentOp = CurOp::get(_txn);
     Top::get(_txn->getClient()->getServiceContext())
         .record(currentOp->getNS(),
-                currentOp->getOp(),
+                currentOp->getLogicalOp(),
                 _txn->lockState()->isWriteLocked() ? 1 : -1,
                 _timer.micros(),
                 currentOp->isCommand());

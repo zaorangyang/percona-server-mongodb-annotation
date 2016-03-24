@@ -62,7 +62,7 @@ namespace mongo {
             if (params.directoryperdb) {
                 severe() << "PerconaFT: directoryPerDB not yet supported.  This option is incompatible with PerconaFT.";
                 severe() << "PerconaFT: The following server crash is intentional.";
-                fassertFailedNoTrace(28828);
+                fassertFailedNoTrace(28928);
             }
             if (tokuftGlobalOptions.engineOptions.directoryForIndexes) {
                 severe() << "PerconaFT: directoryForIndexes not yet supported.  This option is incompatible with PerconaFT.";

@@ -29,7 +29,6 @@
 #pragma once
 
 #include "mongo/client/connection_string.h"
-#include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog/catalog_manager_common.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
@@ -104,7 +103,7 @@ public:
                                            const std::string& collectionNs,
                                            const ChunkType& chunk) override;
 
-    Status getAllShards(OperationContext* txn, std::vector<ShardType>* shards) override;
+    StatusWith<OpTimePair<std::vector<ShardType>>> getAllShards(OperationContext* txn) override;
 
     /**
      * Grabs a distributed lock and runs the command on all config servers.
@@ -115,11 +114,6 @@ public:
                                        const BSONObj& cmdObj,
                                        BSONObjBuilder* result) override;
 
-    bool runReadCommand(OperationContext* txn,
-                        const std::string& dbname,
-                        const BSONObj& cmdObj,
-                        BSONObjBuilder* result) override;
-
     bool runUserManagementReadCommand(OperationContext* txn,
                                       const std::string& dbname,
                                       const BSONObj& cmdObj,
@@ -129,14 +123,6 @@ public:
                                    const BSONArray& updateOps,
                                    const BSONArray& preCondition) override;
 
-    void logAction(OperationContext* txn, const ActionLogType& actionLog);
-
-    void logChange(OperationContext* txn,
-                   const std::string& clientAddress,
-                   const std::string& what,
-                   const std::string& ns,
-                   const BSONObj& detail) override;
-
     StatusWith<SettingsType> getGlobalSettings(OperationContext* txn,
                                                const std::string& key) override;
 
@@ -144,9 +130,26 @@ public:
                                  const BatchedCommandRequest& request,
                                  BatchedCommandResponse* response) override;
 
+    Status insertConfigDocument(OperationContext* txn,
+                                const std::string& ns,
+                                const BSONObj& doc) override;
+
+    StatusWith<bool> updateConfigDocument(OperationContext* txn,
+                                          const std::string& ns,
+                                          const BSONObj& query,
+                                          const BSONObj& update,
+                                          bool upsert) override;
+
+    Status removeConfigDocuments(OperationContext* txn,
+                                 const std::string& ns,
+                                 const BSONObj& query) override;
+
     DistLockManager* getDistLockManager() override;
 
     Status initConfigVersion(OperationContext* txn) override;
+
+    Status appendInfoForConfigServerDatabases(OperationContext* txn,
+                                              BSONArrayBuilder* builder) override;
 
 private:
     Status _checkDbDoesNotExist(OperationContext* txn,
@@ -154,6 +157,10 @@ private:
                                 DatabaseType* db) override;
 
     StatusWith<std::string> _generateNewShardName(OperationContext* txn) override;
+
+    Status _createCappedConfigCollection(OperationContext* txn,
+                                         StringData collName,
+                                         int cappedSize) override;
 
     /**
      * Starts the thread that periodically checks data consistency amongst the config servers.
@@ -185,6 +192,14 @@ private:
      */
     bool _isConsistentFromLastCheck();
 
+    /**
+     * Sends a read only command to the config server.
+     */
+    bool _runReadCommand(OperationContext* txn,
+                         const std::string& dbname,
+                         const BSONObj& cmdObj,
+                         BSONObjBuilder* result);
+
     // Parsed config server hosts, as specified on the command line.
     ConnectionString _configServerConnectionString;
     std::vector<ConnectionString> _configServers;
@@ -192,17 +207,15 @@ private:
     // Distribted lock manager singleton.
     std::unique_ptr<DistLockManager> _distLockManager;
 
-    // Whether the logChange call should attempt to create the changelog collection
-    AtomicInt32 _changeLogCollectionCreated;
-
-    // Whether the logAction call should attempt to create the actionlog collection
-    AtomicInt32 _actionLogCollectionCreated;
-
     // protects _inShutdown, _consistentFromLastCheck; used by _consistencyCheckerCV
     stdx::mutex _mutex;
 
     // True if CatalogManagerLegacy::shutDown has been called. False, otherwise.
     bool _inShutdown = false;
+
+    // Set to true once startup() has been called and returned an OK status.  Allows startup() to be
+    // called multiple times with any time after the first successful call being a no-op.
+    bool _started = false;
 
     // used by consistency checker thread to check if config
     // servers are consistent

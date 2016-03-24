@@ -25,14 +25,18 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/executor/connection_pool.h"
 
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
-
 
 // One interesting implementation note herein concerns how setup() and
 // refresh() are invoked outside of the global lock, but setTimeout is not.
@@ -57,7 +61,7 @@ public:
     ~SpecificPool();
 
     /**
-     * Get's a connection from the specific pool. Sinks a unique_lock from the
+     * Gets a connection from the specific pool. Sinks a unique_lock from the
      * parent to preserve the lock on _mutex
      */
     void getConnection(const HostAndPort& hostAndPort,
@@ -66,7 +70,7 @@ public:
                        GetConnectionCallback cb);
 
     /**
-     * Cascade a failure across existing connections and requests. Invoking
+     * Cascades a failure across existing connections and requests. Invoking
      * this function drops all current connections and fails all current
      * requests with the passed status.
      */
@@ -77,6 +81,21 @@ public:
      * parent to preserve the lock on _mutex
      */
     void returnConnection(ConnectionInterface* connection, stdx::unique_lock<stdx::mutex> lk);
+
+    /**
+     * Returns the number of connections currently checked out of the pool.
+     */
+    size_t inUseConnections(const stdx::unique_lock<stdx::mutex>& lk);
+
+    /**
+     * Returns the number of available connections in the pool.
+     */
+    size_t availableConnections(const stdx::unique_lock<stdx::mutex>& lk);
+
+    /**
+     * Returns the total number of connections ever created in this pool.
+     */
+    size_t createdConnections(const stdx::unique_lock<stdx::mutex>& lk);
 
 private:
     using OwnedConnection = std::unique_ptr<ConnectionInterface>;
@@ -118,6 +137,8 @@ private:
     size_t _generation;
     bool _inFulfillRequests;
 
+    size_t _created;
+
     /**
      * The current state of the pool
      *
@@ -144,11 +165,12 @@ private:
     State _state;
 };
 
-// TODO: revisit these durations when we come up with a more pervasive solution
-// for NetworkInterfaceASIO's timers
-Milliseconds const ConnectionPool::kDefaultRefreshTimeout = Minutes(5);
-Milliseconds const ConnectionPool::kDefaultRefreshRequirement = Minutes(5);
+Milliseconds const ConnectionPool::kDefaultRefreshTimeout = Seconds(20);
+Milliseconds const ConnectionPool::kDefaultRefreshRequirement = Seconds(60);
 Milliseconds const ConnectionPool::kDefaultHostTimeout = Minutes(5);
+
+const Status ConnectionPool::kConnectionStateUnknown =
+    Status(ErrorCodes::InternalError, "Connection is in an unknown state");
 
 ConnectionPool::ConnectionPool(std::unique_ptr<DependentTypeFactoryInterface> impl, Options options)
     : _options(std::move(options)), _factory(std::move(impl)) {}
@@ -189,6 +211,44 @@ void ConnectionPool::get(const HostAndPort& hostAndPort,
     pool->getConnection(hostAndPort, timeout, std::move(lk), std::move(cb));
 }
 
+void ConnectionPool::appendConnectionStats(BSONObjBuilder* b) {
+    size_t inUse = 0u;
+    size_t available = 0u;
+    size_t created = 0u;
+
+    BSONObjBuilder hostBuilder(b->subobjStart("hosts"));
+
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+
+    for (const auto& kv : _pools) {
+        std::string label = kv.first.toString();
+        BSONObjBuilder hostInfo(hostBuilder.subobjStart(label));
+
+        auto& pool = kv.second;
+        auto inUseConnections = pool->inUseConnections(lk);
+        auto availableConnections = pool->availableConnections(lk);
+        auto createdConnections = pool->createdConnections(lk);
+        hostInfo.appendNumber("inUse", inUseConnections);
+        hostInfo.appendNumber("available", availableConnections);
+        hostInfo.appendNumber("created", createdConnections);
+
+        hostInfo.done();
+
+        // update available and created
+        inUse += inUseConnections;
+        available += availableConnections;
+        created += createdConnections;
+    }
+
+    hostBuilder.done();
+
+    b->appendNumber("totalInUse", inUse);
+    b->appendNumber("totalAvailable", available);
+    b->appendNumber("totalCreated", created);
+
+    return;
+}
+
 void ConnectionPool::returnConnection(ConnectionInterface* conn) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
@@ -205,17 +265,36 @@ ConnectionPool::SpecificPool::SpecificPool(ConnectionPool* parent, const HostAnd
       _requestTimer(parent->_factory->makeTimer()),
       _generation(0),
       _inFulfillRequests(false),
+      _created(0),
       _state(State::kRunning) {}
 
 ConnectionPool::SpecificPool::~SpecificPool() {
     DESTRUCTOR_GUARD(_requestTimer->cancelTimeout();)
 }
 
+size_t ConnectionPool::SpecificPool::inUseConnections(const stdx::unique_lock<stdx::mutex>& lk) {
+    return _checkedOutPool.size();
+}
+
+size_t ConnectionPool::SpecificPool::availableConnections(
+    const stdx::unique_lock<stdx::mutex>& lk) {
+    return _readyPool.size();
+}
+
+size_t ConnectionPool::SpecificPool::createdConnections(const stdx::unique_lock<stdx::mutex>& lk) {
+    return _created;
+}
+
 void ConnectionPool::SpecificPool::getConnection(const HostAndPort& hostAndPort,
                                                  Milliseconds timeout,
                                                  stdx::unique_lock<stdx::mutex> lk,
                                                  GetConnectionCallback cb) {
-    auto expiration = _parent->_factory->now() + timeout;
+    // We need some logic here to handle kNoTimeout, which is defined as -1 Milliseconds. If we just
+    // added the timeout, we would get a time 1MS in the past, which would immediately timeout - the
+    // exact opposite of what we want.
+    auto expiration = (timeout == RemoteCommandRequest::kNoTimeout)
+        ? RemoteCommandRequest::kNoExpirationDate
+        : _parent->_factory->now() + timeout;
 
     _requests.push(make_pair(expiration, std::move(cb)));
 
@@ -232,6 +311,10 @@ void ConnectionPool::SpecificPool::returnConnection(ConnectionInterface* connPtr
     auto conn = takeFromPool(_checkedOutPool, connPtr);
 
     updateStateInLock();
+
+    // Users are required to call indicateSuccess() or indicateFailure() before allowing
+    // a connection to be returned. Otherwise, we have entered an unknown state.
+    invariant(conn->getStatus() != kConnectionStateUnknown);
 
     if (conn->getGeneration() != _generation) {
         // If the connection is from an older generation, just return.
@@ -316,6 +399,8 @@ void ConnectionPool::SpecificPool::addToReady(stdx::unique_lock<stdx::mutex>& lk
 
                             _checkedOutPool[connPtr] = std::move(conn);
 
+                            connPtr->indicateSuccess();
+
                             returnConnection(connPtr, std::move(lk));
                         });
 
@@ -380,6 +465,21 @@ void ConnectionPool::SpecificPool::fulfillRequests(stdx::unique_lock<stdx::mutex
         _readyPool.erase(iter);
         conn->cancelTimeout();
 
+        if (!conn->isHealthy()) {
+            log() << "dropping unhealthy pooled connection to " << conn->getHostAndPort();
+
+            if (_readyPool.empty()) {
+                log() << "after drop, pool was empty, going to spawn some connections";
+                // Spawn some more connections to the bad host if we're all out.
+                spawnConnections(lk, conn->getHostAndPort());
+            }
+
+            // Drop the bad connection.
+            conn.reset();
+            // Retry.
+            continue;
+        }
+
         // Grab the request and callback
         auto cb = std::move(_requests.top().second);
         _requests.pop();
@@ -392,6 +492,7 @@ void ConnectionPool::SpecificPool::fulfillRequests(stdx::unique_lock<stdx::mutex
         updateStateInLock();
 
         // pass it to the user
+        connPtr->resetToUnknown();
         lk.unlock();
         cb(ConnectionHandle(connPtr, ConnectionHandleDeleter(_parent)));
         lk.lock();
@@ -415,6 +516,8 @@ void ConnectionPool::SpecificPool::spawnConnections(stdx::unique_lock<stdx::mute
         auto handle = _parent->_factory->makeConnection(hostAndPort, _generation);
         auto connPtr = handle.get();
         _processingPool[connPtr] = std::move(handle);
+
+        ++_created;
 
         // Run the setup callback
         lk.unlock();

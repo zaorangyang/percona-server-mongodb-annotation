@@ -246,6 +246,9 @@ Status KVStorageEngine::dropDatabase(OperationContext* txn, StringData db) {
 }
 
 int KVStorageEngine::flushAllFiles(bool sync) {
+    if (isEphemeral()) {
+        return 0;
+    }
     return _engine->flushAllFiles(sync);
 }
 
@@ -268,6 +271,10 @@ void KVStorageEngine::endBackup(OperationContext* txn) {
 
 bool KVStorageEngine::isDurable() const {
     return _engine->isDurable();
+}
+
+bool KVStorageEngine::isEphemeral() const {
+    return _engine->isEphemeral();
 }
 
 SnapshotManager* KVStorageEngine::getSnapshotManager() const {

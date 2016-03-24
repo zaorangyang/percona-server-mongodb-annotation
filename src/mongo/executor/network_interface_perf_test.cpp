@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -65,7 +65,7 @@ int timeNetworkTestMillis(std::size_t operations, NetworkInterface* net) {
     auto fixture = unittest::getFixtureConnectionString();
     auto server = fixture.getServers()[0];
 
-    std::atomic<int> remainingOps(operations);
+    std::atomic<int> remainingOps(operations);  // NOLINT
     stdx::mutex mtx;
     stdx::condition_variable cv;
     Timer t;

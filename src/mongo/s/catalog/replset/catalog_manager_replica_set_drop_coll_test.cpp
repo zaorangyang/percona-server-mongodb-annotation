@@ -109,7 +109,8 @@ public:
             BSONObj expectedCmd(fromjson(R"({
                 delete: "chunks",
                 deletes: [{ q: { ns: "test.user" }, limit: 0 }],
-                writeConcern: { w: "majority" }
+                writeConcern: { w: "majority" },
+                maxTimeMS: 30000
             })"));
 
             ASSERT_EQ(expectedCmd, request.cmdObj);
@@ -155,10 +156,6 @@ public:
         return _shard2;
     }
 
-    string testClient() const {
-        return _clientHost.toString();
-    }
-
     const HostAndPort& configHost() const {
         return _configHost;
     }
@@ -179,12 +176,8 @@ TEST_F(DropColl2ShardTest, Basic) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -200,7 +193,7 @@ TEST_F(DropColl2ShardTest, Basic) {
     expectUnsetSharding(shard2());
 
     expectChangeLogInsert(
-        configHost(), testClient(), network()->now(), "dropCollection", dropNS().ns(), BSONObj());
+        configHost(), network()->now(), "dropCollection", dropNS().ns(), BSONObj());
 
     future.timed_get(kFutureTimeout);
 }
@@ -212,12 +205,8 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -250,7 +239,7 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
     expectUnsetSharding(shard2());
 
     expectChangeLogInsert(
-        configHost(), testClient(), network()->now(), "dropCollection", dropNS().ns(), BSONObj());
+        configHost(), network()->now(), "dropCollection", dropNS().ns(), BSONObj());
 
     future.timed_get(kFutureTimeout);
 }
@@ -278,12 +267,8 @@ TEST_F(DropColl2ShardTest, DistLockBusy) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -302,12 +287,8 @@ TEST_F(DropColl2ShardTest, FirstShardTargeterError) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -322,12 +303,8 @@ TEST_F(DropColl2ShardTest, FirstShardDropError) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -347,12 +324,8 @@ TEST_F(DropColl2ShardTest, FirstShardDropCmdError) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -368,7 +341,7 @@ TEST_F(DropColl2ShardTest, FirstShardDropCmdError) {
 
 TEST_F(DropColl2ShardTest, SecondShardTargeterError) {
     auto shard2Targeter = RemoteCommandTargeterMock::get(
-        shardRegistry()->getShard(operationContext(), shard2().getHost())->getTargeter());
+        shardRegistry()->getShard(operationContext(), shard2().getName())->getTargeter());
     shard2Targeter->setFindHostReturnValue({ErrorCodes::HostUnreachable, "bad test network"});
 
     auto future = launchAsync([this] {
@@ -378,12 +351,8 @@ TEST_F(DropColl2ShardTest, SecondShardTargeterError) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -400,12 +369,8 @@ TEST_F(DropColl2ShardTest, SecondShardDropError) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -427,12 +392,8 @@ TEST_F(DropColl2ShardTest, SecondShardDropCmdError) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -453,12 +414,8 @@ TEST_F(DropColl2ShardTest, CleanupChunkError) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -481,12 +438,8 @@ TEST_F(DropColl2ShardTest, SSVCmdErrorOnShard1) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -511,12 +464,8 @@ TEST_F(DropColl2ShardTest, SSVErrorOnShard1) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -541,12 +490,8 @@ TEST_F(DropColl2ShardTest, UnsetCmdErrorOnShard1) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -573,12 +518,8 @@ TEST_F(DropColl2ShardTest, UnsetErrorOnShard1) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -605,12 +546,8 @@ TEST_F(DropColl2ShardTest, SSVCmdErrorOnShard2) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -638,12 +575,8 @@ TEST_F(DropColl2ShardTest, SSVErrorOnShard2) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -671,12 +604,8 @@ TEST_F(DropColl2ShardTest, UnsetCmdErrorOnShard2) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 
@@ -706,12 +635,8 @@ TEST_F(DropColl2ShardTest, UnsetErrorOnShard2) {
     });
 
     expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(configHost(),
-                          testClient(),
-                          network()->now(),
-                          "dropCollection.start",
-                          dropNS().ns(),
-                          BSONObj());
+    expectChangeLogInsert(
+        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
 
     expectGetShards({shard1(), shard2()});
 

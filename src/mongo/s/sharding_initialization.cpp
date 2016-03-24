@@ -41,7 +41,9 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
@@ -52,7 +54,8 @@
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
 
@@ -61,14 +64,9 @@ namespace mongo {
 namespace {
 
 using executor::NetworkInterface;
+using executor::NetworkInterfaceThreadPool;
+using executor::TaskExecutorPool;
 using executor::ThreadPoolTaskExecutor;
-
-std::unique_ptr<ThreadPoolTaskExecutor> makeTaskExecutor(std::unique_ptr<NetworkInterface> net) {
-    ThreadPool::Options tpOptions;
-    tpOptions.poolName = "ShardWork";
-    return stdx::make_unique<ThreadPoolTaskExecutor>(stdx::make_unique<ThreadPool>(tpOptions),
-                                                     std::move(net));
-}
 
 // Same logic as sharding_connection_hook.cpp.
 class ShardingEgressMetadataHook final : public rpc::EgressMetadataHook {
@@ -78,11 +76,10 @@ public:
             audit::writeImpersonatedUsersToMetadata(metadataBob);
 
             // Add config server optime to metadata sent to shards.
-            std::string targetStr = target.toString();
-            auto shard = grid.shardRegistry()->getShardNoReload(targetStr);
+            auto shard = grid.shardRegistry()->getShardForHostNoReload(target);
             if (!shard) {
                 return Status(ErrorCodes::ShardNotFound,
-                              str::stream() << "Shard not found for server: " << targetStr);
+                              str::stream() << "Shard not found for server: " << target.toString());
             }
             if (shard->isConfig()) {
                 return Status::OK();
@@ -100,7 +97,7 @@ public:
         try {
             saveGLEStats(metadataObj, replySource.toString());
 
-            auto shard = grid.shardRegistry()->getShardNoReload(replySource.toString());
+            auto shard = grid.shardRegistry()->getShardForHostNoReload(replySource);
             if (!shard) {
                 return Status::OK();
             }
@@ -121,6 +118,36 @@ public:
     }
 };
 
+std::unique_ptr<ThreadPoolTaskExecutor> makeTaskExecutor(std::unique_ptr<NetworkInterface> net) {
+    auto netPtr = net.get();
+    return stdx::make_unique<ThreadPoolTaskExecutor>(
+        stdx::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
+}
+
+std::unique_ptr<TaskExecutorPool> makeTaskExecutorPool(std::unique_ptr<NetworkInterface> fixedNet) {
+    std::vector<std::unique_ptr<executor::TaskExecutor>> executors;
+    for (size_t i = 0; i < TaskExecutorPool::getSuggestedPoolSize(); ++i) {
+        auto net = executor::makeNetworkInterface(
+            "NetworkInterfaceASIO-TaskExecutorPool-" + std::to_string(i),
+            stdx::make_unique<ShardingNetworkConnectionHook>(),
+            stdx::make_unique<ShardingEgressMetadataHook>());
+        auto netPtr = net.get();
+        auto exec = stdx::make_unique<ThreadPoolTaskExecutor>(
+            stdx::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
+
+        executors.emplace_back(std::move(exec));
+    }
+
+    // Add executor used to perform non-performance critical work.
+    auto fixedNetPtr = fixedNet.get();
+    auto fixedExec = stdx::make_unique<ThreadPoolTaskExecutor>(
+        stdx::make_unique<NetworkInterfaceThreadPool>(fixedNetPtr), std::move(fixedNet));
+
+    auto executorPool = stdx::make_unique<TaskExecutorPool>();
+    executorPool->addExecutors(std::move(executors), std::move(fixedExec));
+    return executorPool;
+}
+
 }  // namespace
 
 Status initializeGlobalShardingState(OperationContext* txn,
@@ -131,39 +158,59 @@ Status initializeGlobalShardingState(OperationContext* txn,
             return ShardingNetworkConnectionHook::validateHostImpl(target, isMasterReply);
         });
     auto network =
-        executor::makeNetworkInterface(stdx::make_unique<ShardingNetworkConnectionHook>(),
+        executor::makeNetworkInterface("NetworkInterfaceASIO-ShardRegistry",
+                                       stdx::make_unique<ShardingNetworkConnectionHook>(),
                                        stdx::make_unique<ShardingEgressMetadataHook>());
     auto networkPtr = network.get();
     auto shardRegistry(
         stdx::make_unique<ShardRegistry>(stdx::make_unique<RemoteCommandTargeterFactoryImpl>(),
-                                         makeTaskExecutor(std::move(network)),
+                                         makeTaskExecutorPool(std::move(network)),
                                          networkPtr,
-                                         makeTaskExecutor(executor::makeNetworkInterface()),
+                                         makeTaskExecutor(executor::makeNetworkInterface(
+                                             "NetworkInterfaceASIO-ShardRegistry-TaskExecutor")),
                                          configCS));
 
-    std::unique_ptr<ForwardingCatalogManager> catalogManager;
-    try {
-        catalogManager = stdx::make_unique<ForwardingCatalogManager>(
+    std::unique_ptr<ForwardingCatalogManager> catalogManager =
+        stdx::make_unique<ForwardingCatalogManager>(
             getGlobalServiceContext(),
             configCS,
             shardRegistry.get(),
             HostAndPort(getHostName(), serverGlobalParams.port));
-    } catch (const DBException& ex) {
-        return ex.toStatus();
-    }
 
     shardRegistry->startup();
     grid.init(std::move(catalogManager),
               std::move(shardRegistry),
               stdx::make_unique<ClusterCursorManager>(getGlobalServiceContext()->getClockSource()));
 
-    auto status = grid.catalogManager(txn)->startup(txn, allowNetworking);
-    if (!status.isOK()) {
-        return status;
-    }
+    while (!inShutdown()) {
+        try {
+            Status status = grid.catalogManager(txn)->startup(txn, allowNetworking);
+            uassertStatusOK(status);
 
-    if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::NONE) {
-        grid.shardRegistry()->reload(txn);
+            if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::NONE) {
+                grid.shardRegistry()->reload(txn);
+            }
+            return Status::OK();
+        } catch (const DBException& ex) {
+            Status status = ex.toStatus();
+            if (status == ErrorCodes::ConfigServersInconsistent) {
+                // Legacy catalog manager can return ConfigServersInconsistent.  When that happens
+                // we should immediately fail initialization.  For all other failures we should
+                // retry.
+                return status;
+            }
+            if (status == ErrorCodes::ReplicaSetNotFound) {
+                // ReplicaSetNotFound most likely means we've been waiting for the config replica
+                // set to come up for so long that the ReplicaSetMonitor stopped monitoring the set.
+                // Rebuild the config shard to force the monitor to resume monitoring the config
+                // servers.
+                grid.shardRegistry()->rebuildConfigShard();
+            }
+            log() << "Error initializing sharding state, sleeping for 2 seconds and trying again"
+                  << causedBy(status);
+            sleepmillis(2000);
+            continue;
+        }
     }
 
     return Status::OK();

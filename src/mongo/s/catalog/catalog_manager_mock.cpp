@@ -35,6 +35,8 @@
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_settings.h"
+#include "mongo/s/catalog/type_shard.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -44,13 +46,18 @@ using std::vector;
 CatalogManagerMock::CatalogManagerMock() {
     _mockDistLockMgr = stdx::make_unique<DistLockManagerMock>();
 }
+
 CatalogManagerMock::~CatalogManagerMock() = default;
 
 Status CatalogManagerMock::startup(OperationContext* txn, bool allowNetworking) {
-    return Status::OK();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 void CatalogManagerMock::shutDown(OperationContext* txn, bool allowNetworking) {}
+
+Status CatalogManagerMock::enableSharding(OperationContext* txn, const std::string& dbName) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
 
 Status CatalogManagerMock::shardCollection(OperationContext* txn,
                                            const string& ns,
@@ -58,14 +65,14 @@ Status CatalogManagerMock::shardCollection(OperationContext* txn,
                                            bool unique,
                                            const vector<BSONObj>& initPoints,
                                            const std::set<ShardId>& initShardIds) {
-    return Status::OK();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 StatusWith<string> CatalogManagerMock::addShard(OperationContext* txn,
                                                 const std::string* shardProposedName,
                                                 const ConnectionString& shardConnectionString,
                                                 const long long maxSize) {
-    return Status::OK();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 StatusWith<ShardDrainingStatus> CatalogManagerMock::removeShard(OperationContext* txn,
@@ -76,30 +83,30 @@ StatusWith<ShardDrainingStatus> CatalogManagerMock::removeShard(OperationContext
 Status CatalogManagerMock::updateDatabase(OperationContext* txn,
                                           const string& dbName,
                                           const DatabaseType& db) {
-    return Status::OK();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 StatusWith<OpTimePair<DatabaseType>> CatalogManagerMock::getDatabase(OperationContext* txn,
                                                                      const string& dbName) {
-    return OpTimePair<DatabaseType>();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 Status CatalogManagerMock::updateCollection(OperationContext* txn,
                                             const string& collNs,
                                             const CollectionType& coll) {
-    return Status::OK();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 StatusWith<OpTimePair<CollectionType>> CatalogManagerMock::getCollection(OperationContext* txn,
                                                                          const string& collNs) {
-    return OpTimePair<CollectionType>();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 Status CatalogManagerMock::getCollections(OperationContext* txn,
                                           const string* dbName,
                                           vector<CollectionType>* collections,
                                           repl::OpTime* optime) {
-    return Status::OK();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 Status CatalogManagerMock::dropCollection(OperationContext* txn, const NamespaceString& ns) {
@@ -109,7 +116,7 @@ Status CatalogManagerMock::dropCollection(OperationContext* txn, const Namespace
 Status CatalogManagerMock::getDatabasesForShard(OperationContext* txn,
                                                 const string& shardName,
                                                 vector<string>* dbs) {
-    return Status::OK();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 Status CatalogManagerMock::getChunks(OperationContext* txn,
@@ -118,23 +125,24 @@ Status CatalogManagerMock::getChunks(OperationContext* txn,
                                      boost::optional<int> limit,
                                      std::vector<ChunkType>* chunks,
                                      repl::OpTime* opTime) {
-    return Status::OK();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 Status CatalogManagerMock::getTagsForCollection(OperationContext* txn,
                                                 const string& collectionNs,
                                                 vector<TagsType>* tags) {
-    return Status::OK();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 StatusWith<string> CatalogManagerMock::getTagForChunk(OperationContext* txn,
                                                       const string& collectionNs,
                                                       const ChunkType& chunk) {
-    return string();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
-Status CatalogManagerMock::getAllShards(OperationContext* txn, vector<ShardType>* shards) {
-    return Status::OK();
+StatusWith<OpTimePair<std::vector<ShardType>>> CatalogManagerMock::getAllShards(
+    OperationContext* txn) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 bool CatalogManagerMock::runUserManagementWriteCommand(OperationContext* txn,
@@ -142,13 +150,6 @@ bool CatalogManagerMock::runUserManagementWriteCommand(OperationContext* txn,
                                                        const string& dbname,
                                                        const BSONObj& cmdObj,
                                                        BSONObjBuilder* result) {
-    return true;
-}
-
-bool CatalogManagerMock::runReadCommand(OperationContext* txn,
-                                        const std::string& dbname,
-                                        const BSONObj& cmdObj,
-                                        BSONObjBuilder* result) {
     return true;
 }
 
@@ -162,41 +163,66 @@ bool CatalogManagerMock::runUserManagementReadCommand(OperationContext* txn,
 Status CatalogManagerMock::applyChunkOpsDeprecated(OperationContext* txn,
                                                    const BSONArray& updateOps,
                                                    const BSONArray& preCondition) {
-    return Status::OK();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
-void CatalogManagerMock::logAction(OperationContext* txn, const ActionLogType& actionLog) {}
+Status CatalogManagerMock::logAction(OperationContext* txn,
+                                     const std::string& what,
+                                     const std::string& ns,
+                                     const BSONObj& detail) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
 
-void CatalogManagerMock::logChange(OperationContext* txn,
-                                   const string& clientAddress,
-                                   const string& what,
-                                   const string& ns,
-                                   const BSONObj& detail) {}
+Status CatalogManagerMock::logChange(OperationContext* txn,
+                                     const string& what,
+                                     const string& ns,
+                                     const BSONObj& detail) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
 
 StatusWith<SettingsType> CatalogManagerMock::getGlobalSettings(OperationContext* txn,
                                                                const string& key) {
-    return SettingsType();
+    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 void CatalogManagerMock::writeConfigServerDirect(OperationContext* txn,
                                                  const BatchedCommandRequest& request,
                                                  BatchedCommandResponse* response) {}
 
+Status CatalogManagerMock::insertConfigDocument(OperationContext* txn,
+                                                const std::string& ns,
+                                                const BSONObj& doc) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
+StatusWith<bool> CatalogManagerMock::updateConfigDocument(OperationContext* txn,
+                                                          const std::string& ns,
+                                                          const BSONObj& query,
+                                                          const BSONObj& update,
+                                                          bool upsert) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
+Status CatalogManagerMock::removeConfigDocuments(OperationContext* txn,
+                                                 const std::string& ns,
+                                                 const BSONObj& query) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
+Status CatalogManagerMock::createDatabase(OperationContext* txn, const std::string& dbName) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
 DistLockManager* CatalogManagerMock::getDistLockManager() {
     return _mockDistLockMgr.get();
 }
 
-Status CatalogManagerMock::_checkDbDoesNotExist(OperationContext* txn,
-                                                const std::string& dbName,
-                                                DatabaseType* db) {
-    return Status::OK();
-}
-
-StatusWith<std::string> CatalogManagerMock::_generateNewShardName(OperationContext* txn) {
+Status CatalogManagerMock::initConfigVersion(OperationContext* txn) {
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
-Status CatalogManagerMock::initConfigVersion(OperationContext* txn) {
+Status CatalogManagerMock::appendInfoForConfigServerDatabases(OperationContext* txn,
+                                                              BSONArrayBuilder* builder) {
     return Status::OK();
 }
 

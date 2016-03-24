@@ -313,12 +313,12 @@ namespace mongo {
         Status s = diskFormatVersion.initialize(&opCtx);
         if (!s.isOK()) {
             severe() << "PerconaFT: While checking disk format version, got error " << s;
-            fassertFailed(28825);
+            fassertFailed(28925);
         }
         s = diskFormatVersion.upgradeToCurrent(&opCtx);
         if (!s.isOK()) {
             severe() << "PerconaFT: While upgrading disk format version, got error " << s;
-            fassertFailed(28826);
+            fassertFailed(28926);
         }
 
         wuow.commit();

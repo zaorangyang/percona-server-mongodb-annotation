@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -43,6 +43,7 @@
 #include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -50,6 +51,12 @@
 
 namespace mongo {
 namespace executor {
+
+namespace {
+const std::size_t kIOServiceWorkers = 1;
+}  // namespace
+
+NetworkInterfaceASIO::Options::Options() = default;
 
 #if defined(_MSC_VER) && _MSC_VER < 1900
 NetworkInterfaceASIO::Options::Options(Options&& other)
@@ -74,13 +81,13 @@ NetworkInterfaceASIO::NetworkInterfaceASIO(Options options)
       _io_service(),
       _metadataHook(std::move(_options.metadataHook)),
       _hook(std::move(_options.networkConnectionHook)),
-      _resolver(_io_service),
       _state(State::kReady),
       _timerFactory(std::move(_options.timerFactory)),
       _streamFactory(std::move(_options.streamFactory)),
       _connectionPool(stdx::make_unique<connection_pool_asio::ASIOImpl>(this),
                       _options.connectionPoolOptions),
-      _isExecutorRunnable(false) {}
+      _isExecutorRunnable(false),
+      _strand(_io_service) {}
 
 std::string NetworkInterfaceASIO::getDiagnosticString() {
     str::stream output;
@@ -89,28 +96,40 @@ std::string NetworkInterfaceASIO::getDiagnosticString() {
     return output;
 }
 
+void NetworkInterfaceASIO::appendConnectionStats(BSONObjBuilder* b) {
+    _connectionPool.appendConnectionStats(b);
+}
+
 std::string NetworkInterfaceASIO::getHostName() {
     return getHostNameCached();
 }
 
 void NetworkInterfaceASIO::startup() {
-    _serviceRunner = stdx::thread([this]() {
-        try {
-            asio::io_service::work work(_io_service);
-            _io_service.run();
-        } catch (...) {
-            severe() << "Uncaught exception in NetworkInterfaceASIO IO worker thread of type: "
-                     << exceptionToStatus();
-            fassertFailed(28820);
-        }
-    });
+    _serviceRunners.resize(kIOServiceWorkers);
+    for (std::size_t i = 0; i < kIOServiceWorkers; ++i) {
+        _serviceRunners[i] = stdx::thread([this, i]() {
+            setThreadName(_options.instanceName + "-" + std::to_string(i));
+            try {
+                LOG(2) << "The NetworkInterfaceASIO worker thread is spinning up";
+                asio::io_service::work work(_io_service);
+                _io_service.run();
+            } catch (...) {
+                severe() << "Uncaught exception in NetworkInterfaceASIO IO "
+                            "worker thread of type: " << exceptionToStatus();
+                fassertFailed(28820);
+            }
+        });
+    };
     _state.store(State::kRunning);
 }
 
 void NetworkInterfaceASIO::shutdown() {
     _state.store(State::kShutdown);
     _io_service.stop();
-    _serviceRunner.join();
+    for (auto&& worker : _serviceRunners) {
+        worker.join();
+    }
+    LOG(2) << "NetworkInterfaceASIO shutdown successfully";
 }
 
 void NetworkInterfaceASIO::waitForWork() {
@@ -162,12 +181,16 @@ void NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cbHa
         invariant(insertResult.second);
     }
 
-    auto startTime = now();
+    LOG(2) << "startCommand: " << request.toString();
 
-    auto nextStep = [this, startTime, cbHandle, request, onFinish](
+    auto getConnectionStartTime = now();
+
+    auto nextStep = [this, getConnectionStartTime, cbHandle, request, onFinish](
         StatusWith<ConnectionPool::ConnectionHandle> swConn) {
 
         if (!swConn.isOK()) {
+            LOG(2) << "Failed to get connection from pool: " << swConn.getStatus();
+
             bool wasPreviouslyCanceled = false;
             {
                 stdx::lock_guard<stdx::mutex> lk(_inProgressMutex);
@@ -185,78 +208,104 @@ void NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cbHa
 
         AsyncOp* op = nullptr;
 
-        {
-            stdx::unique_lock<stdx::mutex> lk(_inProgressMutex);
+        stdx::unique_lock<stdx::mutex> lk(_inProgressMutex);
 
-            const auto eraseCount = _inGetConnection.erase(cbHandle);
+        const auto eraseCount = _inGetConnection.erase(cbHandle);
 
-            // If we didn't find the request, we've been canceled
-            if (eraseCount == 0) {
-                lk.unlock();
-                onFinish({ErrorCodes::CallbackCanceled, "Callback canceled"});
-                signalWorkAvailable();
-                return;
-            }
+        // If we didn't find the request, we've been canceled
+        if (eraseCount == 0) {
+            lk.unlock();
 
-            // We can't release the AsyncOp until we know we were not canceled.
-            auto ownedOp = conn->releaseAsyncOp();
-            op = ownedOp.get();
+            onFinish({ErrorCodes::CallbackCanceled, "Callback canceled"});
 
-            // Sanity check that we are getting a clean AsyncOp.
-            invariant(!op->canceled());
-            invariant(!op->timedOut());
+            // Though we were canceled, we know that the stream is fine, so indicate success.
+            conn->indicateSuccess();
 
-            _inProgress.emplace(op, std::move(ownedOp));
+            signalWorkAvailable();
+
+            return;
         }
+
+        // We can't release the AsyncOp until we know we were not canceled.
+        auto ownedOp = conn->releaseAsyncOp();
+        op = ownedOp.get();
+
+        // Sanity check that we are getting a clean AsyncOp.
+        invariant(!op->canceled());
+        invariant(!op->timedOut());
+
+        // Now that we're inProgress, an external cancel can touch our op, but
+        // not until we release the inProgressMutex.
+        _inProgress.emplace(op, std::move(ownedOp));
 
         op->_cbHandle = std::move(cbHandle);
         op->_request = std::move(request);
         op->_onFinish = std::move(onFinish);
         op->_connectionPoolHandle = std::move(swConn.getValue());
-        op->_start = startTime;
+        op->_start = getConnectionStartTime;
 
-        // Set timeout now that we have the correct request object
-        if (op->_request.timeout != RemoteCommandRequest::kNoTimeout) {
-            op->_timeoutAlarm = op->_owner->_timerFactory->make(&_io_service, op->_request.timeout);
+        // This ditches the lock and gets us onto the strand (so we're
+        // threadsafe)
+        op->_strand.post([this, op, getConnectionStartTime] {
+            // Set timeout now that we have the correct request object
+            if (op->_request.timeout != RemoteCommandRequest::kNoTimeout) {
+                // Subtract the time it took to get the connection from the pool from the request
+                // timeout.
+                auto getConnectionDuration = now() - getConnectionStartTime;
+                if (getConnectionDuration >= op->_request.timeout) {
+                    // We only assume that the request timer is guaranteed to fire *after* the
+                    // timeout duration - but make no stronger assumption. It is thus possible that
+                    // we have already exceeded the timeout. In this case we timeout the operation
+                    // manually.
+                    return _completeOperation(op,
+                                              {ErrorCodes::ExceededTimeLimit,
+                                               "Remote command timed out while waiting to get a "
+                                               "connection from the pool."});
+                }
 
-            std::shared_ptr<AsyncOp::AccessControl> access;
-            std::size_t generation;
-            {
-                stdx::lock_guard<stdx::mutex> lk(op->_access->mutex);
-                access = op->_access;
-                generation = access->id;
+                // The above conditional guarantees that the adjusted timeout will never underflow.
+                invariant(op->_request.timeout > getConnectionDuration);
+                auto adjustedTimeout = op->_request.timeout - getConnectionDuration;
+
+                op->_timeoutAlarm = op->_owner->_timerFactory->make(&op->_strand, adjustedTimeout);
+
+                std::shared_ptr<AsyncOp::AccessControl> access;
+                std::size_t generation;
+                {
+                    stdx::lock_guard<stdx::mutex> lk(op->_access->mutex);
+                    access = op->_access;
+                    generation = access->id;
+                }
+
+                op->_timeoutAlarm->asyncWait([this, op, access, generation](std::error_code ec) {
+                    if (!ec) {
+                        // We must pass a check for safe access before using op inside the
+                        // callback or we may attempt access on an invalid pointer.
+                        stdx::lock_guard<stdx::mutex> lk(access->mutex);
+                        if (generation != access->id) {
+                            // The operation has been cleaned up, do not access.
+                            return;
+                        }
+
+                        LOG(2) << "Operation timed out: " << op->request().toString();
+
+                        // An operation may be in mid-flight when it times out, so we
+                        // cancel any in-progress async calls but do not complete the operation now.
+                        op->_timedOut = 1;
+                        if (op->_connection) {
+                            op->_connection->cancel();
+                        }
+                    } else {
+                        LOG(4) << "failed to time operation out: " << ec.message();
+                    }
+                });
             }
 
-            op->_timeoutAlarm->asyncWait([this, op, access, generation](std::error_code ec) {
-                if (!ec) {
-                    // We must pass a check for safe access before using op inside the
-                    // callback or we may attempt access on an invalid pointer.
-                    stdx::lock_guard<stdx::mutex> lk(access->mutex);
-                    if (generation != access->id) {
-                        // The operation has been cleaned up, do not access.
-                        return;
-                    }
-
-                    // An operation may be in mid-flight when it times out, so we
-                    // cancel any in-progress async calls but do not complete the operation now.
-                    if (op->_connection) {
-                        op->_connection->cancel();
-                    }
-                    op->_timedOut.store(1);
-                } else {
-                    LOG(4) << "failed to time operation out: " << ec.message();
-                }
-            });
-        }
-
-        _beginCommunication(op);
+            _beginCommunication(op);
+        });
     };
 
-    // TODO: thread some higher level timeout through, rather than 5 minutes,
-    // once we make timeouts pervasive in this api.
-    asio::post(
-        _io_service,
-        [this, request, nextStep] { _connectionPool.get(request.target, Minutes(5), nextStep); });
+    _connectionPool.get(request.target, request.timeout, nextStep);
 }
 
 void NetworkInterfaceASIO::cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) {
@@ -307,6 +356,13 @@ void NetworkInterfaceASIO::setAlarm(Date_t when, const stdx::function<void()>& a
 
 bool NetworkInterfaceASIO::inShutdown() const {
     return (_state.load() == State::kShutdown);
+}
+
+bool NetworkInterfaceASIO::onNetworkThread() {
+    auto id = stdx::this_thread::get_id();
+    return std::any_of(_serviceRunners.begin(),
+                       _serviceRunners.end(),
+                       [id](const stdx::thread& thread) { return id == thread.get_id(); });
 }
 
 }  // namespace executor

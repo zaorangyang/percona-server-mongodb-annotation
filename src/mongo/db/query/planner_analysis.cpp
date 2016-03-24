@@ -319,8 +319,9 @@ BSONObj QueryPlannerAnalysis::getSortPattern(const BSONObj& indexKeyPattern) {
         if (elt.type() == mongo::String) {
             break;
         }
-        long long val = elt.safeNumberLong();
-        int sortOrder = val >= 0 ? 1 : -1;
+        // The canonical check as to whether a key pattern element is "ascending" or "descending" is
+        // (elt.number() >= 0). This is defined by the Ordering class.
+        int sortOrder = (elt.number() >= 0) ? 1 : -1;
         sortBob.append(elt.fieldName(), sortOrder);
     }
     return sortBob.obj();
@@ -764,6 +765,13 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
                         }
                     }
                 }
+            }
+
+            // If we have a $meta sortKey, just use the project default path, as currently the
+            // project fast paths cannot handle $meta sortKey projections.
+            if (query.getProj()->wantSortKey()) {
+                projType = ProjectionNode::DEFAULT;
+                LOG(5) << "PROJECTION: needs $meta sortKey, using DEFAULT path instead";
             }
         }
         // If we don't have a covered project, and we're not allowed to put an uncovered one in,

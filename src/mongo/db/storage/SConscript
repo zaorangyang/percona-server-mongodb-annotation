@@ -3,7 +3,7 @@ Import("env")
 env.SConscript(
     dirs=[
         'devnull',
-        'in_memory',
+        'ephemeral_for_test',
         'kv',
         'kv/dictionary',
         'kv_heap',
@@ -66,6 +66,16 @@ env.Library(
 )
 
 env.Library(
+    target='storage_options',
+    source=[
+        'storage_options.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/server_parameters',
+    ],
+)
+
+env.Library(
     target='sorted_data_interface_test_harness',
     source=[
         'sorted_data_interface_test_bulkbuilder.cpp',
@@ -80,6 +90,7 @@ env.Library(
         'sorted_data_interface_test_harness.cpp',
         'sorted_data_interface_test_insert.cpp',
         'sorted_data_interface_test_isempty.cpp',
+        'sorted_data_interface_test_rand_cursor.cpp',
         'sorted_data_interface_test_rollback.cpp',
         'sorted_data_interface_test_spaceused.cpp',
         'sorted_data_interface_test_touch.cpp',

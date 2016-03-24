@@ -54,6 +54,8 @@
 #include "mongo/db/index/fts_access_method.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/expression_text_base.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -244,7 +246,7 @@ public:
             BSONObj argObj = e.Obj();
             if (filterTag == e.fieldName()) {
                 StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-                    argObj, WhereCallbackReal(txn, collection->ns().db()));
+                    argObj, ExtensionsCallbackReal(txn, &collection->ns()));
                 if (!statusWithMatcher.isOK()) {
                     return NULL;
                 }
@@ -457,11 +459,11 @@ public:
 
             params.spec = fam->getSpec();
 
-            if (!params.query.parse(search,
-                                    fam->getSpec().defaultLanguage().str().c_str(),
-                                    fts::FTSQuery::caseSensitiveDefault,
-                                    fts::FTSQuery::diacriticSensitiveDefault,
-                                    fam->getSpec().getTextIndexVersion()).isOK()) {
+            params.query.setQuery(search);
+            params.query.setLanguage(fam->getSpec().defaultLanguage().str());
+            params.query.setCaseSensitive(TextMatchExpressionBase::kCaseSensitiveDefault);
+            params.query.setDiacriticSensitive(TextMatchExpressionBase::kDiacriticSensitiveDefault);
+            if (!params.query.parse(fam->getSpec().getTextIndexVersion()).isOK()) {
                 return NULL;
             }
 

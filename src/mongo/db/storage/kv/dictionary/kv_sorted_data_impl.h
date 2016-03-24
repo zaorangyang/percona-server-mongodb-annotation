@@ -36,29 +36,6 @@ namespace mongo {
     class KVSortedDataImpl;
 
     /**
-     * Dummy implementation for now.  We'd need a KVDictionaryBuilder to
-     * do better, let's worry about that later.
-     */
-    class KVSortedDataBuilderImpl : public SortedDataBuilderInterface {
-        KVSortedDataImpl *_impl;
-        OperationContext *_txn;
-        WriteUnitOfWork _wuow;
-        bool _dupsAllowed;
-
-    public:
-        KVSortedDataBuilderImpl(KVSortedDataImpl *impl, OperationContext *txn, bool dupsAllowed)
-            : _impl(impl),
-              _txn(txn),
-              _wuow(txn),
-              _dupsAllowed(dupsAllowed)
-        {}
-        virtual Status addKey(const BSONObj& key, const RecordId& loc);
-        virtual void commit(bool mayInterrupt) {
-            _wuow.commit();
-        }
-    };
-
-    /**
      * Generic implementation of the SortedDataInterface using a KVDictionary.
      */
     class KVSortedDataImpl : public SortedDataInterface {
@@ -99,10 +76,42 @@ namespace mongo {
         static BSONObj extractKey(const Slice &key, const Slice &val, const Ordering &ordering);
         static RecordId extractRecordId(const Slice &s);
 
+        void DuplicatesAreAllowed() { _dupsAllowed = true; }
+        void DuplicatesAreNotAllowed() { _dupsAllowed = false; }
     private:
         // The KVDictionary interface used to store index keys, which map to empty values.
         boost::scoped_ptr<KVDictionary> _db;
         const Ordering _ordering;
+        bool _dupsAllowed;
     };
 
+    /**
+     * Dummy implementation for now.  We'd need a KVDictionaryBuilder to
+     * do better, let's worry about that later.
+     */
+    class KVSortedDataBuilderImpl : public SortedDataBuilderInterface {
+        KVSortedDataImpl *_impl;
+        OperationContext *_txn;
+        WriteUnitOfWork _wuow;
+        bool _dupsAllowed;
+
+    public:
+        KVSortedDataBuilderImpl(KVSortedDataImpl *impl, OperationContext *txn, bool dupsAllowed)
+            : _impl(impl),
+              _txn(txn),
+              _wuow(txn),
+              _dupsAllowed(dupsAllowed)
+        {
+            if (_dupsAllowed) {
+                _impl->DuplicatesAreAllowed();
+            } else {
+                _impl->DuplicatesAreNotAllowed();
+            }
+        }
+
+        virtual Status addKey(const BSONObj& key, const RecordId& loc);
+        virtual void commit(bool mayInterrupt) {
+            _wuow.commit();
+        }
+    };
 } // namespace mongo

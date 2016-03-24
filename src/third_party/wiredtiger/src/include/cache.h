@@ -39,6 +39,14 @@ struct __wt_evict_worker {
 	uint32_t flags;
 };
 
+/* Cache operations. */
+typedef enum __wt_cache_op {
+	WT_SYNC_CHECKPOINT,
+	WT_SYNC_CLOSE,
+	WT_SYNC_DISCARD,
+	WT_SYNC_WRITE_LEAVES
+} WT_CACHE_OP;
+
 /*
  * WiredTiger cache structure.
  */
@@ -151,7 +159,8 @@ struct __wt_cache_pool {
 	/* Locked: List of connections participating in the cache pool. */
 	TAILQ_HEAD(__wt_cache_pool_qh, __wt_connection_impl) cache_pool_qh;
 
-#define	WT_CACHE_POOL_MANAGED	0x01	/* Cache pool has a manager thread */
-#define	WT_CACHE_POOL_ACTIVE	0x02	/* Cache pool is active */
-	uint8_t flags_atomic;
+	uint8_t pool_managed;		/* Cache pool has a manager thread */
+
+#define	WT_CACHE_POOL_ACTIVE	0x01	/* Cache pool is active */
+	uint8_t flags;
 };

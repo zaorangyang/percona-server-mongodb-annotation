@@ -49,11 +49,13 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/matcher/matcher.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/find_common.h"
 #include "mongo/db/range_preserver.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
@@ -762,8 +764,10 @@ void State::init() {
     // setup js
     const string userToken =
         AuthorizationSession::get(ClientBasic::getCurrent())->getAuthenticatedUserNamesToken();
-    _scope.reset(globalScriptEngine->getPooledScope(_txn, _config.dbname, "mapreduce" + userToken)
-                     .release());
+    _scope.reset(globalScriptEngine->newScopeForCurrentThread());
+    _scope->registerOperation(_txn);
+    _scope->setLocalDB(_config.dbname);
+    _scope->loadStored(_txn, true);
 
     if (!_config.scopeSetup.isEmpty())
         _scope->init(&_config.scopeSetup);
@@ -1014,10 +1018,10 @@ void State::finalReduce(CurOp* op, ProgressMeterHolder& pm) {
     }
 
     const NamespaceString nss(_config.incLong);
-    const WhereCallbackReal whereCallback(_txn, nss.db());
+    const ExtensionsCallbackReal extensionsCallback(_txn, &nss);
 
     auto statusWithCQ =
-        CanonicalQuery::canonicalize(nss, BSONObj(), sortKey, BSONObj(), whereCallback);
+        CanonicalQuery::canonicalize(nss, BSONObj(), sortKey, BSONObj(), extensionsCallback);
     verify(statusWithCQ.isOK());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -1248,6 +1252,10 @@ public:
         return true;
     }
 
+    std::size_t reserveBytesForReply() const override {
+        return FindCommon::kInitReplyBufferSize;
+    }
+
     virtual void help(stringstream& help) const {
         help << "Run a map/reduce operation on the server.\n";
         help << "Note this is used for aggregation, not querying, in MongoDB.\n";
@@ -1369,10 +1377,10 @@ public:
                 unique_ptr<ScopedTransaction> scopedXact(new ScopedTransaction(txn, MODE_IS));
                 unique_ptr<AutoGetDb> scopedAutoDb(new AutoGetDb(txn, nss.db(), MODE_S));
 
-                const WhereCallbackReal whereCallback(txn, nss.db());
+                const ExtensionsCallbackReal extensionsCallback(txn, &nss);
 
                 auto statusWithCQ = CanonicalQuery::canonicalize(
-                    nss, config.filter, config.sort, BSONObj(), whereCallback);
+                    nss, config.filter, config.sort, BSONObj(), extensionsCallback);
                 if (!statusWithCQ.isOK()) {
                     uasserted(17238, "Can't canonicalize query " + config.filter.toString());
                     return 0;

@@ -24,31 +24,33 @@ if ( typeof DBQuery == "undefined" ){
 }
 
 DBQuery.prototype.help = function () {
-    print("find() modifiers")
-    print("\t.sort( {...} )")
-    print("\t.limit( n )")
-    print("\t.skip( n )")
-    print("\t.count(applySkipLimit) - total # of objects matching query. by default ignores skip,limit")
+    print("find(<predicate>, <projection>) modifiers")
+    print("\t.sort({...})")
+    print("\t.limit(<n>)")
+    print("\t.skip(<n>)")
+    print("\t.batchSize(<n>) - sets the number of docs to return per getMore")
+    print("\t.hint({...})")
+    print("\t.readConcern(<level>)")
+    print("\t.readPref(<mode>, <tagset>)")
+    print("\t.count(<applySkipLimit>) - total # of objects matching query. by default ignores skip,limit")
     print("\t.size() - total # of objects cursor would return, honors skip,limit")
-    print("\t.explain([verbose])")
-    print("\t.hint(...)")
-    print("\t.addOption(n) - adds op_query options -- see wire protocol")
-    print("\t._addSpecial(name, value) - http://dochub.mongodb.org/core/advancedqueries#AdvancedQueries-Metaqueryoperators")
-    print("\t.batchSize(n) - sets the number of docs to return per getMore")
-    print("\t.showDiskLoc() - Deprecated. Use showRecordId().")
-    print("\t.showRecordId() - adds a $recordId field to each returned object")
-    print("\t.min(idxDoc)")
-    print("\t.max(idxDoc)")
-    print("\t.comment(comment)")
+    print("\t.explain(<verbosity>) - accepted verbosities are {'queryPlanner', 'executionStats', 'allPlansExecution'}")
+    print("\t.min({...})")
+    print("\t.max({...})")
+    print("\t.maxScan(<n>)")
+    print("\t.maxTimeMS(<n>)")
+    print("\t.comment(<comment>)")
     print("\t.snapshot()")
+    print("\t.tailable(<isAwaitData>)")
+    print("\t.noCursorTimeout()")
+    print("\t.allowPartialResults()")
     print("\t.returnKey()")
-    print("\t.maxScan(n)")
-    print("\t.readPref(mode, tagset)")
+    print("\t.showRecordId() - adds a $recordId field to each returned object")
 
     print("\nCursor methods");
     print("\t.toArray() - iterates through docs and returns an array of the results")
-    print("\t.forEach( func )")
-    print("\t.map( func )")
+    print("\t.forEach(<func>)")
+    print("\t.map(<func>)")
     print("\t.hasNext()")
     print("\t.next()")
     print("\t.close()")
@@ -103,6 +105,10 @@ DBQuery.prototype._exec = function(){
             this._cursor = new DBCommandCursor(this._mongo, cmdRes, this._batchSize);
         }
         else {
+            if (this._special && this._query.readConcern) {
+                throw new Error("readConcern requires use of read commands");
+            }
+
             this._cursor = this._mongo.find(this._ns,
                                             this._query,
                                             this._fields,
@@ -196,6 +202,10 @@ DBQuery.prototype._convertToCommand = function(canAttachReadPref) {
 
     if ("$snapshot" in this._query) {
         cmd["snapshot"] = this._query.$snapshot;
+    }
+
+    if ("readConcern" in this._query) {
+        cmd["readConcern"] = this._query.readConcern;
     }
 
     if ((this._options & DBQuery.Option.tailable) != 0) {
@@ -321,6 +331,9 @@ DBQuery.prototype._convertToCountCmd = function( applySkipLimit ) {
             if ( this._query.$hint ) {
                 cmd.hint = this._query.$hint;
             }
+            if ( this._query.readConcern ) {
+                cmd.readConcern = this._query.readConcern;
+            }
         }
         else {
             cmd.query = this._query;
@@ -428,6 +441,14 @@ DBQuery.prototype.showRecordId = function() {
 
 DBQuery.prototype.maxTimeMS = function( maxTimeMS ) {
     return this._addSpecial( "$maxTimeMS" , maxTimeMS );
+}
+
+DBQuery.prototype.readConcern = function( level ) {
+    var readConcernObj = {
+        level: level
+    };
+
+    return this._addSpecial( "readConcern", readConcernObj );
 }
 
 /**
@@ -654,7 +675,10 @@ DBQuery.Option = {
 };
 
 function DBCommandCursor(mongo, cmdResult, batchSize) {
-    assert.commandWorked(cmdResult)
+    if (cmdResult.ok != 1) {
+        throw _getErrorWithCode(cmdResult, "error: " + tojson(cmdResult));
+    }
+
     this._batch = cmdResult.cursor.firstBatch.reverse(); // modifies input to allow popping
 
     if (mongo.useReadCommands()) {
@@ -687,7 +711,9 @@ DBCommandCursor.prototype.close = function() {
             cursors: [ this._cursorid ],
         };
         var cmdRes = this._db.runCommand(killCursorCmd);
-        assert.commandWorked(cmdRes);
+        if (cmdRes.ok != 1) {
+            throw _getErrorWithCode(cmdRes, "killCursors command failed: " + tojson(cmdRes));
+        }
 
         this._cursorHandle.zeroCursorId();
         this._cursorid = NumberLong(0);
@@ -713,7 +739,9 @@ DBCommandCursor.prototype._runGetMoreCommand = function() {
 
     // Deliver the getMore command, and check for errors in the response.
     var cmdRes = this._db.runCommand(getMoreCmd);
-    assert.commandWorked(cmdRes);
+    if (cmdRes.ok != 1) {
+        throw _getErrorWithCode(cmdRes, "getMore command failed: " + tojson(cmdRes));
+    }
 
     if (this._ns !== cmdRes.cursor.ns) {
         throw Error("unexpected collection in getMore response: " +

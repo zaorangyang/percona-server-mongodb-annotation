@@ -189,30 +189,40 @@ connect = function(url, user, pass) {
     if (0 == url.length) {
         throw Error("Empty connection string");
     }
-    var colon = url.lastIndexOf(":");
-    var slash = url.lastIndexOf("/");
-    if (0 == colon || 0 == slash) {
-        throw Error("Missing host name in connection string \"" + url + "\"");
-    }
-    if (colon == slash - 1 || colon == url.length - 1) {
-        throw Error("Missing port number in connection string \"" + url + "\"");
-    }
-    if (colon != -1 && colon < slash) {
-        var portNumber = url.substring(colon + 1, slash);
-        if (portNumber.length > 5 || !/^\d*$/.test(portNumber) || parseInt(portNumber) > 65535) {
-            throw Error("Invalid port number \"" + portNumber +
-                        "\" in connection string \"" + url + "\"");
+    if (!url.startsWith("mongodb://")) {
+        var colon = url.lastIndexOf(":");
+        var slash = url.lastIndexOf("/");
+        if (0 == colon || 0 == slash) {
+            throw Error("Missing host name in connection string \"" + url + "\"");
         }
-    }
-    if (slash == url.length - 1) {
-        throw Error("Missing database name in connection string \"" + url + "\"");
+        if (colon == slash - 1 || colon == url.length - 1) {
+            throw Error("Missing port number in connection string \"" + url + "\"");
+        }
+        if (colon != -1 && colon < slash) {
+            var portNumber = url.substring(colon + 1, slash);
+            if (portNumber.length > 5 ||
+                    !/^\d*$/.test(portNumber) ||
+                    parseInt(portNumber) > 65535) {
+                throw Error("Invalid port number \"" + portNumber +
+                            "\" in connection string \"" + url + "\"");
+            }
+        }
+        if (slash == url.length - 1) {
+            throw Error("Missing database name in connection string \"" + url + "\"");
+        }
     }
 
     chatty("connecting to: " + url)
     var db;
-    if (slash == -1)
+    if (url.startsWith("mongodb://")) {
+        db = new Mongo(url);
+        if (db.defaultDB.length == 0) {
+            throw Error("Missing database name in connection string \"" + url + "\"");
+        }
+        db = db.getDB(db.defaultDB);
+    } else if (slash == -1)
         db = new Mongo().getDB(url);
-    else 
+    else
         db = new Mongo(url.substring(0, slash)).getDB(url.substring(slash + 1));
 
     if (user && pass) {
@@ -235,27 +245,15 @@ Mongo.prototype.forceWriteMode = function( mode ) {
 }
 
 Mongo.prototype.hasWriteCommands = function() {
-    if ( !('_hasWriteCommands' in this) ) {
-        var isMaster = this.getDB("admin").runCommand({ isMaster : 1 });
-        this._hasWriteCommands = (isMaster.ok && 
-                                  'minWireVersion' in isMaster &&
-                                  isMaster.minWireVersion <= 2 && 
-                                  2 <= isMaster.maxWireVersion );
-    }
-    
-    return this._hasWriteCommands;
+    var hasWriteCommands = (this.getMinWireVersion() <= 2 &&
+                            2 <= this.getMaxWireVersion());
+    return hasWriteCommands;
 }
 
 Mongo.prototype.hasExplainCommand = function() {
-    if ( !('_hasExplainCommand' in this) ) {
-        var isMaster = this.getDB("admin").runCommand({ isMaster : 1 });
-        this._hasExplainCommand = (isMaster.ok &&
-                                   'minWireVersion' in isMaster &&
-                                   isMaster.minWireVersion <= 3 &&
-                                   3 <= isMaster.maxWireVersion );
-    }
-
-    return this._hasExplainCommand;
+    var hasExplain = (this.getMinWireVersion() <= 3 &&
+                      3 <= this.getMaxWireVersion());
+    return hasExplain;
 }
 
 /**
@@ -328,12 +326,8 @@ Mongo.prototype.readMode = function() {
     // commands. If it does, use commands mode. If not, degrade to legacy mode.
     if (this._readMode === "compatibility") {
         try {
-            var isMaster = this.getDB("admin").runCommand({isMaster: 1});
-            var hasReadCommands = (isMaster.ok && 'minWireVersion' in isMaster &&
-                                                  'maxWireVersion' in isMaster &&
-                                                  isMaster.minWireVersion <= 4 &&
-                                                  4 <= isMaster.maxWireVersion);
-
+            var hasReadCommands = (this.getMinWireVersion() <= 4 &&
+                                   4 <= this.getMaxWireVersion());
             if (hasReadCommands) {
                 this._readMode = "commands";
             }

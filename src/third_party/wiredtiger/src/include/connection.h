@@ -178,6 +178,7 @@ struct __wt_connection_impl {
 	WT_SPINLOCK reconfig_lock;	/* Single thread reconfigure */
 	WT_SPINLOCK schema_lock;	/* Schema operation spinlock */
 	WT_SPINLOCK table_lock;		/* Table creation spinlock */
+	WT_SPINLOCK turtle_lock;	/* Turtle file spinlock */
 
 	/*
 	 * We distribute the btree page locks across a set of spin locks. Don't
@@ -336,12 +337,12 @@ struct __wt_connection_impl {
 	const char	*stat_stamp;	/* Statistics log entry timestamp */
 	uint64_t	 stat_usecs;	/* Statistics log period */
 
-#define	WT_CONN_LOG_ARCHIVE	0x01	/* Archive is enabled */
-#define	WT_CONN_LOG_ENABLED	0x02	/* Logging is enabled */
-#define	WT_CONN_LOG_EXISTED	0x04	/* Log files found */
-#define	WT_CONN_LOG_PREALLOC	0x08	/* Pre-allocation is enabled */
-#define	WT_CONN_LOG_RECOVER_DONE	0x10	/* Recovery completed */
-#define	WT_CONN_LOG_RECOVER_ERR	0x20	/* Error if recovery required */
+#define	WT_CONN_LOG_ARCHIVE		0x01	/* Archive is enabled */
+#define	WT_CONN_LOG_ENABLED		0x02	/* Logging is enabled */
+#define	WT_CONN_LOG_EXISTED		0x04	/* Log files found */
+#define	WT_CONN_LOG_RECOVER_DONE	0x08	/* Recovery completed */
+#define	WT_CONN_LOG_RECOVER_ERR		0x10	/* Error if recovery required */
+#define	WT_CONN_LOG_ZERO_FILL		0x20	/* Manually zero files */
 	uint32_t	 log_flags;	/* Global logging configuration */
 	WT_CONDVAR	*log_cond;	/* Log server wait mutex */
 	WT_SESSION_IMPL *log_session;	/* Log server session */
@@ -362,13 +363,15 @@ struct __wt_connection_impl {
 	uint32_t	 log_prealloc;	/* Log file pre-allocation */
 	uint32_t	 txn_logsync;	/* Log sync configuration */
 
-	WT_SESSION_IMPL *sweep_session;	/* Handle sweep session */
-	wt_thread_t	 sweep_tid;	/* Handle sweep thread */
-	int		 sweep_tid_set;	/* Handle sweep thread set */
-	WT_CONDVAR	*sweep_cond;	/* Handle sweep wait mutex */
-	time_t		 sweep_idle_time;/* Handle sweep idle time */
-	time_t		 sweep_interval;/* Handle sweep interval */
-	u_int		 sweep_handles_min;/* Handle sweep minimum open */
+	WT_SESSION_IMPL *meta_ckpt_session;/* Metadata checkpoint session */
+
+	WT_SESSION_IMPL *sweep_session;	   /* Handle sweep session */
+	wt_thread_t	 sweep_tid;	   /* Handle sweep thread */
+	int		 sweep_tid_set;	   /* Handle sweep thread set */
+	WT_CONDVAR      *sweep_cond;	   /* Handle sweep wait mutex */
+	uint64_t         sweep_idle_time;  /* Handle sweep idle time */
+	uint64_t         sweep_interval;   /* Handle sweep interval */
+	uint64_t         sweep_handles_min;/* Handle sweep minimum open */
 
 	/*
 	 * Shared lookaside lock, session and cursor, used by threads accessing
@@ -377,12 +380,10 @@ struct __wt_connection_impl {
 	 */
 	WT_SPINLOCK	 las_lock;	/* Lookaside table spinlock */
 	WT_SESSION_IMPL *las_session;	/* Lookaside table session */
-	WT_CURSOR	*las_cursor;	/* Lookaside table cursor */
 	bool		 las_written;	/* Lookaside table has been written */
 
 	WT_ITEM		 las_sweep_key;	/* Sweep server's saved key */
-	int		 las_sweep_call;/* Sweep server's call count */
-	uint64_t	 las_sweep_cnt;	/* Sweep server's per-call row count */
+	int64_t		 las_record_cnt;/* Count of lookaside records */
 
 					/* Locked: collator list */
 	TAILQ_HEAD(__wt_coll_qh, __wt_named_collator) collqh;
@@ -410,7 +411,9 @@ struct __wt_connection_impl {
 	wt_off_t data_extend_len;	/* file_extend data length */
 	wt_off_t log_extend_len;	/* file_extend log length */
 
-	uint32_t direct_io;		/* O_DIRECT file type flags */
+	/* O_DIRECT/FILE_FLAG_NO_BUFFERING file type flags */
+	uint32_t direct_io;
+	uint32_t write_through;		/* FILE_FLAG_WRITE_THROUGH type flags */
 	bool	 mmap;			/* mmap configuration */
 	uint32_t verbose;
 

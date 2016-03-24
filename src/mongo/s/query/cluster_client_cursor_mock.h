@@ -53,6 +53,16 @@ public:
 
     void queueResult(const BSONObj& obj) final;
 
+    Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) final;
+
+    /**
+     * Returns true unless marked as having non-exhausted remote cursors via
+     * markRemotesNotExhausted().
+     */
+    bool remotesExhausted() final;
+
+    void markRemotesNotExhausted();
+
     /**
      * Queues an error response.
      */
@@ -66,6 +76,8 @@ private:
 
     // Number of returned documents.
     long long _numReturnedSoFar = 0;
+
+    bool _remotesExhausted = true;
 };
 
 }  // namespace mongo

@@ -113,31 +113,43 @@ public:
             info = ShardedConnectionInfo::get(client, true);
         }
 
-        // Check config server is ok or enable sharding
-        if (!_checkConfigOrInit(
-                txn, cmdObj["configdb"].valuestrsafe(), authoritative, errmsg, result)) {
-            return false;
+        const auto configDBStr = cmdObj["configdb"].str();
+        string shardName = cmdObj["shard"].str();
+        const auto isInit = cmdObj["init"].trueValue();
+
+        const string ns = cmdObj["setShardVersion"].valuestrsafe();
+        if (shardName.empty()) {
+            if (isInit && ns.empty()) {
+                // Note: v3.0 mongos ConfigCoordinator doesn't set the shard field when sending
+                // setShardVersion to config.
+                shardName = "config";
+            } else {
+                errmsg = "shard name cannot be empty if not init";
+                return false;
+            }
         }
 
         // check shard name is correct
-        if (cmdObj["shard"].type() == String) {
-            // The shard host is also sent when using setShardVersion, report this host if there is
-            // an error
-            shardingState->setShardName(cmdObj["shard"].String());
+        // The shard host is also sent when using setShardVersion, report this host if there is
+        // an error or mismatch.
+        shardingState->setShardName(shardName);
+
+        if (!_checkConfigOrInit(txn, configDBStr, shardName, authoritative, errmsg, result)) {
+            return false;
         }
 
         // Handle initial shard connection
-        if (cmdObj["version"].eoo() && cmdObj["init"].trueValue()) {
+        if (cmdObj["version"].eoo() && isInit) {
             result.append("initialized", true);
 
+            // TODO: SERVER-21397 remove post v3.3.
             // Send back wire version to let mongos know what protocol we can speak
-            result.append("minWireVersion", minWireVersion);
-            result.append("maxWireVersion", maxWireVersion);
+            result.append("minWireVersion", WireSpec::instance().minWireVersionIncoming);
+            result.append("maxWireVersion", WireSpec::instance().maxWireVersionIncoming);
 
             return true;
         }
 
-        string ns = cmdObj["setShardVersion"].valuestrsafe();
         if (ns.size() == 0) {
             errmsg = "need to specify namespace";
             return false;
@@ -298,28 +310,46 @@ public:
     }
 
 private:
-    static bool _checkConfigOrInit(OperationContext* txn,
-                                   const string& configdb,
-                                   bool authoritative,
-                                   string& errmsg,
-                                   BSONObjBuilder& result,
-                                   bool locked = false) {
+    /**
+     * Checks if this server has already been initialized. If yes, then checks that the configdb
+     * settings matches the initialized settings. Otherwise, initializes the server with the given
+     * settings.
+     */
+    bool _checkConfigOrInit(OperationContext* txn,
+                            const string& configdb,
+                            const string& shardName,
+                            bool authoritative,
+                            string& errmsg,
+                            BSONObjBuilder& result) {
         if (configdb.size() == 0) {
             errmsg = "no configdb";
             return false;
         }
 
-        if (ShardingState::get(txn)->enabled()) {
-            auto givenConnStrStatus = ConnectionString::parse(configdb);
-            if (!givenConnStrStatus.isOK()) {
-                errmsg = str::stream() << "error parsing given config string: " << configdb
-                                       << causedBy(givenConnStrStatus.getStatus());
-                return false;
+        auto givenConnStrStatus = ConnectionString::parse(configdb);
+        if (!givenConnStrStatus.isOK()) {
+            errmsg = str::stream() << "error parsing given config string: " << configdb
+                                   << causedBy(givenConnStrStatus.getStatus());
+            return false;
+        }
+
+        const auto& givenConnStr = givenConnStrStatus.getValue();
+        ConnectionString storedConnStr;
+
+        if (shardName == "config") {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            if (!_configStr.isValid()) {
+                _configStr = givenConnStr;
+                return true;
+            } else {
+                storedConnStr = _configStr;
             }
+        } else if (ShardingState::get(txn)->enabled()) {
+            invariant(!_configStr.isValid());
+            storedConnStr = ShardingState::get(txn)->getConfigServer(txn);
+        }
 
-            const auto& givenConnStr = givenConnStrStatus.getValue();
-            auto storedConnStr = ShardingState::get(txn)->getConfigServer(txn);
-
+        if (storedConnStr.isValid()) {
             if (givenConnStr.type() == ConnectionString::SET &&
                 storedConnStr.type() == ConnectionString::SET) {
                 if (givenConnStr.getSetName() != storedConnStr.getSetName()) {
@@ -347,22 +377,21 @@ private:
             return false;
         }
 
+        invariant(shardName != "config");
+
         if (!authoritative) {
             result.appendBool("need_authoritative", true);
             errmsg = "first setShardVersion";
             return false;
         }
 
-        if (locked) {
-            ShardingState::get(txn)->initialize(txn, configdb);
-            return true;
-        }
-
-        ScopedTransaction transaction(txn, MODE_X);
-        Lock::GlobalWrite lk(txn->lockState());
-
-        return _checkConfigOrInit(txn, configdb, authoritative, errmsg, result, true);
+        ShardingState::get(txn)->initialize(txn, configdb);
+        return true;
     }
+
+    // Only for servers that are running as a config server.
+    stdx::mutex _mutex;
+    ConnectionString _configStr;
 
 } setShardVersionCmd;
 

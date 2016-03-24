@@ -33,55 +33,16 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/query/cursor_response.h"
-#include "mongo/s/cursors.h"
-#include "mongo/s/strategy.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
-#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
-namespace {
-Status storePossibleCursorLegacy(const HostAndPort& server, const BSONObj& cmdResult) {
-    if (cmdResult["ok"].trueValue() && cmdResult.hasField("cursor")) {
-        BSONElement cursorIdElt = cmdResult.getFieldDotted("cursor.id");
-
-        if (cursorIdElt.type() != mongo::NumberLong) {
-            return Status(ErrorCodes::TypeMismatch,
-                          str::stream() << "expected \"cursor.id\" field from shard "
-                                        << "response to have NumberLong type, instead "
-                                        << "got: " << typeName(cursorIdElt.type()));
-        }
-
-        const long long cursorId = cursorIdElt.Long();
-        if (cursorId != 0) {
-            BSONElement cursorNsElt = cmdResult.getFieldDotted("cursor.ns");
-            if (cursorNsElt.type() != mongo::String) {
-                return Status(ErrorCodes::TypeMismatch,
-                              str::stream() << "expected \"cursor.ns\" field from "
-                                            << "shard response to have String type, "
-                                            << "instead got: " << typeName(cursorNsElt.type()));
-            }
-
-            const std::string cursorNs = cursorNsElt.String();
-            cursorCache.storeRef(server.toString(), cursorId, cursorNs);
-        }
-    }
-
-    return Status::OK();
-}
-}  // namespace
 
 StatusWith<BSONObj> storePossibleCursor(const HostAndPort& server,
                                         const BSONObj& cmdResult,
                                         executor::TaskExecutor* executor,
                                         ClusterCursorManager* cursorManager) {
-    if (!useClusterClientCursor) {
-        Status status = storePossibleCursorLegacy(server, cmdResult);
-        return (status.isOK() ? StatusWith<BSONObj>(cmdResult) : StatusWith<BSONObj>(status));
-    }
-
     if (!cmdResult["ok"].trueValue() || !cmdResult.hasField("cursor")) {
         return cmdResult;
     }
@@ -91,25 +52,23 @@ StatusWith<BSONObj> storePossibleCursor(const HostAndPort& server,
         return incomingCursorResponse.getStatus();
     }
 
-    if (incomingCursorResponse.getValue().cursorId == CursorId(0)) {
+    if (incomingCursorResponse.getValue().getCursorId() == CursorId(0)) {
         return cmdResult;
     }
 
-    ClusterClientCursorParams params(incomingCursorResponse.getValue().nss);
-    params.remotes.emplace_back(server, incomingCursorResponse.getValue().cursorId);
+    ClusterClientCursorParams params(incomingCursorResponse.getValue().getNSS());
+    params.remotes.emplace_back(server, incomingCursorResponse.getValue().getCursorId());
 
-    auto ccc = stdx::make_unique<ClusterClientCursorImpl>(executor, std::move(params));
-    auto pinnedCursor =
-        cursorManager->registerCursor(std::move(ccc),
-                                      incomingCursorResponse.getValue().nss,
+    auto ccc = ClusterClientCursorImpl::make(executor, std::move(params));
+    auto clusterCursorId =
+        cursorManager->registerCursor(ccc.releaseCursor(),
+                                      incomingCursorResponse.getValue().getNSS(),
                                       ClusterCursorManager::CursorType::NamespaceNotSharded,
                                       ClusterCursorManager::CursorLifetime::Mortal);
-    CursorId clusterCursorId = pinnedCursor.getCursorId();
-    pinnedCursor.returnCursor(ClusterCursorManager::CursorState::NotExhausted);
 
-    CursorResponse outgoingCursorResponse(incomingCursorResponse.getValue().nss,
+    CursorResponse outgoingCursorResponse(incomingCursorResponse.getValue().getNSS(),
                                           clusterCursorId,
-                                          incomingCursorResponse.getValue().batch);
+                                          incomingCursorResponse.getValue().getBatch());
     return outgoingCursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
 }
 

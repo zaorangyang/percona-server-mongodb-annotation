@@ -41,8 +41,42 @@
 
 namespace mongo {
 
+ClusterClientCursorGuard::ClusterClientCursorGuard(std::unique_ptr<ClusterClientCursor> ccc)
+    : _ccc(std::move(ccc)) {}
+
+ClusterClientCursorGuard::~ClusterClientCursorGuard() {
+    if (_ccc && !_ccc->remotesExhausted()) {
+        _ccc->kill();
+    }
+}
+
+#if defined(_MSC_VER) && _MSC_VER < 1900
+ClusterClientCursorGuard::ClusterClientCursorGuard(ClusterClientCursorGuard&& other)
+    : _ccc(std::move(other._ccc)) {}
+
+ClusterClientCursorGuard& ClusterClientCursorGuard::operator=(ClusterClientCursorGuard&& other) {
+    _ccc = std::move(other._ccc);
+    return *this;
+}
+#endif
+
+ClusterClientCursor* ClusterClientCursorGuard::operator->() {
+    return _ccc.get();
+}
+
+std::unique_ptr<ClusterClientCursor> ClusterClientCursorGuard::releaseCursor() {
+    return std::move(_ccc);
+}
+
+ClusterClientCursorGuard ClusterClientCursorImpl::make(executor::TaskExecutor* executor,
+                                                       ClusterClientCursorParams&& params) {
+    std::unique_ptr<ClusterClientCursor> cursor(
+        new ClusterClientCursorImpl(executor, std::move(params)));
+    return ClusterClientCursorGuard(std::move(cursor));
+}
+
 ClusterClientCursorImpl::ClusterClientCursorImpl(executor::TaskExecutor* executor,
-                                                 ClusterClientCursorParams params)
+                                                 ClusterClientCursorParams&& params)
     : _isTailable(params.isTailable), _root(buildMergerPlan(executor, std::move(params))) {}
 
 ClusterClientCursorImpl::ClusterClientCursorImpl(std::unique_ptr<RouterStageMock> root)
@@ -81,21 +115,33 @@ void ClusterClientCursorImpl::queueResult(const BSONObj& obj) {
     _stash.push(obj);
 }
 
+bool ClusterClientCursorImpl::remotesExhausted() {
+    return _root->remotesExhausted();
+}
+
+Status ClusterClientCursorImpl::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
+    return _root->setAwaitDataTimeout(awaitDataTimeout);
+}
+
 std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
-    executor::TaskExecutor* executor, ClusterClientCursorParams params) {
+    executor::TaskExecutor* executor, ClusterClientCursorParams&& params) {
+    const auto skip = params.skip;
+    const auto limit = params.limit;
+    const bool hasSort = !params.sort.isEmpty();
+
     // The first stage is always the one which merges from the remotes.
-    auto leaf = stdx::make_unique<RouterStageMerge>(executor, params);
+    std::unique_ptr<RouterExecStage> root =
+        stdx::make_unique<RouterStageMerge>(executor, std::move(params));
 
-    std::unique_ptr<RouterExecStage> root = std::move(leaf);
-    if (params.skip) {
-        root = stdx::make_unique<RouterStageSkip>(std::move(root), *params.skip);
+    if (skip) {
+        root = stdx::make_unique<RouterStageSkip>(std::move(root), *skip);
     }
 
-    if (params.limit) {
-        root = stdx::make_unique<RouterStageLimit>(std::move(root), *params.limit);
+    if (limit) {
+        root = stdx::make_unique<RouterStageLimit>(std::move(root), *limit);
     }
 
-    if (!params.sort.isEmpty()) {
+    if (hasSort) {
         root = stdx::make_unique<RouterStageRemoveSortKey>(std::move(root));
     }
 

@@ -32,6 +32,7 @@
 
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/client/global_conn_pool.h"
+#include "mongo/client/mongo_uri.h"
 #include "mongo/client/native_sasl_client_session.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/client/sasl_client_session.h"
@@ -68,6 +69,10 @@ const JSFunctionSpec MongoBase::methods[] = {
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
         setClientRPCProtocols, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(update, MongoLocalInfo, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
+        getMinWireVersion, MongoLocalInfo, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
+        getMaxWireVersion, MongoLocalInfo, MongoExternalInfo),
     JS_FS_END,
 };
 
@@ -137,7 +142,9 @@ void MongoBase::Functions::runCommand::call(JSContext* cx, JS::CallArgs args) {
     conn->runCommand(database, cmdObj, cmdRes, queryOptions);
 
     // the returned object is not read only as some of our tests depend on modifying it.
-    ValueReader(cx, args.rval()).fromBSON(cmdRes, false /* read only */);
+    //
+    // Also, we make a copy here because we want a copy after we dump cmdRes
+    ValueReader(cx, args.rval()).fromBSON(cmdRes.getOwned(), nullptr, false /* read only */);
 }
 
 void MongoBase::Functions::runCommandWithMetadata::call(JSContext* cx, JS::CallArgs args) {
@@ -172,8 +179,8 @@ void MongoBase::Functions::runCommandWithMetadata::call(JSContext* cx, JS::CallA
     mergedResultBob.append("commandReply", res->getCommandReply());
     mergedResultBob.append("metadata", res->getMetadata());
 
-    auto mergedResult = mergedResultBob.done();
-    ValueReader(cx, args.rval()).fromBSON(mergedResult, false);
+    auto mergedResult = mergedResultBob.obj();
+    ValueReader(cx, args.rval()).fromBSON(mergedResult, nullptr, false);
 }
 
 void MongoBase::Functions::find::call(JSContext* cx, JS::CallArgs args) {
@@ -195,14 +202,12 @@ void MongoBase::Functions::find::call(JSContext* cx, JS::CallArgs args) {
     bool haveFields = false;
 
     if (args.get(2).isObject()) {
-        size_t i = 0;
-
         JS::RootedObject obj(cx, args.get(2).toObjectOrNull());
 
-        ObjectWrapper(cx, obj).enumerate([&i](jsid) { ++i; });
-
-        if (i > 0)
+        ObjectWrapper(cx, obj).enumerate([&](jsid) {
             haveFields = true;
+            return false;
+        });
     }
 
     if (haveFields)
@@ -238,7 +243,7 @@ void MongoBase::Functions::insert::call(JSContext* cx, JS::CallArgs args) {
 
     ObjectWrapper o(cx, args.thisv());
 
-    if (o.hasField("readOnly") && o.getBoolean("readOnly"))
+    if (o.hasField(InternedString::readOnly) && o.getBoolean(InternedString::readOnly))
         uasserted(ErrorCodes::BadValue, "js db in read only mode");
 
     auto conn = getConnection(args);
@@ -255,10 +260,10 @@ void MongoBase::Functions::insert::call(JSContext* cx, JS::CallArgs args) {
 
         ObjectWrapper ele(cx, elementObj);
 
-        if (!ele.hasField("_id")) {
+        if (!ele.hasField(InternedString::_id)) {
             JS::RootedValue value(cx);
             scope->getProto<OIDInfo>().newInstance(&value);
-            ele.setValue("_id", value);
+            ele.setValue(InternedString::_id, value);
         }
 
         return ValueWriter(cx, value).toBSON();
@@ -279,6 +284,8 @@ void MongoBase::Functions::insert::call(JSContext* cx, JS::CallArgs args) {
             array.getValue(id, &value);
 
             bos.push_back(addId(value));
+
+            return true;
         });
 
         if (!foundElement)
@@ -301,7 +308,7 @@ void MongoBase::Functions::remove::call(JSContext* cx, JS::CallArgs args) {
 
     ObjectWrapper o(cx, args.thisv());
 
-    if (o.hasField("readOnly") && o.getBoolean("readOnly"))
+    if (o.hasOwnField(InternedString::readOnly) && o.getBoolean(InternedString::readOnly))
         uasserted(ErrorCodes::BadValue, "js db in read only mode");
 
     auto conn = getConnection(args);
@@ -330,7 +337,7 @@ void MongoBase::Functions::update::call(JSContext* cx, JS::CallArgs args) {
 
     ObjectWrapper o(cx, args.thisv());
 
-    if (o.hasField("readOnly") && o.getBoolean("readOnly"))
+    if (o.hasOwnField(InternedString::readOnly) && o.getBoolean(InternedString::readOnly))
         uasserted(ErrorCodes::BadValue, "js db in read only mode");
 
     auto conn = getConnection(args);
@@ -385,7 +392,9 @@ void MongoBase::Functions::logout::call(JSContext* cx, JS::CallArgs args) {
         conn->logout(db, ret);
     }
 
-    ValueReader(cx, args.rval()).fromBSON(ret, false);
+    // Make a copy because I want to insulate us from whether conn->logout
+    // writes an owned bson or not
+    ValueReader(cx, args.rval()).fromBSON(ret.getOwned(), nullptr, false);
 }
 
 void MongoBase::Functions::cursorFromId::call(JSContext* cx, JS::CallArgs args) {
@@ -508,7 +517,7 @@ void MongoBase::Functions::copyDatabaseWithSCRAM::call(JSContext* cx, JS::CallAr
             if (code == ErrorCodes::OK)
                 code = ErrorCodes::UnknownError;
 
-            ValueReader(cx, args.rval()).fromBSON(inputObj, true);
+            ValueReader(cx, args.rval()).fromBSON(inputObj, nullptr, true);
             return;
         }
 
@@ -520,7 +529,7 @@ void MongoBase::Functions::copyDatabaseWithSCRAM::call(JSContext* cx, JS::CallAr
         uasserted(ErrorCodes::InternalError, "copydb client finished before server.");
     }
 
-    ValueReader(cx, args.rval()).fromBSON(inputObj, true);
+    ValueReader(cx, args.rval()).fromBSON(inputObj, nullptr, true);
 }
 
 void MongoBase::Functions::getClientRPCProtocols::call(JSContext* cx, JS::CallArgs args) {
@@ -585,8 +594,8 @@ void MongoLocalInfo::construct(JSContext* cx, JS::CallArgs args) {
 
     JS_SetPrivate(thisv, new std::shared_ptr<DBClientBase>(conn.release()));
 
-    o.setBoolean("slaveOk", false);
-    o.setString("host", "EMBEDDED");
+    o.setBoolean(InternedString::slaveOk, false);
+    o.setString(InternedString::host, "EMBEDDED");
 
     args.rval().setObjectOrNull(thisv);
 }
@@ -600,10 +609,9 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
         host = ValueWriter(cx, args.get(0)).toString();
     }
 
-    auto statusWithHost = ConnectionString::parse(host);
+    auto statusWithHost = MongoURI::parse(host);
     uassertStatusOK(statusWithHost);
-
-    const ConnectionString cs(statusWithHost.getValue());
+    auto cs = statusWithHost.getValue();
 
     std::string errmsg;
     std::unique_ptr<DBClientBase> conn(cs.connect(errmsg));
@@ -612,16 +620,31 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
         uasserted(ErrorCodes::InternalError, errmsg);
     }
 
+    ScriptEngine::runConnectCallback(*conn);
+
     JS::RootedObject thisv(cx);
     scope->getProto<MongoExternalInfo>().newObject(&thisv);
     ObjectWrapper o(cx, thisv);
 
     JS_SetPrivate(thisv, new std::shared_ptr<DBClientBase>(conn.release()));
 
-    o.setBoolean("slaveOk", false);
-    o.setString("host", host);
+    o.setBoolean(InternedString::slaveOk, false);
+    o.setString(InternedString::host, host);
+    o.setString(InternedString::defaultDB, cs.getDatabase());
 
     args.rval().setObjectOrNull(thisv);
+}
+
+void MongoBase::Functions::getMinWireVersion::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+
+    args.rval().setInt32(conn->getMinWireVersion());
+}
+
+void MongoBase::Functions::getMaxWireVersion::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+
+    args.rval().setInt32(conn->getMaxWireVersion());
 }
 
 void MongoExternalInfo::Functions::load::call(JSContext* cx, JS::CallArgs args) {

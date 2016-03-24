@@ -3995,6 +3995,50 @@ TEST_F(QueryPlannerTest, SortKeyMetaProjection) {
         "{ixscan: {pattern: {a: 1}}}}}}}}}");
 }
 
+TEST_F(QueryPlannerTest, SortKeyMetaProjectionCovered) {
+    addIndex(BSON("a" << 1));
+
+    runQuerySortProj(
+        BSONObj(), fromjson("{a: 1}"), fromjson("{_id: 0, a: 1, b: {$meta: 'sortKey'}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1, b: {$meta: 'sortKey'}}, node: "
+        "{sort: {limit: 0, pattern: {a: 1}, node: "
+        "{sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}}}");
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1, b: {$meta: 'sortKey'}}, node: "
+        "{sortKeyGen: {node: "
+        "{ixscan: {pattern: {a: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, FloatingPointInKeyPattern) {
+    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+
+    addIndex(BSON("a" << -0.1));
+
+    runQuerySortProj(fromjson("{a: {$gte: 3, $lte: 5}}"), fromjson("{a: 1}"), BSONObj());
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {ixscan: {pattern: {a: -0.1}, "
+        "bounds: {a: [[3, 5, true, true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest, KeyPatternOverflowsInt) {
+    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+
+    addIndex(BSON("a" << -2147483649LL));
+
+    runQuerySortProj(fromjson("{a: {$gte: 3, $lte: 5}}"), fromjson("{a: 1}"), BSONObj());
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {ixscan: {pattern: {a: -2147483649}, "
+        "bounds: {a: [[3, 5, true, true]]}}}}}");
+}
+
 //
 // Test bad input to query planner helpers.
 //

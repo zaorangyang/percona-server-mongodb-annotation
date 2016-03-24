@@ -73,7 +73,7 @@ const UpdateStats* getUpdateStats(const PlanStageStats* stats) {
     // The stats may refer to an update stage, or a projection stage wrapping an update stage.
     if (StageType::STAGE_PROJECTION == stats->stageType) {
         invariant(stats->children.size() == 1);
-        stats = stats->children[0];
+        stats = stats->children[0].get();
     }
 
     invariant(StageType::STAGE_UPDATE == stats->stageType);
@@ -84,7 +84,7 @@ const DeleteStats* getDeleteStats(const PlanStageStats* stats) {
     // The stats may refer to a delete stage, or a projection stage wrapping a delete stage.
     if (StageType::STAGE_PROJECTION == stats->stageType) {
         invariant(stats->children.size() == 1);
-        stats = stats->children[0];
+        stats = stats->children[0].get();
     }
 
     invariant(StageType::STAGE_DELETE == stats->stageType);
@@ -344,7 +344,7 @@ public:
         const FindAndModifyRequest& args = parseStatus.getValue();
         const NamespaceString& nsString = args.getNamespaceString();
 
-        StatusWith<WriteConcernOptions> wcResult = extractWriteConcern(cmdObj);
+        StatusWith<WriteConcernOptions> wcResult = extractWriteConcern(txn, cmdObj, dbName);
         if (!wcResult.isOK()) {
             return appendCommandStatus(result, wcResult.getStatus());
         }
@@ -356,21 +356,15 @@ public:
             maybeDisableValidation.emplace(txn);
 
         auto client = txn->getClient();
-        auto lastOpHolder = repl::ReplClientInfo::forClient(client);
-        auto lastOpAtOperationStart = lastOpHolder.getLastOp();
+        auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
         ScopeGuard lastOpSetterGuard =
             MakeObjGuard(repl::ReplClientInfo::forClient(client),
                          &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
                          txn);
 
-        // We may encounter a WriteConflictException when creating a collection during an
-        // upsert, even when holding the exclusive lock on the database (due to other load on
-        // the system). The query framework should handle all other WriteConflictExceptions,
-        // but we defensively wrap the operation in the retry loop anyway.
-        //
-        // SERVER-17579 getExecutorUpdate() and getExecutorDelete() can throw a
-        // WriteConflictException when checking whether an index is ready or not.
-        // (on debug builds only)
+        // Although usually the PlanExecutor handles WCE internally, it will throw WCEs when it is
+        // executing a findAndModify. This is done to ensure that we can always match, modify, and
+        // return the document under concurrency, if a matching document exists.
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
             if (args.isRemove()) {
                 DeleteRequest request(nsString);
@@ -483,7 +477,7 @@ public:
         }
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "findAndModify", nsString.ns());
 
-        if (lastOpHolder.getLastOp() != lastOpAtOperationStart) {
+        if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
             // If this operation has already generated a new lastOp, don't bother setting it here.
             // No-op updates will not generate a new lastOp, so we still need the guard to fire in
             // that case.
@@ -491,8 +485,11 @@ public:
         }
 
         WriteConcernResult res;
-        auto waitForWCStatus = waitForWriteConcern(
-            txn, repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(), &res);
+        auto waitForWCStatus =
+            waitForWriteConcern(txn,
+                                repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
+                                txn->getWriteConcern(),
+                                &res);
         appendCommandWCStatus(result, waitForWCStatus);
 
         return true;

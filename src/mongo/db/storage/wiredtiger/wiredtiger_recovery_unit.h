@@ -86,6 +86,14 @@ public:
     // ---- WT STUFF
 
     WiredTigerSession* getSession(OperationContext* opCtx);
+
+    /**
+     * Returns a session without starting a new WT txn on the session. Will not close any already
+     * running session.
+     */
+
+    WiredTigerSession* getSessionNoTxn(OperationContext* opCtx);
+
     WiredTigerSessionCache* getSessionCache() {
         return _sessionCache;
     }
@@ -113,7 +121,7 @@ public:
      * Prepares this RU to be the basis for a named snapshot.
      *
      * Begins a WT transaction, and invariants if we are already in one.
-     * Bans being in a WriteUnitOfWork until the next call to commitAndRestart().
+     * Bans being in a WriteUnitOfWork until the next call to abandonSnapshot().
      */
     void prepareForCreateSnapshot(OperationContext* opCtx);
 
@@ -127,7 +135,6 @@ private:
 
     WiredTigerSessionCache* _sessionCache;  // not owned
     WiredTigerSession* _session;            // owned, but from pool
-    bool _defaultCommit;
     bool _areWriteUnitOfWorksBanned = false;
     bool _inUnitOfWork;
     bool _active;

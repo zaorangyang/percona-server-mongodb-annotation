@@ -30,6 +30,8 @@
 
 #include "mongo/scripting/mozjs/objectwrapper.h"
 
+#include <js/Conversions.h>
+
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/platform/decimal128.h"
@@ -62,6 +64,13 @@ void ObjectWrapper::Key::get(JSContext* cx, JS::HandleObject o, JS::MutableHandl
                 return;
             break;
         }
+        case Type::InternedString: {
+            InternedStringId id(cx, _internedString);
+
+            if (JS_GetPropertyById(cx, o, id, value))
+                return;
+            break;
+        }
     }
 
     throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to get value on a JSObject");
@@ -79,6 +88,13 @@ void ObjectWrapper::Key::set(JSContext* cx, JS::HandleObject o, JS::HandleValue 
             break;
         case Type::Id: {
             JS::RootedId id(cx, _id);
+
+            if (JS_SetPropertyById(cx, o, id, value))
+                return;
+            break;
+        }
+        case Type::InternedString: {
+            InternedStringId id(cx, _internedString);
 
             if (JS_SetPropertyById(cx, o, id, value))
                 return;
@@ -109,6 +125,13 @@ void ObjectWrapper::Key::define(JSContext* cx,
                 return;
             break;
         }
+        case Type::InternedString: {
+            InternedStringId id(cx, _internedString);
+
+            if (JS_DefinePropertyById(cx, o, id, value, attrs))
+                return;
+            break;
+        }
     }
 
     throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to define value on a JSObject");
@@ -133,9 +156,47 @@ bool ObjectWrapper::Key::has(JSContext* cx, JS::HandleObject o) {
                 return has;
             break;
         }
+        case Type::InternedString: {
+            InternedStringId id(cx, _internedString);
+
+            if (JS_HasPropertyById(cx, o, id, &has))
+                return has;
+            break;
+        }
     }
 
     throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to has value on a JSObject");
+}
+
+bool ObjectWrapper::Key::hasOwn(JSContext* cx, JS::HandleObject o) {
+    bool has;
+
+    switch (_type) {
+        case Type::Field:
+            if (JS_AlreadyHasOwnProperty(cx, o, _field, &has))
+                return has;
+            break;
+        case Type::Index:
+            if (JS_AlreadyHasOwnElement(cx, o, _idx, &has))
+                return has;
+            break;
+        case Type::Id: {
+            JS::RootedId id(cx, _id);
+
+            if (JS_AlreadyHasOwnPropertyById(cx, o, id, &has))
+                return has;
+            break;
+        }
+        case Type::InternedString: {
+            InternedStringId id(cx, _internedString);
+
+            if (JS_AlreadyHasOwnPropertyById(cx, o, id, &has))
+                return has;
+            break;
+        }
+    }
+
+    throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to hasOwn value on a JSObject");
 }
 
 void ObjectWrapper::Key::del(JSContext* cx, JS::HandleObject o) {
@@ -156,25 +217,52 @@ void ObjectWrapper::Key::del(JSContext* cx, JS::HandleObject o) {
                 return;
             break;
         }
+        case Type::InternedString: {
+            InternedStringId id(cx, _internedString);
+
+            if (JS_DeleteProperty(cx, o, IdWrapper(cx, id).toString().c_str()))
+                break;
+        }
     }
 
     throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to delete value on a JSObject");
 }
 
 std::string ObjectWrapper::Key::toString(JSContext* cx) {
-    switch (_type) {
-        case Type::Field:
-            return _field;
-        case Type::Index:
-            return std::to_string(_idx);
-        case Type::Id: {
-            JS::RootedId id(cx, _id);
-            return IdWrapper(cx, id).toString();
-        }
+    JSStringWrapper jsstr;
+    return toStringData(cx, &jsstr).toString();
+}
+
+StringData ObjectWrapper::Key::toStringData(JSContext* cx, JSStringWrapper* jsstr) {
+    if (_type == Type::Field) {
+        return _field;
     }
 
-    throwCurrentJSException(
-        cx, ErrorCodes::InternalError, "Failed to toString a ObjectWrapper::Key");
+    if (_type == Type::Index) {
+        *jsstr = JSStringWrapper(_idx);
+        return jsstr->toStringData();
+    }
+
+    JS::RootedId rid(cx);
+
+    if (_type == Type::Id) {
+        rid.set(_id);
+    } else {
+        InternedStringId id(cx, _internedString);
+        rid.set(id);
+    }
+
+    if (JSID_IS_INT(rid)) {
+        *jsstr = JSStringWrapper(JSID_TO_INT(rid));
+        return jsstr->toStringData();
+    }
+
+    if (JSID_IS_STRING(rid)) {
+        *jsstr = JSStringWrapper(cx, JSID_TO_STRING(rid));
+        return jsstr->toStringData();
+    }
+
+    uasserted(ErrorCodes::BadValue, "Couldn't convert key to String");
 }
 
 ObjectWrapper::ObjectWrapper(JSContext* cx, JS::HandleObject obj)
@@ -257,16 +345,19 @@ void ObjectWrapper::setBoolean(Key key, bool val) {
     setValue(key, jsValue);
 }
 
-void ObjectWrapper::setBSONElement(Key key, const BSONElement& elem, bool readOnly) {
+void ObjectWrapper::setBSONElement(Key key,
+                                   const BSONElement& elem,
+                                   const BSONObj& parent,
+                                   bool readOnly) {
     JS::RootedValue value(_context);
-    ValueReader(_context, &value).fromBSONElement(elem, readOnly);
+    ValueReader(_context, &value).fromBSONElement(elem, parent, readOnly);
 
     setValue(key, value);
 }
 
 void ObjectWrapper::setBSON(Key key, const BSONObj& obj, bool readOnly) {
     JS::RootedValue value(_context);
-    ValueReader(_context, &value).fromBSON(obj, readOnly);
+    ValueReader(_context, &value).fromBSON(obj, nullptr, readOnly);
 
     setValue(key, value);
 }
@@ -311,6 +402,10 @@ void ObjectWrapper::rename(Key from, const char* to) {
 
 bool ObjectWrapper::hasField(Key key) {
     return key.has(_context, _object);
+}
+
+bool ObjectWrapper::hasOwnField(Key key) {
+    return key.hasOwn(_context, _object);
 }
 
 void ObjectWrapper::callMethod(const char* field,
@@ -379,8 +474,8 @@ BSONObj ObjectWrapper::toBSON() {
 
     // We special case the _id field in top-level objects and move it to the front.
     // This matches other drivers behavior and makes finding the _id field quicker in BSON.
-    if (hasField("_id")) {
-        _writeField(&b, "_id", &frames, frames.top().originalBSON);
+    if (hasOwnField(InternedString::_id)) {
+        _writeField(&b, InternedString::_id, &frames, frames.top().originalBSON);
     }
 
     while (frames.size()) {
@@ -407,7 +502,9 @@ BSONObj ObjectWrapper::toBSON() {
         if (frames.size() == 1) {
             IdWrapper idw(_context, id);
 
-            if (idw.isString() && idw.equals("_id")) {
+            // TODO: check if it's cheaper to just compare with an interned
+            // string of "_id" rather than with ascii
+            if (idw.isString() && idw.equalsAscii("_id")) {
                 continue;
             }
         }
@@ -457,7 +554,9 @@ void ObjectWrapper::_writeField(BSONObjBuilder* b,
     ValueWriter x(_context, value);
     x.setOriginalBSON(originalParent);
 
-    x.writeThis(b, key.toString(_context), frames);
+    JSStringWrapper jsstr;
+
+    x.writeThis(b, key.toStringData(_context, &jsstr), frames);
 }
 
 std::string ObjectWrapper::getClassName() {
@@ -467,9 +566,9 @@ std::string ObjectWrapper::getClassName() {
         return jsclass->name;
 
     JS::RootedValue ctor(_context);
-    getValue("constructor", &ctor);
+    getValue(InternedString::constructor, &ctor);
 
-    return ObjectWrapper(_context, ctor).getString("name");
+    return ObjectWrapper(_context, ctor).getString(InternedString::name);
 }
 
 }  // namespace mozjs

@@ -107,21 +107,19 @@ MongoRunner.VersionSub = function(regex, version) {
     this.version = version;
 }
 
-// These patterns allow substituting the binary versions used for each
-// version string to support the dev/stable MongoDB release cycle.
+// These patterns allow substituting the binary versions used for each version string to support the
+// dev/stable MongoDB release cycle.
+//
+// If you add a new version substitution to this list, you should add it to the lists of versions
+// being checked in '0_test_launching.js' to verify it is susbstituted correctly.
 MongoRunner.binVersionSubs = [ new MongoRunner.VersionSub(/^latest$/, ""),
-                               new MongoRunner.VersionSub(/^oldest-supported$/, "1.8"),
-                               // To-be-updated when 3.4 becomes available
+                               // To-be-updated when we branch for the next release.
                                new MongoRunner.VersionSub(/^last-stable$/, "3.0"),
-                               // Latest unstable and next stable are effectively the
-                               // same release
-                               // 2.8 and 3.0 are equivalent.
-                               new MongoRunner.VersionSub(/^2\.8(\..*){0,1}/, "3.0"),
                                new MongoRunner.VersionSub(/^3\.1(\..*){0,1}/, ""),
                                new MongoRunner.VersionSub(/^3\.2(\..*){0,1}/, "") ];
 
 MongoRunner.getBinVersionFor = function(version) {
- 
+
     // If this is a version iterator, iterate the version via toString()
     if (version instanceof MongoRunner.versionIterator.iterator) {
         version = version.toString();
@@ -142,7 +140,7 @@ MongoRunner.getBinVersionFor = function(version) {
     }
 
     return version;
-}
+};
 
 MongoRunner.areBinVersionsTheSame = function(versionA, versionB) {
 
@@ -177,7 +175,8 @@ MongoRunner.logicalOptions = { runId : true,
                                noJournalPrealloc : true,
                                noJournal : true,
                                binVersion : true,
-                               waitForConnect : true }
+                               waitForConnect : true,
+                               bridgeOptions : true }
 
 MongoRunner.toRealPath = function( path, pathOpts ){
     
@@ -403,7 +402,9 @@ MongoRunner.mongoOptions = function(opts) {
     }
 
     // Normalize and get the binary version to use
-    opts.binVersion = MongoRunner.getBinVersionFor(opts.binVersion);
+    if (opts.hasOwnProperty('binVersion')) {
+        opts.binVersion = MongoRunner.getBinVersionFor(opts.binVersion);
+    }
 
     // Default for waitForConnect is true
     opts.waitForConnect =
@@ -461,8 +462,11 @@ MongoRunner.mongodOptions = function( opts ){
     if( jsTestOptions().noJournalPrealloc || opts.noJournalPrealloc )
         opts.nopreallocj = ""
 
-    if( (jsTestOptions().noJournal || opts.noJournal) && !('journal' in opts))
+    if((jsTestOptions().noJournal || opts.noJournal) &&
+            !('journal' in opts) &&
+            !('configsvr' in opts)) {
         opts.nojournal = ""
+    }
 
     if( jsTestOptions().keyFile && !opts.keyFile) {
         opts.keyFile = jsTestOptions().keyFile
@@ -494,6 +498,18 @@ MongoRunner.mongodOptions = function( opts ){
         opts.encryptionKeyFile = jsTestOptions().encryptionKeyFile;
     }
 
+    if (opts.hasOwnProperty("auditDestination")) {
+        // opts.auditDestination, if set, must be a string
+        if (typeof opts.auditDestination !== "string") {
+            throw new Error("The auditDestination option must be a string if it is specified");
+        }
+    } else if (jsTestOptions().auditDestination !== undefined) {
+        if (typeof(jsTestOptions().auditDestination) !== "string") {
+            throw new Error("The auditDestination option must be a string if it is specified");
+        }
+        opts.auditDestination = jsTestOptions().auditDestination;
+    }
+
     if( opts.noReplSet ) opts.replSet = null
     if( opts.arbiter ) opts.oplogSize = 1
             
@@ -523,10 +539,27 @@ MongoRunner.mongosOptions = function( opts ) {
         opts.logpath = opts.logFile;
     }
 
-    if( jsTestOptions().keyFile && !opts.keyFile) {
-        opts.keyFile = jsTestOptions().keyFile
+    var testOptions = jsTestOptions();
+    if (testOptions.keyFile && !opts.keyFile) {
+        opts.keyFile = testOptions.keyFile;
     }
-    
+
+    if (opts.hasOwnProperty("auditDestination")) {
+        // opts.auditDestination, if set, must be a string
+        if (typeof opts.auditDestination !== "string") {
+            throw new Error("The auditDestination option must be a string if it is specified");
+        }
+    } else if (testOptions.auditDestination !== undefined) {
+        if (typeof(testOptions.auditDestination) !== "string") {
+            throw new Error("The auditDestination option must be a string if it is specified");
+        }
+        opts.auditDestination = testOptions.auditDestination;
+    }
+
+    if (!opts.hasOwnProperty('binVersion') && testOptions.mongosBinVersion) {
+        opts.binVersion = MongoRunner.getBinVersionFor(testOptions.mongosBinVersion);
+    }
+
     return opts
 }
 
@@ -586,7 +619,7 @@ MongoRunner.runMongod = function( opts ){
     }
 
     var mongod = MongoRunner.startWithArgs(opts, waitForConnect);
-    if (!waitForConnect) mongos = {};
+    if (!waitForConnect) mongod = {};
     if (!mongod) return null;
     
     mongod.commandLine = MongoRunner.arrToOpts( opts )
@@ -732,7 +765,8 @@ _startMongodNoReset = function(){
  */
 function appendSetParameterArgs(argArray) {
     var programName = argArray[0];
-    if (programName.endsWith('mongod') || programName.endsWith('mongos')) {
+    if (programName.endsWith('mongod') || programName.endsWith('mongos')
+        || programName.startsWith('mongod-') || programName.startsWith('mongos-')) {
         if (jsTest.options().enableTestCommands) {
             argArray.push.apply(argArray, ['--setParameter', "enableTestCommands=1"]);
         }
@@ -755,7 +789,7 @@ function appendSetParameterArgs(argArray) {
             argArray.push.apply(argArray, ['--setParameter', "enableLocalhostAuthBypass=false"]);
         }
 
-        // mongos only options
+        // mongos only options. Note: excludes mongos with version suffix (ie. mongos-3.0).
         if (programName.endsWith('mongos')) {
             // apply setParameters for mongos
             if (jsTest.options().setParametersMongos) {
@@ -767,7 +801,7 @@ function appendSetParameterArgs(argArray) {
                 }
             }
         }
-        // mongod only options
+        // mongod only options. Note: excludes mongos with version suffix (ie. mongos-3.0).
         else if (programName.endsWith('mongod')) {
             // set storageEngine for mongod
             if (jsTest.options().storageEngine) {
@@ -792,9 +826,6 @@ function appendSetParameterArgs(argArray) {
                         if (p) argArray.push.apply(argArray, ['--setParameter', p])
                     });
                 }
-            }
-            if (argArray.indexOf('--configsvr') > 0 && argArray.indexOf('--replSet') > 0) {
-                argArray.push.apply(argArray, ['--setParameter', "enableReplSnapshotThread=1"]);
             }
         }
     }

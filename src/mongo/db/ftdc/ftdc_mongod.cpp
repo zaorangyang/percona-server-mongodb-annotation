@@ -45,7 +45,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 
 namespace mongo {
 
@@ -61,7 +61,7 @@ FTDCController* getGlobalFTDCController() {
     return getFTDCController(getGlobalServiceContext()).get();
 }
 
-std::atomic<bool> localEnabledFlag(FTDCConfig::kEnabledDefault);
+std::atomic<bool> localEnabledFlag(FTDCConfig::kEnabledDefault);  // NOLINT
 
 class ExportedFTDCEnabledParameter
     : public ExportedServerParameter<bool, ServerParameterType::kStartupAndRuntime> {
@@ -83,7 +83,7 @@ public:
 
 } exportedFTDCEnabledParameter;
 
-std::atomic<std::int32_t> localPeriodMillis(FTDCConfig::kPeriodMillisDefault);
+std::atomic<std::int32_t> localPeriodMillis(FTDCConfig::kPeriodMillisDefault);  // NOLINT
 
 class ExportedFTDCPeriodParameter
     : public ExportedServerParameter<std::int32_t, ServerParameterType::kStartupAndRuntime> {
@@ -112,10 +112,11 @@ public:
 } exportedFTDCPeriodParameter;
 
 // Scale the values down since are defaults are in bytes, but the user interface is MB
-std::atomic<std::int32_t> localMaxDirectorySizeMB(FTDCConfig::kMaxDirectorySizeBytesDefault /
-                                                  (1024 * 1024));
+std::atomic<std::int32_t> localMaxDirectorySizeMB(  // NOLINT
+    FTDCConfig::kMaxDirectorySizeBytesDefault / (1024 * 1024));
 
-std::atomic<std::int32_t> localMaxFileSizeMB(FTDCConfig::kMaxFileSizeBytesDefault / (1024 * 1024));
+std::atomic<std::int32_t> localMaxFileSizeMB(FTDCConfig::kMaxFileSizeBytesDefault /  // NOLINT
+                                             (1024 * 1024));
 
 class ExportedFTDCDirectorySizeParameter
     : public ExportedServerParameter<std::int32_t, ServerParameterType::kStartupAndRuntime> {
@@ -123,23 +124,23 @@ public:
     ExportedFTDCDirectorySizeParameter()
         : ExportedServerParameter<std::int32_t, ServerParameterType::kStartupAndRuntime>(
               ServerParameterSet::getGlobal(),
-              "diagnosticDataCollectionDirectorySizeMb",
+              "diagnosticDataCollectionDirectorySizeMB",
               &localMaxDirectorySizeMB) {}
 
     virtual Status validate(const std::int32_t& potentialNewValue) {
         if (potentialNewValue < 10) {
             return Status(
                 ErrorCodes::BadValue,
-                "diagnosticDataCollectionDirectorySizeMb must be greater than or equal to 10");
+                "diagnosticDataCollectionDirectorySizeMB must be greater than or equal to 10");
         }
 
         if (potentialNewValue < localMaxFileSizeMB) {
             return Status(
                 ErrorCodes::BadValue,
                 str::stream()
-                    << "diagnosticDataCollectionDirectorySizeMb must be greater than or equal to '"
+                    << "diagnosticDataCollectionDirectorySizeMB must be greater than or equal to '"
                     << localMaxFileSizeMB
-                    << "' which is the current value of diagnosticDataCollectionFileSizeMb.");
+                    << "' which is the current value of diagnosticDataCollectionFileSizeMB.");
         }
 
         auto controller = getGlobalFTDCController();
@@ -158,22 +159,22 @@ public:
     ExportedFTDCFileSizeParameter()
         : ExportedServerParameter<std::int32_t, ServerParameterType::kStartupAndRuntime>(
               ServerParameterSet::getGlobal(),
-              "diagnosticDataCollectionFileSizeMb",
+              "diagnosticDataCollectionFileSizeMB",
               &localMaxFileSizeMB) {}
 
     virtual Status validate(const std::int32_t& potentialNewValue) {
         if (potentialNewValue < 1) {
             return Status(ErrorCodes::BadValue,
-                          "diagnosticDataCollectionFileSizeMb must be greater than or equal to 1");
+                          "diagnosticDataCollectionFileSizeMB must be greater than or equal to 1");
         }
 
         if (potentialNewValue > localMaxDirectorySizeMB) {
             return Status(
                 ErrorCodes::BadValue,
                 str::stream()
-                    << "diagnosticDataCollectionFileSizeMb must be less than or equal to '"
+                    << "diagnosticDataCollectionFileSizeMB must be less than or equal to '"
                     << localMaxDirectorySizeMB
-                    << "' which is the current value of diagnosticDataCollectionDirectorySizeMb.");
+                    << "' which is the current value of diagnosticDataCollectionDirectorySizeMB.");
         }
 
         auto controller = getGlobalFTDCController();
@@ -186,7 +187,7 @@ public:
 
 } exportedFTDCFileSizeParameter;
 
-std::atomic<std::int32_t> localMaxSamplesPerArchiveMetricChunk(
+std::atomic<std::int32_t> localMaxSamplesPerArchiveMetricChunk(  // NOLINT
     FTDCConfig::kMaxSamplesPerArchiveMetricChunkDefault);
 
 class ExportedFTDCArchiveChunkSizeParameter
@@ -215,7 +216,7 @@ public:
 
 } exportedFTDCArchiveChunkSizeParameter;
 
-std::atomic<std::int32_t> localMaxSamplesPerInterimMetricChunk(
+std::atomic<std::int32_t> localMaxSamplesPerInterimMetricChunk(  // NOLINT
     FTDCConfig::kMaxSamplesPerInterimMetricChunkDefault);
 
 class ExportedFTDCInterimChunkSizeParameter

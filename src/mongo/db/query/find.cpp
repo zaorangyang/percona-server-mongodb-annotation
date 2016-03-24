@@ -44,6 +44,7 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
@@ -53,7 +54,7 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/stdx/memory.h"
@@ -168,7 +169,8 @@ void endQueryOp(OperationContext* txn,
     if (dbProfilingLevel > 0 || curop->elapsedMillis() > serverGlobalParams.slowMS ||
         logger::globalLogDomain()->shouldLog(queryLogComponent, logLevelOne)) {
         // Generate plan summary string.
-        curop->debug().planSummary = Explain::getPlanSummary(&exec);
+        stdx::lock_guard<Client>(*txn->getClient());
+        curop->setPlanSummary_inlock(Explain::getPlanSummary(&exec));
     }
 
     // Set debug information for consumption by the profiler only.
@@ -180,9 +182,9 @@ void endQueryOp(OperationContext* txn,
         curop->debug().execStats.set(statsBob.obj());
 
         // Replace exec stats with plan summary if stats cannot fit into CachedBSONObj.
-        if (curop->debug().execStats.tooBig() && !curop->debug().planSummary.empty()) {
+        if (curop->debug().execStats.tooBig() && !curop->getPlanSummary().empty()) {
             BSONObjBuilder bob;
-            bob.append("summary", curop->debug().planSummary.toString());
+            bob.append("summary", curop->getPlanSummary());
             curop->debug().execStats.set(bob.done());
         }
     }
@@ -491,7 +493,7 @@ std::string runQuery(OperationContext* txn,
 
     // Parse the qm into a CanonicalQuery.
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(q, WhereCallbackReal(txn, nss.db()));
+    auto statusWithCQ = CanonicalQuery::canonicalize(q, ExtensionsCallbackReal(txn, &nss));
     if (!statusWithCQ.isOK()) {
         uasserted(
             17287,
@@ -565,7 +567,7 @@ std::string runQuery(OperationContext* txn,
     // bb is used to hold query results
     // this buffer should contain either requested documents per query or
     // explain information, but not both
-    BufBuilder bb(32768);
+    BufBuilder bb(FindCommon::kInitReplyBufferSize);
     bb.skip(sizeof(QueryResult::Value));
 
     // How many results have we obtained from the executor?
@@ -579,7 +581,10 @@ std::string runQuery(OperationContext* txn,
     // uint64_t numMisplacedDocs = 0;
 
     // Get summary info about which plan the executor is using.
-    curop.debug().planSummary = Explain::getPlanSummary(exec.get());
+    {
+        stdx::lock_guard<Client> lk(*txn->getClient());
+        curop.setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+    }
 
     while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
         // Add result to output buffer.

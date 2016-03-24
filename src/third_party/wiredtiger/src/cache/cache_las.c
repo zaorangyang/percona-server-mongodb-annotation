@@ -24,10 +24,9 @@ __wt_las_stats_update(WT_SESSION_IMPL *session)
 	/*
 	 * Lookaside table statistics are copied from the underlying lookaside
 	 * table data-source statistics. If there's no lookaside table, values
-	 * remain 0. In the current system, there's always a lookaside table,
-	 * but there's no reason not to be cautious.
+	 * remain 0.
 	 */
-	if (conn->las_cursor == NULL)
+	if (!F_ISSET(conn, WT_CONN_LAS_OPEN))
 		return;
 
 	/*
@@ -35,46 +34,13 @@ __wt_las_stats_update(WT_SESSION_IMPL *session)
 	 * to it by way of the underlying btree handle, but it's a little ugly.
 	 */
 	cstats = conn->stats;
-	dstats = ((WT_CURSOR_BTREE *)conn->las_cursor)->btree->dhandle->stats;
+	dstats = ((WT_CURSOR_BTREE *)
+	    conn->las_session->las_cursor)->btree->dhandle->stats;
 
 	WT_STAT_SET(session, cstats,
 	    cache_lookaside_insert, WT_STAT_READ(dstats, cursor_insert));
 	WT_STAT_SET(session, cstats,
 	    cache_lookaside_remove, WT_STAT_READ(dstats, cursor_remove));
-}
-
-/*
- * __las_cursor_create --
- *	Open a new lookaside table cursor.
- */
-static int
-__las_cursor_create(WT_SESSION_IMPL *session, WT_CURSOR **cursorp)
-{
-	WT_BTREE *btree;
-	const char *open_cursor_cfg[] = {
-	    WT_CONFIG_BASE(session, WT_SESSION_open_cursor), NULL };
-
-	WT_RET(__wt_open_cursor(
-	    session, WT_LAS_URI, NULL, open_cursor_cfg, cursorp));
-
-	/*
-	 * Set special flags for the lookaside table: the lookaside flag (used,
-	 * for example, to avoid writing records during reconciliation), also
-	 * turn off checkpoints and logging.
-	 *
-	 * Test flags before setting them so updates can't race in subsequent
-	 * opens (the first update is safe because it's single-threaded from
-	 * wiredtiger_open).
-	 */
-	btree = S2BT(session);
-	if (!F_ISSET(btree, WT_BTREE_LOOKASIDE))
-		F_SET(btree, WT_BTREE_LOOKASIDE);
-	if (!F_ISSET(btree, WT_BTREE_NO_CHECKPOINT))
-		F_SET(btree, WT_BTREE_NO_CHECKPOINT);
-	if (!F_ISSET(btree, WT_BTREE_NO_LOGGING))
-		F_SET(btree, WT_BTREE_NO_LOGGING);
-
-	return (0);
 }
 
 /*
@@ -85,7 +51,7 @@ int
 __wt_las_create(WT_SESSION_IMPL *session)
 {
 	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
+	uint32_t session_flags;
 	const char *drop_cfg[] = {
 	    WT_CONFIG_BASE(session, WT_SESSION_drop), "force=true", NULL };
 
@@ -93,30 +59,28 @@ __wt_las_create(WT_SESSION_IMPL *session)
 
 	/*
 	 * Done at startup: we cannot do it on demand because we require the
-	 * schema lock to create and drop the file, and it may not always be
+	 * schema lock to create and drop the table, and it may not always be
 	 * available.
 	 *
-	 * Open an internal session, used for the shared lookaside cursor.
-	 *
-	 * Sessions associated with a lookaside cursor should never be tapped
-	 * for eviction.
+	 * Discard any previous incarnation of the table.
 	 */
-	WT_RET(__wt_open_internal_session(
-	    conn, "lookaside table", true, true, &conn->las_session));
-	session = conn->las_session;
-	F_SET(session, WT_SESSION_LOOKASIDE_CURSOR | WT_SESSION_NO_EVICTION);
-
-	/* Discard any previous incarnation of the file. */
 	WT_RET(__wt_session_drop(session, WT_LAS_URI, drop_cfg));
 
-	/* Re-create the file. */
+	/* Re-create the table. */
 	WT_RET(__wt_session_create(session, WT_LAS_URI, WT_LAS_FORMAT));
 
-	/* Open the shared cursor. */
-	WT_WITHOUT_DHANDLE(session,
-	    ret = __las_cursor_create(session, &conn->las_cursor));
+	/*
+	 * Open a shared internal session used to access the lookaside table.
+	 * This session should never be tapped for eviction.
+	 */
+	session_flags = WT_SESSION_LOOKASIDE_CURSOR | WT_SESSION_NO_EVICTION;
+	WT_RET(__wt_open_internal_session(
+	    conn, "lookaside table", true, session_flags, &conn->las_session));
 
-	return (ret);
+	/* Flag that the lookaside table has been created. */
+	F_SET(conn, WT_CONN_LAS_OPEN);
+
+	return (0);
 }
 
 /*
@@ -138,7 +102,6 @@ __wt_las_destroy(WT_SESSION_IMPL *session)
 	wt_session = &conn->las_session->iface;
 	ret = wt_session->close(wt_session, NULL);
 
-	conn->las_cursor = NULL;
 	conn->las_session = NULL;
 
 	return (ret);
@@ -176,6 +139,40 @@ __wt_las_is_written(WT_SESSION_IMPL *session)
 }
 
 /*
+ * __wt_las_cursor_create --
+ *	Open a new lookaside table cursor.
+ */
+int
+__wt_las_cursor_create(WT_SESSION_IMPL *session, WT_CURSOR **cursorp)
+{
+	WT_BTREE *btree;
+	const char *open_cursor_cfg[] = {
+	    WT_CONFIG_BASE(session, WT_SESSION_open_cursor), NULL };
+
+	WT_RET(__wt_open_cursor(
+	    session, WT_LAS_URI, NULL, open_cursor_cfg, cursorp));
+
+	/*
+	 * Set special flags for the lookaside table: the lookaside flag (used,
+	 * for example, to avoid writing records during reconciliation), also
+	 * turn off checkpoints and logging.
+	 *
+	 * Test flags before setting them so updates can't race in subsequent
+	 * opens (the first update is safe because it's single-threaded from
+	 * wiredtiger_open).
+	 */
+	btree = S2BT(session);
+	if (!F_ISSET(btree, WT_BTREE_LOOKASIDE))
+		F_SET(btree, WT_BTREE_LOOKASIDE);
+	if (!F_ISSET(btree, WT_BTREE_NO_CHECKPOINT))
+		F_SET(btree, WT_BTREE_NO_CHECKPOINT);
+	if (!F_ISSET(btree, WT_BTREE_NO_LOGGING))
+		F_SET(btree, WT_BTREE_NO_LOGGING);
+
+	return (0);
+}
+
+/*
  * __wt_las_cursor --
  *	Return a lookaside cursor.
  */
@@ -184,7 +181,6 @@ __wt_las_cursor(
     WT_SESSION_IMPL *session, WT_CURSOR **cursorp, uint32_t *session_flags)
 {
 	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
 
 	*cursorp = NULL;
 
@@ -202,20 +198,15 @@ __wt_las_cursor(
 
 	conn = S2C(session);
 
-	/* Eviction and sweep threads have their own lookaside table cursors. */
-	if (F_ISSET(session, WT_SESSION_LOOKASIDE_CURSOR)) {
-		if (session->las_cursor == NULL) {
-			WT_WITHOUT_DHANDLE(session, ret =
-			    __las_cursor_create(session, &session->las_cursor));
-			WT_RET(ret);
-		}
-
+	/*
+	 * Some threads have their own lookaside table cursors, else lock the
+	 * shared lookaside cursor.
+	 */
+	if (F_ISSET(session, WT_SESSION_LOOKASIDE_CURSOR))
 		*cursorp = session->las_cursor;
-	} else {
-		/* Lock the shared lookaside cursor. */
+	else {
 		__wt_spin_lock(session, &conn->las_lock);
-
-		*cursorp = conn->las_cursor;
+		*cursorp = conn->las_session->las_cursor;
 	}
 
 	/* Turn caching and eviction off. */
@@ -253,8 +244,8 @@ __wt_las_cursor_close(
 	F_SET(session, session_flags);
 
 	/*
-	 * Eviction and sweep threads have their own lookaside table cursors;
-	 * else, unlock the shared lookaside cursor.
+	 * Some threads have their own lookaside table cursors, else unlock the
+	 * shared lookaside cursor.
 	 */
 	if (!F_ISSET(session, WT_SESSION_LOOKASIDE_CURSOR))
 		__wt_spin_unlock(session, &conn->las_lock);
@@ -276,12 +267,14 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 	WT_DECL_RET;
 	WT_ITEM *key;
 	uint64_t cnt, las_counter, las_txnid;
+	int64_t remove_cnt;
 	uint32_t las_id, session_flags;
 	int notused;
 
 	conn = S2C(session);
 	cursor = NULL;
 	key = &conn->las_sweep_key;
+	remove_cnt = 0;
 	session_flags = 0;		/* [-Werror=maybe-uninitialized] */
 
 	WT_ERR(__wt_scr_alloc(session, 0, &las_addr));
@@ -294,9 +287,19 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 	 * from the last call (we don't care if we're before or after the key,
 	 * just roughly in the same spot is fine).
 	 */
-	if (conn->las_sweep_call != 0 && key->data != NULL) {
+	if (key->size != 0) {
 		__wt_cursor_set_raw_key(cursor, key);
-		if ((ret = cursor->search_near(cursor, &notused)) != 0)
+		ret = cursor->search_near(cursor, &notused);
+
+		/*
+		 * Don't search for the same key twice; if we don't set a new
+		 * key below, it's because we've reached the end of the table
+		 * and we want the next pass to start at the beginning of the
+		 * table. Searching for the same key could leave us stuck at
+		 * the end of the table, repeatedly checking the same rows.
+		 */
+		key->size = 0;
+		if (ret != 0)
 			goto srch_notfound;
 	}
 
@@ -312,20 +315,11 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 	 * but possibly better, alternative might be to review all lookaside
 	 * blocks in the cache in order to get rid of them, and slowly review
 	 * lookaside blocks that have already been evicted.
-	 *
-	 * We can't know for sure how many records are in the lookaside table,
-	 * the cursor insert and remove statistics aren't updated atomically.
-	 * Start with reviewing 100 rows, and if it takes more than the target
-	 * number of calls to finish, increase the number of rows checked on
-	 * each call; if it takes less than the target calls to finish, then
-	 * decrease the number of rows reviewed on each call (but never less
-	 * than 100).
 	 */
-#define	WT_SWEEP_LOOKASIDE_MIN_CNT	100
-#define	WT_SWEEP_LOOKASIDE_PASS_TARGET	 30
-	++conn->las_sweep_call;
-	if ((cnt = conn->las_sweep_cnt) < WT_SWEEP_LOOKASIDE_MIN_CNT)
-		cnt = conn->las_sweep_cnt = WT_SWEEP_LOOKASIDE_MIN_CNT;
+	cnt = (uint64_t)WT_MAX(100, conn->las_record_cnt / 30);
+
+	/* Discard pages we read as soon as we're done with them. */
+	F_SET(session, WT_SESSION_NO_CACHE);
 
 	/* Walk the file. */
 	for (; cnt > 0 && (ret = cursor->next(cursor)) == 0; --cnt) {
@@ -354,28 +348,13 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 		 * another thread remove the record before we do, and the cursor
 		 * remains positioned in that case.
 		 */
-		if (__wt_txn_visible_all(session, las_txnid))
+		if (__wt_txn_visible_all(session, las_txnid)) {
 			WT_ERR(cursor->remove(cursor));
-	}
-
-	/*
-	 * When reaching the lookaside table end or the target number of calls,
-	 * adjust the row count. Decrease/increase the row count depending on
-	 * if the number of calls is less/more than the target.
-	 */
-	if (ret == WT_NOTFOUND ||
-	    conn->las_sweep_call > WT_SWEEP_LOOKASIDE_PASS_TARGET) {
-		if (conn->las_sweep_call < WT_SWEEP_LOOKASIDE_PASS_TARGET &&
-		    conn->las_sweep_cnt > WT_SWEEP_LOOKASIDE_MIN_CNT)
-			conn->las_sweep_cnt -= WT_SWEEP_LOOKASIDE_MIN_CNT;
-		if (conn->las_sweep_call > WT_SWEEP_LOOKASIDE_PASS_TARGET)
-			conn->las_sweep_cnt += WT_SWEEP_LOOKASIDE_MIN_CNT;
+			++remove_cnt;
+		}
 	}
 
 srch_notfound:
-	if (ret == WT_NOTFOUND)
-		conn->las_sweep_call = 0;
-
 	WT_ERR_NOTFOUND_OK(ret);
 
 	if (0) {
@@ -383,6 +362,18 @@ err:		__wt_buf_free(session, key);
 	}
 
 	WT_TRET(__wt_las_cursor_close(session, &cursor, session_flags));
+
+	/*
+	 * If there were races to remove records, we can over-count.  All
+	 * arithmetic is signed, so underflow isn't fatal, but check anyway so
+	 * we don't skew low over time.
+	 */
+	if (remove_cnt > S2C(session)->las_record_cnt)
+		S2C(session)->las_record_cnt = 0;
+	else if (remove_cnt > 0)
+		(void)__wt_atomic_subi64(&conn->las_record_cnt, remove_cnt);
+
+	F_CLR(session, WT_SESSION_NO_CACHE);
 
 	__wt_scr_free(session, &las_addr);
 	__wt_scr_free(session, &las_key);

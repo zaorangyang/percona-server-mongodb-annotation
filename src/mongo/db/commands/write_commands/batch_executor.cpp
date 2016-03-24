@@ -160,7 +160,7 @@ void noteInCriticalSection(WriteErrorDetail* staleError) {
  * Translates write item type to wire protocol op code. Helper for
  * WriteBatchExecutor::applyWriteItem().
  */
-int getOpCode(const BatchItemRef& currWrite) {
+NetworkOp getOpCode(const BatchItemRef& currWrite) {
     switch (currWrite.getRequest()->getBatchType()) {
         case BatchedCommandRequest::BatchType_Insert:
             return dbInsert;
@@ -332,8 +332,11 @@ void WriteBatchExecutor::executeBatch(const BatchedCommandRequest& request,
     }
 
     WriteConcernResult res;
-    Status status = waitForWriteConcern(
-        _txn, repl::ReplClientInfo::forClient(_txn->getClient()).getLastOp(), &res);
+    Status status =
+        waitForWriteConcern(_txn,
+                            repl::ReplClientInfo::forClient(_txn->getClient()).getLastOp(),
+                            _txn->getWriteConcern(),
+                            &res);
 
     if (!status.isOK()) {
         wcError.reset(toWriteConcernError(status, res));
@@ -482,11 +485,10 @@ static bool checkIndexConstraints(OperationContext* txn,
 static void beginCurrentOp(OperationContext* txn, const BatchItemRef& currWrite) {
     stdx::lock_guard<Client> lk(*txn->getClient());
     CurOp* const currentOp = CurOp::get(txn);
-    currentOp->setOp_inlock(getOpCode(currWrite));
+    currentOp->setNetworkOp_inlock(getOpCode(currWrite));
+    currentOp->setLogicalOp_inlock(networkOpToLogicalOp(getOpCode(currWrite)));
     currentOp->ensureStarted();
     currentOp->setNS_inlock(currWrite.getRequest()->getNS().ns());
-
-    currentOp->debug().op = currentOp->getOp();
 
     if (currWrite.getOpType() == BatchedCommandRequest::BatchType_Insert) {
         currentOp->setQuery_inlock(currWrite.getDocument());
@@ -505,28 +507,11 @@ static void beginCurrentOp(OperationContext* txn, const BatchItemRef& currWrite)
     }
 }
 
-void WriteBatchExecutor::incOpStats(const BatchItemRef& currWrite) {
-    if (currWrite.getOpType() == BatchedCommandRequest::BatchType_Insert) {
-        _opCounters->gotInsert();
-    } else if (currWrite.getOpType() == BatchedCommandRequest::BatchType_Update) {
-        _opCounters->gotUpdate();
-    } else {
-        dassert(currWrite.getOpType() == BatchedCommandRequest::BatchType_Delete);
-        _opCounters->gotDelete();
-    }
-}
-
-void WriteBatchExecutor::incWriteStats(const BatchItemRef& currWrite,
+void WriteBatchExecutor::incWriteStats(const BatchedCommandRequest::BatchType opType,
                                        const WriteOpStats& stats,
                                        const WriteErrorDetail* error,
                                        CurOp* currentOp) {
-    if (currWrite.getOpType() == BatchedCommandRequest::BatchType_Insert) {
-        _stats->numInserted += stats.n;
-        currentOp->debug().ninserted += stats.n;
-        if (!error) {
-            _le->recordInsert(stats.n);
-        }
-    } else if (currWrite.getOpType() == BatchedCommandRequest::BatchType_Update) {
+    if (opType == BatchedCommandRequest::BatchType_Update) {
         if (stats.upsertedID.isEmpty()) {
             _stats->numMatched += stats.n;
             _stats->numModified += stats.nModified;
@@ -538,7 +523,7 @@ void WriteBatchExecutor::incWriteStats(const BatchItemRef& currWrite,
             _le->recordUpdate(stats.upsertedID.isEmpty() && stats.n > 0, stats.n, stats.upsertedID);
         }
     } else {
-        dassert(currWrite.getOpType() == BatchedCommandRequest::BatchType_Delete);
+        dassert(opType == BatchedCommandRequest::BatchType_Delete);
         _stats->numDeleted += stats.n;
         if (!error) {
             _le->recordDelete(stats.n);
@@ -551,6 +536,15 @@ void WriteBatchExecutor::incWriteStats(const BatchItemRef& currWrite,
     }
 }
 
+static void logCurOpError(CurOp* currentOp, WriteErrorDetail* opError) {
+    invariant(opError != nullptr);
+    currentOp->debug().exceptionInfo =
+        ExceptionInfo(opError->getErrMessage(), opError->getErrCode());
+
+    LOG(3) << " Caught Assertion in " << networkOpToString(currentOp->getNetworkOp())
+           << ", continuing " << causedBy(opError->getErrMessage());
+}
+
 static void finishCurrentOp(OperationContext* txn, WriteErrorDetail* opError) {
     CurOp* currentOp = CurOp::get(txn);
     currentOp->done();
@@ -558,18 +552,13 @@ static void finishCurrentOp(OperationContext* txn, WriteErrorDetail* opError) {
     recordCurOpMetrics(txn);
     Top::get(txn->getClient()->getServiceContext())
         .record(currentOp->getNS(),
-                currentOp->getOp(),
+                currentOp->getLogicalOp(),
                 1,  // "write locked"
                 currentOp->totalTimeMicros(),
                 currentOp->isCommand());
 
-    if (opError) {
-        currentOp->debug().exceptionInfo =
-            ExceptionInfo(opError->getErrMessage(), opError->getErrCode());
-
-        LOG(3) << " Caught Assertion in " << opToString(currentOp->getOp()) << ", continuing "
-               << causedBy(opError->getErrMessage());
-    }
+    if (opError)
+        logCurOpError(currentOp, opError);
 
     bool logAll = logger::globalLogDomain()->shouldLog(logger::LogComponent::kWrite,
                                                        logger::LogSeverity::Debug(1));
@@ -583,7 +572,7 @@ static void finishCurrentOp(OperationContext* txn, WriteErrorDetail* opError) {
     }
 
     if (currentOp->shouldDBProfile(executionTime)) {
-        profile(txn, CurOp::get(txn)->getOp());
+        profile(txn, CurOp::get(txn)->getNetworkOp());
     }
 }
 
@@ -761,64 +750,118 @@ static void normalizeInserts(const BatchedCommandRequest& request,
     }
 }
 
+static void insertOne(WriteBatchExecutor::ExecInsertsState* state, WriteOpResult* result);
+
+// Loops over the specified subset of the batch, processes one document at a time.
+// Returns a true to discontinue the insert, or false if not.
+bool WriteBatchExecutor::insertMany(WriteBatchExecutor::ExecInsertsState* state,
+                                    size_t startIndex,
+                                    size_t endIndex,
+                                    CurOp* currentOp,
+                                    std::vector<WriteErrorDetail*>* errors,
+                                    bool ordered) {
+    for (state->currIndex = startIndex; state->currIndex < endIndex; ++state->currIndex) {
+        WriteOpResult result;
+        BatchItemRef currInsertItem(state->request, state->currIndex);
+        {
+            stdx::lock_guard<Client> lk(*_txn->getClient());
+            currentOp->setQuery_inlock(currInsertItem.getDocument());
+            currentOp->debug().query = currInsertItem.getDocument();
+        }
+
+        _opCounters->gotInsert();
+        // Internally, insertOne retries the single insert until it completes without a write
+        // conflict exception, or until it fails with some kind of error.  Errors are mostly
+        // propagated via the request->error field, but DBExceptions or std::exceptions may escape,
+        // particularly on operation interruption.  These kinds of errors necessarily prevent
+        // further insertOne calls, and stop the batch.  As a result, the only expected source of
+        // such exceptions are interruptions.
+        insertOne(state, &result);
+
+        uint64_t nInserted = result.getStats().n;
+        _stats->numInserted += nInserted;
+        currentOp->debug().ninserted += nInserted;
+
+        const WriteErrorDetail* error = result.getError();
+        if (error) {
+            _le->setLastError(error->getErrCode(), error->getErrMessage().c_str());
+            WriteErrorDetail* error = NULL;
+            error = result.releaseError();
+            errors->push_back(error);
+            error->setIndex(state->currIndex);
+            logCurOpError(CurOp::get(_txn), error);
+            if (ordered)
+                return true;
+        } else {
+            _le->recordInsert(nInserted);
+        }
+    }
+    return false;
+}
+
+// Instantiates an ExecInsertsState, which represents all of the state for the batch.
+// Breaks out into manageably sized chunks for insertMany, between which we can yield.
+// Encapsulates the lock state.
 void WriteBatchExecutor::execInserts(const BatchedCommandRequest& request,
                                      std::vector<WriteErrorDetail*>* errors) {
-    // Theory of operation:
-    //
-    // Instantiates an ExecInsertsState, which represents all of the state involved in the batch
-    // insert execution algorithm.  Most importantly, encapsulates the lock state.
-    //
-    // Every iteration of the loop in execInserts() processes one document insertion, by calling
-    // insertOne() exactly once for a given value of state.currIndex.
-    //
-    // If the ExecInsertsState indicates that the requisite write locks are not held, insertOne
-    // acquires them and performs lock-acquisition-time checks.  However, on non-error
-    // execution, it does not release the locks.  Therefore, the yielding logic in the while
-    // loop in execInserts() is solely responsible for lock release in the non-error case.
-    //
-    // Internally, insertOne loops performing the single insert until it completes without a
-    // PageFaultException, or until it fails with some kind of error.  Errors are mostly
-    // propagated via the request->error field, but DBExceptions or std::exceptions may escape,
-    // particularly on operation interruption.  These kinds of errors necessarily prevent
-    // further insertOne calls, and stop the batch.  As a result, the only expected source of
-    // such exceptions are interruptions.
     ExecInsertsState state(_txn, &request);
     normalizeInserts(request, &state.normalizedInserts);
 
-    // Yield frequency is based on the same constants used by PlanYieldPolicy.
-    ElapsedTracker elapsedTracker(internalQueryExecYieldIterations, internalQueryExecYieldPeriodMS);
+    CurOp* currentOp;
+    {
+        stdx::lock_guard<Client> lk(*_txn->getClient());
+        currentOp = CurOp::get(_txn);
+        currentOp->setLogicalOp_inlock(LogicalOp::opInsert);
+        currentOp->ensureStarted();
+        currentOp->setNS_inlock(request.getNS().ns());
+        currentOp->debug().ninserted = 0;
+    }
 
-    for (state.currIndex = 0; state.currIndex < state.request->sizeWriteOps(); ++state.currIndex) {
-        if (state.currIndex + 1 == state.request->sizeWriteOps()) {
+    int64_t chunkCount = 0;
+    int64_t chunkBytes = 0;
+    const int64_t chunkMaxCount = internalQueryExecYieldIterations / 2;
+    size_t startIndex = 0;
+    size_t maxIndex = state.request->sizeWriteOps() - 1;
+
+    for (size_t i = 0; i <= maxIndex; ++i) {
+        if (i == maxIndex)
             setupSynchronousCommit(_txn);
-        }
+        state.currIndex = i;
+        BatchItemRef currInsertItem(state.request, state.currIndex);
+        chunkBytes += currInsertItem.getDocument().objsize();
+        chunkCount++;
 
-        if (elapsedTracker.intervalHasElapsed()) {
-            // Yield between inserts.
+        if ((chunkCount >= chunkMaxCount) || (chunkBytes >= insertVectorMaxBytes) ||
+            (i == maxIndex)) {
+            bool stop;
+            stop = insertMany(&state, startIndex, i + 1, currentOp, errors, request.getOrdered());
+            startIndex = i + 1;
+            chunkCount = 0;
+            chunkBytes = 0;
+
             if (state.hasLock()) {
-                // Release our locks. They get reacquired when insertOne() calls
-                // ExecInsertsState::lockAndCheck(). Since the lock manager guarantees FIFO
-                // queues waiting on locks, there is no need to explicitly sleep or give up
-                // control of the processor here.
+                // insertOne acquires the locks, but does not release them on non-error cases,
+                // so we release them here. insertOne() reacquires them via lockAndCheck().
                 state.unlock();
-
                 // This releases any storage engine held locks/snapshots.
                 _txn->recoveryUnit()->abandonSnapshot();
+                // Since the lock manager guarantees FIFO queues waiting on locks,
+                // there is no need to explicitly sleep or give up control of the processor here.
             }
-
-            _txn->checkForInterrupt();
-            elapsedTracker.resetLastTime();
-        }
-
-        WriteErrorDetail* error = NULL;
-        execOneInsert(&state, &error);
-        if (error) {
-            errors->push_back(error);
-            error->setIndex(state.currIndex);
-            if (request.getOrdered())
-                return;
+            if (stop)
+                break;
         }
     }
+
+    // TODO: Move Top and CurOp metrics management into an RAII object.
+    currentOp->done();
+    recordCurOpMetrics(_txn);
+    Top::get(_txn->getClient()->getServiceContext())
+        .record(currentOp->getNS(),
+                currentOp->getLogicalOp(),
+                1,  // "write locked"
+                currentOp->totalTimeMicros(),
+                currentOp->isCommand());
 }
 
 void WriteBatchExecutor::execUpdate(const BatchItemRef& updateItem,
@@ -827,7 +870,7 @@ void WriteBatchExecutor::execUpdate(const BatchItemRef& updateItem,
     // BEGIN CURRENT OP
     CurOp currentOp(_txn);
     beginCurrentOp(_txn, updateItem);
-    incOpStats(updateItem);
+    _opCounters->gotUpdate();
 
     WriteOpResult result;
     multiUpdate(_txn, updateItem, &result);
@@ -836,7 +879,7 @@ void WriteBatchExecutor::execUpdate(const BatchItemRef& updateItem,
         *upsertedId = result.getStats().upsertedID;
     }
     // END CURRENT OP
-    incWriteStats(updateItem, result.getStats(), result.getError(), &currentOp);
+    incWriteStats(updateItem.getOpType(), result.getStats(), result.getError(), &currentOp);
     finishCurrentOp(_txn, result.getError());
 
     // End current transaction and release snapshot.
@@ -854,13 +897,13 @@ void WriteBatchExecutor::execRemove(const BatchItemRef& removeItem, WriteErrorDe
     // BEGIN CURRENT OP
     CurOp currentOp(_txn);
     beginCurrentOp(_txn, removeItem);
-    incOpStats(removeItem);
+    _opCounters->gotDelete();
 
     WriteOpResult result;
     multiRemove(_txn, removeItem, &result);
 
     // END CURRENT OP
-    incWriteStats(removeItem, result.getStats(), result.getError(), &currentOp);
+    incWriteStats(removeItem.getOpType(), result.getStats(), result.getError(), &currentOp);
     finishCurrentOp(_txn, result.getError());
 
     // End current transaction and release snapshot.
@@ -927,16 +970,19 @@ bool WriteBatchExecutor::ExecInsertsState::_lockAndCheckImpl(WriteOpResult* resu
             return _lockAndCheckImpl(result, false);
         }
 
-        WriteUnitOfWork wunit(txn);
-        // Implicitly create if it doesn't exist
-        _collection = _database->createCollection(txn, request->getTargetingNS());
-        if (!_collection) {
-            result->setError(
-                toWriteError(Status(ErrorCodes::InternalError,
-                                    "could not create collection " + request->getTargetingNS())));
-            return false;
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            WriteUnitOfWork wunit(txn);
+            // Implicitly create if it doesn't exist
+            _collection = _database->createCollection(txn, request->getTargetingNS());
+            if (!_collection) {
+                result->setError(toWriteError(
+                    Status(ErrorCodes::InternalError,
+                           "could not create collection " + request->getTargetingNS())));
+                return false;
+            }
+            wunit.commit();
         }
-        wunit.commit();
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createCollection", request->getTargetingNS());
     }
     return true;
 }
@@ -985,7 +1031,7 @@ static void insertOne(WriteBatchExecutor::ExecInsertsState* state, WriteOpResult
                     Status status = state->getCollection()->insertDocument(txn, insertDoc, true);
 
                     if (status.isOK()) {
-                        result->getStats().n = 1;
+                        result->getStats().n++;
                         wunit.commit();
                     } else {
                         result->setError(toWriteError(status));
@@ -1011,23 +1057,6 @@ static void insertOne(WriteBatchExecutor::ExecInsertsState* state, WriteOpResult
     if (result->getError()) {
         txn->recoveryUnit()->abandonSnapshot();
         state->unlock();
-    }
-}
-
-void WriteBatchExecutor::execOneInsert(ExecInsertsState* state, WriteErrorDetail** error) {
-    BatchItemRef currInsertItem(state->request, state->currIndex);
-    CurOp currentOp(_txn);
-    beginCurrentOp(_txn, currInsertItem);
-    incOpStats(currInsertItem);
-
-    WriteOpResult result;
-    insertOne(state, &result);
-
-    incWriteStats(currInsertItem, result.getStats(), result.getError(), &currentOp);
-    finishCurrentOp(_txn, result.getError());
-
-    if (result.getError()) {
-        *error = result.releaseError();
     }
 }
 
@@ -1088,7 +1117,6 @@ static void multiUpdate(OperationContext* txn,
     }
 
     auto client = txn->getClient();
-    auto lastOpHolder = repl::ReplClientInfo::forClient(client);
     auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
     ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
                                                 &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
@@ -1211,8 +1239,7 @@ static void multiUpdate(OperationContext* txn,
             PlanSummaryStats summary;
             Explain::getSummaryStats(*exec, &summary);
             collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
-
-            if (lastOpHolder.getLastOp() != lastOpAtOperationStart) {
+            if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
                 // If this operation has already generated a new lastOp, don't bother setting it
                 // here. No-op updates will not generate a new lastOp, so we still need the guard to
                 // fire in that case.
@@ -1271,8 +1298,7 @@ static void multiRemove(OperationContext* txn,
     }
 
     auto client = txn->getClient();
-    auto lastOpHolder = repl::ReplClientInfo::forClient(client);
-    auto lastOpAtOperationStart = lastOpHolder.getLastOp();
+    auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
     ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
                                                 &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
                                                 txn);
@@ -1321,7 +1347,7 @@ static void multiRemove(OperationContext* txn,
             Explain::getSummaryStats(*exec, &summary);
             collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
 
-            if (lastOpHolder.getLastOp() != lastOpAtOperationStart) {
+            if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
                 // If this operation has already generated a new lastOp, don't bother setting it
                 // here. No-op updates will not generate a new lastOp, so we still need the guard to
                 // fire in that case.

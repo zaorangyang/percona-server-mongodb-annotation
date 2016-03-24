@@ -1,6 +1,6 @@
 # -*- mode: python -*-
 
-Import("env use_system_version_of_library usemozjs boostSuffix has_option")
+Import("env use_system_version_of_library usemozjs boostSuffix get_option")
 Import("wiredtiger")
 
 snappySuffix = '-1.1.2'
@@ -28,6 +28,11 @@ if not use_system_version_of_library('boost'):
 if not use_system_version_of_library('snappy'):
     thirdPartyIncludePathList.append(
         ('snappy', '#/src/third_party/snappy' + snappySuffix))
+
+# Valgrind is a header only include as valgrind.h includes everything we need
+if not use_system_version_of_library('valgrind'):
+    thirdPartyIncludePathList.append(
+        ('valgrind', '#/src/third_party/valgrind-3.11.0/include'))
 
 if not use_system_version_of_library('zlib'):
     thirdPartyIncludePathList.append(
@@ -129,6 +134,7 @@ if use_system_version_of_library("boost"):
                 env['LIBDEPS_BOOST_THREAD_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_SYSTEM_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_CHRONO_SYSLIBDEP'],
+                env['LIBDEPS_BOOST_REGEX_SYSLIBDEP'],
             ])
 else:
     boostDirectory = 'boost' + boostSuffix
@@ -142,6 +148,7 @@ else:
             boostDirectory + '/boost_thread',
             boostDirectory + '/boost_system',
             boostDirectory + '/boost_chrono',
+            boostDirectory + '/boost_regex',
         ])
 
 boostEnv.Library(
@@ -334,7 +341,7 @@ asioEnv.Library(
         'shim_asio.cpp'
     ])
 
-if has_option("experimental-decimal-support"):
+if get_option("experimental-decimal-support") == "on":
     if use_system_version_of_library("intel_decimal128"):
         intelDecimal128Env = env.Clone(
             SYSLIBDEPS=[

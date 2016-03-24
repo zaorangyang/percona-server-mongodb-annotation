@@ -1,13 +1,16 @@
-/* check that on a loss of primary, another node doesn't assume primary if it is stale
-   we force a stepDown to test this
-   we use lock+fsync to force secondary to be stale
-*/
+/**
+ * Check that on a loss of primary, another node doesn't assume primary if it is stale. We force a
+ * stepDown to test this.
+ *
+ * This test requires the fsync command to force a secondary to be stale.
+ * @tags: [requires_fsync]
+ */
 
-load("jstests/replsets/rslib.js")
+load("jstests/replsets/rslib.js");
 
 // utility to check if an error was due to connection failure.
 var errorWasDueToConnectionFailure = function(error) {
-    return error.message === "error doing query: failed";
+    return error.message.indexOf("error doing query: failed") >= 0;
 };
 
 var replTest = new ReplSetTest({
@@ -32,6 +35,7 @@ var replTest = new ReplSetTest({
 });
 var nodes = replTest.startSet();
 replTest.initiate();
+replTest.waitForState(nodes[0], replTest.PRIMARY, 60 * 1000);
 var master = replTest.getMaster();
 
 // do a write
@@ -45,7 +49,7 @@ replTest.liveNodes.slaves.forEach(function(slave) {
     printjson(assert.commandWorked(slave.getDB("admin").runCommand({fsync : 1, lock : 1})));
 });
 
-print("\nwaiting 11ish seconds");
+print("\nwaiting several seconds before stepdown");
 
 sleep(2000);
 
@@ -112,9 +116,9 @@ print("\nget a master");
 replTest.getMaster();
 
 assert.soon(function() {
-        var secondMaster = replTest.getMaster();
-        return firstMaster+"" != secondMaster+"";
-    }, 'making sure '+firstMaster+' isn\'t still master', 60000);
+    var secondMaster = replTest.getMaster();
+    return firstMaster.host !== secondMaster.host;
+}, "making sure " + firstMaster.host + " isn't still master", 60000);
 
 // Add arbiter for shutdown tests
 replTest.add();

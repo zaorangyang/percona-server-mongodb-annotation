@@ -79,10 +79,6 @@ public:
         return false;
     }
 
-    bool supportsReadConcern() const final {
-        return true;
-    }
-
     virtual void help(std::stringstream& help) const {
         help << "explain database reads and writes";
     }
@@ -142,8 +138,7 @@ public:
         bool commandCanRunOnSecondary = commToExplain->slaveOk();
 
         bool commandIsOverriddenToRunOnSecondary = commToExplain->slaveOverrideOk() &&
-            (rpc::ServerSelectionMetadata::get(txn).isSecondaryOk() ||
-             rpc::ServerSelectionMetadata::get(txn).getReadPreference() != boost::none);
+            rpc::ServerSelectionMetadata::get(txn).canRunOnSecondary();
         bool iAmStandalone = !txn->writesAreReplicated();
 
         const bool canRunHere = iAmPrimary || commandCanRunOnSecondary ||

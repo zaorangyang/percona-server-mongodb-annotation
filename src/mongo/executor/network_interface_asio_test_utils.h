@@ -49,6 +49,9 @@ public:
     MockCallbackState() = default;
     void cancel() override {}
     void waitForCompletion() override {}
+    bool isCanceled() const override {
+        return false;
+    }
 };
 
 TaskExecutor::CallbackHandle makeCallbackHandle() {
@@ -68,6 +71,11 @@ public:
 
     T& get() {
         return _get(_state.get());
+    }
+
+    bool hasCompleted() {
+        stdx::unique_lock<stdx::mutex> lk(_state->mtx);
+        return _state->thing.is_initialized();
     }
 
     template <typename Continuation>

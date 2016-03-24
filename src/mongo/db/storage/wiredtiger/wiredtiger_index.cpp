@@ -48,7 +48,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
@@ -148,7 +148,8 @@ StatusWith<std::string> WiredTigerIndex::parseIndexOptions(const BSONObj& option
 }
 
 // static
-StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string& sysIndexConfig,
+StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string& engineName,
+                                                              const std::string& sysIndexConfig,
                                                               const std::string& collIndexConfig,
                                                               const IndexDescriptor& desc) {
     str::stream ss;
@@ -176,7 +177,7 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
     if (storageEngineElement.isABSONObj()) {
         BSONObj storageEngine = storageEngineElement.Obj();
         StatusWith<std::string> parseStatus =
-            parseIndexOptions(storageEngine.getObjectField(kWiredTigerEngineName));
+            parseIndexOptions(storageEngine.getObjectField(engineName));
         if (!parseStatus.isOK()) {
             return parseStatus;
         }
@@ -262,7 +263,7 @@ void WiredTigerIndex::fullValidate(OperationContext* txn,
                                    bool full,
                                    long long* numKeysOut,
                                    BSONObjBuilder* output) const {
-    {
+    if (!WiredTigerRecoveryUnit::get(txn)->getSessionCache()->isEphemeral()) {
         std::vector<std::string> errors;
         int err = WiredTigerUtil::verifyTable(txn, _uri, output ? &errors : NULL);
         if (err == EBUSY) {
@@ -376,6 +377,15 @@ bool WiredTigerIndex::isEmpty(OperationContext* txn) {
     invariantWTOK(ret);
     return false;
 }
+
+Status WiredTigerIndex::touch(OperationContext* txn) const {
+    if (WiredTigerRecoveryUnit::get(txn)->getSessionCache()->isEphemeral()) {
+        // Everything is already in memory.
+        return Status::OK();
+    }
+    return Status(ErrorCodes::CommandNotSupported, "this storage engine does not support touch");
+}
+
 
 long long WiredTigerIndex::getSpaceUsedBytes(OperationContext* txn) const {
     WiredTigerSession* session = WiredTigerRecoveryUnit::get(txn)->getSession(txn);
@@ -683,6 +693,14 @@ public:
         invariant(WiredTigerRecoveryUnit::get(_txn)->getSession(_txn) == _cursor->getSession());
 
         if (!_eof) {
+            // Unique indices *don't* include the record id in their KeyStrings. If we seek to the
+            // same key with a new record id, seeking will successfully find the key and will return
+            // true. This will cause us to skip the key with the new record id, since we set
+            // _lastMoveWasRestore to false.
+            //
+            // Standard (non-unique) indices *do* include the record id in their KeyStrings. This
+            // means that restoring to the same key with a new record id will return false, and we
+            // will *not* skip the key with the new record id.
             _lastMoveWasRestore = !seekWTCursor(_key);
             TRACE_CURSOR << "restore _lastMoveWasRestore:" << _lastMoveWasRestore;
         }
@@ -822,7 +840,7 @@ protected:
     KeyString _key;
     KeyString::TypeBits _typeBits;
     RecordId _id;
-    bool _eof = false;
+    bool _eof = true;
 
     // This differs from _eof in that it always reflects the result of the most recent call to
     // reposition _cursor.
@@ -857,38 +875,6 @@ class WiredTigerIndexUniqueCursor final : public WiredTigerIndexCursorBase {
 public:
     WiredTigerIndexUniqueCursor(const WiredTigerIndex& idx, OperationContext* txn, bool forward)
         : WiredTigerIndexCursorBase(idx, txn, forward) {}
-
-    void restore() override {
-        WiredTigerIndexCursorBase::restore();
-
-        // In addition to seeking to the correct key, we also need to make sure that the id is
-        // on the correct side of _id.
-        if (_lastMoveWasRestore)
-            return;  // We are on a different key so no need to check id.
-        if (_eof)
-            return;
-
-        // If we get here we need to look at the actual RecordId for this key and make sure we
-        // are supposed to see it.
-        WT_CURSOR* c = _cursor->get();
-        WT_ITEM item;
-        invariantWTOK(c->get_value(c, &item));
-
-        BufReader br(item.data, item.size);
-        RecordId idInIndex = KeyString::decodeRecordId(&br);
-
-        TRACE_CURSOR << "restore"
-                     << " _id:" << _id << " idInIndex:" << idInIndex;
-
-        if (idInIndex == _id)
-            return;
-
-        _lastMoveWasRestore = true;
-        if (_forward && (idInIndex < _id))
-            advanceWTCursor();
-        if (!_forward && (idInIndex > _id))
-            advanceWTCursor();
-    }
 
     void updateIdAndTypeBits() override {
         // We assume that cursors can only ever see unique indexes in their "pristine" state,

@@ -46,16 +46,35 @@ void FTDCCollectorCollection::add(std::unique_ptr<FTDCCollectorInterface> collec
     _collectors.emplace_back(std::move(collector));
 }
 
-BSONObj FTDCCollectorCollection::collect(Client* client) {
+std::tuple<BSONObj, Date_t> FTDCCollectorCollection::collect(Client* client) {
+    // If there are no collectors, just return an empty BSONObj so that that are caller knows we did
+    // not collect anything
+    if (_collectors.empty()) {
+        return std::tuple<BSONObj, Date_t>(BSONObj(), Date_t());
+    }
+
     BSONObjBuilder builder;
+
+    Date_t start = client->getServiceContext()->getClockSource()->now();
+    Date_t end;
+    bool firstLoop = true;
+
+    builder.appendDate(kFTDCCollectStartField, start);
 
     for (auto& collector : _collectors) {
         BSONObjBuilder subObjBuilder(builder.subobjStart(collector->name()));
 
         // Add a Date_t before and after each BSON is collected so that we can track timing of the
         // collector.
-        subObjBuilder.appendDate(kFTDCCollectStartField,
-                                 client->getServiceContext()->getClockSource()->now());
+        Date_t now = start;
+
+        if (!firstLoop) {
+            now = client->getServiceContext()->getClockSource()->now();
+        }
+
+        firstLoop = false;
+
+        subObjBuilder.appendDate(kFTDCCollectStartField, now);
 
         {
             // Create a operation context per command so that we do not share operation contexts
@@ -65,11 +84,13 @@ BSONObj FTDCCollectorCollection::collect(Client* client) {
             collector->collect(txn.get(), subObjBuilder);
         }
 
-        subObjBuilder.appendDate(kFTDCCollectEndField,
-                                 client->getServiceContext()->getClockSource()->now());
+        end = client->getServiceContext()->getClockSource()->now();
+        subObjBuilder.appendDate(kFTDCCollectEndField, end);
     }
 
-    return builder.obj();
+    builder.appendDate(kFTDCCollectEndField, end);
+
+    return std::tuple<BSONObj, Date_t>(builder.obj(), start);
 }
 
 }  // namespace mongo

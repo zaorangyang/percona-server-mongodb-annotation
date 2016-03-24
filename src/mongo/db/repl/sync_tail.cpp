@@ -45,7 +45,9 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/dbhelpers.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/global_timestamp.h"
@@ -65,6 +67,7 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -129,6 +132,99 @@ bool isCrudOpType(const char* field) {
     return false;
 }
 }
+
+namespace {
+
+class ApplyBatchFinalizer {
+public:
+    ApplyBatchFinalizer(ReplicationCoordinator* replCoord);
+    ~ApplyBatchFinalizer();
+
+    /**
+     * In PV0, calls ReplicationCoordinator::setMyLastOptime with "newOp".
+     * In PV1, sets _latestOpTime to be "newOp" and signals the _waiterThread.
+     */
+    void record(OpTime newOp);
+
+private:
+    /**
+     * Loops continuously, waiting for writes to be flushed to disk and then calls
+     * ReplicationCoordinator::setMyLastOptime with _latestOpTime.
+     * Terminates once _shutdownSignaled is set true.
+     */
+    void _run();
+
+    // Used to update the replication system's progress.
+    ReplicationCoordinator* _replCoord;
+    // Protects _cond, _shutdownSignaled, and _latestOpTime.
+    stdx::mutex _mutex;
+    // Used to alert our thread of a new OpTime.
+    stdx::condition_variable _cond;
+    // The next OpTime to set as the ReplicationCoordinator's lastOpTime after flushing.
+    OpTime _latestOpTime;
+    // Once this is set to true the _run method will terminate.
+    bool _shutdownSignaled;
+    // Thread that will _run(). Must be initialized last as it depends on the other variables.
+    stdx::thread _waiterThread;
+};
+
+ApplyBatchFinalizer::ApplyBatchFinalizer(ReplicationCoordinator* replCoord)
+    : _replCoord(replCoord),
+      _shutdownSignaled(false),
+      _waiterThread(&ApplyBatchFinalizer::_run, this) {}
+
+ApplyBatchFinalizer::~ApplyBatchFinalizer() {
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    _shutdownSignaled = true;
+    _cond.notify_all();
+    lock.unlock();
+
+    _waiterThread.join();
+}
+
+void ApplyBatchFinalizer::record(OpTime newOp) {
+    const bool mustWaitUntilDurable = _replCoord->isV1ElectionProtocol();
+    if (!mustWaitUntilDurable) {
+        // We have to use setMyLastOptimeForward since this thread races with
+        // logTransitionToPrimaryToOplog.
+        _replCoord->setMyLastOptimeForward(newOp);
+        return;
+    }
+
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    _latestOpTime = newOp;
+    _cond.notify_all();
+}
+
+void ApplyBatchFinalizer::_run() {
+    Client::initThread("ApplyBatchFinalizer");
+
+    while (true) {
+        OpTime latestOpTime;
+
+        {
+            stdx::unique_lock<stdx::mutex> lock(_mutex);
+            while (_latestOpTime.isNull() && !_shutdownSignaled) {
+                _cond.wait(lock);
+            }
+
+            if (_shutdownSignaled) {
+                return;
+            }
+
+            latestOpTime = _latestOpTime;
+            _latestOpTime = OpTime();
+        }
+
+        auto txn = cc().makeOperationContext();
+        txn->recoveryUnit()->goingToWaitUntilDurable();
+        txn->recoveryUnit()->waitUntilDurable();
+        // We have to use setMyLastOptimeForward since this thread races with
+        // logTransitionToPrimaryToOplog.
+        _replCoord->setMyLastOptimeForward(latestOpTime);
+    }
+}
+}  // anonymous namespace containing ApplyBatchFinalizer definitions.
 
 SyncTail::SyncTail(BackgroundSyncInterface* q, MultiSyncApplyFunc func)
     : _networkQueue(q),
@@ -292,10 +388,10 @@ void prefetchOp(const BSONObj& op) {
 }
 
 // Doles out all the work to the reader pool threads and waits for them to complete
-void prefetchOps(const std::deque<BSONObj>& ops, OldThreadPool* prefetcherPool) {
+void prefetchOps(const std::deque<SyncTail::OplogEntry>& ops, OldThreadPool* prefetcherPool) {
     invariant(prefetcherPool);
-    for (std::deque<BSONObj>::const_iterator it = ops.begin(); it != ops.end(); ++it) {
-        prefetcherPool->schedule(&prefetchOp, *it);
+    for (auto&& op : ops) {
+        prefetcherPool->schedule(&prefetchOp, op.raw);
     }
     prefetcherPool->join();
 }
@@ -313,31 +409,68 @@ void applyOps(const std::vector<std::vector<BSONObj>>& writerVectors,
             writerPool->schedule(func, stdx::cref(*it), sync);
         }
     }
-    writerPool->join();
 }
 
-void fillWriterVectors(const std::deque<BSONObj>& ops,
+/**
+ * A caching functor that returns true if a namespace refers to a capped collection.
+ * Collections that don't exist are implicitly not capped.
+ */
+class CachingCappedChecker {
+public:
+    bool operator()(OperationContext* txn, const StringMapTraits::HashedKey& ns) {
+        auto it = _cache.find(ns);
+        if (it != _cache.end()) {
+            return it->second;
+        }
+
+        bool isCapped = isCappedImpl(txn, ns.key());
+        _cache[ns] = isCapped;
+        return isCapped;
+    }
+
+private:
+    bool isCappedImpl(OperationContext* txn, StringData ns) {
+        auto db = dbHolder().get(txn, ns);
+        if (!db)
+            return false;
+
+        auto collection = db->getCollection(ns);
+        return collection && collection->isCapped();
+    }
+
+    StringMap<bool> _cache;
+};
+
+void fillWriterVectors(OperationContext* txn,
+                       const std::deque<SyncTail::OplogEntry>& ops,
                        std::vector<std::vector<BSONObj>>* writerVectors) {
-    for (std::deque<BSONObj>::const_iterator it = ops.begin(); it != ops.end(); ++it) {
-        const BSONElement e = it->getField("ns");
-        verify(e.type() == String);
-        const char* ns = e.valuestr();
-        int len = e.valuestrsize();
-        uint32_t hash = 0;
-        MurmurHash3_x86_32(ns, len, 0, &hash);
+    const bool supportsDocLocking =
+        getGlobalServiceContext()->getGlobalStorageEngine()->supportsDocLocking();
+    const uint32_t numWriters = writerVectors->size();
 
-        const char* opType = it->getField("op").valuestrsafe();
+    Lock::GlobalRead globalReadLock(txn->lockState());
 
-        if (getGlobalServiceContext()->getGlobalStorageEngine()->supportsDocLocking() &&
-            isCrudOpType(opType)) {
+    CachingCappedChecker isCapped;
+
+    for (auto&& op : ops) {
+        StringMapTraits::HashedKey hashedNs(op.ns);
+        uint32_t hash = hashedNs.hash();
+
+        const char* opType = op.opType.rawData();
+
+        // For doc locking engines, include the _id of the document in the hash so we get
+        // parallelism even if all writes are to a single collection. We can't do this for capped
+        // collections because the order of inserts is a guaranteed property, unlike for normal
+        // collections.
+        if (supportsDocLocking && isCrudOpType(opType) && !isCapped(txn, hashedNs)) {
             BSONElement id;
             switch (opType[0]) {
                 case 'u':
-                    id = it->getField("o2").Obj()["_id"];
+                    id = op.o2.Obj()["_id"];
                     break;
                 case 'd':
                 case 'i':
-                    id = it->getField("o").Obj()["_id"];
+                    id = op.o.Obj()["_id"];
                     break;
             }
 
@@ -345,14 +478,14 @@ void fillWriterVectors(const std::deque<BSONObj>& ops,
             MurmurHash3_x86_32(&idHash, sizeof(idHash), hash, &hash);
         }
 
-        (*writerVectors)[hash % writerVectors->size()].push_back(*it);
+        (*writerVectors)[hash % numWriters].push_back(op.raw);
     }
 }
 
 }  // namespace
 
 // Applies a batch of oplog entries, by using a set of threads to apply the operations and then
-// writes the oplog entries to the local oplog. At the end we update the lastOpTime.
+// writes the oplog entries to the local oplog.
 OpTime SyncTail::multiApply(OperationContext* txn, const OpQueue& ops) {
     invariant(_applyFunc);
 
@@ -363,7 +496,7 @@ OpTime SyncTail::multiApply(OperationContext* txn, const OpQueue& ops) {
 
     std::vector<std::vector<BSONObj>> writerVectors(replWriterThreadCount);
 
-    fillWriterVectors(ops.getDeque(), &writerVectors);
+    fillWriterVectors(txn, ops.getDeque(), &writerVectors);
     LOG(2) << "replication batch size is " << ops.getDeque().size() << endl;
     // We must grab this because we're going to grab write locks later.
     // We hold this mutex the entire time we're writing; it doesn't matter
@@ -381,23 +514,28 @@ OpTime SyncTail::multiApply(OperationContext* txn, const OpQueue& ops) {
 
     applyOps(writerVectors, &_writerPool, _applyFunc, this);
 
-    if (inShutdown()) {
-        return OpTime();
+    OpTime lastOpTime;
+    {
+        ON_BLOCK_EXIT([&] { _writerPool.join(); });
+        std::vector<BSONObj> raws;
+        raws.reserve(ops.getDeque().size());
+        for (auto&& op : ops.getDeque()) {
+            raws.emplace_back(op.raw);
+        }
+        lastOpTime = writeOpsToOplog(txn, raws);
+        if (inShutdown()) {
+            return OpTime();
+        }
     }
-
-    OpTime lastOpTime = writeOpsToOplog(txn, ops.getDeque());
-
-    ReplClientInfo::forClient(txn->getClient()).setLastOp(lastOpTime);
-    replCoord->setMyLastOptime(lastOpTime);
-    setNewTimestamp(lastOpTime.getTimestamp());
-
-    BackgroundSync::get()->notify(txn);
-
+    // We have now written all database writes and updated the oplog to match.
     return lastOpTime;
 }
 
 namespace {
-void tryToGoLiveAsASecondary(OperationContext* txn, ReplicationCoordinator* replCoord) {
+void tryToGoLiveAsASecondary(OperationContext* txn,
+                             ReplicationCoordinator* replCoord,
+                             const BatchBoundaries& minValidBoundaries,
+                             const OpTime& lastWriteOpTime) {
     if (replCoord->isInPrimaryOrSecondaryState()) {
         return;
     }
@@ -416,8 +554,15 @@ void tryToGoLiveAsASecondary(OperationContext* txn, ReplicationCoordinator* repl
         return;
     }
 
-    BatchBoundaries boundaries = getMinValid(txn);
-    if (!boundaries.start.isNull() || boundaries.end > replCoord->getMyLastOptime()) {
+    // If an apply batch is active then we cannot transition.
+    if (!minValidBoundaries.start.isNull()) {
+        return;
+    }
+
+    // Must have applied/written to minvalid, so return if not.
+    // -- If 'lastWriteOpTime' is null/uninitialized then we can't transition.
+    // -- If 'lastWriteOpTime' is less than the end of the last batch then we can't transition.
+    if (lastWriteOpTime.isNull() || minValidBoundaries.end > lastWriteOpTime) {
         return;
     }
 
@@ -429,81 +574,147 @@ void tryToGoLiveAsASecondary(OperationContext* txn, ReplicationCoordinator* repl
 }
 }
 
+class SyncTail::OpQueueBatcher {
+    MONGO_DISALLOW_COPYING(OpQueueBatcher);
+
+public:
+    explicit OpQueueBatcher(SyncTail* syncTail) : _syncTail(syncTail), _thread([&] { run(); }) {}
+    ~OpQueueBatcher() {
+        _inShutdown.store(true);
+        _cv.notify_all();
+        _thread.join();
+    }
+
+    OpQueue getNextBatch(Seconds maxWaitTime) {
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        if (_ops.empty()) {
+            // We intentionally don't care about whether this returns due to signaling or timeout
+            // since we do the same thing either way: return whatever is in _ops.
+            (void)_cv.wait_for(lk, maxWaitTime);
+        }
+
+        OpQueue ops = std::move(_ops);
+        _ops = {};
+        _cv.notify_all();
+
+        return ops;
+    }
+
+private:
+    void run() {
+        Client::initThread("ReplBatcher");
+        OperationContextImpl txn;
+        auto replCoord = ReplicationCoordinator::get(&txn);
+
+        while (!_inShutdown.load()) {
+            Timer batchTimer;
+
+            OpQueue ops;
+            // tryPopAndWaitForMore returns true when we need to end a batch early
+            while (!_syncTail->tryPopAndWaitForMore(&txn, &ops) &&
+                   (ops.getSize() < replBatchLimitBytes) && !_inShutdown.load()) {
+                int now = batchTimer.seconds();
+
+                // apply replication batch limits
+                if (!ops.empty()) {
+                    if (now > replBatchLimitSeconds)
+                        break;
+                    if (ops.getDeque().size() > replBatchLimitOperations)
+                        break;
+                }
+
+                const int slaveDelaySecs = durationCount<Seconds>(replCoord->getSlaveDelaySecs());
+                if (!ops.empty() && slaveDelaySecs > 0) {
+                    const BSONObj lastOp = ops.back().raw;
+                    const unsigned int opTimestampSecs = lastOp["ts"].timestamp().getSecs();
+
+                    // Stop the batch as the lastOp is too new to be applied. If we continue
+                    // on, we can get ops that are way ahead of the delay and this will
+                    // make this thread sleep longer when handleSlaveDelay is called
+                    // and apply ops much sooner than we like.
+                    if (opTimestampSecs > static_cast<unsigned int>(time(0) - slaveDelaySecs)) {
+                        break;
+                    }
+                }
+
+                if (MONGO_FAIL_POINT(rsSyncApplyStop)) {
+                    break;
+                }
+
+                // keep fetching more ops as long as we haven't filled up a full batch yet
+            }
+
+            // For pausing replication in tests
+            while (MONGO_FAIL_POINT(rsSyncApplyStop) && !_inShutdown.load()) {
+                sleepmillis(0);
+            }
+
+            stdx::unique_lock<stdx::mutex> lk(_mutex);
+            while (!_ops.empty()) {
+                // Block until the previous batch has been taken.
+                if (_inShutdown.load())
+                    return;
+                _cv.wait(lk);
+            }
+            _ops = std::move(ops);
+            _cv.notify_all();
+        }
+    }
+
+    AtomicWord<bool> _inShutdown;
+    SyncTail* const _syncTail;
+
+    stdx::mutex _mutex;  // Guards _ops.
+    stdx::condition_variable _cv;
+    OpQueue _ops;
+
+    stdx::thread _thread;  // Must be last so all other members are initialized before starting.
+};
+
 /* tail an oplog.  ok to return, will be re-called. */
 void SyncTail::oplogApplication() {
-    ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
+    OpQueueBatcher batcher(this);
 
     OperationContextImpl txn;
-    OpTime originalEndOpTime(getMinValid(&txn).end);
+    auto replCoord = ReplicationCoordinator::get(&txn);
+    ApplyBatchFinalizer finalizer(replCoord);
+
+    auto minValidBoundaries = getMinValid(&txn);
+    OpTime originalEndOpTime(minValidBoundaries.end);
+    OpTime lastWriteOpTime{replCoord->getMyLastOptime()};
     while (!inShutdown()) {
         OpQueue ops;
 
-        Timer batchTimer;
-        int lastTimeChecked = 0;
-
         do {
-            int now = batchTimer.seconds();
-
-            // apply replication batch limits
-            if (!ops.empty()) {
-                if (now > replBatchLimitSeconds)
-                    break;
-                if (ops.getDeque().size() > replBatchLimitOperations)
-                    break;
-            }
-            // occasionally check some things
-            // (always checked in the first iteration of this do-while loop, because
-            // ops is empty)
-            if (ops.empty() || now > lastTimeChecked) {
-                BackgroundSync* bgsync = BackgroundSync::get();
-                if (bgsync->getInitialSyncRequestedFlag()) {
-                    // got a resync command
-                    return;
-                }
-                lastTimeChecked = now;
-                // can we become secondary?
-                // we have to check this before calling mgr, as we must be a secondary to
-                // become primary
-                tryToGoLiveAsASecondary(&txn, replCoord);
-            }
-
-            const int slaveDelaySecs = durationCount<Seconds>(replCoord->getSlaveDelaySecs());
-            if (!ops.empty() && slaveDelaySecs > 0) {
-                const BSONObj lastOp = ops.back();
-                const unsigned int opTimestampSecs = lastOp["ts"].timestamp().getSecs();
-
-                // Stop the batch as the lastOp is too new to be applied. If we continue
-                // on, we can get ops that are way ahead of the delay and this will
-                // make this thread sleep longer when handleSlaveDelay is called
-                // and apply ops much sooner than we like.
-                if (opTimestampSecs > static_cast<unsigned int>(time(0) - slaveDelaySecs)) {
-                    break;
-                }
-            }
-
-            if (MONGO_FAIL_POINT(rsSyncApplyStop)) {
-                break;
-            }
-
-            // keep fetching more ops as long as we haven't filled up a full batch yet
-        } while (!tryPopAndWaitForMore(&txn, &ops, replCoord) &&  // tryPopAndWaitForMore returns
-                                                                  // true when we need to end a
-                                                                  // batch early
-                 (ops.getSize() < replBatchLimitBytes) &&
-                 !inShutdown());
-
-        // For pausing replication in tests
-        while (MONGO_FAIL_POINT(rsSyncApplyStop)) {
-            sleepmillis(0);
-            if (inShutdown())
+            if (BackgroundSync::get()->getInitialSyncRequestedFlag()) {
+                // got a resync command
                 return;
+            }
+
+            tryToGoLiveAsASecondary(&txn, replCoord, minValidBoundaries, lastWriteOpTime);
+
+            // Blocks up to a second waiting for a batch to be ready to apply. If one doesn't become
+            // ready in time, we'll loop again so we can do the above checks periodically.
+            ops = batcher.getNextBatch(Seconds(1));
+        } while (!inShutdown() && ops.empty());
+
+        if (inShutdown())
+            return;
+
+        invariant(!ops.empty());
+
+        const BSONObj lastOp = ops.back().raw;
+
+        if (lastOp.isEmpty()) {
+            // This means that the network thread has coalesced and we have processed all of its
+            // data.
+            invariant(ops.getDeque().size() == 1);
+            if (replCoord->isWaitingForApplierToDrain()) {
+                replCoord->signalDrainComplete(&txn);
+            }
+            continue;  // This wasn't a real op. Don't try to apply it.
         }
 
-        if (ops.empty()) {
-            continue;
-        }
-
-        const BSONObj lastOp = ops.back();
         handleSlaveDelay(lastOp);
 
         // Set minValid to the last OpTime that needs to be applied, in this batch or from the
@@ -531,18 +742,30 @@ void SyncTail::oplogApplication() {
         // This write will not journal/checkpoint.
         setMinValid(&txn, {start, end});
 
-        const bool mustWaitUntilDurable =
-            shouldEnsureDurability() && replCoord->isV1ElectionProtocol();
-        if (mustWaitUntilDurable) {
-            txn.recoveryUnit()->goingToWaitUntilDurable();
+        lastWriteOpTime = multiApply(&txn, ops);
+        setNewTimestamp(lastWriteOpTime.getTimestamp());
+
+        setMinValid(&txn, end, DurableRequirement::None);
+        minValidBoundaries.start = {};
+        minValidBoundaries.end = end;
+        finalizer.record(lastWriteOpTime);
+    }
+}
+
+SyncTail::OplogEntry::OplogEntry(const BSONObj& rawInput) : raw(rawInput.getOwned()) {
+    for (auto elem : raw) {
+        const auto name = elem.fieldNameStringData();
+        if (name == "ns") {
+            ns = elem.valuestrsafe();
+        } else if (name == "op") {
+            opType = elem.valuestrsafe();
+        } else if (name == "o2") {
+            o2 = elem;
+        } else if (name == "v") {
+            version = elem;
+        } else if (name == "o") {
+            o = elem;
         }
-
-        multiApply(&txn, ops);
-
-        // This write will journal/checkpoint, and finish the batch.
-        setMinValid(&txn,
-                    end,
-                    mustWaitUntilDurable ? DurableRequirement::Strong : DurableRequirement::None);
     }
 }
 
@@ -553,9 +776,7 @@ void SyncTail::oplogApplication() {
 // This function also blocks 1 second waiting for new ops to appear in the bgsync
 // queue.  We can't block forever because there are maintenance things we need
 // to periodically check in the loop.
-bool SyncTail::tryPopAndWaitForMore(OperationContext* txn,
-                                    SyncTail::OpQueue* ops,
-                                    ReplicationCoordinator* replCoord) {
+bool SyncTail::tryPopAndWaitForMore(OperationContext* txn, SyncTail::OpQueue* ops) {
     BSONObj op;
     // Check to see if there are ops waiting in the bgsync queue
     bool peek_success = peek(&op);
@@ -563,16 +784,6 @@ bool SyncTail::tryPopAndWaitForMore(OperationContext* txn,
     if (!peek_success) {
         // if we don't have anything in the queue, wait a bit for something to appear
         if (ops->empty()) {
-            if (replCoord->isWaitingForApplierToDrain()) {
-                BackgroundSync::get()->waitUntilPaused();
-                if (peek(&op)) {
-                    // The producer generated a last batch of ops before pausing so return
-                    // false so that we'll come back and apply them before signaling the drain
-                    // is complete.
-                    return false;
-                }
-                replCoord->signalDrainComplete(txn);
-            }
             // block up to 1 second
             _networkQueue->waitForMore();
             return false;
@@ -582,16 +793,17 @@ bool SyncTail::tryPopAndWaitForMore(OperationContext* txn,
         return true;
     }
 
-    const char* ns = op["ns"].valuestrsafe();
+    auto entry = OplogEntry(op);
 
-    // check for commands
-    if ((op["op"].valuestrsafe()[0] == 'c') ||
+    // Check for ops that must be processed one at a time.
+    if (entry.raw.isEmpty() ||       // sentinel that network queue is drained.
+        (entry.opType[0] == 'c') ||  // commands.
         // Index builds are acheived through the use of an insert op, not a command op.
         // The following line is the same as what the insert code uses to detect an index build.
-        (*ns != '\0' && nsToCollectionSubstring(ns) == "system.indexes")) {
+        (!entry.ns.empty() && nsToCollectionSubstring(entry.ns) == "system.indexes")) {
         if (ops->empty()) {
             // apply commands one-at-a-time
-            ops->push_back(op);
+            ops->push_back(std::move(entry));
             _networkQueue->consume();
         }
 
@@ -600,13 +812,12 @@ bool SyncTail::tryPopAndWaitForMore(OperationContext* txn,
     }
 
     // check for oplog version change
-    BSONElement elemVersion = op["v"];
     int curVersion = 0;
-    if (elemVersion.eoo())
+    if (entry.version.eoo())
         // missing version means version 1
         curVersion = 1;
     else
-        curVersion = elemVersion.Int();
+        curVersion = entry.version.Int();
 
     if (curVersion != OPLOG_VERSION) {
         severe() << "expected oplog version " << OPLOG_VERSION << " but found version "
@@ -615,7 +826,7 @@ bool SyncTail::tryPopAndWaitForMore(OperationContext* txn,
     }
 
     // Copy the op to the deque and remove it from the bgsync queue.
-    ops->push_back(op);
+    ops->push_back(std::move(entry));
     _networkQueue->consume();
 
     // Go back for more ops

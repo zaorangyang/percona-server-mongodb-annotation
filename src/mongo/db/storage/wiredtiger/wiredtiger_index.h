@@ -62,7 +62,8 @@ public:
      * Note that even if this function returns an OK status, WT_SESSION:create() may still
      * fail with the constructed configuration string.
      */
-    static StatusWith<std::string> generateCreateString(const std::string& sysIndexConfig,
+    static StatusWith<std::string> generateCreateString(const std::string& engineName,
+                                                        const std::string& sysIndexConfig,
                                                         const std::string& collIndexConfig,
                                                         const IndexDescriptor& desc);
 
@@ -98,6 +99,8 @@ public:
     virtual Status dupKeyCheck(OperationContext* txn, const BSONObj& key, const RecordId& id);
 
     virtual bool isEmpty(OperationContext* txn);
+
+    virtual Status touch(OperationContext* txn) const;
 
     virtual long long getSpaceUsedBytes(OperationContext* txn) const;
 
