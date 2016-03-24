@@ -1,4 +1,9 @@
 Import("env")
+Import("rocksdb")
+
+extraStorageDirs = []
+if rocksdb:
+    extraStorageDirs.append('rocks')
 
 env.SConscript(
     dirs=[
@@ -10,7 +15,7 @@ env.SConscript(
         'mmap_v1',
         'tokuft',
         'wiredtiger',
-    ],
+    ] + extraStorageDirs,
 )
 
 
