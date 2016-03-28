@@ -241,7 +241,7 @@ namespace mongo {
         }
 
         uint32_t cacheSizeGB = cacheSize >> 30;
-        uint32_t cacheSizeB = cacheSize & ~uint32_t(1<<30);
+        uint32_t cacheSizeB = cacheSize & (uint32_t(1<<30)-1);
 
         // TODO: Lock wait timeout callback, lock killed callback
         // TODO: logdir
