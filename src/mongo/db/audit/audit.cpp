@@ -803,8 +803,12 @@ namespace audit {
         BSONObjBuilder params;
         params << "role" << role.getRole()
                << "db" << role.getDB();
-        appendRoles(params, *roles);
-        appendPrivileges(params, *privileges);
+        if (roles) {
+            appendRoles(params, *roles);
+        }
+        if (privileges) {
+            appendPrivileges(params, *privileges);
+        }
         _auditEvent(client, "updateRole", params.done());
     }
 
