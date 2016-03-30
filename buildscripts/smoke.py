@@ -238,6 +238,16 @@ class mongod(NullMongod):
         params = self.kwargs.get('set_parameters', None)
         if params:
             for p in params.split(','): argv += ['--setParameter', p]
+        params = self.kwargs.get('mongod_add_options', None)
+        if params:
+            for p in params.split(','):
+                option=p.split('=')
+                if len(option) == 1:
+                    argv += ['--' + option[0]]
+                elif len(option) == 2:
+                    argv += ['--' + option[0], option[1]]
+                else:
+                    raise Exception("Invalid mongod-add-options:" + params)
         if self.kwargs.get('small_oplog_rs'):
             argv += ["--replSet", "foo", "--oplogSize", "511"]
         if self.kwargs.get('no_journal'):
@@ -582,6 +592,7 @@ def runTest(test, result):
                      'TestData.testName = "' + re.sub( ".js$", "", os.path.basename( path ) ) + '";' + \
                      'TestData.setParameters = "' + ternary( set_parameters, set_parameters, "" )  + '";' + \
                      'TestData.setParametersMongos = "' + ternary( set_parameters_mongos, set_parameters_mongos, "" )  + '";' + \
+                     'TestData.mongodAddOptions = "' + ternary( mongod_add_options, mongod_add_options, "" )  + '";' + \
                      'TestData.noJournal = ' + ternary( no_journal )  + ";" + \
                      'TestData.noJournalPrealloc = ' + ternary( no_preallocj )  + ";" + \
                      'TestData.auth = ' + ternary( auth ) + ";" + \
@@ -698,6 +709,7 @@ def run_tests(tests):
                             wiredtiger_collection_config_string=wiredtiger_collection_config_string,
                             wiredtiger_index_config_string=wiredtiger_index_config_string,
                             set_parameters=set_parameters,
+                            mongod_add_options=mongod_add_options,
                             no_preallocj=no_preallocj,
                             auth=auth,
                             authMechanism=authMechanism,
@@ -714,7 +726,8 @@ def run_tests(tests):
                            wiredtiger_engine_config_string=wiredtiger_engine_config_string,
                            wiredtiger_collection_config_string=wiredtiger_collection_config_string,
                            wiredtiger_index_config_string=wiredtiger_index_config_string,
-                           set_parameters=set_parameters)
+                           set_parameters=set_parameters,
+                           mongod_add_options=mongod_add_options)
             slave.start()
         elif small_oplog_rs:
             slave = mongod(slave=True,
@@ -726,6 +739,7 @@ def run_tests(tests):
                            wiredtiger_collection_config_string=wiredtiger_collection_config_string,
                            wiredtiger_index_config_string=wiredtiger_index_config_string,
                            set_parameters=set_parameters,
+                           mongod_add_options=mongod_add_options,
                            no_preallocj=no_preallocj,
                            auth=auth,
                            authMechanism=authMechanism,
@@ -809,6 +823,7 @@ def run_tests(tests):
                                         wiredtiger_collection_config_string=wiredtiger_collection_config_string,
                                         wiredtiger_index_config_string=wiredtiger_index_config_string,
                                         set_parameters=set_parameters,
+                                        mongod_add_options=mongod_add_options,
                                         no_preallocj=no_preallocj,
                                         auth=auth,
                                         authMechanism=authMechanism,
@@ -1081,6 +1096,7 @@ def set_globals(options, tests):
     global temp_path
     global clean_every_n_tests
     global clean_whole_dbroot
+    global mongod_add_options
 
     start_mongod = options.start_mongod
     if hasattr(options, 'use_ssl'):
@@ -1113,6 +1129,7 @@ def set_globals(options, tests):
     wiredtiger_index_config_string = options.wiredtiger_index_config_string
     set_parameters = options.set_parameters
     set_parameters_mongos = options.set_parameters_mongos
+    mongod_add_options = options.mongod_add_options
     no_preallocj = options.no_preallocj
     auth = options.auth
     authMechanism = options.authMechanism
@@ -1227,6 +1244,7 @@ def main():
     global mongod_executable, mongod_port, shell_executable, continue_on_failure, small_oplog
     global no_journal, set_parameters, set_parameters_mongos, no_preallocj, auth, storage_engine, wiredtiger_engine_config_string, wiredtiger_collection_config_string, wiredtiger_index_config_string
     global keyFile, smoke_db_prefix, test_path, use_write_commands
+    global mongod_add_options
 
     try:
         signal.signal(signal.SIGUSR1, dump_stacks)
@@ -1309,6 +1327,8 @@ def main():
                       help='Adds --setParameter to mongod for each passed in item in the csv list - ex. "param1=1,param2=foo" ')
     parser.add_option('--set-parameters-mongos', dest='set_parameters_mongos', default="",
                       help='Adds --setParameter to mongos for each passed in item in the csv list - ex. "param1=1,param2=foo" ')
+    parser.add_option('--mongod-add-options', dest='mongod_add_options', default="",
+                      help='Adds options to mongod for each passed in item in the csv list - ex. "option1=1,option2=foo" ')
     parser.add_option('--temp-path', dest='temp_path', default=None,
                       help='If present, passed as --tempPath to unittests and dbtests or TestData.tmpPath to mongo')
     # Buildlogger invocation from command line
