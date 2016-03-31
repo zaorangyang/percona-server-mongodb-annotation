@@ -704,6 +704,9 @@ if wiredtiger:
     serveronlyLibdeps.append('storage/wiredtiger/storage_wiredtiger')
     serveronlyLibdeps.append('$BUILD_DIR/third_party/shim_wiredtiger')
 
+if has_option( "PerconaFT" ):
+    serveronlyLibdeps.append('storage/tokuft/storage_tokuft')
+
 serveronlyEnv.Library(
     target="serveronly",
     source=serverOnlyFiles,

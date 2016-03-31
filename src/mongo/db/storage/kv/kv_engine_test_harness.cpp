@@ -122,9 +122,10 @@ TEST(KVEngineTestHarness, Restart1) {
         }
     }
 
+    // returns null if the engine does not support restart (transient, test-only engines)
     engine = helper->restartEngine();
 
-    {
+    if (engine != NULL) {
         unique_ptr<RecordStore> rs;
         MyOperationContext opCtx(engine);
         rs.reset(engine->getRecordStore(&opCtx, ns, ns, CollectionOptions()));

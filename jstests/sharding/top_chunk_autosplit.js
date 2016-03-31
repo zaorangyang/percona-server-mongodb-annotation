@@ -315,7 +315,7 @@ var maxSizeTests = [
 ];
 
 // SERVER-17070 Auto split moves to shard node running WiredTiger, if exceeding maxSize
-var unsupported = ["wiredTiger", "rocksdb", "inMemory", "ephemeralForTest"];
+var unsupported = ["wiredTiger", "rocksdb", "inMemory", "ephemeralForTest", "PerconaFT"];
 if (unsupported.indexOf(st.d0.adminCommand({serverStatus : 1}).storageEngine.name) == -1 &&
     unsupported.indexOf(st.d1.adminCommand({serverStatus : 1}).storageEngine.name) == -1) {
 

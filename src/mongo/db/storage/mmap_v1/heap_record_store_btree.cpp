@@ -50,7 +50,7 @@ RecordData HeapRecordStoreBtree::dataFor(OperationContext* txn, const RecordId& 
 
 bool HeapRecordStoreBtree::findRecord(OperationContext* txn,
                                       const RecordId& loc,
-                                      RecordData* out) const {
+                                      RecordData* out, bool skipPessimisticLocking) const {
     Records::const_iterator it = _records.find(loc);
     if (it == _records.end())
         return false;

@@ -349,7 +349,7 @@ public:
      * potentially deleted RecordIds to seek methods if they know that MMAPv1 is not the current
      * storage engine. All new storage engines must support detecting the existence of Records.
      */
-    virtual bool findRecord(OperationContext* txn, const RecordId& loc, RecordData* out) const {
+    virtual bool findRecord(OperationContext* txn, const RecordId& loc, RecordData* out, bool skipPessimisticLocking=false) const {
         auto cursor = getCursor(txn);
         auto record = cursor->seekExact(loc);
         if (!record)
