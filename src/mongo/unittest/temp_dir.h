@@ -25,7 +25,7 @@
  *    delete this exception statement from all source files in the program,
  *    then also delete it in the license file.
  */
-
+#pragma once
 #include <string>
 
 #include "mongo/base/disallow_copying.h"

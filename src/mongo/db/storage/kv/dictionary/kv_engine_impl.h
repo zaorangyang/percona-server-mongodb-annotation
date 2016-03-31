@@ -81,6 +81,10 @@ namespace mongo {
                                                      StringData ident,
                                                      const IndexDescriptor* desc );
 
+        KVSortedDataImpl* getKVSortedDataImpl(OperationContext *opCtx,
+                                              StringData ident,
+                                              const IndexDescriptor* desc);
+
         Status dropIdent( OperationContext* opCtx,
                           StringData ident );
 

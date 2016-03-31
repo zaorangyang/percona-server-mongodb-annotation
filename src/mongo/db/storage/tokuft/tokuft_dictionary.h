@@ -126,7 +126,7 @@ namespace mongo {
 
         virtual Status insert(OperationContext *opCtx, const Slice &key, const Slice &value, bool skipPessimisticLocking);
 
-        virtual bool updateSupported() const { return true; }
+        virtual bool updateSupported() const { return false; }
 
         virtual Status update(OperationContext *opCtx, const Slice &key, const Slice &oldValue,
                               const KVUpdateMessage &message) {

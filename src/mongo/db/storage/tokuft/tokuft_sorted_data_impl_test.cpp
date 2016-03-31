@@ -23,9 +23,11 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include <boost/filesystem/operations.hpp>
 
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
+#include "mongo/db/storage/kv/dictionary/kv_engine_impl.h"
 #include "mongo/db/storage/kv/dictionary/kv_sorted_data_impl.h"
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 #include "mongo/db/storage/tokuft/tokuft_recovery_unit.h"
+#include "mongo/db/storage/tokuft/tokuft_engine_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/util/mongoutils/str.h"
@@ -35,8 +37,8 @@ namespace mongo {
     class TokuFTSortedDataImplHarness : public HarnessHelper {
     public:
 	TokuFTSortedDataImplHarness() :
-            _kvHarness(KVHarnessHelper::create()),
-            _engine(_kvHarness->getEngine()),
+            _kvHarness(createTokuFTEngineHarnessHelper()),
+            _engine(_kvHarness->getKVEngine()),
             _seq(0) {
         }
 
@@ -47,7 +49,13 @@ namespace mongo {
             const std::string ident = mongoutils::str::stream() << "PerconaFTSortedDataInterface-" << _seq++;
             Status status = _engine->createSortedDataInterface(opCtx.get(), ident, NULL);
             invariant(status.isOK());
-            SortedDataInterface *p = _engine->getSortedDataInterface(opCtx.get(), ident, NULL);
+            KVSortedDataImpl *p = _engine->getKVSortedDataImpl(opCtx.get(), ident, NULL);
+            if (unique) {
+                p->DuplicatesAreNotAllowed();
+            } else {
+                p->DuplicatesAreAllowed();
+            }
+
             return std::unique_ptr<SortedDataInterface>(p);
 	}
 
@@ -56,8 +64,8 @@ namespace mongo {
 	}
 
     private:
-        std::auto_ptr<KVHarnessHelper> _kvHarness;
-        KVEngine *_engine;
+        std::auto_ptr<TokuFTEngineHarnessHelper> _kvHarness;
+        KVEngineImpl *_engine;
         int _seq;
     };
 

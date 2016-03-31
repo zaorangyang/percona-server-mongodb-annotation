@@ -112,6 +112,16 @@ namespace mongo {
         return new KVSortedDataImpl(db.release(), opCtx, desc);
     }
 
+    KVSortedDataImpl* KVEngineImpl::getKVSortedDataImpl(OperationContext *opCtx,
+                                                         StringData ident,
+                                                         const IndexDescriptor* desc) {
+        const BSONObj keyPattern = desc ? desc->keyPattern() : BSONObj();
+        const BSONObj options = desc ? desc->infoObj().getObjectField("storageEngine") : BSONObj();
+        std::auto_ptr<KVDictionary> db(getKVDictionary(opCtx, ident, KVDictionary::Encoding::forIndex(Ordering::make(keyPattern)),
+                                                  options));
+        return new KVSortedDataImpl(db.release(), opCtx, desc);        
+    }
+
     Status KVEngineImpl::okToRename( OperationContext* opCtx,
                                      StringData fromNS,
                                      StringData toNS,

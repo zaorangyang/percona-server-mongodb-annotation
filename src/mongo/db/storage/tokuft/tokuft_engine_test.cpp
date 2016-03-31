@@ -30,7 +30,8 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
 #include "mongo/db/storage/tokuft/tokuft_engine.h"
-#include "mongo/unittest/temp_dir.h"
+#include "mongo/db/storage/tokuft/tokuft_engine_test.h"
+//#include "mongo/unittest/temp_dir.h"
 
 namespace mongo {
 
@@ -40,40 +41,40 @@ namespace mongo {
         return Status::OK();
     }
 
-    class TokuFTEngineHarnessHelper : public KVHarnessHelper {
-    public:
-        TokuFTEngineHarnessHelper() : _dbpath("mongo-perconaft-engine-test") {
-            boost::filesystem::remove_all(_dbpath.path());
-            boost::filesystem::create_directory(_dbpath.path());
-            _engine.reset(new TokuFTEngine(_dbpath.path()));
+    TokuFTEngineHarnessHelper::TokuFTEngineHarnessHelper() : _dbpath("mongo-perconaft-engine-test") {
+        boost::filesystem::remove_all(_dbpath.path());
+        boost::filesystem::create_directory(_dbpath.path());
+        _engine.reset(new TokuFTEngine(_dbpath.path()));
+    }
+
+    TokuFTEngineHarnessHelper::~TokuFTEngineHarnessHelper() {
+        _doCleanShutdown();
+    }
+
+    KVEngine* TokuFTEngineHarnessHelper::getEngine() { return _engine.get(); }
+
+    KVEngine* TokuFTEngineHarnessHelper::restartEngine() {
+        _doCleanShutdown();
+        _engine.reset(new TokuFTEngine(_dbpath.path()));
+        return _engine.get();
+    }
+
+    KVEngineImpl* TokuFTEngineHarnessHelper::getKVEngine() {
+        return _engine.get();
+    }
+
+    void TokuFTEngineHarnessHelper::_doCleanShutdown() {
+        if (_engine) {
+            _engine->cleanShutdown();
+            _engine.reset();
         }
-
-        virtual ~TokuFTEngineHarnessHelper() {
-            _doCleanShutdown();
-        }
-
-        virtual KVEngine* getEngine() { return _engine.get(); }
-
-        virtual KVEngine* restartEngine() {
-            _doCleanShutdown();
-            _engine.reset(new TokuFTEngine(_dbpath.path()));
-            return _engine.get();
-        }
-
-    private:
-        void _doCleanShutdown() {
-            if (_engine) {
-                _engine->cleanShutdown();
-                _engine.reset();
-            }
-        }
-
-        unittest::TempDir _dbpath;
-
-        boost::scoped_ptr<TokuFTEngine> _engine;
-    };
+    }
 
     KVHarnessHelper* KVHarnessHelper::create() {
         return new TokuFTEngineHarnessHelper();
+    }
+
+    TokuFTEngineHarnessHelper* createTokuFTEngineHarnessHelper() {
+        return new TokuFTEngineHarnessHelper();        
     }
 }
