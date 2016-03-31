@@ -6,6 +6,7 @@ Import("wiredtiger")
 
 env.SConscript(
     dirs=[
+        'audit',
         'auth',
         'catalog',
         'commands',
