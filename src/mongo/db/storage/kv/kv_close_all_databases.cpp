@@ -64,7 +64,7 @@ namespace mongo {
 
     class OperationContextShutdown : public OperationContext {
     public:
-        OperationContextShutdown() : OperationContext(NULL, 0, NULL) {
+        OperationContextShutdown() : OperationContext(NULL, 0, new LockerImplShutdown()) {
             _recoveryUnit.reset(new RecoveryUnitNoop());
         }
 
