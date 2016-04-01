@@ -25,7 +25,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
 
 #include "backup_status_command.h"
@@ -52,8 +52,7 @@ namespace mongo {
                                         BSONObj &cmdObj,
                                         int options,
                                         std::string &errmsg,
-                                        BSONObjBuilder &result,
-                                        bool fromRepl) {
+                                        BSONObjBuilder &result) {
             if (!this->currentEngineSupportsHotBackup()) {
                 this->printEngineSupportFailure(errmsg);
                 return false;

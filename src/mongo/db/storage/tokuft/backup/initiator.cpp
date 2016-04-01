@@ -27,7 +27,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
 
 #include "initiator.h"

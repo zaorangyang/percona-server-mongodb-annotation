@@ -1,12 +1,12 @@
 # -*- mode: python; -*-
 Import("env")
-Import("has_option")
 
-if has_option("tokubackup"):
-    env.Library(target='tokubackup',
-                source=['backup_error.cpp',
-                        'backup_status_command.cpp',
-                        'start_backup_command.cpp',
-                        'throttle_backup_command.cpp',
-                        'initiator.cpp'],
-                LIBDEPS=[])
+env.Library(target='tokubackup',
+            source=['backup_error.cpp',
+                    'backup_status_command.cpp',
+                    'start_backup_command.cpp',
+                    'throttle_backup_command.cpp',
+                    'initiator.cpp'],
+            LIBDEPS=[],
+            SYSLIBDEPS=['HotBackup']
+)
