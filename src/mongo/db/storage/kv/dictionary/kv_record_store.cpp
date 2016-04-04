@@ -201,8 +201,16 @@ namespace mongo {
         return rd;
     }
 
-    bool KVRecordStore::findRecord( OperationContext* txn,
-                                    const RecordId& loc, RecordData* out, bool skipPessimisticLocking ) const {
+    bool KVRecordStore::findRecordRelaxed(OperationContext* txn, const RecordId& loc, RecordData* out) const {
+        return _findRecord(txn, loc, out, true);
+    }
+
+    bool KVRecordStore::findRecord(OperationContext* txn, const RecordId& loc, RecordData* out) const {
+        return _findRecord(txn, loc, out, false);
+    }
+
+    bool KVRecordStore::_findRecord(OperationContext* txn, const RecordId& loc, RecordData* out,
+                                    bool skipPessimisticLocking) const {
         RecordData rd = _getDataFor(_db.get(), txn, loc, skipPessimisticLocking);
         if (rd.data() == NULL) {
             return false;

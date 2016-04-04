@@ -957,7 +957,7 @@ RecordData WiredTigerRecordStore::dataFor(OperationContext* txn, const RecordId&
 
 bool WiredTigerRecordStore::findRecord(OperationContext* txn,
                                        const RecordId& id,
-                                       RecordData* out, bool skipPessimisticLocking) const {
+                                       RecordData* out) const {
     WiredTigerCursor curwrap(_uri, _tableId, true, txn);
     WT_CURSOR* c = curwrap.get();
     invariant(c);
