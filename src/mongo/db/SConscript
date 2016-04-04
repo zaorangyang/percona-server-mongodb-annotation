@@ -28,9 +28,6 @@ env.SConscript(
     ],
 )
 
-if has_option( "tokubackup" ):
-    env.Append(LIBPATH = ['$BUILD_DIR/third_party/tokubackup/lib'])
-
 #
 # The db/'common' lib has the abstractions that are shared by components of the
 # server. Ideally, many of the object in 'coredb' should be moved here when their dependencies

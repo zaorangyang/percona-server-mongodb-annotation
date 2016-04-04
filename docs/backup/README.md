@@ -30,13 +30,13 @@ This will create the Hot Backup static library in `install/lib` and place the C 
 
 ## Link HotBackup files into MongoDB
 
-The resultant HotBackup library static library `lib/libHotBackup.a` and `include/backup.h` header file must be placed, or linked, into the `src/third_party/tokubackup` directory within the MongoDB source tree.
+The resultant HotBackup library static library `lib/libHotBackup.a` and `include/backup.h` header file must be placed, or linked, into the `src/third_party/install` directory within the MongoDB source tree.
 
 Assuming you have the Percona-Server-MongoDB repository checked out at the same level as the Hot Backup repository:
 
 ```
 cd percona-server-mongodb
-ln -s $PWD/../Percona-TokuBackup/backup/install src/third_party/tokubackup
+ln -s $PWD/../Percona-TokuBackup/backup/install src/third_party/install
 ```
 
 ## Building Percona Server for MongoDB
