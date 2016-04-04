@@ -65,6 +65,10 @@ namespace mongo {
 
         virtual int flushAllFiles( bool sync );
 
+        virtual Status beginBackup(OperationContext* txn);
+
+        virtual void endBackup(OperationContext* txn);
+
         virtual bool isDurable() const { return true; }
 
         /**

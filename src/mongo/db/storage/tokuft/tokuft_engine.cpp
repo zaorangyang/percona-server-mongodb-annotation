@@ -376,6 +376,24 @@ namespace mongo {
         return 1;
     }
 
+    Status TokuFTEngine::beginBackup(OperationContext* txn) {
+        const int r = _env.env()->checkpointing_postpone(_env.env());
+        if (r) {
+            severe() << "PerconaFT: While trying to post pone checkpointing (for mongo backup), got error " << r;
+            fassertFailed(28998);
+        }
+
+        return Status::OK();
+    }
+
+    void TokuFTEngine::endBackup(OperationContext* txn) {
+        const int r = _env.env()->checkpointing_resume(_env.env());
+        if (r) {
+            severe() << "PerconaFT: While trying to resume checkpointing (for mongo backup), got error " << r;
+            fassertFailed(28999);
+        }
+    }
+
     bool TokuFTEngine::hasIdent(OperationContext* opCtx, StringData ident) const {
         ftcxx::Slice key(ident.size() + 1);
         std::copy(ident.begin(), ident.end(), key.mutable_data());
