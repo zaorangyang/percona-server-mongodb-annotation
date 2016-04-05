@@ -9,6 +9,7 @@ pcreSuffix = "-8.37"
 mozjsSuffix = '-38'
 
 thirdPartyIncludePathList = [
+    ('percona_incl', '#/src/third_party/install/include'),
     ('s2', '#/src/third_party/s2'),
     ('tz', '#/src/third_party/tz'),
 ]
@@ -71,9 +72,6 @@ if not use_system_version_of_library('yaml'):
 if not use_system_version_of_library('asio'):
     thirdPartyIncludePathList.append(
         ('asio', '#/src/third_party/asio-asio-1-11-0/asio/include'))
-
-thirdPartyIncludePathList.append(
-    ('tokuft', '#/src/third_party/install/include'))
 
 if not use_system_version_of_library('intel_decimal128'):
     thirdPartyIncludePathList.append(
