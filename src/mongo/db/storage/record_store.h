@@ -361,7 +361,8 @@ public:
     }
 
     /**
-     * Relaxed version of findRecord which allows to implement optimistic locking strategy.
+     * Relaxed version of findRecord which allows storage engines
+     * to skip a pessimistic locking strategy.
      */
     virtual bool findRecordRelaxed(OperationContext* txn,
                                    const RecordId& loc,
