@@ -21,6 +21,7 @@ env.InjectMongoIncludePaths()
 
 # Add needed Percona dependencies
 env.InjectThirdPartyIncludePaths(libraries=['percona_incl'])
+env.Append(LIBPATH = ['#/src/third_party/install/lib'])
 
 env.SConscript(
     dirs=[
