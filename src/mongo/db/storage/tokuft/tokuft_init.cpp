@@ -36,8 +36,17 @@ namespace mongo {
     class TokuFTFactory : public StorageEngine::Factory {
     public:
         virtual ~TokuFTFactory() { }
-        KVStorageEngine *createTokuFTEngine(const std::string &path, const KVStorageEngineOptions &options) const {
-            TokuFTEngine *p = new TokuFTEngine(path);
+        void PrintDurabilityWarnings() const {
+            warning() << "PerconaFT: Initializing with --nojournal.  Note that this will cause {j: true} writes to fail, but will not actually disable journaling.";
+            warning() << "PerconaFT: This is only for tests, there is no reason to run with --nojournal in production.";
+        }
+
+        KVStorageEngine *createTokuFTEngine(const std::string &path, const bool isDurable, const KVStorageEngineOptions &options) const {
+            if (!isDurable) {
+                this->PrintDurabilityWarnings();
+            }
+
+            TokuFTEngine *p = new TokuFTEngine(path, isDurable);
             return new KVStorageEngine(p, options);
         }
         virtual StorageEngine *create(const StorageGlobalParams &params,
@@ -59,7 +68,7 @@ namespace mongo {
             options.forRepair = params.repair;
             // TODO: Possibly push the durability flag down to the FT Engine...
             //return new TokuFTStorageEngine(params.dbpath, params.dur, options);
-            return createTokuFTEngine(params.dbpath, options);
+            return createTokuFTEngine(params.dbpath, params.dur, options);
         }
         virtual StringData getCanonicalName() const {
             return "PerconaFT";

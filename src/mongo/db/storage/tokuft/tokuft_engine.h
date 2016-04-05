@@ -34,7 +34,7 @@ namespace mongo {
         MONGO_DISALLOW_COPYING(TokuFTEngine);
     public:
         // Opens or creates a storage engine environment at the given path
-        TokuFTEngine(const std::string &path);
+        TokuFTEngine(const std::string &path, const bool isDurable = true);
         virtual ~TokuFTEngine();
 
         virtual RecoveryUnit* newRecoveryUnit();
@@ -69,7 +69,7 @@ namespace mongo {
 
         virtual void endBackup(OperationContext* txn);
 
-        virtual bool isDurable() const { return true; }
+        virtual bool isDurable() const { return _durable; }
 
         /**
          * TokuFT supports row-level ("document-level") locking.
@@ -108,6 +108,7 @@ namespace mongo {
         ftcxx::DBEnv _env;
         boost::scoped_ptr<KVDictionary> _metadataDict;
         boost::scoped_ptr<KVDictionary> _internalMetadataDict;
+        bool _durable;
     };
 
 } // namespace mongo

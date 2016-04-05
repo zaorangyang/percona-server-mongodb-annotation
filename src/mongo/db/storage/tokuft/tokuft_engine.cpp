@@ -227,10 +227,11 @@ namespace mongo {
 
     }
 
-    TokuFTEngine::TokuFTEngine(const std::string& path)
+    TokuFTEngine::TokuFTEngine(const std::string& path, const bool isDurable)
         : _env(nullptr),
           _metadataDict(nullptr),
-          _internalMetadataDict(nullptr)
+          _internalMetadataDict(nullptr),
+          _durable(isDurable)
     {
         const TokuFTEngineOptions& engineOptions = tokuftGlobalOptions.engineOptions;
 
