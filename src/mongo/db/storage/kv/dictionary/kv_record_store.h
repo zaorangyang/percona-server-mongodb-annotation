@@ -91,10 +91,13 @@ namespace mongo {
 
         virtual RecordData dataFor( OperationContext* txn, const RecordId& loc ) const;
 
+        virtual bool findRecordRelaxed( OperationContext* txn,
+                                        const RecordId& loc,
+                                        RecordData* out ) const;
+
         virtual bool findRecord( OperationContext* txn,
                                  const RecordId& loc,
-                                 RecordData* out,
-                                 bool skipPessimisticLocking=false ) const;
+                                 RecordData* out ) const;
 
         virtual void deleteRecord( OperationContext* txn, const RecordId& dl );
 
@@ -245,6 +248,8 @@ namespace mongo {
         Status _insertRecord(OperationContext *txn, const RecordId &id, const Slice &value);
 
         void _updateStats(OperationContext *txn, long long nrDelta, long long dsDelta);
+
+        bool _findRecord(OperationContext* txn, const RecordId& loc, RecordData* out, bool skipPessimisticLocking) const;
 
         // Internal version of dataFor that takes a KVDictionary - used by
         // the RecordCursor to implement dataFor.

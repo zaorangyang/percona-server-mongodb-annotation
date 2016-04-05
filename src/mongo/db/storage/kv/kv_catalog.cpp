@@ -224,7 +224,13 @@ BSONObj KVCatalog::_findEntry(OperationContext* opCtx, StringData ns, RecordId* 
 
     LOG(3) << "looking up metadata for: " << ns << " @ " << dl;
     RecordData data;
-    if (!_rs->findRecord(opCtx, dl, &data, skipPessimisticLocking)) {
+    bool recordFound = false;
+    if (skipPessimisticLocking) {
+        recordFound = _rs->findRecordRelaxed(opCtx, dl, &data);
+    } else {
+        recordFound = _rs->findRecord(opCtx, dl, &data);
+    }
+    if (!recordFound) {
         // since the in memory meta data isn't managed with mvcc
         // its possible for different transactions to see slightly
         // different things, which is ok via the locking above.

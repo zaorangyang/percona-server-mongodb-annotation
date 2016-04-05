@@ -349,7 +349,7 @@ public:
      * potentially deleted RecordIds to seek methods if they know that MMAPv1 is not the current
      * storage engine. All new storage engines must support detecting the existence of Records.
      */
-    virtual bool findRecord(OperationContext* txn, const RecordId& loc, RecordData* out, bool skipPessimisticLocking=false) const {
+    virtual bool findRecord(OperationContext* txn, const RecordId& loc, RecordData* out) const {
         auto cursor = getCursor(txn);
         auto record = cursor->seekExact(loc);
         if (!record)
@@ -358,6 +358,16 @@ public:
         record->data.makeOwned();  // Unowned data expires when cursor goes out of scope.
         *out = std::move(record->data);
         return true;
+    }
+
+    /**
+     * Relaxed version of findRecord which allows storage engines
+     * to skip a pessimistic locking strategy.
+     */
+    virtual bool findRecordRelaxed(OperationContext* txn,
+                                   const RecordId& loc,
+                                   RecordData* out) const {
+        return findRecord(txn, loc, out);
     }
 
     virtual void deleteRecord(OperationContext* txn, const RecordId& dl) = 0;
