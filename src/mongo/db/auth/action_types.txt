@@ -12,6 +12,7 @@
 "authCheck",  # Not used for permissions checks, but to id the authorization-checking event in logs.
 "authenticate",  # Not used for permission checks, but to id authentication events in logs.
 "authSchemaUpgrade",
+"backupStatus",
 "bypassDocumentValidation",
 "changeCustomData",
 "changePassword",
@@ -100,7 +101,9 @@
 "shutdown",
 "splitChunk",
 "splitVector",
+"startBackup",
 "storageDetails",
+"throttleBackup",
 "top",
 "touch",
 "unlock",

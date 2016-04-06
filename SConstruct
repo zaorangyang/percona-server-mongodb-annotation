@@ -206,6 +206,11 @@ add_option('audit',
     nargs=0,
 )
 
+add_option('tokubackup',
+    help='Enable Hot Backup for the Fractal Tree engine.',
+    nargs=0,
+)
+
 js_engine_choices = ['mozjs', 'none']
 add_option('js-engine',
     choices=js_engine_choices,
@@ -1392,7 +1397,6 @@ if env.TargetOSIs('posix'):
                          "-fPIC",
                          "-fno-strict-aliasing",
                          "-ggdb",
-                         "-pthread",
                          "-Wall",
                          "-Wsign-compare",
                          "-Wno-unknown-pragmas",
@@ -1403,7 +1407,7 @@ if env.TargetOSIs('posix'):
             env.Append( CCFLAGS=["-Werror"] )
 
     env.Append( CXXFLAGS=["-Wnon-virtual-dtor", "-Woverloaded-virtual"] )
-    env.Append( LINKFLAGS=["-fPIC", "-pthread"] )
+    env.Append( LINKFLAGS=["-fPIC"] )
 
     # SERVER-9761: Ensure early detection of missing symbols in dependent libraries at program
     # startup.
@@ -2359,6 +2363,7 @@ def doConfigure(myenv):
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_HEADER_UNISTD_H")
         conf.CheckLib('rt')
         conf.CheckLib('dl')
+        conf.CheckLib('pthread') ## pthread should be last linker arg list for HotBackup.
 
     if posix_monotonic_clock:
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_POSIX_MONOTONIC_CLOCK")
