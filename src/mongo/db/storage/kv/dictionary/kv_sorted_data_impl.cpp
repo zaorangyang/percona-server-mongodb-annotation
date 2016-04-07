@@ -482,7 +482,7 @@ namespace mongo {
         }
 
         bool _locateWhilePreservingCache(const KeyString &ks) {
-	    KVDictionary::Cursor * c = _db->getCursor(_txn, Slice::of(ks), _dir);
+	    KVDictionary::Cursor * c = _db->getRangedCursor(_txn, Slice::of(ks), _dir);
             _cursor.reset(c);
 	    const bool result = cursorPositionMatchesGivenKey(ks);
 	    return result;
@@ -681,7 +681,7 @@ namespace mongo {
         }
 
         void restoreWithoutDuplicates() {
-            KVDictionary::Cursor * c = _db->getCursor(_txn, Slice::of(_savedKeyStringWithoutRecord), _dir);
+            KVDictionary::Cursor * c = _db->getRangedCursor(_txn, Slice::of(_savedKeyStringWithoutRecord), _dir);
             _cursor.reset(c);
             invalidateCache();
             BSONObj currentBson = this->getKey();
