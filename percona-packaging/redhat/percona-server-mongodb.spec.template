@@ -1,7 +1,7 @@
 #
 %define         mongo_home /var/lib/mongo
 #
-Name:           Percona-Server-MongoDB
+Name:           Percona-Server-MongoDB-32
 Version:        @@VERSION@@
 Release:        @@RELEASE@@%{?dist}
 Summary:        High-performance MongoDB replacement from Percona (metapackage)
@@ -16,7 +16,7 @@ Source3:        mongod.default
 Source4:        percona-server-mongodb-helper.sh
 Source5:        mongod.init
 %if 0%{?rhel} < 6
-Source6:        http://jenkins.percona.com/downloads/mongo-tools-ce5.tar.gz
+Source6:        http://jenkins.percona.com/downloads/mongo-tools-ce5-v@@VERSION@@.tar.gz
 %endif
 Source7:        mongod.pp
 
@@ -42,10 +42,10 @@ BuildRequires: /usr/bin/scons
 BuildRequires: golang
 %endif
 
-Requires: Percona-Server-MongoDB-mongos = %{version}-%{release}
-Requires: Percona-Server-MongoDB-server = %{version}-%{release}
-Requires: Percona-Server-MongoDB-shell = %{version}-%{release}
-Requires: Percona-Server-MongoDB-tools = %{version}-%{release}
+Requires: %{name}-mongos = %{version}-%{release}
+Requires: %{name}-server = %{version}-%{release}
+Requires: %{name}-shell = %{version}-%{release}
+Requires: %{name}-tools = %{version}-%{release}
 
 %description
 This package contains high-performance MongoDB replacement from Percona - Percona Server for MongoDB.
@@ -139,9 +139,9 @@ popd
 
 # Build PSfMDB with SCons
 pushd $RPM_BUILD_DIR/%{src_dir}
-scons --variant-dir=percona --audit --release --ssl --opt=on --cc=${CC} --cxx=${CXX} \
+scons CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
 %{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib \
---PerconaFT --rocksdb --wiredtiger --tokubackup $PSM_TARGETS
+--PerconaFT --rocksdb --wiredtiger --tokubackup ${PSM_TARGETS}
 popd
 
 %install
@@ -280,6 +280,9 @@ fi
 
 #
 %changelog
+
+* Thu Apr 07 2016 Alexey Bychko <alexey.bychko@percona.com> 3.2.4
+- Percona Server for MongoDB v3.2.4 RC
 
 * Fri Sep 18 2015 Alexey Bychko <alexey.bychko@percona.com> 3.0.5
 - Percona Server for MongoDB RC 7
