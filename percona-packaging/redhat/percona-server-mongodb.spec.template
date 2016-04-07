@@ -47,6 +47,8 @@ Requires: %{name}-server = %{version}-%{release}
 Requires: %{name}-shell = %{version}-%{release}
 Requires: %{name}-tools = %{version}-%{release}
 
+Conflicts: Percona-Server-MongoDB
+
 %description
 This package contains high-performance MongoDB replacement from Percona - Percona Server for MongoDB.
 Percona Server for MongoDB is built for scalability, performance and high availability, scaling from single server deployments to large, complex multi-site architectures. By leveraging in-memory computing, Percona Server for MongoDB provides high performance for both reads and writes. Percona Server for MongoDB's native replication and automated failover enable enterprise-grade reliability and operational flexibility.
@@ -71,6 +73,7 @@ Group:          Applications/Databases
 Summary:        Percona Server for MongoDB sharded cluster query router
 %description mongos
 This package contains mongos - the Percona Server for MongoDB sharded cluster query router
+Conflicts: Percona-Server-MongoDB-mongos
 
 %package server
 Group:          Applications/Databases
@@ -78,18 +81,21 @@ Summary:        Percona Server for MongoDB database server
 Requires: policycoreutils
 %description server
 This package contains the Percona Server for MongoDB server software, default configuration files and init.d scripts
+Conflicts: Percona-Server-MongoDB-server
 
 %package shell
 Group:          Applications/Databases
 Summary:        Percona Server for MongoDB shell client
 %description shell
 This package contains the Percona Server for MongoDB shell
+Conflicts: Percona-Server-MongoDB-shell
 
 %package tools
 Group:          Applications/Databases
 Summary:        The tools package for Percona Server for MongoDB
 %description tools
 This package contains various tools from MongoDB project, recompiled for Percona Server for MongoDB
+Conflicts: Percona-Server-MongoDB-tools
 
 %prep
 
