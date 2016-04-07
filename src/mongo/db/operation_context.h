@@ -30,6 +30,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/db/document_locking_context.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/write_concern_options.h"
@@ -57,7 +58,7 @@ class WriteUnitOfWork;
  * (RecoveryUnitState) to reduce complexity and duplication in the storage-engine specific
  * RecoveryUnit and to allow better invariant checking.
  */
-class OperationContext : public Decorable<OperationContext> {
+class OperationContext : public Decorable<OperationContext>, public DocumentLockingContext {
     MONGO_DISALLOW_COPYING(OperationContext);
 
 public:
