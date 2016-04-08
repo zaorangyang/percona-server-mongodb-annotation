@@ -64,7 +64,7 @@ Package: percona-server-mongodb-32-dbg
 Architecture: any
 Breaks: percona-server-mongodb-dbg
 Section: debug
-Depends: percona-server-mongodb (= ${binary:Version}), ${misc:Depends}
+Depends: percona-server-mongodb-32 (= ${binary:Version}), ${misc:Depends}
 Description: Debugging package for Percona Server for MongoDB
  Percona Server for MongoDB is a drop-in high-performance replacement for MongoDB from Percona
 
