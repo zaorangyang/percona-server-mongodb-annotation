@@ -8,4 +8,5 @@ env.Library(target='tokubackup',
                     'throttle_backup_command.cpp',
                     'initiator.cpp'],
             LIBDEPS=[],
+            SYSLIBDEPS=['HotBackup']
 )

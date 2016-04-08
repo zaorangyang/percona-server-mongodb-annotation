@@ -257,10 +257,8 @@ mongodLibDeps = [
 
 if has_option('use-cpu-profiler'):
     mongodLibDeps.append('db/cpuprofiler')
-
-HotBackup = []
-if has_option("tokubackup"):
-    HotBackup = ['HotBackup']
+if has_option('tokubackup'):
+    mongodLibDeps.append('db/storage/tokuft/backup/tokubackup')
 
 mongod = env.Program(
     target="mongod",
@@ -269,7 +267,6 @@ mongod = env.Program(
         "db/mongod_options_init.cpp",
     ],
     LIBDEPS=mongodLibDeps,
-    SYSLIBDEPS=HotBackup,
 )
 
 env.Default(env.Install('#/', mongod))

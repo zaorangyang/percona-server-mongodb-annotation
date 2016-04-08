@@ -711,12 +711,6 @@ if wiredtiger:
 if has_option( "PerconaFT" ):
     serveronlyLibdeps.append('storage/tokuft/storage_tokuft')
 
-HotBackupSysLibs = []
-if has_option( "tokubackup" ):
-    serveronlyLibdeps.append('storage/tokuft/backup/tokubackup')
-    HotBackupSysLibs = ['HotBackup']
-    
-
 serveronlyEnv.Library(
     target="serveronly",
     source=serverOnlyFiles,
@@ -733,7 +727,6 @@ env.Library(
         '$BUILD_DIR/mongo/util/net/network',
         'server_options',
     ],
-    SYSLIBDEPS=HotBackupSysLibs,
 )
 
 env.Library(
