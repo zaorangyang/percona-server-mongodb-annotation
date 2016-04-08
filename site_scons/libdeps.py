@@ -135,7 +135,10 @@ def __get_syslibdeps(node):
                               "but no suitable library was found during configuration." %
                               (str(node), syslib[len(missing_syslibdep):]))
                         node.get_env().Exit(1)
-                    syslibdeps.append(syslib)
+                    if 'HotBackup' in str(syslib):
+                        syslibdeps.insert(0, syslib)
+                    else:
+                        syslibdeps.append(syslib)
         setattr(node.attributes, cached_var_name, syslibdeps)
     return getattr(node.attributes, cached_var_name)
 
