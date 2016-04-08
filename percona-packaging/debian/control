@@ -9,6 +9,7 @@ Build-Depends: debhelper (>= 9), debconf, libbz2-dev, libsnappy-dev, pkg-config,
 
 Package: percona-server-mongodb-32
 Architecture: any
+Breaks: percona-server-mongodb
 Depends: ${shlibs:Depends}, ${misc:Depends}, percona-server-mongodb-mongos, percona-server-mongodb-shell, percona-server-mongodb-server, percona-server-mongodb-tools
 Description: This metapackage will install the mongo shell, import/export tools, other client utilities, server software, default configuration, and init.d scripts.
  This package contains high-performance MongoDB replacement from Percona - Percona Server for MongoDB.
@@ -33,30 +34,35 @@ Description: This metapackage will install the mongo shell, import/export tools,
 
 Package: percona-server-mongodb-32-mongos
 Architecture: any
+Breaks: percona-server-mongodb-mongos
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: This package contains mongos - the Percona Server for MongoDB sharded cluster query router
  Percona Server for MongoDB is a drop-in high-performance replacement for MongoDB from Percona
 
 Package: percona-server-mongodb-32-server
 Architecture: any
+Breaks: percona-server-mongodb-server
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: This package contains the Percona Server for MongoDB server software, default configuration files and init.d scripts
  Percona Server for MongoDB is a drop-in high-performance replacement for MongoDB from Percona
 
 Package: percona-server-mongodb-32-shell
 Architecture: any
+Breaks: percona-server-mongodb-shell
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: This package contains the Percona Server for MongoDB shell
  Percona Server for MongoDB is a drop-in high-performance replacement for MongoDB from Percona
 
 Package: percona-server-mongodb-32-tools
 Architecture: any
+Breaks: percona-server-mongodb-tools
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Mongo tools for high-performance MongoDB fork from Percona
  Percona Server for MongoDB is a drop-in high-performance replacement for MongoDB from Percona
 
 Package: percona-server-mongodb-32-dbg
 Architecture: any
+Breaks: percona-server-mongodb-dbg
 Section: debug
 Depends: percona-server-mongodb (= ${binary:Version}), ${misc:Depends}
 Description: Debugging package for Percona Server for MongoDB
