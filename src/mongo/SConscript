@@ -257,6 +257,8 @@ mongodLibDeps = [
 
 if has_option('use-cpu-profiler'):
     mongodLibDeps.append('db/cpuprofiler')
+if has_option('tokubackup'):
+    mongodLibDeps.append('db/storage/tokuft/backup/tokubackup')
 
 mongod = env.Program(
     target="mongod",

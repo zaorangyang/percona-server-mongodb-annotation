@@ -710,8 +710,6 @@ if wiredtiger:
 
 if has_option( "PerconaFT" ):
     serveronlyLibdeps.append('storage/tokuft/storage_tokuft')
-if has_option( "tokubackup" ):
-    serveronlyLibdeps.append('storage/tokuft/backup/tokubackup')
 
 serveronlyEnv.Library(
     target="serveronly",
