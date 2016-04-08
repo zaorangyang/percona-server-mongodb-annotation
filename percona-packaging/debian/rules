@@ -65,7 +65,7 @@ override_dh_auto_install:
 	cp -av mongod debian/percona-server-mongodb-32-server/usr/bin
 	cp -av debian/percona-server-mongodb-helper.sh debian/percona-server-mongodb-32-server/usr/bin
 	cp -av debian/mongod.conf debian/percona-server-mongodb-32-server/etc/mongod.conf
-	cp -av $(PSMSRC)/bin/* debian/percona-server-mongodb-tools/usr/bin
+	cp -av $(PSMSRC)/bin/* debian/percona-server-mongodb-32-tools/usr/bin
 
 override_dh_strip:
 	dh_strip -a --dbg-package=percona-server-mongodb-32-dbg
