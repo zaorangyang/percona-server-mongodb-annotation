@@ -92,12 +92,14 @@ namespace mongo {
     class KVSortedDataBuilderImpl : public SortedDataBuilderInterface {
         KVSortedDataImpl *_impl;
         OperationContext *_txn;
+        WriteUnitOfWork _wuow;
         bool _dupsAllowed;
 
     public:
         KVSortedDataBuilderImpl(KVSortedDataImpl *impl, OperationContext *txn, bool dupsAllowed)
             : _impl(impl),
               _txn(txn),
+              _wuow(txn),
               _dupsAllowed(dupsAllowed)
         {
             if (_dupsAllowed) {
@@ -109,6 +111,7 @@ namespace mongo {
 
         virtual Status addKey(const BSONObj& key, const RecordId& loc);
         virtual void commit(bool mayInterrupt) {
+            _wuow.commit();
         }
     };
 } // namespace mongo
