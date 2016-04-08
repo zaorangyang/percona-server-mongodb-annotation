@@ -1,22 +1,22 @@
-Source: percona-server-mongodb
+Source: percona-server-mongodb-32
 Maintainer: Alexey Bychko <alexey.bychko@percona.com>
 Section: database
 Priority: extra
 Standards-Version: 3.9.2
-Build-Depends: debhelper (>= 9), debconf, libbz2-dev, libsnappy-dev, pkg-config, 
+Build-Depends: debhelper (>= 9), debconf, libbz2-dev, libsnappy-dev, pkg-config,
 							 zlib1g-dev, libzlcore-dev, dh-systemd, libsasl2-dev, g++, cmake
 
 
-Package: percona-server-mongodb
+Package: percona-server-mongodb-32
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, percona-server-mongodb-mongos, percona-server-mongodb-shell, percona-server-mongodb-server, percona-server-mongodb-tools
 Description: This metapackage will install the mongo shell, import/export tools, other client utilities, server software, default configuration, and init.d scripts.
  This package contains high-performance MongoDB replacement from Percona - Percona Server for MongoDB.
- Percona Server for MongoDB is built for scalability, performance and high availability, scaling from single server deployments to large, complex multi-site architectures. 
- By leveraging in-memory computing, Percona Server for MongoDB provides high performance for both reads and writes. 
+ Percona Server for MongoDB is built for scalability, performance and high availability, scaling from single server deployments to large, complex multi-site architectures.
+ By leveraging in-memory computing, Percona Server for MongoDB provides high performance for both reads and writes.
  Percona Server for MongoDB's native replication and automated failover enable enterprise-grade reliability and operational flexibility.
  .
- Percona Server for MongoDB is an open-source database used by companies of all sizes, across all industries and for a wide variety of applications. 
+ Percona Server for MongoDB is an open-source database used by companies of all sizes, across all industries and for a wide variety of applications.
  It is an agile database that allows schemas to change quickly as applications evolve, while still providing the functionality developers expect from traditional databases,
  such as secondary indexes, a full query language and strict consistency.
  .
@@ -31,31 +31,31 @@ Description: This metapackage will install the mongo shell, import/export tools,
  * Text Search
  * Aggregation Framework & Native MapReduce
 
-Package: percona-server-mongodb-mongos
+Package: percona-server-mongodb-32-mongos
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: This package contains mongos - the Percona Server for MongoDB sharded cluster query router
  Percona Server for MongoDB is a drop-in high-performance replacement for MongoDB from Percona
 
-Package: percona-server-mongodb-server
+Package: percona-server-mongodb-32-server
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: This package contains the Percona Server for MongoDB server software, default configuration files and init.d scripts
  Percona Server for MongoDB is a drop-in high-performance replacement for MongoDB from Percona
 
-Package: percona-server-mongodb-shell
+Package: percona-server-mongodb-32-shell
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: This package contains the Percona Server for MongoDB shell
  Percona Server for MongoDB is a drop-in high-performance replacement for MongoDB from Percona
 
-Package: percona-server-mongodb-tools
+Package: percona-server-mongodb-32-tools
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Mongo tools for high-performance MongoDB fork from Percona
  Percona Server for MongoDB is a drop-in high-performance replacement for MongoDB from Percona
 
-Package: percona-server-mongodb-dbg
+Package: percona-server-mongodb-32-dbg
 Architecture: any
 Section: debug
 Depends: percona-server-mongodb (= ${binary:Version}), ${misc:Depends}
@@ -64,4 +64,4 @@ Description: Debugging package for Percona Server for MongoDB
 
 
 
- 
+
