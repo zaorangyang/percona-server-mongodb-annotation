@@ -92,14 +92,12 @@ namespace mongo {
     class KVSortedDataBuilderImpl : public SortedDataBuilderInterface {
         KVSortedDataImpl *_impl;
         OperationContext *_txn;
-        WriteUnitOfWork _wuow;
         bool _dupsAllowed;
 
     public:
         KVSortedDataBuilderImpl(KVSortedDataImpl *impl, OperationContext *txn, bool dupsAllowed)
             : _impl(impl),
               _txn(txn),
-              _wuow(txn),
               _dupsAllowed(dupsAllowed)
         {
             if (_dupsAllowed) {
@@ -111,6 +109,14 @@ namespace mongo {
 
         virtual Status addKey(const BSONObj& key, const RecordId& loc);
         virtual void commit(bool mayInterrupt) {
+            // NOTE: As of v3.2, This arbitrary start/commit is
+            // required to pass unit tests (and transitively support
+            // the most recent storage engine API specifications).
+            // Code paths that depend on this builder interface now
+            // manage their own outer level transactions, irrespective
+            // of this builder's state, so no transaction needs to be
+            // maintained across this builder's lifetime.
+            WriteUnitOfWork _wuow(_txn);
             _wuow.commit();
         }
     };
