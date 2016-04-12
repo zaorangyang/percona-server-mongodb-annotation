@@ -99,7 +99,12 @@ namespace mongo {
                 KeyString ks;
                 ks.resetFromBuffer(keySlice.data(), keySlice.size());
                 b.append("key", ks.toString());
-                appendRecordId(enc.extractRecordId(keySlice), b);
+                // TODO: See if there is a safe way to decode
+                // index/sorted data interface record id's from
+                // associated key strings...  Currently the
+                // extract-from-buffer logic for RecordIds is broken
+                // for query-formatted index keys.
+                //appendRecordId(enc.extractRecordId(keySlice), b);
                 b.doneFast();
             } else {
                 bounds.append(StringData(keySlice.data(), keySlice.size()));
