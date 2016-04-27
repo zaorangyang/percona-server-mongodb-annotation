@@ -200,12 +200,25 @@ void BackgroundSync::producerThread() {
             std::string msg(str::stream() << "sync producer problem: " << e.toString());
             error() << msg;
             _replCoord->setMyHeartbeatMessage(msg);
+            sleepmillis(100);  // sleep a bit to keep from hammering this thread with temp. errors.
         } catch (const std::exception& e2) {
             severe() << "sync producer exception: " << e2.what();
             fassertFailed(28546);
         }
     }
     stop();
+}
+
+void BackgroundSync::_signalNoNewDataForApplier() {
+    // Signal to consumers that we have entered the stopped state
+    // if the signal isn't already in the queue.
+    const boost::optional<BSONObj> lastObjectPushed = _buffer.lastObjectPushed();
+    if (!lastObjectPushed || !lastObjectPushed->isEmpty()) {
+        const BSONObj sentinelDoc;
+        _buffer.pushEvenIfFull(sentinelDoc);
+        bufferCountGauge.increment();
+        bufferSizeGauge.increment(sentinelDoc.objsize());
+    }
 }
 
 void BackgroundSync::_producerThread() {
@@ -216,15 +229,7 @@ void BackgroundSync::_producerThread() {
             stop();
         }
         if (_replCoord->isWaitingForApplierToDrain()) {
-            // Signal to consumers that we have entered the stopped state
-            // if the signal isn't already in the queue.
-            const boost::optional<BSONObj> lastObjectPushed = _buffer.lastObjectPushed();
-            if (!lastObjectPushed || !lastObjectPushed->isEmpty()) {
-                const BSONObj sentinelDoc;
-                _buffer.pushEvenIfFull(sentinelDoc);
-                bufferCountGauge.increment();
-                bufferSizeGauge.increment(sentinelDoc.objsize());
-            }
+            _signalNoNewDataForApplier();
         }
         sleepsecs(1);
         return;
@@ -691,6 +696,26 @@ void BackgroundSync::_rollback(OperationContext* txn,
                                RollbackSourceImpl(getConnection, source, rsOplogName),
                                _replCoord);
     if (status.isOK()) {
+        // When the syncTail thread sees there is no new data by adding something to the buffer.
+        _signalNoNewDataForApplier();
+        // Wait until the buffer is empty.
+        // This is an indication that syncTail has removed the sentinal marker from the buffer
+        // and reset its local lastAppliedOpTime via the replCoord.
+        while (!_buffer.empty()) {
+            sleepmillis(10);
+            if (inShutdown()) {
+                return;
+            }
+        }
+
+        // It is now safe to clear the ROLLBACK state, which may result in the applier thread
+        // transitioning to SECONDARY.  This is safe because the applier thread has now reloaded
+        // the new rollback minValid from the database.
+        if (!_replCoord->setFollowerMode(MemberState::RS_RECOVERING)) {
+            warning() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING)
+                      << "; expected to be in state " << MemberState(MemberState::RS_ROLLBACK)
+                      << " but found self in " << _replCoord->getMemberState();
+        }
         return;
     }
     if (ErrorCodes::UnrecoverableRollbackError == status.code()) {

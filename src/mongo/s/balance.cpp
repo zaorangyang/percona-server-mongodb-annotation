@@ -278,7 +278,7 @@ bool Balancer::_checkOIDs(OperationContext* txn) {
             continue;
         }
 
-        BSONObj f = uassertStatusOK(grid.shardRegistry()->runCommandOnShard(
+        BSONObj f = uassertStatusOK(grid.shardRegistry()->runIdempotentCommandOnShard(
             txn,
             s,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
@@ -292,7 +292,7 @@ bool Balancer::_checkOIDs(OperationContext* txn) {
                 log() << "error: 2 machines have " << x << " as oid machine piece: " << shardId
                       << " and " << oids[x];
 
-                uassertStatusOK(grid.shardRegistry()->runCommandOnShard(
+                uassertStatusOK(grid.shardRegistry()->runIdempotentCommandOnShard(
                     txn,
                     s,
                     ReadPreferenceSetting{ReadPreference::PrimaryOnly},
@@ -301,7 +301,7 @@ bool Balancer::_checkOIDs(OperationContext* txn) {
 
                 const auto otherShard = grid.shardRegistry()->getShard(txn, oids[x]);
                 if (otherShard) {
-                    uassertStatusOK(grid.shardRegistry()->runCommandOnShard(
+                    uassertStatusOK(grid.shardRegistry()->runIdempotentCommandOnShard(
                         txn,
                         otherShard,
                         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
@@ -637,13 +637,13 @@ void Balancer::run() {
                 } else {
                     _balancedLastTime =
                         _moveChunks(txn.get(), candidateChunks, writeConcern.get(), waitForDelete);
+
+                    roundDetails.setSucceeded(static_cast<int>(candidateChunks.size()),
+                                              _balancedLastTime);
+
+                    grid.catalogManager(txn.get())
+                        ->logAction(txn.get(), "balancer.round", "", roundDetails.toBSON());
                 }
-
-                roundDetails.setSucceeded(static_cast<int>(candidateChunks.size()),
-                                          _balancedLastTime);
-
-                grid.catalogManager(txn.get())
-                    ->logAction(txn.get(), "balancer.round", "", roundDetails.toBSON());
 
                 LOG(1) << "*** End of balancing round";
             }

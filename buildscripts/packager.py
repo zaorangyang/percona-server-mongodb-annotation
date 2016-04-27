@@ -42,7 +42,7 @@ import time
 import urlparse
 
 # The MongoDB names for the architectures we support.
-DEFAULT_ARCHES=["x86_64"]
+ARCH_CHOICES=["x86_64"]
 
 # Made up names for the flavors of distribution we package for.
 DISTROS=["suse", "debian","redhat","ubuntu", "amazon"]
@@ -133,8 +133,12 @@ class Distro(object):
 
     def archname(self, arch):
         if re.search("^(debian|ubuntu)", self.n):
+            if arch == "ppc64le":
+                return "ppc64el"
             return "i386" if arch.endswith("86") else "amd64"
         elif re.search("^(suse|centos|redhat|fedora|amazon)", self.n):
+            if arch == "ppc64le":
+                return "ppc64le"
             return "i686" if arch.endswith("86") else "x86_64"
         else:
             raise Exception("BUG: unsupported platform?")
@@ -205,6 +209,8 @@ class Distro(object):
                 return "precise"
             elif build_os == 'ubuntu1404':
                 return "trusty"
+            elif build_os == 'ubuntu1504':
+                return "vivid"
             else:
                 raise Exception("unsupported build_os: %s" % build_os)
         elif self.n == 'debian':
@@ -223,15 +229,18 @@ class Distro(object):
         else:
             raise Exception("BUG: unsupported platform?")
 
-    def build_os(self):
+    def build_os(self, arch):
         """Return the build os label in the binary package to download ("rhel55", "rhel62" and "rhel70"
         for redhat, "ubuntu1204" and "ubuntu1404" for Ubuntu, "debian71" for Debian), and "suse11"
         for SUSE)"""
+        # Community builds only support amd64
+        if arch not in ['x86_64', 'ppc64le']:
+            raise Exception("BUG: unsupported architecture (%s)" % arch)
 
         if re.search("(suse)", self.n):
             return [ "suse11", "suse12" ]
         elif re.search("(redhat|fedora|centos)", self.n):
-            return [ "rhel70", "rhel62", "rhel55" ]
+            return [ "rhel70", "rhel71", "rhel62", "rhel55" ]
         elif self.n == 'amazon':
             return [ "amazon" ]
         elif self.n == 'ubuntu':
@@ -250,19 +259,20 @@ class Distro(object):
         else:
           return re.sub(r'^rh(el\d).*$', r'\1', build_os)
 
-def get_args(distros):
+def get_args(distros, arch_choices):
 
-    DISTRO_CHOICES=[]
+    distro_choices=[]
     for distro in distros:
-      DISTRO_CHOICES.extend(distro.build_os())
+        for arch in arch_choices:
+          distro_choices.extend(distro.build_os(arch))
 
     parser = argparse.ArgumentParser(description='Build MongoDB Packages')
     parser.add_argument("-s", "--server-version", help="Server version to build (e.g. 2.7.8-rc0)", required=True)
     parser.add_argument("-m", "--metadata-gitspec", help="Gitspec to use for package metadata files", required=False)
     parser.add_argument("-r", "--release-number", help="RPM release number base", type=int, required=False)
-    parser.add_argument("-d", "--distros", help="Distros to build for", choices=DISTRO_CHOICES, required=False, default=[], action='append')
+    parser.add_argument("-d", "--distros", help="Distros to build for", choices=distro_choices, required=False, default=[], action='append')
     parser.add_argument("-p", "--prefix", help="Directory to build into", required=False)
-    parser.add_argument("-a", "--arches", help="Architecture to build", choices=DEFAULT_ARCHES, default=DEFAULT_ARCHES, required=False, action='append')
+    parser.add_argument("-a", "--arches", help="Architecture to build", choices=arch_choices, default=[], required=False, action='append')
     parser.add_argument("-t", "--tarball", help="Local tarball to package instead of downloading (only valid with one distro/arch combination)", required=False, type=lambda x: is_valid_file(parser, x))
 
     args = parser.parse_args()
@@ -276,7 +286,7 @@ def main(argv):
 
     distros=[Distro(distro) for distro in DISTROS]
 
-    args = get_args(distros)
+    args = get_args(distros, ARCH_CHOICES)
 
     spec = Spec(args.server_version, args.metadata_gitspec, args.release_number)
 
@@ -299,7 +309,7 @@ def main(argv):
       # accumulate the repository-layout directories.
       for (distro, arch) in crossproduct(distros, args.arches):
 
-          for build_os in distro.build_os():
+          for build_os in distro.build_os(arch):
             if build_os in args.distros or not args.distros:
 
               if args.tarball:

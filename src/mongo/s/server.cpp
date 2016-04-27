@@ -118,8 +118,20 @@ void signalShutdown() {
     shutdownInProgress.fetchAndAdd(1);
 }
 
+// shutdownLock
+//
+// Protects:
+//  Ensures shutdown is single threaded.
+// Lock Ordering:
+//  No restrictions
+stdx::mutex shutdownLock;
+
 void exitCleanly(ExitCode code) {
     signalShutdown();
+
+    // Grab the shutdown lock to prevent concurrent callers
+    stdx::lock_guard<stdx::mutex> lockguard(shutdownLock);
+
     {
         Client& client = cc();
         ServiceContext::UniqueOperationContext uniqueTxn;
@@ -475,11 +487,11 @@ int mongoSMain(int argc, char* argv[], char** envp) {
 int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
     WindowsCommandLine wcl(argc, argvW, envpW);
     int exitCode = mongoSMain(argc, wcl.argv(), wcl.envp());
-    quickExit(exitCode);
+    exitCleanly(ExitCode(exitCode));
 }
 #else
 int main(int argc, char* argv[], char** envp) {
     int exitCode = mongoSMain(argc, argv, envp);
-    quickExit(exitCode);
+    exitCleanly(ExitCode(exitCode));
 }
 #endif

@@ -341,7 +341,7 @@ void WriteBatchExecutor::executeBatch(const BatchedCommandRequest& request,
                             _txn->getWriteConcern(),
                             &res);
     if (!status.isOK()) {
-        wcError = std::move(toWriteConcernError(status, res));
+        wcError = toWriteConcernError(status, res);
     }
 
     //
@@ -1366,6 +1366,8 @@ static void multiRemove(OperationContext* txn,
             PlanSummaryStats summary;
             Explain::getSummaryStats(*exec, &summary);
             collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+            CurOp::get(txn)->debug().fromMultiPlanner = summary.fromMultiPlanner;
+            CurOp::get(txn)->debug().replanned = summary.replanned;
 
             if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
                 // If this operation has already generated a new lastOp, don't bother setting it
