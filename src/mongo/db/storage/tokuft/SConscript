@@ -31,6 +31,7 @@ if has_option("PerconaFT"):
     env.Library(
         target= 'storage_tokuft_base',
         source= [
+            'periodically_durable_journal.cpp',
             'tokuft_capped_delete_range_optimizer.cpp',
             'tokuft_disk_format.cpp',
             'tokuft_engine.cpp',
@@ -47,8 +48,10 @@ if has_option("PerconaFT"):
             '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
             '$BUILD_DIR/mongo/db/service_context',
             '$BUILD_DIR/mongo/db/storage/bson_collection_catalog_entry',
+            '$BUILD_DIR/mongo/db/storage/journal_listener',
             '$BUILD_DIR/mongo/db/storage/key_string',
             '$BUILD_DIR/mongo/db/storage/kv/dictionary/kv_engine_impl',
+            '$BUILD_DIR/mongo/db/storage/storage_options',
             '$BUILD_DIR/mongo/util/foundation',
             '$BUILD_DIR/mongo/util/processinfo',
             ],

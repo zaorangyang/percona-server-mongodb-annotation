@@ -25,8 +25,10 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/kv/dictionary/kv_dictionary_update.h"
+#include "mongo/db/storage/tokuft/periodically_durable_journal.h"
 #include "mongo/db/storage/tokuft/tokuft_dictionary.h"
 #include "mongo/db/storage/tokuft/tokuft_disk_format.h"
 #include "mongo/db/storage/tokuft/tokuft_engine.h"
@@ -236,7 +238,8 @@ namespace mongo {
         : _env(nullptr),
           _metadataDict(nullptr),
           _internalMetadataDict(nullptr),
-          _durable(isDurable)
+          _durable(isDurable),
+          _durableJournal(nullptr)
     {
         const TokuFTEngineOptions& engineOptions = tokuftGlobalOptions.engineOptions;
 
@@ -275,6 +278,7 @@ namespace mongo {
                .set_update(&ftcxx::wrapped_updater<tokuft_update>)
                .open(path.c_str(), env_flags, env_mode);
 
+        _durableJournal.reset(new TokuFT::PeriodicallyDurableJournal(_env));
         ftcxx::DBTxn txn(_env);
         _metadataDict.reset(
             new TokuFTDictionary(_env, txn, "perconaft.metadata", KVDictionary::Encoding(),
@@ -285,6 +289,9 @@ namespace mongo {
         txn.commit();
 
         _checkAndUpgradeDiskFormatVersion();
+        if (_durable) {
+            _durableJournal->go();
+        }
     }
 
     TokuFTEngine::~TokuFTEngine() {}
@@ -294,6 +301,7 @@ namespace mongo {
 
         LOG(1) << "PerconaFT: shutdown";
 
+        _durableJournal.reset();
         _internalMetadataDict.reset();
         _metadataDict.reset();
         _env.close();
@@ -309,11 +317,11 @@ namespace mongo {
     }
 
     RecoveryUnit *TokuFTEngine::newRecoveryUnit() {
-        return new TokuFTRecoveryUnit(_env);
+        return new TokuFTRecoveryUnit(_env, _durableJournal.get());
     }
 
     void TokuFTEngine::_checkAndUpgradeDiskFormatVersion() {
-        OperationContextNoop opCtx(new TokuFTRecoveryUnit(_env));
+        OperationContextNoop opCtx(new TokuFTRecoveryUnit(_env, _durableJournal.get()));
         {
         WriteUnitOfWork wuow(&opCtx);
 
@@ -422,6 +430,10 @@ namespace mongo {
             }
         }
         return false;
+    }
+
+    void TokuFTEngine::setJournalListener(JournalListener* jl) {
+        _durableJournal->setJournalListener(jl);
     }
 
     std::vector<std::string> TokuFTEngine::getAllIdents(OperationContext *opCtx) const {

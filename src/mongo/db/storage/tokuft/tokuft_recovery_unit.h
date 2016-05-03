@@ -32,6 +32,7 @@ namespace mongo {
 
     class TokuFTEngineHarnessHelper;
     class TokuFTEngine;
+    namespace TokuFT { class DurableJournal; };
     TokuFTEngineHarnessHelper* createTokuEngineHarness();
     class FractalTreeEngineAccess {
     public:
@@ -40,12 +41,13 @@ namespace mongo {
     };
 
     class OperationContext;
+    class JournalListener;
     class TokuFTStorageEngine;
 
     class TokuFTRecoveryUnit : public KVRecoveryUnit {
         MONGO_DISALLOW_COPYING(TokuFTRecoveryUnit);
     public:
-        TokuFTRecoveryUnit(const ftcxx::DBEnv &env);
+        TokuFTRecoveryUnit(const ftcxx::DBEnv &env, TokuFT::DurableJournal *journal);
 
         virtual ~TokuFTRecoveryUnit();
 
@@ -72,7 +74,7 @@ namespace mongo {
         }
 
         KVRecoveryUnit* newRecoveryUnit() const {
-            return new TokuFTRecoveryUnit(_env);
+            return new TokuFTRecoveryUnit(_env, _durableJournal);
         }
 
         bool hasSnapshot() const;
@@ -92,6 +94,7 @@ namespace mongo {
 
         bool _knowsAboutReplicationState;
         bool _isReplicaSetSecondary;
+        TokuFT::DurableJournal * const _durableJournal;
 
         static bool _opCtxIsWriting(OperationContext *opCtx);
 
