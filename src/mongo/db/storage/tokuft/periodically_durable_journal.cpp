@@ -48,7 +48,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 namespace mongo {
 namespace TokuFT {
-    
+
     DurableJournal::DurableJournal(const ftcxx::DBEnv &env) :
         _env(env), _listener(&NoOpJournalListener::instance) {
     }
@@ -69,14 +69,14 @@ namespace TokuFT {
     }
 
     PeriodicallyDurableJournal::PeriodicallyDurableJournal(const ftcxx::DBEnv &env) :
-        DurableJournal(env), BackgroundJob(false) {}
+        DurableJournal(env), BackgroundJob(false), isRunning(false) {}
 
     void PeriodicallyDurableJournal::sleepIfNeeded() const {
         int ms = storageGlobalParams.journalCommitIntervalMs;
         if (!ms) {
             ms = 100;
         }
-    
+
         sleepmillis(ms);
     }
 
@@ -85,12 +85,17 @@ namespace TokuFT {
     }
 
     void PeriodicallyDurableJournal::run() {
+        this->isRunning = true;
         Client::initThread(this->name().c_str());
-        while (true) {
+        while (this->isRunning) {
             this->DurableJournal::forceDurability();
             this->sleepIfNeeded();
         }
     }
 
+    void PeriodicallyDurableJournal::stop() {
+        this->isRunning = false;
+        BackgroundJob::wait();
+    }
 } // namespace TokuFT
 } // namespace mongo

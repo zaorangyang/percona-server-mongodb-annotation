@@ -52,7 +52,9 @@ namespace TokuFT {
         PeriodicallyDurableJournal(const ftcxx::DBEnv &env);
         virtual std::string name() const;
         virtual void run();
+        void stop();
     private:
+        std::atomic<bool> isRunning;
         void sleepIfNeeded() const;
     };
 
