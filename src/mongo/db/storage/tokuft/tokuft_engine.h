@@ -22,12 +22,16 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 #include <boost/scoped_ptr.hpp>
 
+#include "mongo/db/client.h"
 #include "mongo/db/storage/kv/dictionary/kv_engine_impl.h"
+//#include "mongo/db/storage/periodically_durable_journal.h"
 
 #include <ftcxx/db_env.hpp>
 
 namespace mongo {
 
+    class JournalListener;
+    namespace TokuFT { class PeriodicallyDurableJournal; };
     class TokuFTDictionaryOptions;
 
     class TokuFTEngine : public KVEngineImpl {
@@ -78,7 +82,7 @@ namespace mongo {
 
         virtual bool supportsDirectoryPerDB() const { return false; }
 
-        virtual void setJournalListener(JournalListener* jl) {}
+        virtual void setJournalListener(JournalListener* jl);
 
         // ------------------------------------------------------------------ //
 
@@ -109,6 +113,7 @@ namespace mongo {
         boost::scoped_ptr<KVDictionary> _metadataDict;
         boost::scoped_ptr<KVDictionary> _internalMetadataDict;
         bool _durable;
+        boost::scoped_ptr<TokuFT::PeriodicallyDurableJournal> _durableJournal;
     };
 
 } // namespace mongo

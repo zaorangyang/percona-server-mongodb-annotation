@@ -25,6 +25,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/storage/tokuft/periodically_durable_journal.h"
 #include "mongo/db/storage/tokuft/tokuft_recovery_unit.h"
 #include "mongo/db/storage/tokuft/tokuft_global_options.h"
 #include "mongo/util/log.h"
@@ -34,9 +35,9 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 namespace mongo {
 
-    TokuFTRecoveryUnit::TokuFTRecoveryUnit(const ftcxx::DBEnv &env) :
+    TokuFTRecoveryUnit::TokuFTRecoveryUnit(const ftcxx::DBEnv &env, TokuFT::DurableJournal *journal) :
         // We use depth to track transaction nesting
-        _env(env), _txn(), _depth(0), _rollbackWritesDisabled(false), _knowsAboutReplicationState(false) {
+        _env(env), _txn(), _depth(0), _rollbackWritesDisabled(false), _knowsAboutReplicationState(false), _durableJournal(journal) {
     }
 
     TokuFTRecoveryUnit::~TokuFTRecoveryUnit() {
@@ -118,8 +119,9 @@ namespace mongo {
         invariant(!hasSnapshot());
 
         // Once the log is synced, the transaction is fully durable.
-        const int r = _env.env()->log_flush(_env.env(), NULL);
-        return r == 0;
+        int r = _durableJournal->forceDurability();
+        const bool flushWasSuccessful = (r == 0);
+        return flushWasSuccessful;
     }
 
     void TokuFTRecoveryUnit::registerChange(RecoveryUnit::Change *change) {
