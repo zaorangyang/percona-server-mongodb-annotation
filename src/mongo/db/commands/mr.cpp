@@ -32,6 +32,8 @@
 
 #include "mongo/db/commands/mr.h"
 
+#include "mongo/base/status_with.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/parallel.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -45,6 +47,7 @@
 #include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/instance.h"
@@ -53,6 +56,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/find_common.h"
@@ -73,6 +77,7 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -696,6 +701,11 @@ void State::insert(const string& ns, const BSONObj& o) {
         b.appendElements(o);
         BSONObj bo = b.obj();
 
+        StatusWith<BSONObj> res = fixDocumentForInsert(bo);
+        uassertStatusOK(res.getStatus());
+        if (!res.getValue().isEmpty()) {
+            bo = res.getValue();
+        }
         uassertStatusOK(coll->insertDocument(_txn, bo, true));
         wuow.commit();
     }
@@ -715,6 +725,17 @@ void State::_insertToInc(BSONObj& o) {
         bool shouldReplicateWrites = _txn->writesAreReplicated();
         _txn->setReplicatedWrites(false);
         ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, _txn, shouldReplicateWrites);
+
+        // The documents inserted into the incremental collection are of the form
+        // {"0": <key>, "1": <value>}, so we cannot call fixDocumentForInsert(o) here because the
+        // check that the document has an "_id" field would fail. Instead, we directly verify that
+        // the size of the document to insert is smaller than 16MB.
+        if (o.objsize() > BSONObjMaxUserSize) {
+            uasserted(ErrorCodes::BadValue,
+                      str::stream() << "object to insert too large for incremental collection"
+                                    << ". size in bytes: " << o.objsize()
+                                    << ", max size: " << BSONObjMaxUserSize);
+        }
         uassertStatusOK(coll->insertDocument(_txn, o, true, false));
         wuow.commit();
     }
@@ -1064,11 +1085,15 @@ void State::finalReduce(CurOp* op, ProgressMeterHolder& pm) {
         all.push_back(o);
 
         if (!exec->restoreState()) {
-            break;
+            uasserted(34375, "Plan executor killed during mapReduce final reduce");
         }
 
         _txn->checkForInterrupt();
     }
+
+    uassert(34428,
+            "Plan executor error during mapReduce command: " + WorkingSetCommon::toStatusString(o),
+            PlanExecutor::IS_EOF == state);
 
     ctx.reset();
     // reduce and finalize last array
@@ -1387,24 +1412,29 @@ public:
                 }
                 std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-                Database* db = scopedAutoDb->getDb();
-                Collection* coll = state.getCollectionOrUassert(db, config.ns);
-                invariant(coll);
+                unique_ptr<PlanExecutor> exec;
+                {
+                    Database* db = scopedAutoDb->getDb();
+                    Collection* coll = State::getCollectionOrUassert(db, config.ns);
+                    invariant(coll);
 
-                auto statusWithPlanExecutor =
-                    getExecutor(txn, coll, std::move(cq), PlanExecutor::YIELD_AUTO);
-                if (!statusWithPlanExecutor.isOK()) {
-                    uasserted(17239, "Can't get executor for query " + config.filter.toString());
-                    return 0;
+                    auto statusWithPlanExecutor =
+                        getExecutor(txn, coll, std::move(cq), PlanExecutor::YIELD_AUTO);
+                    if (!statusWithPlanExecutor.isOK()) {
+                        uasserted(17239,
+                                  "Can't get executor for query " + config.filter.toString());
+                        return 0;
+                    }
+
+                    exec = std::move(statusWithPlanExecutor.getValue());
                 }
-
-                unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
                 Timer mt;
 
                 // go through each doc
                 BSONObj o;
-                while (PlanExecutor::ADVANCED == exec->getNext(&o, NULL)) {
+                PlanExecutor::ExecState execState;
+                while (PlanExecutor::ADVANCED == (execState = exec->getNext(&o, NULL))) {
                     // check to see if this is a new object we don't own yet
                     // because of a chunk migration
                     if (collMetadata) {
@@ -1442,17 +1472,12 @@ public:
                         scopedXact.reset(new ScopedTransaction(txn, MODE_IS));
                         scopedAutoDb.reset(new AutoGetDb(txn, nss.db(), MODE_S));
 
-                        exec->restoreState();
-
-                        // Need to reload the database, in case it was dropped after we
-                        // released the lock
-                        db = scopedAutoDb->getDb();
-                        if (db == NULL) {
-                            // Database was deleted after we freed the lock
-                            StringBuilder sb;
-                            sb << "Database " << nss.db()
-                               << " was deleted in the middle of the reduce job.";
-                            uasserted(28523, sb.str());
+                        if (!exec->restoreState()) {
+                            return appendCommandStatus(
+                                result,
+                                Status(ErrorCodes::OperationFailed,
+                                       str::stream()
+                                           << "Executor killed during mapReduce command"));
                         }
 
                         reduceTime += t.micros();
@@ -1466,10 +1491,22 @@ public:
                         break;
                 }
 
+                if (PlanExecutor::DEAD == execState || PlanExecutor::FAILURE == execState) {
+                    return appendCommandStatus(
+                        result,
+                        Status(ErrorCodes::OperationFailed,
+                               str::stream() << "Executor error during mapReduce command: "
+                                             << WorkingSetCommon::toStatusString(o)));
+                }
+
                 // Record the indexes used by the PlanExecutor.
                 PlanSummaryStats stats;
                 Explain::getSummaryStats(*exec, &stats);
+                Collection* coll = scopedAutoDb->getDb()->getCollection(config.ns);
+                invariant(coll);  // 'exec' hasn't been killed, so collection must be alive.
                 coll->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
+                CurOp::get(txn)->debug().fromMultiPlanner = stats.fromMultiPlanner;
+                CurOp::get(txn)->debug().replanned = stats.replanned;
             }
             pm.finished();
 

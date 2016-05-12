@@ -708,7 +708,9 @@ public:
     void detachFromOperationContext() final {
         invariant(_txn);
         _txn = nullptr;
-        _cursor->close(_cursor);
+        if (_cursor) {
+            invariantWTOK(_cursor->close(_cursor));
+        }
         _cursor = nullptr;
     }
     void reattachToOperationContext(OperationContext* txn) final {
@@ -812,7 +814,11 @@ WiredTigerRecordStore::WiredTigerRecordStore(OperationContext* ctx,
     Status versionStatus = WiredTigerUtil::checkApplicationMetadataFormatVersion(
         ctx, uri, kMinimumRecordStoreVersion, kMaximumRecordStoreVersion);
     if (!versionStatus.isOK()) {
-        fassertFailedWithStatusNoTrace(28548, versionStatus);
+        if (versionStatus.code() == ErrorCodes::FailedToParse) {
+            uasserted(28548, versionStatus.reason());
+        } else {
+            fassertFailedNoTrace(34433);
+        }
     }
 
     if (_isCapped) {

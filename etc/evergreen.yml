@@ -67,6 +67,7 @@ variables:
   - enterprise-rhel-57-64-bit
   - enterprise-rhel-62-64-bit
   - enterprise-rhel-70-64-bit
+  - enterprise-rhel-71-ppc64le
   - enterprise-suse11-64
   - enterprise-suse12-64
   - enterprise-ubuntu1204-64
@@ -91,6 +92,7 @@ variables:
   - enterprise-rhel-57-64-bit
   - enterprise-rhel-62-64-bit
   - enterprise-rhel-70-64-bit
+  - enterprise-rhel-71-ppc64le
   - enterprise-suse11-64
   - enterprise-suse12-64
   - enterprise-ubuntu1204-64
@@ -214,7 +216,7 @@ functions:
             set -o igncr
         fi;
 
-        git checkout r3.2.4
+        git checkout r3.2.5-rc1
         . ./${set_tools_gopath|set_gopath.sh}
 
         # In RHEL 5.5, /usr/bin/ld can't handle --build-id parameters, so
@@ -226,7 +228,7 @@ functions:
         fi
 
         for i in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog; do
-             ${gorootvars} go build -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec $(git rev-parse HEAD)" ${tooltags|} -o "../mongo-tools/$i${exe|}" $i/main/$i.go
+             ${gorootvars} go build -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec $(git rev-parse HEAD) -X github.com/mongodb/mongo-tools/common/options.VersionStr $(git --git-dir ../../.git describe)" ${tooltags|} -o "../mongo-tools/$i${exe|}" $i/main/$i.go
              echo $i;
         done
         exit 0
@@ -299,7 +301,7 @@ functions:
           git clone git@github.com:10gen/jstestfuzz.git
 
           if [ "Windows_NT" != "$OS" ]; then
-            curl --verbose --max-time 600 --retry 10 --retry-max-time 900 http://boxes.10gen.com/build/node-v0.12.7-linux-x64.tar.gz --output node.tar.gz
+            ${python|python} jstestfuzz/etc/download_nodejs.py
             ${decompress} node.tar.gz > /dev/null
           fi
 
@@ -358,7 +360,7 @@ functions:
         set -o verbose
 
         rm -rf /data/install /data/multiversion
-        ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion ${multiversion_platform_arch|"Linux/x86_64"} "2.4" "2.6" "3.0"
+        ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion ${multiversion_platform_arch|"Linux/x86_64"} "2.4" "2.6" "3.0" "3.2.1"
 
 pre:
   - command: shell.track
@@ -448,10 +450,13 @@ tasks:
           mv mongodb-*-debugsymbols.${ext|tgz} mongo-debugsymbols.tgz || true
           mv mongodb-*.${ext|tgz} mongodb-binaries.tgz
 
-          # If strip is on the path (everywhere except windows) then we should strip the unit test binaries
+          # If strip is on the path (everywhere except windows) then we should strip the test binaries
           # before tarring them up
           if [ -x ${strip_path|/usr/bin/strip} ]; then
             cat build/unittests.txt | xargs ${strip_command|/usr/bin/strip}
+            cat build/integration_tests.txt | xargs ${strip_command|/usr/bin/strip}
+            ${strip_command|/usr/bin/strip} dbtest
+            ${strip_command|/usr/bin/strip} mongobridge
           fi
 
           # On windows we need to make sure the paths in unittests.txt are compatible with cygwin tar
@@ -469,7 +474,7 @@ tasks:
 
           if [ "${has_packages|}" = "true" ] ; then
             cd buildscripts
-            ${python|python} ${packager_script} --prefix `pwd`/.. --distros ${packager_distro} --tarball `pwd`/../mongodb-binaries.tgz -s ${version} -m HEAD
+            ${python|python} ${packager_script} --prefix `pwd`/.. --distros ${packager_distro} --tarball `pwd`/../mongodb-binaries.tgz -s ${version} -m HEAD -a ${packager_arch}
             cd ..
           fi
     - command: archive.targz_pack
@@ -2532,6 +2537,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
+    packager_arch: x86_64
     packager_distro: ubuntu1204
   tasks:
   - name: compile
@@ -2638,6 +2644,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
+    packager_arch: x86_64
     packager_distro: ubuntu1404
   tasks:
   - name: compile
@@ -2744,6 +2751,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
+    packager_arch: x86_64
     packager_distro: amazon
   tasks:
   - name: compile
@@ -2818,6 +2826,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
+    packager_arch: x86_64
     packager_distro: amazon
   tasks:
   - name: compile
@@ -3499,11 +3508,11 @@ buildvariants:
 #             OSX buildvariants           #
 ###########################################
 
-- name: osx-108
-  display_name: OS X 10.8
+- name: osx-107
+  display_name: OS X 10.7
   modules: ~
   run_on:
-  - osx-108
+  - osx-1010
   batchtime: 1440 # 1 day
   expansions:
     push_path: osx
@@ -3588,11 +3597,11 @@ buildvariants:
     distros:
     - rhel55-test
 
-- name: osx-108-ssl
-  display_name: SSL OS X 10.8
+- name: osx-107-ssl
+  display_name: SSL OS X 10.7
   modules: ~
   run_on:
-  - osx-108
+  - osx-1010
   batchtime: 1440 # 1 day
   expansions:
     push_path: osx
@@ -3678,11 +3687,11 @@ buildvariants:
     distros:
     - rhel55-test
 
-- name: osx-108-debug
-  display_name: OS X 10.8 DEBUG
+- name: osx-107-debug
+  display_name: OS X 10.7 DEBUG
   modules: ~
   run_on:
-  - osx-108
+  - osx-1010
   expansions:
     push_path: osx
     push_bucket: downloads.mongodb.org
@@ -3717,12 +3726,12 @@ buildvariants:
   - name: tool_WT
   - name: unittests
 
-- name: enterprise-osx-108
-  display_name: Enterprise OS X 10.8
+- name: enterprise-osx-107
+  display_name: Enterprise OS X 10.7
   modules:
   - enterprise
   run_on:
-  - osx-108
+  - osx-1010
   batchtime: 1440 # 1 day
   expansions:
     push_path: osx
@@ -3780,6 +3789,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
+    packager_arch: x86_64
     packager_distro: rhel57
   tasks:
   - name: compile
@@ -3827,6 +3837,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
+    packager_arch: x86_64
     packager_distro: rhel62
   tasks:
   - name: compile
@@ -3933,6 +3944,7 @@ buildvariants:
   - name: sharding_legacy_op_query_WT
   - name: sharding_op_query_WT
   - name: sharding_legacy_multiversion
+  - name: sharding_csrs_continuous_config_stepdown_WT  
   - name: slow1
   - name: slow1_WT
   - name: slow2
@@ -3966,6 +3978,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
+    packager_arch: x86_64
     packager_distro: rhel70
   tasks:
   - name: compile
@@ -3993,6 +4006,140 @@ buildvariants:
     distros:
     - rhel55-test
 
+- name: enterprise-rhel-71-ppc64le
+  display_name: Enterprise RHEL 7.1 PPC64LE
+  modules:
+  - enterprise
+  run_on:
+  - rhel71-power8-build
+  - rhel71-power8-test
+  batchtime: 1440 # 1 day
+  stepback: false
+  expansions:
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
+    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
+    compile_flags: --ssl MONGO_DISTMOD=rhel71 --release -j$(grep -c processor /proc/cpuinfo) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" CXX=/opt/mongodbtoolchain/v1/bin/g++ CC=/opt/mongodbtoolchain/v1/bin/gcc
+    num_jobs_available: 20
+    test_flags: --continueOnFailure --excludeWithAnyTags=requires_mmapv1
+    has_packages: true
+    packager_script: packager-enterprise.py
+    packager_arch: ppc64le
+    packager_distro: rhel71
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: ppc64le-enterprise-rhel71
+  tasks:
+  - name: compile
+    distros:
+    - rhel71-power8-build
+  # - name: aggregation
+  - name: aggregation_WT
+  - name: aggregation_WT_ese
+  - name: aggregation_auth
+  - name: aggregation_read_concern_majority_passthrough_WT
+  # - name: audit
+  - name: audit_WT
+  # - name: auth
+  - name: auth_WT
+  # - name: auth_audit
+  - name: auth_audit_WT
+  # - name: bulk_gle_passthrough
+  - name: bulk_gle_passthrough_WT
+  # - name: concurrency
+  - name: concurrency_WT
+  # - name: concurrency_replication
+  - name: concurrency_replication_WT
+  # - name: concurrency_sharded
+  - name: concurrency_sharded_WT
+  # - name: concurrency_sharded_sccc
+  - name: concurrency_sharded_sccc_WT
+  # - name: concurrency_simultaneous
+  - name: concurrency_simultaneous_WT
+  # - name: dbtest
+  - name: dbtest_WT
+  # - name: disk
+  # - name: dur_jscore_passthrough
+  # - name: durability
+  - name: ese_WT
+  - name: failpoints
+  - name: failpoints_auth
+  # - name: gle_auth
+  - name: gle_auth_WT
+  # - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_WT
+  # - name: gle_auth_basics_passthrough_write_cmd
+  - name: gle_auth_basics_passthrough_write_cmd_WT
+  # - name: gle_auth_write_cmd
+  - name: gle_auth_write_cmd_WT
+  - name: httpinterface
+  - name: integration_tests_replset
+  - name: integration_tests_standalone
+  # - name: jsCore
+  - name: jsCore_WT
+  - name: jsCore_WT_ese
+  # - name: jsCore_auth
+  # - name: jsCore_compatibility
+  - name: jsCore_compatibility_WT
+  # - name: jsCore_minimum_batch_size_WT
+  # - name: jsCore_op_query
+  - name: jsCore_op_query_WT
+  # - name: jsCore_small_oplog
+  - name: jsCore_small_oplog_WT
+  # - name: jsCore_small_oplog_rs
+  - name: jsCore_small_oplog_rs_WT
+  # - name: mmap
+  - name: mongosTest
+  # - name: noPassthrough
+  # - name: noPassthroughWithMongod
+  - name: noPassthroughWithMongod_WT
+  - name: noPassthrough_WT
+  # - name: parallel
+  - name: parallel_WT
+  # - name: parallel_compatibility
+  - name: parallel_compatibility_WT
+  - name: read_concern_majority_passthrough_WT
+  # - name: replicasets
+  - name: replicasets_WT
+  - name: replicasets_WT_ese
+  - name: replicasets_auth
+  - name: replicasets_legacy
+  # - name: replication
+  - name: replication_WT
+  - name: replication_auth
+  - name: sasl
+  # - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
+  # - name: sharding
+  - name: sharding_WT
+  - name: sharding_WT_ese
+  - name: sharding_auth
+  - name: sharding_auth_audit_WT
+  # - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_WT
+  # - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  # - name: sharding_jscore_passthrough
+  - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_passthrough_wire_ops_WT
+  - name: sharding_legacy
+  - name: sharding_legacy_op_query_WT
+  - name: sharding_op_query_WT
+  # - name: slow1
+  - name: slow1_WT
+  # - name: slow2
+  - name: slow2_WT
+  # - name: snmp
+  - name: snmp_WT
+  - name: ssl
+  - name: sslSpecial
+  # - name: tool
+  - name: tool_WT
+  - name: unittests
+  - name: push
+    distros:
+    - rhel55-test
+
 - name: rhel55
   display_name: SSL RHEL 5.5
   modules: ~
@@ -4012,6 +4159,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
+    packager_arch: x86_64
     packager_distro: rhel55
   tasks:
   - name: compile
@@ -4119,6 +4267,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
+    packager_arch: x86_64
     packager_distro: rhel62
   tasks:
   - name: compile
@@ -4224,6 +4373,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
+    packager_arch: x86_64
     packager_distro: rhel70
   tasks:
   - name: compile
@@ -4336,6 +4486,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
+    packager_arch: x86_64
     packager_distro: ubuntu1204
   tasks:
   - name: compile
@@ -4383,6 +4534,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
+    packager_arch: x86_64
     packager_distro: ubuntu1404
   tasks:
   - name: compile
@@ -4434,6 +4586,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
+    packager_arch: x86_64
     packager_distro: suse12
   tasks:
   - name: compile
@@ -4480,6 +4633,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
+    packager_arch: x86_64
     packager_distro: suse12
   tasks:
   - name: compile
@@ -4588,6 +4742,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
+    packager_arch: x86_64
     packager_distro: suse11
   tasks:
   - name: compile
@@ -4634,6 +4789,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
+    packager_arch: x86_64
     packager_distro: suse11
   tasks:
   - name: compile
@@ -4826,6 +4982,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
+    packager_arch: x86_64
     packager_distro: debian71
   tasks:
   - name: compile
@@ -4872,6 +5029,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
+    packager_arch: x86_64
     packager_distro: debian71
   tasks:
   - name: compile
@@ -4985,6 +5143,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
+    packager_arch: x86_64
     packager_distro: rhel62
   tasks:
   - name: compile
