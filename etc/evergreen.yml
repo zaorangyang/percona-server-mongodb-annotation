@@ -24,6 +24,7 @@
 # - 'builde
 
 command_type: system
+disable_cleanup: true
 
 ## Some variables for convenience:
 variables:
@@ -174,7 +175,7 @@ functions:
             set -o igncr
         fi;
 
-        git checkout r3.0.10
+        git checkout v3.0
         . ./${set_tools_gopath|set_gopath.sh}
 
         # In RHEL 5.5, /usr/bin/ld can't handle --build-id parameters, so
@@ -186,7 +187,7 @@ functions:
         fi
 
         for i in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog; do
-             ${gorootvars} go build -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec $(git rev-parse HEAD)" ${tooltags|} -o "../mongo-tools/$i${exe|}" $i/main/$i.go
+             ${gorootvars} go build -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec $(git rev-parse HEAD) -X github.com/mongodb/mongo-tools/common/options.VersionStr $(git --git-dir ../../.git describe)" ${tooltags|} -o "../mongo-tools/$i${exe|}" $i/main/$i.go
              echo $i;
         done
         exit 0
@@ -3187,11 +3188,11 @@ buildvariants:
 #             OSX buildvariants           #
 ###########################################
 
-- name: osx-108
-  display_name: OS X 10.8
+- name: osx-107
+  display_name: OS X 10.7
   modules: ~
   run_on:
-  - osx-108
+  - osx-1010
   expansions:
     push_path: osx
     push_bucket: downloads.mongodb.org
@@ -3250,11 +3251,11 @@ buildvariants:
     distros:
     - rhel55-test
 
-- name: osx-108-ssl
-  display_name: SSL OS X 10.8
+- name: osx-107-ssl
+  display_name: SSL OS X 10.7
   modules: ~
   run_on:
-  - osx-108
+  - osx-1010
   expansions:
     push_path: osx
     push_bucket: downloads.mongodb.org
@@ -3317,11 +3318,11 @@ buildvariants:
     distros:
     - rhel55-test
 
-- name: osx-108-debug
-  display_name: OS X 10.8 DEBUG
+- name: osx-107-debug
+  display_name: OS X 10.7 DEBUG
   modules: ~
   run_on:
-  - osx-108
+  - osx-1010
   expansions:
     push_path: osx
     push_bucket: downloads.mongodb.org
