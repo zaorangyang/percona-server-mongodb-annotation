@@ -5,10 +5,7 @@ env.SConscript(
         'devnull',
         'ephemeral_for_test',
         'kv',
-        'kv/dictionary',
-        'kv_heap',
         'mmap_v1',
-        'tokuft',
         'wiredtiger',
     ],
 )

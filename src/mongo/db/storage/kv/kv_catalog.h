@@ -86,9 +86,7 @@ private:
     class AddIdentChange;
     class RemoveIdentChange;
 
-    BSONObj _findEntry(OperationContext* opCtx, StringData ns,
-                            RecordId* out=NULL,
-                            bool skipPessimisticLocking=false ) const;
+    BSONObj _findEntry(OperationContext* opCtx, StringData ns, RecordId* out = NULL) const;
 
     /**
      * Generates a new unique identifier for a new "thing".

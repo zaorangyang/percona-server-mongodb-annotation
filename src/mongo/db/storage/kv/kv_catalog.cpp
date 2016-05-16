@@ -203,12 +203,12 @@ std::string KVCatalog::getCollectionIdent(StringData ns) const {
 std::string KVCatalog::getIndexIdent(OperationContext* opCtx,
                                      StringData ns,
                                      StringData idxName) const {
-    BSONObj obj = _findEntry( opCtx, ns, NULL, true );
+    BSONObj obj = _findEntry(opCtx, ns);
     BSONObj idxIdent = obj["idxIdent"].Obj();
     return idxIdent[idxName].String();
 }
 
-BSONObj KVCatalog::_findEntry(OperationContext* opCtx, StringData ns, RecordId* out, bool skipPessimisticLocking) const {
+BSONObj KVCatalog::_findEntry(OperationContext* opCtx, StringData ns, RecordId* out) const {
     std::unique_ptr<Lock::ResourceLock> rLk;
     if (!_isRsThreadSafe && opCtx->lockState()) {
         rLk.reset(new Lock::ResourceLock(opCtx->lockState(), resourceIdCatalogMetadata, MODE_S));
@@ -224,7 +224,7 @@ BSONObj KVCatalog::_findEntry(OperationContext* opCtx, StringData ns, RecordId* 
 
     LOG(1) << "looking up metadata for: " << ns << " @ " << dl;
     RecordData data;
-    if (!_rs->findRecord(opCtx, dl, &data, skipPessimisticLocking)) {
+    if (!_rs->findRecord(opCtx, dl, &data)) {
         // since the in memory meta data isn't managed with mvcc
         // its possible for different transactions to see slightly
         // different things, which is ok via the locking above.
@@ -239,7 +239,7 @@ BSONObj KVCatalog::_findEntry(OperationContext* opCtx, StringData ns, RecordId* 
 
 const BSONCollectionCatalogEntry::MetaData KVCatalog::getMetaData(OperationContext* opCtx,
                                                                   StringData ns) {
-    BSONObj obj = _findEntry( opCtx, ns, NULL, true );
+    BSONObj obj = _findEntry(opCtx, ns);
     LOG(3) << " fetched CCE metadata: " << obj;
     BSONCollectionCatalogEntry::MetaData md;
     const BSONElement mdElement = obj["md"];
@@ -259,7 +259,7 @@ void KVCatalog::putMetaData(OperationContext* opCtx,
     }
 
     RecordId loc;
-    BSONObj obj = _findEntry(opCtx, ns, &loc, false);
+    BSONObj obj = _findEntry(opCtx, ns, &loc);
 
     {
         // rebuilt doc
@@ -306,7 +306,7 @@ Status KVCatalog::renameCollection(OperationContext* opCtx,
     }
 
     RecordId loc;
-    BSONObj old = _findEntry(opCtx, fromNS, &loc, false).getOwned();
+    BSONObj old = _findEntry(opCtx, fromNS, &loc).getOwned();
     {
         BSONObjBuilder b;
 

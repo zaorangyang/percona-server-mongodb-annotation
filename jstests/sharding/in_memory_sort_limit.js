@@ -21,15 +21,8 @@
 
      // Make sure that at least 1 chunk is on another shard so that mongos doesn't treat this as a
      // single-shard query (which doesn't exercise the bug).
-     var oldDiff = st.chunkDiff('skip', 'test');
      st.startBalancer();
-     try {
-         st.awaitBalance('skip', 'test');
-     } catch (ex) {
-         if (st.chunkDiff('skip', 'test') == oldDiff) {
-             throw ex;
-         }
-     }
+     st.awaitBalance('skip', 'test');
 
      var docCount = mongosCol.count();
      var shardCol = st.shard0.getDB('test').getCollection('skip');
