@@ -9,6 +9,7 @@ pcreSuffix = "-8.37"
 mozjsSuffix = '-38'
 
 thirdPartyIncludePathList = [
+    ('percona_incl', '#/src/third_party/install/include'),
     ('s2', '#/src/third_party/s2'),
     ('tz', '#/src/third_party/tz'),
 ]
