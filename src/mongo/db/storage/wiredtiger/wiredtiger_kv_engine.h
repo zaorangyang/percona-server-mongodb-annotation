@@ -56,7 +56,8 @@ public:
                        size_t cacheSizeGB,
                        bool durable,
                        bool ephemeral,
-                       bool repair);
+                       bool repair,
+                       bool cacheInMB = false);
     virtual ~WiredTigerKVEngine();
 
     void setRecordStoreExtraOptions(const std::string& options);
@@ -136,6 +137,10 @@ public:
     bool haveDropsQueued() const;
 
     void syncSizeInfo(bool sync) const;
+
+    std::string getCanonicalName() const {
+        return _canonicalName;
+    }
 
     /**
      * Initializes a background job to remove excess documents in the oplog collections.
