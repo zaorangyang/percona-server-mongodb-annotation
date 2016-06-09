@@ -119,7 +119,8 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                                        size_t cacheSizeGB,
                                        bool durable,
                                        bool ephemeral,
-                                       bool repair)
+                                       bool repair,
+                                       bool cacheInMB /*= false*/)
     : _eventHandler(WiredTigerUtil::defaultEventHandlers()),
       _canonicalName(canonicalName),
       _path(path),
@@ -143,7 +144,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
 
     std::stringstream ss;
     ss << "create,";
-    ss << "cache_size=" << cacheSizeGB << "G,";
+    ss << "cache_size=" << cacheSizeGB << (cacheInMB ? "M, " : "G,");
     ss << "session_max=20000,";
     ss << "eviction=(threads_max=4),";
     ss << "config_base=false,";

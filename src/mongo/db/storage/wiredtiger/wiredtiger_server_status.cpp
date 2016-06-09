@@ -48,7 +48,7 @@ namespace mongo {
 using std::string;
 
 WiredTigerServerStatusSection::WiredTigerServerStatusSection(WiredTigerKVEngine* engine)
-    : ServerStatusSection(kWiredTigerEngineName), _engine(engine) {}
+    : ServerStatusSection(engine->getCanonicalName()), _engine(engine) {}
 
 bool WiredTigerServerStatusSection::includeByDefault() const {
     return true;
