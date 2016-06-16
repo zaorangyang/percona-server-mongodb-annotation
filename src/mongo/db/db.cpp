@@ -416,10 +416,17 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
 
         // First thing after opening the database is to check for file compatibility,
         // otherwise we might crash if this is a deprecated format.
-        if (!db->getDatabaseCatalogEntry()->currentFilesCompatible(txn)) {
-            log() << "****";
-            log() << "cannot do this upgrade without an upgrade in the middle";
-            log() << "please do a --repair with 2.6 and then start this version";
+        auto status = db->getDatabaseCatalogEntry()->currentFilesCompatible(txn);
+        if (!status.isOK()) {
+            if (status.code() == ErrorCodes::CanRepairToDowngrade) {
+                // Convert CanRepairToDowngrade statuses to MustUpgrade statuses to avoid logging a
+                // potentially confusing and inaccurate message.
+                status = {ErrorCodes::MustUpgrade, status.reason()};
+            }
+            severe() << "Unable to start mongod due to an incompatibility with the data files and"
+                        " this version of mongod: " << status;
+            severe() << "Please consult our documentation when trying to downgrade to a previous"
+                        " major release";
             dbexit(EXIT_NEED_UPGRADE);
             return;
         }
@@ -484,6 +491,15 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
         }
     }
 
+    // We may have features enabled on a collection or index in the data files that are recognized
+    // by this version of mongod in order to support downgrading to an earlier version of the same
+    // major release or an earlier major release. Some features may require user-intervention in
+    // order to continue starting up, but a more descriptive error message is provided to the user.
+    // Other features may be able to automatically downconvert the data files and be disabled. In
+    // either case, we only start up if we can guarantee it'd be possible to continue downgrading to
+    // earlier versions of mongod.
+    fassert(40115, storageEngine->requireDataFileCompatibilityWithPriorRelease(txn));
+
     LOG(1) << "done repairDatabases" << endl;
 }
 
@@ -534,7 +550,8 @@ static void _initAndListen(int listenPort) {
     options.port = listenPort;
     options.ipList = serverGlobalParams.bind_ip;
 
-    MessageServer* server = createServer(options, new MyMessageHandler());
+    auto handler = std::make_shared<MyMessageHandler>();
+    MessageServer* server = createServer(options, std::move(handler));
     server->setAsTimeTracker();
 
     // This is what actually creates the sockets, but does not yet listen on them because we

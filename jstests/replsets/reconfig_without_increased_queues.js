@@ -38,8 +38,8 @@
         */
         assert.soon(function() {
             primary = replTest.getPrimary();
-            var stats = replTest.nodes.map(m => m.getDB("admin").serverStatus());
             try {
+                var stats = replTest.nodes.map(m => m.getDB("admin").serverStatus());
                 stats.forEach(s => {
                     var executorStats = s.metrics.repl.executor;
                     printjson(s.host);
@@ -70,7 +70,7 @@
     replTest.awaitSecondaryNodes();
 
     // ** Setup different priorities
-    var c = replTest.getConfigFromPrimary();
+    var c = replTest.getReplSetConfigFromNode();
     c.members[0].priority = 99;
     c.members[1].priority = 2;
     c.members[2].priority = 0;
@@ -82,7 +82,7 @@
     }
 
     // ** Setup different priorities
-    var c = replTest.getConfigFromPrimary();
+    var c = replTest.getReplSetConfigFromNode();
     c.members[2].hidden = true;
     c.members[3].priority = 1000;
     c.members[4].priority = 1000;

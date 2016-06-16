@@ -1805,6 +1805,12 @@ def doConfigure(myenv):
         # than the return type.
         AddToCXXFLAGSIfSupported(myenv, "-Wredundant-move")
 
+        # Disable warning about variables that may not be initialized
+        # Failures are triggered in the case of boost::optional in GCC 4.8.x
+        # TODO: re-evaluate when we move to GCC 5.3
+        # see: http://stackoverflow.com/questions/21755206/how-to-get-around-gcc-void-b-4-may-be-used-uninitialized-in-this-funct
+        AddToCXXFLAGSIfSupported(myenv, "-Wno-maybe-uninitialized")
+
     # Check if we need to disable null-conversion warnings
     if myenv.ToolchainIs('clang'):
         def CheckNullConversion(context):
@@ -2146,6 +2152,17 @@ def doConfigure(myenv):
     if myenv.ToolchainIs('gcc', 'clang'):
         AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
 
+        # Disallow an executable stack. Also, issue a warning if any files are found that would
+        # cause the stack to become executable if the noexecstack flag was not in play, so that we
+        # can find them and fix them. We do this here after we check for ld.gold because the
+        # --warn-execstack is currently only offered with gold.
+        #
+        # TODO: Add -Wl,--fatal-warnings once WT-2629 is fixed. We probably can do that
+        # unconditionally above, and not need to do it as an AddToLINKFLAGSIfSupported step, since
+        # both gold and binutils ld both support it.
+        AddToLINKFLAGSIfSupported(myenv, "-Wl,-z,noexecstack")
+        AddToLINKFLAGSIfSupported(myenv, "-Wl,--warn-execstack")
+
     # Apply any link time optimization settings as selected by the 'lto' option.
     if has_option('lto'):
         if myenv.ToolchainIs('msvc'):
@@ -2261,6 +2278,32 @@ def doConfigure(myenv):
 
     if conf.CheckCXX14MakeUnique():
         conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_MAKE_UNIQUE')
+
+    myenv = conf.Finish()
+
+    def CheckCXX11Align(context):
+        test_body = """
+        #include <memory>
+        int main(int argc, char **argv) {
+            char buf[100];
+            void* ptr = static_cast<void*>(buf);
+            std::size_t size = sizeof(buf);
+            auto foo = std::align(16, 16, ptr, size);
+            return 0;
+        }
+        """
+        context.Message('Checking for C++11 std::align support... ')
+        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
+        context.Result(ret)
+        return ret
+
+    # Check for std::align support
+    conf = Configure(myenv, help=False, custom_tests = {
+        'CheckCXX11Align': CheckCXX11Align,
+    })
+
+    if conf.CheckCXX11Align():
+        conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_ALIGN')
 
     myenv = conf.Finish()
 
