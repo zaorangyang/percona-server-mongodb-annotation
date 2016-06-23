@@ -35,10 +35,6 @@ BuildRequires: /usr/bin/scons
 # BuildRequires: policycoreutils-python
 # %endif
 
-%if 0%{?rhel} > 5
-BuildRequires: golang
-%endif
-
 Requires: %{name}-mongos = %{version}-%{release}
 Requires: %{name}-server = %{version}-%{release}
 Requires: %{name}-shell = %{version}-%{release}
