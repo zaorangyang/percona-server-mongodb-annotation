@@ -90,7 +90,7 @@ public:
         return RecordData(_dummy.objdata(), _dummy.objsize());
     }
 
-    virtual bool findRecord( OperationContext* txn, const RecordId& loc, RecordData* rd, bool skipPessimisticLocking=false ) const {
+    virtual bool findRecord(OperationContext* txn, const RecordId& loc, RecordData* rd) const {
         return false;
     }
 

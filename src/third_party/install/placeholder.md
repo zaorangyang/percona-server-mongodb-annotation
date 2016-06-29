@@ -1,1 +1,0 @@
-This is a place holder for the install directory needed by the MongoDB SCons scripts.

@@ -191,11 +191,6 @@ add_option('wiredtiger',
     type='choice',
 )
 
-add_option('PerconaFT',
-           help='Enable PerconaFT',
-           nargs=0,
-)
-
 js_engine_choices = ['mozjs', 'none']
 add_option('js-engine',
     choices=js_engine_choices,
@@ -2283,8 +2278,6 @@ def doConfigure(myenv):
                 # by the EINTR bug. Setting this avoids a retry loop
                 # in boosts mutex.hpp that we don't want to pay for.
                 "BOOST_THREAD_HAS_NO_EINTR_BUG",
-                "BOOST_THREAD_PROVIDES_NESTED_LOCKS",
-                "BOOST_THREAD_USES_DATETIME",
             ],
         )
 
