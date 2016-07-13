@@ -58,6 +58,7 @@ DEFAULTS = {
     "shellWriteMode": None,
     "shuffle": False,
     "storageEngine": None,
+    "storageEngineCacheSizeGB": None,
     "wiredTigerCollectionConfigString": None,
     "wiredTigerEngineConfigString": None,
     "wiredTigerIndexConfigString": None
@@ -155,6 +156,10 @@ SHUFFLE = None
 # If set, then all mongod's started by resmoke.py and by the mongo shell will use the specified
 # storage engine.
 STORAGE_ENGINE = None
+
+# If set, then all mongod's started by resmoke.py and by the mongo shell will use the specified
+# storage engine cache size.
+STORAGE_ENGINE_CACHE_SIZE = None
 
 # If set, then all mongod's started by resmoke.py and by the mongo shell will use the specified
 # WiredTiger collection configuration settings.
