@@ -24,7 +24,7 @@ By default, even when auditing functionality is compiled into the server executa
 Auditing and audit log generation are activated when this parameter is present on the command line at server startup.
 
 The argument to this parameter is the type of audit log the server will create when storing events.  
-In Percona Server for MongoDB, this can only be set to `file`.
+In Percona Server for MongoDB, valid values for this argument are `file`, `console` and `syslog`.
 
 ```
 mongod --auditDestination=file
@@ -34,12 +34,16 @@ mongod --auditDestination=file
 
 ###--auditFormat
 
-This is the format of each audit event stored in the audit log. 
-In Percona Server for MongoDB, this can only be set to `JSON`.  The default value for this parameter 
-is also `JSON`, thus this parameter is optional and is only provided for application and driver compatibility.
+This is the format of each audit event stored in the audit log. Format can
+be set only when `auditDestination` is `file`. For `console` and `syslog` destinations output format is always `JSON`.
+For `file` destination available formats are `JSON` or `BSON`.
+
+The default value for this parameter is `JSON`.
+
+When `BSON` format is specified you can decode audit log file using `bsondump` utility from `mongo-tools`.
 
 ```
-mongod --auditDestination=file --auditFormat=JSON
+mongod --auditDestination=file --auditFormat=BSON
 ```
 
 ###--auditPath
