@@ -137,8 +137,12 @@ private:
         // Don't change the order as user-defined config string should go
         // AFTER InMemory config to override it if needed
         wiredTigerGlobalOptions.engineConfig += inMemoryGlobalOptions.engineConfig;
+        // Don't change the order as user-defined collection & index config strings should go
+        // BEFORE InMemory configs to disable cache_resident option later
         wiredTigerGlobalOptions.collectionConfig = inMemoryGlobalOptions.collectionConfig;
+        wiredTigerGlobalOptions.collectionConfig += ",cache_resident=false";
         wiredTigerGlobalOptions.indexConfig = inMemoryGlobalOptions.indexConfig;
+        wiredTigerGlobalOptions.indexConfig += ",cache_resident=false";
     }
 };
 }  // namespace
