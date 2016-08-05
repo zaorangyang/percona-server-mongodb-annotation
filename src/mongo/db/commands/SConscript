@@ -1,6 +1,7 @@
 # -*- mode: python -*-
 
 Import("env")
+Import("has_option")
 
 env.Library(
     target="test_commands_enabled",
@@ -20,6 +21,10 @@ env.Library(
         '$BUILD_DIR/mongo/base'
         ]
     )
+
+coredbOptionalLibdeps = []
+if has_option('audit'):
+    coredbOptionalLibdeps.append('$BUILD_DIR/mongo/db/audit/audit')
 
 env.Library(
     target="core",
@@ -73,7 +78,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/foundation',
         '$BUILD_DIR/mongo/util/processinfo',
         'server_status_core',
-    ],
+    ] + coredbOptionalLibdeps,
     LIBDEPS_TAGS=[
         # Depends on mongo::exitCleanly.
         'incomplete',
