@@ -19,6 +19,10 @@ Import("use_system_version_of_library")
 env.InjectThirdPartyIncludePaths(libraries=['boost', 's2', 'pcre'])
 env.InjectMongoIncludePaths()
 
+# Add needed Percona dependencies
+env.InjectThirdPartyIncludePaths(libraries=['percona_incl'])
+env.Append(LIBPATH = ['#/src/third_party/install/lib'])
+
 env.SConscript(
     dirs=[
         'base',
