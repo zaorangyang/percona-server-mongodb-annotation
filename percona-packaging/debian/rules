@@ -39,6 +39,18 @@ PerconaFT:
 
 RocksDB:
 	cd $(PSMSRC)/src/third_party/rocksdb; \
+	(rm -rf lz4-r127 || true); \
+	wget https://codeload.github.com/Cyan4973/lz4/tar.gz/r127 ; \
+	mv r127 lz4-r127.tar.gz; \
+	tar xvzf lz4-r127.tar.gz; \
+	cd lz4-r127/lib; \
+	make CFLAGS=' -O3 -I. -std=c99 -Wall -Wextra -Wundef -Wshadow -Wcast-align -Wstrict-prototypes -pedantic -fPIC' all; \
+	cd ../..; \
+	cp ./lz4-r127/lib/liblz4.a .; \
+	cp ./lz4-r127/lib/lz4.h $(INSTALLDIR)/include; \
+	cp ./lz4-r127/lib/lz4frame.h $(INSTALLDIR)/include; \
+	cp ./lz4-r127/lib/lz4hc.h $(INSTALLDIR)/include; \
+	cp ./lz4-r127/lib/liblz4.a $(INSTALLDIR)/lib; \
 	CC=$(CC) CXX=$(CXX) make -j$(NJOBS) static_lib; \
 	make install-static INSTALL_PATH=$(INSTALLDIR)
 
@@ -46,7 +58,7 @@ RocksDB:
 percona-server-mongodb:
 	scons CC=$(CC) CXX=$(CXX) --audit --release --ssl --opt=on -j$(NJOBS) \
 	--use-sasl-client CPPPATH=$(INSTALLDIR)/include LIBPATH=$(INSTALLDIR)/lib \
-	--PerconaFT --rocksdb --wiredtiger --tokubackup $(PSM_TARGETS)
+	--PerconaFT --rocksdb --wiredtiger --inmemory --tokubackup $(PSM_TARGETS)
 
 compile-mongo-tools:
 	rm -rf $(PSMSRC)/mongo-tools/vendor/pkg
