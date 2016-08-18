@@ -21,6 +21,7 @@ env.Library('authcore', ['action_set.cpp',
                          'action_type.cpp',
                          'authorization_manager.cpp',
                          'authorization_session.cpp',
+                         'auth_decorations.cpp',
                          'authz_manager_external_state.cpp',
                          'authz_manager_external_state_local.cpp',
                          'authz_session_external_state.cpp',
@@ -44,6 +45,7 @@ env.Library('authcore', ['action_set.cpp',
                      '$BUILD_DIR/mongo/db/common',
                      '$BUILD_DIR/mongo/db/ops/update_driver',
                      '$BUILD_DIR/mongo/db/namespace_string',
+                     '$BUILD_DIR/mongo/db/service_context',
                      '$BUILD_DIR/mongo/util/md5'])
 
 env.Library('authcommon',
@@ -56,7 +58,6 @@ env.Library('authcommon',
 
 env.Library('authorization_manager_global',
             [
-                'auth_decorations.cpp',
                 'authorization_manager_global.cpp',
             ],
             LIBDEPS=[

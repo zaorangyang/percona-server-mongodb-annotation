@@ -2676,6 +2676,7 @@ Export("rocksdb")
 Export("wiredtiger")
 Export("inmemory")
 Export("mmapv1")
+Export("endian")
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
