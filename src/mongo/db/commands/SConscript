@@ -42,6 +42,7 @@ env.Library(
         "rename_collection_common.cpp",
         "server_status.cpp",
         "parameters.cpp",
+        "percona/create_backup_command.cpp",
         "user_management_commands_common.cpp",
         "write_commands/write_commands_common.cpp",
         "generic.cpp",
