@@ -468,8 +468,8 @@ ReplicationExecutor::scheduleWorkWithGlobalExclusiveLock(const CallbackFn& work)
     return handle;
 }
 
-void ReplicationExecutor::appendConnectionStats(BSONObjBuilder* b) {
-    _networkInterface->appendConnectionStats(b);
+void ReplicationExecutor::appendConnectionStats(executor::ConnectionPoolStats* stats) const {
+    _networkInterface->appendConnectionStats(stats);
 }
 
 std::pair<ReplicationExecutor::WorkItem, ReplicationExecutor::CallbackHandle>
@@ -594,6 +594,11 @@ ReplicationExecutor::Callback::Callback(ReplicationExecutor* executor,
       _finishedEvent(finishedEvent) {}
 
 ReplicationExecutor::Callback::~Callback() {}
+
+bool ReplicationExecutor::Callback::isCanceled() const {
+    stdx::unique_lock<stdx::mutex> lk(_executor->_mutex);
+    return _isCanceled;
+}
 
 void ReplicationExecutor::Callback::cancel() {
     stdx::unique_lock<stdx::mutex> lk(_executor->_mutex);

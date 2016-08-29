@@ -64,9 +64,8 @@ const int kMaxNumLockAcquireRetries = 2;
 
 }  // namespace
 
-const stdx::chrono::seconds ReplSetDistLockManager::kDistLockWriteConcernTimeout{5};
-const stdx::chrono::seconds ReplSetDistLockManager::kDistLockPingInterval{30};
-const stdx::chrono::minutes ReplSetDistLockManager::kDistLockExpirationTime{15};
+const Seconds ReplSetDistLockManager::kDistLockPingInterval{30};
+const Minutes ReplSetDistLockManager::kDistLockExpirationTime{15};
 
 ReplSetDistLockManager::ReplSetDistLockManager(ServiceContext* globalContext,
                                                StringData processID,
@@ -430,4 +429,5 @@ void ReplSetDistLockManager::queueUnlock(const DistLockHandle& lockSessionID) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     _unlockList.push_back(lockSessionID);
 }
-}
+
+}  // namespace mongo

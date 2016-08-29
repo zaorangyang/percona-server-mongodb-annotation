@@ -92,12 +92,18 @@ namespace {
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
 const ReadPreferenceSetting kConfigPrimaryPreferredSelector(ReadPreference::PrimaryPreferred,
                                                             TagSet{});
+const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
+                                                // Note: Even though we're setting NONE here,
+                                                // kMajority implies JOURNAL if journaling is
+                                                // supported by mongod.
+                                                WriteConcernOptions::NONE,
+                                                Seconds(15));
 
 const int kMaxConfigVersionInitRetry = 3;
 const int kMaxReadRetry = 3;
 const int kMaxWriteRetry = 3;
 
-void _toBatchError(const Status& status, BatchedCommandResponse* response) {
+void toBatchError(const Status& status, BatchedCommandResponse* response) {
     response->clear();
     response->setErrCode(status.code());
     response->setErrMessage(status.reason());
@@ -188,7 +194,11 @@ Status CatalogManagerReplicaSet::shardCollection(OperationContext* txn,
     }
 
     shared_ptr<ChunkManager> manager(new ChunkManager(ns, fieldsAndOrder, unique));
-    manager->createFirstChunks(txn, dbPrimaryShardId, &initPoints, &initShardIds);
+    Status createFirstChunksStatus =
+        manager->createFirstChunks(txn, dbPrimaryShardId, &initPoints, &initShardIds);
+    if (!createFirstChunksStatus.isOK()) {
+        return createFirstChunksStatus;
+    }
     manager->loadExistingRanges(txn, nullptr);
 
     CollectionInfo collInfo;
@@ -379,8 +389,6 @@ StatusWith<OpTimePair<DatabaseType>> CatalogManagerReplicaSet::_fetchDatabaseMet
 
 StatusWith<OpTimePair<CollectionType>> CatalogManagerReplicaSet::getCollection(
     OperationContext* txn, const std::string& collNs) {
-    auto configShard = grid.shardRegistry()->getShard(txn, "config");
-
     auto statusFind = _exhaustiveFindOnConfig(txn,
                                               kConfigReadSelector,
                                               NamespaceString(CollectionType::ConfigNS),
@@ -463,14 +471,13 @@ Status CatalogManagerReplicaSet::dropCollection(OperationContext* txn, const Nam
     LOG(1) << "dropCollection " << ns << " started";
 
     // Lock the collection globally so that split/migrate cannot run
-    stdx::chrono::seconds waitFor(2);
+    stdx::chrono::seconds waitFor(DistLockManager::kDefaultLockTimeout);
     MONGO_FAIL_POINT_BLOCK(setDropCollDistLockWait, customWait) {
         const BSONObj& data = customWait.getData();
         waitFor = stdx::chrono::seconds(data["waitForSecs"].numberInt());
     }
-    const stdx::chrono::milliseconds lockTryInterval(500);
-    auto scopedDistLock =
-        getDistLockManager()->lock(txn, ns.ns(), "drop", waitFor, lockTryInterval);
+
+    auto scopedDistLock = getDistLockManager()->lock(txn, ns.ns(), "drop", waitFor);
     if (!scopedDistLock.isOK()) {
         return scopedDistLock.getStatus();
     }
@@ -891,6 +898,15 @@ DistLockManager* CatalogManagerReplicaSet::getDistLockManager() {
 void CatalogManagerReplicaSet::writeConfigServerDirect(OperationContext* txn,
                                                        const BatchedCommandRequest& batchRequest,
                                                        BatchedCommandResponse* batchResponse) {
+    // We only support batch sizes of one for config writes
+    if (batchRequest.sizeWriteOps() != 1) {
+        toBatchError(Status(ErrorCodes::InvalidOptions,
+                            str::stream() << "Writes to config servers must have batch size of 1, "
+                                          << "found " << batchRequest.sizeWriteOps()),
+                     batchResponse);
+        return;
+    }
+
     _runBatchWriteCommand(txn, batchRequest, batchResponse, ShardRegistry::kNotMasterErrors);
 }
 
@@ -902,21 +918,42 @@ void CatalogManagerReplicaSet::_runBatchWriteCommand(
     const std::string dbname = batchRequest.getNS().db().toString();
     invariant(dbname == "config" || dbname == "admin");
 
+    invariant(batchRequest.sizeWriteOps() == 1);
+
     const BSONObj cmdObj = batchRequest.toBSON();
 
-    auto response =
-        grid.shardRegistry()->runCommandOnConfigWithRetries(txn, dbname, cmdObj, errorsToCheck);
-    if (!response.isOK()) {
-        _toBatchError(response.getStatus(), batchResponse);
+    for (int retry = 1; retry <= kMaxWriteRetry; ++retry) {
+        // runCommandOnConfigWithRetries already does its own retries based on the generic command
+        // errors. If this fails, we know that it has done all the retries that it could do so there
+        // is no need to retry anymore.
+        auto response =
+            grid.shardRegistry()->runCommandOnConfigWithRetries(txn, dbname, cmdObj, errorsToCheck);
+        if (!response.isOK()) {
+            toBatchError(response.getStatus(), batchResponse);
+            return;
+        }
+
+        string errmsg;
+        if (!batchResponse->parseBSON(response.getValue(), &errmsg)) {
+            toBatchError(
+                Status(ErrorCodes::FailedToParse,
+                       str::stream() << "Failed to parse config server response: " << errmsg),
+                batchResponse);
+            return;
+        }
+
+        // If one of the write operations failed (which is reported in the error details), see if
+        // this is a retriable error as well.
+        Status status = batchResponse->toStatus();
+        if (errorsToCheck.count(status.code()) && retry < kMaxWriteRetry) {
+            LOG(1) << "Command failed with retriable error and will be retried" << causedBy(status);
+            continue;
+        }
+
         return;
     }
 
-    string errmsg;
-    if (!batchResponse->parseBSON(response.getValue(), &errmsg)) {
-        _toBatchError(Status(ErrorCodes::FailedToParse,
-                             str::stream() << "Failed to parse config server response: " << errmsg),
-                      batchResponse);
-    }
+    MONGO_UNREACHABLE;
 }
 
 Status CatalogManagerReplicaSet::insertConfigDocument(OperationContext* txn,
@@ -933,7 +970,7 @@ Status CatalogManagerReplicaSet::insertConfigDocument(OperationContext* txn,
 
     BatchedCommandRequest request(insert.release());
     request.setNS(nss);
-    request.setWriteConcern(WriteConcernOptions::Majority);
+    request.setWriteConcern(kMajorityWriteConcern.toBSON());
 
     for (int retry = 1; retry <= kMaxWriteRetry; retry++) {
         BatchedCommandResponse response;
@@ -1010,7 +1047,7 @@ StatusWith<bool> CatalogManagerReplicaSet::updateConfigDocument(OperationContext
 
     BatchedCommandRequest request(updateRequest.release());
     request.setNS(nss);
-    request.setWriteConcern(WriteConcernOptions::Majority);
+    request.setWriteConcern(kMajorityWriteConcern.toBSON());
 
     BatchedCommandResponse response;
     _runBatchWriteCommand(txn, request, &response, ShardRegistry::kAllRetriableErrors);
@@ -1040,7 +1077,7 @@ Status CatalogManagerReplicaSet::removeConfigDocuments(OperationContext* txn,
 
     BatchedCommandRequest request(deleteRequest.release());
     request.setNS(nss);
-    request.setWriteConcern(WriteConcernOptions::Majority);
+    request.setWriteConcern(kMajorityWriteConcern.toBSON());
 
     BatchedCommandResponse response;
     _runBatchWriteCommand(txn, request, &response, ShardRegistry::kAllRetriableErrors);

@@ -25,7 +25,7 @@
 
     var nodes = replTest.startSet();
     replTest.initiate();
-    var master = replTest.getMaster();
+    var master = replTest.getPrimary();
     var mTest = master.getDB("test");
     var mLocal = master.getDB("local");
     var mMinvalid = mLocal["replset.minvalid"];
@@ -39,7 +39,7 @@
 
     // Write op
     assert.writeOK(mTest.foo.save({}, {writeConcern: {w: 3}}));
-    replTest.waitForState(slave, replTest.SECONDARY, 30000);
+    replTest.waitForState(slave, ReplSetTest.State.SECONDARY, 30000);
     assert.writeOK(mTest.foo.save({}, {writeConcern: {w: 3}}));
 
     // Set minvalid to something far in the future for the current primary, to simulate recovery.
@@ -63,10 +63,10 @@
     jsTest.log("restart primary");
     replTest.restart(master);
     printjson(sLocal.adminCommand("isMaster"));
-    replTest.waitForState(master, replTest.RECOVERING, 90000);
+    replTest.waitForState(master, ReplSetTest.State.RECOVERING, 90000);
 
     // Slave is now master... so do a write to get a minvalid entry on the secondary.
-    assert.writeOK(replTest.getMaster().getDB("test").foo.save({}, {writeConcern: {w: 3}}));
+    assert.writeOK(replTest.getPrimary().getDB("test").foo.save({}, {writeConcern: {w: 3}}));
 
     assert.soon(function() {
         var mv;

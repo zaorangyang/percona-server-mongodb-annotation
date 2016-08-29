@@ -14,6 +14,9 @@
  * config.version is read to confirm the availability of metadata
  * reads.
  */
+
+load("jstests/replsets/rslib.js");
+
 var st;
 (function() {
     "use strict";
@@ -42,15 +45,23 @@ var st;
     };
 
     /**
-     * Runs a config.version read, then splits the data collection and expects both operations to
-     * succeed.
+     * Runs several basic operations against a given mongos, including a config.version read,
+     * spliting the data collection, and doing basic crud ops against the data collection, and
+     * expects all operations to succeed.
      */
-    var assertCanSplit = function (snode, msg) {
+    var assertOpsWork = function (snode, msg) {
         if (msg) {
-            jsTest.log("Confirming that " + snode.name + " CAN run a split " + msg);
+            jsTest.log("Confirming that " + snode.name + " CAN run basic sharding ops " + msg);
         }
         assert(snode.getCollection("config.version").findOne());
         assert.commandWorked(runNextSplit(snode));
+
+        // Check that basic crud ops work.
+        var dataColl = snode.getCollection(dataCollectionName);
+        assert.eq(40, dataColl.find().itcount());
+        assert.writeOK(dataColl.insert({_id: 100, x: 1}));
+        assert.writeOK(dataColl.update({_id: 100}, {$inc: {x: 1}}));
+        assert.writeOK(dataColl.remove({x:2}));
     };
 
     var waitUntilMaster = function (dnode) {
@@ -88,33 +99,6 @@ var st;
         }
     });
 
-    var waitUntilAllCaughtUp = function(csrs) {
-        var rsStatus;
-        var firstConflictingIndex;
-        var ot;
-        var otherOt;
-        assert.soon(function () {
-            rsStatus = csrs[0].adminCommand('replSetGetStatus');
-            if (rsStatus.ok != 1) {
-                return false;
-            }
-            assert.eq(csrs.length, rsStatus.members.length, tojson(rsStatus));
-            ot = rsStatus.members[0].optime;
-            for (var i = 1; i < rsStatus.members.length; ++i) {
-                otherOt = rsStatus.members[i].optime;
-                if (bsonWoCompare({ts: otherOt.ts}, {ts: ot.ts}) ||
-                    bsonWoCompare({t: otherOt.t},  {t: ot.t})) {
-                    firstConflictingIndex = i;
-                    return false;
-                }
-            }
-            return true;
-        }, function () {
-            return "Optimes of members 0 (" + tojson(ot) + ") and " + firstConflictingIndex + " (" +
-                tojson(otherOt) + ") are different in " + tojson(rsStatus);
-        });
-    };
-
     var shardConfigs = st.s0.getCollection("config.shards").find().toArray();
     assert.eq(2, shardConfigs.length);
     var shard0Name = shardConfigs[0]._id;
@@ -129,7 +113,7 @@ var st;
         shardcollection: dataCollectionName,
         key: { _id: 1 }
     }));
-    assertCanSplit(st.s0);
+    assert.commandWorked(runNextSplit(st.s0));
     assert.commandWorked(st.s0.adminCommand({
         moveChunk: dataCollectionName,
         find: { _id: 0 },
@@ -164,7 +148,7 @@ var st;
     csrs.push(MongoRunner.runMongod(csrs0Opts));
     waitUntilMaster(csrs[0]);
 
-    assertCanSplit(st.s0, "using SCCC protocol when first config server is a 1-node replica set");
+    assertOpsWork(st.s0, "using SCCC protocol when first config server is a 1-node replica set");
 
     jsTest.log("Starting new CSRS nodes");
     for (var i = 1; i < numCsrsMembers; ++i) {
@@ -181,10 +165,10 @@ var st;
 
     jsTest.log("Splitting a chunk to confirm that the SCCC protocol works w/ 1 rs " +
                "node with secondaries");
-    assertCanSplit(st.s0, "using SCCC protocol when first config server is primary of " +
+    assertOpsWork(st.s0, "using SCCC protocol when first config server is primary of " +
                   csrs.length + "-node replica set");
 
-    waitUntilAllCaughtUp(csrs);
+    waitUntilAllNodesCaughtUp(csrs);
 
     jsTest.log("Shutting down second and third SCCC config server nodes");
     MongoRunner.stopMongod(st.c1);
@@ -219,11 +203,13 @@ var st;
 
         var i;
         for (i = 0; i < csrsStatus.members.length; ++i) {
-            if (TestData.storageEngine != "wiredTiger" && TestData.storageEngine != "") {
-                // NOTE: "" means default storage engine, which is WiredTiger.
-                if (csrsStatus.members[i].name == csrs[0].name &&
-                    csrsStatus.members[i].stateStr != "REMOVED") {
-
+            if (csrsStatus.members[i].name == csrs[0].name) {
+                var supportsCommitted =
+                    csrs[0].getDB("admin").serverStatus().storageEngine.supportsCommittedReads;
+                var stateIsRemoved = csrsStatus.members[i].stateStr == "REMOVED";
+                // If the storage engine supports committed reads, it shouldn't go into REMOVED
+                // state, but if it does not then it should.
+                if (supportsCommitted ? stateIsRemoved : !stateIsRemoved) {
                     return false;
                 }
             }
@@ -239,11 +225,11 @@ var st;
     var sconfig = Object.extend({}, st.s0.fullOptions, /* deep */ true);
     delete sconfig.port;
     sconfig.configdb = csrsName + "/" + csrs[0].name;
-    assertCanSplit(MongoRunner.runMongos(sconfig),
-                   "when mongos started with --configdb=" + sconfig.configdb);
+    assertOpsWork(MongoRunner.runMongos(sconfig),
+                  "when mongos started with --configdb=" + sconfig.configdb);
     sconfig.configdb = st.s0.fullOptions.configdb;
-    assertCanSplit(MongoRunner.runMongos(sconfig),
-                   "when mongos started with --configdb=" + sconfig.configdb);
-    assertCanSplit(st.s0, "on mongos that drove the upgrade");
-    assertCanSplit(st.s1, "on mongos that was previously unaware of the upgrade");
+    assertOpsWork(MongoRunner.runMongos(sconfig),
+                  "when mongos started with --configdb=" + sconfig.configdb);
+    assertOpsWork(st.s0, "on mongos that drove the upgrade");
+    assertOpsWork(st.s1, "on mongos that was previously unaware of the upgrade");
 }());

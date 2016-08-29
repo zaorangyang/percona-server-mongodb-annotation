@@ -44,7 +44,7 @@ print("make sure user is written before shutting down");
 MongoRunner.stopMongod(m);
 
 print("start up rs");
-var rs = new ReplSetTest({"name" : name, "nodes" : 3, "startPort" : port[0]});
+var rs = new ReplSetTest({"name" : name, "nodes" : 3});
 print("restart 0 with keyFile");
 m = rs.restart(0, {"keyFile" : key1_600});
 print("restart 1 with keyFile");
@@ -59,7 +59,7 @@ result = m.getDB("admin").runCommand({replSetInitiate : rs.getReplSetConfig()});
 assert.eq(result.ok, 1, "couldn't initiate: "+tojson(result));
 m.getDB('admin').logout(); // In case this node doesn't become primary, make sure its not auth'd
 
-var master = rs.getMaster();
+var master = rs.getPrimary();
 rs.awaitSecondaryNodes();
 var mId = rs.getNodeId(master);
 var slave = rs.liveNodes.slaves[0];
@@ -107,7 +107,7 @@ assert.writeOK(bulk.execute({ w: 3, wtimeout: 60000 }));
 print("fail over");
 rs.stop(mId);
 
-master = rs.getMaster();
+master = rs.getPrimary();
 
 print("add some more data 1");
 master.getDB("test").auth("bar", "baz");
@@ -119,7 +119,7 @@ assert.writeOK(bulk.execute({ w: 2 }));
 
 print("resync");
 rs.restart(mId, {"keyFile" : key1_600});
-master = rs.getMaster();
+master = rs.getPrimary();
 
 print("add some more data 2");
 bulk = master.getDB("test").foo.initializeUnorderedBulkOp();
@@ -146,7 +146,7 @@ try {
 catch (e) {
     print("error: "+e);
 }
-master = rs.getMaster();
+master = rs.getPrimary();
 master.getDB("admin").auth("foo", "bar");
 
 

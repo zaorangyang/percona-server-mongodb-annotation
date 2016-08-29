@@ -361,11 +361,17 @@ BSONObj DBClientCursor::next() {
 
 BSONObj DBClientCursor::nextSafe() {
     BSONObj o = next();
-    if (this->wasError && strcmp(o.firstElementFieldName(), "$err") == 0) {
-        std::string s = "nextSafe(): " + o.toString();
-        LOG(5) << s;
-        uasserted(13106, s);
+
+    // Only convert legacy errors ($err) to exceptions. Otherwise, just return the response and the
+    // caller will interpret it as a command error.
+    if (wasError && strcmp(o.firstElementFieldName(), "$err") == 0) {
+        auto code = o["code"].numberInt();
+        if (!code) {
+            code = ErrorCodes::UnknownError;
+        }
+        uasserted(code, o.firstElement().str());
     }
+
     return o;
 }
 

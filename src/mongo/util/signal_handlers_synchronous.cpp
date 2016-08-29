@@ -111,7 +111,7 @@ public:
     }
 
 private:
-    static const size_t maxLogLineSize = 16 * 1000;
+    static const size_t maxLogLineSize = 100 * 1000;
     char _buffer[maxLogLineSize];
 };
 
@@ -167,8 +167,10 @@ int MallocFreeOStreamGuard::terminateDepth = 0;
 
 // must hold MallocFreeOStreamGuard to call
 void writeMallocFreeStreamToLog() {
-    logger::globalLogDomain()->append(logger::MessageEventEphemeral(
-        Date_t::now(), logger::LogSeverity::Severe(), getThreadName(), mallocFreeOStream.str()));
+    logger::globalLogDomain()->append(
+        logger::MessageEventEphemeral(
+            Date_t::now(), logger::LogSeverity::Severe(), getThreadName(), mallocFreeOStream.str())
+            .setIsTruncatable(false));
     mallocFreeOStream.rewind();
 }
 

@@ -33,7 +33,7 @@ try {
 } catch (e) {
     // expected since we close all connections after going into REMOVED
 }
-expectState(rst, rst.REMOVED);
+expectState(rst, ReplSetTest.State.REMOVED);
 rst.stopSet();
 })();
 
@@ -51,8 +51,8 @@ var conf = rst.getReplSetConfig();
 conf.configsvr = true;
 assert.commandWorked(rst.nodes[0].adminCommand({replSetInitiate: conf}));
 
-rst.getMaster();
-expectState(rst, rst.PRIMARY);
+rst.getPrimary();
+expectState(rst, ReplSetTest.State.PRIMARY);
 rst.stopSet();
 })();
 
@@ -71,10 +71,10 @@ var conf = rst.getReplSetConfig();
 conf.configsvr = true;
 assert.commandWorked(rst.nodes[0].adminCommand({replSetInitiate: conf}));
 
-rst.getMaster();
-expectState(rst, rst.PRIMARY);
+rst.getPrimary();
+expectState(rst, ReplSetTest.State.PRIMARY);
 
-var conf = rst.getMaster().getDB('local').system.replset.findOne();
+var conf = rst.getPrimary().getDB('local').system.replset.findOne();
 assert(conf.configsvr, tojson(conf));
 
 rst.stopSet();
@@ -93,8 +93,8 @@ var rst = new ReplSetTest({name: "configrs6",
 rst.startSet();
 assert.commandWorked(rst.nodes[0].adminCommand({replSetInitiate: 1}));
 
-rst.getMaster();
-expectState(rst, rst.PRIMARY);
+rst.getPrimary();
+expectState(rst, ReplSetTest.State.PRIMARY);
 rst.stopSet();
 })();
 
@@ -111,8 +111,8 @@ rst.startSet();
 var conf = rst.getReplSetConfig();
 assert.commandWorked(rst.nodes[0].adminCommand({replSetInitiate: conf}));
 
-rst.getMaster();
-expectState(rst, rst.PRIMARY);
+rst.getPrimary();
+expectState(rst, ReplSetTest.State.PRIMARY);
 assert.throws(function() {
                   rst.restart(0, {configsvr: ""});
               });
@@ -135,8 +135,8 @@ var conf = rst.getReplSetConfig();
 conf.configsvr = true;
 assert.commandWorked(rst.nodes[0].adminCommand({replSetInitiate: conf}));
 
-rst.getMaster();
-expectState(rst, rst.PRIMARY);
+rst.getPrimary();
+expectState(rst, ReplSetTest.State.PRIMARY);
 
 var node = rst.nodes[0];
 var options = node.savedOptions;
@@ -149,6 +149,5 @@ assert.eq(null, conn, "Mongod should have failed to start, but didn't");
 
 rst.stopSet();
 })();
-
 
 })();

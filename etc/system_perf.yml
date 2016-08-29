@@ -5,10 +5,6 @@ pre:
     - command: shell.track
 
 post:
-    - command: "json.send"
-      params:
-        name: "perf"
-        file: "src/perf.json"
     - command: attach.results
       params:
         file_location: src/report.json
@@ -18,7 +14,7 @@ post:
       params:
         working_dir: dsi
         script: |
-          set -e 
+          set -e
           set -o verbose
           cd ./clusters/${cluster}
           if [ ! -f "test.success" ]; then yes yes | ./terraform destroy; fi
@@ -35,7 +31,7 @@ functions:
       # checkout dsi code
       params:
         script: |
-          set -e 
+          set -e
           set -v
           git clone git@github.com:10gen/dsi.git
           cd dsi
@@ -104,7 +100,7 @@ functions:
       params:
         working_dir: dsi
         script: |
-          set -e 
+          set -e
           set -o verbose
           cd ./clusters/${cluster}
           # configure mongodb cluster with wiredTiger
@@ -153,7 +149,7 @@ functions:
       params:
         working_dir: dsi
         script: |
-          set -e 
+          set -e
           set -o verbose
           cd ./clusters/${cluster}
           # destroy the EC2 cluster
@@ -169,7 +165,7 @@ functions:
       params:
         working_dir: dsi
         script: |
-          set -e 
+          set -e
           set -o verbose
           cd ./clusters/${cluster}/reports
           # move additional file here
@@ -193,7 +189,7 @@ functions:
             aws_key: ${aws_key}
             aws_secret: ${aws_secret}
             local_file: reports.tgz
-            remote_file: dsi/${build_variant}/${revision}/logs/${test}-${build_id}.${ext|tgz}
+            remote_file: dsi/${build_variant}/${revision}/${task_id}/${version_id}/logs/${test}-${build_id}.${ext|tgz}
             bucket: mciuploads
             permissions: public-read
             content_type: ${content_type|application/x-gzip}
@@ -219,21 +215,23 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          python -u ../dsi/bin/post_run_check.py --rev ${revision} -f history.json -t tags.json --refTag 3.0.6-Baseline --overrideFile ../dsi/bin/override.json --project_id sys-perf --task_name ${task_name} --variant ${build_variant}
+          python -u ../dsi/analysis/post_run_check.py --rev ${revision} -f history.json -t tags.json --refTag 3.0.6-Baseline --overrideFile ../dsi/analysis/system_perf_override.json --project_id sys-perf --task_name ${task_name} --variant ${build_variant}
 
   "compare":
     - command: shell.exec
-      params: 
-        script: | 
-          rm -rf ./*
-          mkdir src
-    - command: s3.get
       params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: dsi/${revision}/compare.py
-        bucket: mciuploads
-        local_file: src/compare.py
+        script: |
+          set -o verbose
+          rm -rf ./src
+          mkdir src
+    - command: shell.exec
+      # checkout dsi code
+      params:
+        script: |
+          set -e
+          set -v
+          rm -rf ./dsi
+          git clone git@github.com:10gen/dsi.git
     - command: json.get
       params:
         task: ${compare_task}
@@ -253,9 +251,11 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          python -u compare.py -b standalone.json -c oplog.json -t ${threshold}
-
-
+          python -u ../dsi/analysis/compare.py -b standalone.json -c oplog.json
+    - command: "json.send"
+      params:
+        name: "perf"
+        file: "src/perf.json"
 
 #######################################
 #               Tasks                 #
@@ -293,16 +293,6 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
         display_name: mongodb.tar.gz
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: src/buildscripts/compare.py
-        remote_file: dsi/${revision}/compare.py
-        bucket: mciuploads
-        permissions: public-read
-        content_type: ${content_type|application/octet-stream}
-        display_name: compare.py
 
 
 # The industry_benchmarks_WT task runs the "bring up cluster" task and is
@@ -386,7 +376,7 @@ tasks:
     - func: "upload log file"
       vars:
         test: "core_workloads_MMAPv1"
-    - func: "destroy cluster"      
+    - func: "destroy cluster"
     - func: "analyze"
 
 - name: industry_benchmarks_WT_oplog_comp
@@ -403,7 +393,7 @@ tasks:
         compare_task: "industry_benchmarks_WT"
         variant1: "linux-standalone"
         variant2: "linux-1-node-replSet"
-        threshold: 70
+    - func: "analyze"
 
 - name: industry_benchmarks_MMAPv1_oplog_comp
   depends_on:
@@ -421,7 +411,7 @@ tasks:
         compare_task: "industry_benchmarks_MMAPv1"
         variant1: "linux-standalone"
         variant2: "linux-1-node-replSet"
-        threshold: 70
+    - func: "analyze"
 
 - name: core_workloads_WT_oplog_comp
   depends_on:
@@ -439,7 +429,7 @@ tasks:
         compare_task: "core_workloads_WT"
         variant1: "linux-standalone"
         variant2: "linux-1-node-replSet"
-        threshold: 70
+    - func: "analyze"
 
 - name: core_workloads_MMAPv1_oplog_comp
   depends_on:
@@ -457,8 +447,7 @@ tasks:
         compare_task: "core_workloads_MMAPv1"
         variant1: "linux-standalone"
         variant2: "linux-1-node-replSet"
-        threshold: 70
-
+    - func: "analyze"
 
 #######################################
 #            Buildvariants            #

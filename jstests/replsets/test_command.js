@@ -22,11 +22,28 @@
     assert.commandWorked(
         replSet.nodes[0].adminCommand({
             replSetTest: 1,
-            waitForMemberState: replSet.PRIMARY,
+            waitForMemberState: ReplSetTest.State.PRIMARY,
             timeoutMillis: 60 * 1000,
         }),
         'node 0' + replSet.nodes[0].host + ' failed to become primary'
     );
+
+    // We need the try/catch to handle that the node may have hung up the connection due
+    // to a state change.
+    try {
+        assert.commandWorked(replSet.nodes[1].adminCommand({
+            replSetTest: 1,
+            waitForMemberState: ReplSetTest.State.SECONDARY,
+            timeoutMillis: 60 * 1000,
+        }));
+    } catch (e) {
+        jsTestLog(e);
+        assert.commandWorked(replSet.nodes[1].adminCommand({
+            replSetTest: 1,
+            waitForMemberState: ReplSetTest.State.SECONDARY,
+            timeoutMillis: 60 * 1000,
+        }), 'node 1' + replSet.nodes[1].host + ' failed to become secondary');
+    }
 
     var primary = replSet.getPrimary();
     var secondary = replSet.getSecondary();
@@ -63,7 +80,7 @@
     assert.commandFailedWithCode(
         primary.adminCommand({
             replSetTest: 1,
-            waitForMemberState: replSet.PRIMARY,
+            waitForMemberState: ReplSetTest.State.PRIMARY,
             timeoutMillis: "what timeout",
         }),
         ErrorCodes.TypeMismatch,
@@ -83,7 +100,7 @@
     assert.commandFailedWithCode(
         primary.adminCommand({
             replSetTest: 1,
-            waitForMemberState: replSet.PRIMARY,
+            waitForMemberState: ReplSetTest.State.PRIMARY,
             timeoutMillis: -1000,
         }),
         ErrorCodes.BadValue,
@@ -93,7 +110,7 @@
     assert.commandFailedWithCode(
         primary.adminCommand({
             replSetTest: 1,
-            waitForMemberState: replSet.SECONDARY,
+            waitForMemberState: ReplSetTest.State.SECONDARY,
             timeoutMillis: 1000,
         }),
         ErrorCodes.ExceededTimeLimit,
@@ -104,7 +121,7 @@
     assert.commandWorked(
         secondary.adminCommand({
             replSetTest: 1,
-            waitForMemberState: replSet.SECONDARY,
+            waitForMemberState: ReplSetTest.State.SECONDARY,
             timeoutMillis: 1000,
         }),
         'replSetTest waitForMemberState(SECONDARY) failed on node 1 ' +

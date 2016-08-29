@@ -230,9 +230,16 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache) {
 
         PlanStage* newRoot;
         // Only one possible plan. Build the stages from the solution.
-        verify(StageBuilder::build(getOpCtx(), _collection, *solutions[0], _ws, &newRoot));
+        verify(StageBuilder::build(
+            getOpCtx(), _collection, *_canonicalQuery, *solutions[0], _ws, &newRoot));
         _children.emplace_back(newRoot);
         _replannedQs.reset(solutions.popAndReleaseBack());
+
+        LOG(1)
+            << "Replanning of query resulted in single query solution, which will not be cached. "
+            << _canonicalQuery->toStringShort()
+            << " plan summary after replan: " << Explain::getPlanSummary(child().get())
+            << " previous cache entry evicted: " << (shouldCache ? "yes" : "no");
         return Status::OK();
     }
 
@@ -250,14 +257,23 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache) {
         }
 
         PlanStage* nextPlanRoot;
-        verify(StageBuilder::build(getOpCtx(), _collection, *solutions[ix], _ws, &nextPlanRoot));
+        verify(StageBuilder::build(
+            getOpCtx(), _collection, *_canonicalQuery, *solutions[ix], _ws, &nextPlanRoot));
 
         // Takes ownership of 'solutions[ix]' and 'nextPlanRoot'.
         multiPlanStage->addPlan(solutions.releaseAt(ix), nextPlanRoot, _ws);
     }
 
     // Delegate to the MultiPlanStage's plan selection facility.
-    return multiPlanStage->pickBestPlan(yieldPolicy);
+    Status pickBestPlanStatus = multiPlanStage->pickBestPlan(yieldPolicy);
+    if (!pickBestPlanStatus.isOK()) {
+        return pickBestPlanStatus;
+    }
+
+    LOG(1) << "Replanning " << _canonicalQuery->toStringShort()
+           << " resulted in plan with summary: " << Explain::getPlanSummary(child().get())
+           << ", which " << (shouldCache ? "has" : "has not") << " been written to the cache";
+    return Status::OK();
 }
 
 bool CachedPlanStage::isEOF() {

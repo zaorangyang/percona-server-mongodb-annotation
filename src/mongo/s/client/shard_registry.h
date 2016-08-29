@@ -60,6 +60,7 @@ class StatusWith;
 
 namespace executor {
 
+struct ConnectionPoolStats;
 class NetworkInterface;
 class TaskExecutor;
 
@@ -149,12 +150,13 @@ public:
 
     /**
      * Updates _lookup and _rsLookup based on the given new version of the given Shard's
-     * ConnectionString.
+     * ConnectionString. If ConnectionString is not specified the maps are updated with hosts
+     * from the ReplicaSetMonitor.
      * Used to update the ShardRegistry when a change in replica set membership is detected by the
      * ReplicaSetMonitor.
      */
     void updateLookupMapsForShard(std::shared_ptr<Shard> shard,
-                                  const ConnectionString& newConnString);
+                                  boost::optional<const ConnectionString&> newConnString);
 
     /**
      * Returns a shared pointer to the shard object with the given shard id.
@@ -205,6 +207,11 @@ public:
     void getAllShardIds(std::vector<ShardId>* all) const;
 
     void toBSON(BSONObjBuilder* result);
+
+    /**
+     * Append information about the sharding subsystem's connection pools.
+     */
+    void appendConnectionStats(executor::ConnectionPoolStats* stats) const;
 
     /**
      * If the newly specified optime is newer than the one the ShardRegistry already knows, the
@@ -342,7 +349,7 @@ private:
     /**
      * Creates a shard based on the specified information and puts it into the lookup maps.
      */
-    void _addShard_inlock(const ShardType& shardType);
+    void _addShard_inlock(const ShardType& shardType, bool passHostName);
 
     /**
      * Adds the "config" shard (representing the config server) to the shard registry.
@@ -350,7 +357,7 @@ private:
     void _addConfigShard_inlock();
 
     void _updateLookupMapsForShard_inlock(std::shared_ptr<Shard> shard,
-                                          const ConnectionString& newConnString);
+                                          boost::optional<const ConnectionString&> newConnString);
 
     std::shared_ptr<Shard> _findUsingLookUp(const ShardId& shardId);
 

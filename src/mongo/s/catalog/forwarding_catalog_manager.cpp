@@ -68,16 +68,15 @@ std::unique_ptr<CatalogManager> makeCatalogManager(ServiceContext* service,
                                                    const ConnectionString& configCS,
                                                    ShardRegistry* shardRegistry,
                                                    const HostAndPort& thisHost) {
+    std::unique_ptr<SecureRandom> rng(SecureRandom::create());
+    std::string distLockProcessId = str::stream()
+        << thisHost.toString() << ':'
+        << durationCount<Seconds>(service->getClockSource()->now().toDurationSinceEpoch()) << ':'
+        << static_cast<int32_t>(rng->nextInt64());
+
     switch (configCS.type()) {
         case ConnectionString::SET: {
-            auto distLockCatalog = stdx::make_unique<DistLockCatalogImpl>(
-                shardRegistry, ReplSetDistLockManager::kDistLockWriteConcernTimeout);
-
-            std::unique_ptr<SecureRandom> rng(SecureRandom::create());
-            std::string distLockProcessId = str::stream()
-                << thisHost.toString() << ':'
-                << durationCount<Seconds>(service->getClockSource()->now().toDurationSinceEpoch())
-                << ':' << static_cast<int32_t>(rng->nextInt64());
+            auto distLockCatalog = stdx::make_unique<DistLockCatalogImpl>(shardRegistry);
             auto distLockManager = stdx::make_unique<ReplSetDistLockManager>(
                 service,
                 distLockProcessId,
@@ -91,7 +90,7 @@ std::unique_ptr<CatalogManager> makeCatalogManager(ServiceContext* service,
         case ConnectionString::MASTER:
         case ConnectionString::CUSTOM: {
             auto catalogManagerLegacy = stdx::make_unique<CatalogManagerLegacy>();
-            uassertStatusOK(catalogManagerLegacy->init(configCS));
+            uassertStatusOK(catalogManagerLegacy->init(configCS, distLockProcessId));
             return std::move(catalogManagerLegacy);
         }
         default:
@@ -126,14 +125,12 @@ StatusWith<ForwardingCatalogManager::ScopedDistLock> ForwardingCatalogManager::d
     OperationContext* txn,
     StringData name,
     StringData whyMessage,
-    stdx::chrono::milliseconds waitFor,
-    stdx::chrono::milliseconds lockTryInterval) {
+    stdx::chrono::milliseconds waitFor) {
     for (int i = 0; i < 2; ++i) {
         try {
             _operationLock.lock_shared();
             auto guard = MakeGuard([this] { _operationLock.unlock_shared(); });
-            auto dlmLock = _actual->getDistLockManager()->lock(
-                txn, name, whyMessage, waitFor, lockTryInterval);
+            auto dlmLock = _actual->getDistLockManager()->lock(txn, name, whyMessage, waitFor);
             if (dlmLock.isOK()) {
                 guard.Dismiss();  // Don't unlock _operationLock; hold it until the returned
                                   // ScopedDistLock goes out of scope!
@@ -331,6 +328,7 @@ void ForwardingCatalogManager::_replaceCatalogManager(const TaskExecutor::Callba
     }
     Client::initThreadIfNotAlready();
     auto txn = cc().makeOperationContext();
+    log() << "Swapping sharding Catalog Manager from mirrored (SCCC) to replica set (CSRS) mode";
 
     stdx::lock_guard<RWLock> oplk(_operationLock);
     stdx::lock_guard<stdx::mutex> oblk(_observerMutex);

@@ -61,14 +61,14 @@ const ReplSettings& ReplicationCoordinatorMock::getSettings() const {
 }
 
 bool ReplicationCoordinatorMock::isReplEnabled() const {
-    return _settings.usingReplSets() || _settings.master || _settings.slave;
+    return _settings.usingReplSets() || _settings.isMaster() || _settings.isSlave();
 }
 
 ReplicationCoordinator::Mode ReplicationCoordinatorMock::getReplicationMode() const {
     if (_settings.usingReplSets()) {
         return modeReplSet;
     }
-    if (_settings.master || _settings.slave) {
+    if (_settings.isMaster() || _settings.isSlave()) {
         return modeMasterSlave;
     }
     return modeNone;
@@ -228,7 +228,8 @@ void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result
 
 void ReplicationCoordinatorMock::appendSlaveInfoData(BSONObjBuilder* result) {}
 
-void ReplicationCoordinatorMock::appendConnectionStats(BSONObjBuilder* b) {}
+void ReplicationCoordinatorMock::appendConnectionStats(executor::ConnectionPoolStats* stats) const {
+}
 
 Status ReplicationCoordinatorMock::setMaintenanceMode(bool activate) {
     return Status::OK();

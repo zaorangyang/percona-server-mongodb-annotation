@@ -125,7 +125,8 @@ CatalogManagerLegacy::CatalogManagerLegacy() = default;
 
 CatalogManagerLegacy::~CatalogManagerLegacy() = default;
 
-Status CatalogManagerLegacy::init(const ConnectionString& configDBCS) {
+Status CatalogManagerLegacy::init(const ConnectionString& configDBCS,
+                                  const std::string& distLockProcessId) {
     // Initialization should not happen more than once
     invariant(!_configServerConnectionString.isValid());
     invariant(_configServers.empty());
@@ -203,7 +204,8 @@ Status CatalogManagerLegacy::init(const ConnectionString& configDBCS) {
         _configServers.push_back(_configServerConnectionString);
     }
 
-    _distLockManager = stdx::make_unique<LegacyDistLockManager>(_configServerConnectionString);
+    _distLockManager =
+        stdx::make_unique<LegacyDistLockManager>(_configServerConnectionString, distLockProcessId);
     _distLockManager->startUp();
 
     {
@@ -331,7 +333,11 @@ Status CatalogManagerLegacy::shardCollection(OperationContext* txn,
     logChange(txn, "shardCollection.start", ns, collectionDetail.obj());
 
     shared_ptr<ChunkManager> manager(new ChunkManager(ns, fieldsAndOrder, unique));
-    manager->createFirstChunks(txn, dbPrimaryShardId, &initPoints, &initShardIds);
+    Status createFirstChunksStatus =
+        manager->createFirstChunks(txn, dbPrimaryShardId, &initPoints, &initShardIds);
+    if (!createFirstChunksStatus.isOK()) {
+        return createFirstChunksStatus;
+    }
     manager->loadExistingRanges(txn, nullptr);
 
     CollectionInfo collInfo;
@@ -555,14 +561,13 @@ Status CatalogManagerLegacy::dropCollection(OperationContext* txn, const Namespa
     LOG(1) << "dropCollection " << ns << " started";
 
     // Lock the collection globally so that split/migrate cannot run
-    stdx::chrono::seconds waitFor(2);
+    stdx::chrono::seconds waitFor(DistLockManager::kDefaultLockTimeout);
     MONGO_FAIL_POINT_BLOCK(setSCCCDropCollDistLockWait, customWait) {
         const BSONObj& data = customWait.getData();
         waitFor = stdx::chrono::seconds(data["waitForSecs"].numberInt());
     }
-    const stdx::chrono::milliseconds lockTryInterval(500);
-    auto scopedDistLock =
-        getDistLockManager()->lock(txn, ns.ns(), "drop", waitFor, lockTryInterval);
+
+    auto scopedDistLock = getDistLockManager()->lock(txn, ns.ns(), "drop", waitFor);
     if (!scopedDistLock.isOK()) {
         return scopedDistLock.getStatus();
     }
@@ -887,8 +892,7 @@ bool CatalogManagerLegacy::runUserManagementWriteCommand(OperationContext* txn,
         dispatcher.addCommand(configServer, dbname, cmdObj);
     }
 
-    auto scopedDistLock =
-        getDistLockManager()->lock(txn, "authorizationData", commandName, Seconds{5});
+    auto scopedDistLock = getDistLockManager()->lock(txn, "authorizationData", commandName);
     if (!scopedDistLock.isOK()) {
         return Command::appendCommandStatus(*result, scopedDistLock.getStatus());
     }
@@ -1300,7 +1304,7 @@ Status CatalogManagerLegacy::_checkConfigServersConsistent(const unsigned tries)
 
     if (up == 0) {
         return {networkError ? ErrorCodes::HostUnreachable : ErrorCodes::UnknownError,
-                str::stream() << "no config servers successfully contacted" << causedBy(&errMsg)};
+                str::stream() << "no config servers successfully contacted" << causedBy(errMsg)};
     } else if (up == 1) {
         warning() << "only 1 config server reachable, continuing";
         return Status::OK();

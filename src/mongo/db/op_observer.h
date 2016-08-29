@@ -51,6 +51,12 @@ class OpObserver {
 public:
     OpObserver() {}
     ~OpObserver() {}
+
+    struct DeleteState {
+        BSONObj idDoc;
+        bool isMigrating = false;
+    };
+
     void onCreateIndex(OperationContext* txn,
                        const std::string& ns,
                        BSONObj indexDoc,
@@ -61,10 +67,20 @@ public:
                    std::vector<BSONObj>::const_iterator end,
                    bool fromMigrate = false);
     void onUpdate(OperationContext* txn, oplogUpdateEntryArgs args);
+    DeleteState aboutToDelete(OperationContext* txn, const NamespaceString& ns, const BSONObj& doc);
+    /**
+     * Handles logging before document is deleted.
+     *
+     * "ns" name of the collection from which deleteState.idDoc will be deleted.
+     * "deleteState" holds information about the deleted document.
+     * "fromMigrate" indicates whether the delete was induced by a chunk migration, and
+     * so should be ignored by the user as an internal maintenance operation and not a
+     * real delete.
+     */
     void onDelete(OperationContext* txn,
-                  const std::string& ns,
-                  const BSONObj& idDoc,
-                  bool fromMigrate = false);
+                  const NamespaceString& ns,
+                  DeleteState deleteState,
+                  bool fromMigrate);
     void onOpMessage(OperationContext* txn, const BSONObj& msgObj);
     void onCreateCollection(OperationContext* txn,
                             const NamespaceString& collectionName,

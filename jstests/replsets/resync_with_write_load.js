@@ -17,9 +17,9 @@ var config = { "_id": testName,
                             {"_id": 2, "host": nodes[2]}]
               };
 var r = replTest.initiate(config);
-replTest.waitForState(replTest.nodes[0], replTest.PRIMARY, 60 * 1000);
+replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY, 60 * 1000);
 // Make sure we have a master
-var master = replTest.getMaster();
+var master = replTest.getPrimary();
 var a_conn = conns[0];
 var b_conn = conns[1];
 a_conn.setSlaveOk();

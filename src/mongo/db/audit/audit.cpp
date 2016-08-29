@@ -46,6 +46,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/client_basic.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/paths.h"
@@ -97,7 +98,7 @@ namespace audit {
     public:
         JSONAuditLog(const std::string &file, const BSONObj &filter)
             : _file(new AuditFile), 
-              _matcher(filter.getOwned()), 
+              _matcher(filter.getOwned(), ExtensionsCallbackDisallowExtensions()),
               _fileName(file) {
             _file->open(file.c_str(), false, false);
         }

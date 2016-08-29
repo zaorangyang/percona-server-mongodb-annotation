@@ -250,6 +250,27 @@ Status refetch(FixUpInfo& fixUpInfo, const BSONObj& ourObj) {
                 throw RSFatalException();
             }
             return Status::OK();
+        } else if (cmdname == "applyOps") {
+            if (first.type() != Array) {
+                std::string message = str::stream()
+                    << "Expected applyOps argument to be an array; found " << first.toString();
+                severe() << message;
+                return Status(ErrorCodes::UnrecoverableRollbackError, message);
+            }
+            for (const auto& subopElement : first.Array()) {
+                if (subopElement.type() != Object) {
+                    std::string message = str::stream()
+                        << "Expected applyOps operations to be of Object type, but found "
+                        << subopElement.toString();
+                    severe() << message;
+                    return Status(ErrorCodes::UnrecoverableRollbackError, message);
+                }
+                auto subStatus = refetch(fixUpInfo, subopElement.Obj());
+                if (!subStatus.isOK()) {
+                    return subStatus;
+                }
+            }
+            return Status::OK();
         } else {
             severe() << "can't rollback this command yet: " << obj.toString();
             log() << "cmdname=" << cmdname;
@@ -625,7 +646,8 @@ void syncFixUp(OperationContext* txn,
 
                 // Add the doc to our rollback file if the collection was not dropped while
                 // rolling back createCollection operations.
-                // Do not log an error when undoing an insert on a no longer existent collection.
+                // Do not log an error when undoing an insert on a no longer existent
+                // collection.
                 // It is likely that the collection was dropped as part of rolling back a
                 // createCollection command and regardless, the document no longer exists.
                 if (collection && removeSaver) {
@@ -646,15 +668,18 @@ void syncFixUp(OperationContext* txn,
 
                 if (idAndDoc.second.isEmpty()) {
                     // wasn't on the primary; delete.
-                    // TODO 1.6 : can't delete from a capped collection.  need to handle that here.
+                    // TODO 1.6 : can't delete from a capped collection.  need to handle that
+                    // here.
                     deletes++;
 
                     if (collection) {
                         if (collection->isCapped()) {
-                            // can't delete from a capped collection - so we truncate instead. if
+                            // can't delete from a capped collection - so we truncate instead.
+                            // if
                             // this item must go, so must all successors!!!
                             try {
-                                // TODO: IIRC cappedTruncateAfter does not handle completely empty.
+                                // TODO: IIRC cappedTruncateAfter does not handle completely
+                                // empty.
                                 // this will crazy slow if no _id index.
                                 long long start = Listener::getElapsedTimeMillis();
                                 RecordId loc = Helpers::findOne(txn, collection, pattern, false);
@@ -878,27 +903,12 @@ Status _syncRollback(OperationContext* txn,
 }  // namespace
 
 Status syncRollback(OperationContext* txn,
-                    const OpTime& lastOpTimeApplied,
                     const OplogInterface& localOplog,
                     const RollbackSource& rollbackSource,
                     ReplicationCoordinator* replCoord,
                     const SleepSecondsFn& sleepSecondsFn) {
     invariant(txn);
     invariant(replCoord);
-
-    // check that we are at minvalid, otherwise we cannot rollback as we may be in an
-    // inconsistent state
-    {
-        BatchBoundaries boundaries = getMinValid(txn);
-        if (!boundaries.start.isNull() || boundaries.end > lastOpTimeApplied) {
-            severe() << "need to rollback, but in inconsistent state" << endl;
-            return Status(ErrorCodes::UnrecoverableRollbackError,
-                          str::stream() << "need to rollback, but in inconsistent state. "
-                                        << "minvalid: " << boundaries.end.toString()
-                                        << " > our last optime: " << lastOpTimeApplied.toString(),
-                          18750);
-        }
-    }
 
     log() << "beginning rollback" << rsLog;
 
@@ -911,12 +921,10 @@ Status syncRollback(OperationContext* txn,
 }
 
 Status syncRollback(OperationContext* txn,
-                    const OpTime& lastOpTimeWritten,
                     const OplogInterface& localOplog,
                     const RollbackSource& rollbackSource,
                     ReplicationCoordinator* replCoord) {
     return syncRollback(txn,
-                        lastOpTimeWritten,
                         localOplog,
                         rollbackSource,
                         replCoord,
