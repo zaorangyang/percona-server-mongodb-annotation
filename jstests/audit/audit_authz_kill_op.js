@@ -20,7 +20,7 @@ auditTest(
         // when an 'admin' user performs this operation.
         var adminDB = m.getDB('admin');
         adminDB.auth('admin','admin');
-        var operation = testDB.currentOp(true);
+        var operation = testDB.currentOp(false);
         assert.eq(null, testDB.getLastError());
         var first = operation.inprog[0];
         var id = first.opid;
