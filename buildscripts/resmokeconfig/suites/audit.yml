@@ -1,7 +1,7 @@
 selector:
   js_test:
     roots:
-    - src/mongo/db/modules/*/jstests/audit/*.js
+    - jstests/audit/*.js
 
 # audit tests start their own mongod's.
 executor:
