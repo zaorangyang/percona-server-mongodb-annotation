@@ -66,7 +66,31 @@ bool CreateBackupCommand::run(mongo::OperationContext* txn,
                               int options,
                               std::string& errmsg,
                               BSONObjBuilder& result) {
-    // TODO: Check if destination directory is empty.
+    namespace fs = boost::filesystem;
+
+    const std::string& dest = cmdObj["path"].String();
+    // Validate destination directory.
+    try {
+        fs::path destPath(dest);
+
+        if (!destPath.is_absolute()) {
+            errmsg = "Destination path must be absolute";
+            return false;
+        }
+
+        if (!fs::is_directory(destPath)) {
+            errmsg = "Destination directory doesn't exist";
+            return false;
+        }
+
+        if (!fs::is_empty(destPath)) {
+            errmsg = "Destination directory is not empty";
+            return false;
+        }
+    } catch (const fs::filesystem_error& ex) {
+        errmsg = ex.what();
+        return false;
+    }
     // TODO: Get global storage engine interface
     // TODO: Pass destination directory to SE API.
     return true;
