@@ -21,7 +21,9 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 #include <boost/filesystem.hpp>
 
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/backup/backupable.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/storage/engine_extension.h"
 
 using namespace mongo;
 
@@ -91,8 +93,15 @@ bool CreateBackupCommand::run(mongo::OperationContext* txn,
         errmsg = ex.what();
         return false;
     }
-    // TODO: Get global storage engine interface
-    // TODO: Pass destination directory to SE API.
+
+    // Do the backup itself.
+    auto ee = getEngineExtension();
+    const auto status = ee->hotBackup(dest);
+
+    if (!status.isOK()) {
+        errmsg = status.reason();
+        return false;
+    }
     return true;
 }
 

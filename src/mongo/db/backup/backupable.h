@@ -20,24 +20,27 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-#include "mongo/db/backup/backupable.h"
+#include <string>
+
+#include "mongo/base/status.h"
 
 namespace percona {
 
 /**
- * Storage engine extension interface.
+ * The interface which provides the ability to perform hot
+ * backups of the storage engine.
  */
-class EngineExtension : public Backupable {
-protected:
-    EngineExtension();
-    virtual ~EngineExtension() {}
-};
+struct Backupable {
+    virtual ~Backupable() {}
 
-/**
- * Returns the singleton EngineExtension to storage engine interface
- * for querying for additional functionality.
- * Caller does not own the pointer.
- */
-EngineExtension* getEngineExtension();
+    /**
+     * Perform hot backup.
+     * @param path destination path to perform backup into.
+     * @return Status code of the operation.
+     */
+    virtual mongo::Status hotBackup(const std::string& path) {
+        return mongo::Status::OK();
+    }
+};
 
 }  // end of percona namespace.
