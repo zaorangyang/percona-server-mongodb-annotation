@@ -7,4 +7,7 @@ env.Library(
     source=[
         'backup_commands.cpp',
     ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/storage/engine_extension',
+    ],
 )
