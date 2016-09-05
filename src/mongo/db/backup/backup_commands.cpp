@@ -23,6 +23,7 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/backup/backupable.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/engine_extension.h"
 #include "mongo/db/storage/storage_options.h"
 
@@ -97,6 +98,10 @@ bool CreateBackupCommand::run(mongo::OperationContext* txn,
         errmsg = ex.what();
         return false;
     }
+
+    // Flush all files first.
+    auto se = getGlobalServiceContext()->getGlobalStorageEngine();
+    se->flushAllFiles(true);
 
     // Do the backup itself.
     auto ee = getEngineExtension();

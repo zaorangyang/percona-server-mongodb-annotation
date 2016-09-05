@@ -1,5 +1,9 @@
 Random.setRandomSeed();
 
+function getDB(conn) {
+    return conn.getDB('db0');
+}
+
 function fillData(conn, count = 1000) {
     for (var i = 0, dbs = Random.randInt(10); i < dbs; i++) {
         var db = conn.getDB('db' + i);
