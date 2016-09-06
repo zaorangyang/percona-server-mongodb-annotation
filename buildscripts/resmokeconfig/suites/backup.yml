@@ -2,6 +2,8 @@ selector:
   js_test:
     roots:
     - jstests/backup/*.js
+    exclude_files:
+    - jstests/backup/_*.js
 
 # backup tests start their own mongod's.
 executor:
