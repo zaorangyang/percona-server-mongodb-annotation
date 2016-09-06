@@ -12,4 +12,4 @@ executor:
       class: MongoDFixture
       mongod_options:
         add_options:
-          config: 'jstests/knobs/config.yml'
+          config: 'jstests/libs/config_files/knobs.json'
