@@ -108,6 +108,8 @@ public:
 
     virtual void endBackup(OperationContext* txn);
 
+    virtual Status hotBackup(const std::string& path);
+
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident);
 
     virtual Status repairIdent(OperationContext* opCtx, StringData ident);
