@@ -24,7 +24,11 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/backup/backupable.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/storage/engine_extension.h"
+#include "mongo/db/storage/storage_options.h"
 
+namespace mongo {
+    extern StorageGlobalParams storageGlobalParams;
+}
 using namespace mongo;
 
 namespace percona {
@@ -71,10 +75,10 @@ bool CreateBackupCommand::run(mongo::OperationContext* txn,
     namespace fs = boost::filesystem;
 
     const std::string& dest = cmdObj["path"].String();
+    fs::path destPath(dest);
+
     // Validate destination directory.
     try {
-        fs::path destPath(dest);
-
         if (!destPath.is_absolute()) {
             errmsg = "Destination path must be absolute";
             return false;
@@ -100,6 +104,16 @@ bool CreateBackupCommand::run(mongo::OperationContext* txn,
 
     if (!status.isOK()) {
         errmsg = status.reason();
+        return false;
+    }
+
+    // Copy storage engine metadata.
+    try {
+        const char* storageMetadata = "storage.bson";
+        fs::path srcPath(mongo::storageGlobalParams.dbpath);
+        fs::copy_file(srcPath / storageMetadata, destPath / storageMetadata, fs::copy_option::none);
+    } catch (const fs::filesystem_error& ex) {
+        errmsg = ex.what();
         return false;
     }
     return true;
