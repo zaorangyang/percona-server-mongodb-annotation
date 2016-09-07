@@ -19,6 +19,13 @@ load('jstests/backup/_backup_helpers.js');
     fillData(conn, 500);
     MongoRunner.stopMongod(conn);
 
+    // Check that backup instanse has engine metadata copied.
+    assert.isnull(MongoRunner.runMongod({
+        dbpath: backupPath,
+        noCleanData: true,
+        storageEngine: 'mmapv1',
+    }));
+
     // Run the backup instance.
     var conn = MongoRunner.runMongod({
         dbpath: backupPath,
