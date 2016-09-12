@@ -35,6 +35,7 @@
 namespace mongo {
 
 const int DEFAULT_UNIX_PERMS = 0700;
+const int RATE_LIMIT_MAX = 1000;
 
 struct ServerGlobalParams {
     ServerGlobalParams()
@@ -49,6 +50,7 @@ struct ServerGlobalParams {
           objcheck(true),
           defaultProfile(0),
           slowMS(100),
+          rateLimit(1),
           defaultLocalThresholdMillis(15),
           moveParanoia(false),
           noUnixSocket(false),
@@ -89,6 +91,7 @@ struct ServerGlobalParams {
 
     int defaultProfile;               // --profile
     int slowMS;                       // --time in ms that is "slow"
+    int rateLimit;                    // --rate limit in the range 1-RATE_LIMIT_MAX represents a  1/N probability that a query will be profiled
     int defaultLocalThresholdMillis;  // --localThreshold in ms to consider a node local
     bool moveParanoia;                // for move chunk paranoia
 
