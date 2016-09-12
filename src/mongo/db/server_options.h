@@ -35,6 +35,7 @@
 namespace mongo {
 
 const int DEFAULT_UNIX_PERMS = 0700;
+const int RATE_LIMIT_MAX = 1000;
 
 struct ServerGlobalParams {
     std::string binaryName;  // mongod or mongos
@@ -64,6 +65,7 @@ struct ServerGlobalParams {
 
     int defaultProfile = 0;                // --profile
     int slowMS = 100;                      // --time in ms that is "slow"
+    int rateLimit = 1;                     // --rate limit in the range 1-RATE_LIMIT_MAX represents a  1/N probability that a query will be profiled
     int defaultLocalThresholdMillis = 15;  // --localThreshold in ms to consider a node local
     bool moveParanoia = false;             // for move chunk paranoia
 
