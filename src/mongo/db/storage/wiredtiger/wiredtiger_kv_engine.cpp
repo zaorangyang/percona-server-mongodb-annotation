@@ -413,6 +413,13 @@ void WiredTigerKVEngine::syncSizeInfo(bool sync) const {
         _sizeStorer->syncCache(sync);
     } catch (const WriteConflictException&) {
         // ignore, we'll try again later.
+    } catch (const UserException& ex) {
+        // re-throw exception if it's not WT_CACHE_FULL.
+        if (!_durable && ex.getCode() == ErrorCodes::ExceededMemoryLimit) {
+            error() << "size storer failed to sync cache... ignoring: " << ex.what();
+        } else {
+            throw;
+        }
     }
 }
 
