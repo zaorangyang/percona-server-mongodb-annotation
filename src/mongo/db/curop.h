@@ -305,6 +305,10 @@ public:
         if (_dbprofile <= 0)
             return false;
 
+        if (serverGlobalParams.rateLimit > 1 && _dbprofile >= 2 && ms < serverGlobalParams.slowMS) {
+            return _shouldDBProfileWithRateLimit();
+        }
+
         return _dbprofile >= 2 || ms >= serverGlobalParams.slowMS;
     }
 
@@ -526,6 +530,10 @@ private:
     uint64_t _maxTimeMicros{0u};
 
     std::string _planSummary;
+
+    // auxilliary method used from shouldDBProfile
+    // allows us to remove random.h dependency from header
+    bool _shouldDBProfileWithRateLimit() const;
 
     /** Nested class that implements tracking of a time limit for a CurOp object. */
     class MaxTimeTracker {
