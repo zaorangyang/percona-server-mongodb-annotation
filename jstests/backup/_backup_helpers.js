@@ -30,7 +30,7 @@ function backup(conn) {
     var backupPath = MongoRunner.dataPath + 'backup';
     mkdir(backupPath);
     var adminDB = conn.getDB('admin');
-    assert.commandWorked(adminDB.runCommand({createBackup: 1, path: backupPath}));
+    assert.commandWorked(adminDB.runCommand({createBackup: 1, backupDir: backupPath}));
     return backupPath;
 }
 
