@@ -5,19 +5,19 @@
 
     var db = conn.getDB('test');
     // Non-admin execution
-    assert.commandFailed(db.runCommand({createBackup: 1, path: MongoRunner.dataPath}));
+    assert.commandFailed(db.runCommand({createBackup: 1, backupDir: MongoRunner.dataPath}));
 
     var adminDB = db.getSiblingDB('admin');
 
     // Wrong value format
-    assert.commandFailed(adminDB.runCommand({createBackup: 1, path: 0}));
+    assert.commandFailed(adminDB.runCommand({createBackup: 1, backupDir: 0}));
 
     // Non-existent path
-    assert.commandFailed(adminDB.runCommand({createBackup: 1, path: '/non-existent/path'}));
+    assert.commandFailed(adminDB.runCommand({createBackup: 1, backupDir: '/non-existent/path'}));
 
     // Relative path
-    assert.commandFailed(adminDB.runCommand({createBackup: 1, path: '../usr'}));
+    assert.commandFailed(adminDB.runCommand({createBackup: 1, backupDir: '../usr'}));
 
     // Non-empty backup folder
-    assert.commandFailed(adminDB.runCommand({createBackup: 1, path: '/'}));
+    assert.commandFailed(adminDB.runCommand({createBackup: 1, backupDir: '/'}));
 })();

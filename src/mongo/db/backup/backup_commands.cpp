@@ -41,7 +41,7 @@ public:
         help << "Creates a hot backup, into the given directory, of the files currently in the "
                 "storage engine's data directory."
              << std::endl
-             << "{ createBackup: <destination directory> }";
+             << "{ createBackup: 1, backupDir: <destination directory> }";
     }
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
@@ -75,7 +75,7 @@ bool CreateBackupCommand::run(mongo::OperationContext* txn,
                               BSONObjBuilder& result) {
     namespace fs = boost::filesystem;
 
-    const std::string& dest = cmdObj["path"].String();
+    const std::string& dest = cmdObj["backupDir"].String();
     fs::path destPath(dest);
 
     // Validate destination directory.
