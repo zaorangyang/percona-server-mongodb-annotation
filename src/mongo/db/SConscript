@@ -436,6 +436,7 @@ env.Library(
     target="mongod_options",
     source=[
         "mongod_options.cpp",
+        "ratelimit_parameter.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/serveronly',
