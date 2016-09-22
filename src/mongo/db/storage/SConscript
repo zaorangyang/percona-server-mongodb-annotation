@@ -21,6 +21,15 @@ env.SConscript(
 
 
 env.Library(
+    target='engine_extension',
+    source=[
+        'engine_extension.cpp',
+        ],
+    LIBDEPS=[
+        ],
+    )
+
+env.Library(
     target='journal_listener',
     source=[
         'journal_listener.cpp',
