@@ -1,0 +1,6 @@
+Percona:
+    cursorTimeoutMillis: 1
+    ignoreLongIndexError: false
+    allowIndexIntersections: false
+    ttlEnabled: false
+    ttlSleepSecs: 1
