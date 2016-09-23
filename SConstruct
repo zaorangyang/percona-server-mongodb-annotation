@@ -218,6 +218,11 @@ add_option('audit',
     nargs=0,
 )
 
+add_option('hotbackup',
+    help='Enable Hot Backup',
+    nargs=0,
+)
+
 add_option('tokubackup',
     help='Enable Hot Backup for the Fractal Tree engine.',
     nargs=0,
