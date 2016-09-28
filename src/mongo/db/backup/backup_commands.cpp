@@ -21,6 +21,7 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 #include <boost/filesystem.hpp>
 
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/backup/backupable.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/service_context.h"
@@ -43,12 +44,13 @@ public:
              << std::endl
              << "{ createBackup: 1, backupDir: <destination directory> }";
     }
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
-        ActionSet actions;
-        actions.addAction(ActionType::startBackup);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForCommand(ClientBasic* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) override {
+        return AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
+                   ResourcePattern::forAnyNormalResource(), ActionType::startBackup)
+            ? Status::OK()
+            : Status(ErrorCodes::Unauthorized, "Unauthorized");
     }
     bool isWriteCommandForConfigServer() const override {
         return false;
