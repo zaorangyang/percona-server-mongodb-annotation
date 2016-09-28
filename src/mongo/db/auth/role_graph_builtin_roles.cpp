@@ -419,6 +419,8 @@ void addBackupPrivileges(PrivilegeVector* privileges) {
         privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::listCollections));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::listIndexes));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnyNormalResource(), ActionType::startBackup));
 
     ActionSet clusterActions;
     clusterActions << ActionType::getParameter  // To check authSchemaVersion
