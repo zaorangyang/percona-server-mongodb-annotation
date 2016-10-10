@@ -141,7 +141,7 @@ popd
 pushd $RPM_BUILD_DIR/%{src_dir}
 scons CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
 %{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib \
---PerconaFT --rocksdb --wiredtiger --inmemory --tokubackup ${PSM_TARGETS}
+--PerconaFT --rocksdb --wiredtiger --inmemory --tokubackup --hotbackup ${PSM_TARGETS}
 popd
 
 # Mongo Tools compilation
