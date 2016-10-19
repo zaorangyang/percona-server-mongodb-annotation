@@ -218,7 +218,6 @@ void msgasserted(int msgid, const string& msg) {
 NOINLINE_DECL void msgasserted(int msgid, const char* msg) {
     assertionCount.condrollover(++assertionCount.warning);
     log() << "Assertion: " << msgid << ":" << msg << endl;
-    // breakpoint();
     logContext();
     throw MsgAssertionException(msgid, msg);
 }
@@ -249,12 +248,8 @@ std::string causedBy(const std::string& e) {
     return causedBy(e.c_str());
 }
 
-std::string causedBy(const std::string* e) {
-    return (e && *e != "") ? causedBy(*e) : "";
-}
-
 std::string causedBy(const Status& e) {
-    return causedBy(e.reason());
+    return causedBy(e.toString());
 }
 
 string errnoWithPrefix(StringData prefix) {

@@ -198,12 +198,16 @@ void WiredTigerRecoveryUnit::abandonSnapshot() {
     _areWriteUnitOfWorksBanned = false;
 }
 
+void* WiredTigerRecoveryUnit::writingPtr(void* data, size_t len) {
+    // This API should not be used for anything other than the MMAP V1 storage engine
+    MONGO_UNREACHABLE;
+}
+
 void WiredTigerRecoveryUnit::setOplogReadTill(const RecordId& id) {
     _oplogReadTill = id;
 }
 
 namespace {
-
 
 class TicketServerParameter : public ServerParameter {
     MONGO_DISALLOW_COPYING(TicketServerParameter);
@@ -249,7 +253,8 @@ TicketServerParameter openWriteTransactionParam(&openWriteTransaction,
 TicketHolder openReadTransaction(128);
 TicketServerParameter openReadTransactionParam(&openReadTransaction,
                                                "wiredTigerConcurrentReadTransactions");
-}
+
+}  // namespace
 
 void WiredTigerRecoveryUnit::appendGlobalStats(BSONObjBuilder& b) {
     BSONObjBuilder bb(b.subobjStart("concurrentTransactions"));
@@ -275,10 +280,10 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     WT_SESSION* s = _session->getSession();
     if (commit) {
         invariantWTOK(s->commit_transaction(s, NULL));
-        LOG(2) << "WT commit_transaction";
+        LOG(3) << "WT commit_transaction";
     } else {
         invariantWTOK(s->rollback_transaction(s, NULL));
-        LOG(2) << "WT rollback_transaction";
+        LOG(3) << "WT rollback_transaction";
     }
     _active = false;
     _myTransactionCount++;
@@ -351,7 +356,7 @@ void WiredTigerRecoveryUnit::_txnOpen(OperationContext* opCtx) {
         invariantWTOK(s->begin_transaction(s, NULL));
     }
 
-    LOG(2) << "WT begin_transaction";
+    LOG(3) << "WT begin_transaction";
     _timer.reset();
     _active = true;
 }

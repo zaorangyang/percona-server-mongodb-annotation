@@ -54,14 +54,23 @@
 
     assert.eq(countA, getUsageCount("a_1"));
 
-    // Confirm index stats tick on findAndModify().
-    var res = db.runCommand({findAndModify: colName, 
-                             query: {a: 1}, 
-                             update: {$set: {d: 1}}, 
+    // Confirm index stats tick on findAndModify() update.
+    var res = db.runCommand({findAndModify: colName,
+                             query: {a: 1},
+                             update: {$set: {d: 1}},
                              'new': true});
     assert.commandWorked(res);
     countA++;
     assert.eq(countA, getUsageCount("a_1"));
+
+    // Confirm index stats tick on findAndModify() delete.
+    res = db.runCommand({findAndModify: colName,
+                         query: {a: 2},
+                         remove: true});
+    assert.commandWorked(res);
+    countA++;
+    assert.eq(countA, getUsageCount("a_1"));
+    assert.writeOK(col.insert(res.value));
 
     // Confirm index stats tick on distinct().
     res = db.runCommand({distinct: colName, key: "b", query: {b: 1}});
@@ -75,6 +84,23 @@
                          cond: {b: {$gt: 0}},
                          $reduce: function(curr, result) {}, 
                          initial: {}}});
+    assert.commandWorked(res);
+    countB++;
+    assert.eq(countB, getUsageCount("b_1_c_1"));
+
+    // Confirm index stats tick on aggregate w/ match.
+    res = db.runCommand({aggregate: colName,
+                         pipeline: [{$match: {b: 1}}]});
+    assert.commandWorked(res);
+    countB++;
+    assert.eq(countB, getUsageCount("b_1_c_1"));
+
+    // Confirm index stats tick on mapReduce with query.
+    res = db.runCommand({mapReduce: colName,
+                         map: function() {emit(this.b, this.c);},
+                         reduce: function(key, val) {return val;},
+                         query: {b: 2},
+                         out: {inline: true}});
     assert.commandWorked(res);
     countB++;
     assert.eq(countB, getUsageCount("b_1_c_1"));

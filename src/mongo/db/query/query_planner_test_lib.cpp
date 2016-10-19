@@ -36,6 +36,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/unittest/unittest.h"
@@ -51,7 +52,8 @@ bool filterMatches(const BSONObj& testFilter, const QuerySolutionNode* trueFilte
     if (NULL == trueFilterNode->filter) {
         return false;
     }
-    StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(testFilter);
+    StatusWithMatchExpression statusWithMatcher =
+        MatchExpressionParser::parse(testFilter, ExtensionsCallbackDisallowExtensions());
     if (!statusWithMatcher.isOK()) {
         return false;
     }
@@ -575,6 +577,25 @@ bool QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
         }
 
         return solutionMatches(child.Obj(), fn->children[0]);
+    } else if (STAGE_ENSURE_SORTED == trueSoln->getType()) {
+        const EnsureSortedNode* esn = static_cast<const EnsureSortedNode*>(trueSoln);
+
+        BSONElement el = testSoln["ensureSorted"];
+        if (el.eoo() || !el.isABSONObj()) {
+            return false;
+        }
+        BSONObj esObj = el.Obj();
+
+        BSONElement patternEl = esObj["pattern"];
+        if (patternEl.eoo() || !patternEl.isABSONObj()) {
+            return false;
+        }
+        BSONElement child = esObj["node"];
+        if (child.eoo() || !child.isABSONObj()) {
+            return false;
+        }
+
+        return (patternEl.Obj() == esn->pattern) && solutionMatches(child.Obj(), esn->children[0]);
     }
 
     return false;

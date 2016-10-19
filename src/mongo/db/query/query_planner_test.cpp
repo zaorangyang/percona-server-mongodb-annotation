@@ -34,6 +34,7 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_fixture.h"
 
@@ -3439,11 +3440,12 @@ TEST_F(QueryPlannerTest, NoKeepWithNToReturn) {
     runQuerySortProjSkipLimit(fromjson("{a: 1}"), fromjson("{b: 1}"), BSONObj(), 0, 3);
 
     assertSolutionExists(
+        "{ensureSorted: {pattern: {b: 1}, node: "
         "{or: {nodes: ["
         "{sort: {pattern: {b: 1}, limit: 3, node: {sortKeyGen: {node: "
         "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}}}, "
         "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
-        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}}}]}}");
+        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}}}]}}}}");
 }
 
 // Make sure a top-level $or hits the limiting number
@@ -3564,11 +3566,12 @@ TEST_F(QueryPlannerTest, SplitLimitedSort) {
     // Second solution has a blocking sort with a limit: it gets split and
     // joined with an OR stage.
     assertSolutionExists(
+        "{ensureSorted: {pattern: {b: 1}, node: "
         "{or: {nodes: ["
         "{sort: {pattern: {b: 1}, limit: 3, node: {sortKeyGen: {node: "
         "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}}}, "
         "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
-        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}}}]}}");
+        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}}}]}}}}");
 }
 
 // The same query run as a find command with a limit should not require the "split limited sort"
@@ -4055,8 +4058,8 @@ TEST(BadInputTest, CacheDataFromTaggedTree) {
     // No relevant index matching the index tag.
     relevantIndices.push_back(IndexEntry(BSON("a" << 1)));
 
-    auto statusWithCQ =
-        CanonicalQuery::canonicalize(NamespaceString("test.collection"), BSON("a" << 3));
+    auto statusWithCQ = CanonicalQuery::canonicalize(
+        NamespaceString("test.collection"), BSON("a" << 3), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     std::unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
     scopedCq->root()->setTag(new IndexTag(1));
@@ -4069,7 +4072,8 @@ TEST(BadInputTest, CacheDataFromTaggedTree) {
 TEST(BadInputTest, TagAccordingToCache) {
     const NamespaceString nss("test.collection");
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(nss, BSON("a" << 3));
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(nss, BSON("a" << 3), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     std::unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
 
@@ -4096,7 +4100,8 @@ TEST(BadInputTest, TagAccordingToCache) {
     ASSERT_OK(s);
 
     // Regenerate canonical query in order to clear tags.
-    statusWithCQ = CanonicalQuery::canonicalize(nss, BSON("a" << 3));
+    statusWithCQ =
+        CanonicalQuery::canonicalize(nss, BSON("a" << 3), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     scopedCq = std::move(statusWithCQ.getValue());
 
@@ -4117,10 +4122,11 @@ TEST_F(QueryPlannerTest, NToReturnHackWithFindCommand) {
 
     assertNumSolutions(1U);
     assertSolutionExists(
+        "{ensureSorted: {pattern: {a: 1}, node: "
         "{or: {nodes: ["
         "{sort: {limit:3, pattern: {a:1}, node: {sortKeyGen: {node: {cscan: {dir:1}}}}}}, "
         "{sort: {limit:0, pattern: {a:1}, node: {sortKeyGen: {node: {cscan: {dir:1}}}}}}"
-        "]}}");
+        "]}}}}");
 }
 
 TEST_F(QueryPlannerTest, NToReturnHackWithSingleBatch) {

@@ -215,6 +215,17 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
     response->setData(msgdata.view2ptr(), true);
 }
 
+/**
+ * Fills out CurOp / OpDebug with basic command info.
+ */
+void beginCommandOp(OperationContext* txn, const NamespaceString& nss, const BSONObj& queryObj) {
+    auto curop = CurOp::get(txn);
+    curop->debug().query = queryObj;
+    stdx::lock_guard<Client> lk(*txn->getClient());
+    curop->setQuery_inlock(queryObj);
+    curop->setNS_inlock(nss.ns());
+}
+
 }  // namespace
 
 static void receivedCommand(OperationContext* txn,
@@ -238,7 +249,7 @@ static void receivedCommand(OperationContext* txn,
         rpc::LegacyRequest request{&message};
         // Auth checking for Commands happens later.
         int nToReturn = queryMessage.ntoreturn;
-        beginQueryOp(txn, nss, queryMessage.query, nToReturn, queryMessage.ntoskip);
+        beginCommandOp(txn, nss, queryMessage.query);
         {
             stdx::lock_guard<Client> lk(*txn->getClient());
             op->markCommand_inlock();
@@ -284,7 +295,7 @@ void receivedRpc(OperationContext* txn, Client& client, DbResponse& dbResponse, 
         // We construct a legacy $cmd namespace so we can fill in curOp using
         // the existing logic that existed for OP_QUERY commands
         NamespaceString nss(request.getDatabase(), "$cmd");
-        beginQueryOp(txn, nss, request.getCommandArgs(), 1, 0);
+        beginCommandOp(txn, nss, request.getCommandArgs());
         {
             stdx::lock_guard<Client> lk(*txn->getClient());
             curOp->markCommand_inlock();
@@ -502,15 +513,7 @@ void assembleResponse(OperationContext* txn,
     OpDebug& debug = currentOp.debug();
 
     long long logThreshold = serverGlobalParams.slowMS;
-    LogComponent responseComponent(LogComponent::kQuery);
-    if (op == dbInsert || op == dbDelete || op == dbUpdate) {
-        responseComponent = LogComponent::kWrite;
-    } else if (isCommand) {
-        responseComponent = LogComponent::kCommand;
-    }
-
-    bool shouldLog =
-        logger::globalLogDomain()->shouldLog(responseComponent, logger::LogSeverity::Debug(1));
+    bool shouldLogOpDebug = shouldLog(logger::LogSeverity::Debug(1));
 
     if (op == dbQuery) {
         if (isCommand) {
@@ -522,15 +525,14 @@ void assembleResponse(OperationContext* txn,
         receivedRpc(txn, c, dbresponse, m);
     } else if (op == dbGetMore) {
         if (!receivedGetMore(txn, dbresponse, m, currentOp))
-            shouldLog = true;
+            shouldLogOpDebug = true;
     } else if (op == dbMsg) {
         // deprecated - replaced by commands
         const char* p = dbmsg.getns();
 
         int len = strlen(p);
         if (len > 400)
-            log(LogComponent::kQuery) << curTimeMillis64() % 10000
-                                      << " long msg received, len:" << len << endl;
+            log() << curTimeMillis64() % 10000 << " long msg received, len:" << len << endl;
 
         if (strcmp("end", p) == 0)
             dbresponse.response.setData(opReply, "dbMsg end no longer supported");
@@ -548,10 +550,9 @@ void assembleResponse(OperationContext* txn,
                 logThreshold = 10;
                 receivedKillCursors(txn, m);
             } else if (op != dbInsert && op != dbUpdate && op != dbDelete) {
-                log(LogComponent::kQuery)
-                    << "    operation isn't supported: " << static_cast<int>(op) << endl;
+                log() << "    operation isn't supported: " << static_cast<int>(op) << endl;
                 currentOp.done();
-                shouldLog = true;
+                shouldLogOpDebug = true;
             } else {
                 if (remote != DBDirectClient::dummyHost) {
                     const ShardedConnectionInfo* connInfo = ShardedConnectionInfo::get(&c, false);
@@ -577,17 +578,15 @@ void assembleResponse(OperationContext* txn,
             }
         } catch (const UserException& ue) {
             LastError::get(c).setLastError(ue.getCode(), ue.getInfo().msg);
-            MONGO_LOG_COMPONENT(3, responseComponent) << " Caught Assertion in "
-                                                      << networkOpToString(op) << ", continuing "
-                                                      << ue.toString() << endl;
+            LOG(3) << " Caught Assertion in " << networkOpToString(op) << ", continuing "
+                   << ue.toString() << endl;
             debug.exceptionInfo = ue.getInfo();
         } catch (const AssertionException& e) {
             LastError::get(c).setLastError(e.getCode(), e.getInfo().msg);
-            MONGO_LOG_COMPONENT(3, responseComponent) << " Caught Assertion in "
-                                                      << networkOpToString(op) << ", continuing "
-                                                      << e.toString() << endl;
+            LOG(3) << " Caught Assertion in " << networkOpToString(op) << ", continuing "
+                   << e.toString() << endl;
             debug.exceptionInfo = e.getInfo();
-            shouldLog = true;
+            shouldLogOpDebug = true;
         }
     }
     currentOp.ensureStarted();
@@ -596,21 +595,19 @@ void assembleResponse(OperationContext* txn,
 
     logThreshold += currentOp.getExpectedLatencyMs();
 
-    if (shouldLog || debug.executionTime > logThreshold) {
+    if (shouldLogOpDebug || debug.executionTime > logThreshold) {
         Locker::LockerInfo lockerInfo;
         txn->lockState()->getLockerInfo(&lockerInfo);
 
-        MONGO_LOG_COMPONENT(0, responseComponent) << debug.report(currentOp, lockerInfo.stats);
+        log() << debug.report(currentOp, lockerInfo.stats);
     }
 
     if (currentOp.shouldDBProfile(debug.executionTime)) {
         // Performance profiling is on
         if (txn->lockState()->isReadLocked()) {
-            MONGO_LOG_COMPONENT(1, responseComponent)
-                << "note: not profiling because recursive read lock";
+            LOG(1) << "note: not profiling because recursive read lock";
         } else if (lockedForWriting()) {
-            MONGO_LOG_COMPONENT(1, responseComponent)
-                << "note: not profiling because doing fsync+lock";
+            LOG(1) << "note: not profiling because doing fsync+lock";
         } else {
             profile(txn, op);
         }
@@ -713,14 +710,20 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
 
                 // Run the plan and get stats out.
                 uassertStatusOK(exec->executePlan());
-                UpdateResult res = UpdateStage::makeUpdateResult(*exec, &op.debug());
-
-                // for getlasterror
-                LastError::get(client).recordUpdate(res.existing, res.numMatched, res.upserted);
 
                 PlanSummaryStats summary;
                 Explain::getSummaryStats(*exec, &summary);
-                collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+                if (collection) {
+                    collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+                }
+
+                const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
+                UpdateStage::fillOutOpDebug(updateStats, &summary, &op.debug());
+
+                UpdateResult res = UpdateStage::makeUpdateResult(updateStats);
+
+                // for getlasterror
+                LastError::get(client).recordUpdate(res.existing, res.numMatched, res.upserted);
 
                 if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
                     // If this operation has already generated a new lastOp, don't bother setting it
@@ -771,13 +774,17 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
 
         // Run the plan and get stats out.
         uassertStatusOK(exec->executePlan());
-        UpdateResult res = UpdateStage::makeUpdateResult(*exec, &op.debug());
-
-        LastError::get(client).recordUpdate(res.existing, res.numMatched, res.upserted);
 
         PlanSummaryStats summary;
         Explain::getSummaryStats(*exec, &summary);
         collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+
+        const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
+        UpdateStage::fillOutOpDebug(updateStats, &summary, &op.debug());
+
+        UpdateResult res = UpdateStage::makeUpdateResult(updateStats);
+
+        LastError::get(client).recordUpdate(res.existing, res.numMatched, res.upserted);
 
         if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
             // If this operation has already generated a new lastOp, don't bother setting it

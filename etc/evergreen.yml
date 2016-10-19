@@ -48,6 +48,7 @@ variables:
   vars:
     resmoke_args: --help # resmoke_args needs to be overridden to specify one of the jstestfuzz suites
     should_shuffle: false
+    continue_on_failure: false
 
 # Used for tests that invoke 'resmoke.py --suites=jstestfuzz*'.
 - &jstestfuzz_template
@@ -86,6 +87,7 @@ variables:
   - osx
 
 - &packaging_variants
+  - enterprise-linux-64-amazon-ami
   - enterprise-rhel-57-64-bit
   - enterprise-rhel-62-64-bit
   - enterprise-rhel-70-64-bit
@@ -212,7 +214,7 @@ functions:
             set -o igncr
         fi;
 
-        git checkout r3.2.0-rc5
+        git checkout r3.3.0
         . ./${set_tools_gopath|set_gopath.sh}
 
         # In RHEL 5.5, /usr/bin/ld can't handle --build-id parameters, so
@@ -280,43 +282,11 @@ functions:
           extra_args="$extra_args --shuffle"
         fi
 
+        if [ ${continue_on_failure|true} = true ]; then
+          extra_args="$extra_args --continueOnFailure"
+        fi
+
         ${path_prefix} ${asan_symbolizer} ${enable_lsan} ${rlp_environment} ${python|python} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json
-
-  "setup release credentials":
-    command: shell.exec
-    params:
-      silent: true
-      script: |
-        cat <<EOF > ~/.mongodb-jira.yaml
-        jira:
-          username: ${release_jira_username}
-          password: ${release_jira_password}
-          url: https://jira.mongodb.org/
-        EOF
-
-  "cleanup release credentials":
-    command: shell.exec
-    params:
-      script: |
-        rm -f ~/.mongodb-jira.yaml
-
-  "clone kernel-tools repo":
-    command: shell.exec
-    params:
-      script: |
-        git clone git@github.com:10gen/kernel-tools.git
-
-  "setup kernel-tools virtualenv":
-    command: shell.exec
-    params:
-      script: |
-        set -o errexit
-        set -o verbose
-
-        cd kernel-tools/releases/release_tickets/
-        virtualenv --system-site-packages venv-release
-        . venv-release/bin/activate
-        pip install --retries 30 --timeout 30 jira==0.16 requests==2.7.0
 
   "run jstestfuzz":
     - command: shell.exec
@@ -330,7 +300,7 @@ functions:
 
           if [ "Windows_NT" != "$OS" ]; then
             curl --silent --max-time 600 http://boxes.10gen.com/build/node-v0.12.7-linux-x64.tar.gz --output node.tar.gz
-            ${decompress} node.tar.gz
+            ${decompress} node.tar.gz > /dev/null
           fi
 
           cp mongodb*/bin/mongod .
@@ -411,7 +381,7 @@ functions:
         set -o verbose
 
         rm -rf /data/install /data/multiversion
-        ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion "Linux/x86_64" "2.4" "2.6" "3.0"
+        ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion ${multiversion_platform_arch|"Linux/x86_64"} "2.4" "2.6" "3.0"
 
 pre:
   - command: shell.track
@@ -627,6 +597,7 @@ tasks:
     vars:
       resmoke_args: --suites=jstestfuzz --storageEngine=mmapv1
       should_shuffle: false
+      continue_on_failure: false
 
 ## jstestfuzz WT ##
 - <<: *jstestfuzz_template
@@ -638,8 +609,23 @@ tasks:
     vars:
       resmoke_args: --suites=jstestfuzz --storageEngine=wiredTiger
       should_shuffle: false
+      continue_on_failure: false
 
-## jstestfuzz replica set ##
+## jstestfuzz replica set mmapv1 ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_replication
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+  - <<: *run_jstestfuzz_tests
+    vars:
+      # Run the mmapv1 tests without the dbHash hook, as a DB could be created with an
+      # invalid namespace (SERVER-10926).
+      resmoke_args: --suites=jstestfuzz_replication_nodbhash --storageEngine=mmapv1
+      should_shuffle: false
+      continue_on_failure: false
+
+## jstestfuzz replica set WT ##
 - <<: *jstestfuzz_template
   name: jstestfuzz_replication_WT
   commands:
@@ -649,8 +635,21 @@ tasks:
     vars:
       resmoke_args: --suites=jstestfuzz_replication --storageEngine=wiredTiger
       should_shuffle: false
+      continue_on_failure: false
 
-## jstestfuzz sharded cluster ##
+## jstestfuzz sharded cluster mmapv1 ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_sharded
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+  - <<: *run_jstestfuzz_tests
+    vars:
+      resmoke_args: --suites=jstestfuzz_sharded --storageEngine=mmapv1
+      should_shuffle: false
+      continue_on_failure: false
+
+## jstestfuzz sharded cluster WT ##
 - <<: *jstestfuzz_template
   name: jstestfuzz_sharded_WT
   commands:
@@ -660,6 +659,7 @@ tasks:
     vars:
       resmoke_args: --suites=jstestfuzz_sharded --storageEngine=wiredTiger
       should_shuffle: false
+      continue_on_failure: false
 
 ## unit tests ##
 - <<: *task_template
@@ -1027,6 +1027,15 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: jsCore_inMem
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core --storageEngine=inMemory
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: jsCore_WT
   commands:
   - func: "do setup"
@@ -1110,15 +1119,6 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=core_op_query --storageEngine=wiredTiger
-      run_multiple_jobs: true
-
-- <<: *task_template
-  name: ephemeralForTest
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=core --storageEngine=ephemeralForTest
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -1282,7 +1282,8 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=slow2 --storageEngine=wiredTiger
-      run_multiple_jobs: true
+      # No parallelization of jobs due to memory constraints and WiredTiger cache size.
+      run_multiple_jobs: false
 
 - <<: *task_template
   name: sharded_collections_jscore_passthrough
@@ -1558,6 +1559,15 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: sharding_csrs_continuous_config_stepdown_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_continuous_config_stepdown --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: sharding_WT_ese
   commands:
   - func: "do setup"
@@ -1738,7 +1748,7 @@ tasks:
         silent: true
         script: |
           set -o errexit
-          echo "${signing_auth_token}" > signing_auth_token
+          echo "${signing_auth_token_32}" > signing_auth_token
     - command: shell.exec
       params:
         working_dir: src
@@ -1752,19 +1762,19 @@ tasks:
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-win32-${push_arch}-${suffix}.msi || true
 
-          notary-client.py --key-name "${signing_key_name}" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
+          notary-client.py --key-name "server-3.2" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
           if [ "${has_packages|}" = "true" ] ; then
             for rpm in $(find repo/ -name \*.rpm) ; do
               pushd $(dirname $rpm)
               # Use --package-file-suffix "" to overwrite existing RPM's instead of saving new "-signed.rpm" RPM files
               #
-              notary-client.py --key-name "${signing_key_name}" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --archive-file-ext gpg --outputs sig --package-file-suffix "" $(basename $rpm)
+              notary-client.py --key-name "server-3.2" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --archive-file-ext gpg --outputs sig --package-file-suffix "" $(basename $rpm)
               popd
             done
             for release_file in $(find repo/ -name Release) ; do
               pushd $(dirname $release_file)
-              notary-client.py --key-name "${signing_key_name}" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --outputs sig Release
+              notary-client.py --key-name "server-3.2" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --outputs sig Release
               popd
             done
           fi
@@ -2116,51 +2126,6 @@ tasks:
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.md5', 'bucket': '${push_bucket}'},
                'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl', 'windows-32'], }
 
-- name: jira_versions
-  patchable: false
-  depends_on:
-    - name: push
-      variant: linux-64
-  stepback: false
-  commands:
-    - func: "clone kernel-tools repo"
-    - func: "setup release credentials"
-    - func: "setup kernel-tools virtualenv"
-    - command: shell.exec
-      params:
-        working_dir: "kernel-tools/releases/release_tickets"
-        script: |
-          set -o errexit
-          set -o verbose
-
-          . venv-release/bin/activate
-
-          python release_fixversion.py ${version}
-          python create_fixversion.py ${version}
-          python make_ticket.py --execute --version ${version} --ticket deploy
-    - func: "cleanup release credentials"
-
-- name: docs_ticket
-  patchable: false
-  depends_on:
-    - name: push
-      variant: "*"
-  stepback: false
-  commands:
-    - func: "clone kernel-tools repo"
-    - func: "setup release credentials"
-    - func: "setup kernel-tools virtualenv"
-    - command: shell.exec
-      working_dir: "kernel-tools/releases/release_tickets"
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          . venv-release/bin/activate
-
-          python make_ticket.py --execute --version ${version} --assignee ${release_notes_maintainer} --ticket docs
-    - func: "cleanup release credentials"
 
 #######################################
 #               Modules               #
@@ -2204,7 +2169,6 @@ buildvariants:
     push_arch: x86_64
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
   tasks:
   - name: compile
     distros:
@@ -2238,7 +2202,6 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: ephemeralForTest
   - name: jsCore
   - name: jsCore_WT
   - name: jsCore_auth
@@ -2252,7 +2215,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -2314,7 +2279,7 @@ buildvariants:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure --repeat=10 --shuffle
+    test_flags: --repeat=10 --shuffle
   tasks:
   - name: compile
     distros:
@@ -2347,7 +2312,6 @@ buildvariants:
     push_name: linux-debug
     push_arch: x86_64
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
   tasks:
   - name: compile
@@ -2387,11 +2351,25 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: concurrency
+    # Some concurrency workloads require a lot of memory, so we use machines
+    # with more RAM for these suites.
+    distros:
+    - rhel55
   - name: concurrency_WT
+    distros:
+    - rhel55
   - name: concurrency_replication
+    distros:
+    - rhel55
   - name: concurrency_replication_WT
+    distros:
+    - rhel55
   - name: concurrency_sharded
+    distros:
+    - rhel55
   - name: concurrency_sharded_WT
+    distros:
+    - rhel55
   - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
@@ -2433,7 +2411,7 @@ buildvariants:
     push_arch: x86_64
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure --nojournal
+    test_flags: --nojournal
   tasks:
   - name: compile
     distros:
@@ -2455,7 +2433,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -2492,7 +2472,7 @@ buildvariants:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure --wiredTigerCollectionConfig=type=lsm --wiredTigerIndexConfig=type=lsm
+    test_flags: --wiredTigerCollectionConfig=type=lsm --wiredTigerIndexConfig=type=lsm
   tasks:
   - name: compile
     distros:
@@ -2546,7 +2526,6 @@ buildvariants:
     push_arch: x86_64-ubuntu1204
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1204 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager.py
     packager_distro: ubuntu1204
@@ -2589,7 +2568,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mongosTest
   - name: mmap
@@ -2649,7 +2630,6 @@ buildvariants:
     push_arch: x86_64-ubuntu1404
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager.py
     packager_distro: ubuntu1404
@@ -2692,7 +2672,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -2752,9 +2734,8 @@ buildvariants:
     push_arch: x86_64-enterprise-amzn64
     compile_flags: --ssl MONGO_DISTMOD=amzn64 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
-    packager_script: packager.py
+    packager_script: packager-enterprise.py
     packager_distro: amazon
   tasks:
   - name: compile
@@ -2779,7 +2760,9 @@ buildvariants:
   - name: jsCore_WT_ese
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: noPassthrough
@@ -2828,7 +2811,9 @@ buildvariants:
     push_arch: x86_64-amazon
     compile_flags: --ssl MONGO_DISTMOD=amazon -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
+    has_packages: true
+    packager_script: packager.py
+    packager_distro: amazon
   tasks:
   - name: compile
     distros:
@@ -2868,7 +2853,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -2932,7 +2919,7 @@ buildvariants:
     push_arch: i686
     compile_flags: --release MONGO_DISTARCH=i686 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --wiredtiger=off CCFLAGS="-m32" LINKFLAGS="-m32"
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure --storageEngine=mmapv1 -j1  # Avoid starting too many mongod's on 32-bit systems.
+    test_flags: --storageEngine=mmapv1 -j1  # Avoid starting too many mongod's on 32-bit systems.
   tasks:
   - name: compile
     distros:
@@ -2962,7 +2949,6 @@ buildvariants:
     push_arch: x86_64-decimal
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release --experimental-decimal-support=on
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
   tasks:
   - name: compile
     distros:
@@ -2994,7 +2980,6 @@ buildvariants:
     content_type: application/zip
     compile_flags: --release -j$(grep -c ^processor /proc/cpuinfo) VARIANT_DIR=win32
     num_jobs_available: 1
-    test_flags: --continueOnFailure
     ext: zip
   tasks:
   - name: compile
@@ -3031,7 +3016,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -3085,11 +3072,11 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: win32
     push_arch: x86_64-2008plus
+    multiversion_platform_arch: "win32/x86_64-2008plus"
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --win-version-min=ws08r2 -j$(grep -c ^processor /proc/cpuinfo) MONGO_DISTMOD=2008plus VARIANT_DIR=win32
     num_jobs_available: 1
-    test_flags: --continueOnFailure
     ext: zip
   tasks:
   - name: compile
@@ -3127,10 +3114,13 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
+  - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
@@ -3183,7 +3173,6 @@ buildvariants:
     push_arch: x86_64-2008plus
     content_type: application/zip
     num_jobs_available: 1
-    test_flags: --continueOnFailure
     compile_flags: --dbg=on --opt=on --win-version-min=ws08r2 -j$(grep -c ^processor /proc/cpuinfo) MONGO_DISTMOD=2008plus
     ext: zip
   tasks:
@@ -3224,11 +3213,25 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: concurrency
+    # Some concurrency workloads require a lot of memory, so we use machines
+    # with more RAM for these suites.
+    distros:
+    - windows-64-vs2013-compile
   - name: concurrency_WT
+    distros:
+    - windows-64-vs2013-compile
   - name: concurrency_replication
+    distros:
+    - windows-64-vs2013-compile
   - name: concurrency_replication_WT
+    distros:
+    - windows-64-vs2013-compile
   - name: concurrency_sharded
+    distros:
+    - windows-64-vs2013-compile
   - name: concurrency_sharded_WT
+    distros:
+    - windows-64-vs2013-compile
   - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
@@ -3258,7 +3261,6 @@ buildvariants:
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib" -j$(grep -c ^processor /proc/cpuinfo) --dynamic-windows --win-version-min=ws08r2 VARIANT_DIR=win32
     num_jobs_available: 1
-    test_flags: --continueOnFailure
     ext: zip
   tasks:
   - name: compile
@@ -3278,7 +3280,9 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: replicasets_auth
@@ -3294,6 +3298,55 @@ buildvariants:
   - name: push
     distros:
     - rhel55-test
+
+- name: enterprise-windows-64-inmem
+  display_name: Enterprise Windows (inMemory)
+  modules:
+  - enterprise
+  run_on:
+  - windows-64-vs2013-test
+  expansions:
+    tooltags: "-tags 'ssl sasl'"
+    exe: ".exe"
+    gorootvars: 'PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH"'
+    push_path: win32
+    push_bucket: downloads.10gen.com
+    push_name: win32
+    push_arch: x86_64-enterprise-windows-64
+    msi_target: msi
+    content_type: application/zip
+    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib" -j$(grep -c ^processor /proc/cpuinfo) --dynamic-windows --win-version-min=ws08r2 VARIANT_DIR=win32
+    num_jobs_available: 1
+    test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence
+    ext: zip
+  tasks:
+  - name: compile
+    distros:
+    - windows-64-vs2013-compile
+  - name: audit
+  - name: audit_WT
+  - name: auth_audit
+  - name: dbtest
+  - name: concurrency
+    distros:
+    - windows-64-vs2013-compile  # Some workloads require a lot of memory, use a bigger machine for this suite.
+  - name: concurrency_replication
+  - name: concurrency_sharded
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_small_oplog
+  - name: jsCore_small_oplog_rs
+  - name: jstestfuzz
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded_WT
+  - name: replicasets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: sharding_auth_audit_WT
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: unittests
 
 - name: windows-64-2k8-ssl
   display_name: SSL Windows 2008R2
@@ -3313,7 +3366,6 @@ buildvariants:
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=2008plus-ssl CPPPATH="c:/openssl/include" LIBPATH="c:/openssl/lib" -j$(grep -c ^processor /proc/cpuinfo) --dynamic-windows --win-version-min=ws08r2 VARIANT_DIR=win32
     num_jobs_available: 1
-    test_flags: --continueOnFailure
     ext: zip
   tasks:
   - name: compile
@@ -3338,7 +3390,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -3399,7 +3453,7 @@ buildvariants:
     content_type: application/zip
     compile_flags: --release -j$(grep -c ^processor /proc/cpuinfo) --wiredtiger=off TARGET_ARCH=i386 VARIANT_DIR=win32
     num_jobs_available: 1
-    test_flags: --continueOnFailure --storageEngine=mmapv1 -j1  # Avoid starting too many mongod's on 32-bit systems.
+    test_flags: --storageEngine=mmapv1 -j1  # Avoid starting too many mongod's on 32-bit systems.
     ext: zip
   tasks:
   - name: compile
@@ -3432,7 +3486,6 @@ buildvariants:
     push_arch: x86_64
     compile_flags: --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++
     num_jobs_available: 1
-    test_flags: --continueOnFailure
   tasks:
   - name: compile
   - name: aggregation
@@ -3519,7 +3572,6 @@ buildvariants:
     tooltags: "-tags ssl"
     compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++
     num_jobs_available: 1
-    test_flags: --continueOnFailure
   tasks:
   - name: compile
   - name: aggregation
@@ -3603,7 +3655,6 @@ buildvariants:
     push_name: osx-debug
     push_arch: x86_64
     num_jobs_available: 1
-    test_flags: --continueOnFailure
     compile_flags: --dbg=on --opt=on --allocator=system -j$(sysctl -n hw.logicalcpu) --osx-version-min=10.7 --libc++
   tasks:
   - name: compile
@@ -3647,7 +3698,6 @@ buildvariants:
     tooltags: "-tags 'ssl sasl'"
     compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++
     num_jobs_available: 1
-    test_flags: --continueOnFailure
   tasks:
   - name: compile
   - name: audit
@@ -3694,7 +3744,6 @@ buildvariants:
     push_arch: x86_64-enterprise-rhel57
     compile_flags: --ssl MONGO_DISTMOD=rhel57 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: rhel57
@@ -3711,7 +3760,9 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: replicasets_auth
@@ -3742,7 +3793,6 @@ buildvariants:
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: rhel62
@@ -3786,6 +3836,7 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd_WT
   - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
+  - name: httpinterface
   - name: integration_tests_replset
   - name: integration_tests_standalone
   - name: jsCore
@@ -3803,7 +3854,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -3877,7 +3930,6 @@ buildvariants:
     push_arch: x86_64-enterprise-rhel70
     compile_flags: --ssl MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: rhel70
@@ -3892,7 +3944,9 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: replicasets_auth
@@ -3924,7 +3978,6 @@ buildvariants:
     push_arch: x86_64-rhel55
     compile_flags: --ssl MONGO_DISTMOD=rhel55 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager.py
     packager_distro: rhel55
@@ -3967,7 +4020,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -4028,7 +4083,6 @@ buildvariants:
     push_arch: x86_64-rhel62
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager.py
     packager_distro: rhel62
@@ -4071,7 +4125,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -4132,7 +4188,6 @@ buildvariants:
     push_arch: x86_64-rhel70
     compile_flags: --ssl MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager.py
     packager_distro: rhel70
@@ -4175,7 +4230,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -4241,7 +4298,6 @@ buildvariants:
     push_arch: x86_64-enterprise-ubuntu1204
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1204 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: ubuntu1204
@@ -4258,7 +4314,9 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: replicasets_auth
@@ -4289,7 +4347,6 @@ buildvariants:
     push_arch: x86_64-enterprise-ubuntu1404
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: ubuntu1404
@@ -4306,7 +4363,9 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: replicasets_auth
@@ -4341,7 +4400,6 @@ buildvariants:
     push_arch: x86_64-enterprise-suse12
     compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: suse12
@@ -4358,7 +4416,9 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: replicasets_auth
   - name: sasl
@@ -4388,7 +4448,6 @@ buildvariants:
     push_arch: x86_64-suse12
     compile_flags: --ssl MONGO_DISTMOD=suse12 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager.py
     packager_distro: suse12
@@ -4431,7 +4490,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -4493,7 +4554,6 @@ buildvariants:
     push_arch: x86_64-enterprise-suse11
     compile_flags: --ssl MONGO_DISTMOD=suse11 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: suse11
@@ -4510,7 +4570,9 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: replicasets_auth
   - name: sasl
@@ -4540,7 +4602,6 @@ buildvariants:
     push_arch: x86_64-suse11
     compile_flags: --ssl MONGO_DISTMOD=suse11 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager.py
     packager_distro: suse11
@@ -4583,7 +4644,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -4645,7 +4708,6 @@ buildvariants:
     push_arch: x86_64
     compile_flags: CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ -j$(kstat cpu | sort -u | grep -c "^module") --release CCFLAGS="-m64" LINKFLAGS="-m64 -static-libstdc++ -static-libgcc" OBJCOPY=/opt/mongodbtoolchain/bin/objcopy
     num_jobs_available: $(kstat cpu | sort -u | grep -c "^module")
-    test_flags: --continueOnFailure
   tasks:
   - name: compile
   - name: aggregation
@@ -4726,7 +4788,6 @@ buildvariants:
     push_arch: x86_64-enterprise-debian71
     compile_flags: --ssl MONGO_DISTMOD=debian71 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: debian71
@@ -4743,7 +4804,9 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: replicasets_auth
@@ -4773,7 +4836,6 @@ buildvariants:
     push_arch: x86_64-debian71
     compile_flags: --ssl MONGO_DISTMOD=debian71 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     has_packages: true
     packager_script: packager.py
     packager_distro: debian71
@@ -4816,7 +4878,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -4879,7 +4943,7 @@ buildvariants:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
-    test_flags: --continueOnFailure --storageEngine=inMemory --excludeWithAnyTags=requires_persistence
+    test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
@@ -4890,42 +4954,68 @@ buildvariants:
   - name: compile
     distros:
     - rhel62-build
-  - name: aggregation
-  - name: dbtest
-  - name: failpoints
-  - name: failpoints_auth
-  - name: jsCore
-  - name: jsCore_auth
-  - name: jsCore_compatibility
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_rs
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded_WT
+  - name: aggregation_WT
+  - name: aggregation_auth
+  - name: aggregation_read_concern_majority_passthrough_WT
+  - name: audit
+  - name: auth
+  - name: auth_audit
   - name: bulk_gle_passthrough
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
-  - name: parallel
-  - name: parallel_compatibility
   - name: concurrency
     distros:
     - rhel62-build  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
   - name: concurrency_sharded
+  - name: dbtest
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth
+  - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_write_cmd
+  - name: gle_auth_write_cmd
+  - name: integration_tests_replset
+  - name: integration_tests_standalone
+  - name: jsCore
+  - name: jsCore_WT
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_op_query
+  - name: jsCore_small_oplog
+  - name: jsCore_small_oplog_rs
+  - name: jstestfuzz_WT
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded_WT
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: read_concern_majority_passthrough_WT
   - name: replicasets_WT
   - name: replicasets_auth
   - name: replicasets_legacy
   - name: replication_WT
   - name: replication_auth
+  - name: rlp
+  - name: sasl
+  - name: sharded_collections_jscore_passthrough
   - name: sharding
   - name: sharding_auth
   - name: sharding_auth_audit_WT
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_jscore_passthrough
+  - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_legacy
   - name: sharding_legacy_op_query_WT
   - name: sharding_op_query_WT
   - name: slow1
-#  - name: slow2
-  - name: sharding_jscore_passthrough
+  - name: slow2
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: tool
+  - name: unittests
 
 - name: linux-64-ephemeralForTest
   display_name: Linux (ephemeralForTest)
@@ -4937,35 +5027,51 @@ buildvariants:
   expansions:
     gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    test_flags: --continueOnFailure --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658
+    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
   tasks:
   - name: compile
     distros:
     - rhel55
-  - name: aggregation
+  - name: aggregation_WT
+  - name: aggregation_auth
+  - name: auth
+  - name: concurrency
+    distros:
+    - rhel62-build  # Some workloads require a lot of memory, use a bigger machine for this suite.
+  - name: concurrency_replication
+  - name: concurrency_sharded
   - name: dbtest
   - name: failpoints
   - name: failpoints_auth
+  - name: gle_auth
+  - name: gle_auth_write_cmd
+  - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_write_cmd
+  - name: httpinterface
+  - name: integration_tests_standalone
+  - name: integration_tests_replset
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: jsCore
+  - name: jsCore_WT
   - name: jsCore_auth
+  - name: jsCore_op_query
   - name: jsCore_compatibility
   - name: jsCore_small_oplog
   - name: jsCore_small_oplog_rs
   - name: jstestfuzz_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
   - name: bulk_gle_passthrough
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
-  - name: concurrency
-    distros:
-    - rhel62-build  # Some workloads require a lot of memory, use a bigger machine for this suite.
-  - name: concurrency_replication
-  - name: concurrency_sharded
   - name: replicasets_WT
   - name: replicasets_auth
   - name: replicasets_legacy
@@ -4977,8 +5083,12 @@ buildvariants:
   - name: sharding_legacy_op_query_WT
   - name: sharding_op_query_WT
   - name: slow1
-#  - name: slow2
+  - name: slow2
+  - name: sharded_collections_jscore_passthrough
   - name: sharding_jscore_passthrough
+  - name: sharding_jscore_passthrough_wire_ops_WT
+  - name: tool
+  - name: unittests
 
 - name: ubuntu1404-rocksdb
   display_name: Ubuntu 14.04 (RocksDB)
@@ -4991,7 +5101,7 @@ buildvariants:
     build_rocksdb: true
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CPPPATH=$(readlink -f ../rocksdb/include/) LIBPATH=$(readlink -f ../rocksdb/) LIBS=rocksdb CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ VARIANT_DIR=release
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure --storageEngine=rocksdb
+    test_flags: --storageEngine=rocksdb
   tasks:
   - name: compile
     distros:
@@ -5056,18 +5166,20 @@ buildvariants:
     enable_lsan: LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1
     compile_flags: CC=/usr/bin/clang CXX=/usr/bin/clang++ --dbg=on --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip VARIANT_DIR=build
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: -j1 --continueOnFailure  # Avoid starting too many mongod's under ASAN build.
+    test_flags: -j1 # Avoid starting too many mongod's under ASAN build.
   tasks:
   - name: compile
   - name: aggregation
   - name: aggregation_WT
+  - name: aggregation_WT_ese
   - name: aggregation_auth
+  - name: aggregation_read_concern_majority_passthrough_WT
   - name: audit
   - name: audit_WT
-  - name: auth_audit
-  - name: auth_audit_WT
   - name: auth
   - name: auth_WT
+  - name: auth_audit
+  - name: auth_audit_WT
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
   - name: concurrency
@@ -5079,6 +5191,7 @@ buildvariants:
   - name: dbtest
   - name: dbtest_WT
   - name: disk
+  - name: dur_jscore_passthrough
   - name: durability
   - name: ese_WT
   - name: failpoints
@@ -5092,13 +5205,18 @@ buildvariants:
   - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
   - name: httpinterface
-  - name: integration_tests_standalone
   - name: integration_tests_replset
+  - name: integration_tests_standalone
   - name: jsCore
   - name: jsCore_WT
+  - name: jsCore_WT_ese
+  - name: jsCore_inMem
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
+  - name: jsCore_minimum_batch_size_WT
+  - name: jsCore_op_query
+  - name: jsCore_op_query_WT
   - name: jsCore_small_oplog
   - name: jsCore_small_oplog_WT
   - name: jsCore_small_oplog_rs
@@ -5114,25 +5232,34 @@ buildvariants:
   - name: parallel_WT
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
+  - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
+  - name: replicasets_WT_ese
   - name: replicasets_auth
+  - name: replicasets_legacy
   - name: replication
   - name: replication_WT
   - name: replication_auth
   - name: sasl
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
+  - name: sharding_WT_ese
   - name: sharding_auth
   - name: sharding_auth_audit_WT
   - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_legacy_multiversion
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
+  - name: sharding_legacy
+  - name: sharding_legacy_op_query_WT
+  - name: sharding_legacy_multiversion
+  - name: sharding_op_query_WT
   - name: slow1
   - name: slow1_WT
   - name: slow2
@@ -5157,12 +5284,14 @@ buildvariants:
     enable_lsan: LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1
     compile_flags: CC=/usr/bin/clang CXX=/usr/bin/clang++ --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip VARIANT_DIR=build
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: -j1 --continueOnFailure  # Avoid starting too many mongod's under ASAN build.
+    test_flags: -j1 # Avoid starting too many mongod's under ASAN build.
   tasks:
   - name: compile
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: unittests
 
@@ -5176,7 +5305,6 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     compile_flags: CC=/usr/bin/clang CXX=/usr/bin/clang++ --libc++ --ssl -j$(grep -c ^processor /proc/cpuinfo) VARIANT_DIR=build MONGO_DISTMOD=ubuntu1410-clang
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --continueOnFailure
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -5220,7 +5348,9 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
   - name: mongosTest
@@ -5269,11 +5399,17 @@ buildvariants:
     distros:
     - rhel55-test
 
-- name: release
-  display_name: ~~ Release Process
-  modules: ~
-  run_on:
-  - ubuntu1404-docker
+- name: enterprise-ubuntu-dynamic-1404-64-bit
+  display_name: ~ Shared Library Enterprise Ubuntu 1404
+  modules:
+  - enterprise
+  batchtime: 1440 # 1 day
+  expansions:
+    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
+    tooltags: "-tags 'ssl sasl'"
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --link-model=dynamic
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
   tasks:
-  - name: jira_versions
-  - name: docs_ticket
+  - name: compile
+    distros:
+    - ubuntu1404-build

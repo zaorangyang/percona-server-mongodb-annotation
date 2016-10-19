@@ -44,8 +44,8 @@ load("jstests/replsets/rslib.js");
     });
 
     // Make sure we have a master
-    replTest.waitForState(replTest.nodes[0], replTest.PRIMARY, 60 * 1000);
-    var master = replTest.getMaster();
+    replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY, 60 * 1000);
+    var master = replTest.getPrimary();
     var a_conn = conns[0];
     var A = a_conn.getDB("admin");
     var b_conn = conns[1];

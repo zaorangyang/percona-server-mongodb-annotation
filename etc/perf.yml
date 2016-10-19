@@ -11,10 +11,6 @@ pre:
           exit 0
 
 post:
-    - command: "json.send"
-      params:
-        name: "perf"
-        file: "src/perf.json"
     - command: attach.results
       params:
         file_location: src/report.json
@@ -27,6 +23,13 @@ post:
     - command: shell.cleanup
 
 functions:
+  "download analysis scripts":
+    - command: shell.exec
+      params:
+        script: |
+          set -v
+          rm -rf ./dsi
+          git clone git@github.com:10gen/dsi.git
   "start server":
     - command: shell.exec
       params:
@@ -51,7 +54,7 @@ functions:
       params:
         working_dir: src
         script: |
-          set -e 
+          set -e
           set -v
           chmod +x mongod
           chmod +x mongo
@@ -63,7 +66,7 @@ functions:
         background: true
         working_dir: src
         script: |
-          set -e 
+          set -e
           set -o verbose
           mkdir -p ./dbdata
           ${mongod_exec_wrapper} ./mongod --dbpath ./dbdata ${mongod_flags}
@@ -78,13 +81,6 @@ functions:
           ./mongo --eval "if(db.isMaster().isreplicaset){rs.initiate(); assert.soon(function(){return db.isMaster().ismaster}, 'no primary')}"
           echo "MONGOD STARTED."
   "compare":
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: perf/${version_id}/${revision}/compare.py-${version_id}
-        bucket: mciuploads
-        local_file: src/compare.py
     - command: json.get
       params:
         task: ${compare_task}
@@ -106,22 +102,12 @@ functions:
           set -o verbose
           virtualenv ./venv
           source ./venv/bin/activate
-          python compare.py -b stand.json -c node.json -t ${threshold}
+          python -u ../dsi/analysis/compare.py -b stand.json -c node.json
+    - command: "json.send"
+      params:
+        name: "perf"
+        file: "src/perf.json"
   "analyze":
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: perf/${version_id}/${revision}/perf_regression_check.py-${version_id}
-        bucket: mciuploads
-        local_file: src/perf_regression_check.py
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: perf/${version_id}/${revision}/override.json-${version_id}
-        bucket: mciuploads
-        local_file: src/override.json
     - command: shell.exec
       params:
         working_dir: src
@@ -150,7 +136,7 @@ functions:
           set -o errexit
           set -o verbose
           source ./venv/bin/activate
-          python perf_regression_check.py -f history.json --rev ${revision} -t tags.json --refTag 3.0.6-Baseline --overrideFile override.json --variant ${build_variant} --threshold 0.10 --threadThreshold 0.15
+          python ../dsi/analysis/perf_regression_check.py -f history.json --rev ${revision} -t tags.json --refTag 3.0.6-Baseline --overrideFile ../dsi/analysis/perf_override.json --variant ${build_variant} --threshold 0.10 --threadThreshold 0.15
   "run perf tests":
     - command: shell.exec
       params:
@@ -214,37 +200,6 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/octet-stream}
         display_name: mongo
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: src/buildscripts/perf_regression_check.py
-        remote_file: perf/${version_id}/${revision}/perf_regression_check.py-${version_id}
-        bucket: mciuploads
-        permissions: public-read
-        content_type: ${content_type|application/octet-stream}
-        display_name: perf_regression_check.py
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: src/buildscripts/compare.py
-        remote_file: perf/${version_id}/${revision}/compare.py-${version_id}
-        bucket: mciuploads
-        permissions: public-read
-        content_type: ${content_type|application/octet-stream}
-        display_name: compare.py
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: src/etc/override.json
-        remote_file: perf/${version_id}/${revision}/override.json-${version_id}
-        bucket: mciuploads
-        permissions: public-read
-        content_type: ${content_type|application/octet-stream}
-        display_name: override.json
-
 - name: query
   depends_on:
   - variant: linux-wt-standalone
@@ -254,9 +209,10 @@ tasks:
     - func: "run perf tests"
       vars:
         includeFilter1: "query"
-        includeFilter2 : "core regression" 
+        includeFilter2 : "core regression"
         excludeFilter : "single_threaded"
         threads : "1 2 4 8"
+    - func: "download analysis scripts"
     - func: "analyze"
 - name: where
   depends_on:
@@ -267,9 +223,10 @@ tasks:
     - func: "run perf tests"
       vars:
         includeFilter1: "where"
-        includeFilter2 : "core regression" 
+        includeFilter2 : "core regression"
         excludeFilter : "single_threaded"
         threads : "1 2 4 8"
+    - func: "download analysis scripts"
     - func: "analyze"
 - name: update
   depends_on:
@@ -280,9 +237,10 @@ tasks:
     - func: "run perf tests"
       vars:
         includeFilter1: "update"
-        includeFilter2 : "core regression" 
+        includeFilter2 : "core regression"
         excludeFilter : "single_threaded"
         threads : "1 2 4 8"
+    - func: "download analysis scripts"
     - func: "analyze"
 - name: insert
   depends_on:
@@ -293,9 +251,10 @@ tasks:
     - func: "run perf tests"
       vars:
         includeFilter1: "insert"
-        includeFilter2 : "core regression" 
+        includeFilter2 : "core regression"
         excludeFilter : "single_threaded"
         threads : "1 2 4 8"
+    - func: "download analysis scripts"
     - func: "analyze"
 - name: geo
   depends_on:
@@ -306,9 +265,10 @@ tasks:
     - func: "run perf tests"
       vars:
         includeFilter1: "geo"
-        includeFilter2 : "core regression" 
+        includeFilter2 : "core regression"
         excludeFilter : "single_threaded"
         threads : "1 2 4 8"
+    - func: "download analysis scripts"
     - func: "analyze"
 - name: misc
   depends_on:
@@ -319,9 +279,10 @@ tasks:
     - func: "run perf tests"
       vars:
         includeFilter1: "command multi remove mixed"
-        includeFilter2 : "core regression" 
+        includeFilter2 : "core regression"
         excludeFilter : "single_threaded"
         threads : "1 2 4 8"
+    - func: "download analysis scripts"
     - func: "analyze"
 - name: singleThreaded
   depends_on:
@@ -332,9 +293,10 @@ tasks:
     - func: "run perf tests"
       vars:
         includeFilter1: "single_threaded"
-        includeFilter2 : "core regression" 
+        includeFilter2 : "core regression"
         excludeFilter : "none"
         threads : "1"
+    - func: "download analysis scripts"
     - func: "analyze"
 - name: singleThreaded-wt-repl-comp
   depends_on:
@@ -347,12 +309,13 @@ tasks:
       variant :  linux-wt-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "singleThreaded"
         variant1 : "linux-wt-standalone"
         variant2 : "linux-wt-repl"
-        threshold : 75
+    - func: "analyze"
 - name: insert-wt-repl-comp
   depends_on:
     - name : compile
@@ -364,12 +327,13 @@ tasks:
       variant :  linux-wt-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "insert"
         variant1 : "linux-wt-standalone"
         variant2 : "linux-wt-repl"
-        threshold : 75
+    - func: "analyze"
 - name: update-wt-repl-comp
   depends_on:
     - name : compile
@@ -381,12 +345,13 @@ tasks:
       variant :  linux-wt-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "update"
         variant1 : "linux-wt-standalone"
         variant2 : "linux-wt-repl"
-        threshold : 75
+    - func: "analyze"
 - name: misc-wt-repl-comp
   depends_on:
     - name : compile
@@ -398,12 +363,13 @@ tasks:
       variant :  linux-wt-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "misc"
         variant1 : "linux-wt-standalone"
         variant2 : "linux-wt-repl"
-        threshold : 75
+    - func: "analyze"
 - name: singleThreaded-wt-mmap-standalone-comp
   depends_on:
     - name : compile
@@ -415,12 +381,13 @@ tasks:
       variant :  linux-mmap-standalone
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "singleThreaded"
         variant2 : "linux-wt-standalone"
         variant1 : "linux-mmap-standalone"
-        threshold : 85
+    - func: "analyze"
 - name: query-wt-mmap-standalone-comp
   depends_on:
     - name : compile
@@ -432,12 +399,13 @@ tasks:
       variant :  linux-mmap-standalone
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "query"
         variant2 : "linux-wt-standalone"
         variant1 : "linux-mmap-standalone"
-        threshold : 85
+    - func: "analyze"
 - name: where-wt-mmap-standalone-comp
   depends_on:
     - name : compile
@@ -449,12 +417,13 @@ tasks:
       variant :  linux-mmap-standalone
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "where"
         variant2 : "linux-wt-standalone"
         variant1 : "linux-mmap-standalone"
-        threshold : 85
+    - func: "analyze"
 - name: geo-wt-mmap-standalone-comp
   depends_on:
     - name : compile
@@ -466,12 +435,13 @@ tasks:
       variant :  linux-mmap-standalone
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "geo"
         variant2 : "linux-wt-standalone"
         variant1 : "linux-mmap-standalone"
-        threshold : 85
+    - func: "analyze"
 - name: insert-wt-mmap-standalone-comp
   depends_on:
     - name : compile
@@ -483,12 +453,13 @@ tasks:
       variant :  linux-mmap-standalone
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "insert"
         variant2 : "linux-wt-standalone"
         variant1 : "linux-mmap-standalone"
-        threshold : 85
+    - func: "analyze"
 - name: update-wt-mmap-standalone-comp
   depends_on:
     - name : compile
@@ -500,12 +471,13 @@ tasks:
       variant :  linux-mmap-standalone
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "update"
         variant2 : "linux-wt-standalone"
         variant1 : "linux-mmap-standalone"
-        threshold : 85
+    - func: "analyze"
 - name: misc-wt-mmap-standalone-comp
   depends_on:
     - name : compile
@@ -517,12 +489,13 @@ tasks:
       variant :  linux-mmap-standalone
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "misc"
         variant2 : "linux-wt-standalone"
         variant1 : "linux-mmap-standalone"
-        threshold : 85
+    - func: "analyze"
 - name: singleThreaded-wt-mmap-repl-comp
   depends_on:
     - name : compile
@@ -534,12 +507,13 @@ tasks:
       variant :  linux-mmap-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "singleThreaded"
         variant2 : "linux-wt-repl"
         variant1 : "linux-mmap-repl"
-        threshold : 85
+    - func: "analyze"
 - name: insert-wt-mmap-repl-comp
   depends_on:
     - name : compile
@@ -551,12 +525,13 @@ tasks:
       variant :  linux-mmap-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "insert"
         variant2 : "linux-wt-repl"
         variant1 : "linux-mmap-repl"
-        threshold : 85
+    - func: "analyze"
 - name: update-wt-mmap-repl-comp
   depends_on:
     - name : compile
@@ -568,29 +543,31 @@ tasks:
       variant :  linux-mmap-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "update"
         variant2 : "linux-wt-repl"
         variant1 : "linux-mmap-repl"
-        threshold : 85
+    - func: "analyze"
 - name: misc-wt-mmap-repl-comp
   depends_on:
     - name : compile
       variant : linux-wt-standalone
-      status : "*"
     - name : misc
       variant : linux-wt-repl
+      status : "*"
     - name : misc
       variant :  linux-mmap-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "misc"
         variant2 : "linux-wt-repl"
         variant1 : "linux-mmap-repl"
-        threshold : 85
+    - func: "analyze"
 - name: singleThreaded-mmap-repl-comp
   depends_on:
     - name : compile
@@ -602,12 +579,13 @@ tasks:
       variant :  linux-mmap-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "singleThreaded"
         variant1 : "linux-mmap-standalone"
         variant2 : "linux-mmap-repl"
-        threshold : 75
+    - func: "analyze"
 - name: insert-mmap-repl-comp
   depends_on:
     - name : compile
@@ -619,12 +597,13 @@ tasks:
       variant :  linux-mmap-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "insert"
         variant1 : "linux-mmap-standalone"
         variant2 : "linux-mmap-repl"
-        threshold : 75
+    - func: "analyze"
 - name: update-mmap-repl-comp
   depends_on:
     - name : compile
@@ -636,12 +615,13 @@ tasks:
       variant :  linux-mmap-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "update"
         variant1 : "linux-mmap-standalone"
         variant2 : "linux-mmap-repl"
-        threshold : 75
+    - func: "analyze"
 - name: misc-mmap-repl-comp
   depends_on:
     - name : compile
@@ -653,12 +633,13 @@ tasks:
       variant :  linux-mmap-repl
       status : "*"
   commands:
+    - func: "download analysis scripts"
     - func: "compare"
       vars:
         compare_task : "misc"
         variant1 : "linux-mmap-standalone"
         variant2 : "linux-mmap-repl"
-        threshold : 75
+    - func: "analyze"
 
 buildvariants:
 - name: linux-wt-standalone
@@ -708,7 +689,7 @@ buildvariants:
   display_name: 1-Node ReplSet Linux WT
   batchtime: 360 # 6 hours
   expansions:
-    compile_flags: *compile_flags 
+    compile_flags: *compile_flags
     mongod_exec_wrapper: *exec_wrapper
     perf_exec_wrapper: *perf_wrapper
     mongod_flags: "--replSet=test --storageEngine=wiredTiger --logpath ./mongod.log --fork --syncdelay 0 --nojournal --setParameter ttlMonitorEnabled=false --wiredTigerCacheSizeGB 16 --oplogSize 100000 --setParameter diagnosticDataCollectionEnabled=false "
@@ -725,7 +706,7 @@ buildvariants:
   display_name: 1-Node ReplSet Linux MMAPv1
   batchtime: 360 # 6 hours
   expansions:
-    compile_flags: *compile_flags 
+    compile_flags: *compile_flags
     mongod_exec_wrapper: *exec_wrapper
     perf_exec_wrapper: *perf_wrapper
     mongod_flags: "--replSet=test --storageEngine=mmapv1 --logpath ./mongod.log --fork --syncdelay 0 --nojournal --setParameter ttlMonitorEnabled=false --oplogSize 100000 --setParameter diagnosticDataCollectionEnabled=false"
@@ -788,4 +769,3 @@ buildvariants:
   - name: insert-wt-mmap-repl-comp
   - name: update-wt-mmap-repl-comp
   - name: misc-wt-mmap-repl-comp
-

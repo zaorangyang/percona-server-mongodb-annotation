@@ -102,6 +102,7 @@ var Cluster = function(options) {
     var st;
 
     var initialized = false;
+    var clusterStartTime;
 
     var _conns = {
         mongos: [],
@@ -119,6 +120,7 @@ var Cluster = function(options) {
 
     this.setup = function setup() {
         var verbosityLevel = 0;
+        const REPL_SET_INITIATE_TIMEOUT_MS = 5 * 60 * 1000;
 
         if (initialized) {
             throw new Error('cluster has already been initialized');
@@ -144,6 +146,11 @@ var Cluster = function(options) {
                     oplogSize: 1024,
                     verbose: verbosityLevel
                 };
+                shardConfig.rsOptions = {
+                    // Specify a longer timeout for replSetInitiate, to ensure that
+                    // slow hardware has sufficient time for file pre-allocation.
+                    initiateTimeout: REPL_SET_INITIATE_TIMEOUT_MS,
+                }
             }
 
             st = new ShardingTest(shardConfig);
@@ -196,8 +203,10 @@ var Cluster = function(options) {
             var rst = new ReplSetTest(replSetConfig);
             rst.startSet();
 
-            // Send the replSetInitiate command and wait for initiation
-            rst.initiate();
+            // Send the replSetInitiate command and wait for initialization, with an increased
+            // timeout. This should provide sufficient time for slow hardware, where files may need
+            // to be pre-allocated.
+            rst.initiate(null, null, REPL_SET_INITIATE_TIMEOUT_MS);
             rst.awaitSecondaryNodes();
 
             conn = rst.getPrimary();
@@ -238,6 +247,7 @@ var Cluster = function(options) {
         }
 
         initialized = true;
+        clusterStartTime = new Date();
 
         options.setupFunctions.mongod.forEach(this.executeOnMongodNodes);
         if (options.sharded) {
@@ -254,10 +264,8 @@ var Cluster = function(options) {
     };
 
     this.executeOnMongodNodes = function executeOnMongodNodes(fn) {
-        if (!initialized) {
-            throw new Error('cluster must be initialized before functions can be executed ' +
-                            'against it');
-        }
+        assert(initialized, 'cluster must be initialized first');
+
         if (!fn || typeof(fn) !== 'function' || fn.length !== 1) {
             throw new Error('mongod function must be a function that takes a db as an argument');
         }
@@ -267,10 +275,8 @@ var Cluster = function(options) {
     };
 
     this.executeOnMongosNodes = function executeOnMongosNodes(fn) {
-        if (!initialized) {
-            throw new Error('cluster must be initialized before functions can be executed ' +
-                            'against it');
-        }
+        assert(initialized, 'cluster must be initialized first');
+
         if (!fn || typeof(fn) !== 'function' || fn.length !== 1) {
             throw new Error('mongos function must be a function that takes a db as an argument');
         }
@@ -280,21 +286,17 @@ var Cluster = function(options) {
     };
 
     this.teardown = function teardown() {
+        assert(initialized, 'cluster must be initialized first');
         options.teardownFunctions.mongod.forEach(this.executeOnMongodNodes);
     };
 
     this.getDB = function getDB(dbName) {
-        if (!initialized) {
-            throw new Error('cluster has not been initialized yet');
-        }
-
+        assert(initialized, 'cluster must be initialized first');
         return conn.getDB(dbName);
     };
 
     this.getHost = function getHost() {
-        if (!initialized) {
-            throw new Error('cluster has not been initialized yet');
-        }
+        assert(initialized, 'cluster must be initialized first');
 
         // Alternate mongos connections for sharded clusters
         if (this.isSharded()) {
@@ -317,6 +319,7 @@ var Cluster = function(options) {
     };
 
     this.shardCollection = function shardCollection() {
+        assert(initialized, 'cluster must be initialized first');
         assert(this.isSharded(), 'cluster is not sharded');
         st.shardColl.apply(st, arguments);
     };
@@ -350,6 +353,8 @@ var Cluster = function(options) {
     //      }
     // }
     this.getSerializedCluster = function getSerializedCluster() {
+        assert(initialized, 'cluster must be initialized first');
+
         // TODO: Add support for non-sharded clusters.
         if (!this.isSharded()) {
             return '';
@@ -397,11 +402,13 @@ var Cluster = function(options) {
     }
 
     this.startBalancer = function startBalancer() {
+        assert(initialized, 'cluster must be initialized first');
         assert(this.isSharded(), 'cluster is not sharded');
         st.startBalancer();
     };
 
     this.stopBalancer = function stopBalancer() {
+        assert(initialized, 'cluster must be initialized first');
         assert(this.isSharded(), 'cluster is not sharded');
         st.stopBalancer();
     };
@@ -411,6 +418,7 @@ var Cluster = function(options) {
     };
 
     this.awaitReplication = function awaitReplication(message) {
+        assert(initialized, 'cluster must be initialized first');
         if (this.isReplication()) {
             var wc = {
                 writeConcern: {
@@ -463,8 +471,8 @@ var Cluster = function(options) {
 
                 hashes.slaves.forEach(function(slaveHashes) {
                     assert.commandWorked(slaveHashes);
-                    assert.eq(masterHashes.numCollections,
-                              slaveHashes.numCollections,
+                    assert.eq(Object.keys(masterHashes.collections).length,
+                              Object.keys(slaveHashes.collections).length,
                               message + ' dbHash number of collections in db ' +
                                 dbInfo.name + ' ' + tojson(hashes));
 
@@ -491,6 +499,35 @@ var Cluster = function(options) {
                 }, this);
             }, this);
         }, this);
+    };
+
+    this.recordConfigServerData = function recordConfigServerData(configServer) {
+        assert(initialized, 'cluster must be initialized first');
+        assert(this.isSharded(), 'cluster is not sharded');
+
+        var data = {};
+        var configDB = configServer.getDB('config');
+
+        // We record the contents of the 'lockpings' and 'locks' collections to make it easier to
+        // debug issues with distributed locks in the sharded cluster.
+        data.lockpings = configDB.lockpings.find({ ping: { $gte: clusterStartTime } }).toArray();
+
+        // We suppress some fields from the result set to reduce the amount of data recorded.
+        data.locks = configDB.locks.find({ when: { $gte: clusterStartTime } },
+                                         { process: 0, ts: 0 }).toArray();
+
+        return data;
+    };
+
+    this.recordAllConfigServerData = function recordAllConfigServerData() {
+        assert(initialized, 'cluster must be initialized first');
+        assert(this.isSharded(), 'cluster is not sharded');
+
+        var data = {};
+        st._configServers.forEach(config =>
+            (data[config.host] = this.recordConfigServerData(config)));
+
+        return data;
     };
 };
 

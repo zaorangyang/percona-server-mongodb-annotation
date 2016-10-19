@@ -1,7 +1,6 @@
 // Tests administrative sharding operations and map-reduce work or fail as expected, when key-based
 // authentication is used
 (function() {
-
 'use strict';
 
 var adminUser = {
@@ -38,7 +37,7 @@ function logout(userObj, thingToUse) {
 }
 
 function getShardName(rsTest) {
-    var master = rsTest.getMaster();
+    var master = rsTest.getPrimary();
     var config = master.getDB("local").system.replset.findOne();
     var members = config.members.map(function(elem) { return elem.host; });
     return config._id+"/"+members.join(",");
@@ -118,7 +117,7 @@ d1.stopSet();
 d1.startSet({keyFile : "jstests/libs/key1" });
 d1.initiate();
 
-var master = d1.getMaster();
+var master = d1.getPrimary();
 
 print("adding shard w/auth " + shardName);
 
@@ -128,7 +127,7 @@ assert.eq(result.ok, 1, tojson(result));
 s.getDB("admin").runCommand({enableSharding : "test"});
 s.getDB("admin").runCommand({shardCollection : "test.foo", key : {x : 1}});
 
-d1.waitForState( d1.getSecondaries(), d1.SECONDARY, 5 * 60 * 1000 )
+d1.waitForState( d1.getSecondaries(), ReplSetTest.State.SECONDARY, 5 * 60 * 1000 )
 
 s.getDB(testUser.db).createUser({user: testUser.username,
                                  pwd: testUser.password,
@@ -250,18 +249,18 @@ assert.eq(count, 500);
 
 logout(adminUser);
 
-d1.waitForState( d1.getSecondaries(), d1.SECONDARY, 5 * 60 * 1000 );
-d2.waitForState( d2.getSecondaries(), d2.SECONDARY, 5 * 60 * 1000 );
+d1.waitForState( d1.getSecondaries(), ReplSetTest.State.SECONDARY, 5 * 60 * 1000 );
+d2.waitForState( d2.getSecondaries(), ReplSetTest.State.SECONDARY, 5 * 60 * 1000 );
 
 authutil.asCluster(d1.nodes, "jstests/libs/key1", function() { d1.awaitReplication(120000); });
 authutil.asCluster(d2.nodes, "jstests/libs/key1", function() { d2.awaitReplication(120000); });
 
 // add admin on shard itself, hack to prevent localhost auth bypass
-d1.getMaster().getDB(adminUser.db).createUser({user: adminUser.username,
+d1.getPrimary().getDB(adminUser.db).createUser({user: adminUser.username,
                                                pwd: adminUser.password,
                                                roles: jsTest.adminUserRoles},
                                               {w: 3, wtimeout: 60000});
-d2.getMaster().getDB(adminUser.db).createUser({user: adminUser.username,
+d2.getPrimary().getDB(adminUser.db).createUser({user: adminUser.username,
                                                pwd: adminUser.password,
                                                roles: jsTest.adminUserRoles},
                                               {w: 3, wtimeout: 60000});

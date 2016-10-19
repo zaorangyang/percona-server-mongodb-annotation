@@ -56,6 +56,7 @@
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -249,7 +250,16 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
         // handling for querying config server content with legacy 3-host config servers.
         if (shard->isConfig() && shard->getConnString().type() == ConnectionString::SYNC) {
             invariant(shards.size() == 1U);
-            return runConfigServerQuerySCCC(query, *shard, results);
+            try {
+                return runConfigServerQuerySCCC(query, *shard, results);
+            } catch (const DBException& e) {
+                if (e.getCode() != ErrorCodes::IncompatibleCatalogManager) {
+                    throw;
+                }
+                grid.forwardingCatalogManager()->waitForCatalogManagerChange(txn);
+                // Fall through to normal code path now that the catalog manager mode has been
+                // swapped and the config servers are a normal replica set.
+            }
         }
 
         // Build the find command, and attach shard version if necessary.
@@ -407,6 +417,10 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* txn,
         return pinnedCursor.getStatus();
     }
     invariant(request.cursorid == pinnedCursor.getValue().getCursorId());
+
+    // If the fail point is enabled, busy wait until it is disabled.
+    while (MONGO_FAIL_POINT(keepCursorPinnedDuringGetMore)) {
+    }
 
     if (request.awaitDataTimeout) {
         auto status = pinnedCursor.getValue().setAwaitDataTimeout(*request.awaitDataTimeout);

@@ -430,15 +430,35 @@ public:
 
 }  // namespace
 
-void logOpForSharding(OperationContext* txn,
-                      const char* opstr,
-                      const char* ns,
-                      const BSONObj& obj,
-                      BSONObj* patt,
-                      bool notInActiveChunk) {
+void logInsertOpForSharding(OperationContext* txn,
+                            const char* ns,
+                            const BSONObj& obj,
+                            bool notInActiveChunk) {
     ShardingState* shardingState = ShardingState::get(txn);
     if (shardingState->enabled())
-        shardingState->migrationSourceManager()->logOp(txn, opstr, ns, obj, patt, notInActiveChunk);
+        shardingState->migrationSourceManager()->logInsertOp(txn, ns, obj, notInActiveChunk);
+}
+
+void logUpdateOpForSharding(OperationContext* txn,
+                            const char* ns,
+                            const BSONObj& pattern,
+                            bool notInActiveChunk) {
+    ShardingState* shardingState = ShardingState::get(txn);
+    if (shardingState->enabled())
+        shardingState->migrationSourceManager()->logUpdateOp(txn, ns, pattern, notInActiveChunk);
+}
+
+void logDeleteOpForSharding(OperationContext* txn,
+                            const char* ns,
+                            const BSONObj& obj,
+                            bool notInActiveChunk) {
+    ShardingState* shardingState = ShardingState::get(txn);
+    if (shardingState->enabled())
+        shardingState->migrationSourceManager()->logDeleteOp(txn, ns, obj, notInActiveChunk);
+}
+
+bool isInMigratingChunk(OperationContext* txn, const NamespaceString& ns, const BSONObj& doc) {
+    return ShardingState::get(txn)->migrationSourceManager()->isInMigratingChunk(ns, doc);
 }
 
 }  // namespace mongo

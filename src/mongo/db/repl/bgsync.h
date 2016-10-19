@@ -78,7 +78,12 @@ public:
 class BackgroundSync : public BackgroundSyncInterface {
 public:
     // Allow index prefetching to be turned on/off
-    enum IndexPrefetchConfig { PREFETCH_NONE = 0, PREFETCH_ID_ONLY = 1, PREFETCH_ALL = 2 };
+    enum IndexPrefetchConfig {
+        UNINITIALIZED = 0,
+        PREFETCH_NONE = 1,
+        PREFETCH_ID_ONLY = 2,
+        PREFETCH_ALL = 3
+    };
 
     static BackgroundSync* get();
 
@@ -88,7 +93,7 @@ public:
 
     void shutdown();
 
-    bool isPaused() const;
+    bool isStopped() const;
 
     virtual ~BackgroundSync() {}
 
@@ -152,8 +157,8 @@ private:
     // a secondary.
     long long _lastFetchedHash;
 
-    // if produce thread should be running
-    bool _pause;
+    // if producer thread should not be running
+    bool _stopped;
 
     HostAndPort _syncSourceHost;
 
@@ -174,7 +179,7 @@ private:
                           OpTime lastOpTimeFetched,
                           long long lastFetchedHash,
                           Milliseconds fetcherMaxTimeMS,
-                          Status* remoteOplogStartStatus);
+                          Status* returnStatus);
 
     /**
      * Executes a rollback.

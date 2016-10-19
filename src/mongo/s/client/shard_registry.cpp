@@ -42,6 +42,7 @@
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/client.h"
 #include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
@@ -125,6 +126,7 @@ const ShardRegistry::ErrorCodesSet ShardRegistry::kNotMasterErrors{ErrorCodes::N
 const ShardRegistry::ErrorCodesSet ShardRegistry::kAllRetriableErrors{
     ErrorCodes::NotMaster,
     ErrorCodes::NotMasterNoSlaveOk,
+    ErrorCodes::NotMasterOrSecondary,
     // If write concern failed to be satisfied on the remote server, this most probably means that
     // some of the secondary nodes were unreachable or otherwise unresponsive, so the call is safe
     // to be retried if idempotency can be guaranteed.
@@ -132,10 +134,7 @@ const ShardRegistry::ErrorCodesSet ShardRegistry::kAllRetriableErrors{
     ErrorCodes::HostUnreachable,
     ErrorCodes::HostNotFound,
     ErrorCodes::NetworkTimeout,
-    // This set includes interrupted because replica set step down kills all server operations
-    // before it closes connections so it may happen that the caller actually receives the
-    // interruption.
-    ErrorCodes::Interrupted};
+    ErrorCodes::InterruptedDueToReplStateChange};
 
 ShardRegistry::ShardRegistry(std::unique_ptr<RemoteCommandTargeterFactory> targeterFactory,
                              std::unique_ptr<executor::TaskExecutorPool> executorPool,
@@ -208,7 +207,7 @@ void ShardRegistry::reload(OperationContext* txn) {
             continue;
         }
 
-        _addShard_inlock(shardType);
+        _addShard_inlock(shardType, false);
     }
 }
 
@@ -324,14 +323,21 @@ void ShardRegistry::toBSON(BSONObjBuilder* result) {
     }
 }
 
+void ShardRegistry::appendConnectionStats(executor::ConnectionPoolStats* stats) const {
+    // Get stats from the pool of task executors, including fixed executor within.
+    _executorPool->appendConnectionStats(stats);
+    // Get stats from the separate executor for addShard.
+    _executorForAddShard->appendConnectionStats(stats);
+}
+
 void ShardRegistry::_addConfigShard_inlock() {
     ShardType configServerShard;
     configServerShard.setName("config");
     configServerShard.setHost(_configServerCS.toString());
-    _addShard_inlock(configServerShard);
+    _addShard_inlock(configServerShard, true);
 }
 
-void ShardRegistry::_addShard_inlock(const ShardType& shardType) {
+void ShardRegistry::_addShard_inlock(const ShardType& shardType, bool passHostName) {
     // This validation should ideally go inside the ShardType::validate call. However, doing
     // it there would prevent us from loading previously faulty shard hosts, which might have
     // been stored (i.e., the entire getAllShards call would fail).
@@ -349,27 +355,38 @@ void ShardRegistry::_addShard_inlock(const ShardType& shardType) {
         // mechanism and must only be reachable through CatalogManagerLegacy or legacy-style queries
         // and inserts. Do not create targeter for these connections. This code should go away after
         // 3.2 is released.
+        // Config server updates must pass the host name to avoid deadlock
         shard = std::make_shared<Shard>(shardType.getName(), shardHost, nullptr);
+        _updateLookupMapsForShard_inlock(std::move(shard), shardHost);
     } else {
         // Non-SYNC shards use targeter factory.
         shard = std::make_shared<Shard>(
             shardType.getName(), shardHost, _targeterFactory->create(shardHost));
+        if (passHostName) {
+            _updateLookupMapsForShard_inlock(std::move(shard), shardHost);
+        } else {
+            _updateLookupMapsForShard_inlock(std::move(shard),
+                                             boost::optional<const ConnectionString&>(boost::none));
+        }
+    }
+}
+
+void ShardRegistry::updateLookupMapsForShard(
+    shared_ptr<Shard> shard, boost::optional<const ConnectionString&> optConnString) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _updateLookupMapsForShard_inlock(std::move(shard), optConnString);
+}
+
+void ShardRegistry::_updateLookupMapsForShard_inlock(
+    shared_ptr<Shard> shard, boost::optional<const ConnectionString&> optConnString) {
+    auto oldConnString = shard->getConnString();
+    auto newConnString = optConnString ? *optConnString : shard->getTargeter()->connectionString();
+
+    if (oldConnString.toString() != newConnString.toString()) {
+        log() << "Updating ShardRegistry connection string for shard " << shard->getId()
+              << " from: " << oldConnString.toString() << " to: " << newConnString.toString();
     }
 
-    _updateLookupMapsForShard_inlock(std::move(shard), shardHost);
-}
-
-void ShardRegistry::updateLookupMapsForShard(shared_ptr<Shard> shard,
-                                             const ConnectionString& newConnString) {
-    log() << "Updating ShardRegistry connection string for shard " << shard->getId()
-          << " from: " << shard->getConnString().toString() << " to: " << newConnString.toString();
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _updateLookupMapsForShard_inlock(std::move(shard), newConnString);
-}
-
-void ShardRegistry::_updateLookupMapsForShard_inlock(shared_ptr<Shard> shard,
-                                                     const ConnectionString& newConnString) {
-    auto oldConnString = shard->getConnString();
     for (const auto& host : oldConnString.getServers()) {
         _lookup.erase(host.toString());
         _hostLookup.erase(host);
@@ -695,6 +712,8 @@ StatusWith<ShardRegistry::CommandResponse> ShardRegistry::_runCommandWithRetries
         }
 
         if (errorsToCheck.count(response.getStatus().code()) && retry < kOnErrorNumRetries) {
+            LOG(1) << "Command failed with retriable error and will be retried"
+                   << causedBy(response.getStatus());
             continue;
         }
 
@@ -772,7 +791,8 @@ StatusWith<ShardRegistry::CommandResponse> ShardRegistry::_runCommandWithMetadat
 void ShardRegistry::updateReplSetMonitor(const std::shared_ptr<RemoteCommandTargeter>& targeter,
                                          const HostAndPort& remoteHost,
                                          const Status& remoteCommandStatus) {
-    if (ErrorCodes::isNotMasterError(remoteCommandStatus.code())) {
+    if (ErrorCodes::isNotMasterError(remoteCommandStatus.code()) ||
+        (remoteCommandStatus == ErrorCodes::InterruptedDueToReplStateChange)) {
         targeter->markHostNotMaster(remoteHost);
     } else if (ErrorCodes::isNetworkError(remoteCommandStatus.code())) {
         targeter->markHostUnreachable(remoteHost);

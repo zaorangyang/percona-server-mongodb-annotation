@@ -1465,6 +1465,11 @@ public:
                     if (config.limit && numInputs >= config.limit)
                         break;
                 }
+
+                // Record the indexes used by the PlanExecutor.
+                PlanSummaryStats stats;
+                Explain::getSummaryStats(*exec, &stats);
+                coll->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
             }
             pm.finished();
 
@@ -1566,6 +1571,14 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
+        if (!grid.shardRegistry()) {
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::CommandNotSupported,
+                       str::stream() << "Can not execute mapReduce with output database "
+                                     << dbname));
+        }
+
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
             maybeDisableValidation.emplace(txn);

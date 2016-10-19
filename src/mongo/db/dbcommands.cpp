@@ -71,6 +71,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
@@ -603,7 +604,11 @@ public:
 
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
             auto statusWithCQ =
-                CanonicalQuery::canonicalize(NamespaceString(ns), query, sort, BSONObj());
+                CanonicalQuery::canonicalize(NamespaceString(ns),
+                                             query,
+                                             sort,
+                                             BSONObj(),
+                                             ExtensionsCallbackDisallowExtensions());
             if (!statusWithCQ.isOK()) {
                 uasserted(17240, "Can't canonicalize query " + query.toString());
                 return 0;
@@ -1216,6 +1221,10 @@ void Command::execCommand(OperationContext* txn,
 
         if (isHelpRequest(extractedFields[kHelpField])) {
             CurOp::get(txn)->ensureStarted();
+            // We disable last-error for help requests due to SERVER-11492, because config servers
+            // use help requests to determine which commands are database writes, and so must be
+            // forwarded to all mirrored (SCCC) config servers.
+            LastError::get(txn->getClient()).disable();
             generateHelpResponse(txn, request, replyBuilder, *command);
             return;
         }

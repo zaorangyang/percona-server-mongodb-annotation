@@ -58,6 +58,7 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -159,6 +160,8 @@ public:
         }
         const GetMoreRequest& request = parseStatus.getValue();
 
+        CurOp::get(txn)->debug().cursorid = request.cursorid;
+
         // Disable shard version checking - getmore commands are always unversioned
         OperationShardVersion::get(txn).setShardVersion(request.nss, ChunkVersion::IGNORED());
 
@@ -216,6 +219,17 @@ public:
                 result,
                 Status(ErrorCodes::CursorNotFound,
                        str::stream() << "Cursor not found, cursor id: " << request.cursorid));
+        }
+
+        // If the fail point is enabled, busy wait until it is disabled. We unlock and re-acquire
+        // the locks periodically in order to avoid deadlock (see SERVER-21997 for details).
+        while (MONGO_FAIL_POINT(keepCursorPinnedDuringGetMore)) {
+            invariant(ctx);
+            invariant(!unpinDBLock);
+            invariant(!unpinCollLock);
+            sleepFor(Milliseconds(10));
+            ctx.reset();
+            ctx = stdx::make_unique<AutoGetCollectionForRead>(txn, request.nss);
         }
 
         if (request.nss.ns() != cursor->ns()) {
@@ -368,6 +382,10 @@ public:
         }
 
         nextBatch.done(respondWithId, request.nss.ns());
+
+        // Ensure log and profiler include the number of results returned in this getMore's response
+        // batch.
+        CurOp::get(txn)->debug().nreturned = numResults;
 
         if (respondWithId) {
             cursorFreer.Dismiss();

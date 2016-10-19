@@ -36,7 +36,7 @@
 
     var nodes = replTest.startSet();
     replTest.initiate();
-    var master = replTest.getMaster();
+    var master = replTest.getPrimary();
     var testDB = master.getDB("test");
     var localDB = master.getDB("local");
     var minvalidColl = localDB["replset.minvalid"];
@@ -103,7 +103,7 @@
     log(assert.commandWorked(localDB.adminCommand("replSetGetStatus")));
     log("restart primary");
     replTest.restart(master);
-    replTest.waitForState(master, replTest.RECOVERING, 90000);
+    replTest.waitForState(master, ReplSetTest.State.RECOVERING, 90000);
 
     assert.soon(function() {
         var mv;
