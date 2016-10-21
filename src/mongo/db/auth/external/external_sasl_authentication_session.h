@@ -30,7 +30,6 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/auth/authentication_session.h"
-#include "mongo/db/auth/native_sasl_authentication_session.h"
 #include "mongo/db/auth/sasl_authentication_session.h"
 
 namespace mongo {
@@ -38,7 +37,7 @@ namespace mongo {
     /**
      * Authentication session data for the server side of external SASL authentication.
      */
-    class ExternalSaslAuthenticationSession : public NativeSaslAuthenticationSession {
+    class ExternalSaslAuthenticationSession : public SaslAuthenticationSession {
         MONGO_DISALLOW_COPYING(ExternalSaslAuthenticationSession);
     public:
         explicit ExternalSaslAuthenticationSession(AuthorizationSession* authSession);
@@ -82,24 +81,6 @@ namespace mongo {
                 return result == SASL_OK || result == SASL_CONTINUE;
             }
         } _results;
-    };
-
-    class IntegratedAuthenticationSession : public ExternalSaslAuthenticationSession {
-        MONGO_DISALLOW_COPYING(IntegratedAuthenticationSession);
-    public:
-        explicit IntegratedAuthenticationSession(AuthorizationSession* authSession);
-        virtual ~IntegratedAuthenticationSession();
-        virtual Status start(StringData authenticationDatabase,
-                             StringData mechanism,
-                             StringData serviceName,
-                             StringData serviceHostname,
-                             int64_t conversationId,
-                             bool autoAuthorize);
-        virtual Status step(StringData inputData, std::string* outputData);
-        virtual std::string getPrincipalId() const;
-        virtual const char* getMechanism() const;
-    private:
-        bool _external;
     };
 
 }  // namespace mongo
