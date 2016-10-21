@@ -5,6 +5,7 @@ env.SConscript(
     dirs=[
         'devnull',
         'ephemeral_for_test',
+        'inmemory',
         'kv',
         'mmap_v1',
         'wiredtiger',

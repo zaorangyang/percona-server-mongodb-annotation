@@ -4,6 +4,7 @@ Import("env")
 Import("has_option")
 Import("rocksdb")
 Import("wiredtiger")
+Import("inmemory")
 
 env.SConscript(
     dirs=[
@@ -703,6 +704,9 @@ serveronlyLibdeps = [
 
 if rocksdb:
     serveronlyLibdeps.append('storage/rocks/storage_rocks')
+
+if inmemory:
+    serveronlyLibdeps.append('storage/inmemory/storage_inmemory')
 
 if wiredtiger:
     serveronlyLibdeps.append('storage/wiredtiger/storage_wiredtiger')

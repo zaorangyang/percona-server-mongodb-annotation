@@ -200,6 +200,15 @@ add_option('wiredtiger',
     type='choice',
 )
 
+add_option('inmemory',
+    choices=['on', 'off'],
+    const='on',
+    default='off',
+    help='Enable InMemory',
+    nargs='?',
+    type='choice',
+)
+
 add_option('audit',
     help='Enable auditing',
     nargs=0,
@@ -1453,6 +1462,12 @@ if get_option('wiredtiger') == 'on':
         wiredtiger = True
         env.SetConfigHeaderDefine("MONGO_CONFIG_WIREDTIGER_ENABLED")
 
+inmemory = False
+if get_option('inmemory') == 'on':
+    inmemory = True
+    if not wiredtiger:
+        env.FatalError("InMemory engine requires WiredTiger to build")
+
 if get_option('experimental-decimal-support') == 'on':
     env.SetConfigHeaderDefine("MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT")
 
@@ -2540,6 +2555,7 @@ Export("debugBuild optBuild")
 Export("rocksdb")
 Export("wiredtiger")
 Export("endian")
+Export("inmemory")
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
