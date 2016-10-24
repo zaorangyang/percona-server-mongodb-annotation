@@ -145,6 +145,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::planCacheIndexFilter << ActionType::planCacheRead
         << ActionType::planCacheWrite << ActionType::reIndex
         << ActionType::renameCollectionSameDB  // read_write gets this also
+        << ActionType::startBackup
         << ActionType::repairDatabase << ActionType::storageDetails << ActionType::validate;
 
     // clusterMonitor role actions that target the cluster resource
