@@ -1,8 +1,9 @@
 (function() {
     'use strict';
 
-    // set rateLimit to 5 and slowms to 150ms, also enable 'all queries' profiling mode
-    var conn = MongoRunner.runMongod({profile: 2, slowms: 150, rateLimit: 5});
+    // set rateLimit to 5 and slowms to 5000ms, also enable 'all queries' profiling mode
+    // here we need a big slowms value to prevent sporadic failures because of random slow inserts
+    var conn = MongoRunner.runMongod({profile: 2, slowms: 5000, rateLimit: 5});
     var db = conn.getDB('test');
 
     //{
@@ -21,7 +22,15 @@
 
     // check that all profiled events have correct 'rateLimit' value
     var cnt2 = db.system.profile.count( { op: "insert", ns: "test.batch", "query.documents.0.tag": "rateLimit test" , rateLimit: 5} );
+
+    if (cnt != cnt2) {
+        db.system.profile.find().forEach( printjsononeline );
+    }
+
     assert.eq(cnt, cnt2);
+
+    // lower slowms value for the next part of test
+    db.runCommand( { profile: 2, slowms: 150, ratelimit: 5 } );
 
     // put some slow events and check their behavior
     for (var i = 0; i < 10; i++) {
