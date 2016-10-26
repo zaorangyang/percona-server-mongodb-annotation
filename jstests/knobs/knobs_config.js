@@ -1,12 +1,4 @@
-var conn = MongoRunner.runMongod({
-    cursorTimeoutMillis: 9,
-    failIndexKeyTooLong: 'false',
-    internalQueryPlannerEnableIndexIntersection: 'false',
-    ttlMonitorEnabled: 'false',
-    ttlMonitorSleepSecs: 7,
-});
-
-var adminDB = conn.getDB('admin');
+var adminDB = db.getSiblingDB('admin');
 
 // test cursorTimeoutMillis
 {
@@ -38,5 +30,3 @@ var adminDB = conn.getDB('admin');
     assert.commandWorked(c);
     assert.eq(c.ttlMonitorSleepSecs, 7)
 }
-
-MongoRunner.stopMongod(conn);
