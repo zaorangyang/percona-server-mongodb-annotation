@@ -36,6 +36,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/storage/engine_extension.h"
 
 namespace mongo {
 
@@ -46,7 +47,7 @@ class RecoveryUnit;
 class SortedDataInterface;
 class SnapshotManager;
 
-class KVEngine {
+class KVEngine : public percona::EngineExtension {
 public:
     virtual RecoveryUnit* newRecoveryUnit() = 0;
 

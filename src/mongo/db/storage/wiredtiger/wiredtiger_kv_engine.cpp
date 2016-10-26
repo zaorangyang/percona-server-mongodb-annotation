@@ -329,6 +329,50 @@ void WiredTigerKVEngine::endBackup(OperationContext* txn) {
     _backupSession.reset();
 }
 
+Status WiredTigerKVEngine::hotBackup(const std::string& path) {
+    // WT-999: Create journal folder.
+    const char* journalDir = "journal";
+    boost::filesystem::path destPath(path);
+    try {
+        boost::filesystem::create_directory(destPath / journalDir);
+    } catch (const boost::filesystem::filesystem_error& ex) {
+        return Status(ErrorCodes::InvalidPath, str::stream() << ex.what());
+    }
+
+    // Open backup cursor in new session, the session will kill the
+    // cursor upon closing.
+    WiredTigerSession sessionBackup(_conn);
+    WT_CURSOR* c = NULL;
+    WT_SESSION* s = sessionBackup.getSession();
+    int ret = s->open_cursor(s, "backup:", NULL, NULL, &c);
+    if (ret != 0) {
+        return wtRCToStatus(ret);
+    }
+
+    // Copy the list of files.
+    boost::filesystem::path srcPath(_path);
+    const char* filename = NULL;
+    while ((ret = c->next(c)) == 0 && (ret = c->get_key(c, &filename)) == 0) {
+        try {
+            boost::filesystem::copy_file(
+                srcPath / filename, destPath / filename, boost::filesystem::copy_option::none);
+        } catch (const boost::filesystem::filesystem_error& ex) {
+            // WT-999: Try copying to journal folder.
+            const std::string& errmsg = str::stream() << ex.what();
+            try {
+                boost::filesystem::copy_file(srcPath / journalDir / filename,
+                                             destPath / journalDir / filename,
+                                             boost::filesystem::copy_option::none);
+            } catch (const boost::filesystem::filesystem_error&) {
+                return Status(ErrorCodes::InvalidPath, errmsg);
+            }
+        }
+    }
+    if (ret == WT_NOTFOUND)
+        ret = 0;
+    return wtRCToStatus(ret);
+}
+
 void WiredTigerKVEngine::syncSizeInfo(bool sync) const {
     if (!_sizeStorer)
         return;

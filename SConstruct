@@ -214,6 +214,11 @@ add_option('audit',
     nargs=0,
 )
 
+add_option('hotbackup',
+    help='Enable Hot Backup',
+    nargs=0,
+)
+
 js_engine_choices = ['mozjs', 'none']
 add_option('js-engine',
     choices=js_engine_choices,

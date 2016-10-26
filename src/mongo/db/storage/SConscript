@@ -16,6 +16,15 @@ if rocksdb:
     env.SConscript(dirs='rocks')
 
 env.Library(
+    target='engine_extension',
+    source=[
+        'engine_extension.cpp',
+        ],
+    LIBDEPS=[
+        ],
+    )
+
+env.Library(
     target='index_entry_comparison',
     source=[
         'index_entry_comparison.cpp',
