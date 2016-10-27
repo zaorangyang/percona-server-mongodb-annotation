@@ -1,18 +1,10 @@
-var conn = MongoRunner.runMongod({
-    cursorTimeoutMillis: 9,
-    failIndexKeyTooLong: 'false',
-    internalQueryPlannerEnableIndexIntersection: 'false',
-    ttlMonitorEnabled: 'false',
-    ttlMonitorSleepSecs: 7,
-});
-
-var adminDB = conn.getDB('admin');
+var adminDB = db.getSiblingDB('admin');
 
 // test cursorTimeoutMillis
 {
     var c = adminDB.runCommand({ getParameter: 1, cursorTimeoutMillis: 1});
     assert.commandWorked(c);
-    assert.eq(c.cursorTimeoutMillis, 9)
+    assert.eq(c.cursorTimeoutMillis, 1)
 }
 // test failIndexKeyTooLong
 {
@@ -36,7 +28,5 @@ var adminDB = conn.getDB('admin');
 {
     var c = adminDB.runCommand({ getParameter: 1, ttlMonitorSleepSecs: 1});
     assert.commandWorked(c);
-    assert.eq(c.ttlMonitorSleepSecs, 7)
+    assert.eq(c.ttlMonitorSleepSecs, 1)
 }
-
-MongoRunner.stopMongod(conn);

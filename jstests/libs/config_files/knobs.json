@@ -1,6 +1,6 @@
 Percona:
-    cursorTimeoutMillis: 9
-    failIndexKeyTooLong: false
-    internalQueryPlannerEnableIndexIntersection: false
-    ttlMonitorEnabled: false
-    ttlMonitorSleepSecs: 7
+    cursorTimeoutMillis: 1
+    ignoreLongIndexError: false
+    allowIndexIntersections: false
+    ttlEnabled: false
+    ttlSleepSecs: 1

@@ -502,26 +502,26 @@ Status addMongodOptions(moe::OptionSection* options) {
         .setSources(moe::SourceYAMLConfig);
 
     percona_options.addOptionChaining("Percona.cursorTimeoutMillis",
-                                      "cursorTimeoutMillis",
+                                      "cursorTimeoutMS",
                                       moe::Int,
                                       "Set when to kill stale cursors (10 minutes)");
 
-    percona_options.addOptionChaining("Percona.failIndexKeyTooLong",
+    percona_options.addOptionChaining("Percona.ignoreLongIndexError",
                                       "failIndexKeyTooLong",
                                       moe::Bool,
                                       "Block long index values and error (true)");
 
-    percona_options.addOptionChaining("Percona.internalQueryPlannerEnableIndexIntersection",
+    percona_options.addOptionChaining("Percona.allowIndexIntersections",
                                       "internalQueryPlannerEnableIndexIntersection",
                                       moe::Bool,
                                       "Enable Index Intersections(true)");
 
-    percona_options.addOptionChaining("Percona.ttlMonitorEnabled",
+    percona_options.addOptionChaining("Percona.ttlEnabled",
                                       "ttlMonitorEnabled",
                                       moe::Bool,
                                       "Enable TTL worker thread(true)");
 
-    percona_options.addOptionChaining("Percona.ttlMonitorSleepSecs",
+    percona_options.addOptionChaining("Percona.ttlSleepSecs",
                                       "ttlMonitorSleepSecs",
                                       moe::Int,
                                       "Sleep time between TTL runs (60)");
@@ -1309,18 +1309,18 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
     if (params.count("Percona.cursorTimeoutMillis")) {
         cursorTimeoutMillis = params["Percona.cursorTimeoutMillis"].as<int>();
     }
-    if (params.count("Percona.failIndexKeyTooLong")) {
-        failIndexKeyTooLong = params["Percona.failIndexKeyTooLong"].as<bool>();
+    if (params.count("Percona.ignoreLongIndexError")) {
+        failIndexKeyTooLong = params["Percona.ignoreLongIndexError"].as<bool>();
     }
-    if (params.count("Percona.internalQueryPlannerEnableIndexIntersection")) {
+    if (params.count("Percona.allowIndexIntersections")) {
         internalQueryPlannerEnableIndexIntersection =
-            params["Percona.internalQueryPlannerEnableIndexIntersection"].as<bool>();
+            params["Percona.allowIndexIntersections"].as<bool>();
     }
-    if (params.count("Percona.ttlMonitorSleepSecs")) {
-        ttlMonitorSleepSecs = params["Percona.ttlMonitorSleepSecs"].as<int>();
+    if (params.count("Percona.ttlSleepSecs")) {
+        ttlMonitorSleepSecs = params["Percona.ttlSleepSecs"].as<int>();
     }
-    if (params.count("Percona.ttlMonitorEnabled")) {
-        ttlMonitorEnabled = params["Percona.ttlMonitorEnabled"].as<bool>();
+    if (params.count("Percona.ttlEnabled")) {
+        ttlMonitorEnabled = params["Percona.ttlEnabled"].as<bool>();
     }
 
     // Check if we are 32 bit and have not explicitly specified any journaling options

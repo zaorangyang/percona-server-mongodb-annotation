@@ -3,15 +3,13 @@ selector:
     roots:
     - jstests/knobs/knobs.js
 
-# knobs tests start their own mongod's.
 executor:
   js_test:
     config:
       shell_options:
-        nodb: ''
         readMode: commands
     fixture:
       class: MongoDFixture
       mongod_options:
-        set_parameters:
-          enableTestCommands: 1
+        add_options:
+          config: 'jstests/libs/config_files/knobs.json'
