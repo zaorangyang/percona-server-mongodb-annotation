@@ -40,6 +40,7 @@
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/getmore_request.h"
+#include "mongo/platform/random.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
@@ -450,6 +451,16 @@ uint64_t CurOp::MaxTimeTracker::getRemainingMicros() const {
     return _targetEpochMicros - now;
 }
 
+bool CurOp::_shouldDBProfileWithRateLimit() const {
+    // Pseudo RNG for rate limiter feature
+    static PseudoRandom _prng(std::unique_ptr<SecureRandom>(SecureRandom::create())->nextInt64());
+
+    const int64_t RATE_LIMIT_MULTIPLIER = 1LL << 52;
+    static_assert( RATE_LIMIT_MAX * RATE_LIMIT_MULTIPLIER <= std::numeric_limits<int64_t>::max(),
+                  "product of RATE_LIMIT_MAX and RATE_LIMIT_MULTIPLIER should not exceed int64_t range");
+    return _prng.nextInt64(RATE_LIMIT_MULTIPLIER) * serverGlobalParams.rateLimit < RATE_LIMIT_MULTIPLIER;
+}
+
 namespace {
 StringData getProtoString(int op) {
     if (op == dbQuery) {
@@ -658,6 +669,8 @@ void OpDebug::append(const CurOp& curop,
         b.append("protocol", getProtoString(networkOp));
     }
     b.append("millis", executionTime);
+    b.append("rateLimit",
+             executionTime >= serverGlobalParams.slowMS ? 1 : serverGlobalParams.rateLimit);
 
     execStats.append(b, "execStats");
 }
