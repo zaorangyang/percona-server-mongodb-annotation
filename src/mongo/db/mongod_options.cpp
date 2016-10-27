@@ -62,11 +62,6 @@ using std::string;
 MongodGlobalParams mongodGlobalParams;
 
 extern DiagLog _diaglog;
-extern std::atomic<int> cursorTimeoutMillis;
-extern std::atomic<bool> failIndexKeyTooLong;
-extern std::atomic<bool> internalQueryPlannerEnableIndexIntersection;
-extern std::atomic<int> ttlMonitorEnabled;
-extern std::atomic<int> ttlMonitorSleepSecs;
 
 Status addMongodOptions(moe::OptionSection* options) {
     moe::OptionSection general_options("General options");
@@ -99,7 +94,6 @@ Status addMongodOptions(moe::OptionSection* options) {
     moe::OptionSection replication_options("Replication options");
     moe::OptionSection sharding_options("Sharding options");
     moe::OptionSection storage_options("Storage options");
-    moe::OptionSection percona_options("Percona options");
 
     // Authentication Options
 
@@ -501,30 +495,6 @@ Status addMongodOptions(moe::OptionSection* options) {
         .hidden()
         .setSources(moe::SourceYAMLConfig);
 
-    percona_options.addOptionChaining("Percona.cursorTimeoutMillis",
-                                      "cursorTimeoutMillis",
-                                      moe::Int,
-                                      "Set when to kill stale cursors (10 minutes)");
-
-    percona_options.addOptionChaining("Percona.failIndexKeyTooLong",
-                                      "failIndexKeyTooLong",
-                                      moe::Bool,
-                                      "Block long index values and error (true)");
-
-    percona_options.addOptionChaining("Percona.internalQueryPlannerEnableIndexIntersection",
-                                      "internalQueryPlannerEnableIndexIntersection",
-                                      moe::Bool,
-                                      "Enable Index Intersections(true)");
-
-    percona_options.addOptionChaining("Percona.ttlMonitorEnabled",
-                                      "ttlMonitorEnabled",
-                                      moe::Bool,
-                                      "Enable TTL worker thread(true)");
-
-    percona_options.addOptionChaining("Percona.ttlMonitorSleepSecs",
-                                      "ttlMonitorSleepSecs",
-                                      moe::Int,
-                                      "Sleep time between TTL runs (60)");
 
     options->addSection(general_options);
 #if defined(_WIN32)
@@ -534,7 +504,6 @@ Status addMongodOptions(moe::OptionSection* options) {
     options->addSection(ms_options);
     options->addSection(rs_options);
     options->addSection(sharding_options);
-    options->addSection(percona_options);
 #ifdef MONGO_CONFIG_SSL
     options->addSection(ssl_options);
 #endif
@@ -1304,24 +1273,6 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
 
     if (replSettings.getPretouch())
         log() << "--pretouch " << replSettings.getPretouch();
-
-    // Percona Variables
-    if (params.count("Percona.cursorTimeoutMillis")) {
-        cursorTimeoutMillis = params["Percona.cursorTimeoutMillis"].as<int>();
-    }
-    if (params.count("Percona.failIndexKeyTooLong")) {
-        failIndexKeyTooLong = params["Percona.failIndexKeyTooLong"].as<bool>();
-    }
-    if (params.count("Percona.internalQueryPlannerEnableIndexIntersection")) {
-        internalQueryPlannerEnableIndexIntersection =
-            params["Percona.internalQueryPlannerEnableIndexIntersection"].as<bool>();
-    }
-    if (params.count("Percona.ttlMonitorSleepSecs")) {
-        ttlMonitorSleepSecs = params["Percona.ttlMonitorSleepSecs"].as<int>();
-    }
-    if (params.count("Percona.ttlMonitorEnabled")) {
-        ttlMonitorEnabled = params["Percona.ttlMonitorEnabled"].as<bool>();
-    }
 
     // Check if we are 32 bit and have not explicitly specified any journaling options
     if (sizeof(void*) == 4 && !params.count("storage.journal.enabled")) {
