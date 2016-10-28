@@ -75,6 +75,22 @@ StorageEngine* ServiceContextMongoD::getGlobalStorageEngine() {
 
 extern bool _supportsDocLocking;
 
+void ServiceContextMongoD::createLockFile() {
+    try {
+        _lockFile.reset(new StorageEngineLockFile(storageGlobalParams.dbpath));
+    } catch (const std::exception& ex) {
+        uassert(28596,
+                str::stream() << "Unable to determine status of lock file in the data directory "
+                              << storageGlobalParams.dbpath << ": " << ex.what(),
+                false);
+    }
+    bool wasUnclean = _lockFile->createdByUncleanShutdown();
+    uassertStatusOK(_lockFile->open());
+    if (wasUnclean) {
+        warning() << "Detected unclean shutdown - " << _lockFile->getFilespec() << " is not empty.";
+    }
+}
+
 void ServiceContextMongoD::initializeGlobalStorageEngine() {
     // This should be set once.
     invariant(!_storageEngine);
@@ -124,6 +140,14 @@ void ServiceContextMongoD::initializeGlobalStorageEngine() {
                           << storageGlobalParams.engine,
             factory);
 
+    if (storageGlobalParams.readOnly) {
+        uassert(34368,
+                str::stream()
+                    << "Server was started in read-only mode, but the configured storage engine, "
+                    << storageGlobalParams.engine << ", does not support read-only operation",
+                factory->supportsReadOnly());
+    }
+
     std::unique_ptr<StorageEngineMetadata> metadata = StorageEngineMetadata::forPath(dbpath);
 
     // Validate options in metadata against current startup options.
@@ -131,19 +155,7 @@ void ServiceContextMongoD::initializeGlobalStorageEngine() {
         uassertStatusOK(factory->validateMetadata(*metadata, storageGlobalParams));
     }
 
-    try {
-        _lockFile.reset(new StorageEngineLockFile(storageGlobalParams.dbpath));
-    } catch (const std::exception& ex) {
-        uassert(28596,
-                str::stream() << "Unable to determine status of lock file in the data directory "
-                              << storageGlobalParams.dbpath << ": " << ex.what(),
-                false);
-    }
-    if (_lockFile->createdByUncleanShutdown()) {
-        warning() << "Detected unclean shutdown - " << _lockFile->getFilespec() << " is not empty.";
-    }
-    uassertStatusOK(_lockFile->open());
-
+    invariant(_lockFile);
     ScopeGuard guard = MakeGuard(&StorageEngineLockFile::close, _lockFile.get());
     _storageEngine = factory->create(storageGlobalParams, *_lockFile);
     _storageEngine->finishInit();

@@ -287,14 +287,11 @@ add_option('durableDefaultOn',
     nargs=0,
 )
 
-if is_running_os('linux') or is_running_os('windows'):
-   defaultAllocator = 'tcmalloc'
-else:
-    defaultAllocator = 'system'
-
 add_option('allocator',
-    default=defaultAllocator,
-    help='allocator to use (tcmalloc or system)',
+    choices=["auto", "system", "tcmalloc"],
+    default="auto",
+    help='allocator to use (use "auto" for best choice for current platform)',
+    type='choice',
 )
 
 add_option('gdbserver',
@@ -909,24 +906,38 @@ def CheckForToolchain(context, toolchain, lang_name, compiler_var, source_suffix
     context.Result(result)
     return result
 
+endian = get_option( "endian" )
+
+if endian == "auto":
+    endian = sys.byteorder
+
+if endian == "little":
+    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "1234")
+elif endian == "big":
+    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "4321")
+
 # These preprocessor macros came from
 # http://nadeausoftware.com/articles/2012/02/c_c_tip_how_detect_processor_type_using_compiler_predefined_macros
 #
 # NOTE: Remember to add a trailing comma to form any required one
 # element tuples, or your configure checks will fail in strange ways.
 processor_macros = {
-    'arm'    : ('__arm__',),
-    'arm64'  : ('__arm64__', '__aarch64__'),
-    'i386'   : ('__i386', '_M_IX86'),
-    'ppc64'  : ('__powerpc64__',),
-    's390x'  : ('__s390x__',),
-    'sparc'  : ('__sparc',),
-    'x86_64' : ('__x86_64', '_M_AMD64'),
+    'arm'    : { 'endian': 'little', 'defines': ('__arm__',) },
+    'arm64'  : { 'endian': 'little', 'defines': ('__arm64__', '__aarch64__')},
+    'i386'   : { 'endian': 'little', 'defines': ('__i386', '_M_IX86')},
+    'ppc64le': { 'endian': 'little', 'defines': ('__powerpc64__',)},
+    's390x'  : { 'endian': 'big',    'defines': ('__s390x__',)},
+    'sparc'  : { 'endian': 'big',    'defines': ('__sparc',)},
+    'x86_64' : { 'endian': 'little', 'defines': ('__x86_64', '_M_AMD64')},
 }
 
 def CheckForProcessor(context, which_arch):
     def run_compile_check(arch):
-        full_macros = " || ".join([ "defined(%s)" % (v) for v in processor_macros[arch]])
+        full_macros = " || ".join([ "defined(%s)" % (v) for v in processor_macros[arch]['defines']])
+
+        if not endian == processor_macros[arch]['endian']:
+            return False
+
         test_body = """
         #if {0}
         /* Detected {1} */
@@ -1041,6 +1052,22 @@ if not env['HOST_ARCH']:
 # env variable to interpolate their names in child sconscripts
 
 env['TARGET_OS_FAMILY'] = 'posix' if env.TargetOSIs('posix') else env.GetTargetOSName()
+
+# Currently we only use tcmalloc on windows and linux x86_64. Other
+# linux targets (power, s390x, arm) do not currently support tcmalloc.
+#
+# Normalize the allocator option and store it in the Environment. It
+# would be nicer to use SetOption here, but you can't reset user
+# options for some strange reason in SCons. Instead, we store this
+# option as a new variable in the environment.
+if get_option('allocator') == "auto":
+    if env.TargetOSIs('windows') or \
+       (env.TargetOSIs('linux') and (env['TARGET_ARCH'] in ['i386', 'x86_64'])):
+        env['MONGO_ALLOCATOR'] = "tcmalloc"
+    else:
+        env['MONGO_ALLOCATOR'] = "system"
+else:
+    env['MONGO_ALLOCATOR'] = get_option('allocator')
 
 if has_option("cache"):
     if has_option("release"):
@@ -1186,16 +1213,6 @@ if has_option('mute'):
     env.Append( LINKCOMSTR = "Linking $TARGET" )
     env.Append( SHLINKCOMSTR = env["LINKCOMSTR"] )
     env.Append( ARCOMSTR = "Generating library $TARGET" )
-
-endian = get_option( "endian" )
-
-if endian == "auto":
-    endian = sys.byteorder
-
-if endian == "little":
-    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "1234")
-elif endian == "big":
-    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "4321")
 
 if env['_LIBDEPS'] == '$_LIBDEPS_OBJS':
     # The libraries we build in LIBDEPS_OBJS mode are just placeholders for tracking dependencies.
@@ -2020,7 +2037,7 @@ def doConfigure(myenv):
         if not myenv.ToolchainIs('clang', 'gcc'):
             env.FatalError('sanitize is only supported with clang or gcc')
 
-        if get_option('allocator') == 'tcmalloc':
+        if env['MONGO_ALLOCATOR'] == 'tcmalloc':
             # There are multiply defined symbols between the sanitizer and
             # our vendorized tcmalloc.
             env.FatalError("Cannot use --sanitize with tcmalloc")
@@ -2409,13 +2426,13 @@ def doConfigure(myenv):
 
     # 'tcmalloc' needs to be the last library linked. Please, add new libraries before this 
     # point.
-    if get_option('allocator') == 'tcmalloc':
+    if myenv['MONGO_ALLOCATOR'] == 'tcmalloc':
         if use_system_version_of_library('tcmalloc'):
             conf.FindSysLibDep("tcmalloc", ["tcmalloc"])
-    elif get_option('allocator') == 'system':
+    elif myenv['MONGO_ALLOCATOR'] == 'system':
         pass
     else:
-        myenv.ConfError("Invalid --allocator parameter: \"{0}\"", get_option('allocator'))
+        myenv.ConfError("Invalid --allocator parameter: $MONGO_ALLOCATOR")
 
     def CheckStdAtomic(context, base_type, extra_message):
         test_body = """

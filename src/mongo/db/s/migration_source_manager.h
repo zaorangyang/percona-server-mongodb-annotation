@@ -75,13 +75,13 @@ public:
                      bool notInActiveChunk);
 
     /**
-     * If a migration for the chunk in 'ns' containing the document with the _id in 'pattern' is
-     * in progress, saves this update to the transfer mods log. The entries saved here are later
-     * transferred to the receiving side of the migration.
+     * If a migration for the chunk in 'ns' containing 'updatedDoc' is in progress, saves this
+     * update to the transfer mods log. The entries saved here are later transferred to the
+     * receiving side of the migration.
      */
     void logUpdateOp(OperationContext* txn,
                      const char* ns,
-                     const BSONObj& pattern,
+                     const BSONObj& updatedDoc,
                      bool notInActiveChunk);
 
     /**
@@ -146,7 +146,7 @@ private:
 
     /**
      * Insert items from docIdList to a new array with the given fieldName in the given builder. If
-     * explode is true, the inserted object will be the full version of the document. Note that the
+     * explode is true, the inserted object will be the full version of the document. Note that
      * whenever an item from the docList is inserted to the array, it will also be removed from
      * docList.
      *

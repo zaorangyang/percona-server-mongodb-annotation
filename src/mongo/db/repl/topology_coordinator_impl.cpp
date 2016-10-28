@@ -766,6 +766,10 @@ Status TopologyCoordinatorImpl::prepareHeartbeatResponseV1(Date_t now,
 
     response->setState(myState.s);
 
+    if (myState.primary()) {
+        response->setElectionTime(_electionTime);
+    }
+
     response->setOpTime(lastOpApplied);
 
     if (_currentPrimaryIndex != -1) {
@@ -2135,11 +2139,16 @@ MemberState TopologyCoordinatorImpl::getMemberState() const {
     return _followerMode;
 }
 
-void TopologyCoordinatorImpl::processWinElection(OID electionId, Timestamp electionOpTime) {
-    invariant(_role == Role::candidate);
+void TopologyCoordinatorImpl::setElectionInfo(OID electionId, Timestamp electionOpTime) {
+    invariant(_role == Role::leader);
     _electionTime = electionOpTime;
     _electionId = electionId;
+}
+
+void TopologyCoordinatorImpl::processWinElection(OID electionId, Timestamp electionOpTime) {
+    invariant(_role == Role::candidate);
     _role = Role::leader;
+    setElectionInfo(electionId, electionOpTime);
     _currentPrimaryIndex = _selfIndex;
     _syncSource = HostAndPort();
     _forceSyncSourceIndex = -1;

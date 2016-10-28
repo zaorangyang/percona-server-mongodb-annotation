@@ -191,7 +191,7 @@ public:
 
         memcpy(buf, _frame.objdata(), _frame.objsize() - 1);  // don't copy final EOO
 
-        reinterpret_cast<int*>(buf)[0] = documentSize();
+        DataView(buf).write<LittleEndian<int>>(documentSize());
 
         buf += (_frame.objsize() - 1);
         buf[0] = (char)Object;
@@ -283,7 +283,7 @@ unique_ptr<OplogDocWriter> _logOpWriter(OperationContext* txn,
                                         const char* opstr,
                                         const NamespaceString& nss,
                                         const BSONObj& obj,
-                                        BSONObj* o2,
+                                        const BSONObj* o2,
                                         bool fromMigrate,
                                         OpTime optime,
                                         long long hashNew) {
@@ -401,7 +401,7 @@ void _logOp(OperationContext* txn,
             const char* opstr,
             const char* ns,
             const BSONObj& obj,
-            BSONObj* o2,
+            const BSONObj* o2,
             bool fromMigrate,
             const std::string& oplogName,
             ReplicationCoordinator::Mode replMode,
@@ -454,7 +454,7 @@ void logOp(OperationContext* txn,
            const char* opstr,
            const char* ns,
            const BSONObj& obj,
-           BSONObj* o2,
+           const BSONObj* o2,
            bool fromMigrate) {
     ReplicationCoordinator::Mode replMode = ReplicationCoordinator::get(txn)->getReplicationMode();
     _logOp(txn, opstr, ns, obj, o2, fromMigrate, _oplogCollectionName, replMode, true);
@@ -732,6 +732,24 @@ Status applyOperation_inlock(OperationContext* txn,
 
     if (*opType == 'i') {
         if (nsToCollectionSubstring(ns) == "system.indexes") {
+            uassert(ErrorCodes::NoSuchKey,
+                    str::stream() << "Missing expected index spec in field 'o': " << op,
+                    !fieldO.eoo());
+            uassert(ErrorCodes::TypeMismatch,
+                    str::stream() << "Expected object for index spec in field 'o': " << op,
+                    fieldO.isABSONObj());
+
+            std::string indexNs;
+            uassertStatusOK(bsonExtractStringField(o, "ns", &indexNs));
+            const NamespaceString indexNss(indexNs);
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << "Invalid namespace in index spec: " << op,
+                    indexNss.isValid());
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << "Database name mismatch for database ("
+                                  << nsToDatabaseSubstring(ns) << ") while creating index: " << op,
+                    nsToDatabaseSubstring(ns) == indexNss.db());
+
             opCounters->gotInsert();
             if (o["background"].trueValue()) {
                 Lock::TempRelease release(txn->lockState());

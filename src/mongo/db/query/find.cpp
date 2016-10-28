@@ -162,12 +162,12 @@ void endQueryOp(OperationContext* txn,
         collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
     }
 
-    const logger::LogComponent queryLogComponent = logger::LogComponent::kQuery;
+    const logger::LogComponent commandLogComponent = logger::LogComponent::kCommand;
     const logger::LogSeverity logLevelOne = logger::LogSeverity::Debug(1);
 
     // Set debug information for consumption by the profiler and slow query log.
     if (dbProfilingLevel > 0 || curop->elapsedMillis() > serverGlobalParams.slowMS ||
-        logger::globalLogDomain()->shouldLog(queryLogComponent, logLevelOne)) {
+        logger::globalLogDomain()->shouldLog(commandLogComponent, logLevelOne)) {
         // Generate plan summary string.
         stdx::lock_guard<Client>(*txn->getClient());
         curop->setPlanSummary_inlock(Explain::getPlanSummary(&exec));
@@ -213,7 +213,14 @@ void generateBatch(int ntoreturn,
     PlanExecutor* exec = cursor->getExecutor();
 
     BSONObj obj;
-    while (PlanExecutor::ADVANCED == (*state = exec->getNext(&obj, NULL))) {
+    while (!FindCommon::enoughForGetMore(ntoreturn, *numResults) &&
+           PlanExecutor::ADVANCED == (*state = exec->getNext(&obj, NULL))) {
+        // If we can't fit this result inside the current batch, then we stash it for later.
+        if (!FindCommon::haveSpaceForNext(obj, *numResults, bb->len())) {
+            exec->enqueue(obj);
+            break;
+        }
+
         // Add result to output buffer.
         bb->appendBuf((void*)obj.objdata(), obj.objsize());
 
@@ -226,10 +233,6 @@ void generateBatch(int ntoreturn,
             if (BSONType::Date == e.type() || BSONType::bsonTimestamp == e.type()) {
                 *slaveReadTill = e.timestamp();
             }
-        }
-
-        if (FindCommon::enoughForGetMore(ntoreturn, *numResults, bb->len())) {
-            break;
         }
     }
 
@@ -252,6 +255,8 @@ QueryResult::View getMore(OperationContext* txn,
                           long long cursorid,
                           bool* exhaust,
                           bool* isCursorAuthorized) {
+    invariant(ntoreturn >= 0);
+
     CurOp& curop = *CurOp::get(txn);
 
     // For testing, we may want to fail if we receive a getmore.
@@ -587,6 +592,12 @@ std::string runQuery(OperationContext* txn,
     }
 
     while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+        // If we can't fit this result inside the current batch, then we stash it for later.
+        if (!FindCommon::haveSpaceForNext(obj, numResults, bb.len())) {
+            exec->enqueue(obj);
+            break;
+        }
+
         // Add result to output buffer.
         bb.appendBuf((void*)obj.objdata(), obj.objsize());
 
@@ -601,7 +612,7 @@ std::string runQuery(OperationContext* txn,
             }
         }
 
-        if (FindCommon::enoughForFirstBatch(pq, numResults, bb.len())) {
+        if (FindCommon::enoughForFirstBatch(pq, numResults)) {
             LOG(5) << "Enough for first batch, wantMore=" << pq.wantMore()
                    << " ntoreturn=" << pq.getNToReturn().value_or(0) << " numResults=" << numResults
                    << endl;

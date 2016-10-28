@@ -202,19 +202,12 @@ ForwardingCatalogManager::ScopedDistLock& ForwardingCatalogManager::ScopedDistLo
     return *this;
 }
 
-Status ForwardingCatalogManager::ScopedDistLock::checkForPendingCatalogSwap() {
-    stdx::lock_guard<stdx::mutex> lk(_fcm->_observerMutex);
-    if (!_fcm->_nextConfigChangeComplete.isValid()) {
-        return Status::OK();
-    }
-    return Status(ErrorCodes::IncompatibleCatalogManager,
-                  "Need to swap sharding catalog manager.  Config server "
-                  "reports that it is in replica set mode, but we are still using the "
-                  "legacy SCCC protocol for config server communication");
+Status ForwardingCatalogManager::ScopedDistLock::checkForPendingCatalogChange() {
+    return _fcm->checkForPendingCatalogChange();
 }
 
 Status ForwardingCatalogManager::ScopedDistLock::checkStatus() {
-    Status status = checkForPendingCatalogSwap();
+    Status status = checkForPendingCatalogChange();
     if (!status.isOK()) {
         return status;
     }
@@ -266,6 +259,17 @@ void ForwardingCatalogManager::waitForCatalogManagerChange(OperationContext* txn
     auto configChangeComplete = _nextConfigChangeComplete;
     oblk.unlock();
     _shardRegistry->getExecutor()->waitForEvent(configChangeComplete);
+}
+
+Status ForwardingCatalogManager::checkForPendingCatalogChange() {
+    stdx::lock_guard<stdx::mutex> lk(_observerMutex);
+    if (!_nextConfigChangeComplete.isValid() || _configChangeComplete) {
+        return Status::OK();
+    }
+    return Status(ErrorCodes::IncompatibleCatalogManager,
+                  "Need to swap sharding catalog manager.  Config server "
+                  "reports that it is in replica set mode, but we are still using the "
+                  "legacy SCCC protocol for config server communication");
 }
 
 namespace {
@@ -322,23 +326,44 @@ auto ForwardingCatalogManager::retry(OperationContext* txn, Callable&& c)
     MONGO_UNREACHABLE;
 }
 
+void ForwardingCatalogManager::_unlockOldDistLocks(std::string processID) {
+    Client::initThreadIfNotAlready("DistributedLockUnlocker");
+    auto txn = cc().makeOperationContext();
+    log() << "Unlocking existing distributed locks after catalog manager swap";
+    rwlock_shared oplk(_operationLock);
+    _actual->getDistLockManager()->unlockAll(txn.get(), processID);
+}
+
 void ForwardingCatalogManager::_replaceCatalogManager(const TaskExecutor::CallbackArgs& args) {
     if (!args.status.isOK()) {
         return;
     }
-    Client::initThreadIfNotAlready();
+    Client::initThreadIfNotAlready("CatalogManagerReplacer");
     auto txn = cc().makeOperationContext();
     log() << "Swapping sharding Catalog Manager from mirrored (SCCC) to replica set (CSRS) mode";
 
     stdx::lock_guard<RWLock> oplk(_operationLock);
-    stdx::lock_guard<stdx::mutex> oblk(_observerMutex);
+    std::string distLockProcessID = _actual->getDistLockManager()->getProcessID();
+    // Shut down the old catalog manager before taking _observerMutex to prevent deadlock with
+    // the LegacyDistLockPinger thread calling scheduleReplaceCatalogManagerIfNeeded.
     _actual->shutDown(txn.get(), /* allowNetworking */ false);
+
+    stdx::lock_guard<stdx::mutex> oblk(_observerMutex);
     _actual = makeCatalogManager(_service, _nextConfigConnectionString, _shardRegistry, _thisHost);
     _shardRegistry->updateConfigServerConnectionString(_nextConfigConnectionString);
     // Note: this assumes that downgrade is not supported, as this will not start the config
     // server consistency checker for the legacy catalog manager.
     fassert(28790, _actual->startup(txn.get(), false /* allowNetworking */));
     args.executor->signalEvent(_nextConfigChangeComplete);
+    _configChangeComplete = true;
+
+    log() << "Swapping sharding Catalog Manager to replica set (CSRS) mode completed successfully";
+
+    // Must be done in a new thread to avoid deadlock resulting from running network operations
+    // within a TaskExecutor callback.
+    stdx::thread distLockUnlockThread(
+        [this, distLockProcessID] { _unlockOldDistLocks(distLockProcessID); });
+    distLockUnlockThread.detach();
 }
 
 CatalogManager::ConfigServerMode ForwardingCatalogManager::getMode() {
@@ -571,7 +596,7 @@ Status ForwardingCatalogManager::createDatabase(OperationContext* txn, const std
 DistLockManager* ForwardingCatalogManager::getDistLockManager() {
     warning() << "getDistLockManager called on ForwardingCatalogManager which should never happen "
                  "outside of unit tests!";
-    stdx::lock_guard<stdx::mutex> lk(_observerMutex);
+    rwlock_shared oplk(_operationLock);
     return _actual->getDistLockManager();
 }
 

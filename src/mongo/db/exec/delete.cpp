@@ -78,12 +78,7 @@ bool DeleteStage::isEOF() {
         child()->isEOF();
 }
 
-PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
@@ -100,7 +95,6 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
 
         *out = _idReturning;
         _idReturning = WorkingSet::INVALID_ID;
-        ++_commonStats.advanced;
         return PlanStage::ADVANCED;
     }
 
@@ -130,12 +124,10 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
                 return status;
 
             case PlanStage::NEED_TIME:
-                ++_commonStats.needTime;
                 return status;
 
             case PlanStage::NEED_YIELD:
                 *out = id;
-                ++_commonStats.needYield;
                 return status;
 
             case PlanStage::IS_EOF:
@@ -154,18 +146,7 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
 
     if (!member->hasLoc()) {
         // We expect to be here because of an invalidation causing a force-fetch.
-
-        // When we're doing a findAndModify with a sort, the sort will have a limit of 1, so will
-        // not produce any more results even if there is another matching document. Throw a WCE here
-        // so that these operations get another chance to find a matching document. The
-        // findAndModify command should automatically retry if it gets a WCE.
-        // TODO: this is not necessary if there was no sort specified.
-        if (_params.returnDeleted) {
-            throw WriteConflictException();
-        }
-
         ++_specificStats.nInvalidateSkips;
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     }
     RecordId rloc = member->loc;
@@ -181,7 +162,6 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
             cursor = _collection->getCursor(getOpCtx());
             if (!WorkingSetCommon::fetch(getOpCtx(), _ws, id, cursor)) {
                 // Doc is already deleted. Nothing more to do.
-                ++_commonStats.needTime;
                 return PlanStage::NEED_TIME;
             }
 
@@ -189,7 +169,6 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
             if (_params.canonicalQuery &&
                 !_params.canonicalQuery->root()->matchesBSON(member->obj.value(), NULL)) {
                 // Doesn't match.
-                ++_commonStats.needTime;
                 return PlanStage::NEED_TIME;
             }
         }
@@ -237,7 +216,6 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
         _idRetrying = id;
         memberFreer.Dismiss();  // Keep this member around so we can retry deleting it.
         *out = WorkingSet::INVALID_ID;
-        _commonStats.needYield++;
         return NEED_YIELD;
     }
 
@@ -266,7 +244,6 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
             memberFreer.Dismiss();
         }
         *out = WorkingSet::INVALID_ID;
-        _commonStats.needYield++;
         return NEED_YIELD;
     }
 
@@ -276,11 +253,9 @@ PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
 
         memberFreer.Dismiss();  // Keep this member around so we can return it.
         *out = id;
-        ++_commonStats.advanced;
         return PlanStage::ADVANCED;
     }
 
-    ++_commonStats.needTime;
     return PlanStage::NEED_TIME;
 }
 

@@ -100,7 +100,7 @@ void CollectionInfo::unshard() {
     _key = BSONObj();
 }
 
-void CollectionInfo::useChunkManager(ChunkManagerPtr manager) {
+void CollectionInfo::useChunkManager(std::shared_ptr<ChunkManager> manager) {
     _cm = manager;
     _key = manager->getShardKeyPattern().toBSON().getOwned();
     _unique = manager->isUnique();
@@ -253,10 +253,10 @@ void DBConfig::getChunkManagerOrPrimary(OperationContext* txn,
 }
 
 
-ChunkManagerPtr DBConfig::getChunkManagerIfExists(OperationContext* txn,
-                                                  const string& ns,
-                                                  bool shouldReload,
-                                                  bool forceReload) {
+std::shared_ptr<ChunkManager> DBConfig::getChunkManagerIfExists(OperationContext* txn,
+                                                                const string& ns,
+                                                                bool shouldReload,
+                                                                bool forceReload) {
     // Don't report exceptions here as errors in GetLastError
     LastError::Disabled ignoreForGLE(&LastError::get(cc()));
 
@@ -276,13 +276,15 @@ std::shared_ptr<ChunkManager> DBConfig::getChunkManager(OperationContext* txn,
     ChunkVersion oldVersion;
     ChunkManagerPtr oldManager;
 
+    const auto currentReloadIteration = _reloadCount.load();
+
     {
         stdx::lock_guard<stdx::mutex> lk(_lock);
 
         bool earlyReload = !_collections[ns].isSharded() && (shouldReload || forceReload);
         if (earlyReload) {
             // This is to catch cases where there this is a new sharded collection
-            _load(txn);
+            _loadIfNeeded(txn, currentReloadIteration);
         }
 
         CollectionInfo& ci = _collections[ns];
@@ -431,11 +433,16 @@ void DBConfig::setPrimary(OperationContext* txn, const ShardId& newPrimaryId) {
 }
 
 bool DBConfig::load(OperationContext* txn) {
+    const auto currentReloadIteration = _reloadCount.load();
     stdx::lock_guard<stdx::mutex> lk(_lock);
-    return _load(txn);
+    return _loadIfNeeded(txn, currentReloadIteration);
 }
 
-bool DBConfig::_load(OperationContext* txn) {
+bool DBConfig::_loadIfNeeded(OperationContext* txn, Counter reloadIteration) {
+    if (reloadIteration != _reloadCount.load()) {
+        return true;
+    }
+
     auto status = grid.catalogManager(txn)->getDatabase(txn, _name);
     if (status == ErrorCodes::NamespaceNotFound) {
         return false;
@@ -483,6 +490,8 @@ bool DBConfig::_load(OperationContext* txn) {
     LOG(2) << "found " << numCollsSharded << " collections left and " << numCollsErased
            << " collections dropped for database " << _name;
 
+    _reloadCount.fetchAndAdd(1);
+
     return true;
 }
 
@@ -509,10 +518,11 @@ void DBConfig::_save(OperationContext* txn, bool db, bool coll) {
 
 bool DBConfig::reload(OperationContext* txn) {
     bool successful = false;
+    const auto currentReloadIteration = _reloadCount.load();
 
     {
         stdx::lock_guard<stdx::mutex> lk(_lock);
-        successful = _load(txn);
+        successful = _loadIfNeeded(txn, currentReloadIteration);
     }
 
     // If we aren't successful loading the database entry, we don't want to keep the stale
