@@ -47,16 +47,16 @@ failure.  By setting this value to false, the old behavior is enabled.
 
 Command Line:
 ```
---setParameter internalQueryPlannerEnableIndexIntersection={0|1}
+--setParameter internalQueryPlannerEnableIndexIntersection={true|false}
 ```
 
 Configuration File:
 ```
 setParameter:
-  internalQueryPlannerEnableIndexIntersection: {0|1}
+  internalQueryPlannerEnableIndexIntersection: {true|false}
 ```
 
-Default Value: 1
+Default Value: true
 
 Due to changes introduced in MongoDB 2.6.4, some queries that reference
 multiple indexed fields where one field matches no documents will choose
