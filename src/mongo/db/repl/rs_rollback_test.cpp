@@ -33,6 +33,7 @@
 #include <list>
 #include <utility>
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -53,6 +54,7 @@
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/rs_rollback.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
@@ -148,6 +150,7 @@ void RSRollbackTest::setUp() {
         mongo::storageGlobalParams.dbpath = tempDir.path();
         mongo::storageGlobalParams.engine = "ephemeralForTest";
         mongo::storageGlobalParams.engineSetByUser = true;
+        checked_cast<ServiceContextMongoD*>(getGlobalServiceContext())->createLockFile();
         serviceContext->initializeGlobalStorageEngine();
     }
 

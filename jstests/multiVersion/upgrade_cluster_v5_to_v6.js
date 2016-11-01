@@ -45,7 +45,8 @@ var cantStartMongos = function(options) {
             sleep(1000);
         }
     }
-    MongoRunner.stopMongos(mongos);
+    MongoRunner.stopMongos(mongos, undefined,
+        { allowedExitCodes: [ MongoRunner.EXIT_BADOPTIONS ] });
     return true;
 
 }
@@ -126,14 +127,6 @@ jsTest.log("Upgraded to 3.2 cluster")
 //
 // Verify cluster version is correct
 //
-
-// Make sure that you can't run 2.4 mongos
-mongos = MongoRunner.runMongos({
-    binVersion : "2.4",
-    configdb : configConnStr,
-    nohttpinterface: ""
-});
-assert.eq(null, mongos);
 
 // Make sure that you can run 2.6 mongos
 mongos = MongoRunner.runMongos({ binVersion : "2.6", configdb : configConnStr });

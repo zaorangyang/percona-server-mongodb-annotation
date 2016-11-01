@@ -1,4 +1,11 @@
-var wait, occasionally, reconnect, getLatestOp, waitForAllMembers, reconfig, awaitOpTime;
+var wait;
+var occasionally;
+var reconnect;
+var getLatestOp;
+var waitForAllMembers;
+var reconfig;
+var awaitOpTime;
+var startSetIfSupportsReadMajority;
 var waitUntilAllNodesCaughtUp;
 
 (function () {
@@ -153,8 +160,10 @@ awaitOpTime = function (node, opTime) {
 /**
  * Uses the results of running replSetGetStatus against an arbitrary replset node to wait until
  * all nodes in the set are replicated through the same optime.
+ * 'rs' is an array of connections to replica set nodes.  This function is useful when you
+ * don't have a ReplSetTest object to use, otherwise ReplSetTest.awaitReplication is preferred.
  */
-waitUntilAllNodesCaughtUp = function(rs) {
+waitUntilAllNodesCaughtUp = function(rs, timeout) {
     var rsStatus;
     var firstConflictingIndex;
     var ot;
@@ -178,7 +187,28 @@ waitUntilAllNodesCaughtUp = function(rs) {
     }, function () {
         return "Optimes of members 0 (" + tojson(ot) + ") and " + firstConflictingIndex + " (" +
             tojson(otherOt) + ") are different in " + tojson(rsStatus);
-    });
+    }, timeout);
+};
+
+/**
+ * Starts each node in the given replica set if the storage engine supports readConcern 'majority'.
+ * Returns true if the replica set was started successfully and false otherwise.
+ *
+ * @param replSetTest - The instance of {@link ReplSetTest} to start
+ * @param options - The options passed to {@link ReplSetTest.startSet}
+ */
+startSetIfSupportsReadMajority = function (replSetTest, options) {
+    try {
+        replSetTest.startSet(options);
+    } catch (e) {
+        var conn = MongoRunner.runMongod();
+        if (!conn.getDB("admin").serverStatus().storageEngine.supportsCommittedReads) {
+            MongoRunner.stopMongod(conn);
+            return false;
+        }
+        throw e;
+    }
+    return true;
 };
 
 }());

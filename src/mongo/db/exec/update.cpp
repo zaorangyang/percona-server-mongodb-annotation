@@ -378,29 +378,34 @@ inline Status validate(const BSONObj& original,
     return Status::OK();
 }
 
-Status ensureIdAndFirst(mb::Document& doc) {
-    mb::Element idElem = mb::findFirstChildNamed(doc.root(), idFieldName);
+Status ensureIdFieldIsFirst(mb::Document* doc) {
+    mb::Element idElem = mb::findFirstChildNamed(doc->root(), idFieldName);
 
-    // Move _id as first element if it exists
-    if (idElem.ok()) {
-        if (idElem.leftSibling().ok()) {
-            Status s = idElem.remove();
-            if (!s.isOK())
-                return s;
-            s = doc.root().pushFront(idElem);
-            if (!s.isOK())
-                return s;
-        }
-    } else {
-        // Create _id if the document does not currently have one.
-        idElem = doc.makeElementNewOID(idFieldName);
-        if (!idElem.ok())
-            return Status(
-                ErrorCodes::BadValue, "Could not create new _id ObjectId element.", 17268);
-        Status s = doc.root().pushFront(idElem);
+    if (!idElem.ok()) {
+        return {ErrorCodes::InvalidIdField, "_id field is missing"};
+    }
+
+    if (idElem.leftSibling().ok()) {
+        // Move '_id' to be the first element
+        Status s = idElem.remove();
+        if (!s.isOK())
+            return s;
+        s = doc->root().pushFront(idElem);
         if (!s.isOK())
             return s;
     }
+
+    return Status::OK();
+}
+
+Status addObjectIDIdField(mb::Document* doc) {
+    const auto idElem = doc->makeElementNewOID(idFieldName);
+    if (!idElem.ok())
+        return {ErrorCodes::BadValue, "Could not create new ObjectId '_id' field.", 17268};
+
+    const auto s = doc->root().pushFront(idElem);
+    if (!s.isOK())
+        return s;
 
     return Status::OK();
 }
@@ -484,8 +489,20 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
         uasserted(16837, status.reason());
     }
 
-    // Ensure _id exists and is first
-    uassertStatusOK(ensureIdAndFirst(_doc));
+    // Skip adding _id field if the collection is capped (since capped collection documents can
+    // neither grow nor shrink).
+    const auto createIdField = !_collection->isCapped();
+
+    // Ensure if _id exists it is first
+    status = ensureIdFieldIsFirst(&_doc);
+    if (status.code() == ErrorCodes::InvalidIdField) {
+        // Create ObjectId _id field if we are doing that
+        if (createIdField) {
+            uassertStatusOK(addObjectIDIdField(&_doc));
+        }
+    } else {
+        uassertStatusOK(status);
+    }
 
     // See if the changes were applied in place
     const char* source = NULL;
@@ -525,7 +542,8 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                 newObj = oldObj.value();
                 const RecordData oldRec(oldObj.value().objdata(), oldObj.value().objsize());
                 BSONObj idQuery = driver->makeOplogEntryQuery(newObj, request->isMulti());
-                oplogUpdateEntryArgs args;
+                OplogUpdateEntryArgs args;
+                args.ns = _collection->ns().ns();
                 args.update = logObj;
                 args.criteria = idQuery;
                 args.fromMigrate = request->isFromMigration();
@@ -535,7 +553,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                     Snapshotted<RecordData>(oldObj.snapshotId(), oldRec),
                     source,
                     _damages,
-                    args);
+                    &args);
                 newObj = uassertStatusOK(std::move(newRecStatus)).releaseToBson();
             }
 
@@ -554,7 +572,8 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
             if (!request->isExplain()) {
                 invariant(_collection);
                 BSONObj idQuery = driver->makeOplogEntryQuery(newObj, request->isMulti());
-                oplogUpdateEntryArgs args;
+                OplogUpdateEntryArgs args;
+                args.ns = _collection->ns().ns();
                 args.update = logObj;
                 args.criteria = idQuery;
                 args.fromMigrate = request->isFromMigration();
@@ -565,7 +584,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                                                                        true,
                                                                        driver->modsAffectIndices(),
                                                                        _params.opDebug,
-                                                                       args);
+                                                                       &args);
                 uassertStatusOK(res.getStatus());
                 newLoc = res.getValue();
             }
@@ -641,7 +660,11 @@ Status UpdateStage::applyUpdateOpsForInsert(const CanonicalQuery* cq,
     }
 
     // Ensure _id exists and is first
-    Status idAndFirstStatus = ensureIdAndFirst(*doc);
+    auto idAndFirstStatus = ensureIdFieldIsFirst(doc);
+    if (idAndFirstStatus.code() == ErrorCodes::InvalidIdField) {  // _id field is missing
+        idAndFirstStatus = addObjectIDIdField(doc);
+    }
+
     if (!idAndFirstStatus.isOK()) {
         return idAndFirstStatus;
     }
@@ -728,12 +751,7 @@ bool UpdateStage::isEOF() {
     return doneUpdating() && !needInsert();
 }
 
-PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
@@ -758,7 +776,6 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
                 member->obj = Snapshotted<BSONObj>(getOpCtx()->recoveryUnit()->getSnapshotId(),
                                                    newObj.getOwned());
                 member->transitionToOwnedObj();
-                ++_commonStats.advanced;
                 return PlanStage::ADVANCED;
             }
         }
@@ -785,7 +802,6 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
 
         *out = _idReturning;
         _idReturning = WorkingSet::INVALID_ID;
-        ++_commonStats.advanced;
         return PlanStage::ADVANCED;
     }
 
@@ -811,19 +827,7 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
 
         if (!member->hasLoc()) {
             // We expect to be here because of an invalidation causing a force-fetch.
-
-            // When we're doing a findAndModify with a sort, the sort will have a limit of 1, so
-            // will not produce any more results even if there is another matching document.
-            // Throw a WCE here so that these operations get another chance to find a matching
-            // document. The findAndModify command should automatically retry if it gets a WCE. The
-            // findAndModify command should automatically retry if it gets a WCE.
-            // TODO: this is not necessary if there was no sort specified.
-            if (_params.request->shouldReturnAnyDocs()) {
-                throw WriteConflictException();
-            }
-
             ++_specificStats.nInvalidateSkips;
-            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
         loc = member->loc;
@@ -837,7 +841,6 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
             // Found a loc that refers to a document we had already updated. Note that
             // we can never remove from _updatedLocs because updates by other clients
             // could cause us to encounter a document again later.
-            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
 
@@ -848,7 +851,6 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
                 // our snapshot has changed, refetch
                 if (!WorkingSetCommon::fetch(getOpCtx(), _ws, id, cursor)) {
                     // document was deleted, we're done here
-                    ++_commonStats.needTime;
                     return PlanStage::NEED_TIME;
                 }
 
@@ -856,7 +858,6 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
                 CanonicalQuery* cq = _params.canonicalQuery;
                 if (cq && !cq->root()->matchesBSON(member->obj.value(), NULL)) {
                     // doesn't match predicates anymore!
-                    ++_commonStats.needTime;
                     return PlanStage::NEED_TIME;
                 }
             }
@@ -910,7 +911,6 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
             _idRetrying = id;
             memberFreer.Dismiss();  // Keep this member around so we can retry updating it.
             *out = WorkingSet::INVALID_ID;
-            _commonStats.needYield++;
             return NEED_YIELD;
         }
 
@@ -936,7 +936,6 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
                 memberFreer.Dismiss();
             }
             *out = WorkingSet::INVALID_ID;
-            _commonStats.needYield++;
             return NEED_YIELD;
         }
 
@@ -946,16 +945,13 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
 
             memberFreer.Dismiss();  // Keep this member around so we can return it.
             *out = id;
-            ++_commonStats.advanced;
             return PlanStage::ADVANCED;
         }
 
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     } else if (PlanStage::IS_EOF == status) {
         // The child is out of results, but we might not be done yet because we still might
         // have to do an insert.
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     } else if (PlanStage::FAILURE == status) {
         *out = id;
@@ -968,10 +964,7 @@ PlanStage::StageState UpdateStage::work(WorkingSetID* out) {
             return PlanStage::FAILURE;
         }
         return status;
-    } else if (PlanStage::NEED_TIME == status) {
-        ++_commonStats.needTime;
     } else if (PlanStage::NEED_YIELD == status) {
-        ++_commonStats.needYield;
         *out = id;
     }
 
