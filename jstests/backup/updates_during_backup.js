@@ -1,11 +1,12 @@
 // Check that updates don't fail during backup.
 load('jstests/backup/_backup_helpers.js');
 
+var sleepTime = 2500;
 var updateWorkers = 3;
 // The minimum speed ratio backup should have compared to normal
 // performance. Otherwise it's not 'hot' as writes are blocked for
 // sufficient time.
-var backupSpeedRatio = 0.7;
+var backupSpeedRatio = 0.25;
 
 function countObjs(conn) {
     // Just go through all possible database names.
@@ -44,7 +45,6 @@ function countObjs(conn) {
     }
 
     // Wait for filling in some data.
-    var sleepTime = 1000;
     sleep(sleepTime);
 
     // Create backup.
