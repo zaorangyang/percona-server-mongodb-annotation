@@ -106,15 +106,17 @@ public:
 
         // Use the runner to count the number of objects scanned.
         int count = 0;
-        for (BSONObj obj; PlanExecutor::ADVANCED == exec->getNext(&obj, NULL);) {
+        PlanExecutor::ExecState state;
+        for (BSONObj obj; PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL));) {
             ++count;
         }
+        ASSERT_EQUALS(PlanExecutor::IS_EOF, state);
         return count;
     }
 
-    void getLocs(Collection* collection,
-                 CollectionScanParams::Direction direction,
-                 vector<RecordId>* out) {
+    void getRecordIds(Collection* collection,
+                      CollectionScanParams::Direction direction,
+                      vector<RecordId>* out) {
         WorkingSet ws;
 
         CollectionScanParams params;
@@ -128,8 +130,8 @@ public:
             PlanStage::StageState state = scan->work(&id);
             if (PlanStage::ADVANCED == state) {
                 WorkingSetMember* member = ws.get(id);
-                verify(member->hasLoc());
-                out->push_back(member->loc);
+                verify(member->hasRecordId());
+                out->push_back(member->recordId);
             }
         }
     }
@@ -220,12 +222,13 @@ public:
         unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         int count = 0;
-        for (BSONObj obj; PlanExecutor::ADVANCED == exec->getNext(&obj, NULL);) {
+        PlanExecutor::ExecState state;
+        for (BSONObj obj; PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL));) {
             // Make sure we get the objects in the order we want
             ASSERT_EQUALS(count, obj["foo"].numberInt());
             ++count;
         }
-
+        ASSERT_EQUALS(PlanExecutor::IS_EOF, state);
         ASSERT_EQUALS(numObj(), count);
     }
 };
@@ -253,11 +256,12 @@ public:
         unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         int count = 0;
-        for (BSONObj obj; PlanExecutor::ADVANCED == exec->getNext(&obj, NULL);) {
+        PlanExecutor::ExecState state;
+        for (BSONObj obj; PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL));) {
             ++count;
             ASSERT_EQUALS(numObj() - count, obj["foo"].numberInt());
         }
-
+        ASSERT_EQUALS(PlanExecutor::IS_EOF, state);
         ASSERT_EQUALS(numObj(), count);
     }
 };
@@ -275,8 +279,8 @@ public:
         Collection* coll = ctx.getCollection();
 
         // Get the RecordIds that would be returned by an in-order scan.
-        vector<RecordId> locs;
-        getLocs(coll, CollectionScanParams::FORWARD, &locs);
+        vector<RecordId> recordIds;
+        getRecordIds(coll, CollectionScanParams::FORWARD, &recordIds);
 
         // Configure the scan.
         CollectionScanParams params;
@@ -293,23 +297,23 @@ public:
             PlanStage::StageState state = scan->work(&id);
             if (PlanStage::ADVANCED == state) {
                 WorkingSetMember* member = ws.get(id);
-                ASSERT_EQUALS(coll->docFor(&_txn, locs[count]).value()["foo"].numberInt(),
+                ASSERT_EQUALS(coll->docFor(&_txn, recordIds[count]).value()["foo"].numberInt(),
                               member->obj.value()["foo"].numberInt());
                 ++count;
             }
         }
 
-        // Remove locs[count].
+        // Remove recordIds[count].
         scan->saveState();
         {
             WriteUnitOfWork wunit(&_txn);
-            scan->invalidate(&_txn, locs[count], INVALIDATION_DELETION);
+            scan->invalidate(&_txn, recordIds[count], INVALIDATION_DELETION);
             wunit.commit();  // to avoid rollback of the invalidate
         }
-        remove(coll->docFor(&_txn, locs[count]).value());
+        remove(coll->docFor(&_txn, recordIds[count]).value());
         scan->restoreState();
 
-        // Skip over locs[count].
+        // Skip over recordIds[count].
         ++count;
 
         // Expect the rest.
@@ -318,7 +322,7 @@ public:
             PlanStage::StageState state = scan->work(&id);
             if (PlanStage::ADVANCED == state) {
                 WorkingSetMember* member = ws.get(id);
-                ASSERT_EQUALS(coll->docFor(&_txn, locs[count]).value()["foo"].numberInt(),
+                ASSERT_EQUALS(coll->docFor(&_txn, recordIds[count]).value()["foo"].numberInt(),
                               member->obj.value()["foo"].numberInt());
                 ++count;
             }
@@ -340,8 +344,8 @@ public:
         Collection* coll = ctx.getCollection();
 
         // Get the RecordIds that would be returned by an in-order scan.
-        vector<RecordId> locs;
-        getLocs(coll, CollectionScanParams::BACKWARD, &locs);
+        vector<RecordId> recordIds;
+        getRecordIds(coll, CollectionScanParams::BACKWARD, &recordIds);
 
         // Configure the scan.
         CollectionScanParams params;
@@ -358,23 +362,23 @@ public:
             PlanStage::StageState state = scan->work(&id);
             if (PlanStage::ADVANCED == state) {
                 WorkingSetMember* member = ws.get(id);
-                ASSERT_EQUALS(coll->docFor(&_txn, locs[count]).value()["foo"].numberInt(),
+                ASSERT_EQUALS(coll->docFor(&_txn, recordIds[count]).value()["foo"].numberInt(),
                               member->obj.value()["foo"].numberInt());
                 ++count;
             }
         }
 
-        // Remove locs[count].
+        // Remove recordIds[count].
         scan->saveState();
         {
             WriteUnitOfWork wunit(&_txn);
-            scan->invalidate(&_txn, locs[count], INVALIDATION_DELETION);
+            scan->invalidate(&_txn, recordIds[count], INVALIDATION_DELETION);
             wunit.commit();  // to avoid rollback of the invalidate
         }
-        remove(coll->docFor(&_txn, locs[count]).value());
+        remove(coll->docFor(&_txn, recordIds[count]).value());
         scan->restoreState();
 
-        // Skip over locs[count].
+        // Skip over recordIds[count].
         ++count;
 
         // Expect the rest.
@@ -383,7 +387,7 @@ public:
             PlanStage::StageState state = scan->work(&id);
             if (PlanStage::ADVANCED == state) {
                 WorkingSetMember* member = ws.get(id);
-                ASSERT_EQUALS(coll->docFor(&_txn, locs[count]).value()["foo"].numberInt(),
+                ASSERT_EQUALS(coll->docFor(&_txn, recordIds[count]).value()["foo"].numberInt(),
                               member->obj.value()["foo"].numberInt());
                 ++count;
             }

@@ -40,6 +40,7 @@
 namespace mongo {
 
 class DatabaseCatalogEntry;
+class JournalListener;
 class OperationContext;
 class RecoveryUnit;
 class SnapshotManager;
@@ -66,10 +67,11 @@ public:
         virtual ~Factory() {}
 
         /**
-         * Return a new instance of the StorageEngine.  Caller owns the returned pointer.
+         * Return a new instance of the StorageEngine. The lockFile parameter may be null if
+         * params.readOnly is set. Caller owns the returned pointer.
          */
         virtual StorageEngine* create(const StorageGlobalParams& params,
-                                      const StorageEngineLockFile& lockFile) const = 0;
+                                      const StorageEngineLockFile* lockFile) const = 0;
 
         /**
          * Returns the name of the storage engine.
@@ -266,6 +268,12 @@ public:
     virtual SnapshotManager* getSnapshotManager() const {
         return nullptr;
     }
+
+    /**
+     * Sets a new JournalListener, which is used by the storage engine to alert the rest of the
+     * system about journaled write progress.
+     */
+    virtual void setJournalListener(JournalListener* jl) = 0;
 
 protected:
     /**

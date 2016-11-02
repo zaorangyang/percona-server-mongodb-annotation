@@ -41,6 +41,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/path.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
@@ -278,16 +279,15 @@ Status RegexMatchExpression::init(StringData path, StringData regex, StringData 
 }
 
 bool RegexMatchExpression::matchesSingleElement(const BSONElement& e) const {
-    // log() << "RegexMatchExpression::matchesSingleElement _regex: " << _regex << " e: " << e <<
-    // std::endl;
     switch (e.type()) {
         case String:
-        case Symbol:
-            // TODO
-            // if (rm._prefix.empty())
-            return _re->PartialMatch(e.valuestr());
-        // else
-        // return !strncmp(e.valuestr(), rm._prefix.c_str(), rm._prefix.size());
+        case Symbol: {
+            // String values stored in documents can contain embedded NUL bytes. We construct a
+            // pcrecpp::StringPiece instance using the full length of the string to avoid truncating
+            // 'data' early.
+            pcrecpp::StringPiece data(e.valuestr(), e.valuestrsize() - 1);
+            return _re->PartialMatch(data);
+        }
         case RegEx:
             return _regex == e.regex() && _flags == e.regexFlags();
         default:
@@ -420,9 +420,14 @@ const std::unordered_map<std::string, BSONType> TypeMatchExpression::typeAliasMa
     {"maxKey", MaxKey},
     {"minKey", MinKey}};
 
-Status TypeMatchExpression::initWithBSONType(StringData path, BSONType type) {
+Status TypeMatchExpression::initWithBSONType(StringData path, int type) {
+    if (!isValidBSONType(type)) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Invalid numerical $type code: " << type);
+    }
+
     _path = path;
-    _type = type;
+    _type = static_cast<BSONType>(type);
     return _elementPath.init(_path);
 }
 

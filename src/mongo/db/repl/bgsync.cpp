@@ -242,7 +242,7 @@ void BackgroundSync::_producerThread() {
     }
 
     // We need to wait until initial sync has started.
-    if (_replCoord->getMyLastOptime().isNull()) {
+    if (_replCoord->getMyLastAppliedOpTime().isNull()) {
         sleepsecs(1);
         return;
     }
@@ -342,7 +342,7 @@ void BackgroundSync::_produce(OperationContext* txn) {
     cmdBob.append("tailable", true);
     cmdBob.append("oplogReplay", true);
     cmdBob.append("awaitData", true);
-    cmdBob.append("maxTimeMS", durationCount<Milliseconds>(fetcherMaxTimeMS));
+    cmdBob.append("maxTimeMS", durationCount<Milliseconds>(Minutes(1)));  // 1 min initial find.
 
     BSONObjBuilder metadataBob;
     if (isV1ElectionProtocol) {
@@ -410,11 +410,11 @@ void BackgroundSync::_produce(OperationContext* txn) {
         log() << "Starting rollback due to " << fetcherReturnStatus;
 
         // Wait till all buffered oplog entries have drained and been applied.
-        auto lastApplied = _replCoord->getMyLastOptime();
+        auto lastApplied = _replCoord->getMyLastAppliedOpTime();
         if (lastApplied != lastOpTimeFetched) {
             log() << "Waiting for all operations from " << lastApplied << " until "
                   << lastOpTimeFetched << " to be applied before starting rollback.";
-            while (lastOpTimeFetched > (lastApplied = _replCoord->getMyLastOptime())) {
+            while (lastOpTimeFetched > (lastApplied = _replCoord->getMyLastAppliedOpTime())) {
                 sleepmillis(10);
                 if (isStopped() || inShutdown()) {
                     return;
@@ -450,21 +450,24 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
     // if target cut connections between connecting and querying (for
     // example, because it stepped down) we might not have a cursor
     if (!result.isOK()) {
+        LOG(2) << "Error returned from oplog query: " << result.getStatus();
         return;
     }
 
     if (inShutdown()) {
+        LOG(2) << "Interrupted by shutdown while querying oplog. 1";  // 1st instance.
         return;
     }
 
     // Check if we have been stopped.
     if (isStopped()) {
+        LOG(2) << "Interrupted by stop request while querying the oplog. 1";  // 1st instance.
         return;
     }
 
     const auto& queryResponse = result.getValue();
     bool syncSourceHasSyncSource = false;
-    OpTime sourcesLastOp;
+    OpTime sourcesLastOpTime;
 
     // Forward metadata (containing liveness information) to replication coordinator.
     bool receivedMetadata =
@@ -483,7 +486,7 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
             _replCoord->cancelAndRescheduleElectionTimeout();
         }
         syncSourceHasSyncSource = metadata.getSyncSourceIndex() != -1;
-        sourcesLastOp = metadata.getLastOpVisible();
+        sourcesLastOpTime = metadata.getLastOpVisible();
     }
 
     const auto& documents = queryResponse.documents;
@@ -520,7 +523,8 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
 
     // No work to do if we are draining/primary.
     if (_replCoord->isWaitingForApplierToDrain() || _replCoord->getMemberState().primary()) {
-        LOG(1) << "waiting for draining or we are primary, not adding more ops to buffer";
+        LOG(2) << "Interrupted by waiting for applier to drain "
+               << "or becoming primary while querying the oplog. 1";  // 1st instance.
         return;
     }
 
@@ -531,6 +535,7 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
         stdx::unique_lock<stdx::mutex> lock(_mutex);
         // If we are stopped then return without queueing this batch to apply.
         if (_stopped) {
+            LOG(2) << "Interrupted by stop request while querying the oplog. 2";  // 2nd instance.
             return;
         }
         lastTS = _lastOpTimeFetched.getTimestamp();
@@ -620,50 +625,44 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
     }
 
     if (inShutdown()) {
+        LOG(2) << "Interrupted by shutdown while querying oplog. 2";  // 2nd instance.
         return;
     }
 
     // If we are transitioning to primary state, we need to leave
     // this loop in order to go into bgsync-stop mode.
     if (_replCoord->isWaitingForApplierToDrain() || _replCoord->getMemberState().primary()) {
+        LOG(2) << "Interrupted by waiting for applier to drain "
+               << "or becoming primary while querying the oplog. 2";  // 2nd instance.
         return;
     }
 
     // re-evaluate quality of sync target
-    if (_shouldChangeSyncSource(source, sourcesLastOp, syncSourceHasSyncSource)) {
+    if (getSyncTarget().empty() ||
+        _replCoord->shouldChangeSyncSource(source, sourcesLastOpTime, syncSourceHasSyncSource)) {
+        LOG(1) << "Cancelling oplog query because we have to choose a sync source. Current source: "
+               << source << ", OpTime" << sourcesLastOpTime
+               << ", hasSyncSource:" << syncSourceHasSyncSource;
         return;
     }
 
     // Check if we have been stopped.
     if (isStopped()) {
+        LOG(2) << "Interrupted by a stop request while fetching the oplog so starting a new query.";
         return;
     }
 
-    // We fill in 'bob' to signal the fetcher to process with another getMore.
-    invariant(bob);
-    bob->append("getMore", queryResponse.cursorId);
-    bob->append("collection", queryResponse.nss.coll());
-    bob->append("maxTimeMS", durationCount<Milliseconds>(fetcherMaxTimeMS));
-    if (receivedMetadata) {
-        bob->append("term", _replCoord->getTerm());
-        _replCoord->getLastCommittedOpTime().append(bob, "lastKnownCommittedOpTime");
+    // We fill in 'bob' to signal the fetcher to process with another getMore, if needed.
+    if (bob) {
+        bob->append("getMore", queryResponse.cursorId);
+        bob->append("collection", queryResponse.nss.coll());
+        bob->append("maxTimeMS", durationCount<Milliseconds>(fetcherMaxTimeMS));
+        if (receivedMetadata) {
+            bob->append("term", _replCoord->getTerm());
+            _replCoord->getLastCommittedOpTime().append(bob, "lastKnownCommittedOpTime");
+        }
     }
 }
-
-bool BackgroundSync::_shouldChangeSyncSource(const HostAndPort& syncSource,
-                                             const OpTime& syncSourceLastOpTime,
-                                             bool syncSourceHasSyncSource) {
-    // is it even still around?
-    if (getSyncTarget().empty() || syncSource.empty()) {
-        return true;
-    }
-
-    // check other members: is any member's optime more than MaxSyncSourceLag seconds
-    // ahead of the current sync source?
-    return _replCoord->shouldChangeSyncSource(
-        syncSource, syncSourceLastOpTime, syncSourceHasSyncSource);
-}
-
 
 bool BackgroundSync::peek(BSONObj* op) {
     return _buffer.peek(*op);
@@ -734,7 +733,7 @@ void BackgroundSync::start(OperationContext* txn) {
     _stopped = false;
 
     // reset _last fields with current oplog data
-    _lastOpTimeFetched = _replCoord->getMyLastOptime();
+    _lastOpTimeFetched = _replCoord->getMyLastAppliedOpTime();
     _lastFetchedHash = lastFetchedHash;
 
     LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched << " " << _lastFetchedHash;
@@ -774,7 +773,8 @@ long long BackgroundSync::_readLastAppliedHash(OperationContext* txn) {
     BSONElement hashElement = oplogEntry[hashFieldName];
     if (hashElement.eoo()) {
         severe() << "Most recent entry in " << rsOplogName << " missing \"" << hashFieldName
-                 << "\" field";
+                 << "\" field. Oplog entry: " << oplogEntry;
+
         fassertFailed(18902);
     }
     if (hashElement.type() != NumberLong) {

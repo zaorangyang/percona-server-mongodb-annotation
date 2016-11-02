@@ -27,7 +27,7 @@ assert.writeOK(bulk.execute({w: 3}));
 assert.commandWorked(s.s.adminCommand({ shardcollection: "test.foo" , key: { _id: 1 } }));
 
 jsTest.log("Waiting for balance to complete");
-s.awaitBalance('foo', 'test', 2 * 60 * 1000);
+s.awaitBalance('foo', 'test', 3 * 60 * 1000);
 
 jsTest.log("Stopping balancer");
 s.stopBalancer();
@@ -46,14 +46,14 @@ s._rs.forEach(function(rsNode) {
     }
 });
 
-assert.eq( num , db.foo.find().count() , "C1" )
-assert.eq( num , db.foo.find().itcount() , "C2" )
-assert.eq( num , db.foo.find().sort( { _id : 1 } ).itcount() , "C3" )
-assert.eq( num , db.foo.find().sort( { _id : -1 } ).itcount() , "C4" )
+assert.eq( num , db.foo.find().count() , "C1" );
+assert.eq( num , db.foo.find().itcount() , "C2" );
+assert.eq( num , db.foo.find().sort( { _id : 1 } ).itcount() , "C3" );
+assert.eq( num , db.foo.find().sort( { _id : -1 } ).itcount() , "C4" );
 
 db.foo.ensureIndex( { x : 1 } );
-assert.eq( num , db.foo.find().sort( { x : 1 } ).itcount() , "C5" )
-assert.eq( num , db.foo.find().sort( { x : -1 } ).itcount() , "C6" )
+assert.eq( num , db.foo.find().sort( { x : 1 } ).itcount() , "C5" );
+assert.eq( num , db.foo.find().sort( { x : -1 } ).itcount() , "C6" );
 
 s.stop();
 

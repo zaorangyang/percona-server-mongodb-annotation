@@ -20,6 +20,7 @@ var roles = [
     {key: "dbAdminAnyDatabase", role: "dbAdminAnyDatabase", dbname: adminDbName},
     {key: "clusterAdmin", role: "clusterAdmin", dbname: adminDbName},
     {key: "dbOwner", role: "dbOwner", dbname: firstDbName},
+    {key: "enableSharding", role: "enableSharding", dbname: firstDbName},
     {key: "clusterMonitor", role: "clusterMonitor", dbname: adminDbName},
     {key: "hostManager", role: "hostManager", dbname: adminDbName},
     {key: "clusterManager", role: "clusterManager", dbname: adminDbName},
@@ -147,11 +148,11 @@ function checkForNonExistentRoles() {
 var opts = {
     auth:"",
     enableExperimentalStorageDetailsCmd: ""
-}
+};
 var impls = {
     createUsers: createUsers,
     runOneTest: runOneTest
-}
+};
 
 checkForNonExistentRoles();
 

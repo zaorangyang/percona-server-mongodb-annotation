@@ -94,7 +94,7 @@ ReplSetTest = function ReplSetTestWithContinuousPrimaryStepdown() {
         }
         options.verbose = 2;
         return _originalStartSetFn.call(this, options);
-    }
+    };
 
     /**
      * Overrides the stopSet call so it terminates the failover thread.
@@ -111,16 +111,6 @@ ReplSetTest = function ReplSetTestWithContinuousPrimaryStepdown() {
         if (_scopedPrimaryStepdownThread) {
             throw new Error('Continuous failover thread is already active');
         }
-
-        // Reduce electionTimeoutMillis to 5 seconds, from 10, so that chunk migrations don't
-        // time out because of the CSRS primary being down so often for so long.
-        print('Reducing electionTimeoutMillis to 5 seconds');
-        var rsconfig = this.getConfigFromPrimary();
-        rsconfig.version++;
-        rsconfig.settings.electionTimeoutMillis = 5000;
-        reconfig(this, rsconfig);
-        assert.eq(this.getConfigFromPrimary().settings.electionTimeoutMillis, 5000, 
-                  "Failed to lower the electionTimeoutMillis to 5000 milliseconds");
 
         _scopedPrimaryStepdownThreadStopCounter = new CountDownLatch(1);
         _scopedPrimaryStepdownThread = new ScopedThread(_continuousPrimaryStepdownFn,
@@ -166,6 +156,14 @@ ShardingTest = function ShardingTestWithContinuousConfigPrimaryStepdown() {
     }
     arguments[0].other.shardOptions.verbose = 2;
 
+    // Set electionTimeoutMillis to 5 seconds, from 10, so that chunk migrations don't
+    // time out because of the CSRS primary being down so often for so long.
+    arguments[0].configReplSetTestOptions = Object.merge(arguments[0].configReplSetTestOptions, {
+        settings: {
+            electionTimeoutMillis: 5000,
+        },
+    });
+
     // Construct the original object
     originalShardingTest.apply(this, arguments);
 
@@ -179,7 +177,10 @@ ShardingTest = function ShardingTestWithContinuousConfigPrimaryStepdown() {
      */
     this.printShardingStatus = function() {
 
-    }
+    };
+
+    assert.eq(this.configRS.getConfigFromPrimary().settings.electionTimeoutMillis, 5000,
+        "Failed to set the electionTimeoutMillis to 5000 milliseconds");
 
     // Start the continuous config server stepdown thread
     this.configRS.startContinuousFailover();

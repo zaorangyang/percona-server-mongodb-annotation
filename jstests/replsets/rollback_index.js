@@ -18,7 +18,7 @@ doesEntryMatch = function(array, regex) {
         }
     }
     return found;
-}
+};
 
 // set up a set and grab things for later
 var name = "rollback_index";
@@ -78,7 +78,7 @@ replTest.awaitReplication();
 replTest.awaitSecondaryNodes();
 
 // Perform a write that should succeed if there's no unique index on B.
-options = {writeConcern: {w: 'majority', wtimeout: 10000}};
+options = {writeConcern: {w: 'majority', wtimeout: 60000}};
 assert.writeOK(a_conn.getDB(name).foo.insert({x: 1}, options));
 
 // Check collections and indexes.

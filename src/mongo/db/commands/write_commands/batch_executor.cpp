@@ -293,7 +293,8 @@ void WriteBatchExecutor::executeBatch(const BatchedCommandRequest& request,
 
     const WriteConcernOptions& writeConcern = _txn->getWriteConcern();
     bool silentWC = writeConcern.wMode.empty() && writeConcern.wNumNodes == 0 &&
-        writeConcern.syncMode == WriteConcernOptions::NONE;
+        (writeConcern.syncMode == WriteConcernOptions::SyncMode::NONE ||
+         writeConcern.syncMode == WriteConcernOptions::SyncMode::UNSET);
 
     Timer commandTimer;
 
@@ -817,6 +818,12 @@ void WriteBatchExecutor::execInserts(const BatchedCommandRequest& request,
         currentOp->debug().ninserted = 0;
     }
 
+    auto client = _txn->getClient();
+    auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
+    ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
+                                                &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
+                                                _txn);
+
     int64_t chunkCount = 0;
     int64_t chunkBytes = 0;
     const int64_t chunkMaxCount = internalQueryExecYieldIterations / 2;
@@ -851,6 +858,13 @@ void WriteBatchExecutor::execInserts(const BatchedCommandRequest& request,
             if (stop)
                 break;
         }
+    }
+
+    if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
+        // If this operation has already generated a new lastOp, don't bother setting it
+        // here. No-op updates will not generate a new lastOp, so we still need the guard to
+        // fire in that case.
+        lastOpSetterGuard.Dismiss();
     }
 
     // TODO: Move Top and CurOp metrics management into an RAII object.
@@ -1240,7 +1254,7 @@ static void multiUpdate(OperationContext* txn,
             // We have an _id from an insert
             const bool didInsert = !resUpsertedID.isEmpty();
 
-            result->getStats().nModified = didInsert ? 0 : numDocsModified;
+            result->getStats().nModified = numDocsModified;
             result->getStats().n = didInsert ? 1 : numMatched;
             result->getStats().upsertedID = resUpsertedID;
 
@@ -1351,6 +1365,8 @@ static void multiRemove(OperationContext* txn,
             PlanSummaryStats summary;
             Explain::getSummaryStats(*exec, &summary);
             collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+            CurOp::get(txn)->debug().fromMultiPlanner = summary.fromMultiPlanner;
+            CurOp::get(txn)->debug().replanned = summary.replanned;
 
             if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
                 // If this operation has already generated a new lastOp, don't bother setting it

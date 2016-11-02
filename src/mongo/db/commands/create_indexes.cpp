@@ -137,12 +137,21 @@ public:
             }
 
             if (spec["ns"].type() != String) {
-                errmsg = "spec has no ns";
+                errmsg = "ns field must be a string";
                 result.append("spec", spec);
                 return false;
             }
-            if (ns != spec["ns"].String()) {
-                errmsg = "namespace mismatch";
+
+            std::string nsFromUser = spec["ns"].String();
+            if (nsFromUser.empty()) {
+                errmsg = "ns field cannot be an empty string";
+                result.append("spec", spec);
+                return false;
+            }
+
+            if (ns != nsFromUser) {
+                errmsg = str::stream() << "value of ns field '" << nsFromUser
+                                       << "' doesn't match namespace " << ns.ns();
                 result.append("spec", spec);
                 return false;
             }
@@ -165,8 +174,9 @@ public:
         }
 
         Collection* collection = db->getCollection(ns.ns());
-        result.appendBool("createdCollectionAutomatically", collection == NULL);
-        if (!collection) {
+        if (collection) {
+            result.appendBool("createdCollectionAutomatically", false);
+        } else {
             MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
                 WriteUnitOfWork wunit(txn);
                 collection = db->createCollection(txn, ns.ns(), CollectionOptions());
@@ -174,6 +184,7 @@ public:
                 wunit.commit();
             }
             MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createIndexes", ns.ns());
+            result.appendBool("createdCollectionAutomatically", true);
         }
 
         const int numIndexesBefore = collection->getIndexCatalog()->numIndexesTotal(txn);

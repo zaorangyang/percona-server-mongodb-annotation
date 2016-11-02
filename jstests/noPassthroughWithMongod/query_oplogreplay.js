@@ -5,7 +5,7 @@ function test(t) {
     assert.commandWorked(t.getDB().createCollection(t.getName(), {capped: true, size: 16*1024}));
 
     function makeTS(i) {
-        return Timestamp(1000, i)
+        return Timestamp(1000, i);
     }
 
     for (var i = 0; i < 100; i++) {
@@ -55,3 +55,11 @@ test(db.jstests_query_oplogreplay);
 
 // test on real oplog
 test(db.getSiblingDB('local').oplog.jstests_query_oplogreplay);
+
+// test on non-capped collection
+var coll = db.jstests_query_oplogreplay;
+coll.drop();
+assert.commandWorked(coll.getDB().createCollection(coll.getName()));
+var res = assert.throws(function() {
+        coll.find({ts: {$gt: "abcd"}}).addOption(DBQuery.Option.oplogReplay).next();
+    });

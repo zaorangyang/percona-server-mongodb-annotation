@@ -233,6 +233,7 @@ public:
                                             const ReplSetHeartbeatArgs& args,
                                             const std::string& ourSetName,
                                             const OpTime& lastOpApplied,
+                                            const OpTime& lastOpDurable,
                                             ReplSetHeartbeatResponse* response) = 0;
 
     // produce a reply to a V1 heartbeat
@@ -240,13 +241,20 @@ public:
                                               const ReplSetHeartbeatArgsV1& args,
                                               const std::string& ourSetName,
                                               const OpTime& lastOpApplied,
+                                              const OpTime& lastOpDurable,
                                               ReplSetHeartbeatResponse* response) = 0;
+
+    struct ReplSetStatusArgs {
+        Date_t now;
+        unsigned selfUptime;
+        const OpTime& lastOpApplied;
+        const OpTime& lastCommittedOpTime;
+        const OpTime& readConcernMajorityOpTime;
+    };
 
     // produce a reply to a status request
     virtual void prepareStatusResponse(const ReplicationExecutor::CallbackArgs& data,
-                                       Date_t now,
-                                       unsigned uptime,
-                                       const OpTime& lastOpApplied,
+                                       const ReplSetStatusArgs& rsStatusArgs,
                                        BSONObjBuilder* response,
                                        Status* result) = 0;
 

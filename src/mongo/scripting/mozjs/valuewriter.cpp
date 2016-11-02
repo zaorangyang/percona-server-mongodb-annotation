@@ -170,7 +170,7 @@ Decimal128 ValueWriter::toDecimal128() {
         return Decimal128(NumberIntInfo::ToNumberInt(_context, _value));
 
     if (getScope(_context)->getProto<NumberLongInfo>().instanceOf(_value))
-        return Decimal128(NumberLongInfo::ToNumberLong(_context, _value));
+        return Decimal128(static_cast<int64_t>(NumberLongInfo::ToNumberLong(_context, _value)));
 
     if (getScope(_context)->getProto<NumberDecimalInfo>().instanceOf(_value))
         return NumberDecimalInfo::ToNumberDecimal(_context, _value);
@@ -263,6 +263,26 @@ void ValueWriter::_writeObject(BSONObjBuilder* b,
             if (scope->getProto<NumberIntInfo>().getJSClass() == jsclass) {
                 b->append(sd, NumberIntInfo::ToNumberInt(_context, obj));
 
+                return;
+            }
+
+            if (scope->getProto<CodeInfo>().getJSClass() == jsclass) {
+                if (o.hasOwnField(InternedString::scope)  // CodeWScope
+                    &&
+                    o.type(InternedString::scope) == mongo::Object) {
+                    if (o.type(InternedString::code) != mongo::String) {
+                        uasserted(ErrorCodes::BadValue, "code must be a string");
+                    }
+
+                    b->appendCodeWScope(
+                        sd, o.getString(InternedString::code), o.getObject(InternedString::scope));
+                } else {  // Code
+                    if (o.type(InternedString::code) != mongo::String) {
+                        uasserted(ErrorCodes::BadValue, "code must be a string");
+                    }
+
+                    b->appendCode(sd, o.getString(InternedString::code));
+                }
                 return;
             }
 

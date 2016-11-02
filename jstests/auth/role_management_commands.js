@@ -231,13 +231,13 @@ function runTest(conn) {
          assert.eq(4, res.roles.length);
 
          res = testUserAdmin.runCommand({rolesInfo: 1, showBuiltinRoles: 1});
-         assert.eq(9, res.roles.length);
+         assert.eq(10, res.roles.length);
      })();
 
     (function testDropRole() {
          jsTestLog("Testing dropRole");
 
-         testUserAdmin.grantRolesToUser('testUser', ['testRole4'])
+         testUserAdmin.grantRolesToUser('testUser', ['testRole4']);
 
          assert.doesNotThrow(function() {db.foo.findOne();});
          assert.writeOK(db.foo.insert({ a: 1 }));

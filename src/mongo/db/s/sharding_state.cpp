@@ -171,9 +171,9 @@ void ShardingState::shutDown(OperationContext* txn) {
                    "Sharding state unavailable because the system is shutting down"));
     }
 
-    auto catalogMgr = grid.catalogManager(txn);
-    if (catalogMgr) {
-        catalogMgr->shutDown(txn);
+    if (_getInitializationState() == InitializationState::kInitialized) {
+        grid.shardRegistry()->shutdown();
+        grid.catalogManager(txn)->shutDown(txn);
     }
 }
 
@@ -627,15 +627,6 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
     shared_ptr<CollectionMetadata> beforeMetadata;
 
     {
-        // We can't reload if sharding is not enabled - i.e. without a config server location
-        if (!enabled()) {
-            string errMsg = str::stream() << "cannot refresh metadata for " << ns
-                                          << " before sharding has been enabled";
-
-            warning() << errMsg;
-            return Status(ErrorCodes::NotYetInitialized, errMsg);
-        }
-
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         // We also can't reload if a shard name has not yet been set.
         if (_shardName.empty()) {

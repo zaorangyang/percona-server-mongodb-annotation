@@ -44,7 +44,7 @@
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/storage/record_fetcher.h"
 #include "mongo/stdx/memory.h"
-
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
@@ -56,6 +56,10 @@ using std::vector;
 using stdx::make_unique;
 
 namespace {
+
+namespace {
+MONGO_FP_DECLARE(planExecutorAlwaysDead);
+}  // namespace
 
 /**
  * Retrieves the first stage of a given type from the plan tree, or NULL
@@ -336,6 +340,15 @@ PlanExecutor::ExecState PlanExecutor::getNextSnapshotted(Snapshotted<BSONObj>* o
 }
 
 PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, RecordId* dlOut) {
+    MONGO_FAIL_POINT_BLOCK(planExecutorAlwaysDead, customKill) {
+        const BSONObj& data = customKill.getData();
+        BSONElement customKillNS = data["namespace"];
+        if (!customKillNS || _ns == customKillNS.str()) {
+            deregisterExec();
+            kill("hit planExecutorAlwaysDead fail point");
+        }
+    }
+
     invariant(_currentState == kUsable);
     if (killed()) {
         if (NULL != objOut) {
@@ -396,18 +409,11 @@ PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, 
             writeConflictsInARow = 0;
 
         if (PlanStage::ADVANCED == code) {
-            // Fast count.
-            if (WorkingSet::INVALID_ID == id) {
-                invariant(NULL == objOut);
-                invariant(NULL == dlOut);
-                return PlanExecutor::ADVANCED;
-            }
-
             WorkingSetMember* member = _workingSet->get(id);
             bool hasRequestedData = true;
 
             if (NULL != objOut) {
-                if (WorkingSetMember::LOC_AND_IDX == member->getState()) {
+                if (WorkingSetMember::RID_AND_IDX == member->getState()) {
                     if (1 != member->keyData.size()) {
                         _workingSet->free(id);
                         hasRequestedData = false;
@@ -425,8 +431,8 @@ PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, 
             }
 
             if (NULL != dlOut) {
-                if (member->hasLoc()) {
-                    *dlOut = member->loc;
+                if (member->hasRecordId()) {
+                    *dlOut = member->recordId;
                 } else {
                     _workingSet->free(id);
                     hasRequestedData = false;

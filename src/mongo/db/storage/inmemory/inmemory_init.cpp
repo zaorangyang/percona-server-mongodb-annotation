@@ -51,7 +51,7 @@ class InMemoryFactory : public StorageEngine::Factory {
 public:
     virtual ~InMemoryFactory() {}
     virtual StorageEngine* create(const StorageGlobalParams& params,
-                                  const StorageEngineLockFile&) const {
+                                  const StorageEngineLockFile*) const {
         syncInMemoryAndWiredTigerOptions();
 
         size_t cacheMB = static_cast<size_t>(inMemoryGlobalOptions.cacheSizeGB * 1024);

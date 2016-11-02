@@ -39,14 +39,13 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/snapshot_name.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
 class BSONObjBuilder;
-class WiredTigerSession;
-class WiredTigerSessionCache;
 
 class WiredTigerRecoveryUnit final : public RecoveryUnit {
 public:
@@ -107,8 +106,6 @@ public:
         return _oplogReadTill;
     }
 
-    void markNoTicketRequired();
-
     static WiredTigerRecoveryUnit* get(OperationContext* txn);
 
     static void appendGlobalStats(BSONObjBuilder& b);
@@ -130,7 +127,7 @@ private:
     void _txnOpen(OperationContext* opCtx);
 
     WiredTigerSessionCache* _sessionCache;  // not owned
-    WiredTigerSession* _session;            // owned, but from pool
+    UniqueWiredTigerSession _session;
     bool _areWriteUnitOfWorksBanned = false;
     bool _inUnitOfWork;
     bool _active;
@@ -143,10 +140,6 @@ private:
 
     typedef OwnedPointerVector<Change> Changes;
     Changes _changes;
-
-    bool _noTicketNeeded;
-    void _getTicket(OperationContext* opCtx);
-    TicketHolderReleaser _ticket;
 };
 
 /**

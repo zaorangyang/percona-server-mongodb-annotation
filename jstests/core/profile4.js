@@ -61,7 +61,7 @@ try {
     coll.save({});
     coll.find().skip(1).limit(4).itcount();
     lastOp = getLastOp();
-    assert.eq(lastOp.query.skip, 1)
+    assert.eq(lastOp.query.skip, 1);
     assert.eq(lastOp.docsExamined, 3);
     assert.eq(lastOp.nreturned, 2);
     // Find command will use "limit", OP_QUERY will use ntoreturn.
@@ -166,8 +166,8 @@ try {
     assert("getMore" in lastOp.query);
     assert.eq(lastOp.query.getMore, lastOp.cursorid);
     assert.eq(lastOp.query.collection, coll.getName());
-    assert.eq(lastOp.query.batchSize, 3)
-    assert.eq(lastOp.cursorExhausted, true)
+    assert.eq(lastOp.query.batchSize, 3);
+    assert.eq(lastOp.cursorExhausted, true);
     assert.eq(lastOp.nreturned, 2);
     assert("responseLength" in lastOp);
 
@@ -251,8 +251,8 @@ try {
     assert.eq(lastOp.updateobj, {$inc: {b: 1}});
     assert.eq(lastOp.keysExamined, 0);
     assert.eq(lastOp.docsExamined, 0);
-    assert.eq(lastOp.nMatched, 1);
-    assert.eq(lastOp.nModified, 1);
+    assert.eq(lastOp.nMatched, 0);
+    assert.eq(lastOp.nModified, 0);
     assert.eq(lastOp.upsert, true);
 
     // Idhack update as findAndModify.
@@ -298,6 +298,36 @@ try {
     assert.eq(lastOp.command.fields, {_id: 0, a: 1});
     assert(!("updateobj" in lastOp));
     assert.eq(lastOp.ndeleted, 1);
+
+    // Tests for profiling update
+    coll.drop();
+    for (var i = 0; i < 3; i++) {
+        assert.writeOK(coll.insert({_id: i, a: i}));
+    }
+
+    // Update
+    coll.update({a: 2}, {$inc: {b: 1}});
+    lastOp = getLastOp();
+    assert.eq(lastOp.op, "update");    assert.eq(lastOp.ns, coll.getFullName());
+    assert.eq(lastOp.query, {a: 2});
+    assert.eq(lastOp.updateobj, {$inc: {b: 1}});
+    assert.eq(lastOp.keysExamined, 0);
+    assert.eq(lastOp.docsExamined, 3);
+    assert.eq(lastOp.nMatched, 1);
+    assert.eq(lastOp.nModified, 1);
+
+    // Update with {upsert: true}
+    coll.update({_id: 4, a: 4}, {$inc: {b: 1}}, {upsert: true});
+    lastOp = getLastOp();
+    assert.eq(lastOp.op, "update");
+    assert.eq(lastOp.ns, coll.getFullName());
+    assert.eq(lastOp.query, {_id: 4, a: 4});
+    assert.eq(lastOp.updateobj, {$inc: {b: 1}});
+    assert.eq(lastOp.keysExamined, 0);
+    assert.eq(lastOp.docsExamined, 0);
+    assert.eq(lastOp.nMatched, 0);
+    assert.eq(lastOp.nModified, 0);
+    assert.eq(lastOp.upsert, true);
 
     db.setProfilingLevel(0);
     db.system.profile.drop();

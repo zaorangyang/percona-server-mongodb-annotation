@@ -13,13 +13,17 @@
 
         if (typeof(jsCode) === "function") {
             // Load the override file and immediately invoke the supplied function.
-            newCode = `load("${overridesFile}"); (${jsCode})();`
+            // clang-format off
+            newCode = `load("${overridesFile}"); (${jsCode})();`;
+            // clang-format on
         } else {
-            newCode = `load("${overridesFile}"); ${jsCode};`
+            // clang-format off
+            newCode = `load("${overridesFile}"); ${jsCode};`;
+            // clang-format on
         }
 
         return originalStartParallelShell(newCode, port, noConnect);
-    }
+    };
 
     DB.prototype._runCommandImpl = function(dbName, obj, options) {
         var cmdName = "";
@@ -30,6 +34,7 @@
 
         // These commands directly support a writeConcern argument.
         var commandsToForceWriteConcern = [
+            "authSchemaUpgrade",
             "createRole",
             "createUser",
             "delete",

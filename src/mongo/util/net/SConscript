@@ -51,6 +51,17 @@ env.Library(
     ],
 )
 
+env.CppUnitTest(
+    target='listen_test',
+    source=[
+        'listen_test.cpp',
+    ],
+    LIBDEPS=[
+        'network',
+    ],
+    NO_CRUTCH = True,
+)
+
 env.Library(
     target='message_port_mock',
     source=[

@@ -94,6 +94,9 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
     // Perform the possibly heavy-duty initialization of the underlying index cursor.
     _indexCursor = _iam->newCursor(getOpCtx(), _forward);
 
+    // We always seek once to establish the cursor position.
+    ++_specificStats.seeks;
+
     if (_params.bounds.isSimpleRange) {
         // Start at one key, end at another.
         _endKey = _params.bounds.endKey;
@@ -133,6 +136,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
                 kv = _indexCursor->next();
                 break;
             case NEED_SEEK:
+                ++_specificStats.seeks;
                 kv = _indexCursor->seek(_seekPoint);
                 break;
             case HIT_END:
@@ -205,9 +209,9 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
     // We found something to return, so fill out the WSM.
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
-    member->loc = kv->loc;
+    member->recordId = kv->loc;
     member->keyData.push_back(IndexKeyDatum(_keyPattern, kv->key, _iam));
-    _workingSet->transitionToLocAndIdx(id);
+    _workingSet->transitionToRecordIdAndIdx(id);
 
     if (_params.addKeyMetadata) {
         BSONObjBuilder bob;

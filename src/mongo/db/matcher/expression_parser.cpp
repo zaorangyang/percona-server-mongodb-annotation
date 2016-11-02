@@ -171,27 +171,26 @@ StatusWithMatchExpression MatchExpressionParser::_parseSubField(const BSONObj& c
 
         case BSONObj::opSIZE: {
             int size = 0;
-            if (e.type() == String) {
-                // matching old odd semantics
-                size = 0;
-            } else if (e.type() == NumberInt || e.type() == NumberLong) {
-                if (e.numberLong() < 0) {
-                    // SERVER-11952. Setting 'size' to -1 means that no documents
-                    // should match this $size expression.
-                    size = -1;
-                } else {
+            if (e.type() == NumberInt) {
+                size = e.numberInt();
+            } else if (e.type() == NumberLong) {
+                if (e.numberInt() == e.numberLong()) {
                     size = e.numberInt();
+                } else {
+                    return {Status(ErrorCodes::BadValue,
+                                   "$size must be representable as a 32-bit integer")};
                 }
             } else if (e.type() == NumberDouble) {
                 if (e.numberInt() == e.numberDouble()) {
                     size = e.numberInt();
                 } else {
-                    // old semantcs require exact numeric match
-                    // so [1,2] != 1 or 2
-                    size = -1;
+                    return {Status(ErrorCodes::BadValue, "$size must be a whole number")};
                 }
             } else {
                 return {Status(ErrorCodes::BadValue, "$size needs a number")};
+            }
+            if (size < 0) {
+                return {Status(ErrorCodes::BadValue, "$size may not be negative")};
             }
 
             std::unique_ptr<SizeMatchExpression> temp = stdx::make_unique<SizeMatchExpression>();
@@ -252,8 +251,12 @@ StatusWithMatchExpression MatchExpressionParser::_parseSubField(const BSONObj& c
         case BSONObj::opGEO_INTERSECTS:
             return expressionParserGeoCallback(name, x, context);
 
-        // Handles bitwise query operators.
+        case BSONObj::opNEAR:
+            return {Status(ErrorCodes::BadValue,
+                           mongoutils::str::stream() << "near must be first in: " << context)};
 
+
+        // Handles bitwise query operators.
         case BSONObj::opBITS_ALL_SET: {
             return _parseBitTest<BitsAllSetMatchExpression>(name, e);
         }
@@ -622,14 +625,14 @@ StatusWithMatchExpression MatchExpressionParser::_parseType(const char* name,
 
     std::unique_ptr<TypeMatchExpression> temp = stdx::make_unique<TypeMatchExpression>();
 
-    BSONType typeInt;
+    int typeInt;
 
     // The element can be a number (the BSON type number) or a string representing the name
     // of the type.
     if (elt.isNumber()) {
-        typeInt = static_cast<BSONType>(elt.numberInt());
+        typeInt = elt.numberInt();
         if (elt.type() != NumberInt && typeInt != elt.number()) {
-            typeInt = static_cast<BSONType>(-1);
+            typeInt = -1;
         }
     } else {
         invariant(elt.type() == BSONType::String);

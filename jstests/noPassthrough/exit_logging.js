@@ -13,32 +13,29 @@
                 data: { how: crashHow }
             }));
             admin.shutdownServer();
-        }
+        };
     }
 
     function makeRegExMatchFn(pattern) {
         return function (text) {
-            if (!pattern.test(text)) {
-                print("--- LOG CONTENTS ---");
-                print(text);
-                print("--- END LOG CONTENTS ---");
-                doassert("Log contents did not match " + pattern);
-            }
-        }
+            return pattern.test(text);
+        };
     }
 
     function testShutdownLogging(launcher, crashFn, matchFn, expectedExitCode) {
-        var logFileName = MongoRunner.dataPath + "mongod.log";
-        var opts = { logpath: logFileName };
-        var conn = launcher.start(opts);
+        clearRawMongoProgramOutput();
+        var conn = launcher.start({});
         try {
             crashFn(conn);
         }
         finally {
             launcher.stop(conn, undefined, { allowedExitCodes: [ expectedExitCode ] });
         }
-        var logContents = cat(logFileName);
-        matchFn(logContents);
+
+        assert.soon(() => {
+            var logContents = rawMongoProgramOutput();
+            return matchFn(logContents);
+        }, "Log contents should match", 120000);
     }
 
     function runAllTests(launcher) {
@@ -46,7 +43,7 @@
         const SIGABRT = 6;
         testShutdownLogging(
             launcher,
-            function (conn) { conn.getDB('admin').shutdownServer() },
+            function (conn) { conn.getDB('admin').shutdownServer(); },
             makeRegExMatchFn(/shutdown command received[\s\S]*dbexit:/),
             MongoRunner.EXIT_CLEAN);
 
@@ -96,7 +93,7 @@
         });
         var mongosLauncher = {
             start: function (opts) {
-                var actualOpts = { configdb: st._configDB }
+                var actualOpts = { configdb: st._configDB };
                 Object.extend(actualOpts, opts);
                 return MongoRunner.runMongos(actualOpts);
             },

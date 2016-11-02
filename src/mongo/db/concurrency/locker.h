@@ -48,6 +48,26 @@ class Locker {
 public:
     virtual ~Locker() {}
 
+    /**
+     * Require global lock attempts with obtain tickets from 'reading' (for MODE_S and MODE_IS),
+     * and from 'writing' (for MODE_IX), which must have static lifetimes. There is no throttling
+     * for MODE_X, as there can only ever be a single locker using this mode. The throttling is
+     * intended to defend against arge drops in throughput under high load due to too much
+     * concurrency.
+     */
+    static void setGlobalThrottling(class TicketHolder* reading, class TicketHolder* writing);
+
+    /**
+     * State for reporting the number of active and queued reader and writer clients.
+     */
+    enum ClientState { kInactive, kActiveReader, kActiveWriter, kQueuedReader, kQueuedWriter };
+
+    /**
+     * Return whether client is holding any locks (active), or is queued on any locks or waiting
+     * for a ticket (throttled).
+     */
+    virtual ClientState getClientState() const = 0;
+
     virtual LockerId getId() const = 0;
 
     /**

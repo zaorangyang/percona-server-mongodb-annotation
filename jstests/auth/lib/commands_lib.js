@@ -184,6 +184,7 @@ var roles_all = {
     dbAdmin: 1,
     dbAdminAnyDatabase: 1,
     dbOwner: 1,
+    enableSharding: 1,
     clusterMonitor: 1,
     hostManager: 1,
     clusterManager: 1,
@@ -1064,7 +1065,7 @@ var authCommandsLib = {
             testcases: [
                 {
                     runOnDb: adminDbName,
-                    roles: roles_clusterManager,
+                    roles: Object.extend({enableSharding:1}, roles_clusterManager),
                     privileges: [
                         { resource: {db: "x", collection: ""}, actions: ["enableSharding"] }
                     ],
@@ -2534,7 +2535,7 @@ var authCommandsLib = {
             testcases: [
                 {
                     runOnDb: adminDbName,
-                    roles: roles_clusterManager,
+                    roles: Object.extend({enableSharding:1}, roles_clusterManager),
                     privileges: [
                         { resource: {db: "test", collection: "x"}, actions: ["enableSharding"] }
                     ],
@@ -2843,8 +2844,8 @@ var authCommandsLib = {
             failures = failures.concat(res);
         }
 
-        failures.forEach(function(i) { jsTest.log(i) });
+        failures.forEach(function(i) { jsTest.log(i); });
         assert.eq(0, failures.length);
     }
 
-}
+};

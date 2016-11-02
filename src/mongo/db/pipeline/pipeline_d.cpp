@@ -214,15 +214,16 @@ StatusWith<std::unique_ptr<PlanExecutor>> attemptToGetExecutor(
 shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
     OperationContext* txn,
     Collection* collection,
+    const NamespaceString& nss,
     const intrusive_ptr<Pipeline>& pPipeline,
     const intrusive_ptr<ExpressionContext>& pExpCtx) {
     // We will be modifying the source vector as we go.
     Pipeline::SourceContainer& sources = pPipeline->sources;
 
     // Inject a MongodImplementation to sources that need them.
-    for (size_t i = 0; i < sources.size(); i++) {
+    for (auto&& source : sources) {
         DocumentSourceNeedsMongod* needsMongod =
-            dynamic_cast<DocumentSourceNeedsMongod*>(sources[i].get());
+            dynamic_cast<DocumentSourceNeedsMongod*>(source.get());
         if (needsMongod) {
             needsMongod->injectMongodInterface(std::make_shared<MongodImplementation>(pExpCtx));
         }
@@ -292,8 +293,16 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
     }
 
     // Create the PlanExecutor.
-    auto exec = prepareExecutor(
-        txn, collection, pPipeline, pExpCtx, sortStage, deps, queryObj, &sortObj, &projForQuery);
+    auto exec = prepareExecutor(txn,
+                                collection,
+                                nss,
+                                pPipeline,
+                                pExpCtx,
+                                sortStage,
+                                deps,
+                                queryObj,
+                                &sortObj,
+                                &projForQuery);
 
     return addCursorSource(pPipeline, pExpCtx, exec, deps, queryObj, sortObj, projForQuery);
 }
@@ -301,6 +310,7 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
 std::shared_ptr<PlanExecutor> PipelineD::prepareExecutor(
     OperationContext* txn,
     Collection* collection,
+    const NamespaceString& nss,
     const intrusive_ptr<Pipeline>& pipeline,
     const intrusive_ptr<ExpressionContext>& expCtx,
     const intrusive_ptr<DocumentSourceSort>& sortStage,
@@ -326,8 +336,13 @@ std::shared_ptr<PlanExecutor> PipelineD::prepareExecutor(
     //
     // LATER - We should attempt to determine if the results from the query are returned in some
     // order so we can then apply other optimizations there are tickets for, such as SERVER-4507.
-    size_t plannerOpts = QueryPlannerParams::DEFAULT | QueryPlannerParams::INCLUDE_SHARD_FILTER |
-        QueryPlannerParams::NO_BLOCKING_SORT;
+    size_t plannerOpts = QueryPlannerParams::DEFAULT | QueryPlannerParams::NO_BLOCKING_SORT;
+
+    // If we are connecting directly to the shard rather than through a mongos, don't filter out
+    // orphaned documents.
+    if (ShardingState::get(txn)->needCollectionMetadata(txn, nss.ns())) {
+        plannerOpts |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    }
 
     // The only way to get a text score is to let the query system handle the projection. In all
     // other cases, unless the query system can do an index-covered projection and avoid going to
@@ -419,11 +434,10 @@ shared_ptr<PlanExecutor> PipelineD::addCursorSource(const intrusive_ptr<Pipeline
         pSource->setProjection(deps.toProjection(), deps.toParsedDeps());
     }
 
-    while (!pipeline->sources.empty() && pSource->coalesce(pipeline->sources.front())) {
-        pipeline->sources.pop_front();
-    }
-
+    // Add the initial DocumentSourceCursor to the front of the pipeline. Then optimize again in
+    // case the new stage can be absorbed with the first stages of the pipeline.
     pipeline->addInitialSource(pSource);
+    pipeline->optimizePipeline();
 
     // DocumentSourceCursor expects a yielding PlanExecutor that has had its state saved. We
     // deregister the PlanExecutor so that it can be registered with ClientCursor.

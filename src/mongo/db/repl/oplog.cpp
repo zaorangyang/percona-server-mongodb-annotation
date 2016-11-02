@@ -219,7 +219,7 @@ public:
         : _newOpTime(newOpTime), _replCoord(replCoord) {}
 
     virtual void commit() {
-        _replCoord->setMyLastOptimeForward(_newOpTime);
+        _replCoord->setMyLastAppliedOpTimeForward(_newOpTime);
     }
 
     virtual void rollback() {}
@@ -305,7 +305,7 @@ unique_ptr<OplogDocWriter> _logOpWriter(OperationContext* txn,
 }
 }  // end anon namespace
 
-// Truncates the oplog to and including the "truncateTimestamp" entry.
+// Truncates the oplog to but excluding the "truncateTimestamp" entry.
 void truncateOplogTo(OperationContext* txn, Timestamp truncateTimestamp) {
     const NamespaceString oplogNss(rsOplogName);
     ScopedTransaction transaction(txn, MODE_IX);
@@ -314,7 +314,7 @@ void truncateOplogTo(OperationContext* txn, Timestamp truncateTimestamp) {
     Collection* oplogCollection = autoDb.getDb()->getCollection(oplogNss);
     if (!oplogCollection) {
         fassertFailedWithStatusNoTrace(
-            28820,
+            34418,
             Status(ErrorCodes::NamespaceNotFound, str::stream() << "Can't find " << rsOplogName));
     }
 
@@ -339,8 +339,14 @@ void truncateOplogTo(OperationContext* txn, Timestamp truncateTimestamp) {
             first = false;
         }
 
-        if (tsElem.timestamp() < truncateTimestamp) {
+        if (tsElem.timestamp() == truncateTimestamp) {
             break;
+        } else if (tsElem.timestamp() < truncateTimestamp) {
+            fassertFailedWithStatusNoTrace(34411,
+                                           Status(ErrorCodes::OplogOutOfOrder,
+                                                  str::stream() << "Can't find "
+                                                                << truncateTimestamp.toString()
+                                                                << " to truncate from!"));
         }
 
         foundSomethingToTruncate = true;
@@ -465,7 +471,7 @@ OpTime writeOpsToOplog(OperationContext* txn, const std::vector<BSONObj>& ops) {
 
     OpTime lastOptime;
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-        lastOptime = replCoord->getMyLastOptime();
+        lastOptime = replCoord->getMyLastAppliedOpTime();
         invariant(!ops.empty());
         ScopedTransaction transaction(txn, MODE_IX);
         Lock::DBLock lk(txn->lockState(), "local", MODE_X);
@@ -855,7 +861,7 @@ Status applyOperation_inlock(OperationContext* txn,
                 request.setLifecycle(&updateLifecycle);
 
                 UpdateResult res = update(txn, db, request, &debug);
-                if (res.numMatched == 0) {
+                if (res.numMatched == 0 && res.upserted.isEmpty()) {
                     error() << "No document was updated even though we got a DuplicateKey "
                                "error when inserting";
                     fassertFailedNoTrace(28750);
@@ -887,7 +893,7 @@ Status applyOperation_inlock(OperationContext* txn,
 
         UpdateResult ur = update(txn, db, request, &debug);
 
-        if (ur.numMatched == 0) {
+        if (ur.numMatched == 0 && ur.upserted.isEmpty()) {
             if (ur.modifiers) {
                 if (updateCriteria.nFields() == 1) {
                     // was a simple { _id : ... } update criteria

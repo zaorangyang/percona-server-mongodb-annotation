@@ -80,27 +80,32 @@ ElectionTimingTest.prototype._runTimingTest = function() {
 
         // Create and populate a collection.
         var primary = this.rst.getPrimary();
-        var coll = primary.getCollection(collectionName);
-        var secondary = this.rst.getSecondary();
 
         this.electionTimeoutLimitMillis =
             ElectionTimingTest.calculateElectionTimeoutLimitMillis(primary);
         jsTestLog('Election timeout limit: ' + this.electionTimeoutLimitMillis + ' ms');
 
+        var coll = primary.getCollection(collectionName);
         for (var i = 0; i < 100; i++) {
             assert.writeOK(coll.insert({_id: i,
                                         x: i * 3,
                                         arbitraryStr: "this is a string"}));
         }
 
-        // Make sure the secondaries are up then await replication.
-        this.rst.awaitSecondaryNodes();
-        this.rst.awaitReplication();
-
         // Run the election tests on this ReplSetTest instance.
+        var secondary;
         for (var cycle = 0; cycle < this.testCycles; cycle++) {
+            // Wait for replication.
+            this.rst.awaitSecondaryNodes();
+            this.rst.awaitReplication();
+            primary = this.rst.getPrimary();
+            secondary = this.rst.getSecondary();
+
             jsTestLog("Starting test: " + this.name + " run: " + run + " cycle: " + cycle);
-            var oldElectionId = primary.getDB("admin").isMaster().electionId;
+            var isMasterResult = primary.getDB("admin").isMaster();
+            assert.commandWorked(isMasterResult, "isMaster() failed");
+            var oldElectionId = isMasterResult.electionId;
+            assert.neq(undefined, oldElectionId, "isMaster() failed to return a valid electionId");
 
             // Time the new election.
             var stepDownTime = Date.now();
@@ -129,7 +134,11 @@ ElectionTimingTest.prototype._runTimingTest = function() {
 
             // Verify we had an election and we have a new primary.
             var newPrimary = this.rst.getPrimary();
-            var newElectionId = newPrimary.getDB("admin").isMaster().electionId;
+            isMasterResult = newPrimary.getDB("admin").isMaster();
+            assert.commandWorked(isMasterResult, "isMaster() failed");
+            var newElectionId = isMasterResult.electionId;
+            assert.neq(undefined, newElectionId, "isMaster() failed to return a valid electionId");
+
             if (bsonWoCompare(oldElectionId, newElectionId) !== 0) {
                 this.testErrors.push({testRun: run,
                                       cycle: cycle,
@@ -158,13 +167,6 @@ ElectionTimingTest.prototype._runTimingTest = function() {
                     break;
                 }
             }
-            // Wait for replication. When there are only two nodes in the set,
-            // the previous primary should be given a chance to catch up or
-            // else there will be rollbacks after the next election cycle.
-            this.rst.awaitSecondaryNodes();
-            this.rst.awaitReplication();
-            primary = newPrimary;
-            secondary = this.rst.getSecondary();
         }
         this.testResults.push(cycleData);
         this.rst.stopSet();
@@ -210,7 +212,7 @@ ElectionTimingTest.calculateElectionTimeoutLimitMillis = function(primary) {
     var protocolVersion = config.hasOwnProperty("protocolVersion") ? config.protocolVersion : 0;
     var electionTimeoutMillis = 0;
     var electionTimeoutOffsetLimitFraction = 0;
-    if (protocolVersion == 0) {
+    if (protocolVersion === 0) {
         electionTimeoutMillis = 30000;  // from TopologyCoordinatorImpl::VoteLease::leaseTime
         electionTimeoutOffsetLimitFraction = 0;
     } else {
@@ -229,4 +231,4 @@ ElectionTimingTest.calculateElectionTimeoutLimitMillis = function(primary) {
         applierDrainWaitMillis +
         assertSoonIntervalMillis;
     return electionTimeoutLimitMillis;
-}
+};

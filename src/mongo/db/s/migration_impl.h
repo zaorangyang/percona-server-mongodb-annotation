@@ -42,42 +42,10 @@
 namespace mongo {
 
 class CollectionMetadata;
+class MigrationSessionId;
 class OperationContext;
 template <typename T>
 class StatusWith;
-
-/**
- * Returns the default write concern for migration cleanup on the donor shard and for cloning
- * documents on the destination shard.
- */
-class ChunkMoveWriteConcernOptions {
-public:
-    /**
-     * Parses the chunk move options from a command object.
-     */
-    static StatusWith<ChunkMoveWriteConcernOptions> initFromCommand(const BSONObj& cmdObj);
-
-    /**
-     * Returns the throttle options to be used when committing migrated documents on the recipient
-     * shard's seconary.
-     */
-    const BSONObj& getSecThrottle() const {
-        return _secThrottleObj;
-    }
-
-    /**
-     * Returns the write concern options.
-     */
-    const WriteConcernOptions& getWriteConcern() const {
-        return _writeConcernOptions;
-    }
-
-private:
-    ChunkMoveWriteConcernOptions(BSONObj secThrottleObj, WriteConcernOptions writeConcernOptions);
-
-    const BSONObj _secThrottleObj;
-    const WriteConcernOptions _writeConcernOptions;
-};
 
 /**
  * Contains all the runtime state for an active move operation and allows persistence of this state
@@ -114,7 +82,7 @@ public:
     /**
      * Starts the move chunk operation.
      */
-    Status start(BSONObj shardKeyPattern);
+    Status start(const MigrationSessionId& sessionId, const BSONObj& shardKeyPattern);
 
     /**
      * Implements the migration critical section. Needs to be invoked after all data has been moved
@@ -125,7 +93,7 @@ public:
      * Since some migration failures are non-recoverable, it may also shut down the server on
      * certain errors.
      */
-    Status commitMigration();
+    Status commitMigration(const MigrationSessionId& sessionId);
 
     const NamespaceString& getNss() const {
         return _nss;
@@ -181,10 +149,6 @@ private:
     // Resolved shard connection strings for the above shards
     ConnectionString _fromShardCS;
     ConnectionString _toShardCS;
-
-    // Epoch for the collection sent along with the command
-    // TODO(SERVER-20742): remove this after 3.2, now that we're sending version it is redundant
-    OID _collectionEpoch;
 
     // ChunkVersion for the collection sent along with the command
     ChunkVersion _collectionVersion;

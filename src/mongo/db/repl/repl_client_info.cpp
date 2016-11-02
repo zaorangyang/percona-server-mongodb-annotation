@@ -46,7 +46,7 @@ const Client::Decoration<ReplClientInfo> ReplClientInfo::forClient =
 void ReplClientInfo::setLastOpToSystemLastOpTime(OperationContext* txn) {
     ReplicationCoordinator* replCoord = repl::ReplicationCoordinator::get(txn->getServiceContext());
     if (replCoord->isReplEnabled() && txn->writesAreReplicated()) {
-        setLastOp(replCoord->getMyLastOptime());
+        setLastOp(replCoord->getMyLastAppliedOpTime());
     }
 }
 
