@@ -40,13 +40,13 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/record_id.h"
 #include "mongo/logger/ramlog.h"
 #include "mongo/s/chunk.h"
-#include "mongo/s/d_state.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/log.h"
@@ -162,6 +162,7 @@ MigrationSourceManager::MigrationSourceManager() = default;
 MigrationSourceManager::~MigrationSourceManager() = default;
 
 bool MigrationSourceManager::start(OperationContext* txn,
+                                   const MigrationSessionId& sessionId,
                                    const std::string& ns,
                                    const BSONObj& min,
                                    const BSONObj& max,
@@ -176,7 +177,7 @@ bool MigrationSourceManager::start(OperationContext* txn,
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
-    if (_active) {
+    if (_sessionId) {
         return false;
     }
 
@@ -189,7 +190,7 @@ bool MigrationSourceManager::start(OperationContext* txn,
     invariant(_reload.size() == 0);
     invariant(_memoryUsed == 0);
 
-    _active = true;
+    _sessionId = sessionId;
 
     stdx::lock_guard<stdx::mutex> tLock(_cloneLocsMutex);
     invariant(_cloneLocs.size() == 0);
@@ -206,7 +207,7 @@ void MigrationSourceManager::done(OperationContext* txn) {
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
-    _active = false;
+    _sessionId = boost::none;
     _deleteNotifyExec.reset(NULL);
     _inCriticalSection = false;
     _inCriticalSectionCV.notify_all();
@@ -221,16 +222,10 @@ void MigrationSourceManager::done(OperationContext* txn) {
 
 void MigrationSourceManager::logInsertOp(OperationContext* txn,
                                          const char* ns,
-                                         const BSONObj& obj,
-                                         bool notInActiveChunk) {
-    ensureShardVersionOKOrThrow(txn, ns);
-
-    if (notInActiveChunk)
-        return;
-
+                                         const BSONObj& obj) {
     dassert(txn->lockState()->isWriteLocked());  // Must have Global IX.
 
-    if (!_active || (_nss != ns))
+    if (!_sessionId || (_nss != ns))
         return;
 
     BSONElement idElement = obj["_id"];
@@ -250,16 +245,10 @@ void MigrationSourceManager::logInsertOp(OperationContext* txn,
 
 void MigrationSourceManager::logUpdateOp(OperationContext* txn,
                                          const char* ns,
-                                         const BSONObj& updatedDoc,
-                                         bool notInActiveChunk) {
-    ensureShardVersionOKOrThrow(txn, ns);
-
-    if (notInActiveChunk)
-        return;
-
+                                         const BSONObj& updatedDoc) {
     dassert(txn->lockState()->isWriteLocked());  // Must have Global IX.
 
-    if (!_active || (_nss != ns))
+    if (!_sessionId || (_nss != ns))
         return;
 
     BSONElement idElement = updatedDoc["_id"];
@@ -279,13 +268,7 @@ void MigrationSourceManager::logUpdateOp(OperationContext* txn,
 
 void MigrationSourceManager::logDeleteOp(OperationContext* txn,
                                          const char* ns,
-                                         const BSONObj& obj,
-                                         bool notInActiveChunk) {
-    ensureShardVersionOKOrThrow(txn, ns);
-
-    if (notInActiveChunk)
-        return;
-
+                                         const BSONObj& obj) {
     dassert(txn->lockState()->isWriteLocked());  // Must have Global IX.
 
     BSONElement idElement = obj["_id"];
@@ -300,14 +283,17 @@ void MigrationSourceManager::logDeleteOp(OperationContext* txn,
 }
 
 bool MigrationSourceManager::isInMigratingChunk(const NamespaceString& ns, const BSONObj& doc) {
-    if (!_active)
+    if (!_sessionId)
         return false;
+
     if (ns != _nss)
         return false;
+
     return isInRange(doc, _min, _max, _shardKeyPattern);
 }
 
 bool MigrationSourceManager::transferMods(OperationContext* txn,
+                                          const MigrationSessionId& sessionId,
                                           string& errmsg,
                                           BSONObjBuilder& b) {
     long long size = 0;
@@ -316,8 +302,19 @@ bool MigrationSourceManager::transferMods(OperationContext* txn,
         AutoGetCollectionForRead ctx(txn, _getNS());
 
         stdx::lock_guard<stdx::mutex> sl(_mutex);
-        if (!_active) {
+
+        if (!_sessionId) {
             errmsg = "no active migration!";
+            return false;
+        }
+
+        // TODO after 3.4 release, !sessionId.isEmpty() can be removed: versions >= 3.2 will
+        // all have sessionId implemented. (two more instances below).
+        // A mongod version < v3.2 will not have sessionId, in which case it is empty and ignored.
+        if (!sessionId.isEmpty() && !_sessionId->matches(sessionId)) {
+            errmsg = str::stream() << "requested migration session id " << sessionId.toString()
+                                   << " does not match active session id "
+                                   << _sessionId->toString();
             return false;
         }
 
@@ -418,8 +415,10 @@ bool MigrationSourceManager::storeCurrentLocs(OperationContext* txn,
     bool isLargeChunk = false;
     unsigned long long recCount = 0;
 
+    BSONObj obj;
     RecordId recordId;
-    while (PlanExecutor::ADVANCED == exec->getNext(NULL, &recordId)) {
+    PlanExecutor::ExecState state;
+    while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, &recordId))) {
         if (!isLargeChunk) {
             stdx::lock_guard<stdx::mutex> lk(_cloneLocsMutex);
             _cloneLocs.insert(recordId);
@@ -430,6 +429,12 @@ bool MigrationSourceManager::storeCurrentLocs(OperationContext* txn,
             // Continue on despite knowing that it will fail, just to get the correct value for
             // recCount
         }
+    }
+
+    if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
+        errmsg = "Executor error while scanning for documents belonging to chunk: " +
+            WorkingSetCommon::toStatusString(obj);
+        return false;
     }
 
     exec.reset();
@@ -452,7 +457,10 @@ bool MigrationSourceManager::storeCurrentLocs(OperationContext* txn,
     return true;
 }
 
-bool MigrationSourceManager::clone(OperationContext* txn, string& errmsg, BSONObjBuilder& result) {
+bool MigrationSourceManager::clone(OperationContext* txn,
+                                   const MigrationSessionId& sessionId,
+                                   string& errmsg,
+                                   BSONObjBuilder& result) {
     ElapsedTracker tracker(internalQueryExecYieldIterations, internalQueryExecYieldPeriodMS);
 
     int allocSize = 0;
@@ -461,8 +469,17 @@ bool MigrationSourceManager::clone(OperationContext* txn, string& errmsg, BSONOb
         AutoGetCollection autoColl(txn, _getNS(), MODE_IS);
 
         stdx::lock_guard<stdx::mutex> sl(_mutex);
-        if (!_active) {
+
+        if (!_sessionId) {
             errmsg = "not active";
+            return false;
+        }
+
+        // A mongod version < v3.2 will not have sessionId, in which case it is empty and ignored.
+        if (!sessionId.isEmpty() && !_sessionId->matches(sessionId)) {
+            errmsg = str::stream() << "requested migration session id " << sessionId.toString()
+                                   << " does not match active session id "
+                                   << _sessionId->toString();
             return false;
         }
 
@@ -483,8 +500,17 @@ bool MigrationSourceManager::clone(OperationContext* txn, string& errmsg, BSONOb
         AutoGetCollection autoColl(txn, _getNS(), MODE_IS);
 
         stdx::lock_guard<stdx::mutex> sl(_mutex);
-        if (!_active) {
+
+        if (!_sessionId) {
             errmsg = "not active";
+            return false;
+        }
+
+        // A mongod version < v3.2 will not have sessionId, in which case it is empty and ignored.
+        if (!sessionId.isEmpty() && !_sessionId->matches(sessionId)) {
+            errmsg = str::stream() << "migration session id changed from " << sessionId.toString()
+                                   << " to " << _sessionId->toString()
+                                   << " while initial clone was active";
             return false;
         }
 
@@ -579,7 +605,7 @@ bool MigrationSourceManager::waitTillNotInCriticalSection(int maxSecondsToWait) 
 
 bool MigrationSourceManager::isActive() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _active;
+    return _sessionId.is_initialized();
 }
 
 void MigrationSourceManager::_xfer(OperationContext* txn,

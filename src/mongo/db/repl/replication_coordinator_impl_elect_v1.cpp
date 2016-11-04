@@ -124,9 +124,9 @@ void ReplicationCoordinatorImpl::_startElectSelfV1() {
 
 
     invariant(_rsConfig.getMemberAt(_selfIndex).isElectable());
-    OpTime lastOpTimeApplied(_getMyLastOptime_inlock());
+    OpTime lastOpTimeDurable(_getMyLastDurableOpTime_inlock());
 
-    if (lastOpTimeApplied == OpTime()) {
+    if (lastOpTimeDurable == OpTime()) {
         log() << "not trying to elect self, "
                  "do not yet have a complete set of data from any point in time";
         return;
@@ -147,7 +147,7 @@ void ReplicationCoordinatorImpl::_startElectSelfV1() {
         _selfIndex,
         _topCoord->getTerm(),
         true,  // dry run
-        getMyLastOptime(),
+        getMyLastDurableOpTime(),
         stdx::bind(&ReplicationCoordinatorImpl::_onDryRunComplete, this, term));
     if (nextPhaseEvh.getStatus() == ErrorCodes::ShutdownInProgress) {
         return;
@@ -199,7 +199,7 @@ void ReplicationCoordinatorImpl::_onDryRunComplete(long long originalTerm) {
     if (cbStatus.getStatus() == ErrorCodes::ShutdownInProgress) {
         return;
     }
-    fassert(28769, cbStatus.getStatus());
+    fassert(34421, cbStatus.getStatus());
     lossGuard.dismiss();
 }
 
@@ -245,7 +245,7 @@ void ReplicationCoordinatorImpl::_startVoteRequester(long long newTerm) {
         _selfIndex,
         _topCoord->getTerm(),
         false,
-        getMyLastOptime(),
+        getMyLastDurableOpTime(),
         stdx::bind(&ReplicationCoordinatorImpl::_onVoteRequestComplete, this, newTerm));
     if (nextPhaseEvh.getStatus() == ErrorCodes::ShutdownInProgress) {
         return;

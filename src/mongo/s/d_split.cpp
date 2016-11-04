@@ -44,13 +44,14 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -173,7 +174,8 @@ public:
 
         RecordId loc;
         BSONObj currKey;
-        while (PlanExecutor::ADVANCED == exec->getNext(&currKey, &loc)) {
+        PlanExecutor::ExecState state;
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&currKey, &loc))) {
             // check that current key contains non missing elements for all fields in keyPattern
             BSONObjIterator i(currKey);
             for (int k = 0; k < keyPatternLength; k++) {
@@ -208,6 +210,14 @@ public:
                 errmsg = os.str();
                 return false;
             }
+        }
+
+        if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::OperationFailed,
+                       str::stream() << "Executor error while checking sharding index: "
+                                     << WorkingSetCommon::toStatusString(currKey)));
         }
 
         return true;
@@ -455,6 +465,14 @@ public:
                     state = exec->getNext(&currKey, NULL);
                 }
 
+                if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
+                    return appendCommandStatus(
+                        result,
+                        Status(ErrorCodes::OperationFailed,
+                               str::stream() << "Executor error during splitVector command: "
+                                             << WorkingSetCommon::toStatusString(currKey)));
+                }
+
                 if (!forceMedianSplit)
                     break;
 
@@ -634,7 +652,8 @@ public:
 
         const string whyMessage(str::stream() << "splitting chunk [" << min << ", " << max
                                               << ") in " << nss.toString());
-        auto scopedDistLock = grid.forwardingCatalogManager()->distLock(txn, nss.ns(), whyMessage);
+        auto scopedDistLock = grid.catalogManager(txn)->distLock(
+            txn, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
         if (!scopedDistLock.isOK()) {
             errmsg = str::stream() << "could not acquire collection lock for " << nss.toString()
                                    << " to split chunk [" << min << "," << max << ")"
@@ -671,7 +690,7 @@ public:
             // Mongos >= v3.2 sends the full version, v3.0 only sends the epoch.
             // TODO(SERVER-20742): Stop parsing epoch separately after 3.2.
             OID cmdEpoch;
-            auto& operationVersion = OperationShardVersion::get(txn);
+            auto& operationVersion = OperationShardingState::get(txn);
             if (operationVersion.hasShardVersion()) {
                 cmdVersion = operationVersion.getShardVersion(nss);
                 cmdEpoch = cmdVersion.epoch();
@@ -811,8 +830,9 @@ public:
         //
         // 4. apply the batch of updates to remote and local metadata
         //
-        Status applyOpsStatus =
-            grid.catalogManager(txn)->applyChunkOpsDeprecated(txn, updates.arr(), preCond.arr());
+
+        Status applyOpsStatus = grid.catalogManager(txn)->applyChunkOpsDeprecated(
+            txn, updates.arr(), preCond.arr(), nss.ns(), nextChunkVersion);
         if (!applyOpsStatus.isOK()) {
             return appendCommandStatus(result, applyOpsStatus);
         }
@@ -938,11 +958,16 @@ private:
                                                                  PlanExecutor::YIELD_MANUAL));
 
         // check if exactly one document found
-        if (PlanExecutor::ADVANCED == exec->getNext(NULL, NULL)) {
-            if (PlanExecutor::IS_EOF == exec->getNext(NULL, NULL)) {
+        PlanExecutor::ExecState state;
+        BSONObj obj;
+        if (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+            if (PlanExecutor::IS_EOF == (state = exec->getNext(&obj, NULL))) {
                 return true;
             }
         }
+
+        // Non-yielding collection scans from InternalPlanner will never error.
+        invariant(PlanExecutor::ADVANCED == state || PlanExecutor::IS_EOF == state);
 
         return false;
     }

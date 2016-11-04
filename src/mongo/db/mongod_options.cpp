@@ -664,6 +664,30 @@ Status validateMongodOptions(const moe::Environment& params) {
     }
 #endif
 
+    if (params.count("storage.readOnly")) {
+        // Command line options that are disallowed when --readOnly is specified.
+        for (const auto& disallowedOption : {"replSet",
+                                             "configSvr",
+                                             "upgrade",
+                                             "repair",
+                                             "profile",
+                                             "master",
+                                             "slave",
+                                             "source",
+                                             "only",
+                                             "slavedelay",
+                                             "journal",
+                                             "storage.journal.enabled",
+                                             "dur",
+                                             "autoresync",
+                                             "fastsync"}) {
+            if (params.count(disallowedOption)) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "Cannot specify both --readOnly and --"
+                                            << disallowedOption);
+            }
+        }
+    }
     return Status::OK();
 }
 
@@ -1040,8 +1064,9 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
         storageGlobalParams.directoryperdb = params["storage.directoryPerDB"].as<bool>();
     }
 
-    if (params.count("storage.readOnly")) {
-        storageGlobalParams.readOnly = params["storage.readOnly"].as<bool>();
+    if (params.count("storage.readOnly") && params["storage.readOnly"].as<bool>()) {
+        storageGlobalParams.readOnly = true;
+        storageGlobalParams.dur = false;
     }
 
     if (params.count("cpu")) {
@@ -1174,7 +1199,8 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
     }
 
     if (params.count("replication.enableMajorityReadConcern")) {
-        replSettings.setMajorityReadConcernEnabled(true);
+        replSettings.setMajorityReadConcernEnabled(
+            params["replication.enableMajorityReadConcern"].as<bool>());
     }
 
     if (params.count("storage.indexBuildRetry")) {

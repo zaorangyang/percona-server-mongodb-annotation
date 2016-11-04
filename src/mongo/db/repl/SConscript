@@ -209,6 +209,7 @@ env.Library(
     target='sync_tail',
     source=[
         'sync_tail.cpp',
+        'oplog_entry.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
@@ -446,6 +447,7 @@ env.Library('replica_set_messages',
                 'handshake_args.cpp',
                 'is_master_response.cpp',
                 'member_config.cpp',
+                'old_update_position_args.cpp',
                 'read_concern_response.cpp',
                 'repl_set_declare_election_winner_args.cpp',
                 'repl_set_heartbeat_args.cpp',
@@ -515,6 +517,7 @@ env.Library(
         'reporter.cpp',
     ],
     LIBDEPS=[
+        'replica_set_messages',
         'replication_executor',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/namespace_string',
@@ -527,7 +530,8 @@ env.CppUnitTest(
     source='reporter_test.cpp',
     LIBDEPS=[
         'reporter',
-        'replication_executor_test_fixture',
+        '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
+        '$BUILD_DIR/mongo/unittest/task_executor_proxy',
     ],
 )
 

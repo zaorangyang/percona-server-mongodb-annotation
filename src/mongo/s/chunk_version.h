@@ -29,7 +29,6 @@
 #pragma once
 
 #include "mongo/db/jsobj.h"
-#include "mongo/s/optime_pair.h"
 
 namespace mongo {
 
@@ -52,10 +51,17 @@ class StatusWith;
  */
 struct ChunkVersion {
 public:
-    ChunkVersion() : _minor(0), _major(0), _epoch(OID()) {}
+    /**
+     * The name for the shard version information field, which shard-aware commands should include
+     * if they want to convey shard version.
+     */
+    static const char kShardVersionField[];
+
+    ChunkVersion() : _combined(0), _epoch(OID()) {}
 
     ChunkVersion(int major, int minor, const OID& epoch)
-        : _minor(minor), _major(major), _epoch(epoch) {}
+        : _combined(static_cast<uint64_t>(minor) | (static_cast<uint64_t>(major) << 32)),
+          _epoch(epoch) {}
 
     /**
      * Interprets the specified BSON content as the format for commands, which is in the form:
@@ -103,12 +109,11 @@ public:
     }
 
     void incMajor() {
-        _major++;
-        _minor = 0;
+        _combined = static_cast<uint64_t>(majorVersion() + 1) << 32;
     }
 
     void incMinor() {
-        _minor++;
+        _combined++;
     }
 
     // Note: this shouldn't be used as a substitute for version except in specific cases -
@@ -122,11 +127,11 @@ public:
     }
 
     int majorVersion() const {
-        return _major;
+        return _combined >> 32;
     }
 
     int minorVersion() const {
-        return _minor;
+        return _combined & 0xFFFF;
     }
 
     OID epoch() const {
@@ -163,7 +168,7 @@ public:
     bool isWriteCompatibleWith(const ChunkVersion& otherVersion) const {
         if (!hasEqualEpoch(otherVersion))
             return false;
-        return otherVersion._major == _major;
+        return otherVersion.majorVersion() == majorVersion();
     }
 
     // Is this the same version?
@@ -192,10 +197,10 @@ public:
         if (otherVersion._epoch != _epoch)
             return false;
 
-        if (_major != otherVersion._major)
-            return _major < otherVersion._major;
+        if (majorVersion() != otherVersion.majorVersion())
+            return majorVersion() < otherVersion.majorVersion();
 
-        return _minor < otherVersion._minor;
+        return minorVersion() < otherVersion.minorVersion();
     }
 
     // Is this in the same epoch?
@@ -343,21 +348,14 @@ public:
 
     std::string toString() const {
         StringBuilder sb;
-        sb << _major << "|" << _minor << "||" << _epoch;
+        sb << majorVersion() << "|" << minorVersion() << "||" << _epoch;
         return sb.str();
     }
 
     BSONObj toBSON() const;
 
 private:
-    union {
-        struct {
-            int _minor;
-            int _major;
-        };
-
-        uint64_t _combined;
-    };
+    uint64_t _combined;
 
     OID _epoch;
 };

@@ -75,6 +75,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/oplog_hack.h"
@@ -85,7 +86,6 @@
 namespace mongo {
 
 using std::unique_ptr;
-using std::endl;
 using std::string;
 using std::vector;
 using stdx::make_unique;
@@ -174,7 +174,7 @@ void fillOutPlannerParams(OperationContext* txn,
     // If the caller wants a shard filter, make sure we're actually sharded.
     if (plannerParams->options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
         std::shared_ptr<CollectionMetadata> collMetadata =
-            ShardingState::get(txn)->getCollectionMetadata(canonicalQuery->ns());
+            CollectionShardingState::get(txn, canonicalQuery->nss())->getMetadata();
         if (collMetadata) {
             plannerParams->shardKey = collMetadata->getKeyPattern();
         } else {
@@ -259,7 +259,7 @@ Status prepareExecution(OperationContext* opCtx,
         if (plannerParams.options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
             *rootOut = new ShardFilterStage(
                 opCtx,
-                ShardingState::get(opCtx)->getCollectionMetadata(collection->ns().ns()),
+                CollectionShardingState::get(opCtx, canonicalQuery->nss())->getMetadata(),
                 ws,
                 *rootOut);
         }
@@ -315,12 +315,11 @@ Status prepareExecution(OperationContext* opCtx,
         Status status = QueryPlanner::planFromCache(*canonicalQuery, plannerParams, *cs, &qs);
 
         if (status.isOK()) {
-            verify(StageBuilder::build(opCtx, collection, *canonicalQuery, *qs, ws, rootOut));
-            if ((plannerParams.options & QueryPlannerParams::PRIVATE_IS_COUNT) &&
-                turnIxscanIntoCount(qs)) {
-                LOG(2) << "Using fast count: " << canonicalQuery->toStringShort()
-                       << ", planSummary: " << Explain::getPlanSummary(*rootOut);
+            if ((plannerParams.options & QueryPlannerParams::IS_COUNT) && turnIxscanIntoCount(qs)) {
+                LOG(2) << "Using fast count: " << canonicalQuery->toStringShort();
             }
+
+            verify(StageBuilder::build(opCtx, collection, *canonicalQuery, *qs, ws, rootOut));
 
             // Add a CachedPlanStage on top of the previous root.
             //
@@ -360,7 +359,7 @@ Status prepareExecution(OperationContext* opCtx,
     }
 
     // See if one of our solutions is a fast count hack in disguise.
-    if (plannerParams.options & QueryPlannerParams::PRIVATE_IS_COUNT) {
+    if (plannerParams.options & QueryPlannerParams::IS_COUNT) {
         for (size_t i = 0; i < solutions.size(); ++i) {
             if (turnIxscanIntoCount(solutions[i])) {
                 // Great, we can use solutions[i].  Clean up the other QuerySolution(s).
@@ -480,6 +479,11 @@ StatusWith<unique_ptr<PlanExecutor>> getOplogStartHack(OperationContext* txn,
                                                        unique_ptr<CanonicalQuery> cq) {
     invariant(collection);
     invariant(cq.get());
+
+    if (!collection->isCapped()) {
+        return Status(ErrorCodes::BadValue,
+                      "OplogReplay cursor requested on non-capped collection");
+    }
 
     // A query can only do oplog start finding if it has a top-level $gt or $gte predicate over
     // the "ts" field (the operation's timestamp). Find that predicate and pass it to
@@ -644,7 +648,7 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDelete(OperationContext* txn,
                 12050, "cannot delete from system namespace", legalClientSystemNS(nss.ns(), true));
         }
         if (nss.ns().find('$') != string::npos) {
-            log() << "cannot delete from collection with reserved $ in name: " << nss << endl;
+            log() << "cannot delete from collection with reserved $ in name: " << nss;
             uasserted(10100, "cannot delete from collection with reserved $ in name");
         }
     }
@@ -1015,14 +1019,14 @@ bool turnIxscanIntoCount(QuerySolution* soln) {
     }
 
     // Make the count node that we replace the fetch + ixscan with.
-    CountNode* cn = new CountNode();
-    cn->indexKeyPattern = isn->indexKeyPattern;
-    cn->startKey = startKey;
-    cn->startKeyInclusive = startKeyInclusive;
-    cn->endKey = endKey;
-    cn->endKeyInclusive = endKeyInclusive;
+    CountScanNode* csn = new CountScanNode();
+    csn->indexKeyPattern = isn->indexKeyPattern;
+    csn->startKey = startKey;
+    csn->startKeyInclusive = startKeyInclusive;
+    csn->endKey = endKey;
+    csn->endKeyInclusive = endKeyInclusive;
     // Takes ownership of 'cn' and deletes the old root.
-    soln->root.reset(cn);
+    soln->root.reset(csn);
     return true;
 }
 
@@ -1147,68 +1151,67 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorCount(OperationContext* txn,
                                                       PlanExecutor::YieldPolicy yieldPolicy) {
     unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
 
-    // If collection exists and the query is empty, no additional canonicalization is needed.
+    auto cq = CanonicalQuery::canonicalize(
+        request.getNs(),
+        request.getQuery(),
+        BSONObj(),  // sort
+        BSONObj(),  // projection
+        0,          // skip
+        0,          // limit
+        request.getHint(),
+        BSONObj(),  // min
+        BSONObj(),  // max
+        false,      // snapshot
+        explain,
+        collection
+            ? static_cast<const ExtensionsCallback&>(ExtensionsCallbackReal(txn, &collection->ns()))
+            : static_cast<const ExtensionsCallback&>(ExtensionsCallbackNoop()));
+
+    if (!cq.isOK()) {
+        return cq.getStatus();
+    }
+    if (!collection) {
+        // Treat collections that do not exist as empty collections. Note that the explain
+        // reporting machinery always assumes that the root stage for a count operation is
+        // a CountStage, so in this case we put a CountStage on top of an EOFStage.
+        const bool useRecordStoreCount = false;
+        CountStageParams params(request, useRecordStoreCount);
+        unique_ptr<PlanStage> root = make_unique<CountStage>(
+            txn, collection, std::move(params), ws.get(), new EOFStage(txn));
+        return PlanExecutor::make(
+            txn, std::move(ws), std::move(root), request.getNs().ns(), yieldPolicy);
+    }
+
     // If the query is empty, then we can determine the count by just asking the collection
     // for its number of records. This is implemented by the CountStage, and we don't need
     // to create a child for the count stage in this case.
     //
     // If there is a hint, then we can't use a trival count plan as described above.
-    if (collection && request.getQuery().isEmpty() && request.getHint().isEmpty()) {
+    const bool isEmptyQueryPredicate = cq.getValue()->root()->matchType() == MatchExpression::AND &&
+        cq.getValue()->root()->numChildren() == 0;
+    const bool useRecordStoreCount = isEmptyQueryPredicate && request.getHint().isEmpty();
+    CountStageParams params(request, useRecordStoreCount);
+
+    if (useRecordStoreCount) {
         unique_ptr<PlanStage> root =
-            make_unique<CountStage>(txn, collection, request, ws.get(), nullptr);
+            make_unique<CountStage>(txn, collection, std::move(params), ws.get(), nullptr);
         return PlanExecutor::make(
             txn, std::move(ws), std::move(root), request.getNs().ns(), yieldPolicy);
     }
 
-    unique_ptr<CanonicalQuery> cq;
-    if (!request.getQuery().isEmpty() || !request.getHint().isEmpty()) {
-        // If query or hint is not empty, canonicalize the query before working with collection.
-        typedef ExtensionsCallback ExtensionsCallback;
-        auto statusWithCQ = CanonicalQuery::canonicalize(
-            request.getNs(),
-            request.getQuery(),
-            BSONObj(),  // sort
-            BSONObj(),  // projection
-            0,          // skip
-            0,          // limit
-            request.getHint(),
-            BSONObj(),  // min
-            BSONObj(),  // max
-            false,      // snapshot
-            explain,
-            collection ? static_cast<const ExtensionsCallback&>(
-                             ExtensionsCallbackReal(txn, &collection->ns()))
-                       : static_cast<const ExtensionsCallback&>(ExtensionsCallbackNoop()));
-        if (!statusWithCQ.isOK()) {
-            return statusWithCQ.getStatus();
-        }
-        cq = std::move(statusWithCQ.getValue());
-    }
-
-    if (!collection) {
-        // Treat collections that do not exist as empty collections. Note that the explain
-        // reporting machinery always assumes that the root stage for a count operation is
-        // a CountStage, so in this case we put a CountStage on top of an EOFStage.
-        unique_ptr<PlanStage> root =
-            make_unique<CountStage>(txn, collection, request, ws.get(), new EOFStage(txn));
-        return PlanExecutor::make(
-            txn, std::move(ws), std::move(root), request.getNs().ns(), yieldPolicy);
-    }
-
-    invariant(cq.get());
-
-    const size_t plannerOptions = QueryPlannerParams::PRIVATE_IS_COUNT;
+    const size_t plannerOptions = QueryPlannerParams::IS_COUNT;
     PlanStage* child;
     QuerySolution* rawQuerySolution;
     Status prepStatus = prepareExecution(
-        txn, collection, ws.get(), cq.get(), plannerOptions, &child, &rawQuerySolution);
+        txn, collection, ws.get(), cq.getValue().get(), plannerOptions, &child, &rawQuerySolution);
     if (!prepStatus.isOK()) {
         return prepStatus;
     }
     invariant(child);
 
     // Make a CountStage to be the new root.
-    unique_ptr<PlanStage> root = make_unique<CountStage>(txn, collection, request, ws.get(), child);
+    unique_ptr<PlanStage> root =
+        make_unique<CountStage>(txn, collection, std::move(params), ws.get(), child);
     unique_ptr<QuerySolution> querySolution(rawQuerySolution);
     // We must have a tree of stages in order to have a valid plan executor, but the query
     // solution may be NULL. Takes ownership of all args other than 'collection' and 'txn'
@@ -1216,7 +1219,7 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorCount(OperationContext* txn,
                               std::move(ws),
                               std::move(root),
                               std::move(querySolution),
-                              std::move(cq),
+                              std::move(cq.getValue()),
                               collection,
                               yieldPolicy);
 }

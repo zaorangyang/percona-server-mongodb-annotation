@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/optime_pair.h"
 
@@ -47,10 +48,10 @@ class BSONArrayBuilder;
 class BSONObj;
 class BSONObjBuilder;
 class ChunkType;
+struct ChunkVersion;
 class CollectionType;
 class ConnectionString;
 class DatabaseType;
-class DistLockManager;
 class NamespaceString;
 class OperationContext;
 class SettingsType;
@@ -81,7 +82,6 @@ enum ShardDrainingStatus {
  */
 class CatalogManager {
     MONGO_DISALLOW_COPYING(CatalogManager);
-    friend class ForwardingCatalogManager;
 
 public:
     enum class ConfigServerMode {
@@ -103,12 +103,6 @@ public:
      * Performs necessary cleanup when shutting down cleanly.
      */
     virtual void shutDown(OperationContext* txn, bool allowNetworking = true) = 0;
-
-    /**
-     * Returns what type of catalog manager this is - CSRS for the CatalogManagerReplicaSet and
-     * SCCC for the CatalogManagerLegacy.
-     */
-    virtual ConfigServerMode getMode() = 0;
 
     /**
      * Creates a new database or updates the sharding status for an existing one. Cannot be
@@ -317,12 +311,23 @@ public:
      * Applies oplog entries to the config servers.
      * Used by mergeChunk, splitChunk, and moveChunk commands.
      *
-     * @param updateOps: oplog entries to apply
-     * @param preCondition: preconditions for applying oplog entries
+     * @param updateOps: documents to write to the chunks collection.
+     * @param preCondition: preconditions for applying documents.
+     * @param nss: namespace string for the chunks collection.
+     * @param lastChunkVersion: version of the last document being written to the chunks
+     * collection.
+     *
+     * 'nss' and 'lastChunkVersion' uniquely identify the last document being written, which is
+     * expected to appear in the chunks collection on success. This is important for the
+     * case where network problems cause a retry of a successful write, which then returns
+     * failure because the precondition no longer matches. If a query of the chunks collection
+     * returns a document matching both 'nss' and 'lastChunkVersion,' the write succeeded.
      */
     virtual Status applyChunkOpsDeprecated(OperationContext* txn,
                                            const BSONArray& updateOps,
-                                           const BSONArray& preCondition) = 0;
+                                           const BSONArray& preCondition,
+                                           const std::string& nss,
+                                           const ChunkVersion& lastChunkVersion) = 0;
 
     /**
      * Writes a diagnostic event to the action log.
@@ -432,6 +437,13 @@ public:
      */
     virtual Status appendInfoForConfigServerDatabases(OperationContext* txn,
                                                       BSONArrayBuilder* builder) = 0;
+
+
+    virtual StatusWith<DistLockManager::ScopedDistLock> distLock(
+        OperationContext* txn,
+        StringData name,
+        StringData whyMessage,
+        stdx::chrono::milliseconds waitFor = DistLockManager::kSingleLockAttemptTimeout) = 0;
 
 protected:
     CatalogManager() = default;

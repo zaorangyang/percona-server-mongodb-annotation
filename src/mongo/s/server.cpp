@@ -59,8 +59,9 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balance.h"
-#include "mongo/s/catalog/forwarding_catalog_manager.h"
+#include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/client/shard_connection.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
@@ -107,10 +108,63 @@ ntservice::NtServiceDefaultStrings defaultServiceStrings = {
 static ExitCode initService();
 #endif
 
-bool dbexitCalled = false;
+static AtomicUInt32 shutdownInProgress(0);
 
 bool inShutdown() {
-    return dbexitCalled;
+    return shutdownInProgress.loadRelaxed() != 0;
+}
+void signalShutdown() {
+    // Notify all threads shutdown has started
+    shutdownInProgress.fetchAndAdd(1);
+}
+
+// shutdownLock
+//
+// Protects:
+//  Ensures shutdown is single threaded.
+// Lock Ordering:
+//  No restrictions
+stdx::mutex shutdownLock;
+
+void exitCleanly(ExitCode code) {
+    signalShutdown();
+
+    // Grab the shutdown lock to prevent concurrent callers
+    stdx::lock_guard<stdx::mutex> lockguard(shutdownLock);
+
+    {
+        Client& client = cc();
+        ServiceContext::UniqueOperationContext uniqueTxn;
+        OperationContext* txn = client.getOperationContext();
+        if (!txn) {
+            uniqueTxn = client.makeOperationContext();
+            txn = uniqueTxn.get();
+        }
+
+        auto cursorManager = grid.getCursorManager();
+        cursorManager->shutdown();
+        grid.shardRegistry()->shutdown();
+        grid.catalogManager(txn)->shutDown(txn);
+    }
+
+    dbexit(code);
+}
+
+void dbexit(ExitCode rc, const char* why) {
+    audit::logShutdown(ClientBasic::getCurrent());
+
+#if defined(_WIN32)
+    // Windows Service Controller wants to be told when we are done shutting down
+    // and call quickExit itself.
+    //
+    if (rc == EXIT_WINDOWS_SERVICE_STOP) {
+        log() << "dbexit: exiting because Windows service was stopped";
+        return;
+    }
+#endif
+
+    log() << "dbexit: " << why << " rc:" << rc;
+    quickExit(rc);
 }
 
 static BSONObj buildErrReply(const DBException& ex) {
@@ -236,6 +290,11 @@ static ExitCode runMongosServer() {
         auto txn = cc().makeOperationContext();
         Status status = initializeSharding(txn.get());
         if (!status.isOK()) {
+            if (status == ErrorCodes::CallbackCanceled) {
+                invariant(inShutdown());
+                log() << "Shutdown called before mongos finished starting up";
+                return EXIT_CLEAN;
+            }
             error() << "Error initializing sharding system: " << status;
             return EXIT_SHARDING_ERROR;
         }
@@ -428,57 +487,11 @@ int mongoSMain(int argc, char* argv[], char** envp) {
 int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
     WindowsCommandLine wcl(argc, argvW, envpW);
     int exitCode = mongoSMain(argc, wcl.argv(), wcl.envp());
-    quickExit(exitCode);
+    exitCleanly(ExitCode(exitCode));
 }
 #else
 int main(int argc, char* argv[], char** envp) {
     int exitCode = mongoSMain(argc, argv, envp);
-    quickExit(exitCode);
+    exitCleanly(ExitCode(exitCode));
 }
 #endif
-
-void mongo::signalShutdown() {
-    // Notify all threads shutdown has started
-    dbexitCalled = true;
-}
-
-void mongo::exitCleanly(ExitCode code) {
-    // TODO: do we need to add anything?
-    {
-        Client& client = cc();
-        ServiceContext::UniqueOperationContext uniqueTxn;
-        OperationContext* txn = client.getOperationContext();
-        if (!txn) {
-            uniqueTxn = client.makeOperationContext();
-            txn = uniqueTxn.get();
-        }
-
-        auto catalogMgr = grid.catalogManager(txn);
-        if (catalogMgr) {
-            catalogMgr->shutDown(txn);
-            auto cursorManager = grid.getCursorManager();
-            cursorManager->killAllCursors();
-            cursorManager->reapZombieCursors();
-        }
-    }
-
-    mongo::dbexit(code);
-}
-
-void mongo::dbexit(ExitCode rc, const char* why) {
-    dbexitCalled = true;
-    audit::logShutdown(ClientBasic::getCurrent());
-
-#if defined(_WIN32)
-    // Windows Service Controller wants to be told when we are done shutting down
-    // and call quickExit itself.
-    //
-    if (rc == EXIT_WINDOWS_SERVICE_STOP) {
-        log() << "dbexit: exiting because Windows service was stopped";
-        return;
-    }
-#endif
-
-    log() << "dbexit: " << why << " rc:" << rc;
-    quickExit(rc);
-}

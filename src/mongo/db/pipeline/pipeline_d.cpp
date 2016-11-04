@@ -72,10 +72,12 @@ public:
     MongodImplementation(const intrusive_ptr<ExpressionContext>& ctx)
         : _ctx(ctx), _client(ctx->opCtx) {}
 
+    void setOperationContext(OperationContext* opCtx) {
+        invariant(_ctx->opCtx == opCtx);
+        _client.setOpCtx(opCtx);
+    }
+
     DBClientBase* directClient() final {
-        // opCtx may have changed since our last call
-        invariant(_ctx->opCtx);
-        _client.setOpCtx(_ctx->opCtx);
         return &_client;
     }
 
@@ -214,15 +216,16 @@ StatusWith<std::unique_ptr<PlanExecutor>> attemptToGetExecutor(
 shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
     OperationContext* txn,
     Collection* collection,
+    const NamespaceString& nss,
     const intrusive_ptr<Pipeline>& pPipeline,
     const intrusive_ptr<ExpressionContext>& pExpCtx) {
     // We will be modifying the source vector as we go.
     Pipeline::SourceContainer& sources = pPipeline->sources;
 
     // Inject a MongodImplementation to sources that need them.
-    for (size_t i = 0; i < sources.size(); i++) {
+    for (auto&& source : sources) {
         DocumentSourceNeedsMongod* needsMongod =
-            dynamic_cast<DocumentSourceNeedsMongod*>(sources[i].get());
+            dynamic_cast<DocumentSourceNeedsMongod*>(source.get());
         if (needsMongod) {
             needsMongod->injectMongodInterface(std::make_shared<MongodImplementation>(pExpCtx));
         }
@@ -260,13 +263,19 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
         }
     }
 
-    // Look for an initial match. This works whether we got an initial query or not.
-    // If not, it results in a "{}" query, which will be what we want in that case.
+    // Look for an initial match. This works whether we got an initial query or not. If not, it
+    // results in a "{}" query, which will be what we want in that case.
     const BSONObj queryObj = pPipeline->getInitialQuery();
     if (!queryObj.isEmpty()) {
-        // This will get built in to the Cursor we'll create, so
-        // remove the match from the pipeline
-        sources.pop_front();
+        if (dynamic_cast<DocumentSourceMatch*>(sources.front().get())) {
+            // If a $match query is pulled into the cursor, the $match is redundant, and can be
+            // removed from the pipeline.
+            sources.pop_front();
+        } else {
+            // A $geoNear stage, the only other stage that can produce an initial query, is also
+            // a valid initial stage and will be handled above.
+            MONGO_UNREACHABLE;
+        }
     }
 
     // Find the set of fields in the source documents depended on by this pipeline.
@@ -292,8 +301,16 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
     }
 
     // Create the PlanExecutor.
-    auto exec = prepareExecutor(
-        txn, collection, pPipeline, pExpCtx, sortStage, deps, queryObj, &sortObj, &projForQuery);
+    auto exec = prepareExecutor(txn,
+                                collection,
+                                nss,
+                                pPipeline,
+                                pExpCtx,
+                                sortStage,
+                                deps,
+                                queryObj,
+                                &sortObj,
+                                &projForQuery);
 
     return addCursorSource(pPipeline, pExpCtx, exec, deps, queryObj, sortObj, projForQuery);
 }
@@ -301,6 +318,7 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
 std::shared_ptr<PlanExecutor> PipelineD::prepareExecutor(
     OperationContext* txn,
     Collection* collection,
+    const NamespaceString& nss,
     const intrusive_ptr<Pipeline>& pipeline,
     const intrusive_ptr<ExpressionContext>& expCtx,
     const intrusive_ptr<DocumentSourceSort>& sortStage,
@@ -326,8 +344,19 @@ std::shared_ptr<PlanExecutor> PipelineD::prepareExecutor(
     //
     // LATER - We should attempt to determine if the results from the query are returned in some
     // order so we can then apply other optimizations there are tickets for, such as SERVER-4507.
-    size_t plannerOpts = QueryPlannerParams::DEFAULT | QueryPlannerParams::INCLUDE_SHARD_FILTER |
-        QueryPlannerParams::NO_BLOCKING_SORT;
+    size_t plannerOpts = QueryPlannerParams::DEFAULT | QueryPlannerParams::NO_BLOCKING_SORT;
+
+    // If we are connecting directly to the shard rather than through a mongos, don't filter out
+    // orphaned documents.
+    if (ShardingState::get(txn)->needCollectionMetadata(txn, nss.ns())) {
+        plannerOpts |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    }
+
+    if (deps.hasNoRequirements()) {
+        // If we don't need any fields from the input document, performing a count is faster, and
+        // will output empty documents, which is okay.
+        plannerOpts |= QueryPlannerParams::IS_COUNT;
+    }
 
     // The only way to get a text score is to let the query system handle the projection. In all
     // other cases, unless the query system can do an index-covered projection and avoid going to
@@ -408,6 +437,10 @@ shared_ptr<PlanExecutor> PipelineD::addCursorSource(const intrusive_ptr<Pipeline
     pSource->setQuery(queryObj);
     pSource->setSort(sortObj);
 
+    if (deps.hasNoRequirements()) {
+        pSource->shouldProduceEmptyDocs();
+    }
+
     if (!projectionObj.isEmpty()) {
         pSource->setProjection(projectionObj, boost::none);
     } else {
@@ -419,11 +452,10 @@ shared_ptr<PlanExecutor> PipelineD::addCursorSource(const intrusive_ptr<Pipeline
         pSource->setProjection(deps.toProjection(), deps.toParsedDeps());
     }
 
-    while (!pipeline->sources.empty() && pSource->coalesce(pipeline->sources.front())) {
-        pipeline->sources.pop_front();
-    }
-
+    // Add the initial DocumentSourceCursor to the front of the pipeline. Then optimize again in
+    // case the new stage can be absorbed with the first stages of the pipeline.
     pipeline->addInitialSource(pSource);
+    pipeline->optimizePipeline();
 
     // DocumentSourceCursor expects a yielding PlanExecutor that has had its state saved. We
     // deregister the PlanExecutor so that it can be registered with ClientCursor.

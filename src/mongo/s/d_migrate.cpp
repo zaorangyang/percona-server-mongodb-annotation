@@ -43,22 +43,18 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/field_parser.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/range_deleter_service.h"
-#include "mongo/db/s/migration_impl.h"
+#include "mongo/db/s/chunk_move_write_concern_options.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/migration_secondary_throttle_options.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-using std::list;
-using std::set;
 using std::string;
-using std::unique_ptr;
-using std::vector;
 
 namespace {
 
@@ -96,7 +92,10 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        return ShardingState::get(txn)->migrationSourceManager()->transferMods(txn, errmsg, result);
+        const MigrationSessionId migrationSessionid(
+            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
+        return ShardingState::get(txn)->migrationSourceManager()->transferMods(
+            txn, migrationSessionid, errmsg, result);
     }
 
 } transferModsCommand;
@@ -135,7 +134,10 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        return ShardingState::get(txn)->migrationSourceManager()->clone(txn, errmsg, result);
+        const MigrationSessionId migrationSessionid(
+            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
+        return ShardingState::get(txn)->migrationSourceManager()->clone(
+            txn, migrationSessionid, errmsg, result);
     }
 
 } initialCloneCommand;
@@ -210,7 +212,7 @@ public:
 
         // Active state of TO-side migrations (MigrateStatus) is serialized by distributed
         // collection lock.
-        if (shardingState->migrationDestinationManager()->getActive()) {
+        if (shardingState->migrationDestinationManager()->isActive()) {
             errmsg = "migrate already in progress";
             return false;
         }
@@ -267,17 +269,27 @@ public:
         }
 
         // Process secondary throttle settings and assign defaults if necessary.
-        const auto moveWriteConcernOptions =
-            uassertStatusOK(ChunkMoveWriteConcernOptions::initFromCommand(cmdObj));
-        const auto& writeConcern = moveWriteConcernOptions.getWriteConcern();
+        const auto secondaryThrottle =
+            uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
+        const auto writeConcern = uassertStatusOK(
+            ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(secondaryThrottle));
 
         BSONObj shardKeyPattern = cmdObj["shardKeyPattern"].Obj().getOwned();
 
         const string fromShard(cmdObj["from"].String());
 
-        Status startStatus = shardingState->migrationDestinationManager()->start(
-            ns, fromShard, min, max, shardKeyPattern, currentVersion.epoch(), writeConcern);
+        const MigrationSessionId migrationSessionId(
+            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
 
+        Status startStatus =
+            shardingState->migrationDestinationManager()->start(ns,
+                                                                migrationSessionId,
+                                                                fromShard,
+                                                                min,
+                                                                max,
+                                                                shardKeyPattern,
+                                                                currentVersion.epoch(),
+                                                                writeConcern);
         if (!startStatus.isOK()) {
             return appendCommandStatus(result, startStatus);
         }
@@ -323,7 +335,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         ShardingState::get(txn)->migrationDestinationManager()->report(result);
-        return 1;
+        return true;
     }
 
 } recvChunkStatusCommand;
@@ -362,7 +374,11 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        bool ok = ShardingState::get(txn)->migrationDestinationManager()->startCommit();
+        const MigrationSessionId migrationSessionid(
+            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
+        const bool ok =
+            ShardingState::get(txn)->migrationDestinationManager()->startCommit(migrationSessionid);
+
         ShardingState::get(txn)->migrationDestinationManager()->report(result);
         return ok;
     }
@@ -411,36 +427,4 @@ public:
 } recvChunkAbortCommand;
 
 }  // namespace
-
-void logInsertOpForSharding(OperationContext* txn,
-                            const char* ns,
-                            const BSONObj& obj,
-                            bool notInActiveChunk) {
-    ShardingState* shardingState = ShardingState::get(txn);
-    if (shardingState->enabled())
-        shardingState->migrationSourceManager()->logInsertOp(txn, ns, obj, notInActiveChunk);
-}
-
-void logUpdateOpForSharding(OperationContext* txn,
-                            const char* ns,
-                            const BSONObj& updatedDoc,
-                            bool notInActiveChunk) {
-    ShardingState* shardingState = ShardingState::get(txn);
-    if (shardingState->enabled())
-        shardingState->migrationSourceManager()->logUpdateOp(txn, ns, updatedDoc, notInActiveChunk);
-}
-
-void logDeleteOpForSharding(OperationContext* txn,
-                            const char* ns,
-                            const BSONObj& obj,
-                            bool notInActiveChunk) {
-    ShardingState* shardingState = ShardingState::get(txn);
-    if (shardingState->enabled())
-        shardingState->migrationSourceManager()->logDeleteOp(txn, ns, obj, notInActiveChunk);
-}
-
-bool isInMigratingChunk(OperationContext* txn, const NamespaceString& ns, const BSONObj& doc) {
-    return ShardingState::get(txn)->migrationSourceManager()->isInMigratingChunk(ns, doc);
-}
-
 }  // namespace mongo

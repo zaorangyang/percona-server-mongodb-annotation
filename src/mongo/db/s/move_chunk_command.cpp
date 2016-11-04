@@ -38,6 +38,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/range_deleter_service.h"
+#include "mongo/db/s/chunk_move_write_concern_options.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/migration_impl.h"
 #include "mongo/db/s/sharding_state.h"
@@ -46,6 +47,7 @@
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/migration_secondary_throttle_options.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
@@ -177,10 +179,10 @@ public:
         // Initialize our current shard name in the shard state if needed
         shardingState->setShardName(chunkMoveState.getFromShard());
 
-        const auto moveWriteConcernOptions =
-            uassertStatusOK(ChunkMoveWriteConcernOptions::initFromCommand(cmdObj));
-        const auto& secThrottleObj = moveWriteConcernOptions.getSecThrottle();
-        const auto& writeConcern = moveWriteConcernOptions.getWriteConcern();
+        const auto secondaryThrottle =
+            uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
+        const auto writeConcernForRangeDeleter = uassertStatusOK(
+            ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(secondaryThrottle));
 
         // Do inline deletion
         bool waitForDelete = cmdObj["waitForDelete"].trueValue();
@@ -237,18 +239,13 @@ public:
 
         timing.done(2);
 
-        Status distLockStatus = distLock->checkForPendingCatalogChange();
-        if (!distLockStatus.isOK()) {
-            warning() << "Aborting migration due to need to swap current catalog manager"
-                      << causedBy(distLockStatus);
-            return appendCommandStatus(result, distLockStatus);
-        }
-
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep2);
 
         // 3.
 
-        auto moveChunkStartStatus = chunkMoveState.start(shardKeyPattern);
+        const auto migrationSessionId = MigrationSessionId::generate(chunkMoveState.getFromShard(),
+                                                                     chunkMoveState.getToShard());
+        auto moveChunkStartStatus = chunkMoveState.start(migrationSessionId, shardKeyPattern);
 
         if (!moveChunkStartStatus.isOK()) {
             warning() << moveChunkStartStatus.toString();
@@ -264,10 +261,9 @@ public:
                 return false;
             }
 
-            const bool isSecondaryThrottle(writeConcern.shouldWaitForOtherNodes());
-
             BSONObjBuilder recvChunkStartBuilder;
             recvChunkStartBuilder.append("_recvChunkStart", ns);
+            migrationSessionId.append(&recvChunkStartBuilder);
             recvChunkStartBuilder.append("from", chunkMoveState.getFromShardCS().toString());
             recvChunkStartBuilder.append("fromShardName", chunkMoveState.getFromShard());
             recvChunkStartBuilder.append("toShardName", chunkMoveState.getToShard());
@@ -276,12 +272,7 @@ public:
             recvChunkStartBuilder.append("shardKeyPattern", shardKeyPattern);
             recvChunkStartBuilder.append("configServer",
                                          shardingState->getConfigServer(txn).toString());
-            recvChunkStartBuilder.append("secondaryThrottle", isSecondaryThrottle);
-
-            // Follow the same convention in moveChunk.
-            if (isSecondaryThrottle && !secThrottleObj.isEmpty()) {
-                recvChunkStartBuilder.append("writeConcern", secThrottleObj);
-            }
+            secondaryThrottle.append(&recvChunkStartBuilder);
 
             BSONObj res;
 
@@ -312,13 +303,6 @@ public:
         }
 
         timing.done(3);
-
-        distLockStatus = distLock->checkForPendingCatalogChange();
-        if (!distLockStatus.isOK()) {
-            warning() << "Aborting migration due to need to swap current catalog manager"
-                      << causedBy(distLockStatus);
-            return appendCommandStatus(result, distLockStatus);
-        }
 
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep3);
 
@@ -416,23 +400,9 @@ public:
             }
 
             txn->checkForInterrupt();
-
-            distLockStatus = distLock->checkForPendingCatalogChange();
-            if (!distLockStatus.isOK()) {
-                warning() << "Aborting migration due to need to swap current catalog manager"
-                          << causedBy(distLockStatus);
-                return appendCommandStatus(result, distLockStatus);
-            }
         }
 
         timing.done(4);
-
-        distLockStatus = distLock->checkForPendingCatalogChange();
-        if (!distLockStatus.isOK()) {
-            warning() << "Aborting migration due to need to swap current catalog manager"
-                      << causedBy(distLockStatus);
-            return appendCommandStatus(result, distLockStatus);
-        }
 
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep4);
 
@@ -466,7 +436,7 @@ public:
             return appendCommandStatus(result, Status(lockStatus.code(), msg));
         }
 
-        uassertStatusOK(chunkMoveState.commitMigration());
+        uassertStatusOK(chunkMoveState.commitMigration(migrationSessionId));
         timing.done(5);
 
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep5);
@@ -477,7 +447,7 @@ public:
                                                     chunkMoveState.getMinKey().getOwned(),
                                                     chunkMoveState.getMaxKey().getOwned(),
                                                     shardKeyPattern));
-        deleterOptions.writeConcern = writeConcern;
+        deleterOptions.writeConcern = writeConcernForRangeDeleter;
         deleterOptions.waitForOpenCursors = true;
         deleterOptions.fromMigrate = true;
         deleterOptions.onlyRemoveOrphanedDocs = true;

@@ -379,6 +379,20 @@ add_option('use-system-asio',
     nargs=0,
 )
 
+add_option('icu',
+    choices=['on', 'off'],
+    const='on',
+    default='off',
+    help='Enable ICU',
+    nargs='?',
+    type='choice',
+)
+
+add_option('use-system-icu',
+    help="use system version of ICU",
+    nargs=0,
+)
+
 add_option('use-system-intel_decimal128',
     help='use system version of intel decimal128',
     nargs=0,
@@ -1062,7 +1076,7 @@ env['TARGET_OS_FAMILY'] = 'posix' if env.TargetOSIs('posix') else env.GetTargetO
 # option as a new variable in the environment.
 if get_option('allocator') == "auto":
     if env.TargetOSIs('windows') or \
-       (env.TargetOSIs('linux') and (env['TARGET_ARCH'] in ['i386', 'x86_64'])):
+       (env.TargetOSIs('linux') and (env['TARGET_ARCH'] in ['i386', 'x86_64', 'ppc64le'])):
         env['MONGO_ALLOCATOR'] = "tcmalloc"
     else:
         env['MONGO_ALLOCATOR'] = "system"
@@ -1492,6 +1506,11 @@ if get_option('inmemory') == 'on':
 
 if get_option('experimental-decimal-support') == 'on':
     env.SetConfigHeaderDefine("MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT")
+
+icuEnabled = False
+if get_option('icu') == 'on':
+    icuEnabled = True
+    env.SetConfigHeaderDefine("MONGO_CONFIG_ICU_ENABLED")
 
 if env['TARGET_ARCH'] == 'i386':
     # If we are using GCC or clang to target 32 bit, set the ISA minimum to 'nocona',
@@ -2047,6 +2066,7 @@ def doConfigure(myenv):
         using_lsan = 'leak' in sanitizer_list
         using_asan = 'address' in sanitizer_list or using_lsan
         using_tsan = 'thread' in sanitizer_list
+        using_ubsan = 'undefined' in sanitizer_list
 
         # If the user asked for leak sanitizer, turn on the detect_leaks
         # ASAN_OPTION. If they asked for address sanitizer as well, drop
@@ -2104,6 +2124,10 @@ def doConfigure(myenv):
         if using_tsan:
             tsan_options += "suppressions=\"%s\" " % myenv.File("#etc/tsan.suppressions").abspath
             myenv['ENV']['TSAN_OPTIONS'] = tsan_options
+
+        # By default, undefined behavior sanitizer doesn't stop on the first error. Make it so.
+        if using_ubsan:
+            AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover")
 
     if myenv.ToolchainIs('msvc') and optBuild:
         # http://blogs.msdn.com/b/vcblog/archive/2013/09/11/introducing-gw-compiler-switch.aspx
@@ -2212,6 +2236,41 @@ def doConfigure(myenv):
 
     if conf.CheckCXX11IsTriviallyCopyable():
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_STD_IS_TRIVIALLY_COPYABLE")
+
+    myenv = conf.Finish()
+
+    def CheckCXX14EnableIfT(context):
+        test_body = """
+        #include <cstdlib>
+        #include <type_traits>
+
+        template <typename = void>
+        struct scons {
+            bool hasSupport() { return false; }
+        };
+
+        template <>
+        struct scons<typename std::enable_if_t<true>> {
+            bool hasSupport() { return true; }
+        };
+
+        int main(int argc, char **argv) {
+            scons<> SCons;
+            return SCons.hasSupport() ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
+        """
+        context.Message('Checking for C++14 std::enable_if_t support...')
+        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
+        context.Result(ret)
+        return ret
+
+    # Check for std::enable_if_t support without using the __cplusplus macro
+    conf = Configure(myenv, help=False, custom_tests = {
+        'CheckCXX14EnableIfT' : CheckCXX14EnableIfT,
+    })
+
+    if conf.CheckCXX14EnableIfT():
+        conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_ENABLE_IF_T')
 
     myenv = conf.Finish()
 
@@ -2578,6 +2637,7 @@ Export("rocksdb")
 Export("wiredtiger")
 Export("endian")
 Export("inmemory")
+Export("icuEnabled")
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])

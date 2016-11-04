@@ -26,6 +26,8 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/shell/shell_options.h"
 
 #include <boost/filesystem/operations.hpp>
@@ -124,6 +126,11 @@ Status addMongoShellOptions(moe::OptionSection* options) {
                                moe::Switch,
                                "disable the Javascript Just In Time compiler");
 
+    options->addOptionChaining("enableJavaScriptProtection",
+                               "enableJavaScriptProtection",
+                               moe::Switch,
+                               "disable automatic JavaScript function marshalling");
+
     Status ret = Status::OK();
 #ifdef MONGO_CONFIG_SSL
     ret = addSSLClientOptions(options);
@@ -178,8 +185,8 @@ std::string getMongoShellHelp(StringData name, const moe::OptionSection& options
     sb << "usage: " << name << " [options] [db address] [file names (ending in .js)]\n"
        << "db address can be:\n"
        << "  foo                   foo database on local machine\n"
-       << "  192.169.0.5/foo       foo database on 192.168.0.5 machine\n"
-       << "  192.169.0.5:9999/foo  foo database on 192.168.0.5 machine on port 9999\n"
+       << "  192.168.0.5/foo       foo database on 192.168.0.5 machine\n"
+       << "  192.168.0.5:9999/foo  foo database on 192.168.0.5 machine on port 9999\n"
        << options.helpString() << "\n"
        << "file names: a list of files to run. files have to end in .js and will exit after "
        << "unless --shell is specified";
@@ -259,6 +266,9 @@ Status storeMongoShellOptions(const moe::Environment& params,
     }
     if (params.count("nodb")) {
         shellGlobalParams.nodb = true;
+    }
+    if (params.count("enableJavaScriptProtection")) {
+        shellGlobalParams.javascriptProtection = true;
     }
     if (params.count("norc")) {
         shellGlobalParams.norc = true;
@@ -355,13 +365,13 @@ Status storeMongoShellOptions(const moe::Environment& params,
         } else if (!shellGlobalParams.password.empty() && !cs.getPassword().empty()) {
             sb << "password";
         } else if (!shellGlobalParams.authenticationMechanism.empty() &&
-                   uriOptions.hasField("authMechanism")) {
+                   uriOptions.count("authMechanism")) {
             sb << "the authentication mechanism";
         } else if (!shellGlobalParams.authenticationDatabase.empty() &&
-                   uriOptions.hasField("authSource")) {
+                   uriOptions.count("authSource")) {
             sb << "the authentication database";
         } else if (shellGlobalParams.gssapiServiceName != saslDefaultServiceName &&
-                   uriOptions.hasField("gssapiServiceName")) {
+                   uriOptions.count("gssapiServiceName")) {
             sb << "the GSSAPI service name";
         } else {
             return Status::OK();

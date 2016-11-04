@@ -36,6 +36,8 @@
 
 namespace mongo {
 
+class JournalListener;
+
 class DevNullKVEngine : public KVEngine {
 public:
     virtual ~DevNullKVEngine() {}
@@ -82,6 +84,10 @@ public:
         return true;
     }
 
+    virtual bool isEphemeral() const {
+        return true;
+    }
+
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) {
         return 1;
     }
@@ -99,6 +105,8 @@ public:
     }
 
     virtual void cleanShutdown(){};
+
+    void setJournalListener(JournalListener* jl) final {}
 
 private:
     std::shared_ptr<void> _catalogInfo;

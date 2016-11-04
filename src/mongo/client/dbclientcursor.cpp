@@ -417,7 +417,10 @@ bool DBClientCursor::peekError(BSONObj* error) {
     peek(v, 1);
 
     verify(v.size() == 1);
-    verify(hasErrField(v[0]));
+    // We check both the legacy error format, and the new error format. hasErrField checks for
+    // $err, and getStatusFromCommandResult checks for modern errors of the form '{ok: 0.0, code:
+    // <...>, errmsg: ...}'.
+    verify(hasErrField(v[0]) || !getStatusFromCommandResult(v[0]).isOK());
 
     if (error)
         *error = v[0].getOwned();
@@ -429,8 +432,7 @@ void DBClientCursor::attach(AScopedConnection* conn) {
     verify(conn);
     verify(conn->get());
 
-    if (conn->get()->type() == ConnectionString::SET ||
-        conn->get()->type() == ConnectionString::SYNC) {
+    if (conn->get()->type() == ConnectionString::SET) {
         if (_lazyHost.size() > 0)
             _scopedHost = _lazyHost;
         else if (_client)

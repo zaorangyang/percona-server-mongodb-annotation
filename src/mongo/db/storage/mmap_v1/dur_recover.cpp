@@ -34,6 +34,7 @@
 
 #include "mongo/db/storage/mmap_v1/dur_recover.h"
 
+#include <cstring>
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
@@ -177,7 +178,7 @@ public:
      *  throws on premature end of section.
      */
     void next(ParsedJournalEntry& e) {
-        unsigned lenOrOpCode;
+        unsigned lenOrOpCode{};
         _entries->read(lenOrOpCode);
 
         if (lenOrOpCode > JEntry::OpCode_Min) {
@@ -299,7 +300,7 @@ DurableMappedFile* RecoveryJob::Last::newEntry(const dur::ParsedJournalEntry& en
             verify(false);
         }
         std::shared_ptr<DurableMappedFile> sp(new DurableMappedFile);
-        verify(sp->open(fn, false));
+        verify(sp->open(fn));
         rj._mmfs.push_back(sp);
         mmf = sp.get();
     }
@@ -471,6 +472,8 @@ bool RecoveryJob::processFileBuffer(const void* p, unsigned len) {
         {
             // read file header
             JHeader h;
+            std::memset(&h, 0, sizeof(h));
+
             br.read(h);
 
             if (!h.valid()) {
@@ -498,6 +501,8 @@ bool RecoveryJob::processFileBuffer(const void* p, unsigned len) {
         // read sections
         while (!br.atEof()) {
             JSectHeader h;
+            std::memset(&h, 0, sizeof(h));
+
             br.peek(h);
             if (h.fileId != fileId) {
                 if (kDebugBuild ||
@@ -546,9 +551,8 @@ bool RecoveryJob::processFile(boost::filesystem::path journalfile) {
         log() << "recover exception checking filesize" << endl;
     }
 
-    MemoryMappedFile f;
-    void* p =
-        f.mapWithOptions(journalfile.string().c_str(), MongoFile::READONLY | MongoFile::SEQUENTIAL);
+    MemoryMappedFile f{MongoFile::Options::READONLY | MongoFile::Options::SEQUENTIAL};
+    void* p = f.map(journalfile.string().c_str());
     massert(13544, str::stream() << "recover error couldn't open " << journalfile.string(), p);
     return processFileBuffer(p, (unsigned)f.length());
 }

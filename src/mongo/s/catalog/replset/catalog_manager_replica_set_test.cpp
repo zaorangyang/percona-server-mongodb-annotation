@@ -117,7 +117,7 @@ TEST_F(CatalogManagerReplSetTest, GetCollectionExisting) {
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
-        ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, 30, -1);
+        ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder);
 
@@ -179,7 +179,7 @@ TEST_F(CatalogManagerReplSetTest, GetDatabaseExisting) {
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
-        ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, 30, -1);
+        ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder);
 
@@ -505,7 +505,7 @@ TEST_F(CatalogManagerReplSetTest, GetChunksForNSWithSortAndLimit) {
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
-        ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, 30, -1);
+        ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder);
 
@@ -1017,7 +1017,7 @@ TEST_F(CatalogManagerReplSetTest, GetCollectionsValidResultsNoDb) {
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
-        ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, 30, -1);
+        ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder);
 
@@ -1497,7 +1497,7 @@ TEST_F(CatalogManagerReplSetTest, UpdateDatabaseExceededTimeLimit) {
     future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecated) {
+TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecatedSuccessful) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     BSONArray updateOps = BSON_ARRAY(BSON("update1"
@@ -1508,29 +1508,77 @@ TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecated) {
                                              << "first precondition")
                                         << BSON("precondition2"
                                                 << "second precondition"));
+    std::string nss = "config.chunks";
+    ChunkVersion lastChunkVersion(0, 0, OID());
 
-    auto future = launchAsync([this, updateOps, preCondition] {
-        auto status =
-            catalogManager()->applyChunkOpsDeprecated(operationContext(), updateOps, preCondition);
+    auto future = launchAsync([this, updateOps, preCondition, nss, lastChunkVersion] {
+        auto status = catalogManager()->applyChunkOpsDeprecated(
+            operationContext(), updateOps, preCondition, nss, lastChunkVersion);
         ASSERT_OK(status);
     });
 
-    onCommand([updateOps, preCondition](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS("config", request.dbname);
+    onCommand(
+        [updateOps, preCondition, nss](const RemoteCommandRequest& request) {
+            ASSERT_EQUALS("config", request.dbname);
+            ASSERT_EQUALS(BSON("w"
+                               << "majority"
+                               << "wtimeout" << 15000),
+                          request.cmdObj["writeConcern"].Obj());
+            ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+            ASSERT_EQUALS(updateOps, request.cmdObj["applyOps"].Obj());
+            ASSERT_EQUALS(preCondition, request.cmdObj["preCondition"].Obj());
 
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+            return BSON("ok" << 1);
+        });
 
-        ASSERT_EQUALS(updateOps, request.cmdObj["applyOps"].Obj());
-        ASSERT_EQUALS(preCondition, request.cmdObj["preCondition"].Obj());
+    // Now wait for the applyChunkOpsDeprecated call to return
+    future.timed_get(kFutureTimeout);
+}
 
-        return BSON("ok" << 1);
+TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecatedSuccessfulWithCheck) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
+
+    BSONArray updateOps = BSON_ARRAY(BSON("update1"
+                                          << "first update")
+                                     << BSON("update2"
+                                             << "second update"));
+    BSONArray preCondition = BSON_ARRAY(BSON("precondition1"
+                                             << "first precondition")
+                                        << BSON("precondition2"
+                                                << "second precondition"));
+    std::string nss = "config.chunks";
+    ChunkVersion lastChunkVersion(0, 0, OID());
+
+    auto future = launchAsync([this, updateOps, preCondition, nss, lastChunkVersion] {
+        auto status = catalogManager()->applyChunkOpsDeprecated(
+            operationContext(), updateOps, preCondition, nss, lastChunkVersion);
+        ASSERT_OK(status);
+    });
+
+    onCommand([&](const RemoteCommandRequest& request) {
+        BSONObjBuilder responseBuilder;
+        Command::appendCommandStatus(responseBuilder,
+                                     Status(ErrorCodes::DuplicateKey, "precondition failed"));
+        return responseBuilder.obj();
+    });
+
+    onFindCommand([this](const RemoteCommandRequest& request) {
+        OID oid = OID::gen();
+        ChunkType chunk;
+        chunk.setName("chunk0000");
+        chunk.setNS("TestDB.TestColl");
+        chunk.setMin(BSON("a" << 1));
+        chunk.setMax(BSON("a" << 100));
+        chunk.setVersion({1, 2, oid});
+        chunk.setShard("shard0000");
+        return vector<BSONObj>{chunk.toBSON()};
     });
 
     // Now wait for the applyChunkOpsDeprecated call to return
     future.timed_get(kFutureTimeout);
 }
 
-TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecatedCommandFailed) {
+TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecatedFailedWithCheck) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     BSONArray updateOps = BSON_ARRAY(BSON("update1"
@@ -1541,25 +1589,23 @@ TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecatedCommandFailed) {
                                              << "first precondition")
                                         << BSON("precondition2"
                                                 << "second precondition"));
+    std::string nss = "config.chunks";
+    ChunkVersion lastChunkVersion(0, 0, OID());
 
-    auto future = launchAsync([this, updateOps, preCondition] {
-        auto status =
-            catalogManager()->applyChunkOpsDeprecated(operationContext(), updateOps, preCondition);
-        ASSERT_EQUALS(ErrorCodes::BadValue, status);
+    auto future = launchAsync([this, updateOps, preCondition, nss, lastChunkVersion] {
+        auto status = catalogManager()->applyChunkOpsDeprecated(
+            operationContext(), updateOps, preCondition, nss, lastChunkVersion);
+        ASSERT_EQUALS(ErrorCodes::NoMatchingDocument, status);
     });
 
-    onCommand([updateOps, preCondition](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS("config", request.dbname);
-        ASSERT_EQUALS(updateOps, request.cmdObj["applyOps"].Obj());
-        ASSERT_EQUALS(preCondition, request.cmdObj["preCondition"].Obj());
-
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
-
+    onCommand([&](const RemoteCommandRequest& request) {
         BSONObjBuilder responseBuilder;
         Command::appendCommandStatus(responseBuilder,
-                                     Status(ErrorCodes::BadValue, "precondition failed"));
+                                     Status(ErrorCodes::NoMatchingDocument, "some error"));
         return responseBuilder.obj();
     });
+
+    onFindCommand([this](const RemoteCommandRequest& request) { return vector<BSONObj>{}; });
 
     // Now wait for the applyChunkOpsDeprecated call to return
     future.timed_get(kFutureTimeout);
@@ -2297,7 +2343,7 @@ TEST_F(CatalogManagerReplSetTest, BasicReadAfterOpTime) {
             ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
             checkReadConcern(request.cmdObj, lastOpTime.getTimestamp(), lastOpTime.getTerm());
 
-            ReplSetMetadata metadata(10, repl::OpTime(), newOpTime, 100, 30, -1);
+            ReplSetMetadata metadata(10, repl::OpTime(), newOpTime, 100, OID(), 30, -1);
             BSONObjBuilder builder;
             metadata.writeToMetadata(&builder);
 
@@ -2332,7 +2378,7 @@ TEST_F(CatalogManagerReplSetTest, ReadAfterOpTimeShouldNotGoBack) {
         ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
 
-        ReplSetMetadata metadata(10, repl::OpTime(), newOpTime, 100, 30, -1);
+        ReplSetMetadata metadata(10, repl::OpTime(), newOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder);
 
@@ -2360,7 +2406,7 @@ TEST_F(CatalogManagerReplSetTest, ReadAfterOpTimeShouldNotGoBack) {
         ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
 
-        ReplSetMetadata metadata(10, repl::OpTime(), oldOpTime, 100, 30, -1);
+        ReplSetMetadata metadata(10, repl::OpTime(), oldOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder);
 
@@ -2384,7 +2430,7 @@ TEST_F(CatalogManagerReplSetTest, ReadAfterOpTimeShouldNotGoBack) {
         ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
 
-        ReplSetMetadata metadata(10, repl::OpTime(), oldOpTime, 100, 30, -1);
+        ReplSetMetadata metadata(10, repl::OpTime(), oldOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder);
 
@@ -2409,7 +2455,7 @@ TEST_F(CatalogManagerReplSetTest, ReadAfterOpTimeFindThenCmd) {
             ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
             checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
 
-            ReplSetMetadata metadata(10, repl::OpTime(), newOpTime, 100, 30, -1);
+            ReplSetMetadata metadata(10, repl::OpTime(), newOpTime, 100, OID(), 30, -1);
             BSONObjBuilder builder;
             metadata.writeToMetadata(&builder);
 
@@ -2468,7 +2514,7 @@ TEST_F(CatalogManagerReplSetTest, ReadAfterOpTimeCmdThenFind) {
         ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
 
-        ReplSetMetadata metadata(10, repl::OpTime(), newOpTime, 100, 30, -1);
+        ReplSetMetadata metadata(10, repl::OpTime(), newOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder);
 

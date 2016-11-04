@@ -89,14 +89,18 @@ using str::stream;
 
 namespace {
 
+const char kWriteConcernField[] = "writeConcern";
+
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
 const ReadPreferenceSetting kConfigPrimaryPreferredSelector(ReadPreference::PrimaryPreferred,
                                                             TagSet{});
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
-                                                // Note: Even though we're setting NONE here,
+                                                // Note: Even though we're setting UNSET here,
                                                 // kMajority implies JOURNAL if journaling is
-                                                // supported by mongod.
-                                                WriteConcernOptions::NONE,
+                                                // supported by mongod and
+                                                // writeConcernMajorityJournalDefault is set to true
+                                                // in the ReplicaSetConfig.
+                                                WriteConcernOptions::SyncMode::UNSET,
                                                 Seconds(15));
 
 const int kMaxConfigVersionInitRetry = 3;
@@ -216,8 +220,12 @@ Status CatalogManagerReplicaSet::shardCollection(OperationContext* txn,
         manager->getVersion(),
         true);
 
-    auto ssvStatus = grid.shardRegistry()->runCommandWithNotMasterRetries(
-        txn, dbPrimaryShardId, "admin", ssv.toBSON());
+    auto ssvStatus = grid.shardRegistry()->runIdempotentCommandOnShard(
+        txn,
+        dbPrimaryShardId,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        "admin",
+        ssv.toBSON());
     if (!ssvStatus.isOK()) {
         warning() << "could not update initial version of " << ns << " on shard primary "
                   << dbPrimaryShardId << ssvStatus.getStatus();
@@ -487,8 +495,12 @@ Status CatalogManagerReplicaSet::dropCollection(OperationContext* txn, const Nam
     auto* shardRegistry = grid.shardRegistry();
 
     for (const auto& shardEntry : allShards) {
-        auto dropResult = shardRegistry->runCommandWithNotMasterRetries(
-            txn, shardEntry.getName(), ns.db().toString(), BSON("drop" << ns.coll()));
+        auto dropResult = shardRegistry->runIdempotentCommandOnShard(
+            txn,
+            shardEntry.getName(),
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            ns.db().toString(),
+            BSON("drop" << ns.coll()));
 
         if (!dropResult.isOK()) {
             return dropResult.getStatus();
@@ -552,8 +564,12 @@ Status CatalogManagerReplicaSet::dropCollection(OperationContext* txn, const Nam
             ChunkVersion::DROPPED(),
             true);
 
-        auto ssvResult = shardRegistry->runCommandWithNotMasterRetries(
-            txn, shardEntry.getName(), "admin", ssv.toBSON());
+        auto ssvResult = shardRegistry->runIdempotentCommandOnShard(
+            txn,
+            shardEntry.getName(),
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            "admin",
+            ssv.toBSON());
 
         if (!ssvResult.isOK()) {
             return ssvResult.getStatus();
@@ -564,8 +580,12 @@ Status CatalogManagerReplicaSet::dropCollection(OperationContext* txn, const Nam
             return ssvStatus;
         }
 
-        auto unsetShardingStatus = shardRegistry->runCommandWithNotMasterRetries(
-            txn, shardEntry.getName(), "admin", BSON("unsetSharding" << 1));
+        auto unsetShardingStatus = shardRegistry->runIdempotentCommandOnShard(
+            txn,
+            shardEntry.getName(),
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            "admin",
+            BSON("unsetSharding" << 1));
 
         if (!unsetShardingStatus.isOK()) {
             return unsetShardingStatus.getStatus();
@@ -789,6 +809,7 @@ bool CatalogManagerReplicaSet::runUserManagementWriteCommand(OperationContext* t
         // Make sure that if the command has a write concern that it is w:1 or w:majority, and
         // convert w:1 or no write concern to w:majority before sending.
         WriteConcernOptions writeConcern;
+        writeConcern.reset();
         const char* writeConcernFieldName = "writeConcern";
         BSONElement writeConcernElement = cmdObj[writeConcernFieldName];
         bool initialCmdHadWriteConcern = !writeConcernElement.eoo();
@@ -846,7 +867,8 @@ bool CatalogManagerReplicaSet::runReadCommandForTest(OperationContext* txn,
     cmdBuilder.appendElements(cmdObj);
     _appendReadConcern(&cmdBuilder);
 
-    auto resultStatus = _runReadCommand(txn, dbname, cmdBuilder.done(), kConfigReadSelector);
+    auto resultStatus = grid.shardRegistry()->runIdempotentCommandOnConfig(
+        txn, kConfigReadSelector, dbname, cmdBuilder.done());
     if (resultStatus.isOK()) {
         result->appendElements(resultStatus.getValue());
         return Command::getStatusFromCommandResult(resultStatus.getValue()).isOK();
@@ -859,7 +881,8 @@ bool CatalogManagerReplicaSet::runUserManagementReadCommand(OperationContext* tx
                                                             const std::string& dbname,
                                                             const BSONObj& cmdObj,
                                                             BSONObjBuilder* result) {
-    auto resultStatus = _runReadCommand(txn, dbname, cmdObj, kConfigPrimaryPreferredSelector);
+    auto resultStatus = grid.shardRegistry()->runIdempotentCommandOnConfig(
+        txn, kConfigPrimaryPreferredSelector, dbname, cmdObj);
     if (resultStatus.isOK()) {
         result->appendElements(resultStatus.getValue());
         return Command::getStatusFromCommandResult(resultStatus.getValue()).isOK();
@@ -870,8 +893,12 @@ bool CatalogManagerReplicaSet::runUserManagementReadCommand(OperationContext* tx
 
 Status CatalogManagerReplicaSet::applyChunkOpsDeprecated(OperationContext* txn,
                                                          const BSONArray& updateOps,
-                                                         const BSONArray& preCondition) {
-    BSONObj cmd = BSON("applyOps" << updateOps << "preCondition" << preCondition);
+                                                         const BSONArray& preCondition,
+                                                         const std::string& nss,
+                                                         const ChunkVersion& lastChunkVersion) {
+    BSONObj cmd = BSON("applyOps" << updateOps << "preCondition" << preCondition
+                                  << kWriteConcernField << kMajorityWriteConcern.toBSON());
+
     auto response = grid.shardRegistry()->runCommandOnConfigWithRetries(
         txn, "config", cmd, ShardRegistry::kAllRetriableErrors);
 
@@ -880,12 +907,52 @@ Status CatalogManagerReplicaSet::applyChunkOpsDeprecated(OperationContext* txn,
     }
 
     Status status = Command::getStatusFromCommandResult(response.getValue());
-    if (!status.isOK()) {
-        string errMsg(str::stream() << "Unable to save chunk ops. Command: " << cmd
-                                    << ". Result: " << response.getValue());
 
+    if (MONGO_FAIL_POINT(failApplyChunkOps)) {
+        status = Status(ErrorCodes::InternalError, "Failpoint 'failApplyChunkOps' generated error");
+    }
+
+    if (!status.isOK()) {
+        string errMsg;
+
+        // This could be a blip in the network connectivity. Check if the commit request made it.
+        //
+        // If all the updates were successfully written to the chunks collection, the last
+        // document in the list of updates should be returned from a query to the chunks
+        // collection. The last chunk can be identified by namespace and version number.
+
+        warning() << "chunk operation commit failed and metadata will be revalidated"
+                  << causedBy(status);
+
+        // Look for the chunk in this shard whose version got bumped. We assume that if that
+        // mod made it to the config server, then applyOps was successful.
+        std::vector<ChunkType> newestChunk;
+        BSONObjBuilder query;
+        lastChunkVersion.addToBSON(query, ChunkType::DEPRECATED_lastmod());
+        query.append(ChunkType::ns(), nss);
+        Status chunkStatus = getChunks(txn, query.obj(), BSONObj(), 1, &newestChunk, nullptr);
+
+        if (!chunkStatus.isOK()) {
+            warning() << "getChunks function failed, unable to validate chunk operation metadata"
+                      << causedBy(chunkStatus);
+            errMsg = str::stream() << "getChunks function failed, unable to validate chunk "
+                                   << "operation metadata: " << causedBy(chunkStatus)
+                                   << ". applyChunkOpsDeprecated failed to get confirmation "
+                                   << "of commit. Unable to save chunk ops. Command: " << cmd
+                                   << ". Result: " << response.getValue();
+        } else if (!newestChunk.empty()) {
+            invariant(newestChunk.size() == 1);
+            log() << "chunk operation commit confirmed";
+            return Status::OK();
+        } else {
+            errMsg = str::stream() << "chunk operation commit failed: version "
+                                   << lastChunkVersion.toString() << " doesn't exist in namespace"
+                                   << nss << ". Unable to save chunk ops. Command: " << cmd
+                                   << ". Result: " << response.getValue();
+        }
         return Status(status.code(), errMsg);
     }
+
     return Status::OK();
 }
 
@@ -1186,8 +1253,8 @@ StatusWith<long long> CatalogManagerReplicaSet::_runCountCommandOnConfig(Operati
     countBuilder.append("query", query);
     _appendReadConcern(&countBuilder);
 
-    auto resultStatus =
-        _runReadCommand(txn, ns.db().toString(), countBuilder.done(), kConfigReadSelector);
+    auto resultStatus = grid.shardRegistry()->runIdempotentCommandOnConfig(
+        txn, kConfigReadSelector, ns.db().toString(), countBuilder.done());
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
     }
@@ -1338,32 +1405,10 @@ void CatalogManagerReplicaSet::_appendReadConcern(BSONObjBuilder* builder) {
     readConcern.appendInfo(builder);
 }
 
-StatusWith<BSONObj> CatalogManagerReplicaSet::_runReadCommand(
-    OperationContext* txn,
-    const std::string& dbname,
-    const BSONObj& cmdObj,
-    const ReadPreferenceSetting& readPref) {
-    for (int retry = 1; retry <= kMaxReadRetry; ++retry) {
-        auto response = grid.shardRegistry()->runCommandOnConfig(txn, readPref, dbname, cmdObj);
-        if (response.isOK()) {
-            return response;
-        }
-
-        if (ShardRegistry::kAllRetriableErrors.count(response.getStatus().code()) &&
-            retry < kMaxReadRetry) {
-            continue;
-        }
-
-        return response.getStatus();
-    }
-
-    MONGO_UNREACHABLE;
-}
-
 Status CatalogManagerReplicaSet::appendInfoForConfigServerDatabases(OperationContext* txn,
                                                                     BSONArrayBuilder* builder) {
-    auto resultStatus =
-        _runReadCommand(txn, "admin", BSON("listDatabases" << 1), kConfigPrimaryPreferredSelector);
+    auto resultStatus = grid.shardRegistry()->runIdempotentCommandOnConfig(
+        txn, kConfigPrimaryPreferredSelector, "admin", BSON("listDatabases" << 1));
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();

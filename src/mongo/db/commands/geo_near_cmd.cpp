@@ -270,9 +270,8 @@ public:
 
         // Return an error if execution fails for any reason.
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
-            const std::unique_ptr<PlanStageStats> stats(exec->getStats());
             log() << "Plan executor error during geoNear command: " << PlanExecutor::statestr(state)
-                  << ", stats: " << Explain::statsToBSON(*stats);
+                  << ", stats: " << Explain::getWinningPlanStats(exec.get());
 
             return appendCommandStatus(result,
                                        Status(ErrorCodes::OperationFailed,
@@ -288,6 +287,8 @@ public:
         PlanSummaryStats summary;
         Explain::getSummaryStats(*exec, &summary);
         collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+        CurOp::get(txn)->debug().fromMultiPlanner = summary.fromMultiPlanner;
+        CurOp::get(txn)->debug().replanned = summary.replanned;
 
         stats.appendNumber("nscanned", summary.totalKeysExamined);
         stats.appendNumber("objectsLoaded", summary.totalDocsExamined);

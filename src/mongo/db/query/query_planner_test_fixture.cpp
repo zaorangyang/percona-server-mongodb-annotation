@@ -32,6 +32,8 @@
 
 #include "mongo/db/query/query_planner_test_fixture.h"
 
+#include <algorithm>
+
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
@@ -101,6 +103,37 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, MatchExpression* filterExpr)
                                         "foo",
                                         filterExpr,
                                         BSONObj()));
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern, IndexEntry::MultikeyPaths multikeyPaths) {
+    invariant(multikeyPaths.size() == static_cast<size_t>(keyPattern.nFields()));
+
+    const bool multikey =
+        std::any_of(multikeyPaths.cbegin(),
+                    multikeyPaths.cend(),
+                    [](const std::set<size_t>& components) { return !components.empty(); });
+    const bool sparse = false;
+    const bool unique = false;
+    const char name[] = "my_index_with_path_level_multikey_info";
+    const MatchExpression* filterExpr = nullptr;
+    const BSONObj infoObj;
+    IndexEntry entry(keyPattern, multikey, sparse, unique, name, filterExpr, infoObj);
+    entry.multikeyPaths = multikeyPaths;
+    params.indices.push_back(entry);
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern, std::unique_ptr<CollatorInterface> collator) {
+    _collators.emplace_back(std::move(collator));
+
+    const bool sparse = false;
+    const bool unique = false;
+    const bool multikey = false;
+    const char name[] = "my_index_with_collator";
+    const MatchExpression* filterExpr = nullptr;
+    const BSONObj infoObj;
+    IndexEntry entry(keyPattern, multikey, sparse, unique, name, filterExpr, infoObj);
+    entry.collator = _collators.back().get();
+    params.indices.push_back(entry);
 }
 
 void QueryPlannerTest::runQuery(BSONObj query) {

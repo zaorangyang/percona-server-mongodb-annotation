@@ -44,7 +44,9 @@ class ClientBasic;
 class Command;
 struct DepsTracker;
 class DocumentSource;
+class DocumentSourceNeedsMongod;
 struct ExpressionContext;
+class OperationContext;
 class Privilege;
 
 /** mongodb "commands" (sent via db.$cmd.findOne(...))
@@ -52,6 +54,8 @@ class Privilege;
     */
 class Pipeline : public IntrusiveCounterUnsigned {
 public:
+    typedef std::list<boost::intrusive_ptr<DocumentSource>> SourceContainer;
+
     /**
      * Create a pipeline from the command.
      *
@@ -64,7 +68,7 @@ public:
         const BSONObj& cmdObj,
         const boost::intrusive_ptr<ExpressionContext>& pCtx);
 
-    /// Helper to implement Command::checkAuthForCommand
+    // Helper to implement Command::checkAuthForCommand
     static Status checkAuthForCommand(ClientBasic* client,
                                       const std::string& dbname,
                                       const BSONObj& cmdObj);
@@ -72,6 +76,22 @@ public:
     const boost::intrusive_ptr<ExpressionContext>& getContext() const {
         return pCtx;
     }
+
+    /**
+     * Sets the OperationContext of 'pCtx' to nullptr.
+     *
+     * The PipelineProxyStage is responsible for detaching the OperationContext and releasing any
+     * storage-engine state of the DocumentSourceCursor that may be present in 'sources'.
+     */
+    void detachFromOperationContext();
+
+    /**
+     * Sets the OperationContext of 'pCtx' to 'opCtx'.
+     *
+     * The PipelineProxyStage is responsible for reattaching the OperationContext and reacquiring
+     * any storage-engine state of the DocumentSourceCursor that may be present in 'sources'.
+     */
+    void reattachToOperationContext(OperationContext* opCtx);
 
     /**
       Split the current Pipeline into a Pipeline for each shard, and
@@ -93,6 +113,11 @@ public:
      * Returns whether or not any DocumentSource in the pipeline needs the primary shard.
      */
     bool needsPrimaryShardMerger() const;
+
+    /**
+     * Modifies the pipeline, optimizing it by combining and swapping stages.
+     */
+    void optimizePipeline();
 
     /**
      * Returns any other collections involved in the pipeline in addition to the collection the
@@ -189,9 +214,12 @@ private:
 
     Pipeline(const boost::intrusive_ptr<ExpressionContext>& pCtx);
 
-    typedef std::deque<boost::intrusive_ptr<DocumentSource>> SourceContainer;
     SourceContainer sources;
     bool explain;
+
+    // Cache of the document sources for which dynamic_cast<DocumentSourceNeedsMongod*>() returns a
+    // non-null pointer.
+    std::vector<DocumentSourceNeedsMongod*> sourcesNeedingMongod;
 
     boost::intrusive_ptr<ExpressionContext> pCtx;
 };

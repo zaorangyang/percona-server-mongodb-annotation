@@ -32,6 +32,7 @@
 #include "mongo/client/fetcher.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
@@ -197,20 +198,6 @@ private:
                    const HostAndPort& source,
                    stdx::function<DBClientBase*()> getConnection);
 
-    /**
-     * Evaluate if the current sync source is still good.
-     * "syncSource" is the name of the current sync source, which will be used to look up the
-     * member's heartbeat data.
-     * "syncSourceLastOpTime" is the last OpTime the sync source has. This is passed in because the
-     * data stored from heartbeats could be too stale and would cause unnecessary sync source
-     * changes.
-     * "syncSourceHasSyncSource" indicates whether our sync source is currently syncing from another
-     * member.
-     */
-    bool _shouldChangeSyncSource(const HostAndPort& syncSource,
-                                 const OpTime& syncSourceLastOpTime,
-                                 bool syncSourceHasSyncSource);
-
     // restart syncing
     void start(OperationContext* txn);
 
@@ -218,6 +205,10 @@ private:
 
     // A pointer to the replication coordinator running the show.
     ReplicationCoordinator* _replCoord;
+
+    // Used to determine sync source.
+    // TODO(dannenberg) move into DataReplicator.
+    SyncSourceResolver _syncSourceResolver;
 
     // bool for indicating resync need on this node and the mutex that protects it
     // The resync command sets this flag; the Applier thread observes and clears it.

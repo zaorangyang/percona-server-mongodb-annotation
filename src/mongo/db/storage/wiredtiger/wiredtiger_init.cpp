@@ -56,8 +56,8 @@ class WiredTigerFactory : public StorageEngine::Factory {
 public:
     virtual ~WiredTigerFactory() {}
     virtual StorageEngine* create(const StorageGlobalParams& params,
-                                  const StorageEngineLockFile& lockFile) const {
-        if (lockFile.createdByUncleanShutdown()) {
+                                  const StorageEngineLockFile* lockFile) const {
+        if (lockFile && lockFile->createdByUncleanShutdown()) {
             warning() << "Recovering data from the last clean checkpoint.";
         }
 
@@ -82,7 +82,8 @@ public:
                                                         cacheSizeGB,
                                                         params.dur,
                                                         ephemeral,
-                                                        params.repair);
+                                                        params.repair,
+                                                        params.readOnly);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
         // Intentionally leaked.
@@ -130,6 +131,10 @@ public:
         builder.appendBool("directoryPerDB", params.directoryperdb);
         builder.appendBool("directoryForIndexes", wiredTigerGlobalOptions.directoryForIndexes);
         return builder.obj();
+    }
+
+    bool supportsReadOnly() const final {
+        return true;
     }
 };
 }  // namespace

@@ -61,32 +61,41 @@ const std::string kMembersFieldName = "members";
 const std::string kSettingsFieldName = "settings";
 const std::string kStepDownCheckWriteConcernModeName = "$stepDownCheck";
 const std::string kProtocolVersionFieldName = "protocolVersion";
+const std::string kWriteConcernMajorityJournalDefaultFieldName =
+    "writeConcernMajorityJournalDefault";
 
 const std::string kLegalConfigTopFieldNames[] = {kIdFieldName,
                                                  ReplicaSetConfig::kVersionFieldName,
                                                  kMembersFieldName,
                                                  kSettingsFieldName,
                                                  kProtocolVersionFieldName,
-                                                 ReplicaSetConfig::kConfigServerFieldName};
+                                                 ReplicaSetConfig::kConfigServerFieldName,
+                                                 kWriteConcernMajorityJournalDefaultFieldName};
 
-const std::string kElectionTimeoutFieldName = "electionTimeoutMillis";
-const std::string kHeartbeatIntervalFieldName = "heartbeatIntervalMillis";
-const std::string kHeartbeatTimeoutFieldName = "heartbeatTimeoutSecs";
 const std::string kChainingAllowedFieldName = "chainingAllowed";
+const std::string kElectionTimeoutFieldName = "electionTimeoutMillis";
 const std::string kGetLastErrorDefaultsFieldName = "getLastErrorDefaults";
 const std::string kGetLastErrorModesFieldName = "getLastErrorModes";
+const std::string kHeartbeatIntervalFieldName = "heartbeatIntervalMillis";
+const std::string kHeartbeatTimeoutFieldName = "heartbeatTimeoutSecs";
+const std::string kReplicaSetIdFieldName = "replicaSetId";
 
 }  // namespace
 
-Status ReplicaSetConfig::initialize(const BSONObj& cfg, bool usePV1ByDefault) {
-    return _initialize(cfg, false, usePV1ByDefault);
+Status ReplicaSetConfig::initialize(const BSONObj& cfg,
+                                    bool usePV1ByDefault,
+                                    OID defaultReplicaSetId) {
+    return _initialize(cfg, false, usePV1ByDefault, defaultReplicaSetId);
 }
 
 Status ReplicaSetConfig::initializeForInitiate(const BSONObj& cfg, bool usePV1ByDefault) {
-    return _initialize(cfg, true, usePV1ByDefault);
+    return _initialize(cfg, true, usePV1ByDefault, OID());
 }
 
-Status ReplicaSetConfig::_initialize(const BSONObj& cfg, bool forInitiate, bool usePV1ByDefault) {
+Status ReplicaSetConfig::_initialize(const BSONObj& cfg,
+                                     bool forInitiate,
+                                     bool usePV1ByDefault,
+                                     OID defaultReplicaSetId) {
     _isInitialized = false;
     _members.clear();
     Status status =
@@ -158,6 +167,16 @@ Status ReplicaSetConfig::_initialize(const BSONObj& cfg, bool forInitiate, bool 
     }
 
     //
+    // Parse writeConcernMajorityJournalDefault
+    //
+    status = bsonExtractBooleanFieldWithDefault(cfg,
+                                                kWriteConcernMajorityJournalDefaultFieldName,
+                                                _protocolVersion == 1,
+                                                &_writeConcernMajorityJournalDefault);
+    if (!status.isOK())
+        return status;
+
+    //
     // Parse settings
     //
     BSONElement settingsElement;
@@ -171,6 +190,23 @@ Status ReplicaSetConfig::_initialize(const BSONObj& cfg, bool forInitiate, bool 
     status = _parseSettingsSubdocument(settings);
     if (!status.isOK())
         return status;
+
+    //
+    // Generate replica set ID if called from replSetInitiate.
+    // Otherwise, uses 'defaultReplicatSetId' as default if 'cfg' doesn't have an ID.
+    //
+    if (forInitiate) {
+        if (_replicaSetId.isSet()) {
+            return Status(ErrorCodes::InvalidReplicaSetConfig,
+                          str::stream() << "replica set configuration cannot contain '"
+                                        << kReplicaSetIdFieldName
+                                        << "' "
+                                           "field when called from replSetInitiate: " << cfg);
+        }
+        _replicaSetId = OID::gen();
+    } else if (!_replicaSetId.isSet()) {
+        _replicaSetId = defaultReplicaSetId;
+    }
 
     _calculateMajorities();
     _addInternalWriteConcernModes();
@@ -308,6 +344,19 @@ Status ReplicaSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
         }
         _customWriteConcernModes[modeElement.fieldNameStringData()] = pattern;
     }
+
+    // Parse replica set ID.
+    OID replicaSetId;
+    status = mongo::bsonExtractOIDField(settings, kReplicaSetIdFieldName, &replicaSetId);
+    if (status.isOK()) {
+        if (!replicaSetId.isSet()) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << kReplicaSetIdFieldName << " field value cannot be null");
+        }
+    } else if (status != ErrorCodes::NoSuchKey) {
+        return status;
+    }
+    _replicaSetId = replicaSetId;
 
     return Status::OK();
 }
@@ -453,6 +502,12 @@ Status ReplicaSetConfig::validate() const {
             return Status(ErrorCodes::BadValue,
                           "Nodes being used for config servers must be started with the "
                           "--configsvr flag");
+        }
+        if (!_writeConcernMajorityJournalDefault) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << kWriteConcernMajorityJournalDefaultFieldName
+                                        << " must be true in replica set configurations being "
+                                           "used for config servers");
         }
     } else if (serverGlobalParams.configsvr) {
         return Status(ErrorCodes::BadValue,
@@ -616,8 +671,20 @@ BSONObj ReplicaSetConfig::toBSON() const {
         configBuilder.append(kConfigServerFieldName, _configServer);
     }
 
+    // Only include writeConcernMajorityJournalDefault if it is not the default version for this
+    // ProtocolVersion to prevent breaking cross version-3.2.1 compatibilty of ReplicaSetConfigs.
     if (_protocolVersion > 0) {
         configBuilder.append(kProtocolVersionFieldName, _protocolVersion);
+        // Only include writeConcernMajorityJournalDefault if it is not the default version for this
+        // ProtocolVersion to prevent breaking cross version-3.2.1 compatibilty of
+        // ReplicaSetConfigs.
+        if (!_writeConcernMajorityJournalDefault) {
+            configBuilder.append(kWriteConcernMajorityJournalDefaultFieldName,
+                                 _writeConcernMajorityJournalDefault);
+        }
+    } else if (_writeConcernMajorityJournalDefault) {
+        configBuilder.append(kWriteConcernMajorityJournalDefaultFieldName,
+                             _writeConcernMajorityJournalDefault);
     }
 
     BSONArrayBuilder members(configBuilder.subarrayStart(kMembersFieldName));
@@ -656,6 +723,11 @@ BSONObj ReplicaSetConfig::toBSON() const {
     gleModes.done();
 
     settingsBuilder.append(kGetLastErrorDefaultsFieldName, _defaultWriteConcern.toBSON());
+
+    if (_replicaSetId.isSet()) {
+        settingsBuilder.append(kReplicaSetIdFieldName, _replicaSetId);
+    }
+
     settingsBuilder.done();
     return configBuilder.obj();
 }

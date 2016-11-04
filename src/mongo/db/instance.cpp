@@ -608,6 +608,8 @@ void assembleResponse(OperationContext* txn,
             LOG(1) << "note: not profiling because recursive read lock";
         } else if (lockedForWriting()) {
             LOG(1) << "note: not profiling because doing fsync+lock";
+        } else if (storageGlobalParams.readOnly) {
+            LOG(1) << "note: not profiling because server is read-only";
         } else {
             profile(txn, op);
         }
@@ -723,7 +725,8 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
                 UpdateResult res = UpdateStage::makeUpdateResult(updateStats);
 
                 // for getlasterror
-                LastError::get(client).recordUpdate(res.existing, res.numMatched, res.upserted);
+                size_t nMatchedOrInserted = res.upserted.isEmpty() ? res.numMatched : 1U;
+                LastError::get(client).recordUpdate(res.existing, nMatchedOrInserted, res.upserted);
 
                 if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
                     // If this operation has already generated a new lastOp, don't bother setting it
@@ -769,6 +772,7 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
         }
 
         auto collection = ctx.db()->getCollection(nsString);
+        invariant(collection);
         unique_ptr<PlanExecutor> exec =
             uassertStatusOK(getExecutorUpdate(txn, collection, &parsedUpdate, &op.debug()));
 
@@ -784,7 +788,8 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
 
         UpdateResult res = UpdateStage::makeUpdateResult(updateStats);
 
-        LastError::get(client).recordUpdate(res.existing, res.numMatched, res.upserted);
+        size_t nMatchedOrInserted = res.upserted.isEmpty() ? res.numMatched : 1U;
+        LastError::get(client).recordUpdate(res.existing, nMatchedOrInserted, res.upserted);
 
         if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
             // If this operation has already generated a new lastOp, don't bother setting it
@@ -857,7 +862,11 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
 
             PlanSummaryStats summary;
             Explain::getSummaryStats(*exec, &summary);
-            collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+            if (collection) {
+                collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+            }
+            op.debug().fromMultiPlanner = summary.fromMultiPlanner;
+            op.debug().replanned = summary.replanned;
 
             if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
                 // If this operation has already generated a new lastOp, don't bother setting it
@@ -879,7 +888,7 @@ bool receivedGetMore(OperationContext* txn, DbResponse& dbresponse, Message& m, 
     const char* ns = d.getns();
     int ntoreturn = d.pullInt();
     uassert(
-        34368, str::stream() << "Invalid ntoreturn for OP_GET_MORE: " << ntoreturn, ntoreturn >= 0);
+        34419, str::stream() << "Invalid ntoreturn for OP_GET_MORE: " << ntoreturn, ntoreturn >= 0);
     long long cursorid = d.pullInt64();
 
     curop.debug().ntoreturn = ntoreturn;
@@ -984,13 +993,6 @@ void insertMultiVector(OperationContext* txn,
                        CurOp& op,
                        vector<BSONObj>::iterator begin,
                        vector<BSONObj>::iterator end) {
-    for (vector<BSONObj>::iterator it = begin; it != end; it++) {
-        StatusWith<BSONObj> fixed = fixDocumentForInsert(*it);
-        uassertStatusOK(fixed.getStatus());
-        if (!fixed.getValue().isEmpty())
-            *it = fixed.getValue();
-    }
-
     try {
         WriteUnitOfWork wunit(txn);
         Collection* collection = ctx.db()->getCollection(ns);
@@ -1026,6 +1028,19 @@ NOINLINE_DECL void insertMulti(OperationContext* txn,
     int64_t chunkCount = 0;
     int64_t chunkSize = 0;
 
+    auto client = txn->getClient();
+    auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
+    ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
+                                                &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
+                                                txn);
+
+    for (vector<BSONObj>::iterator it = docs.begin(); it != docs.end(); it++) {
+        StatusWith<BSONObj> fixed = fixDocumentForInsert(*it);
+        uassertStatusOK(fixed.getStatus());
+        if (!fixed.getValue().isEmpty())
+            *it = fixed.getValue();
+    }
+
     for (vector<BSONObj>::iterator it = docs.begin(); it != docs.end(); it++) {
         chunkSize += (*it).objsize();
         // Limit chunk size, actual size chosen is a tradeoff: larger sizes are more efficient,
@@ -1043,6 +1058,13 @@ NOINLINE_DECL void insertMulti(OperationContext* txn,
     }
     if (chunkBegin != docs.end())
         insertMultiVector(txn, ctx, keepGoing, ns, op, chunkBegin, docs.end());
+
+    if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
+        // If this operation has already generated a new lastOp, don't bother setting it
+        // here. No-op inserts will not generate a new lastOp, so we still need the
+        // guard to fire in that case.
+        lastOpSetterGuard.Dismiss();
+    }
 }
 
 static void convertSystemIndexInsertsToCommands(DbMessage& d, BSONArrayBuilder* allCmdsBuilder) {

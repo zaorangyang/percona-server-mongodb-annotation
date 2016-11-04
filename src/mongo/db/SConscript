@@ -533,7 +533,6 @@ serverOnlyFiles = [
     "clientcursor.cpp",
     "cloner.cpp",
     "commands/apply_ops.cpp",
-    "commands/cleanup_orphaned_cmd.cpp",
     "commands/clone.cpp",
     "commands/clone_collection.cpp",
     "commands/collection_to_capped.cpp",
@@ -616,6 +615,7 @@ serverOnlyFiles = [
     "repl/minvalid.cpp",
     "repl/oplog.cpp",
     "repl/oplogreader.cpp",
+    "repl/sync_source_resolver.cpp", # TODO(dannenberg) move this into DataReplicator in repl/SConscript.
     "repl/replication_coordinator_external_state_impl.cpp",
     "repl/replication_info.cpp",
     "repl/resync.cpp",
@@ -649,7 +649,6 @@ serveronlyEnv.InjectThirdPartyIncludePaths(libraries=['snappy'])
 serveronlyLibdeps = [
     "$BUILD_DIR/mongo/client/parallel",
     "$BUILD_DIR/mongo/executor/network_interface_factory",
-    "$BUILD_DIR/mongo/s/catalog/legacy/catalog_manager_legacy",
     "$BUILD_DIR/mongo/s/catalog/replset/catalog_manager_replica_set",
     "$BUILD_DIR/mongo/s/client/sharding_connection_hook",
     "$BUILD_DIR/mongo/s/coreshard",

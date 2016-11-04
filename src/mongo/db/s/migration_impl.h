@@ -36,48 +36,16 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/catalog/forwarding_catalog_manager.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
 class CollectionMetadata;
+class MigrationSessionId;
 class OperationContext;
 template <typename T>
 class StatusWith;
-
-/**
- * Returns the default write concern for migration cleanup on the donor shard and for cloning
- * documents on the destination shard.
- */
-class ChunkMoveWriteConcernOptions {
-public:
-    /**
-     * Parses the chunk move options from a command object.
-     */
-    static StatusWith<ChunkMoveWriteConcernOptions> initFromCommand(const BSONObj& cmdObj);
-
-    /**
-     * Returns the throttle options to be used when committing migrated documents on the recipient
-     * shard's seconary.
-     */
-    const BSONObj& getSecThrottle() const {
-        return _secThrottleObj;
-    }
-
-    /**
-     * Returns the write concern options.
-     */
-    const WriteConcernOptions& getWriteConcern() const {
-        return _writeConcernOptions;
-    }
-
-private:
-    ChunkMoveWriteConcernOptions(BSONObj secThrottleObj, WriteConcernOptions writeConcernOptions);
-
-    const BSONObj _secThrottleObj;
-    const WriteConcernOptions _writeConcernOptions;
-};
 
 /**
  * Contains all the runtime state for an active move operation and allows persistence of this state
@@ -109,12 +77,12 @@ public:
      * TODO: Once the entire chunk move process is moved to be inside this state machine, there
      *       will not be any need to expose the distributed lock.
      */
-    StatusWith<ForwardingCatalogManager::ScopedDistLock*> acquireMoveMetadata();
+    StatusWith<DistLockManager::ScopedDistLock*> acquireMoveMetadata();
 
     /**
      * Starts the move chunk operation.
      */
-    Status start(BSONObj shardKeyPattern);
+    Status start(const MigrationSessionId& sessionId, const BSONObj& shardKeyPattern);
 
     /**
      * Implements the migration critical section. Needs to be invoked after all data has been moved
@@ -125,7 +93,7 @@ public:
      * Since some migration failures are non-recoverable, it may also shut down the server on
      * certain errors.
      */
-    Status commitMigration();
+    Status commitMigration(const MigrationSessionId& sessionId);
 
     const NamespaceString& getNss() const {
         return _nss;
@@ -182,10 +150,6 @@ private:
     ConnectionString _fromShardCS;
     ConnectionString _toShardCS;
 
-    // Epoch for the collection sent along with the command
-    // TODO(SERVER-20742): remove this after 3.2, now that we're sending version it is redundant
-    OID _collectionEpoch;
-
     // ChunkVersion for the collection sent along with the command
     ChunkVersion _collectionVersion;
 
@@ -194,7 +158,7 @@ private:
     BSONObj _maxKey;
 
     // The distributed lock, which protects other migrations from happening on the same collection
-    boost::optional<StatusWith<ForwardingCatalogManager::ScopedDistLock>> _distLockStatus;
+    boost::optional<StatusWith<DistLockManager::ScopedDistLock>> _distLockStatus;
 
     // The cached collection metadata and the shard version from the time the migration process
     // started. This metadata is guaranteed to not change until either failure or successful

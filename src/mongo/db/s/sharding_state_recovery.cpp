@@ -64,7 +64,7 @@ const char kMinOpTimeUpdaters[] = "minOpTimeUpdaters";
 
 const Seconds kWriteTimeout(15);
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
-                                                WriteConcernOptions::NONE,
+                                                WriteConcernOptions::SyncMode::UNSET,
                                                 kWriteTimeout);
 
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(recoverShardingState, bool, true);
@@ -200,7 +200,7 @@ Status modifyRecoveryDocument(OperationContext* txn,
         updateReq.setLifecycle(&updateLifecycle);
 
         UpdateResult result = update(txn, autoGetOrCreateDb->getDb(), updateReq, &opDebug);
-        invariant(result.numDocsModified == 1);
+        invariant(result.numDocsModified == 1 || !result.upserted.isEmpty());
         invariant(result.numMatched <= 1);
 
         // Wait until the majority write concern has been satisfied, but do it outside of lock
@@ -219,10 +219,6 @@ Status modifyRecoveryDocument(OperationContext* txn,
 }  // namespace
 
 Status ShardingStateRecovery::startMetadataOp(OperationContext* txn) {
-    if (grid.catalogManager(txn)->getMode() != CatalogManager::ConfigServerMode::CSRS) {
-        return Status::OK();
-    }
-
     Status upsertStatus =
         modifyRecoveryDocument(txn, RecoveryDocument::Increment, kMajorityWriteConcern);
 
@@ -237,10 +233,6 @@ Status ShardingStateRecovery::startMetadataOp(OperationContext* txn) {
 }
 
 void ShardingStateRecovery::endMetadataOp(OperationContext* txn) {
-    if (grid.catalogManager(txn)->getMode() != CatalogManager::ConfigServerMode::CSRS) {
-        return;
-    }
-
     Status status = modifyRecoveryDocument(txn, RecoveryDocument::Decrement, WriteConcernOptions());
     if (!status.isOK()) {
         warning() << "Failed to decrement minOpTimeUpdaters due to " << status;

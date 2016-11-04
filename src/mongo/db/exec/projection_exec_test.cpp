@@ -146,7 +146,7 @@ void testTransform(const char* specStr,
 /**
  * Test function to verify the results of projecting the $meta sortKey while under a covered
  * projection. In particular, it tests that ProjectionExec can take a WorkingSetMember in
- * LOC_AND_IDX state and use the sortKey along with the index data to generate the final output
+ * RID_AND_IDX state and use the sortKey along with the index data to generate the final output
  * document. For SERVER-20117.
  *
  * sortKey - The sort key in BSONObj form.
@@ -163,7 +163,7 @@ BSONObj transformMetaSortKeyCovered(const BSONObj& sortKey,
     WorkingSetMember* wsm = ws.get(wsid);
     wsm->keyData.push_back(ikd);
     wsm->addComputed(new SortKeyComputedData(sortKey));
-    ws.transitionToLocAndIdx(wsid);
+    ws.transitionToRecordIdAndIdx(wsid);
 
     ProjectionExec projExec(fromjson(projSpec), nullptr, ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(projExec.transform(wsm));
@@ -184,6 +184,12 @@ TEST(ProjectionExecTest, TransformPositionalDollar) {
 
     // Invalid position $ projections.
     testTransform("{'a.$': 1}", "{a: {$size: 1}}", "{a: [5]}", false, "");
+
+    // Ambigous position $ projections.
+    testTransform("{'a.$': 1}", "{$and: [{a: 1}, {a: 2}]}", "{a: [1, 2]}", false, "");
+    testTransform("{'a.$': 1}", "{a: 1, b: 2}", "{a: [1], b: [2]}", false, "");
+    testTransform("{'a.$': 1}", "{a: {$elemMatch: {$lt: 2}}, b: 2}", "{a: [1], b: [2]}", false, "");
+    testTransform("{'a.$': 1}", "{'a.b': 1, 'a.c': 2}", "{a: [{b: 1}, {c: 2}]}", false, "");
 }
 
 //

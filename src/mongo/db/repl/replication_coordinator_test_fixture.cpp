@@ -113,12 +113,13 @@ void ReplCoordTest::init() {
 
     TopologyCoordinatorImpl::Options settings;
     _topo = new TopologyCoordinatorImpl(settings);
+    stdx::function<bool()> _durablityLambda = [this]() -> bool { return _isStorageEngineDurable; };
     _net = new NetworkInterfaceMock;
     _storage = new StorageInterfaceMock;
     _replExec.reset(new ReplicationExecutor(_net, _storage, seed));
     _externalState = new ReplicationCoordinatorExternalStateMock;
-    _repl.reset(
-        new ReplicationCoordinatorImpl(_settings, _externalState, _topo, _replExec.get(), seed));
+    _repl.reset(new ReplicationCoordinatorImpl(
+        _settings, _externalState, _topo, _replExec.get(), seed, &_durablityLambda));
 }
 
 void ReplCoordTest::init(const ReplSettings& settings) {
@@ -181,6 +182,36 @@ ResponseStatus ReplCoordTest::makeResponseStatus(const BSONObj& doc,
     log() << "Responding with " << doc << " (metadata: " << metadata << "; elapsed: " << millis
           << ")";
     return ResponseStatus(RemoteCommandResponse(doc, metadata, millis));
+}
+
+void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
+    ReplicationCoordinatorImpl* replCoord = getReplCoord();
+    ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
+    NetworkInterfaceMock* net = getNet();
+    net->enterNetwork();
+    for (int i = 0; i < rsConfig.getNumMembers() - 1; ++i) {
+        const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
+        const RemoteCommandRequest& request = noi->getRequest();
+        log() << request.target.toString() << " processing " << request.cmdObj;
+        ReplSetHeartbeatArgsV1 hbArgs;
+        ReplSetHeartbeatArgs hbArgsPV0;
+        if (hbArgs.initialize(request.cmdObj).isOK() ||
+            hbArgsPV0.initialize(request.cmdObj).isOK()) {
+            ReplSetHeartbeatResponse hbResp;
+            hbResp.setSetName(rsConfig.getReplSetName());
+            hbResp.setState(MemberState::RS_SECONDARY);
+            hbResp.setConfigVersion(rsConfig.getConfigVersion());
+            hbResp.setAppliedOpTime(OpTime(Timestamp(100, 2), 0));
+            BSONObjBuilder respObj;
+            net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+        } else {
+            error() << "Black holing unexpected request to " << request.target << ": "
+                    << request.cmdObj;
+            net->blackHole(noi);
+        }
+        net->runReadyNetworkOperations();
+    }
+    net->exitNetwork();
 }
 
 void ReplCoordTest::simulateSuccessfulDryRun(

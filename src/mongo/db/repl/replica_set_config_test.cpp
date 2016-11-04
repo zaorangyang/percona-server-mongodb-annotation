@@ -76,6 +76,7 @@ TEST(ReplicaSetConfig, ParseMinimalConfigAndCheckDefaults) {
     ASSERT_EQUALS(ReplicaSetConfig::kDefaultElectionTimeoutPeriod,
                   config.getElectionTimeoutPeriod());
     ASSERT_TRUE(config.isChainingAllowed());
+    ASSERT_FALSE(config.getWriteConcernMajorityShouldJournal());
     ASSERT_FALSE(config.isConfigServer());
     ASSERT_EQUALS(0, config.getProtocolVersion());
 }
@@ -104,6 +105,7 @@ TEST(ReplicaSetConfig, ParseLargeConfigAndCheckAccessors) {
     ASSERT_EQUALS(0, config.getDefaultWriteConcern().wNumNodes);
     ASSERT_EQUALS("majority", config.getDefaultWriteConcern().wMode);
     ASSERT_FALSE(config.isChainingAllowed());
+    ASSERT_TRUE(config.getWriteConcernMajorityShouldJournal());
     ASSERT_FALSE(config.isConfigServer());
     ASSERT_EQUALS(Seconds(5), config.getHeartbeatInterval());
     ASSERT_EQUALS(Seconds(120), config.getHeartbeatTimeoutPeriod());
@@ -952,7 +954,8 @@ bool operator==(const ReplicaSetConfig& a, const ReplicaSetConfig& b) {
         a.isConfigServer() == b.isConfigServer() &&
         a.getDefaultWriteConcern().wNumNodes == b.getDefaultWriteConcern().wNumNodes &&
         a.getDefaultWriteConcern().wMode == b.getDefaultWriteConcern().wMode &&
-        a.getProtocolVersion() == b.getProtocolVersion();
+        a.getProtocolVersion() == b.getProtocolVersion() &&
+        a.getReplicaSetId() == b.getReplicaSetId();
 }
 
 TEST(ReplicaSetConfig, toBSONRoundTripAbility) {
@@ -964,7 +967,8 @@ TEST(ReplicaSetConfig, toBSONRoundTripAbility) {
                                       << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                << "localhost:12345")) << "settings"
                                       << BSON("heartbeatIntervalMillis"
-                                              << 5000 << "heartbeatTimeoutSecs" << 20))));
+                                              << 5000 << "heartbeatTimeoutSecs" << 20
+                                              << "replicaSetId" << OID::gen()))));
     ASSERT_OK(configB.initialize(configA.toBSON()));
     ASSERT_TRUE(configA == configB);
 }
@@ -975,7 +979,7 @@ TEST(ReplicaSetConfig, toBSONRoundTripAbilityLarge) {
     ASSERT_OK(configA.initialize(BSON(
         "_id"
         << "asdf"
-        << "version" << 9 << "members"
+        << "version" << 9 << "writeConcernMajorityJournalDefault" << true << "members"
         << BSON_ARRAY(BSON("_id" << 0 << "host"
                                  << "localhost:12345"
                                  << "arbiterOnly" << true << "votes" << 1)
@@ -993,14 +997,14 @@ TEST(ReplicaSetConfig, toBSONRoundTripAbilityLarge) {
                                     << BSON("coast"
                                             << "west"
                                             << "hdd"
-                                            << "true"))) << "protocolVersion" << 0
-        << "settings" << BSON("heartbeatIntervalMillis"
-                              << 5000 << "heartbeatTimeoutSecs" << 20 << "electionTimeoutMillis"
-                              << 4 << "chainingAllowd" << true << "getLastErrorDefaults"
-                              << BSON("w"
-                                      << "majority") << "getLastErrorModes"
-                              << BSON("disks" << BSON("ssd" << 1 << "hdd" << 1) << "coasts"
-                                              << BSON("coast" << 2))))));
+                                            << "true"))) << "protocolVersion" << 0 << "settings"
+
+        << BSON("heartbeatIntervalMillis"
+                << 5000 << "heartbeatTimeoutSecs" << 20 << "electionTimeoutMillis" << 4
+                << "chainingAllowd" << true << "getLastErrorDefaults" << BSON("w"
+                                                                              << "majority")
+                << "getLastErrorModes" << BSON("disks" << BSON("ssd" << 1 << "hdd" << 1) << "coasts"
+                                                       << BSON("coast" << 2))))));
     BSONObj configObjA = configA.toBSON();
     // Ensure a protocolVersion does not show up if it is 0 to maintain cross version compatibility.
     ASSERT_FALSE(configObjA.hasField("protocolVersion"));
@@ -1197,6 +1201,23 @@ TEST(ReplicaSetConfig, CheckConfigServerCantHaveSlaveDelay) {
     ASSERT_STRING_CONTAINS(status.reason(), "cannot have a non-zero slaveDelay");
 }
 
+TEST(ReplicaSetConfig, CheckConfigServerMustHaveTrueForWriteConcernMajorityJournalDefault) {
+    serverGlobalParams.configsvr = true;
+    ON_BLOCK_EXIT([&] { serverGlobalParams.configsvr = false; });
+    ReplicaSetConfig configA;
+    ASSERT_OK(
+        configA.initialize(BSON("_id"
+                                << "rs0"
+                                << "protocolVersion" << 1 << "version" << 1 << "configsvr" << true
+                                << "members" << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                      << "localhost:12345")
+                                                           << BSON("_id" << 1 << "host"
+                                                                         << "localhost:54321"))
+                                << "writeConcernMajorityJournalDefault" << false)));
+    Status status = configA.validate();
+    ASSERT_EQUALS(ErrorCodes::BadValue, status);
+    ASSERT_STRING_CONTAINS(status.reason(), " must be true in replica set configurations being ");
+}
 
 TEST(ReplicaSetConfig, GetPriorityTakeoverDelay) {
     ReplicaSetConfig configA;
@@ -1252,6 +1273,136 @@ TEST(ReplicaSetConfig, GetPriorityTakeoverDelay) {
     ASSERT_EQUALS(Milliseconds(3000), configB.getPriorityTakeoverDelay(2));
     ASSERT_EQUALS(Milliseconds(1000), configB.getPriorityTakeoverDelay(3));
     ASSERT_EQUALS(Milliseconds(1000), configB.getPriorityTakeoverDelay(4));
+}
+
+TEST(ReplicaSetConfig, ConfirmDefaultValuesOfAndAbilityToSetWriteConcernMajorityJournalDefault) {
+    // PV0, should default to false.
+    ReplicaSetConfig config;
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345")))));
+    ASSERT_OK(config.validate());
+    ASSERT_FALSE(config.getWriteConcernMajorityShouldJournal());
+    ASSERT_FALSE(config.toBSON().hasField("writeConcernMajorityJournalDefault"));
+
+    // Should be able to set it true in PV0.
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345"))
+                                     << "writeConcernMajorityJournalDefault" << true)));
+    ASSERT_OK(config.validate());
+    ASSERT_TRUE(config.getWriteConcernMajorityShouldJournal());
+    ASSERT_TRUE(config.toBSON().hasField("writeConcernMajorityJournalDefault"));
+
+    // PV1, should default to true.
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "protocolVersion" << 1 << "version" << 1 << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345")))));
+    ASSERT_OK(config.validate());
+    ASSERT_TRUE(config.getWriteConcernMajorityShouldJournal());
+    ASSERT_FALSE(config.toBSON().hasField("writeConcernMajorityJournalDefault"));
+
+    // Should be able to set it false in PV1.
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "protocolVersion" << 1 << "version" << 1 << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345"))
+                                     << "writeConcernMajorityJournalDefault" << false)));
+    ASSERT_OK(config.validate());
+    ASSERT_FALSE(config.getWriteConcernMajorityShouldJournal());
+    ASSERT_TRUE(config.toBSON().hasField("writeConcernMajorityJournalDefault"));
+}
+
+TEST(ReplicaSetConfig, ReplSetId) {
+    // Uninitialized configuration has no ID.
+    ASSERT_FALSE(ReplicaSetConfig().hasReplicaSetId());
+
+    // Cannot provide replica set ID in configuration document when initialized from
+    // replSetInitiate.
+    auto status =
+        ReplicaSetConfig().initializeForInitiate(BSON("_id"
+                                                      << "rs0"
+                                                      << "version" << 1 << "members"
+                                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                               << "localhost:12345"
+                                                                               << "priority" << 1))
+                                                      << "settings"
+                                                      << BSON("replicaSetId" << OID::gen())));
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig, status);
+    ASSERT_STRING_CONTAINS(status.reason(),
+                           "replica set configuration cannot contain 'replicaSetId' field when "
+                           "called from replSetInitiate");
+
+
+    // Configuration created by replSetInitiate should generate replica set ID.
+    ReplicaSetConfig configInitiate;
+    ASSERT_OK(
+        configInitiate.initializeForInitiate(BSON("_id"
+                                                  << "rs0"
+                                                  << "version" << 1 << "members"
+                                                  << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                           << "localhost:12345"
+                                                                           << "priority" << 1)))));
+    ASSERT_OK(configInitiate.validate());
+    ASSERT_TRUE(configInitiate.hasReplicaSetId());
+    OID replicaSetId = configInitiate.getReplicaSetId();
+
+    // Configuration initialized from local database can contain ID.
+    ReplicaSetConfig configLocal;
+    ASSERT_OK(configLocal.initialize(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                   << "localhost:12345"
+                                                                   << "priority" << 1))
+                                          << "settings" << BSON("replicaSetId" << replicaSetId))));
+    ASSERT_OK(configLocal.validate());
+    ASSERT_TRUE(configLocal.hasReplicaSetId());
+    ASSERT_EQUALS(replicaSetId, configLocal.getReplicaSetId());
+
+    // When reconfiguring, we can provide an default ID if the configuration does not contain one.
+    OID defaultReplicaSetId = OID::gen();
+    ASSERT_OK(configLocal.initialize(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                   << "localhost:12345"
+                                                                   << "priority" << 1))),
+                                     true,
+                                     defaultReplicaSetId));
+    ASSERT_OK(configLocal.validate());
+    ASSERT_TRUE(configLocal.hasReplicaSetId());
+    ASSERT_EQUALS(defaultReplicaSetId, configLocal.getReplicaSetId());
+
+    // 'replicaSetId' field cannot be null.
+    status = configLocal.initialize(BSON("_id"
+                                         << "rs0"
+                                         << "version" << 1 << "members"
+                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                  << "localhost:12345"
+                                                                  << "priority" << 1)) << "settings"
+                                         << BSON("replicaSetId" << OID())));
+    ASSERT_EQUALS(ErrorCodes::BadValue, status);
+    ASSERT_STRING_CONTAINS(status.reason(), "replicaSetId field value cannot be null");
+
+    // 'replicaSetId' field must be an OID.
+    status = configLocal.initialize(BSON("_id"
+                                         << "rs0"
+                                         << "version" << 1 << "members"
+                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                  << "localhost:12345"
+                                                                  << "priority" << 1)) << "settings"
+                                         << BSON("replicaSetId" << 12345)));
+    ASSERT_EQUALS(ErrorCodes::TypeMismatch, status);
+    ASSERT_STRING_CONTAINS(status.reason(),
+                           "\"replicaSetId\" had the wrong type. Expected OID, found NumberInt32");
 }
 
 }  // namespace

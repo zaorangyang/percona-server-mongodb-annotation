@@ -157,6 +157,8 @@ void endQueryOp(OperationContext* txn,
     curop->debug().keysExamined = summaryStats.totalKeysExamined;
     curop->debug().docsExamined = summaryStats.totalDocsExamined;
     curop->debug().idhack = summaryStats.isIdhack;
+    curop->debug().fromMultiPlanner = summaryStats.fromMultiPlanner;
+    curop->debug().replanned = summaryStats.replanned;
 
     if (collection) {
         collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
@@ -176,9 +178,8 @@ void endQueryOp(OperationContext* txn,
     // Set debug information for consumption by the profiler only.
     if (dbProfilingLevel > 0) {
         // Get BSON stats.
-        unique_ptr<PlanStageStats> execStats(exec.getStats());
         BSONObjBuilder statsBob;
-        Explain::statsToBSON(*execStats, &statsBob);
+        Explain::getWinningPlanStats(&exec, &statsBob);
         curop->debug().execStats.set(statsBob.obj());
 
         // Replace exec stats with plan summary if stats cannot fit into CachedBSONObj.
@@ -238,8 +239,7 @@ void generateBatch(int ntoreturn,
 
     if (PlanExecutor::DEAD == *state || PlanExecutor::FAILURE == *state) {
         // Propagate this error to caller.
-        const unique_ptr<PlanStageStats> stats(exec->getStats());
-        error() << "getMore executor error, stats: " << Explain::statsToBSON(*stats);
+        error() << "getMore executor error, stats: " << Explain::getWinningPlanStats(exec);
         uasserted(17406, "getMore executor error: " + WorkingSetCommon::toStatusString(obj));
     }
 }
@@ -630,9 +630,8 @@ std::string runQuery(OperationContext* txn,
 
     // Caller expects exceptions thrown in certain cases.
     if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
-        const unique_ptr<PlanStageStats> stats(exec->getStats());
         error() << "Plan executor error during find: " << PlanExecutor::statestr(state)
-                << ", stats: " << Explain::statsToBSON(*stats);
+                << ", stats: " << Explain::getWinningPlanStats(exec.get());
         uasserted(17144, "Executor error: " + WorkingSetCommon::toStatusString(obj));
     }
 

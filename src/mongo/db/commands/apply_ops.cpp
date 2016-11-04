@@ -53,8 +53,11 @@
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/write_concern.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -109,7 +112,39 @@ public:
             }
         }
 
-        return appendCommandStatus(result, applyOps(txn, dbname, cmdObj, &result));
+        StatusWith<WriteConcernOptions> wcResult = extractWriteConcern(txn, cmdObj, dbname);
+        if (!wcResult.isOK()) {
+            return appendCommandStatus(result, wcResult.getStatus());
+        }
+        txn->setWriteConcern(wcResult.getValue());
+        setupSynchronousCommit(txn);
+
+
+        auto client = txn->getClient();
+        auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
+        ScopeGuard lastOpSetterGuard =
+            MakeObjGuard(repl::ReplClientInfo::forClient(client),
+                         &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
+                         txn);
+
+        auto applyOpsStatus = appendCommandStatus(result, applyOps(txn, dbname, cmdObj, &result));
+
+        if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
+            // If this operation has already generated a new lastOp, don't bother setting it
+            // here. No-op applyOps will not generate a new lastOp, so we still need the guard to
+            // fire in that case.
+            lastOpSetterGuard.Dismiss();
+        }
+
+        WriteConcernResult res;
+        auto waitForWCStatus =
+            waitForWriteConcern(txn,
+                                repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
+                                txn->getWriteConcern(),
+                                &res);
+        appendCommandWCStatus(result, waitForWCStatus);
+
+        return applyOpsStatus;
     }
 
 private:

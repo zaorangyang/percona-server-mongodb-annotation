@@ -60,7 +60,6 @@ executor:
         global_vars:
           TestData:
             useLegacyReplicationProtocol: true
-            useLegacyConfigServers: true
             mongosBinVersion: 'last-stable'
         nodb: ''
         readMode: compatibility

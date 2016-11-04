@@ -41,6 +41,7 @@
 namespace mongo {
 
 class IndexDescriptor;
+class JournalListener;
 class OperationContext;
 class RecordStore;
 class RecoveryUnit;
@@ -113,11 +114,10 @@ public:
     virtual bool isDurable() const = 0;
 
     /**
-     * See StorageEngine::isEphemeral for details
+     * Returns true if the KVEngine is ephemeral -- that is, it is NOT persistent and all data is
+     * lost after shutdown. Otherwise, returns false.
      */
-    virtual bool isEphemeral() {
-        return false;
-    }
+    virtual bool isEphemeral() const = 0;
 
     /**
      * This must not change over the lifetime of the engine.
@@ -160,6 +160,12 @@ public:
     virtual SnapshotManager* getSnapshotManager() const {
         return nullptr;
     }
+
+    /**
+     * Sets a new JournalListener, which is used to alert the rest of the
+     * system about journaled write progress.
+     */
+    virtual void setJournalListener(JournalListener* jl) = 0;
 
     /**
      * The destructor will never be called from mongod, but may be called from tests.

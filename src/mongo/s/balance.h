@@ -30,15 +30,15 @@
 
 #pragma once
 
-#include "mongo/s/catalog/forwarding_catalog_manager.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/util/background.h"
 
 namespace mongo {
 
 class BalancerPolicy;
 struct MigrateInfo;
+class MigrationSecondaryThrottleOptions;
 class OperationContext;
-struct WriteConcernOptions;
 
 /**
  * The balancer is a background task that tries to keep the number of chunks across all
@@ -94,7 +94,7 @@ private:
      *                          possibly be moved
      */
     void _doBalanceRound(OperationContext* txn,
-                         ForwardingCatalogManager::ScopedDistLock* distLock,
+                         DistLockManager::ScopedDistLock* distLock,
                          std::vector<std::shared_ptr<MigrateInfo>>* candidateChunks);
 
     /**
@@ -107,7 +107,7 @@ private:
      */
     int _moveChunks(OperationContext* txn,
                     const std::vector<std::shared_ptr<MigrateInfo>>& candidateChunks,
-                    const WriteConcernOptions* writeConcern,
+                    const MigrationSecondaryThrottleOptions& secondaryThrottle,
                     bool waitForDelete);
 
     /**

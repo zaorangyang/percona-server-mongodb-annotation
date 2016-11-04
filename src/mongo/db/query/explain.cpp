@@ -31,6 +31,7 @@
 #include "mongo/db/query/explain.h"
 
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/count_scan.h"
 #include "mongo/db/exec/distinct_scan.h"
 #include "mongo/db/exec/idhack.h"
@@ -72,14 +73,15 @@ void flattenStatsTree(const PlanStageStats* root, vector<const PlanStageStats*>*
  * MultiPlanStage is encountered, only add the best plan and its children to 'flattened'.
  */
 void flattenExecTree(const PlanStage* root, vector<const PlanStage*>* flattened) {
+    flattened->push_back(root);
+
     if (root->stageType() == STAGE_MULTI_PLAN) {
-        // Only add the winning stage from a MultiPlanStage.
+        // Only add the winning plan from a MultiPlanStage.
         auto mps = static_cast<const MultiPlanStage*>(root);
         const PlanStage* winningStage = mps->getChildren()[mps->bestPlanIdx()].get();
         return flattenExecTree(winningStage, flattened);
     }
 
-    flattened->push_back(root);
     const auto& children = root->getChildren();
     for (size_t i = 0; i < children.size(); ++i) {
         flattenExecTree(children[i].get(), flattened);
@@ -331,6 +333,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
 
         bob->append("keyPattern", spec->keyPattern);
         bob->append("indexName", spec->indexName);
+        bob->append("indexVersion", spec->indexVersion);
 
         if (verbosity >= ExplainCommon::EXEC_STATS) {
             BSONArrayBuilder intervalsBob(bob->subarrayStart("searchIntervals"));
@@ -377,6 +380,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
 
         if (verbosity >= ExplainCommon::EXEC_STATS) {
             bob->appendNumber("keysExamined", spec->keysExamined);
+            bob->appendNumber("seeks", spec->seeks);
             bob->appendNumber("dupsTested", spec->dupsTested);
             bob->appendNumber("dupsDropped", spec->dupsDropped);
             bob->appendNumber("seenInvalidated", spec->seenInvalidated);
@@ -387,7 +391,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         if (verbosity >= ExplainCommon::EXEC_STATS) {
             bob->appendNumber("dupsTested", spec->dupsTested);
             bob->appendNumber("dupsDropped", spec->dupsDropped);
-            bob->appendNumber("locsForgotten", spec->locsForgotten);
+            bob->appendNumber("recordIdsForgotten", spec->recordIdsForgotten);
         }
     } else if (STAGE_LIMIT == stats.stageType) {
         LimitStats* spec = static_cast<LimitStats*>(stats.specific.get());
@@ -430,6 +434,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         bob->append("indexPrefix", spec->indexPrefix);
         bob->append("indexName", spec->indexName);
         bob->append("parsedTextQuery", spec->parsedTextQuery);
+        bob->append("textIndexVersion", spec->textIndexVersion);
     } else if (STAGE_TEXT_MATCH == stats.stageType) {
         TextMatchStats* spec = static_cast<TextMatchStats*>(stats.specific.get());
 
@@ -493,6 +498,23 @@ void Explain::statsToBSON(const PlanStageStats& stats,
                           BSONObjBuilder* bob,
                           ExplainCommon::Verbosity verbosity) {
     statsToBSON(stats, verbosity, bob, bob);
+}
+
+// static
+BSONObj Explain::getWinningPlanStats(const PlanExecutor* exec) {
+    BSONObjBuilder bob;
+    getWinningPlanStats(exec, &bob);
+    return bob.obj();
+}
+
+// static
+void Explain::getWinningPlanStats(const PlanExecutor* exec, BSONObjBuilder* bob) {
+    MultiPlanStage* mps = getMultiPlanStage(exec->getRootStage());
+    unique_ptr<PlanStageStats> winningStats(
+        mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()])
+            : std::move(exec->getRootStage()->getStats()));
+
+    statsToBSON(*winningStats, ExplainCommon::EXEC_STATS, bob, bob);
 }
 
 // static
@@ -602,37 +624,24 @@ void Explain::explainStages(PlanExecutor* exec,
                             ExplainCommon::Verbosity verbosity,
                             BSONObjBuilder* out) {
     //
-    // Step 1: run the stages as required by the verbosity level.
+    // Collect plan stats, running the plan if necessary. The stats also give the structure of the
+    // plan tree.
     //
 
-    // Inspect the tree to see if there is a MultiPlanStage.
+    // Inspect the tree to see if there is a MultiPlanStage. Plan selection has already happened at
+    // this point, since we have a PlanExecutor.
     MultiPlanStage* mps = getMultiPlanStage(exec->getRootStage());
 
-    // Get stats of the winning plan from the trial period, if the verbosity level
-    // is high enough and there was a runoff between multiple plans.
+    // Get stats of the winning plan from the trial period, if the verbosity level is high enough
+    // and there was a runoff between multiple plans.
     unique_ptr<PlanStageStats> winningStatsTrial;
     if (verbosity >= ExplainCommon::EXEC_ALL_PLANS && mps) {
         winningStatsTrial = std::move(mps->getStats()->children[mps->bestPlanIdx()]);
         invariant(winningStatsTrial.get());
     }
 
-    // If we need execution stats, then run the plan in order to gather the stats.
-    Status executePlanStatus = Status::OK();
-    if (verbosity >= ExplainCommon::EXEC_STATS) {
-        executePlanStatus = exec->executePlan();
-    }
-
-    //
-    // Step 2: collect plan stats (which also give the structure of the plan tree).
-    //
-
-    // Get stats for the winning plan. If there is only a single candidate plan, it is considered
-    // the winner.
-    unique_ptr<PlanStageStats> winningStats(
-        mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()])
-            : std::move(exec->getStats()));
-
-    // Get stats for the rejected plans, if more than one plan was considered.
+    // If more than one plan was considered, get the stats from the trial period for the rejected
+    // plans.
     vector<unique_ptr<PlanStageStats>> allPlansStats;
     if (mps) {
         auto mpsStats = mps->getStats();
@@ -643,8 +652,21 @@ void Explain::explainStages(PlanExecutor* exec,
         }
     }
 
+    // If we need execution stats, then run the plan in order to gather the stats.
+    Status executePlanStatus = Status::OK();
+    if (verbosity >= ExplainCommon::EXEC_STATS) {
+        executePlanStatus = exec->executePlan();
+    }
+
+    // Get stats for the winning plan. If there is only a single candidate plan, it is considered
+    // the winner.
+    unique_ptr<PlanStageStats> winningStats(
+        mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()])
+            : std::move(exec->getStats()));
+
+
     //
-    // Step 3: use the stats trees to produce explain BSON.
+    // Use the stats trees to produce explain BSON.
     //
 
     if (verbosity >= ExplainCommon::QUERY_PLANNER) {
@@ -785,6 +807,13 @@ void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsO
             const NearStats* nearStats =
                 static_cast<const NearStats*>(nearStage->getSpecificStats());
             statsOut->indexesUsed.insert(nearStats->indexName);
+        } else if (STAGE_CACHED_PLAN == stages[i]->stageType()) {
+            const CachedPlanStage* cachedPlan = static_cast<const CachedPlanStage*>(stages[i]);
+            const CachedPlanStats* cachedStats =
+                static_cast<const CachedPlanStats*>(cachedPlan->getSpecificStats());
+            statsOut->replanned = cachedStats->replanned;
+        } else if (STAGE_MULTI_PLAN == stages[i]->stageType()) {
+            statsOut->fromMultiPlanner = true;
         }
     }
 }

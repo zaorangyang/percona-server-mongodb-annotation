@@ -69,7 +69,7 @@ public:
         _client.insert(ns(), obj);
     }
 
-    void getLocs(set<RecordId>* out, Collection* coll) {
+    void getRecordIds(set<RecordId>* out, Collection* coll) {
         auto cursor = coll->getCursor(&_txn);
         while (auto record = cursor->next()) {
             out->insert(record->id);
@@ -80,20 +80,20 @@ public:
      * We feed a mix of (key, unowned, owned) data to the sort stage.
      */
     void insertVarietyOfObjects(WorkingSet* ws, QueuedDataStage* ms, Collection* coll) {
-        set<RecordId> locs;
-        getLocs(&locs, coll);
+        set<RecordId> recordIds;
+        getRecordIds(&recordIds, coll);
 
-        set<RecordId>::iterator it = locs.begin();
+        set<RecordId>::iterator it = recordIds.begin();
 
         for (int i = 0; i < numObj(); ++i, ++it) {
-            ASSERT_FALSE(it == locs.end());
+            ASSERT_FALSE(it == recordIds.end());
 
             // Insert some owned obj data.
             WorkingSetID id = ws->allocate();
             WorkingSetMember* member = ws->get(id);
-            member->loc = *it;
+            member->recordId = *it;
             member->obj = coll->docFor(&_txn, *it);
-            ws->transitionToLocAndObj(id);
+            ws->transitionToRecordIdAndObj(id);
             ms->pushBack(id);
         }
     }
@@ -176,7 +176,8 @@ public:
         int count = 1;
 
         BSONObj current;
-        while (PlanExecutor::ADVANCED == exec->getNext(&current, NULL)) {
+        PlanExecutor::ExecState state;
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&current, NULL))) {
             int cmp = sgn(current.woSortOrder(last, params.pattern));
             // The next object should be equal to the previous or oriented according to the sort
             // pattern.
@@ -184,7 +185,7 @@ public:
             ++count;
             last = current.getOwned();
         }
-
+        ASSERT_EQUALS(PlanExecutor::IS_EOF, state);
         checkCount(count);
     }
 
@@ -322,8 +323,8 @@ public:
         }
 
         // The data we're going to later invalidate.
-        set<RecordId> locs;
-        getLocs(&locs, coll);
+        set<RecordId> recordIds;
+        getRecordIds(&recordIds, coll);
 
         unique_ptr<PlanExecutor> exec(makePlanExecutorWithSortStage(coll));
         SortStage* ss = static_cast<SortStage*>(exec->getRootStage());
@@ -340,10 +341,10 @@ public:
             ASSERT_NOT_EQUALS(PlanStage::ADVANCED, status);
         }
 
-        // We should have read in the first 'firstRead' locs.  Invalidate the first one.
+        // We should have read in the first 'firstRead' recordIds.  Invalidate the first one.
         // Since it's in the WorkingSet, the updates should not be reflected in the output.
         exec->saveState();
-        set<RecordId>::iterator it = locs.begin();
+        set<RecordId>::iterator it = recordIds.begin();
         Snapshotted<BSONObj> oldDoc = coll->docFor(&_txn, *it);
 
         OID updatedId = oldDoc.value().getField("_id").OID();
@@ -370,7 +371,7 @@ public:
         // Let's just invalidate everything now. Already read into ss, so original values
         // should be fetched.
         exec->saveState();
-        while (it != locs.end()) {
+        while (it != recordIds.end()) {
             oldDoc = coll->docFor(&_txn, *it);
             {
                 WriteUnitOfWork wuow(&_txn);
@@ -435,8 +436,8 @@ public:
         }
 
         // The data we're going to later invalidate.
-        set<RecordId> locs;
-        getLocs(&locs, coll);
+        set<RecordId> recordIds;
+        getRecordIds(&recordIds, coll);
 
         unique_ptr<PlanExecutor> exec(makePlanExecutorWithSortStage(coll));
         SortStage* ss = static_cast<SortStage*>(exec->getRootStage());
@@ -453,9 +454,9 @@ public:
             ASSERT_NOT_EQUALS(PlanStage::ADVANCED, status);
         }
 
-        // We should have read in the first 'firstRead' locs.  Invalidate the first.
+        // We should have read in the first 'firstRead' recordIds.  Invalidate the first.
         exec->saveState();
-        set<RecordId>::iterator it = locs.begin();
+        set<RecordId>::iterator it = recordIds.begin();
         {
             WriteUnitOfWork wuow(&_txn);
             coll->deleteDocument(&_txn, *it++);
@@ -471,7 +472,7 @@ public:
 
         // Let's just invalidate everything now.
         exec->saveState();
-        while (it != locs.end()) {
+        while (it != recordIds.end()) {
             {
                 WriteUnitOfWork wuow(&_txn);
                 coll->deleteDocument(&_txn, *it++);
@@ -502,7 +503,7 @@ public:
 
 // Deletion invalidation of everything fed to sort with limit enabled.
 // Limit size of working set within sort stage to a small number
-// Sort stage implementation should not try to invalidate DiskLocc that
+// Sort stage implementation should not try to invalidate RecordIds that
 // are no longer in the working set.
 
 template <int LIMIT>

@@ -29,6 +29,7 @@
 
 #include "mongo/bson/bsontypes.h"
 
+#include "mongo/config.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
@@ -89,6 +90,38 @@ const char* typeName(BSONType type) {
             return "MaxKey";
         default:
             return "Invalid";
+    }
+}
+
+bool isValidBSONType(int type) {
+    switch (type) {
+        case MinKey:
+        case EOO:
+        case NumberDouble:
+        case String:
+        case Object:
+        case Array:
+        case BinData:
+        case Undefined:
+        case jstOID:
+        case Bool:
+        case Date:
+        case jstNULL:
+        case RegEx:
+        case DBRef:
+        case Code:
+        case Symbol:
+        case CodeWScope:
+        case NumberInt:
+        case bsonTimestamp:
+        case NumberLong:
+#ifdef MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT
+        case NumberDecimal:
+#endif
+        case MaxKey:
+            return true;
+        default:
+            return false;
     }
 }
 

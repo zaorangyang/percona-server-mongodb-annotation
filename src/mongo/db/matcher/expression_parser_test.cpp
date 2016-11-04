@@ -63,7 +63,7 @@ TEST(MatchExpressionParserTest, Multiple1) {
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << 5 << "y" << 4)));
 }
 
-TEST(AtomicMatchExpressionTest, Simple1) {
+TEST(AtomicMatchExpressionTest, AtomicOperator1) {
     BSONObj query = BSON("x" << 5 << "$atomic" << BSON("$gt" << 5 << "$lt" << 8));
     StatusWithMatchExpression result =
         MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions());
@@ -75,6 +75,13 @@ TEST(AtomicMatchExpressionTest, Simple1) {
 
     query = BSON("x" << 5 << "y" << BSON("$isolated" << 1));
     result = MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions());
+    ASSERT_FALSE(result.isOK());
+}
+
+TEST(MatchExpressionParserTest, MinDistanceWithoutNearFailsToParse) {
+    BSONObj query = fromjson("{loc: {$minDistance: 10}}");
+    StatusWithMatchExpression result =
+        MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions());
     ASSERT_FALSE(result.isOK());
 }
 

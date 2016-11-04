@@ -105,7 +105,9 @@ PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
         return PlanStage::NEED_TIME;
     }
 
-    *out = WorkingSet::INVALID_ID;
+    WorkingSetID id = _workingSet->allocate();
+    _workingSet->transitionToRecordIdAndObj(id);
+    *out = id;
     return PlanStage::ADVANCED;
 }
 

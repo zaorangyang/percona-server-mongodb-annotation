@@ -200,7 +200,6 @@ void Strategy::clientCommandOp(OperationContext* txn, Request& request) {
         return;
 
     int loops = 5;
-    bool cmChangeAttempted = false;
 
     while (true) {
         try {
@@ -254,20 +253,13 @@ void Strategy::clientCommandOp(OperationContext* txn, Request& request) {
             if (loops < 4)
                 versionManager.forceRemoteCheckShardVersionCB(txn, staleNS);
         } catch (const DBException& e) {
-            if (e.getCode() == ErrorCodes::IncompatibleCatalogManager) {
-                fassert(28791, !cmChangeAttempted);
-                cmChangeAttempted = true;
-
-                grid.forwardingCatalogManager()->waitForCatalogManagerChange(txn);
-            } else {
-                OpQueryReplyBuilder reply;
-                {
-                    BSONObjBuilder builder(reply.bufBuilderForResults());
-                    Command::appendCommandStatus(builder, e.toStatus());
-                }
-                reply.sendCommandReply(request.p(), request.m());
-                return;
+            OpQueryReplyBuilder reply;
+            {
+                BSONObjBuilder builder(reply.bufBuilderForResults());
+                Command::appendCommandStatus(builder, e.toStatus());
             }
+            reply.sendCommandReply(request.p(), request.m());
+            return;
         }
     }
 }
@@ -330,7 +322,7 @@ void Strategy::commandOp(OperationContext* txn,
         result.shardTargetId = shardId;
 
         result.target = fassertStatusOK(
-            28739, ConnectionString::parse(cursor.getShardCursor(shardId)->originalHost()));
+            34417, ConnectionString::parse(cursor.getShardCursor(shardId)->originalHost()));
         result.result = cursor.getShardCursor(shardId)->peekFirst().getOwned();
         results->push_back(result);
     }
@@ -340,7 +332,7 @@ void Strategy::getMore(OperationContext* txn, Request& request) {
     const char* ns = request.getns();
     const int ntoreturn = request.d().pullInt();
     uassert(
-        34369, str::stream() << "Invalid ntoreturn for OP_GET_MORE: " << ntoreturn, ntoreturn >= 0);
+        34424, str::stream() << "Invalid ntoreturn for OP_GET_MORE: " << ntoreturn, ntoreturn >= 0);
     const long long id = request.d().pullInt64();
 
     // TODO: Handle stale config exceptions here from coll being dropped or sharded during op for
@@ -390,7 +382,7 @@ void Strategy::getMore(OperationContext* txn, Request& request) {
 void Strategy::killCursors(OperationContext* txn, Request& request) {
     DbMessage& dbMessage = request.d();
     const int numCursors = dbMessage.pullInt();
-    massert(28793,
+    massert(34425,
             str::stream() << "Invalid killCursors message. numCursors: " << numCursors
                           << ", message size: " << dbMessage.msg().dataSize() << ".",
             dbMessage.msg().dataSize() == 8 + (8 * numCursors));

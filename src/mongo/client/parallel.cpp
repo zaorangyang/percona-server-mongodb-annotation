@@ -115,7 +115,7 @@ static void throwCursorError(DBClientCursor* cursor) {
 
 ParallelSortClusteredCursor::ParallelSortClusteredCursor(const QuerySpec& qSpec,
                                                          const CommandInfo& cInfo)
-    : _qSpec(qSpec), _cInfo(cInfo), _totalTries(0), _cmChangeAttempted(false) {
+    : _qSpec(qSpec), _cInfo(cInfo), _totalTries(0) {
     _done = false;
     _didInit = false;
 
@@ -688,15 +688,6 @@ void ParallelSortClusteredCursor::startInit(OperationContext* txn) {
             }
             throw;
         } catch (DBException& e) {
-            if (e.getCode() == ErrorCodes::IncompatibleCatalogManager) {
-                fassert(28792, !_cmChangeAttempted);
-                _cmChangeAttempted = true;
-
-                grid.forwardingCatalogManager()->waitForCatalogManagerChange(txn);
-                startInit(txn);
-                return;
-            }
-
             warning() << "db exception when initializing on " << shardId
                       << ", current connection state is " << mdata.toBSON() << causedBy(e);
             e._shard = shardId;
@@ -858,8 +849,14 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* txn) {
                 }
                 throw;
             } else {
-                warning() << "db exception when finishing on " << shardId
-                          << ", current connection state is " << mdata.toBSON() << causedBy(e);
+                // the InvalidBSON exception indicates that the BSON is malformed ->
+                // don't print/call "mdata.toBSON()" to avoid unexpected errors e.g. a segfault
+                if (e.getCode() == 22)
+                    warning() << "bson is malformed :: db exception when finishing on " << shardId
+                              << causedBy(e);
+                else
+                    warning() << "db exception when finishing on " << shardId
+                              << ", current connection state is " << mdata.toBSON() << causedBy(e);
                 mdata.errored = true;
                 throw;
             }

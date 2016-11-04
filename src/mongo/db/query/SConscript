@@ -2,6 +2,12 @@
 
 Import("env")
 
+env.SConscript(
+    dirs=[
+        "collation",
+    ],
+)
+
 env.Library(
     target='query_planner',
     source=[
@@ -24,10 +30,12 @@ env.Library(
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/index/expression_params",
+        "$BUILD_DIR/mongo/db/index_names",
         "$BUILD_DIR/mongo/db/matcher/expression_algo",
         "$BUILD_DIR/mongo/db/matcher/expressions",
-        "$BUILD_DIR/mongo/db/index_names",
         "$BUILD_DIR/mongo/db/server_parameters",
+        "collation/collation_serializer",
+        "collation/collator_interface",
         "command_request_response",
         "index_bounds",
     ],
@@ -338,6 +346,16 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "query_planner_test_fixture",
+    ],
+)
+
+env.CppUnitTest(
+    target="query_solution_test",
+    source=[
+        "query_solution_test.cpp",
+    ],
+    LIBDEPS=[
+        "query_planner",
     ],
 )
 

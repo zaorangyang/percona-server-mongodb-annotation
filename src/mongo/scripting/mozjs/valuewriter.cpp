@@ -39,6 +39,7 @@
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/represent_as.h"
 
 namespace mongo {
 namespace mozjs {
@@ -170,7 +171,7 @@ Decimal128 ValueWriter::toDecimal128() {
         return Decimal128(NumberIntInfo::ToNumberInt(_context, _value));
 
     if (getScope(_context)->getProto<NumberLongInfo>().instanceOf(_value))
-        return Decimal128(NumberLongInfo::ToNumberLong(_context, _value));
+        return Decimal128(static_cast<int64_t>(NumberLongInfo::ToNumberLong(_context, _value)));
 
     if (getScope(_context)->getProto<NumberDecimalInfo>().instanceOf(_value))
         return NumberDecimalInfo::ToNumberDecimal(_context, _value);
@@ -203,14 +204,14 @@ void ValueWriter::writeThis(BSONObjBuilder* b,
     } else if (_value.isNumber()) {
         double val = toNumber();
 
-        // if previous type was integer, keep it
-        int intval = static_cast<int>(val);
+        // if previous type was integer, attempt to represent 'val' as an integer
+        auto intval = representAs<int>(val);
 
-        if (val == intval && _originalParent) {
+        if (intval && _originalParent) {
             // This makes copying an object of numbers O(n**2) :(
             BSONElement elmt = _originalParent->getField(sd);
             if (elmt.type() == mongo::NumberInt) {
-                b->append(sd, intval);
+                b->append(sd, *intval);
                 return;
             }
         }
@@ -263,6 +264,26 @@ void ValueWriter::_writeObject(BSONObjBuilder* b,
             if (scope->getProto<NumberIntInfo>().getJSClass() == jsclass) {
                 b->append(sd, NumberIntInfo::ToNumberInt(_context, obj));
 
+                return;
+            }
+
+            if (scope->getProto<CodeInfo>().getJSClass() == jsclass) {
+                if (o.hasOwnField(InternedString::scope)  // CodeWScope
+                    &&
+                    o.type(InternedString::scope) == mongo::Object) {
+                    if (o.type(InternedString::code) != mongo::String) {
+                        uasserted(ErrorCodes::BadValue, "code must be a string");
+                    }
+
+                    b->appendCodeWScope(
+                        sd, o.getString(InternedString::code), o.getObject(InternedString::scope));
+                } else {  // Code
+                    if (o.type(InternedString::code) != mongo::String) {
+                        uasserted(ErrorCodes::BadValue, "code must be a string");
+                    }
+
+                    b->appendCode(sd, o.getString(InternedString::code));
+                }
                 return;
             }
 
@@ -343,7 +364,7 @@ void ValueWriter::_writeObject(BSONObjBuilder* b,
                 JS::RootedValue dateval(_context);
                 o.callMethod("getTime", &dateval);
 
-                auto d = Date_t::fromMillisSinceEpoch(ValueWriter(_context, dateval).toNumber());
+                auto d = Date_t::fromMillisSinceEpoch(ValueWriter(_context, dateval).toInt64());
                 b->appendDate(sd, d);
 
                 return;

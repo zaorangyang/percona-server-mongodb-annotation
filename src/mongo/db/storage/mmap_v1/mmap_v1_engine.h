@@ -38,11 +38,12 @@
 
 namespace mongo {
 
+class JournalListener;
 class MMAPV1DatabaseCatalogEntry;
 
 class MMAPV1Engine : public StorageEngine {
 public:
-    MMAPV1Engine(const StorageEngineLockFile& lockFile);
+    MMAPV1Engine(const StorageEngineLockFile* lockFile);
     virtual ~MMAPV1Engine();
 
     void finishInit();
@@ -64,6 +65,8 @@ public:
     }
 
     virtual bool isDurable() const;
+
+    virtual bool isEphemeral() const;
 
     virtual Status closeDatabase(OperationContext* txn, StringData db);
 
@@ -92,6 +95,8 @@ public:
      * The RecordAccessTracker is thread-safe (it uses its own mutex internally).
      */
     RecordAccessTracker& getRecordAccessTracker();
+
+    void setJournalListener(JournalListener* jl) final;
 
 private:
     static void _listDatabases(const std::string& directory, std::vector<std::string>* out);

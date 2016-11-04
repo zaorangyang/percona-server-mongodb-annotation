@@ -62,6 +62,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/index_access_method.h"
@@ -85,7 +86,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/write_concern.h"
@@ -96,6 +97,7 @@
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/rpc/protocol.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
@@ -265,7 +267,13 @@ public:
         // TODO: SERVER-4328 Don't lock globally
         ScopedTransaction transaction(txn, MODE_X);
         Lock::GlobalWrite lk(txn->lockState());
-        OldClientContext context(txn, dbname);
+
+        // TODO (Kal): OldClientContext legacy, needs to be removed
+        {
+            CurOp::get(txn)->ensureStarted();
+            stdx::lock_guard<Client> lk(*txn->getClient());
+            CurOp::get(txn)->setNS_inlock(dbname);
+        }
 
         log() << "repairDatabase " << dbname;
         BackgroundOperation::assertNoBgOpInProgForDb(dbname);
@@ -437,7 +445,13 @@ public:
         //
         ScopedTransaction transaction(txn, MODE_IX);
         Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-        OldClientContext ctx(txn, dbname);
+
+        // TODO (Kal): OldClientContext legacy, needs to be removed
+        {
+            CurOp::get(txn)->ensureStarted();
+            stdx::lock_guard<Client> lk(*txn->getClient());
+            CurOp::get(txn)->setNS_inlock(dbname);
+        }
 
         int was = _diaglog.setLevel(cmdObj.firstElement().numberInt());
         _diaglog.flush();
@@ -696,6 +710,14 @@ public:
                 }
             }
 
+            if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
+                return appendCommandStatus(result,
+                                           Status(ErrorCodes::OperationFailed,
+                                                  str::stream()
+                                                      << "Executor error during filemd5 command: "
+                                                      << WorkingSetCommon::toStatusString(obj)));
+            }
+
             if (partialOk)
                 result.appendBinData("md5state", sizeof(st), BinDataGeneral, &st);
 
@@ -837,8 +859,9 @@ public:
         long long numObjects = 0;
 
         RecordId loc;
+        BSONObj obj;
         PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &loc))) {
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, &loc))) {
             if (estimate)
                 size += avgObjSize;
             else
@@ -852,8 +875,13 @@ public:
             }
         }
 
-        if (PlanExecutor::IS_EOF != state) {
+        if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
             warning() << "Internal error while reading " << ns << endl;
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::OperationFailed,
+                       str::stream() << "Executor error while reading during dataSize command: "
+                                     << WorkingSetCommon::toStatusString(obj)));
         }
 
         ostringstream os;
@@ -1061,9 +1089,9 @@ public:
 
         const string ns = parseNs(dbname, jsobj);
 
-        // TODO: OldClientContext legacy, needs to be removed
-        CurOp::get(txn)->ensureStarted();
+        // TODO (Kal): OldClientContext legacy, needs to be removed
         {
+            CurOp::get(txn)->ensureStarted();
             stdx::lock_guard<Client> lk(*txn->getClient());
             CurOp::get(txn)->setNS_inlock(dbname);
         }
@@ -1191,14 +1219,14 @@ namespace {
 // Symbolic names for indexes to make code more readable.
 const std::size_t kCmdOptionMaxTimeMSField = 0;
 const std::size_t kHelpField = 1;
-const std::size_t kShardVersionField = 2;
+const std::size_t kShardVersionFieldIdx = 2;
 const std::size_t kQueryOptionMaxTimeMSField = 3;
 
 // We make an array of the fields we need so we can call getFields once. This saves repeated
 // scans over the command object.
 const std::array<StringData, 4> neededFieldNames{LiteParsedQuery::cmdOptionMaxTimeMS,
                                                  Command::kHelpFieldName,
-                                                 OperationShardVersion::fieldName(),
+                                                 ChunkVersion::kShardVersionField,
                                                  LiteParsedQuery::queryOptionMaxTimeMS};
 }  // namespace
 
@@ -1308,12 +1336,10 @@ void Command::execCommand(OperationContext* txn,
         if (iAmPrimary && !txn->getClient()->isInDirectClient()) {
             // Handle shard version and config optime information that may have been sent along with
             // the command.
-            auto& operationShardVersion = OperationShardVersion::get(txn);
-            invariant(!operationShardVersion.hasShardVersion());
+            auto& oss = OperationShardingState::get(txn);
 
             auto commandNS = NamespaceString(command->parseNs(dbname, request.getCommandArgs()));
-            operationShardVersion.initializeFromCommand(commandNS,
-                                                        extractedFields[kShardVersionField]);
+            oss.initializeShardVersion(commandNS, extractedFields[kShardVersionFieldIdx]);
 
             auto shardingState = ShardingState::get(txn);
             if (shardingState->enabled()) {
@@ -1322,13 +1348,12 @@ void Command::execCommand(OperationContext* txn,
                 shardingState->updateConfigServerOpTimeFromMetadata(txn);
             } else {
                 massert(
-                    28807,
+                    34422,
                     str::stream()
                         << "Received a command with sharding chunk version information but this "
                            "node is not sharding aware: " << request.getCommandArgs().jsonString(),
-                    !operationShardVersion.hasShardVersion() ||
-                        ChunkVersion::isIgnoredVersion(
-                            operationShardVersion.getShardVersion(commandNS)));
+                    !oss.hasShardVersion() ||
+                        ChunkVersion::isIgnoredVersion(oss.getShardVersion(commandNS)));
             }
         }
 
@@ -1414,6 +1439,13 @@ bool Command::run(OperationContext* txn,
                 auto readConcernResult = replCoord->waitUntilOpTime(txn, readConcernArgs);
                 readConcernResult.appendInfo(&inPlaceReplyBob);
                 if (!readConcernResult.getStatus().isOK()) {
+                    if (ErrorCodes::ExceededTimeLimit == readConcernResult.getStatus()) {
+                        const int debugLevel = serverGlobalParams.configsvr ? 0 : 2;
+                        LOG(debugLevel)
+                            << "Command on database " << request.getDatabase()
+                            << " timed out waiting for read concern to be satisfied. Command: "
+                            << getRedactedCopyForLogging(request.getCommandArgs());
+                    }
                     auto result =
                         appendCommandStatus(inPlaceReplyBob, readConcernResult.getStatus());
                     inPlaceReplyBob.doneFast();

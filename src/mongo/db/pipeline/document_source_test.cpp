@@ -33,6 +33,7 @@
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/stdx/memory.h"
@@ -215,6 +216,46 @@ TEST(Mock, Empty) {
 
 }  // namespace Mock
 
+namespace DocumentSourceRedact {
+using mongo::DocumentSourceRedact;
+using mongo::DocumentSourceMatch;
+using mongo::DocumentSourceMock;
+
+class Base : public Mock::Base {
+protected:
+    void createRedact() {
+        BSONObj spec = BSON("$redact"
+                            << "$$PRUNE");
+        _redact = DocumentSourceRedact::createFromBson(spec.firstElement(), ctx());
+    }
+
+    DocumentSource* redact() {
+        return _redact.get();
+    }
+
+private:
+    intrusive_ptr<DocumentSource> _redact;
+};
+
+class PromoteMatch : public Base {
+public:
+    void run() {
+        createRedact();
+
+        auto match = DocumentSourceMatch::createFromBson(BSON("a" << 1).firstElement(), ctx());
+
+        Pipeline::SourceContainer pipeline;
+        pipeline.push_back(redact());
+        pipeline.push_back(match);
+
+        pipeline.front()->optimizeAt(pipeline.begin(), &pipeline);
+
+        ASSERT_EQUALS(pipeline.size(), 4U);
+        ASSERT(dynamic_cast<DocumentSourceMatch*>(pipeline.front().get()));
+    }
+};
+}  // namespace DocumentSourceRedact
+
 namespace DocumentSourceLimit {
 
 using mongo::DocumentSourceLimit;
@@ -248,6 +289,25 @@ public:
         ASSERT_EQUALS(Value(1), next->getField("a"));
         // The limit is exhausted.
         ASSERT(!limit()->getNext());
+    }
+};
+
+/** Combine two $limit stages. */
+class CombineLimit : public Base {
+public:
+    void run() {
+        Pipeline::SourceContainer container;
+        createLimit(10);
+
+        auto secondLimit =
+            DocumentSourceLimit::createFromBson(BSON("$limit" << 5).firstElement(), ctx());
+
+        container.push_back(limit());
+        container.push_back(secondLimit);
+
+        limit()->optimizeAt(container.begin(), &container);
+        ASSERT_EQUALS(5, static_cast<DocumentSourceLimit*>(limit())->getLimit());
+        ASSERT_EQUALS(1U, container.size());
     }
 };
 
@@ -1402,6 +1462,9 @@ public:
         createSort(BSON("a" << 1));
         ASSERT_EQUALS(sort()->getLimit(), -1);
 
+        Pipeline::SourceContainer container;
+        container.push_back(sort());
+
         {  // pre-limit checks
             vector<Value> arr;
             sort()->serializeToArray(arr);
@@ -1411,12 +1474,22 @@ public:
             ASSERT(sort()->getMergeSource() != NULL);
         }
 
-        ASSERT_TRUE(sort()->coalesce(mkLimit(10)));
+        container.push_back(mkLimit(10));
+        sort()->optimizeAt(container.begin(), &container);
+        ASSERT_EQUALS(container.size(), 1U);
         ASSERT_EQUALS(sort()->getLimit(), 10);
-        ASSERT_TRUE(sort()->coalesce(mkLimit(15)));
-        ASSERT_EQUALS(sort()->getLimit(), 10);  // unchanged
-        ASSERT_TRUE(sort()->coalesce(mkLimit(5)));
-        ASSERT_EQUALS(sort()->getLimit(), 5);  // reduced
+
+        // unchanged
+        container.push_back(mkLimit(15));
+        sort()->optimizeAt(container.begin(), &container);
+        ASSERT_EQUALS(container.size(), 1U);
+        ASSERT_EQUALS(sort()->getLimit(), 10);
+
+        // reduced
+        container.push_back(mkLimit(5));
+        sort()->optimizeAt(container.begin(), &container);
+        ASSERT_EQUALS(container.size(), 1U);
+        ASSERT_EQUALS(sort()->getLimit(), 5);
 
         vector<Value> arr;
         sort()->serializeToArray(arr);
@@ -2477,15 +2550,27 @@ public:
     void run() {
         intrusive_ptr<DocumentSourceGeoNear> geoNear = DocumentSourceGeoNear::create(ctx());
 
-        ASSERT_EQUALS(geoNear->getLimit(), 100);
+        Pipeline::SourceContainer container;
+        container.push_back(geoNear);
 
-        ASSERT(geoNear->coalesce(DocumentSourceLimit::create(ctx(), 200)));
-        ASSERT_EQUALS(geoNear->getLimit(), 100);
+        ASSERT_EQUALS(geoNear->getLimit(), DocumentSourceGeoNear::kDefaultLimit);
 
-        ASSERT(geoNear->coalesce(DocumentSourceLimit::create(ctx(), 50)));
+        container.push_back(DocumentSourceLimit::create(ctx(), 200));
+        geoNear->optimizeAt(container.begin(), &container);
+
+        ASSERT_EQUALS(container.size(), 1U);
+        ASSERT_EQUALS(geoNear->getLimit(), DocumentSourceGeoNear::kDefaultLimit);
+
+        container.push_back(DocumentSourceLimit::create(ctx(), 50));
+        geoNear->optimizeAt(container.begin(), &container);
+
+        ASSERT_EQUALS(container.size(), 1U);
         ASSERT_EQUALS(geoNear->getLimit(), 50);
 
-        ASSERT(geoNear->coalesce(DocumentSourceLimit::create(ctx(), 30)));
+        container.push_back(DocumentSourceLimit::create(ctx(), 30));
+        geoNear->optimizeAt(container.begin(), &container);
+
+        ASSERT_EQUALS(container.size(), 1U);
         ASSERT_EQUALS(geoNear->getLimit(), 30);
     }
 };
@@ -2637,6 +2722,111 @@ public:
     }
 };
 
+class DependenciesOrExpression {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMatch> match = makeMatch("{$or: [{a: 1}, {'x.y': {$gt: 4}}]}");
+        DepsTracker dependencies;
+        ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+        ASSERT_EQUALS(1U, dependencies.fields.count("a"));
+        ASSERT_EQUALS(1U, dependencies.fields.count("x.y"));
+        ASSERT_EQUALS(2U, dependencies.fields.size());
+        ASSERT_EQUALS(false, dependencies.needWholeDocument);
+        ASSERT_EQUALS(false, dependencies.needTextScore);
+    }
+};
+
+class DependenciesTextExpression {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMatch> match = makeMatch("{$text: {$search: 'hello'} }");
+        DepsTracker dependencies;
+        ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_ALL, match->getDependencies(&dependencies));
+        ASSERT_EQUALS(true, dependencies.needWholeDocument);
+        ASSERT_EQUALS(false, dependencies.needTextScore);
+    }
+};
+
+class DependenciesGTEExpression {
+public:
+    void run() {
+        // Parses to {a: {$eq: {notAField: {$gte: 4}}}}.
+        intrusive_ptr<DocumentSourceMatch> match = makeMatch("{a: {notAField: {$gte: 4}}}");
+        DepsTracker dependencies;
+        ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+        ASSERT_EQUALS(1U, dependencies.fields.count("a"));
+        ASSERT_EQUALS(1U, dependencies.fields.size());
+        ASSERT_EQUALS(false, dependencies.needWholeDocument);
+        ASSERT_EQUALS(false, dependencies.needTextScore);
+    }
+};
+
+class DependenciesElemMatchExpression {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMatch> match = makeMatch("{a: {$elemMatch: {c: {$gte: 4}}}}");
+        DepsTracker dependencies;
+        ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+        ASSERT_EQUALS(1U, dependencies.fields.count("a.c"));
+        ASSERT_EQUALS(1U, dependencies.fields.size());
+        ASSERT_EQUALS(false, dependencies.needWholeDocument);
+        ASSERT_EQUALS(false, dependencies.needTextScore);
+    }
+};
+
+class DependenciesNotExpression {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMatch> match = makeMatch("{b: {$not: {$gte: 4}}}}");
+        DepsTracker dependencies;
+        ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+        ASSERT_EQUALS(1U, dependencies.fields.count("b"));
+        ASSERT_EQUALS(1U, dependencies.fields.size());
+        ASSERT_EQUALS(false, dependencies.needWholeDocument);
+        ASSERT_EQUALS(false, dependencies.needTextScore);
+    }
+};
+
+class DependenciesNorExpression {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMatch> match =
+            makeMatch("{$nor: [{'a.b': {$gte: 4}}, {'b.c': {$in: [1, 2]}}]}");
+        DepsTracker dependencies;
+        ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+        ASSERT_EQUALS(1U, dependencies.fields.count("a.b"));
+        ASSERT_EQUALS(1U, dependencies.fields.count("b.c"));
+        ASSERT_EQUALS(2U, dependencies.fields.size());
+        ASSERT_EQUALS(false, dependencies.needWholeDocument);
+        ASSERT_EQUALS(false, dependencies.needTextScore);
+    }
+};
+
+class DependenciesCommentExpression {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMatch> match = makeMatch("{$comment: 'misleading?'}");
+        DepsTracker dependencies;
+        ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+        ASSERT_EQUALS(0U, dependencies.fields.size());
+        ASSERT_EQUALS(false, dependencies.needWholeDocument);
+        ASSERT_EQUALS(false, dependencies.needTextScore);
+    }
+};
+
+class DependenciesCommentMatchExpression {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMatch> match = makeMatch("{a: 4, $comment: 'irrelevant'}");
+        DepsTracker dependencies;
+        ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+        ASSERT_EQUALS(1U, dependencies.fields.count("a"));
+        ASSERT_EQUALS(1U, dependencies.fields.size());
+        ASSERT_EQUALS(false, dependencies.needWholeDocument);
+        ASSERT_EQUALS(false, dependencies.needTextScore);
+    }
+};
+
 class Coalesce {
 public:
     void run() {
@@ -2644,15 +2834,23 @@ public:
         intrusive_ptr<DocumentSourceMatch> match2 = makeMatch(BSON("b" << 1));
         intrusive_ptr<DocumentSourceMatch> match3 = makeMatch(BSON("c" << 1));
 
+        Pipeline::SourceContainer container;
+
         // Check initial state
         ASSERT_EQUALS(match1->getQuery(), BSON("a" << 1));
         ASSERT_EQUALS(match2->getQuery(), BSON("b" << 1));
         ASSERT_EQUALS(match3->getQuery(), BSON("c" << 1));
 
-        ASSERT(match1->coalesce(match2));
+        container.push_back(match1);
+        container.push_back(match2);
+        match1->optimizeAt(container.begin(), &container);
+
+        ASSERT_EQUALS(container.size(), 1U);
         ASSERT_EQUALS(match1->getQuery(), fromjson("{'$and': [{a:1}, {b:1}]}"));
 
-        ASSERT(match1->coalesce(match3));
+        container.push_back(match3);
+        match1->optimizeAt(container.begin(), &container);
+        ASSERT_EQUALS(container.size(), 1U);
         ASSERT_EQUALS(match1->getQuery(),
                       fromjson(
                           "{'$and': [{'$and': [{a:1}, {b:1}]},"
@@ -2668,6 +2866,7 @@ public:
         add<DocumentSourceClass::Deps>();
 
         add<DocumentSourceLimit::DisposeSource>();
+        add<DocumentSourceLimit::CombineLimit>();
         add<DocumentSourceLimit::DisposeSourceCascade>();
         add<DocumentSourceLimit::Dependencies>();
 
@@ -2763,6 +2962,13 @@ public:
 
         add<DocumentSourceMatch::RedactSafePortion>();
         add<DocumentSourceMatch::Coalesce>();
+        add<DocumentSourceMatch::DependenciesOrExpression>();
+        add<DocumentSourceMatch::DependenciesGTEExpression>();
+        add<DocumentSourceMatch::DependenciesElemMatchExpression>();
+        add<DocumentSourceMatch::DependenciesNotExpression>();
+        add<DocumentSourceMatch::DependenciesNorExpression>();
+        add<DocumentSourceMatch::DependenciesCommentExpression>();
+        add<DocumentSourceMatch::DependenciesCommentMatchExpression>();
     }
 };
 

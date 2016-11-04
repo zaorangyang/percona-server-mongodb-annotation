@@ -205,7 +205,7 @@ public:
 
     // For testing only
 
-    void _resetState_inlock(Timestamp lastAppliedOptime);
+    void _resetState_inlock(Timestamp lastAppliedOpTime);
     void _setInitialSyncStorageInterface(CollectionCloner::StorageInterface* si);
 
 private:

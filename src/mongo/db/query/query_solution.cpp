@@ -501,6 +501,16 @@ void IndexScanNode::computeProperties() {
             }
             equalityFields.insert(oil.name);
         }
+    } else {
+        BSONObjIterator keyIter(indexKeyPattern);
+        BSONObjIterator startIter(bounds.startKey);
+        BSONObjIterator endIter(bounds.endKey);
+        while (keyIter.more() && startIter.more() && endIter.more()) {
+            BSONElement key = keyIter.next();
+            if (startIter.next() == endIter.next()) {
+                equalityFields.insert(key.fieldName());
+            }
+        }
     }
 
     if (equalityFields.empty()) {
@@ -533,6 +543,10 @@ void IndexScanNode::computeProperties() {
         // We add the sort obtained by dropping 'elt' and all preceding elements from the index
         // key pattern.
         BSONObjIterator droppedPrefixIt = it;
+        if (!droppedPrefixIt.more()) {
+            // Do not insert an empty sort order.
+            break;
+        }
         BSONObjBuilder droppedPrefixBob;
         while (droppedPrefixIt.more()) {
             droppedPrefixBob.append(droppedPrefixIt.next());
@@ -888,10 +902,10 @@ QuerySolutionNode* DistinctNode::clone() const {
 }
 
 //
-// CountNode
+// CountScanNode
 //
 
-void CountNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void CountScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "COUNT\n";
     addIndent(ss, indent + 1);
@@ -902,8 +916,8 @@ void CountNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     *ss << "endKey = " << endKey << '\n';
 }
 
-QuerySolutionNode* CountNode::clone() const {
-    CountNode* copy = new CountNode();
+QuerySolutionNode* CountScanNode::clone() const {
+    CountScanNode* copy = new CountScanNode();
     cloneBaseData(copy);
 
     copy->sorts = this->sorts;

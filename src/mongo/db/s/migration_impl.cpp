@@ -36,9 +36,8 @@
 #include "mongo/client/connpool.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/logger/ramlog.h"
@@ -62,73 +61,17 @@ namespace {
 
 Tee* const migrateLog = RamLog::get("migrate");
 
-const int kDefaultWriteTimeoutForMigrationMs = 60 * 1000;
-const WriteConcernOptions DefaultWriteConcernForMigration(2,
-                                                          WriteConcernOptions::NONE,
-                                                          kDefaultWriteTimeoutForMigrationMs);
-
-WriteConcernOptions getDefaultWriteConcernForMigration() {
-    repl::ReplicationCoordinator* replCoordinator = repl::getGlobalReplicationCoordinator();
-    if (replCoordinator->getReplicationMode() == mongo::repl::ReplicationCoordinator::modeReplSet) {
-        Status status =
-            replCoordinator->checkIfWriteConcernCanBeSatisfied(DefaultWriteConcernForMigration);
-        if (status.isOK()) {
-            return DefaultWriteConcernForMigration;
-        }
-    }
-
-    return WriteConcernOptions(1, WriteConcernOptions::NONE, 0);
+BSONObj createRecvChunkCommitRequest(const MigrationSessionId& sessionId) {
+    BSONObjBuilder builder;
+    builder.append("_recvChunkCommit", 1);
+    sessionId.append(&builder);
+    return builder.obj();
 }
 
 MONGO_FP_DECLARE(failMigrationCommit);
 MONGO_FP_DECLARE(hangBeforeLeavingCriticalSection);
-MONGO_FP_DECLARE(failMigrationConfigWritePrepare);
-MONGO_FP_DECLARE(failMigrationApplyOps);
 
 }  // namespace
-
-ChunkMoveWriteConcernOptions::ChunkMoveWriteConcernOptions(BSONObj secThrottleObj,
-                                                           WriteConcernOptions writeConcernOptions)
-    : _secThrottleObj(std::move(secThrottleObj)),
-      _writeConcernOptions(std::move(writeConcernOptions)) {}
-
-StatusWith<ChunkMoveWriteConcernOptions> ChunkMoveWriteConcernOptions::initFromCommand(
-    const BSONObj& cmdObj) {
-    BSONObj secThrottleObj;
-    WriteConcernOptions writeConcernOptions;
-
-    Status status = writeConcernOptions.parseSecondaryThrottle(cmdObj, &secThrottleObj);
-    if (!status.isOK()) {
-        if (status.code() != ErrorCodes::WriteConcernNotDefined) {
-            return status;
-        }
-
-        writeConcernOptions = getDefaultWriteConcernForMigration();
-    } else {
-        repl::ReplicationCoordinator* replCoordinator = repl::getGlobalReplicationCoordinator();
-
-        if (replCoordinator->getReplicationMode() ==
-                repl::ReplicationCoordinator::modeMasterSlave &&
-            writeConcernOptions.shouldWaitForOtherNodes()) {
-            warning() << "moveChunk cannot check if secondary throttle setting "
-                      << writeConcernOptions.toBSON()
-                      << " can be enforced in a master slave configuration";
-        }
-
-        Status status = replCoordinator->checkIfWriteConcernCanBeSatisfied(writeConcernOptions);
-        if (!status.isOK() && status != ErrorCodes::NoReplicationEnabled) {
-            return status;
-        }
-    }
-
-    if (writeConcernOptions.shouldWaitForOtherNodes() &&
-        writeConcernOptions.wTimeout == WriteConcernOptions::kNoTimeout) {
-        // Don't allow no timeout
-        writeConcernOptions.wTimeout = kDefaultWriteTimeoutForMigrationMs;
-    }
-
-    return ChunkMoveWriteConcernOptions(secThrottleObj, writeConcernOptions);
-}
 
 ChunkMoveOperationState::ChunkMoveOperationState(OperationContext* txn, NamespaceString ns)
     : _txn(txn), _nss(std::move(ns)) {}
@@ -156,11 +99,6 @@ Status ChunkMoveOperationState::initialize(const BSONObj& cmdObj) {
     _toShard = cmdObj["toShard"].str();
     if (_toShard.empty()) {
         return {ErrorCodes::InvalidOptions, "need to specify shard to move chunk to"};
-    }
-
-    Status epochStatus = bsonExtractOIDField(cmdObj, "epoch", &_collectionEpoch);
-    if (!epochStatus.isOK()) {
-        return epochStatus;
     }
 
     _minKey = cmdObj["min"].Obj();
@@ -195,15 +133,21 @@ Status ChunkMoveOperationState::initialize(const BSONObj& cmdObj) {
         _toShardCS = toShard->getConnString();
     }
 
+    auto& operationVersion = OperationShardingState::get(_txn);
+    if (!operationVersion.hasShardVersion()) {
+        return Status{ErrorCodes::InvalidOptions, "moveChunk command is missing shard version"};
+    }
+
+    _collectionVersion = operationVersion.getShardVersion(_nss);
+
     return Status::OK();
 }
 
-StatusWith<ForwardingCatalogManager::ScopedDistLock*>
-ChunkMoveOperationState::acquireMoveMetadata() {
+StatusWith<DistLockManager::ScopedDistLock*> ChunkMoveOperationState::acquireMoveMetadata() {
     // Get the distributed lock
     const string whyMessage(stream() << "migrating chunk [" << _minKey << ", " << _maxKey << ") in "
                                      << _nss.ns());
-    _distLockStatus = grid.forwardingCatalogManager()->distLock(_txn, _nss.ns(), whyMessage);
+    _distLockStatus = grid.catalogManager(_txn)->distLock(_txn, _nss.ns(), whyMessage);
 
     if (!_distLockStatus->isOK()) {
         const string msg = stream() << "could not acquire collection lock for " << _nss.ns()
@@ -234,24 +178,14 @@ ChunkMoveOperationState::acquireMoveMetadata() {
         return Status(ErrorCodes::IncompatibleShardingMetadata, msg);
     }
 
-    {
-        // Mongos >= v3.2 sends the full version, v3.0 only sends the epoch.
-        // TODO(SERVER-20742): Stop parsing epoch separately after 3.2.
-        auto& operationVersion = OperationShardVersion::get(_txn);
-        if (operationVersion.hasShardVersion()) {
-            _collectionVersion = operationVersion.getShardVersion(_nss);
-            _collectionEpoch = _collectionVersion.epoch();
-        }  // else the epoch will already be set from the parsing of the ChunkMoveOperationState
-
-        if (_collectionEpoch != _shardVersion.epoch()) {
-            const string msg = stream() << "moveChunk cannot move chunk "
-                                        << "[" << _minKey << "," << _maxKey << "), "
-                                        << "collection may have been dropped. "
-                                        << "current epoch: " << _shardVersion.epoch()
-                                        << ", cmd epoch: " << _collectionEpoch;
-            warning() << msg;
-            throw SendStaleConfigException(_nss.toString(), msg, _collectionVersion, _shardVersion);
-        }
+    if (_collectionVersion.epoch() != _shardVersion.epoch()) {
+        const string msg = stream() << "moveChunk cannot move chunk "
+                                    << "[" << _minKey << "," << _maxKey << "), "
+                                    << "collection may have been dropped. "
+                                    << "current epoch: " << _shardVersion.epoch()
+                                    << ", cmd epoch: " << _collectionVersion.epoch();
+        warning() << msg;
+        throw SendStaleConfigException(_nss.toString(), msg, _collectionVersion, _shardVersion);
     }
 
     _collMetadata = shardingState->getCollectionMetadata(_nss.ns());
@@ -276,7 +210,7 @@ ChunkMoveOperationState::acquireMoveMetadata() {
     return &_distLockStatus->getValue();
 }
 
-Status ChunkMoveOperationState::commitMigration() {
+Status ChunkMoveOperationState::commitMigration(const MigrationSessionId& sessionId) {
     invariant(_distLockStatus.is_initialized());
     invariant(_distLockStatus->isOK());
 
@@ -321,7 +255,7 @@ Status ChunkMoveOperationState::commitMigration() {
 
     try {
         ScopedDbConnection connTo(_toShardCS, 35.0);
-        connTo->runCommand("admin", BSON("_recvChunkCommit" << 1), res);
+        connTo->runCommand("admin", createRecvChunkCommitRequest(sessionId), res);
         connTo.done();
         recvChunkCommitStatus = getStatusFromCommandResult(res);
     } catch (const DBException& e) {
@@ -451,97 +385,9 @@ Status ChunkMoveOperationState::commitMigration() {
         preCond.append(b.obj());
     }
 
-    Status applyOpsStatus{Status::OK()};
-    try {
-        // For testing migration failures
-        if (MONGO_FAIL_POINT(failMigrationConfigWritePrepare)) {
-            throw DBException("mock migration failure before config write",
-                              ErrorCodes::PrepareConfigsFailed);
-        }
-
-        applyOpsStatus =
-            grid.catalogManager(_txn)->applyChunkOpsDeprecated(_txn, updates.arr(), preCond.arr());
-
-        if (MONGO_FAIL_POINT(failMigrationApplyOps)) {
-            throw SocketException(SocketException::RECV_ERROR,
-                                  shardingState->getConfigServer(_txn).toString());
-        }
-    } catch (const DBException& ex) {
-        applyOpsStatus = ex.toStatus();
-    }
-
-    if (applyOpsStatus == ErrorCodes::PrepareConfigsFailed) {
-        // In the process of issuing the migrate commit, the SyncClusterConnection checks that
-        // the config servers are reachable. If they are not, we are sure that the applyOps
-        // command was not sent to any of the configs, so we can safely back out of the
-        // migration here, by resetting the shard version that we bumped up to in the
-        // donateChunk() call above.
-        log() << "About to acquire moveChunk coll lock to reset shard version from "
-              << "failed migration";
-
-        {
-            ScopedTransaction transaction(_txn, MODE_IX);
-            Lock::DBLock dbLock(_txn->lockState(), _nss.db(), MODE_IX);
-            Lock::CollectionLock collLock(_txn->lockState(), _nss.ns(), MODE_X);
-
-            // Revert the metadata back to the state before "forgetting" about the chunk
-            shardingState->undoDonateChunk(_txn, _nss.ns(), getCollMetadata());
-        }
-
-        log() << "Shard version successfully reset to clean up failed migration";
-
-        const string msg = stream() << "Failed to send migrate commit to configs "
-                                    << causedBy(applyOpsStatus);
-        return Status(applyOpsStatus.code(), msg);
-    } else if (!applyOpsStatus.isOK()) {
-        // This could be a blip in the connectivity. Wait out a few seconds and check if the
-        // commit request made it.
-        //
-        // If the commit made it to the config, we'll see the chunk in the new shard and
-        // there's no further action to be done.
-        //
-        // If the commit did not make it, currently the only way to fix this state is to
-        // bounce the mongod so that the old state (before migrating) is brought in.
-
-        warning() << "moveChunk commit failed and metadata will be revalidated"
-                  << causedBy(applyOpsStatus) << migrateLog;
-        sleepsecs(10);
-
-        // Look for the chunk in this shard whose version got bumped. We assume that if that
-        // mod made it to the config server, then applyOps was successful.
-        try {
-            std::vector<ChunkType> newestChunk;
-            Status status =
-                grid.catalogManager(_txn)->getChunks(_txn,
-                                                     BSON(ChunkType::ns(_nss.ns())),
-                                                     BSON(ChunkType::DEPRECATED_lastmod() << -1),
-                                                     1,
-                                                     &newestChunk,
-                                                     nullptr);
-            uassertStatusOK(status);
-
-            ChunkVersion checkVersion;
-            if (!newestChunk.empty()) {
-                invariant(newestChunk.size() == 1);
-                checkVersion = newestChunk[0].getVersion();
-            }
-
-            if (checkVersion.equals(nextVersion)) {
-                log() << "moveChunk commit confirmed" << migrateLog;
-            } else {
-                error() << "moveChunk commit failed: version is at " << checkVersion
-                        << " instead of " << nextVersion << migrateLog;
-                error() << "TERMINATING" << migrateLog;
-
-                dbexit(EXIT_SHARDING_ERROR);
-            }
-        } catch (...) {
-            error() << "moveChunk failed to get confirmation of commit" << migrateLog;
-            error() << "TERMINATING" << migrateLog;
-
-            dbexit(EXIT_SHARDING_ERROR);
-        }
-    }
+    fassertStatusOK(34431,
+                    grid.catalogManager(_txn)->applyChunkOpsDeprecated(
+                        _txn, updates.arr(), preCond.arr(), _nss.ns(), nextVersion));
 
     MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangBeforeLeavingCriticalSection);
 
@@ -578,9 +424,11 @@ std::shared_ptr<CollectionMetadata> ChunkMoveOperationState::getCollMetadata() c
     return _collMetadata;
 }
 
-Status ChunkMoveOperationState::start(BSONObj shardKeyPattern) {
+Status ChunkMoveOperationState::start(const MigrationSessionId& sessionId,
+                                      const BSONObj& shardKeyPattern) {
     auto migrationSourceManager = ShardingState::get(_txn)->migrationSourceManager();
-    if (!migrationSourceManager->start(_txn, _nss.ns(), _minKey, _maxKey, shardKeyPattern)) {
+    if (!migrationSourceManager->start(
+            _txn, sessionId, _nss.ns(), _minKey, _maxKey, shardKeyPattern)) {
         return {ErrorCodes::ConflictingOperationInProgress,
                 "Not starting chunk migration because another migration is already in progress "
                 "from this shard"};

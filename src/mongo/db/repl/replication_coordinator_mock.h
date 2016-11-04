@@ -103,15 +103,18 @@ public:
 
     virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
 
-    virtual void setMyLastOptime(const OpTime& opTime);
+    virtual void setMyLastAppliedOpTime(const OpTime& opTime);
+    virtual void setMyLastDurableOpTime(const OpTime& opTime);
 
-    virtual void setMyLastOptimeForward(const OpTime& opTime);
+    virtual void setMyLastAppliedOpTimeForward(const OpTime& opTime);
+    virtual void setMyLastDurableOpTimeForward(const OpTime& opTime);
 
-    virtual void resetMyLastOptime();
+    virtual void resetMyLastOpTimes();
 
     virtual void setMyHeartbeatMessage(const std::string& msg);
 
-    virtual OpTime getMyLastOptime() const;
+    virtual OpTime getMyLastAppliedOpTime() const;
+    virtual OpTime getMyLastDurableOpTime() const;
 
     virtual ReadConcernResponse waitUntilOpTime(OperationContext* txn,
                                                 const ReadConcernArgs& settings) override;
@@ -132,7 +135,8 @@ public:
 
     virtual void signalUpstreamUpdater();
 
-    virtual bool prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder);
+    virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
+        ReplSetUpdatePositionCommandStyle commandStyle) const override;
 
     virtual Status processReplSetGetStatus(BSONObjBuilder* result);
 
@@ -177,6 +181,8 @@ public:
 
     virtual Status processReplSetElect(const ReplSetElectArgs& args, BSONObjBuilder* resultObj);
 
+    virtual Status processReplSetUpdatePosition(const OldUpdatePositionArgs& updates,
+                                                long long* configVersion);
     virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
                                                 long long* configVersion);
 
@@ -184,7 +190,7 @@ public:
 
     virtual bool buildsIndexes();
 
-    virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op);
+    virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op, bool durablyWritten);
 
     virtual std::vector<HostAndPort> getOtherNodesInReplSet() const;
 
@@ -196,7 +202,10 @@ public:
 
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
 
-    virtual void resetLastOpTimeFromOplog(OperationContext* txn);
+    virtual SyncSourceResolverResponse selectSyncSource(OperationContext* txn,
+                                                        const OpTime& lastOpTimeFetched);
+
+    virtual void resetLastOpTimesFromOplog(OperationContext* txn);
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const OpTime& syncSourceLastOpTime,
@@ -218,7 +227,9 @@ public:
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response);
 
-    virtual bool isV1ElectionProtocol();
+    virtual bool isV1ElectionProtocol() const override;
+
+    virtual bool getWriteConcernMajorityShouldJournal();
 
     virtual void summarizeAsHtml(ReplSetHtmlSummary* output);
 
@@ -241,11 +252,15 @@ public:
 
     virtual size_t getNumUncommittedSnapshots() override;
 
+    virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
+        WriteConcernOptions wc) override;
+
 private:
     AtomicUInt64 _snapshotNameGenerator;
     const ReplSettings _settings;
     MemberState _memberState;
-    OpTime _myLastOpTime;
+    OpTime _myLastDurableOpTime;
+    OpTime _myLastAppliedOpTime;
 };
 
 }  // namespace repl

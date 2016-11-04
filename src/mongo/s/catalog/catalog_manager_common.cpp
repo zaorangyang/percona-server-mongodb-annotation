@@ -60,6 +60,8 @@
 
 namespace mongo {
 
+MONGO_FP_DECLARE(failApplyChunkOps);
+
 using std::string;
 using std::unique_ptr;
 using std::vector;
@@ -93,10 +95,8 @@ StatusWith<ShardType> validateHostAsShard(OperationContext* txn,
                                           ShardRegistry* shardRegistry,
                                           const ConnectionString& connectionString,
                                           const std::string* shardProposedName) {
-    if (connectionString.type() == ConnectionString::SYNC) {
-        return {ErrorCodes::BadValue,
-                "can't use sync cluster as a shard; for a replica set, "
-                "you have to use <setname>/<server1>,<server2>,..."};
+    if (connectionString.type() == ConnectionString::INVALID) {
+        return {ErrorCodes::BadValue, "Invalid connection string"};
     }
 
     if (shardProposedName && shardProposedName->empty()) {
@@ -109,7 +109,7 @@ StatusWith<ShardType> validateHostAsShard(OperationContext* txn,
     const ReadPreferenceSetting readPref{ReadPreference::PrimaryOnly};
 
     // Is it mongos?
-    auto cmdStatus = shardRegistry->runCommandForAddShard(
+    auto cmdStatus = shardRegistry->runIdempotentCommandForAddShard(
         txn, shardConn, readPref, "admin", BSON("isdbgrid" << 1));
     if (!cmdStatus.isOK()) {
         return cmdStatus.getStatus();
@@ -121,7 +121,7 @@ StatusWith<ShardType> validateHostAsShard(OperationContext* txn,
     }
 
     // Is it a replica set?
-    cmdStatus = shardRegistry->runCommandForAddShard(
+    cmdStatus = shardRegistry->runIdempotentCommandForAddShard(
         txn, shardConn, readPref, "admin", BSON("isMaster" << 1));
     if (!cmdStatus.isOK()) {
         return cmdStatus.getStatus();
@@ -155,7 +155,7 @@ StatusWith<ShardType> validateHostAsShard(OperationContext* txn,
     }
 
     // Is it a mongos config server?
-    cmdStatus = shardRegistry->runCommandForAddShard(
+    cmdStatus = shardRegistry->runIdempotentCommandForAddShard(
         txn, shardConn, readPref, "admin", BSON("replSetGetStatus" << 1));
     if (!cmdStatus.isOK()) {
         return cmdStatus.getStatus();
@@ -258,12 +258,12 @@ StatusWith<std::vector<std::string>> getDBNamesListFromShard(
         shardRegistry->createConnection(connectionString).release()};
     invariant(shardConn);
 
-    auto cmdStatus =
-        shardRegistry->runCommandForAddShard(txn,
-                                             shardConn,
-                                             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                             "admin",
-                                             BSON("listDatabases" << 1));
+    auto cmdStatus = shardRegistry->runIdempotentCommandForAddShard(
+        txn,
+        shardConn,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        "admin",
+        BSON("listDatabases" << 1));
     if (!cmdStatus.isOK()) {
         return cmdStatus.getStatus();
     }
@@ -602,6 +602,14 @@ Status CatalogManagerCommon::_log(OperationContext* txn,
     }
 
     return result;
+}
+
+StatusWith<DistLockManager::ScopedDistLock> CatalogManagerCommon::distLock(
+    OperationContext* txn,
+    StringData name,
+    StringData whyMessage,
+    stdx::chrono::milliseconds waitFor) {
+    return getDistLockManager()->lock(txn, name, whyMessage, waitFor);
 }
 
 }  // namespace mongo

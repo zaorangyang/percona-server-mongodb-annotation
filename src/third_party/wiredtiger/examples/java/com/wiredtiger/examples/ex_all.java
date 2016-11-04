@@ -326,6 +326,22 @@ public static int cursor_ops(Session session)
     /*! [Display an error] */
     }
 
+    {
+    /*! [Display an error thread safe] */
+    try {
+        String key = "non-existent key";
+        cursor.putKeyString(key);
+        if ((ret = cursor.remove()) != 0) {
+            System.err.println(
+                "cursor.remove: " + wiredtiger.wiredtiger_strerror(ret));
+            return (ret);
+        }
+    } catch (WiredTigerException wte) {  /* Catch severe errors. */
+        System.err.println("cursor.remove exception: " + wte);
+    }
+    /*! [Display an error thread safe] */
+    }
+
     /*! [Close the cursor] */
     ret = cursor.close();
     /*! [Close the cursor] */
@@ -516,12 +532,6 @@ session_ops(Session session)
      * the code snippets, use if (false) to avoid running it.
      */
     if (false) {  // MIGHT_NOT_RUN
-    /*! [Create a bzip2 compressed table] */
-    ret = session.create("table:mytable",
-        "block_compressor=bzip2,key_format=S,value_format=S");
-    /*! [Create a bzip2 compressed table] */
-    ret = session.drop("table:mytable", null);
-
     /*! [Create a lz4 compressed table] */
     ret = session.create("table:mytable",
         "block_compressor=lz4,key_format=S,value_format=S");
@@ -899,13 +909,6 @@ allExample()
      * be installed, causing the open to fail.  The documentation requires
      * the code snippets, use if (false) to avoid running it.
      */
-    /*! [Configure bzip2 extension] */
-    conn = wiredtiger.open(home,
-        "create," +
-        "extensions=[/usr/local/lib/libwiredtiger_bzip2.so]");
-    /*! [Configure bzip2 extension] */
-    conn.close(null);
-
     /*! [Configure lz4 extension] */
     conn = wiredtiger.open(home,
         "create," +

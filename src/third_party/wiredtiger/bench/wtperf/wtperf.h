@@ -29,6 +29,8 @@
 #ifndef	HAVE_WTPERF_H
 #define	HAVE_WTPERF_H
 
+#include <wt_internal.h>
+
 #ifndef _WIN32
 #include <sys/time.h>
 #endif
@@ -56,8 +58,6 @@
 #include <unistd.h>
 #endif
 
-#include <wt_internal.h>
-
 #ifdef _WIN32
 #include "windows_shim.h"
 #endif
@@ -73,9 +73,6 @@ typedef struct __truncate_queue_entry TRUNCATE_QUEUE_ENTRY;
 #define	EXTPATH "../../ext/compressors/"		/* Extensions path */
 #define	BLKCMP_PFX	",block_compressor="
 
-#define	BZIP_BLK BLKCMP_PFX "bzip2"
-#define	BZIP_EXT							\
-	EXT_PFX EXTPATH "bzip2/.libs/libwiredtiger_bzip2.so" EXT_SFX
 #define	LZ4_BLK BLKCMP_PFX "lz4"
 #define	LZ4_EXT							\
 	EXT_PFX EXTPATH "lz4/.libs/libwiredtiger_lz4.so" EXT_SFX
@@ -91,12 +88,13 @@ typedef struct {
 	int64_t insert;			/* Insert ratio */
 	int64_t read;			/* Read ratio */
 	int64_t update;			/* Update ratio */
-	uint64_t throttle;              /* Maximum operations/second */
+	uint64_t throttle;		/* Maximum operations/second */
 		/* Number of operations per transaction. Zero for autocommit */
 	int64_t ops_per_txn;
 	int64_t truncate;		/* Truncate ratio */
 	uint64_t truncate_pct;		/* Truncate Percent */
 	uint64_t truncate_count;	/* Truncate Count */
+	int64_t update_delta;		/* Value size change on update */
 
 #define	WORKER_INSERT		1	/* Insert */
 #define	WORKER_INSERT_RMW	2	/* Insert with read-modify-write */
@@ -141,6 +139,7 @@ typedef struct {
 } THROTTLE_CONFIG;
 
 #define	LOG_PARTIAL_CONFIG	",log=(enabled=false)"
+#define	READONLY_CONFIG		",readonly=true"
 /*
  * NOTE:  If you add any fields to this structure here, you must also add
  * an initialization in wtperf.c in the default_cfg.
@@ -148,7 +147,8 @@ typedef struct {
 struct __config {			/* Configuration structure */
 	const char *home;		/* WiredTiger home */
 	const char *monitor_dir;	/* Monitor output dir */
-	const char *partial_config;	/* Config string for partial logging */
+	char *partial_config;		/* Config string for partial logging */
+	char *reopen_config;		/* Config string for conn reopen */
 	char *base_uri;			/* Object URI */
 	char **uris;			/* URIs if multiple tables */
 	const char *helium_mount;	/* Optional Helium mount point */
@@ -191,7 +191,10 @@ struct __config {			/* Configuration structure */
 
 	volatile uint32_t totalsec;	/* total seconds running */
 
-	u_int		 has_truncate;  /* if there is a truncate workload */
+#define	CFG_GROW	0x0001		/* There is a grow workload */
+#define	CFG_SHRINK	0x0002		/* There is a shrink workload */
+#define	CFG_TRUNCATE	0x0004		/* There is a truncate workload */
+	uint32_t	flags;		/* flags */
 
 	/* Queue head for use with the Truncate Logic */
 	TAILQ_HEAD(__truncate_qh, __truncate_queue_entry) stone_head;
@@ -406,16 +409,18 @@ dstrdup(const char *str)
 
 /*
  * dstrndup --
- *      Call strndup, dying on failure.
+ *      Call emulating strndup, dying on failure. Don't use actual strndup here
+ *	as it is not supported within MSVC.
  */
 static inline char *
 dstrndup(const char *str, const size_t len)
 {
 	char *p;
+	p = dcalloc(len + 1, 1);
 
-	if ((p = strndup(str, len)) == NULL)
-		die(errno, "strndup");
+	strncpy(p, str, len);
+	if (p == NULL)
+		die(errno, "dstrndup");
 	return (p);
 }
-
 #endif

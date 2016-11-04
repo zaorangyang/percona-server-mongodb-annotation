@@ -85,7 +85,6 @@ public:
         WHERE,
 
         // things that maybe shouldn't even be nodes
-        ATOMIC,
         ALWAYS_FALSE,
 
         // Things that we parse but cannot be answered without an index.
@@ -189,12 +188,16 @@ public:
     // XXX document
     virtual bool equivalent(const MatchExpression* other) const = 0;
 
-    //
-    // Determine if a document satisfies the tree-predicate.
-    //
-
+    /**
+    * Determine if a document satisfies the tree-predicate.
+    *
+    * The caller may optionally provide a non-null MatchDetails as an out-parameter. For matching
+    *documents, the MatchDetails provide further info on how the document was
+    *matched---specifically, which array element matched an array predicate.
+    *
+    * The caller must check that the MatchDetails is valid via the isValid() method before using.
+    */
     virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const = 0;
-
     virtual bool matchesBSON(const BSONObj& doc, MatchDetails* details = 0) const;
 
     /**
@@ -243,35 +246,6 @@ protected:
 private:
     MatchType _matchType;
     std::unique_ptr<TagData> _tagData;
-};
-
-/**
- * this isn't really an expression, but a hint to other things
- * not sure where to put it in the end
- */
-class AtomicMatchExpression : public MatchExpression {
-public:
-    AtomicMatchExpression() : MatchExpression(ATOMIC) {}
-
-    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const {
-        return true;
-    }
-
-    virtual bool matchesSingleElement(const BSONElement& e) const {
-        return true;
-    }
-
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        return stdx::make_unique<AtomicMatchExpression>();
-    }
-
-    virtual void debugString(StringBuilder& debug, int level = 0) const;
-
-    virtual void toBSON(BSONObjBuilder* out) const;
-
-    virtual bool equivalent(const MatchExpression* other) const {
-        return other->matchType() == ATOMIC;
-    }
 };
 
 class FalseMatchExpression : public MatchExpression {

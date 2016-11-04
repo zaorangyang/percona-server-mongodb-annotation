@@ -201,6 +201,8 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache) {
     _ws->clear();
     _children.clear();
 
+    _specificStats.replanned = true;
+
     // Use the query planning module to plan the whole query.
     std::vector<QuerySolution*> rawSolutions;
     Status status = QueryPlanner::plan(*_canonicalQuery, _plannerParams, &rawSolutions);
@@ -301,8 +303,8 @@ void CachedPlanStage::doInvalidate(OperationContext* txn,
                                    InvalidationType type) {
     for (auto it = _results.begin(); it != _results.end(); ++it) {
         WorkingSetMember* member = _ws->get(*it);
-        if (member->hasLoc() && member->loc == dl) {
-            WorkingSetCommon::fetchAndInvalidateLoc(txn, member, _collection);
+        if (member->hasRecordId() && member->recordId == dl) {
+            WorkingSetCommon::fetchAndInvalidateRecordId(txn, member, _collection);
         }
     }
 }
@@ -325,7 +327,7 @@ const SpecificStats* CachedPlanStage::getSpecificStats() const {
 void CachedPlanStage::updatePlanCache() {
     std::unique_ptr<PlanCacheEntryFeedback> feedback = stdx::make_unique<PlanCacheEntryFeedback>();
     feedback->stats = getStats();
-    feedback->score = PlanRanker::scoreTree(feedback->stats.get());
+    feedback->score = PlanRanker::scoreTree(feedback->stats->children[0].get());
 
     PlanCache* cache = _collection->infoCache()->getPlanCache();
     Status fbs = cache->feedback(*_canonicalQuery, feedback.release());

@@ -197,11 +197,10 @@ public:
         verify(!_done);
         fillIfNeeded();
 
-        Data out;
         // Note: key must be read before value so can't pass directly to Data constructor
-        out.first = Key::deserializeForSorter(*_reader, _settings.first);
-        out.second = Value::deserializeForSorter(*_reader, _settings.second);
-        return out;
+        auto first = Key::deserializeForSorter(*_reader, _settings.first);
+        auto second = Value::deserializeForSorter(*_reader, _settings.second);
+        return Data(std::move(first), std::move(second));
     }
 
 private:
@@ -769,6 +768,9 @@ private:
                           << " bytes, but did not opt in to external sorting. Aborting operation."
                           << " Pass allowDiskUse:true to opt in.");
         }
+
+        // We should check readOnly before getting here.
+        invariant(!storageGlobalParams.readOnly);
 
         sort();
         updateCutoff();

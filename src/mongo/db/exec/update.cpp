@@ -425,7 +425,7 @@ UpdateStage::UpdateStage(OperationContext* txn,
       _collection(collection),
       _idRetrying(WorkingSet::INVALID_ID),
       _idReturning(WorkingSet::INVALID_ID),
-      _updatedLocs(params.request->isMulti() ? new DiskLocSet() : NULL),
+      _updatedRecordIds(params.request->isMulti() ? new RecordIdSet() : NULL),
       _doc(params.driver->getDocument()) {
     _children.emplace_back(child);
     // We are an update until we fall into the insert case.
@@ -436,7 +436,7 @@ UpdateStage::UpdateStage(OperationContext* txn,
     _specificStats.isDocReplacement = params.driver->isDocReplacement();
 }
 
-BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, RecordId& loc) {
+BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, RecordId& recordId) {
     const UpdateRequest* request = _params.request;
     UpdateDriver* driver = _params.driver;
     CanonicalQuery* cq = _params.canonicalQuery;
@@ -472,6 +472,10 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
 
         dassert(cq);
         verify(cq->root()->matchesBSON(oldObj.value(), &matchDetails));
+
+        // If we have matched more than one array position, we cannot perform a positional update
+        // operation.
+        uassert(34412, "ambiguous positional update operation", matchDetails.isValid());
 
         string matchedField;
         if (matchDetails.hasElemMatchKey())
@@ -533,7 +537,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
         // Prepare to write back the modified document
         WriteUnitOfWork wunit(getOpCtx());
 
-        RecordId newLoc;
+        RecordId newRecordId;
 
         if (inPlace) {
             // Don't actually do the write if this is an explain.
@@ -549,7 +553,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                 args.fromMigrate = request->isFromMigration();
                 StatusWith<RecordData> newRecStatus = _collection->updateDocumentWithDamages(
                     getOpCtx(),
-                    loc,
+                    recordId,
                     Snapshotted<RecordData>(oldObj.snapshotId(), oldRec),
                     source,
                     _damages,
@@ -558,7 +562,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
             }
 
             _specificStats.fastmod = true;
-            newLoc = loc;
+            newRecordId = recordId;
         } else {
             // The updates were not in place. Apply them through the file manager.
 
@@ -578,7 +582,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                 args.criteria = idQuery;
                 args.fromMigrate = request->isFromMigration();
                 StatusWith<RecordId> res = _collection->updateDocument(getOpCtx(),
-                                                                       loc,
+                                                                       recordId,
                                                                        oldObj,
                                                                        newObj,
                                                                        true,
@@ -586,7 +590,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                                                                        _params.opDebug,
                                                                        &args);
                 uassertStatusOK(res.getStatus());
-                newLoc = res.getValue();
+                newRecordId = res.getValue();
             }
         }
 
@@ -598,11 +602,11 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
         //
         // If the document is indexed and the mod changes an indexed value, we might see
         // it again.  For an example, see the comment above near declaration of
-        // updatedLocs.
+        // updatedRecordIds.
         //
         // This must be done after the wunit commits so we are sure we won't be rolling back.
-        if (_updatedLocs && (newLoc != loc || driver->modsAffectIndices())) {
-            _updatedLocs->insert(newLoc);
+        if (_updatedRecordIds && (newRecordId != recordId || driver->modsAffectIndices())) {
+            _updatedRecordIds->insert(newRecordId);
         }
     }
 
@@ -818,28 +822,28 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
     if (PlanStage::ADVANCED == status) {
         // Need to get these things from the result returned by the child.
-        RecordId loc;
+        RecordId recordId;
 
         WorkingSetMember* member = _ws->get(id);
 
         // We want to free this member when we return, unless we need to retry it.
         ScopeGuard memberFreer = MakeGuard(&WorkingSet::free, _ws, id);
 
-        if (!member->hasLoc()) {
+        if (!member->hasRecordId()) {
             // We expect to be here because of an invalidation causing a force-fetch.
             ++_specificStats.nInvalidateSkips;
             return PlanStage::NEED_TIME;
         }
-        loc = member->loc;
+        recordId = member->recordId;
 
         // Updates can't have projections. This means that covering analysis will always add
         // a fetch. We should always get fetched data, and never just key data.
         invariant(member->hasObj());
 
-        // We fill this with the new locs of moved doc so we don't double-update.
-        if (_updatedLocs && _updatedLocs->count(loc) > 0) {
-            // Found a loc that refers to a document we had already updated. Note that
-            // we can never remove from _updatedLocs because updates by other clients
+        // We fill this with the new RecordIds of moved doc so we don't double-update.
+        if (_updatedRecordIds && _updatedRecordIds->count(recordId) > 0) {
+            // Found a RecordId that refers to a document we had already updated. Note that
+            // we can never remove from _updatedRecordIds because updates by other clients
             // could cause us to encounter a document again later.
             return PlanStage::NEED_TIME;
         }
@@ -868,11 +872,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
             // Save state before making changes
             try {
-                if (supportsDocLocking()) {
-                    // Doc-locking engines require this before saveState() since they don't use
-                    // invalidations.
-                    WorkingSetCommon::prepareForSnapshotChange(_ws);
-                }
+                WorkingSetCommon::prepareForSnapshotChange(_ws);
                 child()->saveState();
             } catch (const WriteConflictException& wce) {
                 std::terminate();
@@ -885,7 +885,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
             }
 
             // Do the update, get us the new version of the doc.
-            BSONObj newObj = transformAndUpdate(member->obj, loc);
+            BSONObj newObj = transformAndUpdate(member->obj, recordId);
 
             // Set member's obj to be the doc we want to return.
             if (_params.request->shouldReturnAnyDocs()) {
@@ -896,7 +896,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
                     invariant(_params.request->shouldReturnOldDocs());
                     member->obj.setValue(oldObj);
                 }
-                member->loc = RecordId();
+                member->recordId = RecordId();
                 member->transitionToOwnedObj();
             }
         } catch (const WriteConflictException& wce) {
@@ -1033,32 +1033,18 @@ void UpdateStage::fillOutOpDebug(const UpdateStats* updateStats,
     opDebug->fastmodinsert = updateStats->fastmodinsert;
     opDebug->fastmod = updateStats->fastmod;
 
-    // Historically, 'opDebug' considers 'nMatched' and 'nModified' to be 1 (rather than 0)
-    // if there is an upsert that inserts a document. The UpdateStage does not participate
-    // in this madness in order to have saner stats reporting for explain. This means that
-    // we have to set these values "manually" in the case of an insert.
-    if (updateStats->inserted) {
-        opDebug->nMatched = 1;
-        opDebug->nModified = 1;
-    }
-
     // Copy summary information about the plan into OpDebug.
     opDebug->keysExamined = summaryStats->totalKeysExamined;
     opDebug->docsExamined = summaryStats->totalDocsExamined;
+    opDebug->fromMultiPlanner = summaryStats->fromMultiPlanner;
+    opDebug->replanned = summaryStats->replanned;
 }
 
 UpdateResult UpdateStage::makeUpdateResult(const UpdateStats* updateStats) {
-    // Historically, UpdateResult considers 'nMatched' and 'nModified' to be 1 (rather than 0) if
-    // there is an upsert that inserts a document. The UpdateStage does not participate in this
-    // madness in order to have saner stats reporting for explain. This means that we have to set
-    // these values "manually" in the case of an insert.
-    size_t nMatched = updateStats->inserted ? 1U : updateStats->nMatched;
-    size_t nModified = updateStats->inserted ? 1U : updateStats->nModified;
-
     return UpdateResult(updateStats->nMatched > 0 /* Did we update at least one obj? */,
                         !updateStats->isDocReplacement /* $mod or obj replacement */,
-                        nModified /* number of modified docs, no no-ops */,
-                        nMatched /* # of docs matched/updated, even no-ops */,
+                        updateStats->nModified /* number of modified docs, no no-ops */,
+                        updateStats->nMatched /* # of docs matched/updated, even no-ops */,
                         updateStats->objInserted);
 };
 

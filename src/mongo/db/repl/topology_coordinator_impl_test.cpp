@@ -207,7 +207,8 @@ private:
         ReplSetHeartbeatResponse hb;
         hb.setConfigVersion(1);
         hb.setState(memberState);
-        hb.setOpTime(lastOpTimeSender);
+        hb.setDurableOpTime(lastOpTimeSender);
+        hb.setAppliedOpTime(lastOpTimeSender);
         hb.setElectionTime(electionTime);
 
         StatusWith<ReplSetHeartbeatResponse> hbResponse = responseStatus.isOK()
@@ -1320,6 +1321,8 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     Date_t curTime = heartbeatTime + uptimeSecs;
     Timestamp electionTime(1, 2);
     OpTime oplogProgress(Timestamp(3, 4), 0);
+    OpTime lastCommittedOpTime(Timestamp(2, 3), -1);
+    OpTime readConcernMajorityOpTime(Timestamp(4, 5), -1);
     std::string setName = "mySet";
 
     ReplSetHeartbeatResponse hb;
@@ -1327,7 +1330,8 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     hb.setState(MemberState::RS_SECONDARY);
     hb.setElectionTime(electionTime);
     hb.setHbMsg("READY");
-    hb.setOpTime(oplogProgress);
+    hb.setAppliedOpTime(oplogProgress);
+    hb.setDurableOpTime(oplogProgress);
     StatusWith<ReplSetHeartbeatResponse> hbResponseGood = StatusWith<ReplSetHeartbeatResponse>(hb);
 
     updateConfig(
@@ -1366,18 +1370,25 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     // Now node 0 is down, node 1 is up, and for node 2 we have no heartbeat data yet.
     BSONObjBuilder statusBuilder;
     Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
-    getTopoCoord().prepareStatusResponse(cbData(),
-                                         curTime,
-                                         durationCount<Seconds>(uptimeSecs),
-                                         oplogProgress,
-                                         &statusBuilder,
-                                         &resultStatus);
+    getTopoCoord().prepareStatusResponse(
+        cbData(),
+        TopologyCoordinator::ReplSetStatusArgs{
+            curTime,
+            static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
+            oplogProgress,
+            lastCommittedOpTime,
+            readConcernMajorityOpTime},
+        &statusBuilder,
+        &resultStatus);
     ASSERT_OK(resultStatus);
     BSONObj rsStatus = statusBuilder.obj();
 
     // Test results for all non-self members
     ASSERT_EQUALS(setName, rsStatus["set"].String());
     ASSERT_EQUALS(curTime.asInt64(), rsStatus["date"].Date().asInt64());
+    ASSERT_EQUALS(lastCommittedOpTime.toBSON(), rsStatus["OpTimes"]["lastCommittedOpTime"].Obj());
+    ASSERT_EQUALS(readConcernMajorityOpTime.toBSON(),
+                  rsStatus["OpTimes"]["readConcernMajorityOpTime"].Obj());
     std::vector<BSONElement> memberArray = rsStatus["members"].Array();
     ASSERT_EQUALS(4U, memberArray.size());
     BSONObj member0Status = memberArray[0].Obj();
@@ -1469,12 +1480,16 @@ TEST_F(TopoCoordTest, NodeReturnsInvalidReplicaSetConfigInResponseToGetStatusWhe
 
     BSONObjBuilder statusBuilder;
     Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
-    getTopoCoord().prepareStatusResponse(cbData(),
-                                         curTime,
-                                         durationCount<Seconds>(uptimeSecs),
-                                         oplogProgress,
-                                         &statusBuilder,
-                                         &resultStatus);
+    getTopoCoord().prepareStatusResponse(
+        cbData(),
+        TopologyCoordinator::ReplSetStatusArgs{
+            curTime,
+            static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
+            oplogProgress,
+            OpTime(),
+            OpTime()},
+        &statusBuilder,
+        &resultStatus);
     ASSERT_NOT_OK(resultStatus);
     ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig, resultStatus);
 }
@@ -2163,12 +2178,15 @@ public:
         // Ensure a single failed heartbeat did not cause the node to be marked down
         BSONObjBuilder statusBuilder;
         Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
-        getTopoCoord().prepareStatusResponse(cbData(),
-                                             _firstRequestDate + Milliseconds(4000),
-                                             10,
-                                             OpTime(Timestamp(100, 0), 0),
-                                             &statusBuilder,
-                                             &resultStatus);
+        getTopoCoord().prepareStatusResponse(
+            cbData(),
+            TopologyCoordinator::ReplSetStatusArgs{_firstRequestDate + Milliseconds(4000),
+                                                   10,
+                                                   OpTime(Timestamp(100, 0), 0),
+                                                   OpTime(),
+                                                   OpTime()},
+            &statusBuilder,
+            &resultStatus);
         ASSERT_OK(resultStatus);
         BSONObj rsStatus = statusBuilder.obj();
         std::vector<BSONElement> memberArray = rsStatus["members"].Array();
@@ -2176,6 +2194,11 @@ public:
 
         ASSERT_EQUALS(1, member1Status["_id"].Int());
         ASSERT_EQUALS(1, member1Status["health"].Double());
+
+        ASSERT_EQUALS(Timestamp(0, 0),
+                      Timestamp(rsStatus["OpTimes"]["lastCommittedOpTime"]["ts"].timestampValue()));
+        ASSERT_EQUALS(-1LL, rsStatus["OpTimes"]["lastCommittedOpTime"]["t"].numberLong());
+        ASSERT_FALSE(rsStatus["OpTimes"].Obj().hasField("readConcernMajorityOpTime"));
     }
 
     Date_t firstRequestDate() {
@@ -2218,12 +2241,15 @@ public:
         // Ensure a second failed heartbeat did not cause the node to be marked down
         BSONObjBuilder statusBuilder;
         Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
-        getTopoCoord().prepareStatusResponse(cbData(),
-                                             firstRequestDate() + Seconds(4),
-                                             10,
-                                             OpTime(Timestamp(100, 0), 0),
-                                             &statusBuilder,
-                                             &resultStatus);
+        getTopoCoord().prepareStatusResponse(
+            cbData(),
+            TopologyCoordinator::ReplSetStatusArgs{firstRequestDate() + Seconds(4),
+                                                   10,
+                                                   OpTime(Timestamp(100, 0), 0),
+                                                   OpTime(),
+                                                   OpTime()},
+            &statusBuilder,
+            &resultStatus);
         ASSERT_OK(resultStatus);
         BSONObj rsStatus = statusBuilder.obj();
         std::vector<BSONElement> memberArray = rsStatus["members"].Array();
@@ -2531,12 +2557,15 @@ TEST_F(HeartbeatResponseTestTwoRetries, NodeDoesNotRetryHeartbeatsAfterFailingTw
     // Ensure a third failed heartbeat caused the node to be marked down
     BSONObjBuilder statusBuilder;
     Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
-    getTopoCoord().prepareStatusResponse(cbData(),
-                                         firstRequestDate() + Milliseconds(4900),
-                                         10,
-                                         OpTime(Timestamp(100, 0), 0),
-                                         &statusBuilder,
-                                         &resultStatus);
+    getTopoCoord().prepareStatusResponse(
+        cbData(),
+        TopologyCoordinator::ReplSetStatusArgs{firstRequestDate() + Milliseconds(4900),
+                                               10,
+                                               OpTime(Timestamp(100, 0), 0),
+                                               OpTime(),
+                                               OpTime()},
+        &statusBuilder,
+        &resultStatus);
     ASSERT_OK(resultStatus);
     BSONObj rsStatus = statusBuilder.obj();
     std::vector<BSONElement> memberArray = rsStatus["members"].Array();
@@ -2769,12 +2798,15 @@ TEST_F(HeartbeatResponseTestTwoRetries,
     // Ensure a third nonconsecutive heartbeat failure did not cause the node to be marked down
     BSONObjBuilder statusBuilder;
     Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
-    getTopoCoord().prepareStatusResponse(cbData(),
-                                         firstRequestDate() + Milliseconds(7000),
-                                         600,
-                                         OpTime(Timestamp(100, 0), 0),
-                                         &statusBuilder,
-                                         &resultStatus);
+    getTopoCoord().prepareStatusResponse(
+        cbData(),
+        TopologyCoordinator::ReplSetStatusArgs{firstRequestDate() + Milliseconds(7000),
+                                               600,
+                                               OpTime(Timestamp(100, 0), 0),
+                                               OpTime(),
+                                               OpTime()},
+        &statusBuilder,
+        &resultStatus);
     ASSERT_OK(resultStatus);
     BSONObj rsStatus = statusBuilder.obj();
     std::vector<BSONElement> memberArray = rsStatus["members"].Array();
@@ -2960,7 +2992,8 @@ TEST_F(
     hbArgs.setSenderId(1);
     hbArgs.setSenderHost(HostAndPort("host3", 27017));
     ReplSetHeartbeatResponse hbResp;
-    ASSERT_OK(getTopoCoord().prepareHeartbeatResponse(now(), hbArgs, "rs0", election, &hbResp));
+    ASSERT_OK(
+        getTopoCoord().prepareHeartbeatResponse(now(), hbArgs, "rs0", election, election, &hbResp));
     ASSERT(!hbResp.hasIsElectable() || hbResp.isElectable()) << hbResp.toString();
 }
 
@@ -4220,7 +4253,11 @@ TEST_F(ShutdownInProgressTest, NodeReturnsShutdownInProgressWhenSyncFromCallback
 TEST_F(ShutdownInProgressTest, NodeReturnsShutDownInProgressWhenGetReplSetStatusCallbackCanceled) {
     Status result = Status::OK();
     BSONObjBuilder response;
-    getTopoCoord().prepareStatusResponse(cbData(), Date_t(), 0, OpTime(), &response, &result);
+    getTopoCoord().prepareStatusResponse(
+        cbData(),
+        TopologyCoordinator::ReplSetStatusArgs{Date_t(), 0, OpTime(), OpTime(), OpTime()},
+        &response,
+        &result);
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, result);
     ASSERT_TRUE(response.obj().isEmpty());
 }
@@ -4245,8 +4282,8 @@ public:
                                   OpTime lastOpApplied,
                                   ReplSetHeartbeatResponse* response,
                                   Status* result) {
-        *result =
-            getTopoCoord().prepareHeartbeatResponse(now()++, args, "rs0", lastOpApplied, response);
+        *result = getTopoCoord().prepareHeartbeatResponse(
+            now()++, args, "rs0", lastOpApplied, lastOpApplied, response);
     }
 };
 
@@ -4319,7 +4356,7 @@ TEST_F(PrepareHeartbeatResponseTest,
     ASSERT_FALSE(response.isElectable());
     ASSERT_TRUE(response.isReplSet());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, response.getState().s);
-    ASSERT_EQUALS(OpTime(), response.getOpTime());
+    ASSERT_EQUALS(OpTime(), response.getDurableOpTime());
     ASSERT_EQUALS(0, durationCount<Seconds>(response.getTime()));
     ASSERT_EQUALS("", response.getHbMsg());
     ASSERT_EQUALS("rs0", response.getReplicaSetName());
@@ -4343,7 +4380,7 @@ TEST_F(PrepareHeartbeatResponseTest,
     ASSERT_FALSE(response.isElectable());
     ASSERT_TRUE(response.isReplSet());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, response.getState().s);
-    ASSERT_EQUALS(OpTime(), response.getOpTime());
+    ASSERT_EQUALS(OpTime(), response.getDurableOpTime());
     ASSERT_EQUALS(0, durationCount<Seconds>(response.getTime()));
     ASSERT_EQUALS("", response.getHbMsg());
     ASSERT_EQUALS("rs0", response.getReplicaSetName());
@@ -4368,7 +4405,7 @@ TEST_F(PrepareHeartbeatResponseTest,
     ASSERT_FALSE(response.isElectable());
     ASSERT_TRUE(response.isReplSet());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, response.getState().s);
-    ASSERT_EQUALS(OpTime(), response.getOpTime());
+    ASSERT_EQUALS(OpTime(), response.getDurableOpTime());
     ASSERT_EQUALS(0, durationCount<Seconds>(response.getTime()));
     ASSERT_EQUALS("", response.getHbMsg());
     ASSERT_EQUALS("rs0", response.getReplicaSetName());
@@ -4393,7 +4430,7 @@ TEST_F(PrepareHeartbeatResponseTest,
     ASSERT_FALSE(response.isElectable());
     ASSERT_TRUE(response.isReplSet());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, response.getState().s);
-    ASSERT_EQUALS(OpTime(), response.getOpTime());
+    ASSERT_EQUALS(OpTime(), response.getDurableOpTime());
     ASSERT_EQUALS(0, durationCount<Seconds>(response.getTime()));
     ASSERT_EQUALS("", response.getHbMsg());
     ASSERT_EQUALS("rs0", response.getReplicaSetName());
@@ -4417,7 +4454,7 @@ TEST_F(PrepareHeartbeatResponseTest,
     ASSERT_FALSE(response.isElectable());
     ASSERT_TRUE(response.isReplSet());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, response.getState().s);
-    ASSERT_EQUALS(OpTime(), response.getOpTime());
+    ASSERT_EQUALS(OpTime(), response.getDurableOpTime());
     ASSERT_EQUALS(0, durationCount<Seconds>(response.getTime()));
     ASSERT_EQUALS("", response.getHbMsg());
     ASSERT_EQUALS("rs0", response.getReplicaSetName());
@@ -4444,7 +4481,7 @@ TEST_F(PrepareHeartbeatResponseTest,
     ASSERT_TRUE(response.isElectable());
     ASSERT_TRUE(response.isReplSet());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, response.getState().s);
-    ASSERT_EQUALS(OpTime(Timestamp(100, 0), 0), response.getOpTime());
+    ASSERT_EQUALS(OpTime(Timestamp(100, 0), 0), response.getDurableOpTime());
     ASSERT_EQUALS(0, durationCount<Seconds>(response.getTime()));
     ASSERT_EQUALS("", response.getHbMsg());
     ASSERT_EQUALS("rs0", response.getReplicaSetName());
@@ -4460,13 +4497,13 @@ TEST_F(TopoCoordTest, SetConfigVersionToNegativeTwoInHeartbeatResponseWhenNoConf
     args.setSenderId(20);
     ReplSetHeartbeatResponse response;
     // prepare response and check the results
-    Status result =
-        getTopoCoord().prepareHeartbeatResponse(now()++, args, "rs0", OpTime(), &response);
+    Status result = getTopoCoord().prepareHeartbeatResponse(
+        now()++, args, "rs0", OpTime(), OpTime(), &response);
     ASSERT_OK(result);
     ASSERT_FALSE(response.isElectable());
     ASSERT_TRUE(response.isReplSet());
     ASSERT_EQUALS(MemberState::RS_STARTUP, response.getState().s);
-    ASSERT_EQUALS(OpTime(), response.getOpTime());
+    ASSERT_EQUALS(OpTime(), response.getDurableOpTime());
     ASSERT_EQUALS(0, durationCount<Seconds>(response.getTime()));
     ASSERT_EQUALS("", response.getHbMsg());
     ASSERT_EQUALS("rs0", response.getReplicaSetName());
@@ -4493,7 +4530,7 @@ TEST_F(PrepareHeartbeatResponseTest,
     ASSERT_TRUE(response.isElectable());
     ASSERT_TRUE(response.isReplSet());
     ASSERT_EQUALS(MemberState::RS_PRIMARY, response.getState().s);
-    ASSERT_EQUALS(OpTime(Timestamp(11, 0), 0), response.getOpTime());
+    ASSERT_EQUALS(OpTime(Timestamp(11, 0), 0), response.getDurableOpTime());
     ASSERT_EQUALS(Timestamp(10, 0), response.getElectionTime());
     ASSERT_EQUALS(0, durationCount<Seconds>(response.getTime()));
     ASSERT_EQUALS("", response.getHbMsg());
@@ -4527,7 +4564,7 @@ TEST_F(PrepareHeartbeatResponseTest,
     ASSERT_TRUE(response.isElectable());
     ASSERT_TRUE(response.isReplSet());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, response.getState().s);
-    ASSERT_EQUALS(OpTime(Timestamp(100, 0), 0), response.getOpTime());
+    ASSERT_EQUALS(OpTime(Timestamp(100, 0), 0), response.getDurableOpTime());
     ASSERT_EQUALS(0, durationCount<Seconds>(response.getTime()));
     // changed to a syncing message because our sync source changed recently
     ASSERT_EQUALS("syncing from: h2:27017", response.getHbMsg());
@@ -4854,7 +4891,7 @@ TEST_F(HeartbeatResponseTest, ReconfigBetweenHeartbeatRequestAndRepsonse) {
 
     ReplSetHeartbeatResponse hb;
     hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_PRIMARY), 0);
-    hb.setOpTime(lastOpTimeApplied);
+    hb.setDurableOpTime(lastOpTimeApplied);
     hb.setElectionTime(election.getTimestamp());
     StatusWith<ReplSetHeartbeatResponse> hbResponse = StatusWith<ReplSetHeartbeatResponse>(hb);
     HeartbeatResponseAction action = getTopoCoord().processHeartbeatResponse(
@@ -4903,7 +4940,7 @@ TEST_F(HeartbeatResponseTest, ReconfigNodeRemovedBetweenHeartbeatRequestAndRepso
 
     ReplSetHeartbeatResponse hb;
     hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_PRIMARY), 0);
-    hb.setOpTime(lastOpTimeApplied);
+    hb.setDurableOpTime(lastOpTimeApplied);
     hb.setElectionTime(election.getTimestamp());
     StatusWith<ReplSetHeartbeatResponse> hbResponse = StatusWith<ReplSetHeartbeatResponse>(hb);
     HeartbeatResponseAction action = getTopoCoord().processHeartbeatResponse(

@@ -138,9 +138,10 @@ config_setup(void)
 
 	/* Required shared libraries. */
 	if (DATASOURCE("helium") && access(HELIUM_PATH, R_OK) != 0)
-		die(errno, "Levyx/helium shared library: %s", HELIUM_PATH);
+		testutil_die(errno,
+		    "Levyx/helium shared library: %s", HELIUM_PATH);
 	if (DATASOURCE("kvsbdb") && access(KVS_BDB_PATH, R_OK) != 0)
-		die(errno, "kvsbdb shared library: %s", KVS_BDB_PATH);
+		testutil_die(errno, "kvsbdb shared library: %s", KVS_BDB_PATH);
 
 	/* Some data-sources don't support user-specified collations. */
 	if (DATASOURCE("helium") || DATASOURCE("kvsbdb"))
@@ -199,14 +200,15 @@ config_setup(void)
 	if (!config_is_perm("key_max") && g.c_key_max < g.c_key_min)
 		g.c_key_max = g.c_key_min;
 	if (g.c_key_min > g.c_key_max)
-		die(EINVAL, "key_min may not be larger than key_max");
+		testutil_die(EINVAL, "key_min may not be larger than key_max");
 
 	if (!config_is_perm("value_min") && g.c_value_min > g.c_value_max)
 		g.c_value_min = g.c_value_max;
 	if (!config_is_perm("value_max") && g.c_value_max < g.c_value_min)
 		g.c_value_max = g.c_value_min;
 	if (g.c_value_min > g.c_value_max)
-		die(EINVAL, "value_min may not be larger than value_max");
+		testutil_die(EINVAL,
+		    "value_min may not be larger than value_max");
 
 	/* Reset the key count. */
 	g.key_cnt = 0;
@@ -244,45 +246,58 @@ config_compression(const char *conf_name)
 	const char *cstr;
 	char confbuf[128];
 
-	/*
-	 * Compression: choose something if compression wasn't specified,
-	 * otherwise confirm the appropriate shared library is available.
-	 * We used to verify that the libraries existed but that's no longer
-	 * robust, since it's possible to build compression libraries into
-	 * the WiredTiger library.
-	 */
-	if (!config_is_perm(conf_name)) {
-		cstr = "none";
-		switch (mmrand(NULL, 1, 20)) {
-		case 1: case 2: case 3: case 4:		/* 20% no compression */
-			break;
-		case 5:					/* 5% bzip */
-			cstr = "bzip";
-			break;
-		case 6:					/* 5% bzip-raw */
-			cstr = "bzip-raw";
-			break;
-		case 7: case 8: case 9: case 10:	/* 20% lz4 */
-			cstr = "lz4";
-			break;
-		case 11:				/* 5% lz4-no-raw */
-			cstr = "lz4-noraw";
-			break;
-		case 12: case 13: case 14: case 15:	/* 20% snappy */
-			cstr = "snappy";
-			break;
-		case 16: case 17: case 18: case 19:	/* 20% zlib */
-			cstr = "zlib";
-			break;
-		case 20:				/* 5% zlib-no-raw */
-			cstr = "zlib-noraw";
-			break;
-		}
+	/* Return if already specified. */
+	if (config_is_perm(conf_name))
+		return;
 
-		(void)snprintf(confbuf, sizeof(confbuf), "%s=%s", conf_name,
-		    cstr);
+	/*
+	 * Don't configure a compression engine for logging if logging isn't
+	 * configured (it won't break, but it's confusing).
+	 */
+	cstr = "none";
+	if (strcmp(conf_name, "logging_compression") == 0 && g.c_logging == 0) {
+		(void)snprintf(
+		    confbuf, sizeof(confbuf), "%s=%s", conf_name, cstr);
 		config_single(confbuf, 0);
+		return;
 	}
+
+	/*
+	 * Select a compression type from the list of built-in engines.
+	 *
+	 * Listed percentages are only correct if all of the possible engines
+	 * are compiled in.
+	 */
+	switch (mmrand(NULL, 1, 20)) {
+#ifdef HAVE_BUILTIN_EXTENSION_LZ4
+	case 1: case 2: case 3: case 4:		/* 20% lz4 */
+		cstr = "lz4";
+		break;
+	case 5:					/* 5% lz4-no-raw */
+		cstr = "lz4-noraw";
+		break;
+#endif
+#ifdef HAVE_BUILTIN_EXTENSION_SNAPPY
+	case 6: case 7: case 8: case 9:		/* 30% snappy */
+	case 10: case 11:
+		cstr = "snappy";
+		break;
+#endif
+#ifdef HAVE_BUILTIN_EXTENSION_ZLIB
+	case 12: case 13: case 14: case 15:	/* 20% zlib */
+		cstr = "zlib";
+		break;
+	case 16:				/* 5% zlib-no-raw */
+		cstr = "zlib-noraw";
+		break;
+#endif
+	case 17: case 18: case 19: case 20:	/* 20% no compression */
+	default:
+		break;
+	}
+
+	(void)snprintf(confbuf, sizeof(confbuf), "%s=%s", conf_name, cstr);
+	config_single(confbuf, 0);
 }
 
 /*
@@ -399,7 +414,7 @@ config_lrt(void)
 	 */
 	if (g.type == FIX) {
 		if (g.c_long_running_txn && config_is_perm("long_running_txn"))
-			die(EINVAL,
+			testutil_die(EINVAL,
 			    "long_running_txn not supported with fixed-length "
 			    "column store");
 		g.c_long_running_txn = 0;
@@ -440,7 +455,7 @@ config_print(int error_display)
 		fp = stdout;
 	else
 		if ((fp = fopen(g.home_config, "w")) == NULL)
-			die(errno, "fopen: %s", g.home_config);
+			testutil_die(errno, "fopen: %s", g.home_config);
 
 	fprintf(fp, "############################################\n");
 	fprintf(fp, "#  RUN PARAMETERS\n");
@@ -474,7 +489,7 @@ config_file(const char *name)
 	char *p, buf[256];
 
 	if ((fp = fopen(name, "r")) == NULL)
-		die(errno, "fopen: %s", name);
+		testutil_die(errno, "fopen: %s", name);
 	while (fgets(buf, sizeof(buf), fp) != NULL) {
 		for (p = buf; *p != '\0' && *p != '\n'; ++p)
 			;
@@ -569,7 +584,7 @@ config_single(const char *s, int perm)
 			*cp->vstr = strdup(ep);
 		}
 		if (*cp->vstr == NULL)
-			die(errno, "malloc");
+			testutil_die(errno, "malloc");
 
 		return;
 	}
@@ -612,7 +627,7 @@ config_map_file_type(const char *s, u_int *vp)
 	    strcmp(s, "row-store") == 0)
 		*vp = ROW;
 	else
-		die(EINVAL, "illegal file type configuration: %s", s);
+		testutil_die(EINVAL, "illegal file type configuration: %s", s);
 }
 
 /*
@@ -629,7 +644,7 @@ config_map_checksum(const char *s, u_int *vp)
 	else if (strcmp(s, "uncompressed") == 0)
 		*vp = CHECKSUM_UNCOMPRESSED;
 	else
-		die(EINVAL, "illegal checksum configuration: %s", s);
+		testutil_die(EINVAL, "illegal checksum configuration: %s", s);
 }
 
 /*
@@ -641,10 +656,6 @@ config_map_compression(const char *s, u_int *vp)
 {
 	if (strcmp(s, "none") == 0)
 		*vp = COMPRESS_NONE;
-	else if (strcmp(s, "bzip") == 0)
-		*vp = COMPRESS_BZIP;
-	else if (strcmp(s, "bzip-raw") == 0)
-		*vp = COMPRESS_BZIP_RAW;
 	else if (strcmp(s, "lz4") == 0)
 		*vp = COMPRESS_LZ4;
 	else if (strcmp(s, "lz4-noraw") == 0)
@@ -658,7 +669,8 @@ config_map_compression(const char *s, u_int *vp)
 	else if (strcmp(s, "zlib-noraw") == 0)
 		*vp = COMPRESS_ZLIB_NO_RAW;
 	else
-		die(EINVAL, "illegal compression configuration: %s", s);
+		testutil_die(EINVAL,
+		    "illegal compression configuration: %s", s);
 }
 
 /*
@@ -673,7 +685,7 @@ config_map_encryption(const char *s, u_int *vp)
 	else if (strcmp(s, "rotn-7") == 0)
 		*vp = ENCRYPT_ROTN_7;
 	else
-		die(EINVAL, "illegal encryption configuration: %s", s);
+		testutil_die(EINVAL, "illegal encryption configuration: %s", s);
 }
 
 /*
@@ -692,7 +704,7 @@ config_map_isolation(const char *s, u_int *vp)
 	else if (strcmp(s, "snapshot") == 0)
 		*vp = ISOLATION_SNAPSHOT;
 	else
-		die(EINVAL, "illegal isolation configuration: %s", s);
+		testutil_die(EINVAL, "illegal isolation configuration: %s", s);
 }
 
 /*

@@ -44,6 +44,7 @@
 
 namespace mongo {
 
+class JournalListener;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
 
@@ -56,7 +57,9 @@ public:
                        bool durable,
                        bool ephemeral,
                        bool repair,
+                       bool readOnly,
                        bool cacheInMB = false);
+
     virtual ~WiredTigerKVEngine();
 
     void setRecordStoreExtraOptions(const std::string& options);
@@ -70,7 +73,7 @@ public:
         return _durable;
     }
 
-    virtual bool isEphemeral() {
+    virtual bool isEphemeral() const {
         return _ephemeral;
     }
 
@@ -124,6 +127,8 @@ public:
         return &_sessionCache->snapshotManager();
     }
 
+    void setJournalListener(JournalListener* jl) final;
+
     // wiredtiger specific
     // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
     // held by this class
@@ -149,6 +154,8 @@ public:
      */
     static bool initRsOplogBackgroundThread(StringData ns);
 
+    static void appendGlobalStats(BSONObjBuilder& b);
+
 private:
     class WiredTigerJournalFlusher;
 
@@ -166,19 +173,20 @@ private:
     std::string _canonicalName;
     std::string _path;
 
+    std::unique_ptr<WiredTigerSizeStorer> _sizeStorer;
+    std::string _sizeStorerUri;
+    mutable ElapsedTracker _sizeStorerSyncTracker;
+
     bool _durable;
     bool _ephemeral;
-    std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;
+    bool _readOnly;
+    std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
 
     std::string _rsOptions;
     std::string _indexOptions;
 
-    std::set<std::string> _identToDrop;
     mutable stdx::mutex _identToDropMutex;
-
-    std::unique_ptr<WiredTigerSizeStorer> _sizeStorer;
-    std::string _sizeStorerUri;
-    mutable ElapsedTracker _sizeStorerSyncTracker;
+    std::set<std::string> _identToDrop;
 
     mutable Date_t _previousCheckedDropsQueued;
 
