@@ -55,6 +55,7 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/migration_secondary_throttle_options.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -133,7 +134,7 @@ Balancer::~Balancer() = default;
 
 int Balancer::_moveChunks(OperationContext* txn,
                           const vector<shared_ptr<MigrateInfo>>& candidateChunks,
-                          const WriteConcernOptions* writeConcern,
+                          const MigrationSecondaryThrottleOptions& secondaryThrottle,
                           bool waitForDelete) {
     int movedCount = 0;
 
@@ -208,7 +209,7 @@ int Balancer::_moveChunks(OperationContext* txn,
             if (c->moveAndCommit(txn,
                                  migrateInfo->to,
                                  Chunk::MaxChunkSize,
-                                 writeConcern,
+                                 secondaryThrottle,
                                  waitForDelete,
                                  0, /* maxTimeMS */
                                  res)) {
@@ -278,7 +279,7 @@ bool Balancer::_checkOIDs(OperationContext* txn) {
             continue;
         }
 
-        BSONObj f = uassertStatusOK(grid.shardRegistry()->runCommandOnShard(
+        BSONObj f = uassertStatusOK(grid.shardRegistry()->runIdempotentCommandOnShard(
             txn,
             s,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
@@ -292,7 +293,7 @@ bool Balancer::_checkOIDs(OperationContext* txn) {
                 log() << "error: 2 machines have " << x << " as oid machine piece: " << shardId
                       << " and " << oids[x];
 
-                uassertStatusOK(grid.shardRegistry()->runCommandOnShard(
+                uassertStatusOK(grid.shardRegistry()->runIdempotentCommandOnShard(
                     txn,
                     s,
                     ReadPreferenceSetting{ReadPreference::PrimaryOnly},
@@ -301,7 +302,7 @@ bool Balancer::_checkOIDs(OperationContext* txn) {
 
                 const auto otherShard = grid.shardRegistry()->getShard(txn, oids[x]);
                 if (otherShard) {
-                    uassertStatusOK(grid.shardRegistry()->runCommandOnShard(
+                    uassertStatusOK(grid.shardRegistry()->runIdempotentCommandOnShard(
                         txn,
                         otherShard,
                         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
@@ -343,7 +344,7 @@ void warnOnMultiVersion(const ShardInfoMap& shardInfo) {
 }
 
 void Balancer::_doBalanceRound(OperationContext* txn,
-                               ForwardingCatalogManager::ScopedDistLock* distLock,
+                               DistLockManager::ScopedDistLock* distLock,
                                vector<shared_ptr<MigrateInfo>>* candidateChunks) {
     invariant(candidateChunks);
 
@@ -382,8 +383,6 @@ void Balancer::_doBalanceRound(OperationContext* txn,
 
     // For each collection, check if the balancing policy recommends moving anything around.
     for (const auto& coll : collections) {
-        uassertStatusOK(distLock->checkForPendingCatalogChange());
-
         // Skip collections for which balancing is disabled
         const NamespaceString& nss = coll.getNs();
 
@@ -602,8 +601,11 @@ void Balancer::run() {
             uassert(13258, "oids broken after resetting!", _checkOIDs(txn.get()));
 
             {
-                auto scopedDistLock = grid.forwardingCatalogManager()->distLock(
-                    txn.get(), "balancer", "doing balance round");
+                auto scopedDistLock = grid.catalogManager(txn.get())
+                                          ->distLock(txn.get(),
+                                                     "balancer",
+                                                     "doing balance round",
+                                                     DistLockManager::kSingleLockAttemptTimeout);
 
                 if (!scopedDistLock.isOK()) {
                     LOG(1) << "skipping balancing round" << causedBy(scopedDistLock.getStatus());
@@ -619,14 +621,18 @@ void Balancer::run() {
                     (balancerConfig.isWaitForDeleteSet() ? balancerConfig.getWaitForDelete()
                                                          : false);
 
-                std::unique_ptr<WriteConcernOptions> writeConcern;
-                if (balancerConfig.isKeySet()) {  // if balancer doc exists.
-                    writeConcern = balancerConfig.getWriteConcern();
+                MigrationSecondaryThrottleOptions secondaryThrottle(
+                    MigrationSecondaryThrottleOptions::create(
+                        MigrationSecondaryThrottleOptions::kDefault));
+                if (balancerConfig.isKeySet()) {
+                    secondaryThrottle =
+                        uassertStatusOK(MigrationSecondaryThrottleOptions::createFromBalancerConfig(
+                            balancerConfig.toBSON()));
                 }
 
                 LOG(1) << "*** start balancing round. "
-                       << "waitForDelete: " << waitForDelete << ", secondaryThrottle: "
-                       << (writeConcern.get() ? writeConcern->toBSON().toString() : "default");
+                       << "waitForDelete: " << waitForDelete
+                       << ", secondaryThrottle: " << secondaryThrottle.toBSON();
 
                 vector<shared_ptr<MigrateInfo>> candidateChunks;
                 _doBalanceRound(txn.get(), &scopedDistLock.getValue(), &candidateChunks);
@@ -636,14 +642,14 @@ void Balancer::run() {
                     _balancedLastTime = 0;
                 } else {
                     _balancedLastTime =
-                        _moveChunks(txn.get(), candidateChunks, writeConcern.get(), waitForDelete);
+                        _moveChunks(txn.get(), candidateChunks, secondaryThrottle, waitForDelete);
+
+                    roundDetails.setSucceeded(static_cast<int>(candidateChunks.size()),
+                                              _balancedLastTime);
+
+                    grid.catalogManager(txn.get())
+                        ->logAction(txn.get(), "balancer.round", "", roundDetails.toBSON());
                 }
-
-                roundDetails.setSucceeded(static_cast<int>(candidateChunks.size()),
-                                          _balancedLastTime);
-
-                grid.catalogManager(txn.get())
-                    ->logAction(txn.get(), "balancer.round", "", roundDetails.toBSON());
 
                 LOG(1) << "*** End of balancing round";
             }

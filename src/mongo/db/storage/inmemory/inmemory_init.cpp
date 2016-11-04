@@ -65,6 +65,7 @@ public:
         }
         const bool durable = false;
         const bool ephemeral = true;
+        const bool readOnly = false;
         WiredTigerKVEngine* kv = new WiredTigerKVEngine(getCanonicalName().toString(),
                                                         params.dbpath,
                                                         wiredTigerGlobalOptions.engineConfig,
@@ -72,6 +73,7 @@ public:
                                                         durable,
                                                         ephemeral,
                                                         params.repair,
+                                                        readOnly,
                                                         true);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
@@ -119,6 +121,11 @@ public:
         builder.appendBool("directoryPerDB", params.directoryperdb);
         builder.appendBool("directoryForIndexes", wiredTigerGlobalOptions.directoryForIndexes);
         return builder.obj();
+    }
+
+    // explicitly specify that inMemory does not support readOnly mode
+    bool supportsReadOnly() const final {
+        return false;
     }
 
 private:

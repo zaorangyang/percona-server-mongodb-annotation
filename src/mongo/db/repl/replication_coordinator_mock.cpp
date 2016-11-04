@@ -36,6 +36,7 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/read_concern_response.h"
 #include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/db/storage/snapshot_name.h"
 #include "mongo/util/assert_util.h"
 
@@ -217,15 +218,11 @@ Status ReplicationCoordinatorMock::waitForDrainFinish(Milliseconds timeout) {
 
 void ReplicationCoordinatorMock::signalUpstreamUpdater() {}
 
-bool ReplicationCoordinatorMock::prepareOldReplSetUpdatePositionCommand(
-    BSONObjBuilder* cmdBuilder) {
-    cmdBuilder->append("replSetUpdatePosition", 1);
-    return true;
-}
-
-bool ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder) {
-    cmdBuilder->append("replSetUpdatePosition", 1);
-    return true;
+StatusWith<BSONObj> ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand(
+    ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle) const {
+    BSONObjBuilder cmdBuilder;
+    cmdBuilder.append("replSetUpdatePosition", 1);
+    return cmdBuilder.obj();
 }
 
 ReplicaSetConfig ReplicationCoordinatorMock::getConfig() const {
@@ -365,6 +362,11 @@ bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& curre
     invariant(false);
 }
 
+SyncSourceResolverResponse ReplicationCoordinatorMock::selectSyncSource(
+    OperationContext* txn, const OpTime& lastOpTimeFetched) {
+    return SyncSourceResolverResponse();
+}
+
 OpTime ReplicationCoordinatorMock::getLastCommittedOpTime() const {
     return OpTime();
 }
@@ -390,7 +392,7 @@ Status ReplicationCoordinatorMock::processHeartbeatV1(const ReplSetHeartbeatArgs
     return Status::OK();
 }
 
-bool ReplicationCoordinatorMock::isV1ElectionProtocol() {
+bool ReplicationCoordinatorMock::isV1ElectionProtocol() const {
     return true;
 }
 

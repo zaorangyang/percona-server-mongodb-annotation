@@ -72,10 +72,12 @@ public:
     MongodImplementation(const intrusive_ptr<ExpressionContext>& ctx)
         : _ctx(ctx), _client(ctx->opCtx) {}
 
+    void setOperationContext(OperationContext* opCtx) {
+        invariant(_ctx->opCtx == opCtx);
+        _client.setOpCtx(opCtx);
+    }
+
     DBClientBase* directClient() final {
-        // opCtx may have changed since our last call
-        invariant(_ctx->opCtx);
-        _client.setOpCtx(_ctx->opCtx);
         return &_client;
     }
 
@@ -261,13 +263,19 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
         }
     }
 
-    // Look for an initial match. This works whether we got an initial query or not.
-    // If not, it results in a "{}" query, which will be what we want in that case.
+    // Look for an initial match. This works whether we got an initial query or not. If not, it
+    // results in a "{}" query, which will be what we want in that case.
     const BSONObj queryObj = pPipeline->getInitialQuery();
     if (!queryObj.isEmpty()) {
-        // This will get built in to the Cursor we'll create, so
-        // remove the match from the pipeline
-        sources.pop_front();
+        if (dynamic_cast<DocumentSourceMatch*>(sources.front().get())) {
+            // If a $match query is pulled into the cursor, the $match is redundant, and can be
+            // removed from the pipeline.
+            sources.pop_front();
+        } else {
+            // A $geoNear stage, the only other stage that can produce an initial query, is also
+            // a valid initial stage and will be handled above.
+            MONGO_UNREACHABLE;
+        }
     }
 
     // Find the set of fields in the source documents depended on by this pipeline.
@@ -342,6 +350,12 @@ std::shared_ptr<PlanExecutor> PipelineD::prepareExecutor(
     // orphaned documents.
     if (ShardingState::get(txn)->needCollectionMetadata(txn, nss.ns())) {
         plannerOpts |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    }
+
+    if (deps.hasNoRequirements()) {
+        // If we don't need any fields from the input document, performing a count is faster, and
+        // will output empty documents, which is okay.
+        plannerOpts |= QueryPlannerParams::IS_COUNT;
     }
 
     // The only way to get a text score is to let the query system handle the projection. In all
@@ -422,6 +436,10 @@ shared_ptr<PlanExecutor> PipelineD::addCursorSource(const intrusive_ptr<Pipeline
     // Note the query, sort, and projection for explain.
     pSource->setQuery(queryObj);
     pSource->setSort(sortObj);
+
+    if (deps.hasNoRequirements()) {
+        pSource->shouldProduceEmptyDocs();
+    }
 
     if (!projectionObj.isEmpty()) {
         pSource->setProjection(projectionObj, boost::none);

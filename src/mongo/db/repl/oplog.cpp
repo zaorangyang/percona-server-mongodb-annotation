@@ -84,7 +84,6 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/platform/random.h"
-#include "mongo/s/d_state.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/elapsed_tracker.h"
@@ -1022,6 +1021,7 @@ Status applyCommand_inlock(OperationContext* txn, const BSONObj& op) {
 
                 BackgroundOperation::awaitNoBgOpInProgForDb(nsToDatabaseSubstring(ns));
                 txn->recoveryUnit()->abandonSnapshot();
+                txn->checkForInterrupt();
                 break;
             }
             case ErrorCodes::BackgroundOperationInProgressForNamespace: {
@@ -1031,6 +1031,7 @@ Status applyCommand_inlock(OperationContext* txn, const BSONObj& op) {
                 invariant(cmd);
                 BackgroundOperation::awaitNoBgOpInProgForNs(cmd->parseNs(nsToDatabase(ns), o));
                 txn->recoveryUnit()->abandonSnapshot();
+                txn->checkForInterrupt();
                 break;
             }
             default:

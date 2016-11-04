@@ -37,7 +37,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/logger/ramlog.h"
@@ -70,8 +70,6 @@ BSONObj createRecvChunkCommitRequest(const MigrationSessionId& sessionId) {
 
 MONGO_FP_DECLARE(failMigrationCommit);
 MONGO_FP_DECLARE(hangBeforeLeavingCriticalSection);
-MONGO_FP_DECLARE(failMigrationConfigWritePrepare);
-MONGO_FP_DECLARE(failMigrationApplyOps);
 
 }  // namespace
 
@@ -135,7 +133,7 @@ Status ChunkMoveOperationState::initialize(const BSONObj& cmdObj) {
         _toShardCS = toShard->getConnString();
     }
 
-    auto& operationVersion = OperationShardVersion::get(_txn);
+    auto& operationVersion = OperationShardingState::get(_txn);
     if (!operationVersion.hasShardVersion()) {
         return Status{ErrorCodes::InvalidOptions, "moveChunk command is missing shard version"};
     }
@@ -145,12 +143,11 @@ Status ChunkMoveOperationState::initialize(const BSONObj& cmdObj) {
     return Status::OK();
 }
 
-StatusWith<ForwardingCatalogManager::ScopedDistLock*>
-ChunkMoveOperationState::acquireMoveMetadata() {
+StatusWith<DistLockManager::ScopedDistLock*> ChunkMoveOperationState::acquireMoveMetadata() {
     // Get the distributed lock
     const string whyMessage(stream() << "migrating chunk [" << _minKey << ", " << _maxKey << ") in "
                                      << _nss.ns());
-    _distLockStatus = grid.forwardingCatalogManager()->distLock(_txn, _nss.ns(), whyMessage);
+    _distLockStatus = grid.catalogManager(_txn)->distLock(_txn, _nss.ns(), whyMessage);
 
     if (!_distLockStatus->isOK()) {
         const string msg = stream() << "could not acquire collection lock for " << _nss.ns()
@@ -388,97 +385,9 @@ Status ChunkMoveOperationState::commitMigration(const MigrationSessionId& sessio
         preCond.append(b.obj());
     }
 
-    Status applyOpsStatus{Status::OK()};
-    try {
-        // For testing migration failures
-        if (MONGO_FAIL_POINT(failMigrationConfigWritePrepare)) {
-            throw DBException("mock migration failure before config write",
-                              ErrorCodes::PrepareConfigsFailed);
-        }
-
-        applyOpsStatus =
-            grid.catalogManager(_txn)->applyChunkOpsDeprecated(_txn, updates.arr(), preCond.arr());
-
-        if (MONGO_FAIL_POINT(failMigrationApplyOps)) {
-            throw SocketException(SocketException::RECV_ERROR,
-                                  shardingState->getConfigServer(_txn).toString());
-        }
-    } catch (const DBException& ex) {
-        applyOpsStatus = ex.toStatus();
-    }
-
-    if (applyOpsStatus == ErrorCodes::PrepareConfigsFailed) {
-        // In the process of issuing the migrate commit, the SyncClusterConnection checks that
-        // the config servers are reachable. If they are not, we are sure that the applyOps
-        // command was not sent to any of the configs, so we can safely back out of the
-        // migration here, by resetting the shard version that we bumped up to in the
-        // donateChunk() call above.
-        log() << "About to acquire moveChunk coll lock to reset shard version from "
-              << "failed migration";
-
-        {
-            ScopedTransaction transaction(_txn, MODE_IX);
-            Lock::DBLock dbLock(_txn->lockState(), _nss.db(), MODE_IX);
-            Lock::CollectionLock collLock(_txn->lockState(), _nss.ns(), MODE_X);
-
-            // Revert the metadata back to the state before "forgetting" about the chunk
-            shardingState->undoDonateChunk(_txn, _nss.ns(), getCollMetadata());
-        }
-
-        log() << "Shard version successfully reset to clean up failed migration";
-
-        const string msg = stream() << "Failed to send migrate commit to configs "
-                                    << causedBy(applyOpsStatus);
-        return Status(applyOpsStatus.code(), msg);
-    } else if (!applyOpsStatus.isOK()) {
-        // This could be a blip in the connectivity. Wait out a few seconds and check if the
-        // commit request made it.
-        //
-        // If the commit made it to the config, we'll see the chunk in the new shard and
-        // there's no further action to be done.
-        //
-        // If the commit did not make it, currently the only way to fix this state is to
-        // bounce the mongod so that the old state (before migrating) is brought in.
-
-        warning() << "moveChunk commit failed and metadata will be revalidated"
-                  << causedBy(applyOpsStatus) << migrateLog;
-        sleepsecs(10);
-
-        // Look for the chunk in this shard whose version got bumped. We assume that if that
-        // mod made it to the config server, then applyOps was successful.
-        try {
-            std::vector<ChunkType> newestChunk;
-            Status status =
-                grid.catalogManager(_txn)->getChunks(_txn,
-                                                     BSON(ChunkType::ns(_nss.ns())),
-                                                     BSON(ChunkType::DEPRECATED_lastmod() << -1),
-                                                     1,
-                                                     &newestChunk,
-                                                     nullptr);
-            uassertStatusOK(status);
-
-            ChunkVersion checkVersion;
-            if (!newestChunk.empty()) {
-                invariant(newestChunk.size() == 1);
-                checkVersion = newestChunk[0].getVersion();
-            }
-
-            if (checkVersion.equals(nextVersion)) {
-                log() << "moveChunk commit confirmed" << migrateLog;
-            } else {
-                error() << "moveChunk commit failed: version is at " << checkVersion
-                        << " instead of " << nextVersion << migrateLog;
-                error() << "TERMINATING" << migrateLog;
-
-                dbexit(EXIT_SHARDING_ERROR);
-            }
-        } catch (...) {
-            error() << "moveChunk failed to get confirmation of commit" << migrateLog;
-            error() << "TERMINATING" << migrateLog;
-
-            dbexit(EXIT_SHARDING_ERROR);
-        }
-    }
+    fassertStatusOK(34431,
+                    grid.catalogManager(_txn)->applyChunkOpsDeprecated(
+                        _txn, updates.arr(), preCond.arr(), _nss.ns(), nextVersion));
 
     MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangBeforeLeavingCriticalSection);
 

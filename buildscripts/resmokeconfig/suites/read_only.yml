@@ -7,5 +7,8 @@ executor:
   js_test:
     config:
       shell_options:
+        global_vars:
+          TestData:
+            fixture: standalone
         readMode: commands
         nodb: ""

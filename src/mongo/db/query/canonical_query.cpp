@@ -315,6 +315,7 @@ Status CanonicalQuery::init(LiteParsedQuery* lpq,
     _pq.reset(lpq);
 
     _hasNoopExtensions = extensionsCallback.hasNoopExtensions();
+    _isIsolated = LiteParsedQuery::isQueryIsolated(lpq->getFilter());
 
     // Normalize, sort and validate tree.
     root = normalizeTree(root);
@@ -553,6 +554,11 @@ Status CanonicalQuery::isValid(MatchExpression* root, const LiteParsedQuery& par
     // TEXT and snapshot cannot both be in the query.
     if (numText > 0 && parsed.isSnapshot()) {
         return Status(ErrorCodes::BadValue, "text and snapshot not allowed in same query");
+    }
+
+    // TEXT and tailable are incompatible.
+    if (numText > 0 && parsed.isTailable()) {
+        return Status(ErrorCodes::BadValue, "text and tailable cursor not allowed in same query");
     }
 
     // $natural sort order must agree with hint.

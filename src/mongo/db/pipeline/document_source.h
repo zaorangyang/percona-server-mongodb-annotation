@@ -276,8 +276,15 @@ public:
         virtual ~MongodInterface(){};
 
         /**
-         * Always returns a DBDirectClient.
-         * Callers must not cache the returned pointer outside the scope of a single function.
+         * Sets the OperationContext of the DBDirectClient returned by directClient(). This method
+         * must be called after updating the 'opCtx' member of the ExpressionContext associated with
+         * the document source.
+         */
+        virtual void setOperationContext(OperationContext* opCtx) = 0;
+
+        /**
+         * Always returns a DBDirectClient. The return type in the function signature is a
+         * DBClientBase* because DBDirectClient isn't linked into mongos.
          */
         virtual DBClientBase* directClient() = 0;
 
@@ -301,6 +308,11 @@ public:
 
     void injectMongodInterface(std::shared_ptr<MongodInterface> mongod) {
         _mongod = mongod;
+    }
+
+    void setOperationContext(OperationContext* opCtx) {
+        invariant(_mongod);
+        _mongod->setOperationContext(opCtx);
     }
 
 protected:
@@ -386,6 +398,14 @@ public:
     /// returns -1 for no limit
     long long getLimit() const;
 
+    /**
+     * If subsequent sources need no information from the cursor, the cursor can simply output empty
+     * documents, avoiding the overhead of converting BSONObjs to Documents.
+     */
+    void shouldProduceEmptyDocs() {
+        _shouldProduceEmptyDocs = true;
+    }
+
 private:
     DocumentSourceCursor(const std::string& ns,
                          const std::shared_ptr<PlanExecutor>& exec,
@@ -399,6 +419,7 @@ private:
     BSONObj _query;
     BSONObj _sort;
     BSONObj _projection;
+    bool _shouldProduceEmptyDocs = false;
     boost::optional<ParsedDeps> _dependencies;
     boost::intrusive_ptr<DocumentSourceLimit> _limit;
     long long _docsAddedToBatches;  // for _limit enforcement
@@ -577,6 +598,8 @@ public:
                                                    Pipeline::SourceContainer* container) final;
     void setSource(DocumentSource* Source) final;
 
+    GetDepsReturn getDependencies(DepsTracker* deps) const final;
+
     /**
       Create a filter.
 
@@ -586,7 +609,9 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pCtx);
 
-    /// Returns the query in Matcher syntax.
+    /**
+     * Returns the query in MatchExpression syntax.
+     */
     BSONObj getQuery() const;
 
     /** Returns the portion of the match that can safely be promoted to before a $redact.
@@ -610,7 +635,10 @@ private:
     DocumentSourceMatch(const BSONObj& query,
                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    std::unique_ptr<Matcher> matcher;
+    void addDependencies(MatchExpression* expression, DepsTracker* deps, std::string prefix) const;
+
+    std::unique_ptr<MatchExpression> _expression;
+    BSONObj _predicate;
     bool _isTextQuery;
 };
 
@@ -1269,6 +1297,10 @@ public:
     long long getLimit() {
         return limit;
     }
+
+    BSONObj getQuery() const {
+        return query;
+    };
 
     // this should only be used for testing
     static boost::intrusive_ptr<DocumentSourceGeoNear> create(

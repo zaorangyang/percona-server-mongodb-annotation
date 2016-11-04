@@ -39,8 +39,11 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/optime_pair.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
+
+MONGO_FP_FORWARD_DECLARE(failApplyChunkOps);
 
 /**
  * Common implementation shared by concrete catalog manager classes.
@@ -75,6 +78,11 @@ public:
                      const std::string& what,
                      const std::string& ns,
                      const BSONObj& detail) final;
+
+    StatusWith<DistLockManager::ScopedDistLock> distLock(OperationContext* txn,
+                                                         StringData name,
+                                                         StringData whyMessage,
+                                                         stdx::chrono::milliseconds waitFor) final;
 
 protected:
     /**

@@ -69,6 +69,7 @@
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/request_interface.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
@@ -115,6 +116,26 @@ BSONObj incrementConfigVersionByRandom(BSONObj config) {
 }
 
 }  // namespace
+
+BSONObj ReplicationCoordinatorImpl::SlaveInfo::toBSON() const {
+    BSONObjBuilder bo;
+    bo.append("id", memberId);
+    bo.append("rid", rid);
+    bo.append("host", hostAndPort.toString());
+    bo.append("lastDurableOpTime", lastDurableOpTime.toBSON());
+    bo.append("lastAppliedOpTime", lastAppliedOpTime.toBSON());
+    if (self)
+        bo.append("self", true);
+    if (down)
+        bo.append("down", true);
+    bo.append("lastUpdated", lastUpdate);
+    return bo.obj();
+}
+
+std::string ReplicationCoordinatorImpl::SlaveInfo::toString() const {
+    return toBSON().toString();
+}
+
 
 struct ReplicationCoordinatorImpl::WaiterInfo {
     /**
@@ -163,14 +184,11 @@ DataReplicatorOptions createDataReplicatorOptions(ReplicationCoordinator* replCo
     options.applierFn = [](OperationContext*, const BSONObj&) -> Status { return Status::OK(); };
     options.rollbackFn =
         [](OperationContext*, const OpTime&, const HostAndPort&) { return Status::OK(); };
-    options.prepareOldReplSetUpdatePositionCommandFn = [replCoord]() -> StatusWith<BSONObj> {
-        BSONObjBuilder bob;
-        if (replCoord->prepareOldReplSetUpdatePositionCommand(&bob)) {
-            return bob.obj();
-        }
-        return Status(ErrorCodes::OperationFailed,
-                      "unable to prepare replSetUpdatePosition command object");
-    };
+    options.prepareReplSetUpdatePositionCommandFn =
+        [replCoord](ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle)
+            -> StatusWith<BSONObj> {
+                return replCoord->prepareReplSetUpdatePositionCommand(commandStyle);
+            };
     options.getMyLastOptime = [replCoord]() { return replCoord->getMyLastAppliedOpTime(); };
     options.setMyLastOptime =
         [replCoord](const OpTime& opTime) { replCoord->setMyLastAppliedOpTime(opTime); };
@@ -418,7 +436,8 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     const PostMemberStateUpdateAction action =
         _setCurrentRSConfig_inlock(cbData, localConfig, myIndex.getValue());
     _setMyLastAppliedOpTime_inlock(lastOpTime, false);
-    _setMyLastDurableOpTimeAndReport_inlock(&lk, lastOpTime, false);
+    _setMyLastDurableOpTime_inlock(lastOpTime, false);
+    _reportUpstream_inlock(&lk);
     _externalState->setGlobalTimestamp(lastOpTime.getTimestamp());
     // Step down is impossible, so we don't need to wait for the returned event.
     _updateTerm_incallback(term);
@@ -770,8 +789,9 @@ void ReplicationCoordinatorImpl::_updateSlaveInfoDurableOpTime_inlock(SlaveInfo*
                                                                       const OpTime& opTime) {
     // lastAppliedOpTime cannot be behind lastDurableOpTime.
     if (slaveInfo->lastAppliedOpTime < opTime) {
-        log() << "Durable progress is ahead of the applied progress. This is likely due to a "
-                 "rollback.";
+        log() << "Durable progress (" << opTime << ") is ahead of the applied progress ("
+              << slaveInfo->lastAppliedOpTime << ". This is likely due to a "
+                                                 "rollback. slaveInfo: " << slaveInfo->toString();
         return;
     }
     slaveInfo->lastDurableOpTime = opTime;
@@ -875,56 +895,48 @@ void ReplicationCoordinatorImpl::setMyHeartbeatMessage(const std::string& msg) {
 void ReplicationCoordinatorImpl::setMyLastAppliedOpTimeForward(const OpTime& opTime) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
     if (opTime > _getMyLastAppliedOpTime_inlock()) {
-        _setMyLastAppliedOpTimeAndReport_inlock(&lock, opTime, false);
+        const bool allowRollback = false;
+        _setMyLastAppliedOpTime_inlock(opTime, allowRollback);
+
+        // If the storage engine isn't durable then we need to update the durableOpTime.
+        if (!_isDurableStorageEngine()) {
+            _setMyLastDurableOpTime_inlock(opTime, allowRollback);
+        }
+
+        _reportUpstream_inlock(&lock);
     }
 }
 
 void ReplicationCoordinatorImpl::setMyLastDurableOpTimeForward(const OpTime& opTime) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
     if (opTime > _getMyLastDurableOpTime_inlock()) {
-        _setMyLastDurableOpTimeAndReport_inlock(&lock, opTime, false);
+        _setMyLastDurableOpTime_inlock(opTime, false);
+        _reportUpstream_inlock(&lock);
     }
 }
 
 void ReplicationCoordinatorImpl::setMyLastAppliedOpTime(const OpTime& opTime) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
-    _setMyLastAppliedOpTimeAndReport_inlock(&lock, opTime, false);
+    _setMyLastAppliedOpTime_inlock(opTime, false);
+    _reportUpstream_inlock(&lock);
 }
 
 void ReplicationCoordinatorImpl::setMyLastDurableOpTime(const OpTime& opTime) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
-    _setMyLastDurableOpTimeAndReport_inlock(&lock, opTime, false);
+    _setMyLastDurableOpTime_inlock(opTime, false);
+    _reportUpstream_inlock(&lock);
 }
 
 void ReplicationCoordinatorImpl::resetMyLastOpTimes() {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
     // Reset to uninitialized OpTime
     _setMyLastAppliedOpTime_inlock(OpTime(), true);
-    _setMyLastDurableOpTimeAndReport_inlock(&lock, OpTime(), true);
+    _setMyLastDurableOpTime_inlock(OpTime(), true);
+    _reportUpstream_inlock(&lock);
 }
 
-void ReplicationCoordinatorImpl::_setMyLastAppliedOpTimeAndReport_inlock(
-    stdx::unique_lock<stdx::mutex>* lock, const OpTime& opTime, bool isRollbackAllowed) {
+void ReplicationCoordinatorImpl::_reportUpstream_inlock(stdx::unique_lock<stdx::mutex>* lock) {
     invariant(lock->owns_lock());
-    _setMyLastAppliedOpTime_inlock(opTime, isRollbackAllowed);
-
-    if (getReplicationMode() != modeReplSet) {
-        return;
-    }
-
-    if (_getMemberState_inlock().primary()) {
-        return;
-    }
-
-    lock->unlock();
-
-    _externalState->forwardSlaveProgress();  // Must do this outside _mutex
-}
-
-void ReplicationCoordinatorImpl::_setMyLastDurableOpTimeAndReport_inlock(
-    stdx::unique_lock<stdx::mutex>* lock, const OpTime& opTime, bool isRollbackAllowed) {
-    invariant(lock->owns_lock());
-    _setMyLastDurableOpTime_inlock(opTime, isRollbackAllowed);
 
     if (getReplicationMode() != modeReplSet) {
         return;
@@ -958,8 +970,10 @@ void ReplicationCoordinatorImpl::_setMyLastDurableOpTime_inlock(const OpTime& op
     invariant(isRollbackAllowed || mySlaveInfo->lastDurableOpTime <= opTime);
     // lastAppliedOpTime cannot be behind lastDurableOpTime.
     if (mySlaveInfo->lastAppliedOpTime < opTime) {
-        log() << "Durable progress is ahead of the applied progress. This is likely due to a "
-                 "rollback.";
+        log() << "My durable progress (" << opTime << ") is ahead of my applied progress ("
+              << mySlaveInfo->lastAppliedOpTime
+              << ". This is likely due to a "
+                 "rollback. slaveInfo: " << mySlaveInfo->toString();
         return;
     }
     _updateSlaveInfoDurableOpTime_inlock(mySlaveInfo, opTime);
@@ -1804,69 +1818,52 @@ int ReplicationCoordinatorImpl::_getMyId_inlock() const {
     return self.getId();
 }
 
-bool ReplicationCoordinatorImpl::prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder) {
+StatusWith<BSONObj> ReplicationCoordinatorImpl::prepareReplSetUpdatePositionCommand(
+    ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle) const {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     invariant(_rsConfig.isInitialized());
     // Do not send updates if we have been removed from the config.
     if (_selfIndex == -1) {
-        return false;
+        return Status(ErrorCodes::NodeNotFound,
+                      "This node is not in the current replset configuration.");
     }
-    cmdBuilder->append("replSetUpdatePosition", 1);
+    BSONObjBuilder cmdBuilder;
+    cmdBuilder.append(UpdatePositionArgs::kCommandFieldName, 1);
     // Create an array containing objects each live member connected to us and for ourself.
-    BSONArrayBuilder arrayBuilder(cmdBuilder->subarrayStart("optimes"));
-    for (SlaveInfoVector::iterator itr = _slaveInfo.begin(); itr != _slaveInfo.end(); ++itr) {
-        if (itr->lastAppliedOpTime.isNull()) {
+    BSONArrayBuilder arrayBuilder(cmdBuilder.subarrayStart("optimes"));
+    for (const auto& slaveInfo : _slaveInfo) {
+        if (slaveInfo.lastAppliedOpTime.isNull()) {
             // Don't include info on members we haven't heard from yet.
             continue;
         }
         // Don't include members we think are down.
-        if (!itr->self && itr->down) {
+        if (!slaveInfo.self && slaveInfo.down) {
             continue;
         }
 
         BSONObjBuilder entry(arrayBuilder.subobjStart());
-        itr->lastDurableOpTime.append(&entry, "durableOpTime");
-        itr->lastAppliedOpTime.append(&entry, "appliedOpTime");
-        entry.append("memberId", itr->memberId);
-        entry.append("cfgver", _rsConfig.getConfigVersion());
-    }
-
-    return true;
-}
-
-bool ReplicationCoordinatorImpl::prepareOldReplSetUpdatePositionCommand(
-    BSONObjBuilder* cmdBuilder) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
-    invariant(_rsConfig.isInitialized());
-    // do not send updates if we have been removed from the config
-    if (_selfIndex == -1) {
-        return false;
-    }
-    cmdBuilder->append("replSetUpdatePosition", 1);
-    // create an array containing objects each member connected to us and for ourself
-    BSONArrayBuilder arrayBuilder(cmdBuilder->subarrayStart("optimes"));
-    for (SlaveInfoVector::iterator itr = _slaveInfo.begin(); itr != _slaveInfo.end(); ++itr) {
-        if (itr->lastDurableOpTime.isNull()) {
-            // Don't include info on members we haven't heard from yet.
-            continue;
+        switch (commandStyle) {
+            case ReplSetUpdatePositionCommandStyle::kNewStyle:
+                slaveInfo.lastDurableOpTime.append(&entry,
+                                                   UpdatePositionArgs::kDurableOpTimeFieldName);
+                slaveInfo.lastAppliedOpTime.append(&entry,
+                                                   UpdatePositionArgs::kAppliedOpTimeFieldName);
+                break;
+            case ReplSetUpdatePositionCommandStyle::kOldStyle:
+                entry.append("_id", slaveInfo.rid);
+                if (isV1ElectionProtocol()) {
+                    slaveInfo.lastDurableOpTime.append(&entry, "optime");
+                } else {
+                    entry.append("optime", slaveInfo.lastDurableOpTime.getTimestamp());
+                }
+                break;
         }
-        // Don't include members we think are down.
-        if (!itr->self && itr->down) {
-            continue;
-        }
-
-        BSONObjBuilder entry(arrayBuilder.subobjStart());
-        entry.append("_id", itr->rid);
-        if (isV1ElectionProtocol()) {
-            itr->lastDurableOpTime.append(&entry, "optime");
-        } else {
-            entry.append("optime", itr->lastDurableOpTime.getTimestamp());
-        }
-        entry.append("memberId", itr->memberId);
-        entry.append("cfgver", _rsConfig.getConfigVersion());
+        entry.append(UpdatePositionArgs::kMemberIdFieldName, slaveInfo.memberId);
+        entry.append(UpdatePositionArgs::kConfigVersionFieldName, _rsConfig.getConfigVersion());
     }
+    arrayBuilder.done();
 
-    return true;
+    return cmdBuilder.obj();
 }
 
 Status ReplicationCoordinatorImpl::processReplSetGetStatus(BSONObjBuilder* response) {
@@ -3029,7 +3026,8 @@ void ReplicationCoordinatorImpl::resetLastOpTimesFromOplog(OperationContext* txn
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     _setMyLastAppliedOpTime_inlock(lastOpTime, true);
-    _setMyLastDurableOpTimeAndReport_inlock(&lk, lastOpTime, true);
+    _setMyLastDurableOpTime_inlock(lastOpTime, true);
+    _reportUpstream_inlock(&lk);
     _externalState->setGlobalTimestamp(lastOpTime.getTimestamp());
 }
 
@@ -3068,6 +3066,78 @@ bool ReplicationCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& curre
     fassert(18906, cbh.getStatus());
     _replExecutor.wait(cbh.getValue());
     return shouldChange;
+}
+
+SyncSourceResolverResponse ReplicationCoordinatorImpl::selectSyncSource(
+    OperationContext* txn, const OpTime& lastOpTimeFetched) {
+    const Timestamp sentinelTimestamp(duration_cast<Seconds>(Milliseconds(curTimeMillis64())), 0);
+    const OpTime sentinel(sentinelTimestamp, std::numeric_limits<long long>::max());
+    OpTime earliestOpTimeSeen = sentinel;
+    SyncSourceResolverResponse resp;
+    while (true) {
+        HostAndPort candidate = chooseNewSyncSource(lastOpTimeFetched.getTimestamp());
+
+        if (candidate.empty()) {
+            if (earliestOpTimeSeen == sentinel) {
+                // If, in this invocation of selectSyncSource(), we did not successfully connect
+                // to any node ahead of us, we apparently have no sync sources to connect to.
+                // This situation is common; e.g. if there are no writes to the primary at
+                // the moment.
+                resp.syncSourceStatus = HostAndPort();
+                return resp;
+            }
+
+            resp.syncSourceStatus = {ErrorCodes::OplogStartMissing, "too stale to catch up"};
+            resp.earliestOpTimeSeen = earliestOpTimeSeen;
+            return resp;
+        }
+
+        // Candidate found.
+        BSONObj firstObjFound;
+        auto work = [&firstObjFound](const StatusWith<Fetcher::QueryResponse>& queryResult,
+                                     NextAction* nextActiion,
+                                     BSONObjBuilder* bob) {
+            if (queryResult.isOK() && !queryResult.getValue().documents.empty()) {
+                firstObjFound = queryResult.getValue().documents.front();
+            }
+        };
+        Fetcher candidateProber(&_replExecutor,
+                                candidate,
+                                "local",
+                                BSON("find"
+                                     << "oplog.rs"
+                                     << "limit" << 1 << "sort" << BSON("$natural" << 1)),
+                                work,
+                                rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                                Milliseconds(30000));
+        candidateProber.schedule();
+        candidateProber.wait();
+
+        if (firstObjFound.isEmpty()) {
+            // Remote oplog is emtpy, or we got an error.
+            blacklistSyncSource(candidate, Date_t::now() + Minutes(1));
+            continue;
+        }
+
+        OpTime remoteEarliestOpTime =
+            fassertStatusOK(34432, OpTime::parseFromOplogEntry(firstObjFound));
+
+        // remoteEarliestOpTime may come from a very old config, so we cannot compare their terms.
+        if (!lastOpTimeFetched.isNull() &&
+            lastOpTimeFetched.getTimestamp() < remoteEarliestOpTime.getTimestamp()) {
+            // We're too stale to use this sync source.
+            blacklistSyncSource(candidate, Date_t::now() + Minutes(1));
+            if (earliestOpTimeSeen.getTimestamp() > remoteEarliestOpTime.getTimestamp()) {
+                log() << "we are too stale to use " << candidate << " as a sync source";
+                earliestOpTimeSeen = remoteEarliestOpTime;
+            }
+            continue;
+        }
+
+        // Got a valid sync source.
+        resp.syncSourceStatus = candidate;
+        return resp;
+    }
 }
 
 void ReplicationCoordinatorImpl::_updateLastCommittedOpTime_inlock() {
@@ -3277,7 +3347,7 @@ void ReplicationCoordinatorImpl::_prepareReplResponseMetadata_finish(
     _topCoord->prepareReplResponseMetadata(metadata, lastVisibleOpTime, _lastCommittedOpTime);
 }
 
-bool ReplicationCoordinatorImpl::isV1ElectionProtocol() {
+bool ReplicationCoordinatorImpl::isV1ElectionProtocol() const {
     return _protVersion.load() == 1;
 }
 

@@ -26,15 +26,12 @@
  *    then also delete it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/migration_secondary_throttle_options.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -70,6 +67,7 @@ TEST(MigrationSecondaryThrottleOptions, NotSpecifiedInCommandBSON) {
     MigrationSecondaryThrottleOptions options = assertGet(
         MigrationSecondaryThrottleOptions::createFromCommand(BSON("someOtherField" << 1)));
     ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault, options.getSecondaryThrottle());
+    ASSERT(!options.isWriteConcernSpecified());
     ASSERT_EQUALS(BSONObj(), options.toBSON());
 }
 
@@ -115,6 +113,57 @@ TEST(MigrationSecondaryThrottleOptions, DisabledInCommandBSON) {
     MigrationSecondaryThrottleOptions options =
         assertGet(MigrationSecondaryThrottleOptions::createFromCommand(
             BSON("someOtherField" << 1 << "secondaryThrottle" << false)));
+    ASSERT_EQ(MigrationSecondaryThrottleOptions::kOff, options.getSecondaryThrottle());
+}
+
+TEST(MigrationSecondaryThrottleOptions, NotSpecifiedInBalancerConfig) {
+    MigrationSecondaryThrottleOptions options = assertGet(
+        MigrationSecondaryThrottleOptions::createFromBalancerConfig(BSON("someOtherField" << 1)));
+    ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault, options.getSecondaryThrottle());
+    ASSERT(!options.isWriteConcernSpecified());
+    ASSERT_EQUALS(BSONObj(), options.toBSON());
+}
+
+TEST(MigrationSecondaryThrottleOptions, EnabledInBalancerConfigLegacyStyle) {
+    MigrationSecondaryThrottleOptions options =
+        assertGet(MigrationSecondaryThrottleOptions::createFromBalancerConfig(
+            BSON("someOtherField" << 1 << "_secondaryThrottle" << true)));
+    ASSERT_EQ(MigrationSecondaryThrottleOptions::kOn, options.getSecondaryThrottle());
+    ASSERT(!options.isWriteConcernSpecified());
+}
+
+TEST(MigrationSecondaryThrottleOptions, EnabledInBalancerConfigWithSimpleWriteConcern) {
+    MigrationSecondaryThrottleOptions options =
+        assertGet(MigrationSecondaryThrottleOptions::createFromBalancerConfig(
+            BSON("someOtherField" << 1 << "_secondaryThrottle" << BSON("w" << 2))));
+    ASSERT_EQ(MigrationSecondaryThrottleOptions::kOn, options.getSecondaryThrottle());
+    ASSERT(options.isWriteConcernSpecified());
+
+    WriteConcernOptions writeConcern = options.getWriteConcern();
+    ASSERT_EQ(2, writeConcern.wNumNodes);
+    ASSERT_EQ(static_cast<int>(WriteConcernOptions::SyncMode::UNSET),
+              static_cast<int>(writeConcern.syncMode));
+    ASSERT_EQ(WriteConcernOptions::kNoTimeout, writeConcern.wTimeout);
+}
+
+TEST(MigrationSecondaryThrottleOptions, EnabledInBalancerConfigWithCompleteWriteConcern) {
+    MigrationSecondaryThrottleOptions options =
+        assertGet(MigrationSecondaryThrottleOptions::createFromBalancerConfig(
+            BSON("someOtherField" << 1 << "_secondaryThrottle" << BSON("w" << 3 << "j" << true))));
+    ASSERT_EQ(MigrationSecondaryThrottleOptions::kOn, options.getSecondaryThrottle());
+    ASSERT(options.isWriteConcernSpecified());
+
+    WriteConcernOptions writeConcern = options.getWriteConcern();
+    ASSERT_EQ(3, writeConcern.wNumNodes);
+    ASSERT_EQ(static_cast<int>(WriteConcernOptions::SyncMode::JOURNAL),
+              static_cast<int>(writeConcern.syncMode));
+    ASSERT_EQ(WriteConcernOptions::kNoTimeout, writeConcern.wTimeout);
+}
+
+TEST(MigrationSecondaryThrottleOptions, DisabledInBalancerConfig) {
+    MigrationSecondaryThrottleOptions options =
+        assertGet(MigrationSecondaryThrottleOptions::createFromCommand(
+            BSON("someOtherField" << 1 << "_secondaryThrottle" << false)));
     ASSERT_EQ(MigrationSecondaryThrottleOptions::kOff, options.getSecondaryThrottle());
 }
 

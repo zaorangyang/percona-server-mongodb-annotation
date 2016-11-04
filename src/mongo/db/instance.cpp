@@ -608,6 +608,8 @@ void assembleResponse(OperationContext* txn,
             LOG(1) << "note: not profiling because recursive read lock";
         } else if (lockedForWriting()) {
             LOG(1) << "note: not profiling because doing fsync+lock";
+        } else if (storageGlobalParams.readOnly) {
+            LOG(1) << "note: not profiling because server is read-only";
         } else {
             profile(txn, op);
         }
@@ -770,6 +772,7 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
         }
 
         auto collection = ctx.db()->getCollection(nsString);
+        invariant(collection);
         unique_ptr<PlanExecutor> exec =
             uassertStatusOK(getExecutorUpdate(txn, collection, &parsedUpdate, &op.debug()));
 
@@ -859,7 +862,9 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
 
             PlanSummaryStats summary;
             Explain::getSummaryStats(*exec, &summary);
-            collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+            if (collection) {
+                collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+            }
             op.debug().fromMultiPlanner = summary.fromMultiPlanner;
             op.debug().replanned = summary.replanned;
 

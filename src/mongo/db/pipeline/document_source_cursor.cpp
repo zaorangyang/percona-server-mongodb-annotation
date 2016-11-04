@@ -30,7 +30,6 @@
 
 #include "mongo/db/pipeline/document_source.h"
 
-
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -39,7 +38,6 @@
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/s/d_state.h"
 
 namespace mongo {
 
@@ -94,7 +92,9 @@ void DocumentSourceCursor::loadBatch() {
     BSONObj obj;
     PlanExecutor::ExecState state;
     while ((state = _exec->getNext(&obj, NULL)) == PlanExecutor::ADVANCED) {
-        if (_dependencies) {
+        if (_shouldProduceEmptyDocs) {
+            _currentBatch.push_back(Document());
+        } else if (_dependencies) {
             _currentBatch.push_back(_dependencies->extractFields(obj));
         } else {
             _currentBatch.push_back(Document::fromBsonWithMetaData(obj));

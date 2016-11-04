@@ -144,9 +144,6 @@ const char* encodeMatchType(MatchExpression::MatchType mt) {
         case MatchExpression::WHERE:
             return "wh";
             break;
-        case MatchExpression::ATOMIC:
-            return "at";
-            break;
         case MatchExpression::ALWAYS_FALSE:
             return "af";
             break;
@@ -406,6 +403,7 @@ PlanCacheIndexTree* PlanCacheIndexTree::clone() const {
     if (NULL != entry.get()) {
         root->index_pos = index_pos;
         root->setIndexEntry(*entry.get());
+        root->canCombineBounds = canCombineBounds;
     }
 
     for (std::vector<PlanCacheIndexTree*>::const_iterator it = children.begin();
@@ -431,7 +429,8 @@ std::string PlanCacheIndexTree::toString(int indents) const {
     } else {
         result << std::string(3 * indents, '-') << "Leaf ";
         if (NULL != entry.get()) {
-            result << entry->keyPattern.toString() << ", pos: " << index_pos;
+            result << entry->keyPattern.toString() << ", pos: " << index_pos << ", can combine? "
+                   << canCombineBounds;
         }
         result << '\n';
     }

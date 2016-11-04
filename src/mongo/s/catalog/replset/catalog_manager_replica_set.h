@@ -48,10 +48,6 @@ public:
     explicit CatalogManagerReplicaSet(std::unique_ptr<DistLockManager> distLockManager);
     virtual ~CatalogManagerReplicaSet();
 
-    ConfigServerMode getMode() override {
-        return ConfigServerMode::CSRS;
-    }
-
     /**
      * Safe to call multiple times as long as they
      */
@@ -116,7 +112,9 @@ public:
 
     Status applyChunkOpsDeprecated(OperationContext* txn,
                                    const BSONArray& updateOps,
-                                   const BSONArray& preCondition) override;
+                                   const BSONArray& preCondition,
+                                   const std::string& nss,
+                                   const ChunkVersion& lastChunkVersion) override;
 
     StatusWith<SettingsType> getGlobalSettings(OperationContext* txn,
                                                const std::string& key) override;
@@ -164,15 +162,6 @@ private:
     Status _createCappedConfigCollection(OperationContext* txn,
                                          StringData collName,
                                          int cappedSize) override;
-
-    /**
-     * Helper method for running a read command against the config server. Automatically retries on
-     * NotMaster and network errors, so these will never be returned.
-     */
-    StatusWith<BSONObj> _runReadCommand(OperationContext* txn,
-                                        const std::string& dbname,
-                                        const BSONObj& cmdObj,
-                                        const ReadPreferenceSetting& readPref);
 
     /**
      * Executes the specified batch write command on the current config server's primary and retries

@@ -676,6 +676,9 @@ Status validateMongodOptions(const moe::Environment& params) {
                                              "source",
                                              "only",
                                              "slavedelay",
+                                             "journal",
+                                             "storage.journal.enabled",
+                                             "dur",
                                              "autoresync",
                                              "fastsync"}) {
             if (params.count(disallowedOption)) {
@@ -1061,8 +1064,9 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
         storageGlobalParams.directoryperdb = params["storage.directoryPerDB"].as<bool>();
     }
 
-    if (params.count("storage.readOnly")) {
-        storageGlobalParams.readOnly = params["storage.readOnly"].as<bool>();
+    if (params.count("storage.readOnly") && params["storage.readOnly"].as<bool>()) {
+        storageGlobalParams.readOnly = true;
+        storageGlobalParams.dur = false;
     }
 
     if (params.count("cpu")) {

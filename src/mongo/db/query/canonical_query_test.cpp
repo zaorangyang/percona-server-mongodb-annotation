@@ -28,6 +28,7 @@
 
 #include "mongo/db/query/canonical_query.h"
 
+#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
@@ -162,6 +163,27 @@ TEST(CanonicalQueryTest, IsValidText) {
         "    ]}"
         "]}",
         *lpq));
+}
+
+TEST(CanonicalQueryTest, IsValidTextTailable) {
+    // Passes in default values for LiteParsedQuery.
+    // Filter inside LiteParsedQuery is not used.
+    int options = QueryOption_CursorTailable;
+    unique_ptr<LiteParsedQuery> lpq(assertGet(LiteParsedQuery::makeAsOpQuery(nss,
+                                                                             0,
+                                                                             0,
+                                                                             options,
+                                                                             BSONObj(),
+                                                                             BSONObj(),
+                                                                             BSONObj(),
+                                                                             BSONObj(),
+                                                                             BSONObj(),
+                                                                             BSONObj(),
+                                                                             false,
+                                                                             false)));
+
+    // Invalid: TEXT and tailable.
+    ASSERT_NOT_OK(isValid("{$text: {$search: 's'}}", *lpq));
 }
 
 TEST(CanonicalQueryTest, IsValidGeo) {
@@ -529,6 +551,29 @@ std::unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
         nss, queryObj, sortObj, projObj, ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
+}
+
+/**
+ * Test that CanonicalQuery::isIsolated() returns correctly.
+ */
+TEST(CanonicalQueryTest, IsIsolatedReturnsTrueWithIsolated) {
+    unique_ptr<CanonicalQuery> cq = canonicalize("{$isolated: 1, x: 3}");
+    ASSERT_TRUE(cq->isIsolated());
+}
+
+TEST(CanonicalQueryTest, IsIsolatedReturnsTrueWithAtomic) {
+    unique_ptr<CanonicalQuery> cq = canonicalize("{$atomic: 1, x: 3}");
+    ASSERT_TRUE(cq->isIsolated());
+}
+
+TEST(CanonicalQueryTest, IsIsolatedReturnsFalseWithIsolated) {
+    unique_ptr<CanonicalQuery> cq = canonicalize("{$isolated: 0, x: 3}");
+    ASSERT_FALSE(cq->isIsolated());
+}
+
+TEST(CanonicalQueryTest, IsIsolatedReturnsFalseWithAtomic) {
+    unique_ptr<CanonicalQuery> cq = canonicalize("{$atomic: 0, x: 3}");
+    ASSERT_FALSE(cq->isIsolated());
 }
 
 /**

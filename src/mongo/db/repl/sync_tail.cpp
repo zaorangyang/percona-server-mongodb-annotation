@@ -171,14 +171,35 @@ namespace {
 
 class ApplyBatchFinalizer {
 public:
-    ApplyBatchFinalizer(ReplicationCoordinator* replCoord);
-    ~ApplyBatchFinalizer();
+    ApplyBatchFinalizer(ReplicationCoordinator* replCoord) : _replCoord(replCoord) {}
+    virtual ~ApplyBatchFinalizer(){};
 
-    /**
-     * In PV0, calls ReplicationCoordinator::setMyLastOptime with "newOp".
-     * In PV1, sets _latestOpTime to be "newOp" and signals the _waiterThread.
-     */
-    void record(OpTime newOp);
+    virtual void record(const OpTime& newOpTime) {
+        _recordApplied(newOpTime);
+    };
+
+protected:
+    void _recordApplied(const OpTime& newOpTime) {
+        _replCoord->setMyLastAppliedOpTimeForward(newOpTime);
+    }
+
+    void _recordDurable(const OpTime& newOpTime) {
+        _replCoord->setMyLastDurableOpTimeForward(newOpTime);
+    }
+
+private:
+    // Used to update the replication system's progress.
+    ReplicationCoordinator* _replCoord;
+};
+
+class ApplyBatchFinalizerForJournal : public ApplyBatchFinalizer {
+public:
+    ApplyBatchFinalizerForJournal(ReplicationCoordinator* replCoord)
+        : ApplyBatchFinalizer(replCoord),
+          _waiterThread{&ApplyBatchFinalizerForJournal::_run, this} {};
+    ~ApplyBatchFinalizerForJournal();
+
+    void record(const OpTime& newOpTime) override;
 
 private:
     /**
@@ -188,8 +209,6 @@ private:
      */
     void _run();
 
-    // Used to update the replication system's progress.
-    ReplicationCoordinator* _replCoord;
     // Protects _cond, _shutdownSignaled, and _latestOpTime.
     stdx::mutex _mutex;
     // Used to alert our thread of a new OpTime.
@@ -197,17 +216,12 @@ private:
     // The next OpTime to set as the ReplicationCoordinator's lastOpTime after flushing.
     OpTime _latestOpTime;
     // Once this is set to true the _run method will terminate.
-    bool _shutdownSignaled;
+    bool _shutdownSignaled = false;
     // Thread that will _run(). Must be initialized last as it depends on the other variables.
     stdx::thread _waiterThread;
 };
 
-ApplyBatchFinalizer::ApplyBatchFinalizer(ReplicationCoordinator* replCoord)
-    : _replCoord(replCoord),
-      _shutdownSignaled(false),
-      _waiterThread(&ApplyBatchFinalizer::_run, this) {}
-
-ApplyBatchFinalizer::~ApplyBatchFinalizer() {
+ApplyBatchFinalizerForJournal::~ApplyBatchFinalizerForJournal() {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
     _shutdownSignaled = true;
     _cond.notify_all();
@@ -216,18 +230,18 @@ ApplyBatchFinalizer::~ApplyBatchFinalizer() {
     _waiterThread.join();
 }
 
-void ApplyBatchFinalizer::record(OpTime newOp) {
+void ApplyBatchFinalizerForJournal::record(const OpTime& newOpTime) {
     // We have to use setMyLastAppliedOpTimeForward since this thread races with
     // logTransitionToPrimaryToOplog.
-    _replCoord->setMyLastAppliedOpTimeForward(newOp);
+    _recordApplied(newOpTime);
 
     stdx::unique_lock<stdx::mutex> lock(_mutex);
-    _latestOpTime = newOp;
+    _latestOpTime = newOpTime;
     _cond.notify_all();
 }
 
-void ApplyBatchFinalizer::_run() {
-    Client::initThread("ApplyBatchFinalizer");
+void ApplyBatchFinalizerForJournal::_run() {
+    Client::initThread("ApplyBatchFinalizerForJournal");
 
     while (true) {
         OpTime latestOpTime;
@@ -251,7 +265,7 @@ void ApplyBatchFinalizer::_run() {
         txn->recoveryUnit()->waitUntilDurable();
         // We have to use setMyLastDurableOpTimeForward since this thread races with
         // logTransitionToPrimaryToOplog.
-        _replCoord->setMyLastDurableOpTimeForward(latestOpTime);
+        _recordDurable(latestOpTime);
     }
 }
 }  // anonymous namespace containing ApplyBatchFinalizer definitions.
@@ -418,7 +432,7 @@ void prefetchOp(const BSONObj& op) {
 }
 
 // Doles out all the work to the reader pool threads and waits for them to complete
-void prefetchOps(const std::deque<SyncTail::OplogEntry>& ops, OldThreadPool* prefetcherPool) {
+void prefetchOps(const std::deque<OplogEntry>& ops, OldThreadPool* prefetcherPool) {
     invariant(prefetcherPool);
     for (auto&& op : ops) {
         prefetcherPool->schedule(&prefetchOp, op.raw);
@@ -427,12 +441,12 @@ void prefetchOps(const std::deque<SyncTail::OplogEntry>& ops, OldThreadPool* pre
 }
 
 // Doles out all the work to the writer pool threads and waits for them to complete
-void applyOps(const std::vector<std::vector<SyncTail::OplogEntry>>& writerVectors,
+void applyOps(const std::vector<std::vector<OplogEntry>>& writerVectors,
               OldThreadPool* writerPool,
               SyncTail::MultiSyncApplyFunc func,
               SyncTail* sync) {
     TimerHolder timer(&applyBatchStats);
-    for (std::vector<std::vector<SyncTail::OplogEntry>>::const_iterator it = writerVectors.begin();
+    for (std::vector<std::vector<OplogEntry>>::const_iterator it = writerVectors.begin();
          it != writerVectors.end();
          ++it) {
         if (!it->empty()) {
@@ -472,8 +486,8 @@ private:
 };
 
 void fillWriterVectors(OperationContext* txn,
-                       const std::deque<SyncTail::OplogEntry>& ops,
-                       std::vector<std::vector<SyncTail::OplogEntry>>* writerVectors) {
+                       const std::deque<OplogEntry>& ops,
+                       std::vector<std::vector<OplogEntry>>* writerVectors) {
     const bool supportsDocLocking =
         getGlobalServiceContext()->getGlobalStorageEngine()->supportsDocLocking();
     const uint32_t numWriters = writerVectors->size();
@@ -511,7 +525,7 @@ void fillWriterVectors(OperationContext* txn,
         if (op.opType == "i" && isCapped(txn, hashedNs)) {
             // Mark capped collection ops before storing them to ensure we do not attempt to bulk
             // insert them.
-            SyncTail::OplogEntry modifiedOp = op;
+            OplogEntry modifiedOp = op;
             modifiedOp.isForCappedCollection = true;
             (*writerVectors)[hash % numWriters].push_back(modifiedOp);
         } else {
@@ -532,7 +546,7 @@ OpTime SyncTail::multiApply(OperationContext* txn, const OpQueue& ops) {
         prefetchOps(ops.getDeque(), &_prefetcherPool);
     }
 
-    std::vector<std::vector<SyncTail::OplogEntry>> writerVectors(replWriterThreadCount);
+    std::vector<std::vector<OplogEntry>> writerVectors(replWriterThreadCount);
 
     fillWriterVectors(txn, ops.getDeque(), &writerVectors);
     LOG(2) << "replication batch size is " << ops.getDeque().size() << endl;
@@ -717,7 +731,10 @@ void SyncTail::oplogApplication() {
 
     OperationContextImpl txn;
     auto replCoord = ReplicationCoordinator::get(&txn);
-    ApplyBatchFinalizer finalizer(replCoord);
+    std::unique_ptr<ApplyBatchFinalizer> finalizer{
+        getGlobalServiceContext()->getGlobalStorageEngine()->isDurable()
+            ? new ApplyBatchFinalizerForJournal(replCoord)
+            : new ApplyBatchFinalizer(replCoord)};
 
     auto minValidBoundaries = getMinValid(&txn);
     OpTime originalEndOpTime(minValidBoundaries.end);
@@ -811,24 +828,7 @@ void SyncTail::oplogApplication() {
         setMinValid(&txn, end, DurableRequirement::None);
         minValidBoundaries.start = {};
         minValidBoundaries.end = end;
-        finalizer.record(lastWriteOpTime);
-    }
-}
-
-SyncTail::OplogEntry::OplogEntry(const BSONObj& rawInput) : raw(rawInput.getOwned()) {
-    for (auto elem : raw) {
-        const auto name = elem.fieldNameStringData();
-        if (name == "ns") {
-            ns = elem.valuestrsafe();
-        } else if (name == "op") {
-            opType = elem.valuestrsafe();
-        } else if (name == "o2") {
-            o2 = elem;
-        } else if (name == "v") {
-            version = elem;
-        } else if (name == "o") {
-            o = elem;
-        }
+        finalizer->record(lastWriteOpTime);
     }
 }
 
@@ -1013,8 +1013,8 @@ static void initializeWriterThread() {
 }
 
 // This free function is used by the writer threads to apply each op
-void multiSyncApply(const std::vector<SyncTail::OplogEntry>& ops, SyncTail* st) {
-    using OplogEntry = SyncTail::OplogEntry;
+void multiSyncApply(const std::vector<OplogEntry>& ops, SyncTail* st) {
+    using OplogEntry = OplogEntry;
 
     std::vector<OplogEntry> oplogEntries(ops.begin(), ops.end());
     std::vector<OplogEntry*> oplogEntryPointers(oplogEntries.size());
@@ -1113,6 +1113,9 @@ void multiSyncApply(const std::vector<SyncTail::OplogEntry>& ops, SyncTail* st) 
 
             if (!s.isOK()) {
                 severe() << "Error applying operation (" << entry->raw.toString() << "): " << s;
+                if (inShutdown()) {
+                    return;
+                }
                 fassertFailedNoTrace(16359);
             }
         } catch (const DBException& e) {
@@ -1129,7 +1132,7 @@ void multiSyncApply(const std::vector<SyncTail::OplogEntry>& ops, SyncTail* st) 
 }
 
 // This free function is used by the initial sync writer threads to apply each op
-void multiInitialSyncApply(const std::vector<SyncTail::OplogEntry>& ops, SyncTail* st) {
+void multiInitialSyncApply(const std::vector<OplogEntry>& ops, SyncTail* st) {
     initializeWriterThread();
 
     OperationContextImpl txn;
@@ -1141,8 +1144,7 @@ void multiInitialSyncApply(const std::vector<SyncTail::OplogEntry>& ops, SyncTai
 
     bool convertUpdatesToUpserts = false;
 
-    for (std::vector<SyncTail::OplogEntry>::const_iterator it = ops.begin(); it != ops.end();
-         ++it) {
+    for (std::vector<OplogEntry>::const_iterator it = ops.begin(); it != ops.end(); ++it) {
         try {
             const Status s = SyncTail::syncApply(&txn, it->raw, convertUpdatesToUpserts);
             if (!s.isOK()) {

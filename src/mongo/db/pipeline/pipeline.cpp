@@ -120,6 +120,10 @@ intrusive_ptr<Pipeline> Pipeline::parseCommand(string& errmsg,
         }
 
         if (str::equals(pFieldName, "allowDiskUse")) {
+            uassert(ErrorCodes::IllegalOperation,
+                    "The 'allowDiskUse' option is not permitted in read-only mode.",
+                    !storageGlobalParams.readOnly);
+
             uassert(16949,
                     str::stream() << "allowDiskUse must be a bool, not a "
                                   << typeName(cmdElement.type()),
@@ -250,6 +254,23 @@ Status Pipeline::checkAuthForCommand(ClientBasic* client,
     return Status(ErrorCodes::Unauthorized, "unauthorized");
 }
 
+void Pipeline::detachFromOperationContext() {
+    pCtx->opCtx = nullptr;
+
+    for (auto* source : sourcesNeedingMongod) {
+        source->setOperationContext(nullptr);
+    }
+}
+
+void Pipeline::reattachToOperationContext(OperationContext* opCtx) {
+    invariant(pCtx->opCtx == nullptr);
+    pCtx->opCtx = opCtx;
+
+    for (auto* source : sourcesNeedingMongod) {
+        source->setOperationContext(opCtx);
+    }
+}
+
 intrusive_ptr<Pipeline> Pipeline::splitForSharded() {
     // Create and initialize the shard spec we'll return. We start with an empty pipeline on the
     // shards and all work being done in the merger. Optimizations can move operations between
@@ -340,10 +361,16 @@ BSONObj Pipeline::getInitialQuery() const {
 
     /* look for an initial $match */
     DocumentSourceMatch* match = dynamic_cast<DocumentSourceMatch*>(sources.front().get());
-    if (!match)
-        return BSONObj();
+    if (match) {
+        return match->getQuery();
+    }
 
-    return match->getQuery();
+    DocumentSourceGeoNear* geoNear = dynamic_cast<DocumentSourceGeoNear*>(sources.front().get());
+    if (geoNear) {
+        return geoNear->getQuery();
+    }
+
+    return BSONObj();
 }
 
 bool Pipeline::needsPrimaryShardMerger() const {
@@ -403,6 +430,14 @@ void Pipeline::stitch() {
         intrusive_ptr<DocumentSource> pTemp(*iter);
         pTemp->setSource(prevSource);
         prevSource = pTemp.get();
+    }
+
+    // Cache the document sources that have a MongodInterface to avoid the cost of a dynamic cast
+    // when updating the OperationContext of their DBDirectClients while executing the pipeline.
+    for (auto&& source : sources) {
+        if (auto* needsMongod = dynamic_cast<DocumentSourceNeedsMongod*>(source.get())) {
+            sourcesNeedingMongod.push_back(needsMongod);
+        }
     }
 }
 

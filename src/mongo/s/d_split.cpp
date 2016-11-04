@@ -51,7 +51,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -652,7 +652,8 @@ public:
 
         const string whyMessage(str::stream() << "splitting chunk [" << min << ", " << max
                                               << ") in " << nss.toString());
-        auto scopedDistLock = grid.forwardingCatalogManager()->distLock(txn, nss.ns(), whyMessage);
+        auto scopedDistLock = grid.catalogManager(txn)->distLock(
+            txn, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
         if (!scopedDistLock.isOK()) {
             errmsg = str::stream() << "could not acquire collection lock for " << nss.toString()
                                    << " to split chunk [" << min << "," << max << ")"
@@ -689,7 +690,7 @@ public:
             // Mongos >= v3.2 sends the full version, v3.0 only sends the epoch.
             // TODO(SERVER-20742): Stop parsing epoch separately after 3.2.
             OID cmdEpoch;
-            auto& operationVersion = OperationShardVersion::get(txn);
+            auto& operationVersion = OperationShardingState::get(txn);
             if (operationVersion.hasShardVersion()) {
                 cmdVersion = operationVersion.getShardVersion(nss);
                 cmdEpoch = cmdVersion.epoch();
@@ -829,8 +830,9 @@ public:
         //
         // 4. apply the batch of updates to remote and local metadata
         //
-        Status applyOpsStatus =
-            grid.catalogManager(txn)->applyChunkOpsDeprecated(txn, updates.arr(), preCond.arr());
+
+        Status applyOpsStatus = grid.catalogManager(txn)->applyChunkOpsDeprecated(
+            txn, updates.arr(), preCond.arr(), nss.ns(), nextChunkVersion);
         if (!applyOpsStatus.isOK()) {
             return appendCommandStatus(result, applyOpsStatus);
         }

@@ -41,6 +41,7 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/platform/random.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/balancer_policy.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -49,6 +50,8 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/move_chunk_request.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/log.h"
 
@@ -135,13 +138,14 @@ bool tryMoveToOtherShard(OperationContext* txn,
 
     BSONObj res;
     WriteConcernOptions noThrottle;
-    if (!toMove->moveAndCommit(txn,
-                               newShard->getId(),
-                               Chunk::MaxChunkSize,
-                               &noThrottle, /* secondaryThrottle */
-                               false,       /* waitForDelete - small chunk, no need */
-                               0,           /* maxTimeMS - don't time out */
-                               res)) {
+    if (!toMove->moveAndCommit(
+            txn,
+            newShard->getId(),
+            Chunk::MaxChunkSize,
+            MigrationSecondaryThrottleOptions::create(MigrationSecondaryThrottleOptions::kOff),
+            false, /* waitForDelete - small chunk, no need */
+            0,     /* maxTimeMS - don't time out */
+            res)) {
         msgassertedNoTrace(10412, str::stream() << "moveAndCommit failed: " << res);
     }
 
@@ -309,7 +313,7 @@ void Chunk::pickSplitVector(OperationContext* txn,
 
     BSONObj cmdObj = cmd.obj();
 
-    auto result = grid.shardRegistry()->runCommandOnShard(
+    auto result = grid.shardRegistry()->runIdempotentCommandOnShard(
         txn,
         getShardId(),
         ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
@@ -455,11 +459,12 @@ Status Chunk::multiSplit(OperationContext* txn, const vector<BSONObj>& m, BSONOb
 
     ShardConnection conn(_getShardConnectionString(txn), "");
     if (!conn->runCommand("admin", cmdObj, *res)) {
-        string msg(str::stream() << "splitChunk failed - cmd: " << cmdObj << " result: " << *res);
-        warning() << msg;
+        Status status = getStatusFromCommandResult(*res);
+        warning() << "splitChunk cmd " << cmdObj << " failed" << causedBy(status);
         conn.done();
 
-        return Status(ErrorCodes::SplitFailed, msg);
+        return Status(ErrorCodes::SplitFailed,
+                      str::stream() << "command failed due to " << status.toString());
     }
 
     conn.done();
@@ -473,49 +478,32 @@ Status Chunk::multiSplit(OperationContext* txn, const vector<BSONObj>& m, BSONOb
 bool Chunk::moveAndCommit(OperationContext* txn,
                           const ShardId& toShardId,
                           long long chunkSize /* bytes */,
-                          const WriteConcernOptions* writeConcern,
+                          const MigrationSecondaryThrottleOptions& secondaryThrottle,
                           bool waitForDelete,
                           int maxTimeMS,
                           BSONObj& res) const {
     uassert(10167, "can't move shard to its current location!", getShardId() != toShardId);
 
-    log() << "moving chunk ns: " << _manager->getns() << " moving ( " << toString() << ") "
-          << getShardId() << " -> " << toShardId;
-
     BSONObjBuilder builder;
-    builder.append("moveChunk", _manager->getns());
-    builder.append("from", _getShardConnectionString(txn).toString());
-    {
-        const auto toShard = grid.shardRegistry()->getShard(txn, toShardId);
-        builder.append("to", toShard->getConnString().toString());
-    }
-    // NEEDED FOR 2.0 COMPATIBILITY
-    builder.append("fromShard", getShardId());
-    builder.append("toShard", toShardId);
-    ///////////////////////////////
-    builder.append("min", _min);
-    builder.append("max", _max);
-    builder.append("maxChunkSizeBytes", chunkSize);
-    builder.append("configdb", grid.shardRegistry()->getConfigServerConnectionString().toString());
-
-    // For legacy secondary throttle setting.
-    bool secondaryThrottle = true;
-    if (writeConcern && writeConcern->wNumNodes <= 1 && writeConcern->wMode.empty()) {
-        secondaryThrottle = false;
-    }
-
-    builder.append("secondaryThrottle", secondaryThrottle);
-
-    if (secondaryThrottle && writeConcern) {
-        builder.append("writeConcern", writeConcern->toBSON());
-    }
-
-    builder.append("waitForDelete", waitForDelete);
+    MoveChunkRequest::appendAsCommand(&builder,
+                                      NamespaceString(_manager->getns()),
+                                      _manager->getVersion(),
+                                      grid.shardRegistry()->getConfigServerConnectionString(),
+                                      _shardId,
+                                      toShardId,
+                                      _min,
+                                      _max,
+                                      chunkSize,
+                                      secondaryThrottle,
+                                      waitForDelete);
     builder.append(LiteParsedQuery::cmdOptionMaxTimeMS, maxTimeMS);
-    _manager->getVersion().appendForCommands(&builder);
+
+    BSONObj cmdObj = builder.obj();
+
+    log() << "Moving chunk with the following arguments: " << cmdObj;
 
     ShardConnection fromconn(_getShardConnectionString(txn), "");
-    bool worked = fromconn->runCommand("admin", builder.done(), res);
+    bool worked = fromconn->runCommand("admin", cmdObj, res);
     fromconn.done();
 
     LOG(worked ? 1 : 0) << "moveChunk result: " << res;

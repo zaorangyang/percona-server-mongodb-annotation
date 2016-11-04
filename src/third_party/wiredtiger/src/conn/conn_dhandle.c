@@ -134,13 +134,10 @@ __wt_conn_btree_sync_and_close(WT_SESSION_IMPL *session, bool final, bool force)
 	btree = S2BT(session);
 	bm = btree->bm;
 	dhandle = session->dhandle;
-	marked_dead = false;
+	evict_reset = marked_dead = false;
 
 	if (!F_ISSET(dhandle, WT_DHANDLE_OPEN))
 		return (0);
-
-	/* Ensure that we aren't racing with the eviction server */
-	WT_RET(__wt_evict_file_exclusive_on(session, &evict_reset));
 
 	/*
 	 * If we don't already have the schema lock, make it an error to try
@@ -163,6 +160,13 @@ __wt_conn_btree_sync_and_close(WT_SESSION_IMPL *session, bool final, bool force)
 	__wt_spin_lock(session, &dhandle->close_lock);
 
 	/*
+	 * Ensure we aren't racing with the eviction server; inside the close
+	 * lock so threads won't race setting/clearing the tree's "no eviction"
+	 * flag.
+	 */
+	WT_ERR(__wt_evict_file_exclusive_on(session, &evict_reset));
+
+	/*
 	 * The close can fail if an update cannot be written, return the EBUSY
 	 * error to our caller for eventual retry.
 	 *
@@ -176,23 +180,19 @@ __wt_conn_btree_sync_and_close(WT_SESSION_IMPL *session, bool final, bool force)
 	    WT_BTREE_SALVAGE | WT_BTREE_UPGRADE | WT_BTREE_VERIFY)) {
 		if (force && (bm == NULL || !bm->is_mapped(bm, session))) {
 			F_SET(session->dhandle, WT_DHANDLE_DEAD);
-
-			/*
-			 * Reset the tree's eviction priority, and the tree is
-			 * evictable by definition.
-			 */
-			__wt_evict_priority_clear(session);
-			F_CLR(S2BT(session), WT_BTREE_NO_EVICTION);
-
 			marked_dead = true;
+
+			/* Reset the tree's eviction priority (if any). */
+			__wt_evict_priority_clear(session);
 		}
 		if (!marked_dead || final)
 			WT_ERR(__wt_checkpoint_close(session, final));
 	}
 
 	WT_TRET(__wt_btree_close(session));
+
 	/*
-	 * If we marked a handle as dead it will be closed by sweep, via
+	 * If we marked a handle dead it will be closed by sweep, via
 	 * another call to sync and close.
 	 */
 	if (!marked_dead) {
@@ -204,10 +204,9 @@ __wt_conn_btree_sync_and_close(WT_SESSION_IMPL *session, bool final, bool force)
 	    F_ISSET(dhandle, WT_DHANDLE_DEAD) ||
 	    !F_ISSET(dhandle, WT_DHANDLE_OPEN));
 
-err:	__wt_spin_unlock(session, &dhandle->close_lock);
-
-	if (evict_reset)
+err:	if (evict_reset)
 		__wt_evict_file_exclusive_off(session);
+	__wt_spin_unlock(session, &dhandle->close_lock);
 
 	if (no_schema_lock)
 		F_CLR(session, WT_SESSION_NO_SCHEMA_LOCK);
@@ -355,13 +354,25 @@ err:		F_CLR(btree, WT_BTREE_SPECIAL_FLAGS);
 
 /*
  * __conn_btree_apply_internal --
- *	Apply a function to the open btree handles.
+ *	Apply a function to an open data handle.
  */
 static int
 __conn_btree_apply_internal(WT_SESSION_IMPL *session, WT_DATA_HANDLE *dhandle,
-    int (*func)(WT_SESSION_IMPL *, const char *[]), const char *cfg[])
+    int (*file_func)(WT_SESSION_IMPL *, const char *[]),
+    int (*name_func)(WT_SESSION_IMPL *, const char *, bool *),
+    const char *cfg[])
 {
 	WT_DECL_RET;
+	bool skip;
+
+	/* Always apply the name function, if supplied. */
+	skip = false;
+	if (name_func != NULL)
+		WT_RET(name_func(session, dhandle->name, &skip));
+
+	/* If there is no file function, don't bother locking the handle */
+	if (file_func == NULL || skip)
+		return (0);
 
 	/*
 	 * We need to pull the handle into the session handle cache and make
@@ -372,7 +383,7 @@ __conn_btree_apply_internal(WT_SESSION_IMPL *session, WT_DATA_HANDLE *dhandle,
 	    dhandle->name, dhandle->checkpoint, NULL, 0)) != 0)
 		return (ret == EBUSY ? 0 : ret);
 
-	WT_SAVE_DHANDLE(session, ret = func(session, cfg));
+	WT_SAVE_DHANDLE(session, ret = file_func(session, cfg));
 	if (WT_META_TRACKING(session))
 		WT_TRET(__wt_meta_track_handle_lock(session, false));
 	else
@@ -385,9 +396,10 @@ __conn_btree_apply_internal(WT_SESSION_IMPL *session, WT_DATA_HANDLE *dhandle,
  *	Apply a function to all open btree handles with the given URI.
  */
 int
-__wt_conn_btree_apply(WT_SESSION_IMPL *session,
-    bool apply_checkpoints, const char *uri,
-    int (*func)(WT_SESSION_IMPL *, const char *[]), const char *cfg[])
+__wt_conn_btree_apply(WT_SESSION_IMPL *session, const char *uri,
+    int (*file_func)(WT_SESSION_IMPL *, const char *[]),
+    int (*name_func)(WT_SESSION_IMPL *, const char *, bool *),
+    const char *cfg[])
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_DATA_HANDLE *dhandle;
@@ -404,23 +416,26 @@ __wt_conn_btree_apply(WT_SESSION_IMPL *session,
 	if (uri != NULL) {
 		bucket =
 		    __wt_hash_city64(uri, strlen(uri)) % WT_HASH_ARRAY_SIZE;
-		TAILQ_FOREACH(dhandle, &conn->dhhash[bucket], hashq)
-			if (F_ISSET(dhandle, WT_DHANDLE_OPEN) &&
-			    !F_ISSET(dhandle, WT_DHANDLE_DEAD) &&
-			    strcmp(uri, dhandle->name) == 0 &&
-			    (apply_checkpoints || dhandle->checkpoint == NULL))
-				WT_RET(__conn_btree_apply_internal(
-				    session, dhandle, func, cfg));
+		TAILQ_FOREACH(dhandle, &conn->dhhash[bucket], hashq) {
+			if (!F_ISSET(dhandle, WT_DHANDLE_OPEN) ||
+			    F_ISSET(dhandle, WT_DHANDLE_DEAD) ||
+			    dhandle->checkpoint != NULL ||
+			    strcmp(uri, dhandle->name) != 0)
+				continue;
+			WT_RET(__conn_btree_apply_internal(
+			    session, dhandle, file_func, name_func, cfg));
+		}
 	} else {
-		TAILQ_FOREACH(dhandle, &conn->dhqh, q)
-			if (F_ISSET(dhandle, WT_DHANDLE_OPEN) &&
-			    !F_ISSET(dhandle, WT_DHANDLE_DEAD) &&
-			    (apply_checkpoints ||
-			    dhandle->checkpoint == NULL) &&
-			    WT_PREFIX_MATCH(dhandle->name, "file:") &&
-			    !WT_IS_METADATA(session, dhandle))
-				WT_RET(__conn_btree_apply_internal(
-				    session, dhandle, func, cfg));
+		TAILQ_FOREACH(dhandle, &conn->dhqh, q) {
+			if (!F_ISSET(dhandle, WT_DHANDLE_OPEN) ||
+			    F_ISSET(dhandle, WT_DHANDLE_DEAD) ||
+			    dhandle->checkpoint != NULL ||
+			    !WT_PREFIX_MATCH(dhandle->name, "file:") ||
+			    WT_IS_METADATA(session, dhandle))
+				continue;
+			WT_RET(__conn_btree_apply_internal(
+			    session, dhandle, file_func, name_func, cfg));
+		}
 	}
 
 	return (0);

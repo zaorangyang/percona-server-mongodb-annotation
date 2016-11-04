@@ -1898,43 +1898,50 @@ TEST_F(ReplCoordTest, NodeIncludesOtherMembersProgressInUpdatePositionCommand) {
     ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(1, 3, optime1));
 
     // Check that the proper BSON is generated for the replSetUpdatePositionCommand
-    BSONObjBuilder cmdBuilder;
-    getReplCoord()->prepareReplSetUpdatePositionCommand(&cmdBuilder);
-    BSONObj cmd = cmdBuilder.done();
+    BSONObj cmd = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
+        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle));
 
     ASSERT_EQUALS(2, cmd.nFields());
-    ASSERT_EQUALS("replSetUpdatePosition", cmd.firstElement().fieldNameStringData());
+    ASSERT_EQUALS(UpdatePositionArgs::kCommandFieldName, cmd.firstElement().fieldNameStringData());
 
     std::set<long long> memberIds;
-    BSONForEach(entryElement, cmd["optimes"].Obj()) {
+    BSONForEach(entryElement, cmd[UpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
         OpTime durableOpTime;
         OpTime appliedOpTime;
         BSONObj entry = entryElement.Obj();
-        long long memberId = entry["memberId"].Number();
+        long long memberId = entry[UpdatePositionArgs::kMemberIdFieldName].Number();
         memberIds.insert(memberId);
         if (memberId == 0) {
             log() << 0;
-            ASSERT_OK(bsonExtractOpTimeField(entry, "appliedOpTime", &appliedOpTime));
-            ASSERT_OK(bsonExtractOpTimeField(entry, "durableOpTime", &durableOpTime));
+            ASSERT_OK(bsonExtractOpTimeField(
+                entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime));
+            ASSERT_OK(bsonExtractOpTimeField(
+                entry, UpdatePositionArgs::kDurableOpTimeFieldName, &durableOpTime));
             ASSERT_EQUALS(optime1, appliedOpTime);
             ASSERT_EQUALS(optime1, durableOpTime);
         } else if (memberId == 1) {
             log() << 1;
-            ASSERT_OK(bsonExtractOpTimeField(entry, "appliedOpTime", &appliedOpTime));
-            ASSERT_OK(bsonExtractOpTimeField(entry, "durableOpTime", &durableOpTime));
+            ASSERT_OK(bsonExtractOpTimeField(
+                entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime));
+            ASSERT_OK(bsonExtractOpTimeField(
+                entry, UpdatePositionArgs::kDurableOpTimeFieldName, &durableOpTime));
             ASSERT_EQUALS(optime2, appliedOpTime);
             ASSERT_EQUALS(OpTime(), durableOpTime);
         } else if (memberId == 2) {
             log() << 2;
-            ASSERT_OK(bsonExtractOpTimeField(entry, "appliedOpTime", &appliedOpTime));
-            ASSERT_OK(bsonExtractOpTimeField(entry, "durableOpTime", &durableOpTime));
+            ASSERT_OK(bsonExtractOpTimeField(
+                entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime));
+            ASSERT_OK(bsonExtractOpTimeField(
+                entry, UpdatePositionArgs::kDurableOpTimeFieldName, &durableOpTime));
             ASSERT_EQUALS(optime3, appliedOpTime);
             ASSERT_EQUALS(optime3, durableOpTime);
         } else {
             log() << 3;
             ASSERT_EQUALS(3, memberId);
-            ASSERT_OK(bsonExtractOpTimeField(entry, "appliedOpTime", &appliedOpTime));
-            ASSERT_OK(bsonExtractOpTimeField(entry, "durableOpTime", &durableOpTime));
+            ASSERT_OK(bsonExtractOpTimeField(
+                entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime));
+            ASSERT_OK(bsonExtractOpTimeField(
+                entry, UpdatePositionArgs::kDurableOpTimeFieldName, &durableOpTime));
             ASSERT_EQUALS(optime3, appliedOpTime);
             ASSERT_EQUALS(optime1, durableOpTime);
         }
@@ -1966,28 +1973,31 @@ TEST_F(ReplCoordTest, NodeIncludesOtherMembersProgressInOldUpdatePositionCommand
     ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(1, 2, optime3));
 
     // Check that the proper BSON is generated for the replSetUpdatePositionCommand
-    BSONObjBuilder cmdBuilder;
-    getReplCoord()->prepareOldReplSetUpdatePositionCommand(&cmdBuilder);
-    BSONObj cmd = cmdBuilder.done();
+    BSONObj cmd = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
+        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kOldStyle));
 
     ASSERT_EQUALS(2, cmd.nFields());
-    ASSERT_EQUALS("replSetUpdatePosition", cmd.firstElement().fieldNameStringData());
+    ASSERT_EQUALS(OldUpdatePositionArgs::kCommandFieldName,
+                  cmd.firstElement().fieldNameStringData());
 
     std::set<long long> memberIds;
-    BSONForEach(entryElement, cmd["optimes"].Obj()) {
+    BSONForEach(entryElement, cmd[OldUpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
         BSONObj entry = entryElement.Obj();
-        long long memberId = entry["memberId"].Number();
+        long long memberId = entry[OldUpdatePositionArgs::kMemberIdFieldName].Number();
         memberIds.insert(memberId);
         if (memberId == 0) {
             // TODO(siyuan) Update when we change replSetUpdatePosition format
-            ASSERT_EQUALS(optime1.timestamp, entry["optime"]["ts"].timestamp());
+            ASSERT_EQUALS(optime1.timestamp,
+                          entry[OldUpdatePositionArgs::kOpTimeFieldName]["ts"].timestamp());
         } else if (memberId == 1) {
-            ASSERT_EQUALS(optime2.timestamp, entry["optime"]["ts"].timestamp());
+            ASSERT_EQUALS(optime2.timestamp,
+                          entry[OldUpdatePositionArgs::kOpTimeFieldName]["ts"].timestamp());
         } else {
             ASSERT_EQUALS(2, memberId);
-            ASSERT_EQUALS(optime3.timestamp, entry["optime"]["ts"].timestamp());
+            ASSERT_EQUALS(optime3.timestamp,
+                          entry[OldUpdatePositionArgs::kOpTimeFieldName]["ts"].timestamp());
         }
-        ASSERT_EQUALS(0, entry["optime"]["t"].Number());
+        ASSERT_EQUALS(0, entry[OldUpdatePositionArgs::kOpTimeFieldName]["t"].Number());
     }
     ASSERT_EQUALS(3U, memberIds.size());  // Make sure we saw all 3 nodes
 }
@@ -2465,12 +2475,14 @@ TEST_F(ReplCoordTest, DoNotProcessSelfWhenUpdatePositionContainsInfoAboutSelf) {
     // receive updatePosition containing ourself, should not process the update for self
     UpdatePositionArgs args;
     ASSERT_OK(args.initialize(
-        BSON("replSetUpdatePosition"
-             << 1 << "optimes"
-             << BSON_ARRAY(BSON("cfgver" << 2 << "memberId" << 0 << "durableOpTime"
-                                         << BSON("ts" << time2.getTimestamp() << "t" << 2)
-                                         << "appliedOpTime"
-                                         << BSON("ts" << time2.getTimestamp() << "t" << 2))))));
+        BSON(UpdatePositionArgs::kCommandFieldName
+             << 1 << UpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                << 2 << UpdatePositionArgs::kMemberIdFieldName << 0
+                                << UpdatePositionArgs::kDurableOpTimeFieldName
+                                << BSON("ts" << time2.getTimestamp() << "t" << 2)
+                                << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                << BSON("ts" << time2.getTimestamp() << "t" << 2))))));
 
     ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, 0));
     ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
@@ -2511,10 +2523,12 @@ TEST_F(ReplCoordTest, DoNotProcessSelfWhenOldUpdatePositionContainsInfoAboutSelf
 
     // receive updatePosition containing ourself, should not process the update for self
     OldUpdatePositionArgs args;
-    ASSERT_OK(args.initialize(BSON("replSetUpdatePosition"
-                                   << 1 << "optimes"
-                                   << BSON_ARRAY(BSON("cfgver" << 2 << "memberId" << 0 << "optime"
-                                                               << time2.timestamp)))));
+    ASSERT_OK(args.initialize(
+        BSON(OldUpdatePositionArgs::kCommandFieldName
+             << 1 << OldUpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 0
+                                << OldUpdatePositionArgs::kOpTimeFieldName << time2.timestamp)))));
 
     ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, 0));
     ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
@@ -2552,12 +2566,14 @@ TEST_F(ReplCoordTest, DoNotProcessUpdatePositionWhenItsConfigVersionIsIncorrect)
     // receive updatePosition with incorrect config version
     UpdatePositionArgs args;
     ASSERT_OK(args.initialize(
-        BSON("replSetUpdatePosition"
-             << 1 << "optimes"
-             << BSON_ARRAY(BSON("cfgver" << 3 << "memberId" << 1 << "durableOpTime"
-                                         << BSON("ts" << time2.getTimestamp() << "t" << 3)
-                                         << "appliedOpTime"
-                                         << BSON("ts" << time2.getTimestamp() << "t" << 3))))));
+        BSON(UpdatePositionArgs::kCommandFieldName
+             << 1 << UpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                << 3 << UpdatePositionArgs::kMemberIdFieldName << 1
+                                << UpdatePositionArgs::kDurableOpTimeFieldName
+                                << BSON("ts" << time2.getTimestamp() << "t" << 3)
+                                << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                << BSON("ts" << time2.getTimestamp() << "t" << 3))))));
 
     long long cfgver;
     ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
@@ -2597,10 +2613,12 @@ TEST_F(ReplCoordTest, DoNotProcessOldUpdatePositionWhenItsConfigVersionIsIncorre
 
     // receive updatePosition with incorrect config version
     OldUpdatePositionArgs args;
-    ASSERT_OK(args.initialize(BSON("replSetUpdatePosition"
-                                   << 1 << "optimes"
-                                   << BSON_ARRAY(BSON("cfgver" << 3 << "memberId" << 1 << "optime"
-                                                               << time2.timestamp)))));
+    ASSERT_OK(args.initialize(
+        BSON(OldUpdatePositionArgs::kCommandFieldName
+             << 1 << OldUpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                << 3 << OldUpdatePositionArgs::kMemberIdFieldName << 1
+                                << OldUpdatePositionArgs::kOpTimeFieldName << time2.timestamp)))));
 
     long long cfgver;
     ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
@@ -2640,12 +2658,14 @@ TEST_F(ReplCoordTest, DoNotProcessUpdatePositionOfMembersWhoseIdsAreNotInTheConf
     // receive updatePosition with nonexistent member id
     UpdatePositionArgs args;
     ASSERT_OK(args.initialize(
-        BSON("replSetUpdatePosition"
-             << 1 << "optimes"
-             << BSON_ARRAY(BSON("cfgver" << 2 << "memberId" << 9 << "durableOpTime"
-                                         << BSON("ts" << time2.getTimestamp() << "t" << 2)
-                                         << "appliedOpTime"
-                                         << BSON("ts" << time2.getTimestamp() << "t" << 2))))));
+        BSON(UpdatePositionArgs::kCommandFieldName
+             << 1 << UpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                << 2 << UpdatePositionArgs::kMemberIdFieldName << 9
+                                << UpdatePositionArgs::kDurableOpTimeFieldName
+                                << BSON("ts" << time2.getTimestamp() << "t" << 2)
+                                << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                << BSON("ts" << time2.getTimestamp() << "t" << 2))))));
 
     ASSERT_EQUALS(ErrorCodes::NodeNotFound, getReplCoord()->processReplSetUpdatePosition(args, 0));
     ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
@@ -2683,10 +2703,12 @@ TEST_F(ReplCoordTest, DoNotProcessOldUpdatePositionOfMembersWhoseIdsAreNotInTheC
 
     // receive updatePosition with nonexistent member id
     OldUpdatePositionArgs args;
-    ASSERT_OK(args.initialize(BSON("replSetUpdatePosition"
-                                   << 1 << "optimes"
-                                   << BSON_ARRAY(BSON("cfgver" << 2 << "memberId" << 9 << "optime"
-                                                               << time2.timestamp)))));
+    ASSERT_OK(args.initialize(
+        BSON(OldUpdatePositionArgs::kCommandFieldName
+             << 1 << OldUpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 9
+                                << OldUpdatePositionArgs::kOpTimeFieldName << time2.timestamp)))));
 
     ASSERT_EQUALS(ErrorCodes::NodeNotFound, getReplCoord()->processReplSetUpdatePosition(args, 0));
     ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
@@ -2727,12 +2749,15 @@ TEST_F(ReplCoordTest,
     getReplCoord()->setMyLastAppliedOpTime(time2);
     getReplCoord()->setMyLastDurableOpTime(time2);
     OldUpdatePositionArgs args;
-    ASSERT_OK(args.initialize(
-        BSON("replSetUpdatePosition"
-             << 1 << "optimes"
-             << BSON_ARRAY(
-                    BSON("cfgver" << 2 << "memberId" << 1 << "optime" << time2.timestamp)
-                    << BSON("cfgver" << 2 << "memberId" << 2 << "optime" << time2.timestamp)))));
+    ASSERT_OK(args.initialize(BSON(
+        OldUpdatePositionArgs::kCommandFieldName
+        << 1 << OldUpdatePositionArgs::kUpdateArrayFieldName
+        << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                           << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 1
+                           << OldUpdatePositionArgs::kOpTimeFieldName << time2.timestamp)
+                      << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                              << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 2
+                              << OldUpdatePositionArgs::kOpTimeFieldName << time2.timestamp)))));
 
     ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, 0));
     ASSERT_OK(getReplCoord()->awaitReplication(&txn, time2, writeConcern).status);
@@ -3937,7 +3962,7 @@ TEST_F(ReplCoordTest, DoNotAdvanceCommittedSnapshotWhenAppliedOpTimeChanges) {
 }
 
 TEST_F(ReplCoordTest,
-       NodeChangesMyLastOpTimeWhenAndOnlyWhensetMyLastDurableOpTimeReceivesANewerOpTime) {
+       NodeChangesMyLastOpTimeWhenAndOnlyWhensetMyLastDurableOpTimeReceivesANewerOpTime4DurableSE) {
     assertStartSuccess(BSON("_id"
                             << "mySet"
                             << "version" << 2 << "members" << BSON_ARRAY(BSON("host"
@@ -3957,6 +3982,32 @@ TEST_F(ReplCoordTest,
     getReplCoord()->setMyLastAppliedOpTimeForward(time2);
     getReplCoord()->setMyLastDurableOpTimeForward(time2);
     ASSERT_EQUALS(time3, getReplCoord()->getMyLastAppliedOpTime());
+}
+
+TEST_F(ReplCoordTest,
+       NodeChangesMyLastOpTimeWhenSetMyLastDurableOpTimeReceivesANewerOpTimeWithoutJournaling) {
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members" << BSON_ARRAY(BSON("host"
+                                                                              << "node1:12345"
+                                                                              << "_id" << 0))),
+                       HostAndPort("node1", 12345));
+
+
+    setStorageEngineDurable(false);
+
+    OpTime time1(Timestamp(100, 1), 1);
+    OpTime time2(Timestamp(100, 2), 1);
+    OpTime time3(Timestamp(100, 3), 1);
+
+    getReplCoord()->setMyLastAppliedOpTime(time1);
+    ASSERT_EQUALS(time1, getReplCoord()->getMyLastAppliedOpTime());
+    getReplCoord()->setMyLastAppliedOpTimeForward(time3);
+    ASSERT_EQUALS(time3, getReplCoord()->getMyLastAppliedOpTime());
+    ASSERT_EQUALS(time3, getReplCoord()->getMyLastDurableOpTime());
+    getReplCoord()->setMyLastAppliedOpTimeForward(time2);
+    ASSERT_EQUALS(time3, getReplCoord()->getMyLastAppliedOpTime());
+    ASSERT_EQUALS(time3, getReplCoord()->getMyLastDurableOpTime());
 }
 
 TEST_F(ReplCoordTest, OnlyForwardSyncProgressForOtherNodesWhenTheNodesAreBelievedToBeUp) {
@@ -3979,34 +4030,32 @@ TEST_F(ReplCoordTest, OnlyForwardSyncProgressForOtherNodesWhenTheNodesAreBelieve
     ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(1, 1, optime));
 
     // Check that we have two entries in our UpdatePosition (us and node 1).
-    BSONObjBuilder cmdBuilder;
-    getReplCoord()->prepareReplSetUpdatePositionCommand(&cmdBuilder);
-    BSONObj cmd = cmdBuilder.done();
+    BSONObj cmd = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
+        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle));
     std::set<long long> memberIds;
-    BSONForEach(entryElement, cmd["optimes"].Obj()) {
+    BSONForEach(entryElement, cmd[UpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
         BSONObj entry = entryElement.Obj();
-        long long memberId = entry["memberId"].Number();
+        long long memberId = entry[UpdatePositionArgs::kMemberIdFieldName].Number();
         memberIds.insert(memberId);
         OpTime appliedOpTime;
         OpTime durableOpTime;
-        bsonExtractOpTimeField(entry, "appliedOpTime", &appliedOpTime);
+        bsonExtractOpTimeField(entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime);
         ASSERT_EQUALS(optime, appliedOpTime);
-        bsonExtractOpTimeField(entry, "durableOpTime", &durableOpTime);
+        bsonExtractOpTimeField(entry, UpdatePositionArgs::kDurableOpTimeFieldName, &durableOpTime);
         ASSERT_EQUALS(optime, durableOpTime);
     }
     ASSERT_EQUALS(2U, memberIds.size());
 
-    // Check that this true for old style (pre-3.2.2) UpdatePosition as well.
-    BSONObjBuilder cmdBuilder2;
-    getReplCoord()->prepareOldReplSetUpdatePositionCommand(&cmdBuilder2);
-    BSONObj cmd2 = cmdBuilder2.done();
+    // Check that this true for old style (pre-3.2.4) UpdatePosition as well.
+    BSONObj cmd2 = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
+        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kOldStyle));
     std::set<long long> memberIds2;
-    BSONForEach(entryElement, cmd2["optimes"].Obj()) {
+    BSONForEach(entryElement, cmd2[OldUpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
         BSONObj entry = entryElement.Obj();
-        long long memberId = entry["memberId"].Number();
+        long long memberId = entry[OldUpdatePositionArgs::kMemberIdFieldName].Number();
         memberIds2.insert(memberId);
         OpTime entryOpTime;
-        bsonExtractOpTimeField(entry, "optime", &entryOpTime);
+        bsonExtractOpTimeField(entry, OldUpdatePositionArgs::kOpTimeFieldName, &entryOpTime);
         ASSERT_EQUALS(optime, entryOpTime);
     }
     ASSERT_EQUALS(2U, memberIds2.size());
@@ -4025,34 +4074,32 @@ TEST_F(ReplCoordTest, OnlyForwardSyncProgressForOtherNodesWhenTheNodesAreBelieve
 
     // Check there is one entry in our UpdatePosition, since we shouldn't forward for a
     // DOWN node.
-    BSONObjBuilder cmdBuilder3;
-    getReplCoord()->prepareReplSetUpdatePositionCommand(&cmdBuilder3);
-    BSONObj cmd3 = cmdBuilder3.done();
+    BSONObj cmd3 = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
+        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle));
     std::set<long long> memberIds3;
-    BSONForEach(entryElement, cmd3["optimes"].Obj()) {
+    BSONForEach(entryElement, cmd3[UpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
         BSONObj entry = entryElement.Obj();
-        long long memberId = entry["memberId"].Number();
+        long long memberId = entry[UpdatePositionArgs::kMemberIdFieldName].Number();
         memberIds3.insert(memberId);
         OpTime appliedOpTime;
         OpTime durableOpTime;
-        bsonExtractOpTimeField(entry, "appliedOpTime", &appliedOpTime);
+        bsonExtractOpTimeField(entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime);
         ASSERT_EQUALS(optime, appliedOpTime);
-        bsonExtractOpTimeField(entry, "durableOpTime", &durableOpTime);
+        bsonExtractOpTimeField(entry, UpdatePositionArgs::kDurableOpTimeFieldName, &durableOpTime);
         ASSERT_EQUALS(optime, durableOpTime);
     }
     ASSERT_EQUALS(1U, memberIds3.size());
 
-    // Check that this true for old style (pre-3.2.2) UpdatePosition as well.
-    BSONObjBuilder cmdBuilder4;
-    getReplCoord()->prepareOldReplSetUpdatePositionCommand(&cmdBuilder4);
-    BSONObj cmd4 = cmdBuilder4.done();
+    // Check that this true for old style (pre-3.2.4) UpdatePosition as well.
+    BSONObj cmd4 = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
+        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kOldStyle));
     std::set<long long> memberIds4;
-    BSONForEach(entryElement, cmd4["optimes"].Obj()) {
+    BSONForEach(entryElement, cmd4[OldUpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
         BSONObj entry = entryElement.Obj();
-        long long memberId = entry["memberId"].Number();
+        long long memberId = entry[OldUpdatePositionArgs::kMemberIdFieldName].Number();
         memberIds4.insert(memberId);
         OpTime entryOpTime;
-        bsonExtractOpTimeField(entry, "optime", &entryOpTime);
+        bsonExtractOpTimeField(entry, OldUpdatePositionArgs::kOpTimeFieldName, &entryOpTime);
         ASSERT_EQUALS(optime, entryOpTime);
     }
     ASSERT_EQUALS(1U, memberIds4.size());
@@ -4085,16 +4132,23 @@ TEST_F(ReplCoordTest, StepDownWhenHandleLivenessTimeoutMarksAMajorityOfVotingNod
 
     // Receive notification that every node is up.
     OldUpdatePositionArgs args;
-    ASSERT_OK(args.initialize(
-        BSON("replSetUpdatePosition"
-             << 1 << "optimes" << BSON_ARRAY(BSON("cfgver" << 2 << "memberId" << 1 << "optime"
-                                                           << startingOpTime.getTimestamp())
-                                             << BSON("cfgver" << 2 << "memberId" << 2 << "optime"
-                                                              << startingOpTime.getTimestamp())
-                                             << BSON("cfgver" << 2 << "memberId" << 3 << "optime"
-                                                              << startingOpTime.getTimestamp())
-                                             << BSON("cfgver" << 2 << "memberId" << 4 << "optime"
-                                                              << startingOpTime.getTimestamp())))));
+    ASSERT_OK(args.initialize(BSON(
+        OldUpdatePositionArgs::kCommandFieldName
+        << 1 << OldUpdatePositionArgs::kUpdateArrayFieldName
+        << BSON_ARRAY(
+               BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                    << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 1
+                    << OldUpdatePositionArgs::kOpTimeFieldName << startingOpTime.getTimestamp())
+               << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                       << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 2
+                       << OldUpdatePositionArgs::kOpTimeFieldName << startingOpTime.getTimestamp())
+               << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                       << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 3
+                       << OldUpdatePositionArgs::kOpTimeFieldName << startingOpTime.getTimestamp())
+               << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                       << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 4
+                       << OldUpdatePositionArgs::kOpTimeFieldName
+                       << startingOpTime.getTimestamp())))));
 
     ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, 0));
     // Become PRIMARY.
@@ -4103,11 +4157,16 @@ TEST_F(ReplCoordTest, StepDownWhenHandleLivenessTimeoutMarksAMajorityOfVotingNod
     // Keep two nodes alive.
     OldUpdatePositionArgs args1;
     ASSERT_OK(args1.initialize(
-        BSON("replSetUpdatePosition"
-             << 1 << "optimes" << BSON_ARRAY(BSON("cfgver" << 2 << "memberId" << 1 << "optime"
-                                                           << startingOpTime.getTimestamp())
-                                             << BSON("cfgver" << 2 << "memberId" << 2 << "optime"
-                                                              << startingOpTime.getTimestamp())))));
+        BSON(OldUpdatePositionArgs::kCommandFieldName
+             << 1 << OldUpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 1
+                                << OldUpdatePositionArgs::kOpTimeFieldName
+                                << startingOpTime.getTimestamp())
+                           << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                   << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 2
+                                   << OldUpdatePositionArgs::kOpTimeFieldName
+                                   << startingOpTime.getTimestamp())))));
     ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args1, 0));
 
     // Confirm that the node remains PRIMARY after the other two nodes are marked DOWN.
@@ -4119,10 +4178,13 @@ TEST_F(ReplCoordTest, StepDownWhenHandleLivenessTimeoutMarksAMajorityOfVotingNod
 
     // Keep one node alive via two methods (UpdatePosition and requestHeartbeat).
     OldUpdatePositionArgs args2;
-    ASSERT_OK(args2.initialize(
-        BSON("replSetUpdatePosition"
-             << 1 << "optimes" << BSON_ARRAY(BSON("cfgver" << 2 << "memberId" << 1 << "optime"
-                                                           << startingOpTime.getTimestamp())))));
+    ASSERT_OK(
+        args2.initialize(BSON(OldUpdatePositionArgs::kCommandFieldName
+                              << 1 << OldUpdatePositionArgs::kUpdateArrayFieldName
+                              << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                                 << 2 << OldUpdatePositionArgs::kMemberIdFieldName
+                                                 << 1 << OldUpdatePositionArgs::kOpTimeFieldName
+                                                 << startingOpTime.getTimestamp())))));
     ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args2, 0));
 
     ReplSetHeartbeatArgs hbArgs;
@@ -4232,24 +4294,38 @@ TEST_F(ReplCoordTest, UpdatePositionArgsReturnsNoSuchKeyWhenParsingOldUpdatePosi
     ASSERT_EQUALS(
         ErrorCodes::NoSuchKey,
         args2.initialize(BSON(
-            "replSetUpdatePosition"
-            << 1 << "optimes"
+            OldUpdatePositionArgs::kCommandFieldName
+            << 1 << OldUpdatePositionArgs::kUpdateArrayFieldName
             << BSON_ARRAY(
-                   BSON("cfgver" << 2 << "memberId" << 1 << "optime" << opTime.getTimestamp())
-                   << BSON("cfgver" << 2 << "memberId" << 2 << "optime" << opTime.getTimestamp())
-                   << BSON("cfgver" << 2 << "memberId" << 3 << "optime" << opTime.getTimestamp())
-                   << BSON("cfgver" << 2 << "memberId" << 4 << "optime"
-                                    << opTime.getTimestamp())))));
+                   BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                        << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 1
+                        << OldUpdatePositionArgs::kOpTimeFieldName << opTime.getTimestamp())
+                   << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                           << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 2
+                           << OldUpdatePositionArgs::kOpTimeFieldName << opTime.getTimestamp())
+                   << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                           << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 3
+                           << OldUpdatePositionArgs::kOpTimeFieldName << opTime.getTimestamp())
+                   << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                           << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 4
+                           << OldUpdatePositionArgs::kOpTimeFieldName << opTime.getTimestamp())))));
 
-    ASSERT_OK(args.initialize(
-        BSON("replSetUpdatePosition"
-             << 1 << "optimes"
-             << BSON_ARRAY(
-                    BSON("cfgver" << 2 << "memberId" << 1 << "optime" << opTime.getTimestamp())
-                    << BSON("cfgver" << 2 << "memberId" << 2 << "optime" << opTime.getTimestamp())
-                    << BSON("cfgver" << 2 << "memberId" << 3 << "optime" << opTime.getTimestamp())
-                    << BSON("cfgver" << 2 << "memberId" << 4 << "optime"
-                                     << opTime.getTimestamp())))));
+    ASSERT_OK(args.initialize(BSON(
+        OldUpdatePositionArgs::kCommandFieldName
+        << 1 << OldUpdatePositionArgs::kUpdateArrayFieldName
+        << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                           << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 1
+                           << OldUpdatePositionArgs::kOpTimeFieldName << opTime.getTimestamp())
+                      << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                              << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 2
+                              << OldUpdatePositionArgs::kOpTimeFieldName << opTime.getTimestamp())
+                      << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                              << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 3
+                              << OldUpdatePositionArgs::kOpTimeFieldName << opTime.getTimestamp())
+                      << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                              << 2 << OldUpdatePositionArgs::kMemberIdFieldName << 4
+                              << OldUpdatePositionArgs::kOpTimeFieldName
+                              << opTime.getTimestamp())))));
 }
 
 
@@ -4257,46 +4333,61 @@ TEST_F(ReplCoordTest, OldUpdatePositionArgsReturnsBadValueWhenParsingUpdatePosit
     OldUpdatePositionArgs args;
     UpdatePositionArgs args2;
     OpTime opTime = OpTime(Timestamp(100, 1), 0);
-    ASSERT_EQUALS(
-        ErrorCodes::BadValue,
-        args.initialize(BSON(
-            "replSetUpdatePosition"
-            << 1 << "optimes"
-            << BSON_ARRAY(BSON("cfgver" << 2 << "memberId" << 1 << "durableOpTime"
-                                        << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                        << "appliedOpTime"
-                                        << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                          << BSON("cfgver" << 2 << "memberId" << 2 << "durableOpTime"
-                                           << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                           << "appliedOpTime"
-                                           << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                          << BSON("cfgver" << 2 << "memberId" << 3 << "durableOpTime"
-                                           << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                           << "appliedOpTime"
-                                           << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                          << BSON("cfgver" << 2 << "memberId" << 4 << "durableOpTime"
-                                           << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                           << "appliedOpTime"
-                                           << BSON("ts" << opTime.getTimestamp() << "t" << 3))))));
-    ASSERT_OK(args2.initialize(
-        BSON("replSetUpdatePosition"
-             << 1 << "optimes"
-             << BSON_ARRAY(BSON("cfgver" << 2 << "memberId" << 1 << "durableOpTime"
+    ASSERT_EQUALS(ErrorCodes::BadValue,
+                  args.initialize(BSON(
+                      UpdatePositionArgs::kCommandFieldName
+                      << 1 << UpdatePositionArgs::kUpdateArrayFieldName
+                      << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                         << 2 << UpdatePositionArgs::kMemberIdFieldName << 1
+                                         << UpdatePositionArgs::kDurableOpTimeFieldName
                                          << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                         << "appliedOpTime"
+                                         << UpdatePositionArgs::kAppliedOpTimeFieldName
                                          << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                           << BSON("cfgver" << 2 << "memberId" << 2 << "durableOpTime"
+                                    << BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                            << 2 << UpdatePositionArgs::kMemberIdFieldName << 2
+                                            << UpdatePositionArgs::kDurableOpTimeFieldName
                                             << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                            << "appliedOpTime"
+                                            << UpdatePositionArgs::kAppliedOpTimeFieldName
                                             << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                           << BSON("cfgver" << 2 << "memberId" << 3 << "durableOpTime"
+                                    << BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                            << 2 << UpdatePositionArgs::kMemberIdFieldName << 3
+                                            << UpdatePositionArgs::kDurableOpTimeFieldName
                                             << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                            << "appliedOpTime"
+                                            << UpdatePositionArgs::kAppliedOpTimeFieldName
                                             << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                           << BSON("cfgver" << 2 << "memberId" << 4 << "durableOpTime"
+                                    << BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                            << 2 << UpdatePositionArgs::kMemberIdFieldName << 4
+                                            << UpdatePositionArgs::kDurableOpTimeFieldName
                                             << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                            << "appliedOpTime"
+                                            << UpdatePositionArgs::kAppliedOpTimeFieldName
                                             << BSON("ts" << opTime.getTimestamp() << "t" << 3))))));
+    ASSERT_OK(args2.initialize(
+        BSON(UpdatePositionArgs::kCommandFieldName
+             << 1 << UpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                << 2 << UpdatePositionArgs::kMemberIdFieldName << 1
+                                << UpdatePositionArgs::kDurableOpTimeFieldName
+                                << BSON("ts" << opTime.getTimestamp() << "t" << 3)
+                                << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                << BSON("ts" << opTime.getTimestamp() << "t" << 3))
+                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                   << 2 << UpdatePositionArgs::kMemberIdFieldName << 2
+                                   << UpdatePositionArgs::kDurableOpTimeFieldName
+                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3)
+                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3))
+                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                   << 2 << UpdatePositionArgs::kMemberIdFieldName << 3
+                                   << UpdatePositionArgs::kDurableOpTimeFieldName
+                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3)
+                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3))
+                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                   << 2 << UpdatePositionArgs::kMemberIdFieldName << 4
+                                   << UpdatePositionArgs::kDurableOpTimeFieldName
+                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3)
+                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3))))));
 }
 
 TEST_F(
@@ -4385,6 +4476,283 @@ TEST_F(ReplCoordTest, PopulateUnsetWriteConcernOptionsSyncModeReturnsInputIfWMod
     ASSERT(WriteConcernOptions::SyncMode::NONE ==
            getReplCoord()->populateUnsetWriteConcernOptionsSyncMode(wc).syncMode);
 }
+
+namespace {
+void selectSyncSource(ReplicationCoordinatorImpl* replCoord, SyncSourceResolverResponse* resp) {
+    OperationContextNoop txn;
+    OpTime opTime = OpTime(Timestamp(100, 1), 0);
+    *resp = replCoord->selectSyncSource(&txn, opTime);
+}
+}  // namespace
+
+/*
+TEST_F(ReplCoordTest, SelectSyncSourceReturnsStatusOkAndAnEmptyHostWhenNoViableHostExists) {
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("host"
+                                               << "node1:12345"
+                                               << "_id" << 0)
+                                          << BSON("host"
+                                                  << "node2:12345"
+                                                  << "_id" << 1) << BSON("host"
+                                                                         << "node3:12345"
+                                                                         << "_id" << 2))),
+                       HostAndPort("node1", 12345));
+
+    OperationContextReplMock txn;
+
+    simulateEnoughHeartbeatsForAllNodesUp();
+
+    SyncSourceResolverResponse resp;
+    stdx::thread selectSyncSourceThread(selectSyncSource, getReplCoord(), &resp);
+
+    selectSyncSourceThread.join();
+    ASSERT(resp.isOK());
+    ASSERT_EQUALS(HostAndPort(), resp.getSyncSource());
+}
+
+class ReplCoordSelectSyncSourceTest : public ReplCoordTest {
+public:
+    virtual void setUp() {
+        ReplCoordTest::setUp();
+        // Start with a two node config and two rounds of heartbeats.
+        assertStartSuccess(BSON("_id"
+                                << "mySet"
+                                << "version" << 2 << "members"
+                                << BSON_ARRAY(BSON("host"
+                                                   << "node1:12345"
+                                                   << "_id" << 0)
+                                              << BSON("host"
+                                                      << "node2:12345"
+                                                      << "_id" << 1) << BSON("host"
+                                                                             << "node3:12345"
+                                                                             << "_id" << 2))),
+                           HostAndPort("node1", 12345));
+
+        OperationContextReplMock txn;
+
+        simulateEnoughHeartbeatsForAllNodesUp();
+        ASSERT_TRUE(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+
+        auto net = getNet();
+        net->enterNetwork();
+        net->runUntil(net->now() + Seconds(10));
+        net->exitNetwork();
+        simulateEnoughHeartbeatsForAllNodesUp();
+    }
+};
+
+TEST_F(ReplCoordSelectSyncSourceTest,
+       SelectSyncSourceReturnsStatusOkAndTheFoundHostWhenAnEligibleSyncSourceExists) {
+    SyncSourceResolverResponse resp;
+    stdx::thread selectSyncSourceThread(selectSyncSource, getReplCoord(), &resp);
+
+    auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
+
+    auto net = getNet();
+    bool done = false;
+    while (!done) {
+        net->enterNetwork();
+        if (!net->hasReadyRequests()) {
+            net->runUntil(net->now() + Seconds(10));
+        } else {
+            auto noi = net->getNextReadyRequest();
+            const auto& request = noi->getRequest();
+
+            if (request.cmdObj.firstElement().fieldNameStringData() == "find") {
+                net->scheduleResponse(
+                    noi,
+                    net->now(),
+                    makeResponseStatus(BSON(
+                        "cursor" << BSON("id" << 7LL << "ns"
+                                              << "local.oplog.rs"
+                                              << "firstBatch"
+                                              << BSON_ARRAY(BSON("ts" << Timestamp(10, 2) << "t"
+                                                                      << 0))) << "ok" << 1)));
+                done = true;
+            } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetHeartbeat") {
+                ReplSetHeartbeatResponse hbResp;
+                hbResp.setSetName(rsConfig.getReplSetName());
+                hbResp.setState(MemberState::RS_SECONDARY);
+                hbResp.setConfigVersion(rsConfig.getConfigVersion());
+                hbResp.setAppliedOpTime(OpTime(Timestamp(100, 2), 0));
+                BSONObjBuilder respObj;
+                net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+            } else {
+                log() << "request to " << request.target << " which was " << request.cmdObj;
+                net->blackHole(noi);
+            }
+        }
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+    }
+    selectSyncSourceThread.join();
+    ASSERT(resp.isOK());
+    ASSERT_EQUALS(HostAndPort("node3", 12345), resp.getSyncSource());
+}
+
+TEST_F(ReplCoordSelectSyncSourceTest,
+       SelectSyncSourceWillTryOtherSourcesWhenTheFirstNodeDoesNotHaveOldEnoughData) {
+    SyncSourceResolverResponse resp;
+    stdx::thread selectSyncSourceThread(selectSyncSource, getReplCoord(), &resp);
+
+    auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
+
+    auto net = getNet();
+    int trials = 2;
+    while (trials) {
+        net->enterNetwork();
+        if (!net->hasReadyRequests()) {
+            net->runUntil(net->now() + Seconds(10));
+        } else {
+            auto noi = net->getNextReadyRequest();
+            const auto& request = noi->getRequest();
+
+            if (request.cmdObj.firstElement().fieldNameStringData() == "find") {
+                // The first timestamp will be too high, but the second will be low enough.
+                net->scheduleResponse(
+                    noi,
+                    net->now(),
+                    makeResponseStatus(
+                        BSON("cursor"
+                             << BSON("id" << 7LL << "ns"
+                                          << "local.oplog.rs"
+                                          << "firstBatch"
+                                          << BSON_ARRAY(BSON("ts" << Timestamp(55 * trials, 2)
+                                                                  << "t" << 0))) << "ok" << 1)));
+                trials--;
+            } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetHeartbeat") {
+                ReplSetHeartbeatResponse hbResp;
+                hbResp.setSetName(rsConfig.getReplSetName());
+                hbResp.setState(MemberState::RS_SECONDARY);
+                hbResp.setConfigVersion(rsConfig.getConfigVersion());
+                hbResp.setAppliedOpTime(OpTime(Timestamp(100, 2), 0));
+                BSONObjBuilder respObj;
+                net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+            } else {
+                log() << "request to " << request.target << " which was " << request.cmdObj;
+                net->blackHole(noi);
+            }
+        }
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+    }
+    selectSyncSourceThread.join();
+    ASSERT(resp.isOK());
+    ASSERT_EQUALS(HostAndPort("node2", 12345), resp.getSyncSource());
+}
+
+TEST_F(
+    ReplCoordSelectSyncSourceTest,
+    SelectSyncSourceWillReturnOplogStartMissingAndTheEarliestOpTimeAvailableWhenAllSourcesAreTooFresh)
+{
+    SyncSourceResolverResponse resp;
+    stdx::thread selectSyncSourceThread(selectSyncSource, getReplCoord(), &resp);
+
+    auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
+
+    auto net = getNet();
+    int trials = 2;
+    while (trials) {
+        net->enterNetwork();
+        if (!net->hasReadyRequests()) {
+            net->runUntil(net->now() + Seconds(10));
+        } else {
+            auto noi = net->getNextReadyRequest();
+            const auto& request = noi->getRequest();
+
+            if (request.cmdObj.firstElement().fieldNameStringData() == "find") {
+                // All timestamps will be too high.
+                net->scheduleResponse(
+                    noi,
+                    net->now(),
+                    makeResponseStatus(BSON(
+                        "cursor" << BSON("id" << 7LL << "ns"
+                                              << "local.oplog.rs"
+                                              << "firstBatch"
+                                              << BSON_ARRAY(BSON("ts" << Timestamp(550, 2) << "t"
+                                                                      << 0))) << "ok" << 1)));
+                trials--;
+            } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetHeartbeat") {
+                ReplSetHeartbeatResponse hbResp;
+                hbResp.setSetName(rsConfig.getReplSetName());
+                hbResp.setState(MemberState::RS_SECONDARY);
+                hbResp.setConfigVersion(rsConfig.getConfigVersion());
+                hbResp.setAppliedOpTime(OpTime(Timestamp(100, 2), 0));
+                BSONObjBuilder respObj;
+                net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+            } else {
+                log() << "request to " << request.target << " which was " << request.cmdObj;
+                net->blackHole(noi);
+            }
+        }
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+    }
+    selectSyncSourceThread.join();
+    ASSERT_EQUALS(ErrorCodes::OplogStartMissing, resp.syncSourceStatus);
+    ASSERT_EQUALS(OpTime(Timestamp(550, 2), 0), resp.earliestOpTimeSeen);
+}
+
+
+TEST_F(ReplCoordSelectSyncSourceTest,
+       SelectSyncSourceWillTryOtherSourcesWhenTheFirstNodeHasANetworkError) {
+    SyncSourceResolverResponse resp;
+    stdx::thread selectSyncSourceThread(selectSyncSource, getReplCoord(), &resp);
+
+    auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
+
+    auto net = getNet();
+    int trials = 2;
+    while (trials) {
+        net->enterNetwork();
+        if (!net->hasReadyRequests()) {
+            net->runUntil(net->now() + Seconds(10));
+        } else {
+            auto noi = net->getNextReadyRequest();
+            const auto& request = noi->getRequest();
+
+            if (request.cmdObj.firstElement().fieldNameStringData() == "find") {
+                // The first response will fail. The second will be good enough.
+                if (trials > 1) {
+                    net->scheduleResponse(
+                        noi,
+                        net->now(),
+                        {ErrorCodes::HostUnreachable, "Sad message from the network :("});
+                } else {
+                    net->scheduleResponse(
+                        noi,
+                        net->now(),
+                        makeResponseStatus(BSON(
+                            "cursor" << BSON("id" << 7LL << "ns"
+                                                  << "local.oplog.rs"
+                                                  << "firstBatch"
+                                                  << BSON_ARRAY(BSON("ts" << Timestamp(55, 2) << "t"
+                                                                          << 0))) << "ok" << 1)));
+                }
+                trials--;
+            } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetHeartbeat") {
+                ReplSetHeartbeatResponse hbResp;
+                hbResp.setSetName(rsConfig.getReplSetName());
+                hbResp.setState(MemberState::RS_SECONDARY);
+                hbResp.setConfigVersion(rsConfig.getConfigVersion());
+                hbResp.setAppliedOpTime(OpTime(Timestamp(100, 2), 0));
+                BSONObjBuilder respObj;
+                net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+            } else {
+                log() << "request to " << request.target << " which was " << request.cmdObj;
+                net->blackHole(noi);
+            }
+        }
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+    }
+    selectSyncSourceThread.join();
+    ASSERT(resp.isOK());
+    ASSERT_EQUALS(HostAndPort("node2", 12345), resp.getSyncSource());
+}
+*/
 
 // TODO(schwerin): Unit test election id updating
 }  // namespace

@@ -65,7 +65,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/stats/counters.h"
@@ -119,13 +119,15 @@ private:
     std::unique_ptr<WriteErrorDetail> _error;
 };
 
-WCErrorDetail* toWriteConcernError(const Status& wcStatus, const WriteConcernResult& wcResult) {
-    WCErrorDetail* wcError = new WCErrorDetail;
+unique_ptr<WCErrorDetail> toWriteConcernError(const Status& wcStatus,
+                                              const WriteConcernResult& wcResult) {
+    auto wcError = stdx::make_unique<WCErrorDetail>();
 
     wcError->setErrCode(wcStatus.code());
     wcError->setErrMessage(wcStatus.reason());
-    if (wcResult.wTimedOut)
+    if (wcResult.wTimedOut) {
         wcError->setErrInfo(BSON("wtimeout" << true));
+    }
 
     return wcError;
 }
@@ -195,36 +197,24 @@ bool checkShardVersion(OperationContext* txn,
     const NamespaceString& nss = request.getTargetingNSS();
     dassert(txn->lockState()->isCollectionLockedForMode(nss.ns(), MODE_IX));
 
-    if (!request.hasShardVersion()) {
-        // Request is unsharded;
+    auto& oss = OperationShardingState::get(txn);
+
+    if (!oss.hasShardVersion()) {
         return true;
     }
 
-    // If sharding metadata was specified by the caller, the sharding state must have been
-    // initialized already. Otherwise we must fail the request so the query is not silently
-    // treated as unsharded.
+    ChunkVersion operationShardVersion = oss.getShardVersion(nss);
+    if (ChunkVersion::isIgnoredVersion(operationShardVersion)) {
+        return true;
+    }
+
     ShardingState* shardingState = ShardingState::get(txn);
-    if (!shardingState->enabled()) {
-        // Being in this state is really a bug on the caller side (most likely mongos), unless
-        // this is a test or someone manually constructing commands with sharding fields using the
-        // shell.
-        result->setError(toWriteError({ErrorCodes::NotYetInitialized,
-                                       "Request contains sharding metadata, but the server has not "
-                                       "been made sharding aware."}));
-        return false;
-    }
-
-    ChunkVersion requestShardVersion = request.getShardVersion();
-    if (ChunkVersion::isIgnoredVersion(requestShardVersion)) {
-        return true;
-    }
-
     CollectionMetadataPtr metadata = shardingState->getCollectionMetadata(nss.ns());
     ChunkVersion shardVersion = metadata ? metadata->getShardVersion() : ChunkVersion::UNSHARDED();
 
-    if (!requestShardVersion.isWriteCompatibleWith(shardVersion)) {
+    if (!operationShardVersion.isWriteCompatibleWith(shardVersion)) {
         result->setError(new WriteErrorDetail);
-        buildStaleError(requestShardVersion, shardVersion, result->getError());
+        buildStaleError(operationShardVersion, shardVersion, result->getError());
         return false;
     }
 
@@ -304,16 +294,6 @@ void WriteBatchExecutor::executeBatch(const BatchedCommandRequest& request,
     OwnedPointerVector<BatchedUpsertDetail> upsertedOwned;
     vector<BatchedUpsertDetail*>& upserted = upsertedOwned.mutableVector();
 
-    // If the request has a shard version, but the operation doesn't have a shard version, this
-    // means it came from an old mongos instance (pre 3.2) that set the version in the "metadata"
-    // field instead of at the top level. Set the value in order to ensure the
-    // dependent code works.
-    // TODO(spencer): Remove this after 3.2 ships.
-    OperationShardVersion& operationShardVersion = OperationShardVersion::get(_txn);
-    if (request.hasShardVersion() && !operationShardVersion.hasShardVersion()) {
-        operationShardVersion.setShardVersion(request.getTargetingNSS(), request.getShardVersion());
-    }
-
     //
     // Apply each batch item, possibly bulking some items together in the write lock.
     // Stops on error if batch is ordered.
@@ -326,21 +306,20 @@ void WriteBatchExecutor::executeBatch(const BatchedCommandRequest& request,
     // If something failed, we have already set the lastOp to be the last op to have succeeded
     // and written to the oplog.
 
-    unique_ptr<WCErrorDetail> wcError;
     {
         stdx::lock_guard<Client> lk(*_txn->getClient());
         CurOp::get(_txn)->setMessage_inlock("waiting for write concern");
     }
 
+    unique_ptr<WCErrorDetail> wcError;
     WriteConcernResult res;
     Status status =
         waitForWriteConcern(_txn,
                             repl::ReplClientInfo::forClient(_txn->getClient()).getLastOp(),
                             _txn->getWriteConcern(),
                             &res);
-
     if (!status.isOK()) {
-        wcError.reset(toWriteConcernError(status, res));
+        wcError = toWriteConcernError(status, res);
     }
 
     //
@@ -352,8 +331,9 @@ void WriteBatchExecutor::executeBatch(const BatchedCommandRequest& request,
 
     if (staleBatch) {
         ShardingState* shardingState = ShardingState::get(_txn);
-        const ChunkVersion& requestShardVersion =
-            operationShardVersion.getShardVersion(request.getTargetingNSS());
+
+        auto& oss = OperationShardingState::get(_txn);
+        ChunkVersion requestShardVersion = oss.getShardVersion(request.getTargetingNSS());
 
         //
         // First, we refresh metadata if we need to based on the requested version.
@@ -1124,12 +1104,6 @@ static void multiUpdate(OperationContext* txn,
     // Updates from the write commands path can yield.
     request.setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
-    boost::optional<OperationShardVersion::IgnoreVersioningBlock> maybeIgnoreVersion;
-    if (isMulti) {
-        // Multi-updates are unversioned.
-        maybeIgnoreVersion.emplace(txn, nsString);
-    }
-
     auto client = txn->getClient();
     auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
     ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
@@ -1310,12 +1284,6 @@ static void multiRemove(OperationContext* txn,
     // Deletes running through the write commands path can yield.
     request.setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
-    boost::optional<OperationShardVersion::IgnoreVersioningBlock> maybeIgnoreVersion;
-    if (request.isMulti()) {
-        // Multi-removes are unversioned.
-        maybeIgnoreVersion.emplace(txn, nss);
-    }
-
     auto client = txn->getClient();
     auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
     ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
@@ -1364,7 +1332,9 @@ static void multiRemove(OperationContext* txn,
 
             PlanSummaryStats summary;
             Explain::getSummaryStats(*exec, &summary);
-            collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+            if (collection) {
+                collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+            }
             CurOp::get(txn)->debug().fromMultiPlanner = summary.fromMultiPlanner;
             CurOp::get(txn)->debug().replanned = summary.replanned;
 

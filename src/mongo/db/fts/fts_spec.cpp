@@ -193,7 +193,7 @@ void FTSSpec::_scoreStringV2(FTSTokenizer* tokenizer,
     tokenizer->reset(raw.rawData(), FTSTokenizer::kFilterStopWords);
 
     while (tokenizer->moveNext()) {
-        string term = tokenizer->get().toString();
+        StringData term = tokenizer->get();
 
         ScoreHelperStruct& data = terms[term];
 
@@ -364,7 +364,10 @@ BSONObj FTSSpec::fixSpec(const BSONObj& spec) {
     {
         BSONObjBuilder b;
         for (map<string, int>::iterator i = m.begin(); i != m.end(); ++i) {
-            uassert(16674, "score for word too high", i->second > 0 && i->second < MAX_WORD_WEIGHT);
+            uassert(16674,
+                    str::stream() << "text index weight must be in the exclusive interval (0,"
+                                  << MAX_WORD_WEIGHT << ") but found: " << i->second,
+                    i->second > 0 && i->second < MAX_WORD_WEIGHT);
 
             // Verify weight refers to a valid field.
             if (i->first != "$**") {

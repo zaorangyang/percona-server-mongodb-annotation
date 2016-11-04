@@ -50,7 +50,6 @@
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/batched_update_request.h"
-#include "mongo/s/write_ops/wc_error_detail.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -60,7 +59,6 @@ using std::vector;
 
 namespace {
 
-const char kCmdResponseWriteConcernField[] = "writeConcernError";
 const char kFindAndModifyResponseResultDocField[] = "value";
 const char kLocalTimeField[] = "localTime";
 const ReadPreferenceSetting kReadPref(ReadPreference::PrimaryOnly, TagSet());
@@ -82,26 +80,6 @@ StatusWith<BSONObj> extractFindAndModifyNewObj(const BSONObj& responseObj) {
 
     if (!cmdStatus.isOK()) {
         return cmdStatus;
-    }
-
-    BSONElement wcErrorElem;
-    auto wcErrStatus =
-        bsonExtractTypedField(responseObj, kCmdResponseWriteConcernField, Object, &wcErrorElem);
-
-    if (wcErrStatus.isOK()) {
-        BSONObj wcErrObj(wcErrorElem.Obj());
-        WCErrorDetail wcError;
-
-        string wcErrorParseMsg;
-        if (!wcError.parseBSON(wcErrObj, &wcErrorParseMsg)) {
-            return Status(ErrorCodes::UnsupportedFormat, wcErrorParseMsg);
-        }
-
-        return {ErrorCodes::WriteConcernFailed, wcError.getErrMessage()};
-    }
-
-    if (wcErrStatus != ErrorCodes::NoSuchKey) {
-        return wcErrStatus;
     }
 
     if (const auto& newDocElem = responseObj[kFindAndModifyResponseResultDocField]) {
@@ -347,7 +325,6 @@ Status DistLockCatalogImpl::unlockAll(OperationContext* txn, const std::string& 
     auto response = _client->runCommandOnConfigWithRetries(
         txn, "config", cmdObj, ShardRegistry::kAllRetriableErrors);
 
-
     if (!response.isOK()) {
         return response.getStatus();
     }
@@ -365,7 +342,7 @@ Status DistLockCatalogImpl::unlockAll(OperationContext* txn, const std::string& 
 
 StatusWith<DistLockCatalog::ServerInfo> DistLockCatalogImpl::getServerInfo(OperationContext* txn) {
     auto resultStatus =
-        _client->runCommandOnConfig(txn, kReadPref, "admin", BSON("serverStatus" << 1));
+        _client->runIdempotentCommandOnConfig(txn, kReadPref, "admin", BSON("serverStatus" << 1));
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();

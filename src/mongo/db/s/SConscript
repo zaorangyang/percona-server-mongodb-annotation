@@ -5,7 +5,6 @@ Import("env")
 env.Library(
     target='metadata',
     source=[
-        'operation_shard_version.cpp',
         'collection_metadata.cpp',
         'metadata_loader.cpp',
     ],
@@ -23,10 +22,12 @@ env.Library(
     target='migration_types',
     source=[
         'migration_session_id.cpp',
+        'start_chunk_clone_request.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
+        '$BUILD_DIR/mongo/s/common',
     ],
 )
 
@@ -34,9 +35,11 @@ env.Library(
     target='sharding',
     source=[
         'chunk_move_write_concern_options.cpp',
+        'collection_sharding_state.cpp',
         'migration_destination_manager.cpp',
         'migration_impl.cpp',
         'migration_source_manager.cpp',
+        'operation_sharding_state.cpp',
         'sharded_connection_info.cpp',
         'sharding_state.cpp',
         'sharding_state_recovery.cpp',
@@ -46,6 +49,7 @@ env.Library(
         '$BUILD_DIR/mongo/bson/util/bson_extract',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/s/sharding_initialization',
+        'metadata',
         'migration_types',
     ],
     LIBDEPS_TAGS=[
@@ -79,6 +83,7 @@ env.CppUnitTest(
     target='migration_types_test',
     source=[
         'migration_session_id_test.cpp',
+        'start_chunk_clone_request_test.cpp',
     ],
     LIBDEPS=[
         'migration_types',
@@ -96,8 +101,10 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/dbtests/mocklib',
-        '$BUILD_DIR/mongo/s/catalog/legacy/catalog_manager_legacy',
+        '$BUILD_DIR/mongo/s/catalog/replset/catalog_manager_replica_set_test_fixture',
         '$BUILD_DIR/mongo/s/coreshard',
         '$BUILD_DIR/mongo/s/mongoscore',
+        '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
+        '$BUILD_DIR/mongo/s/sharding_test_fixture',
     ]
 )

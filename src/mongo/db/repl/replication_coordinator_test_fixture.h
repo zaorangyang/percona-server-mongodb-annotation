@@ -214,6 +214,18 @@ protected:
     void replyToReceivedHeartbeat();
     void replyToReceivedHeartbeatV1();
 
+    /**
+     * Sets how the test fixture reports the storage engine's durability feature.
+     */
+    void setStorageEngineDurable(bool val = true) {
+        _isStorageEngineDurable = val;
+    }
+    bool isStorageEngineDurable() const {
+        return _isStorageEngineDurable;
+    }
+
+    void simulateEnoughHeartbeatsForAllNodesUp();
+
 private:
     std::unique_ptr<ReplicationCoordinatorImpl> _repl;
     // Owned by ReplicationCoordinatorImpl
@@ -227,6 +239,7 @@ private:
     ReplicationCoordinatorExternalStateMock* _externalState = nullptr;
     ReplSettings _settings;
     bool _callShutdown = false;
+    bool _isStorageEngineDurable = true;
 };
 
 }  // namespace repl

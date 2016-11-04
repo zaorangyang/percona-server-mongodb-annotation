@@ -305,7 +305,7 @@ functions:
           git clone git@github.com:10gen/jstestfuzz.git
 
           if [ "Windows_NT" != "$OS" ]; then
-            curl --verbose --max-time 600 --retry 10 --retry-max-time 900 http://boxes.10gen.com/build/node-v0.12.7-linux-x64.tar.gz --output node.tar.gz
+            ${python|python} jstestfuzz/etc/download_nodejs.py
             ${decompress} node.tar.gz > /dev/null
           fi
 
@@ -367,7 +367,7 @@ functions:
         rm -rf /data/install /data/multiversion
         # 3.2.1 is needed to check cross version compatibility as it is the final version
         # to use the old style replSetUpdatePosition command.
-        ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion ${multiversion_platform_arch|"Linux/x86_64"} "2.4" "2.6" "3.0" "3.2" "3.2.1"
+        ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion ${multiversion_platform_arch|"Linux/x86_64"} "2.6" "3.0" "3.2" "3.2.1"
 
 pre:
   - command: shell.track
@@ -1421,22 +1421,6 @@ tasks:
       resmoke_args: --suites=concurrency_sharded --storageEngine=wiredTiger
 
 - <<: *task_template
-  name: concurrency_sharded_sccc
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=concurrency_sharded_sccc --storageEngine=mmapv1
-
-- <<: *task_template
-  name: concurrency_sharded_sccc_WT
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=concurrency_sharded_sccc --storageEngine=wiredTiger
-
-- <<: *task_template
   name: concurrency_simultaneous
   commands:
   - func: "do setup"
@@ -1723,7 +1707,34 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=read_only
+      resmoke_args: --suites=read_only --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: read_only_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=read_only --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: read_only_sharded
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=read_only_sharded --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: read_only_sharded_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=read_only_sharded --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - name: push
@@ -2241,12 +2252,13 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: read_concern_majority_passthrough_WT
   - name: read_only
+  - name: read_only_WT
+  - name: read_only_sharded
+  - name: read_only_sharded_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replicasets_auth
@@ -2301,7 +2313,6 @@ buildvariants:
   - name: concurrency_WT
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: unittests
@@ -2377,12 +2388,6 @@ buildvariants:
     distros:
     - rhel55
   - name: concurrency_sharded_WT
-    distros:
-    - rhel55
-  - name: concurrency_sharded_sccc
-    distros:
-    - rhel55
-  - name: concurrency_sharded_sccc_WT
     distros:
     - rhel55
   - name: concurrency_simultaneous
@@ -2467,7 +2472,6 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_sharded
-  - name: concurrency_sharded_sccc
   - name: concurrency_simultaneous
   - name: replicasets
   - name: replicasets_auth
@@ -2523,7 +2527,6 @@ buildvariants:
   - name: concurrency_WT
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous_WT
   - name: replicasets_WT
   - name: replication_WT
@@ -2616,8 +2619,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -2724,8 +2725,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -2909,8 +2908,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -3074,8 +3071,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -3177,8 +3172,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: read_concern_majority_passthrough_WT
@@ -3276,12 +3269,6 @@ buildvariants:
   - name: concurrency_sharded_WT
     distros:
     - windows-64-vs2013-compile
-  - name: concurrency_sharded_sccc
-    distros:
-    - windows-64-vs2013-compile
-  - name: concurrency_sharded_sccc_WT
-    distros:
-    - windows-64-vs2013-compile
   - name: concurrency_simultaneous
     distros:
     - windows-64-vs2013-compile
@@ -3289,6 +3276,10 @@ buildvariants:
     distros:
     - windows-64-vs2013-compile
   - name: read_concern_majority_passthrough_WT
+  - name: read_only
+  - name: read_only_WT
+  - name: read_only_sharded
+  - name: read_only_sharded_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replication
@@ -3389,7 +3380,6 @@ buildvariants:
     - windows-64-vs2013-compile  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
   - name: concurrency_sharded
-  - name: concurrency_sharded_sccc
   - name: concurrency_simultaneous
   - name: jsCore
   - name: jsCore_auth
@@ -3471,8 +3461,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -3605,8 +3593,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -3701,8 +3687,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: read_concern_majority_passthrough_WT
@@ -3911,8 +3895,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: dbtest
@@ -3966,6 +3948,9 @@ buildvariants:
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
   - name: read_only
+  - name: read_only_WT
+  - name: read_only_sharded
+  - name: read_only_sharded_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replicasets_WT_ese
@@ -4139,8 +4124,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -4355,8 +4338,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -4529,8 +4510,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: dbtest
@@ -4576,6 +4555,10 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
+  - name: read_only
+  - name: read_only_WT
+  - name: read_only_sharded
+  - name: read_only_sharded_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replicasets_WT_ese
@@ -4751,8 +4734,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -4910,8 +4891,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -4968,8 +4947,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: dbtest
@@ -5204,8 +5181,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -5317,8 +5292,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets
@@ -5387,7 +5360,6 @@ buildvariants:
     - rhel62-build  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
   - name: concurrency_sharded
-  - name: concurrency_sharded_sccc
   - name: concurrency_simultaneous
   - name: dbtest
   - name: failpoints
@@ -5463,7 +5435,6 @@ buildvariants:
     - rhel62-build  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
   - name: concurrency_sharded
-  - name: concurrency_sharded_sccc
   - name: concurrency_simultaneous
   - name: dbtest
   - name: failpoints
@@ -5559,7 +5530,6 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_sharded
-  - name: concurrency_sharded_sccc
   - name: concurrency_simultaneous
   - name: replicasets
   - name: replicasets_auth
@@ -5613,8 +5583,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: dbtest
@@ -5663,6 +5631,9 @@ buildvariants:
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
   - name: read_only
+  - name: read_only_WT
+  - name: read_only_sharded
+  - name: read_only_sharded_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replicasets_WT_ese
@@ -5798,8 +5769,6 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  - name: concurrency_sharded_sccc
-  - name: concurrency_sharded_sccc_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: replicasets

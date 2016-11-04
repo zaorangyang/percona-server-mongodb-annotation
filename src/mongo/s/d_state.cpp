@@ -37,17 +37,15 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 #include "mongo/util/stringutils.h"
 
@@ -56,7 +54,6 @@ namespace mongo {
 using std::shared_ptr;
 using std::string;
 using std::stringstream;
-using std::vector;
 
 namespace {
 
@@ -141,13 +138,12 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        const string ns = cmdObj["getShardVersion"].valuestrsafe();
-        if (ns.size() == 0) {
-            errmsg = "need to specify full namespace";
-            return false;
+        const NamespaceString nss(cmdObj["getShardVersion"].valuestrsafe());
+        if (!nss.isValid()) {
+            uasserted(ErrorCodes::InvalidNamespace, "Command requires valid collection namespace");
         }
 
-        ShardingState* shardingState = ShardingState::get(txn);
+        ShardingState* const shardingState = ShardingState::get(txn);
 
         if (shardingState->enabled()) {
             result.append("configServer", shardingState->getConfigServer(txn).toString());
@@ -155,18 +151,27 @@ public:
             result.append("configServer", "");
         }
 
-        result.appendTimestamp("global", shardingState->getVersion(ns).toLong());
+        AutoGetCollection autoColl(txn, nss, MODE_IS);
+        CollectionShardingState* const css = CollectionShardingState::get(txn, nss);
+
+        shared_ptr<CollectionMetadata> metadata(css ? css->getMetadata() : nullptr);
+        if (metadata) {
+            result.appendTimestamp("global", metadata->getShardVersion().toLong());
+        } else {
+            result.appendTimestamp("global", ChunkVersion(0, 0, OID()).toLong());
+        }
 
         ShardedConnectionInfo* const info = ShardedConnectionInfo::get(txn->getClient(), false);
         result.appendBool("inShardedMode", info != NULL);
         if (info) {
-            result.appendTimestamp("mine", info->getVersion(ns).toLong());
+            result.appendTimestamp("mine", info->getVersion(nss.ns()).toLong());
         } else {
             result.appendTimestamp("mine", 0);
         }
 
         if (cmdObj["fullMetadata"].trueValue()) {
-            shared_ptr<CollectionMetadata> metadata = shardingState->getCollectionMetadata(ns);
+            shared_ptr<CollectionMetadata> metadata =
+                shardingState->getCollectionMetadata(nss.ns());
             if (metadata) {
                 result.append("metadata", metadata->toBSON());
             } else {
@@ -177,7 +182,7 @@ public:
         return true;
     }
 
-} getShardVersion;
+} getShardVersionCmd;
 
 class ShardingStateCmd : public Command {
 public:
@@ -209,138 +214,29 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        ScopedTransaction transaction(txn, MODE_IX);
-        Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-        OldClientContext ctx(txn, dbname);
-
         ShardingState::get(txn)->appendInfo(txn, result);
         return true;
     }
 
 } shardingStateCmd;
 
-/**
- * @ return true if not in sharded mode
-                 or if version for this client is ok
- */
-bool shardVersionOk(OperationContext* txn,
-                    const string& ns,
-                    string& errmsg,
-                    ChunkVersion& received,
-                    ChunkVersion& wanted) {
-    Client* client = txn->getClient();
-
-    // Operations using the DBDirectClient are unversioned.
-    if (client->isInDirectClient()) {
-        return true;
-    }
-
-    ShardingState* shardingState = ShardingState::get(client->getServiceContext());
-    if (!shardingState->enabled()) {
-        return true;
-    }
-
-    if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(nsToDatabase(ns))) {
-        // right now connections to secondaries aren't versioned at all
-        return true;
-    }
-
-    // If there is a version attached to the OperationContext, use it as the received version.
-    // Otherwise, get the received version from the ShardedConnectionInfo.
-    if (OperationShardVersion::get(txn).hasShardVersion()) {
-        received = OperationShardVersion::get(txn).getShardVersion(NamespaceString(ns));
-    } else {
-        ShardedConnectionInfo* info = ShardedConnectionInfo::get(client, false);
-        if (!info) {
-            // There is no shard version information on either 'txn' or 'client'. This means that
-            // the operation represented by 'txn' is unversioned, and the shard version is always OK
-            // for unversioned operations.
-            return true;
-        }
-
-        received = info->getVersion(ns);
-    }
-
-    if (ChunkVersion::isIgnoredVersion(received)) {
-        return true;
-    }
-
-    wanted = shardingState->getVersion(ns);
-
-    if (received.isWriteCompatibleWith(wanted))
-        return true;
-
-    //
-    // Figure out exactly why not compatible, send appropriate error message
-    // The versions themselves are returned in the error, so not needed in messages here
-    //
-
-    // Check epoch first, to send more meaningful message, since other parameters probably
-    // won't match either
-    if (!wanted.hasEqualEpoch(received)) {
-        errmsg = str::stream() << "version epoch mismatch detected for " << ns << ", "
-                               << "the collection may have been dropped and recreated";
-        return false;
-    }
-
-    if (!wanted.isSet() && received.isSet()) {
-        errmsg = str::stream() << "this shard no longer contains chunks for " << ns << ", "
-                               << "the collection may have been dropped";
-        return false;
-    }
-
-    if (wanted.isSet() && !received.isSet()) {
-        errmsg = str::stream() << "this shard contains versioned chunks for " << ns << ", "
-                               << "but no version set in request";
-        return false;
-    }
-
-    if (wanted.majorVersion() != received.majorVersion()) {
-        //
-        // Could be > or < - wanted is > if this is the source of a migration,
-        // wanted < if this is the target of a migration
-        //
-
-        errmsg = str::stream() << "version mismatch detected for " << ns << ", "
-                               << "stored major version " << wanted.majorVersion()
-                               << " does not match received " << received.majorVersion();
-        return false;
-    }
-
-    // Those are all the reasons the versions can mismatch
-    MONGO_UNREACHABLE;
-}
-
 }  // namespace
 
-bool haveLocalShardingInfo(Client* client, const string& ns) {
-    if (!ShardingState::get(client->getServiceContext())->enabled())
+bool haveLocalShardingInfo(OperationContext* txn, const string& ns) {
+    if (!ShardingState::get(txn)->enabled()) {
         return false;
-
-    if (!ShardingState::get(client->getServiceContext())->hasVersion(ns))
-        return false;
-
-    return ShardedConnectionInfo::get(client, false) != NULL;
-}
-
-void ensureShardVersionOKOrThrow(OperationContext* txn, const std::string& ns) {
-    string errmsg;
-    ChunkVersion received;
-    ChunkVersion wanted;
-    if (!shardVersionOk(txn, ns, errmsg, received, wanted)) {
-        StringBuilder sb;
-        sb << "[" << ns << "] shard version not ok: " << errmsg;
-        throw SendStaleConfigException(ns, sb.str(), received, wanted);
     }
+
+    auto css = CollectionShardingState::get(txn, ns);
+    if (!css->getMetadata()) {
+        return false;
+    }
+
+    return ShardedConnectionInfo::get(txn->getClient(), false) != nullptr;
 }
 
 void usingAShardConnection(const string& addr) {}
 
-void saveGLEStats(const BSONObj& result, StringData hostString) {
-    // Declared in cluster_last_error_info.h.
-    //
-    // This can be called in mongod, which is unfortunate.  To fix this,
-    // we can redesign how connection pooling works on mongod for sharded operations.
-}
+void saveGLEStats(const BSONObj& result, StringData hostString) {}
 
 }  // namespace mongo

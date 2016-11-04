@@ -433,15 +433,15 @@ TEST_F(AddShardTest, StandaloneGenerateName) {
 TEST_F(AddShardTest, AddSCCCConnectionStringAsShard) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
         stdx::make_unique<RemoteCommandTargeterMock>());
-    auto scccConn =
-        ConnectionString(ConnectionString::SYNC, "host1:12345,host2:12345,host3:12345", "");
-    targeter->setConnectionStringReturnValue(scccConn);
+    auto invalidConn =
+        ConnectionString("host1:12345,host2:12345,host3:12345", ConnectionString::INVALID);
+    targeter->setConnectionStringReturnValue(invalidConn);
 
-    auto future = launchAsync([this, scccConn] {
+    auto future = launchAsync([this, invalidConn] {
         const std::string shardName("StandaloneShard");
-        auto status = catalogManager()->addShard(operationContext(), &shardName, scccConn, 100);
+        auto status = catalogManager()->addShard(operationContext(), &shardName, invalidConn, 100);
         ASSERT_EQUALS(ErrorCodes::BadValue, status);
-        ASSERT_STRING_CONTAINS(status.getStatus().reason(), "can't use sync cluster as a shard");
+        ASSERT_STRING_CONTAINS(status.getStatus().reason(), "Invalid connection string");
     });
 
     future.timed_get(kFutureTimeout);
@@ -485,10 +485,12 @@ TEST_F(AddShardTest, UnreachableHost) {
         ASSERT_EQUALS("host unreachable", status.getStatus().reason());
     });
 
-    onCommandForAddShard([](const RemoteCommandRequest& request) {
-        ASSERT_EQ(request.target, HostAndPort("StandaloneHost:12345"));
-        return StatusWith<BSONObj>{ErrorCodes::HostUnreachable, "host unreachable"};
-    });
+    for (int i = 0; i < 3; i++) {  // ShardRegistry will retry 3 times
+        onCommandForAddShard([](const RemoteCommandRequest& request) {
+            ASSERT_EQ(request.target, HostAndPort("StandaloneHost:12345"));
+            return StatusWith<BSONObj>{ErrorCodes::HostUnreachable, "host unreachable"};
+        });
+    }
 
     future.timed_get(kFutureTimeout);
 }

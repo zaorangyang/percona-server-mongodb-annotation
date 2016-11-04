@@ -57,7 +57,9 @@ public:
                        bool durable,
                        bool ephemeral,
                        bool repair,
+                       bool readOnly,
                        bool cacheInMB = false);
+
     virtual ~WiredTigerKVEngine();
 
     void setRecordStoreExtraOptions(const std::string& options);
@@ -71,7 +73,7 @@ public:
         return _durable;
     }
 
-    virtual bool isEphemeral() {
+    virtual bool isEphemeral() const {
         return _ephemeral;
     }
 
@@ -177,6 +179,7 @@ private:
 
     bool _durable;
     bool _ephemeral;
+    bool _readOnly;
     std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
 
     std::string _rsOptions;

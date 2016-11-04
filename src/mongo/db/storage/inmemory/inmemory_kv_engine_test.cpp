@@ -34,13 +34,14 @@ namespace {
 class InMemoryKVHarnessHelper : public KVHarnessHelper {
 public:
     InMemoryKVHarnessHelper() : _dbpath("inmem-kv-harness") {
+        const bool readOnly = false;
         _engine.reset(new WiredTigerKVEngine(
             kInMemoryEngineName, _dbpath.path(),
             "in_memory=true,"
             "log=(enabled=false),"
             "file_manager=(close_idle_time=0),"
             "checkpoint=(wait=0,log_size=0)",
-            100, false, true, false, true));
+            100, false, true, false, readOnly, true));
     }
 
     virtual ~InMemoryKVHarnessHelper() {

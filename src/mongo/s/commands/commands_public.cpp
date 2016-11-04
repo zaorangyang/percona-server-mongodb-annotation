@@ -787,8 +787,9 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const string fullns = parseNs(dbName, cmdObj);
+        const string nsDBName = nsToDatabase(fullns);
 
-        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
+        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, nsDBName));
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
             return passthrough(txn, conf, cmdObj, result);
         }
@@ -907,17 +908,17 @@ public:
         auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
         if (!status.isOK()) {
             return Status(status.getStatus().code(),
-                          stream() << "Passthrough command failed: " << command.toString()
-                                   << " on ns " << nss.ns() << ". Caused by "
-                                   << causedBy(status.getStatus()));
+                          str::stream() << "Passthrough command failed: " << command.toString()
+                                        << " on ns " << nss.ns() << ". Caused by "
+                                        << causedBy(status.getStatus()));
         }
 
         shared_ptr<DBConfig> conf = status.getValue();
         if (conf->isSharded(nss.ns())) {
             return Status(ErrorCodes::IllegalOperation,
-                          stream() << "Passthrough command failed: " << command.toString()
-                                   << " on ns " << nss.ns()
-                                   << ". Cannot run on sharded namespace.");
+                          str::stream() << "Passthrough command failed: " << command.toString()
+                                        << " on ns " << nss.ns()
+                                        << ". Cannot run on sharded namespace.");
         }
 
         const auto primaryShard = grid.shardRegistry()->getShard(txn, conf->getPrimaryId());
@@ -930,8 +931,9 @@ public:
             if (!conn->runCommand(nss.db().toString(), command, shardResult, options)) {
                 conn.done();
                 return Status(ErrorCodes::OperationFailed,
-                              stream() << "Passthrough command failed: " << command << " on ns "
-                                       << nss.ns() << "; result: " << shardResult);
+                              str::stream() << "Passthrough command failed: " << command
+                                            << " on ns " << nss.ns()
+                                            << "; result: " << shardResult);
             }
             conn.done();
         } catch (const DBException& ex) {

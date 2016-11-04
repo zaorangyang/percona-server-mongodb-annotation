@@ -38,10 +38,12 @@
 #include "mongo/db/repl/data_replicator.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/replication_executor_test_fixture.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/reporter.h"
 #include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/fail_point_service.h"
@@ -81,6 +83,11 @@ public:
                                 bool syncSourceHasSyncSource) override {
         return false;
     }
+    SyncSourceResolverResponse selectSyncSource(OperationContext* txn,
+                                                const OpTime& lastOpTimeFetched) override {
+        return SyncSourceResolverResponse();
+    }
+
     HostAndPort _syncSource;
     HostAndPort _blacklistedSource;
 };
@@ -119,6 +126,10 @@ public:
                                 bool syncSourceHasSyncSource) override {
         return _syncSourceSelector->shouldChangeSyncSource(
             currentSource, sourcesOpTime, syncSourceHasSyncSource);
+    }
+    SyncSourceResolverResponse selectSyncSource(OperationContext* txn,
+                                                const OpTime& lastOpTimeFetched) override {
+        return SyncSourceResolverResponse();
     }
 
     void scheduleNetworkResponse(const BSONObj& obj) {
@@ -179,8 +190,9 @@ protected:
             return _rollbackFn(txn, lastOpTimeWritten, syncSource);
         };
 
-        options.prepareOldReplSetUpdatePositionCommandFn =
-            []() -> StatusWith<BSONObj> { return BSON("replSetUpdatePosition" << 1); };
+        options.prepareReplSetUpdatePositionCommandFn =
+            [](ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle)
+                -> StatusWith<BSONObj> { return BSON(UpdatePositionArgs::kCommandFieldName << 1); };
         options.getMyLastOptime = [this]() { return _myLastOpTime; };
         options.setMyLastOptime = [this](const OpTime& opTime) { _setMyLastOptime(opTime); };
         options.setFollowerMode = [this](const MemberState& state) {
@@ -564,6 +576,10 @@ public:
                                 bool syncSourceHasSyncSource) override {
         return false;
     }
+    SyncSourceResolverResponse selectSyncSource(OperationContext* txn,
+                                                const OpTime& lastOpTimeFetched) override {
+        return SyncSourceResolverResponse();
+    }
     mutable stdx::mutex _mutex;
     stdx::condition_variable _condition;
     int _nextSourceNum{0};
@@ -691,6 +707,10 @@ public:
                                 const OpTime& sourcesOpTime,
                                 bool syncSourceHasSyncSource) override {
         return false;
+    }
+    SyncSourceResolverResponse selectSyncSource(OperationContext* txn,
+                                                const OpTime& lastOpTimeFetched) override {
+        return SyncSourceResolverResponse();
     }
     ReplicationExecutor* _exec;
 };
@@ -986,14 +1006,20 @@ TEST_F(SteadyStateTest, ApplyOneOperation) {
 
     // Ensure that we send position information upstream after completing batch.
     net->enterNetwork();
-    ASSERT_TRUE(net->hasReadyRequests());
-    {
+    bool found = false;
+    while (net->hasReadyRequests()) {
         auto networkRequest = net->getNextReadyRequest();
         auto commandRequest = networkRequest->getRequest();
-        ASSERT_EQUALS("admin", commandRequest.dbname);
         const auto& cmdObj = commandRequest.cmdObj;
-        ASSERT_EQUALS(std::string("replSetUpdatePosition"), cmdObj.firstElementFieldName());
+        if (str::equals(cmdObj.firstElementFieldName(), UpdatePositionArgs::kCommandFieldName) &&
+            commandRequest.dbname == "admin") {
+            found = true;
+            break;
+        } else {
+            net->blackHole(networkRequest);
+        }
     }
+    ASSERT_TRUE(found);
 }
 
 }  // namespace

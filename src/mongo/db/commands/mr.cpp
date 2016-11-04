@@ -63,14 +63,13 @@
 #include "mongo/db/range_preserver.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
-#include "mongo/s/d_state.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/stale_exception.h"
@@ -584,7 +583,7 @@ unsigned long long _safeCount(OperationContext* txn,
                               int options = 0,
                               int limit = 0,
                               int skip = 0) {
-    OperationShardVersion::IgnoreVersioningBlock ignoreVersion(txn, NamespaceString(ns));
+    OperationShardingState::IgnoreVersioningBlock ignoreVersion(txn, NamespaceString(ns));
     return db.count(ns, query, options, limit, skip);
 }
 
@@ -1575,26 +1574,6 @@ public:
 
 } mapReduceCommand;
 
-namespace {
-Status _checkForCatalogManagerChange(ForwardingCatalogManager* catalogManager,
-                                     CatalogManager::ConfigServerMode initialConfigServerMode) {
-    Status status = catalogManager->checkForPendingCatalogChange();
-    if (!status.isOK()) {
-        return status;
-    }
-
-    auto currentConfigServerMode = catalogManager->getMode();
-    if (currentConfigServerMode != initialConfigServerMode) {
-        invariant(initialConfigServerMode == CatalogManager::ConfigServerMode::SCCC &&
-                  currentConfigServerMode == CatalogManager::ConfigServerMode::CSRS);
-        return Status(ErrorCodes::IncompatibleCatalogManager,
-                      "CatalogManager was swapped from SCCC to CSRS mode during mapreduce."
-                      "Aborting mapreduce to unblock mongos.");
-    }
-    return Status::OK();
-}
-}  // namespace
-
 /**
  * This class represents a map/reduce command executed on the output server of a sharded env
  */
@@ -1634,11 +1613,6 @@ public:
                        str::stream() << "Can not execute mapReduce with output database "
                                      << dbname));
         }
-
-        // Store the initial catalog manager mode so we can check if it changes at any point.
-        CatalogManager::ConfigServerMode initialConfigServerMode =
-            grid.catalogManager(txn)->getMode();
-
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
@@ -1737,12 +1711,6 @@ public:
         BSONObj query;
         BSONArrayBuilder chunkSizes;
         while (true) {
-            Status status = _checkForCatalogManagerChange(grid.forwardingCatalogManager(),
-                                                          initialConfigServerMode);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
-
             ChunkPtr chunk;
             if (chunks.size() > 0) {
                 chunk = chunks[index];
@@ -1761,12 +1729,6 @@ public:
             int chunkSize = 0;
 
             while (cursor.more() || !values.empty()) {
-                status = _checkForCatalogManagerChange(grid.forwardingCatalogManager(),
-                                                       initialConfigServerMode);
-                if (!status.isOK()) {
-                    return appendCommandStatus(result, status);
-                }
-
                 BSONObj t;
                 if (cursor.more()) {
                     t = cursor.next().getOwned();
