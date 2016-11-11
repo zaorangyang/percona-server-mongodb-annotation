@@ -30,7 +30,6 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/util/net/sock.h"
 
 namespace mongo {
 namespace {
@@ -43,9 +42,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(std::stringstream& help) const {
         help << "{whatsmyuri:1}";

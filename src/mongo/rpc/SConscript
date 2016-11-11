@@ -24,10 +24,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-    ],
-    LIBDEPS_TAGS=[
-        # Depends on validation in a strange way right now
-        'incomplete'
+        '$BUILD_DIR/mongo/db/server_options_core',
     ],
 )
 
@@ -77,10 +74,6 @@ env.Library(
         'document_range',
         '$BUILD_DIR/mongo/util/net/network',
     ],
-    LIBDEPS_TAGS=[
-        # Circular with rpc because it needs object_check.cpp
-        'incomplete'
-    ],
 )
 
 env.Library(
@@ -111,10 +104,6 @@ env.Library(
     LIBDEPS=[
         'document_range',
         '$BUILD_DIR/mongo/util/net/network',
-    ],
-    LIBDEPS_TAGS=[
-        # Circular with rpc because it needs object_check.cpp
-        'incomplete'
     ],
 )
 
@@ -157,7 +146,7 @@ env.Library(
 
 env.CppUnitTest(
     target=[
-        'metadata_test',
+        'rpc_metadata_test',
     ],
     source=[
         'metadata/server_selection_metadata_test.cpp',
@@ -202,4 +191,3 @@ env.CppUnitTest(
     ],
     LIBDEPS=['metadata']
 )
-

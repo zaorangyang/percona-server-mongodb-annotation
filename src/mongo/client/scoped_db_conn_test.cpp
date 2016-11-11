@@ -66,36 +66,8 @@ using std::vector;
 class Client;
 class OperationContext;
 
-namespace {
-
-stdx::mutex shutDownMutex;
-bool shuttingDown = false;
-
-}  // namespace
-
-// Symbols defined to build the binary correctly.
-bool inShutdown() {
-    stdx::lock_guard<stdx::mutex> sl(shutDownMutex);
-    return shuttingDown;
-}
-
-void signalShutdown() {}
-
 DBClientBase* createDirectClient(OperationContext* txn) {
     return NULL;
-}
-
-void dbexit(ExitCode rc, const char* why) {
-    {
-        stdx::lock_guard<stdx::mutex> sl(shutDownMutex);
-        shuttingDown = true;
-    }
-
-    quickExit(rc);
-}
-
-void exitCleanly(ExitCode rc) {
-    dbexit(rc, "");
 }
 
 namespace {
@@ -127,8 +99,7 @@ public:
     }
 
     virtual void close() {}
-
-} dummyHandler;
+};
 
 // TODO: Take this out and make it as a reusable class in a header file. The only
 // thing that is preventing this from happening is the dependency on the inShutdown
@@ -162,7 +133,7 @@ public:
      * @param messageHandler the message handler to use for this server. Ownership
      *     of this object is passed to this server.
      */
-    void run(MessageHandler* messsageHandler) {
+    void run(std::shared_ptr<MessageHandler> messsageHandler) {
         if (_server != NULL) {
             return;
         }
@@ -170,12 +141,7 @@ public:
         MessageServer::Options options;
         options.port = _port;
 
-        {
-            stdx::lock_guard<stdx::mutex> sl(shutDownMutex);
-            shuttingDown = false;
-        }
-
-        _server.reset(createServer(options, messsageHandler));
+        _server.reset(createServer(options, std::move(messsageHandler)));
         _serverThread = stdx::thread(runServer, _server.get());
     }
 
@@ -185,11 +151,6 @@ public:
     void stop() {
         if (!_server) {
             return;
-        }
-
-        {
-            stdx::lock_guard<stdx::mutex> sl(shutDownMutex);
-            shuttingDown = true;
         }
 
         ListeningSockets::get()->closeAll();
@@ -234,7 +195,8 @@ public:
         _maxPoolSizePerHost = globalConnPool.getMaxPoolSize();
         _dummyServer = new DummyServer(TARGET_PORT);
 
-        _dummyServer->run(&dummyHandler);
+        auto dummyHandler = std::make_shared<DummyMessageHandler>();
+        _dummyServer->run(std::move(dummyHandler));
         DBClientConnection conn;
         Timer timer;
 

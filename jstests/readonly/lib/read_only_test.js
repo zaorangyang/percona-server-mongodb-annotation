@@ -32,7 +32,7 @@ StandaloneFixture.prototype.runExecPhase = function runExecPhase(test) {
         makeDirectoryReadOnly(this.dbpath);
 
         var options = {
-            readOnly: "",
+            queryableBackupMode: "",
             noCleanData: true,
             dbpath: this.dbpath
         };
@@ -52,11 +52,7 @@ function ShardedFixture() {
 }
 
 ShardedFixture.prototype.runLoadPhase = function runLoadPhase(test) {
-    this.shardingTest = new ShardingTest({
-        nopreallocj: true,
-        mongos: 1,
-        shards: this.nShards
-    });
+    this.shardingTest = new ShardingTest({nopreallocj: true, mongos: 1, shards: this.nShards});
 
     this.paths = this.shardingTest.getDBPaths();
 
@@ -73,13 +69,15 @@ ShardedFixture.prototype.runExecPhase = function runExecPhase(test) {
     try {
         for (var i = 0; i < this.nShards; ++i) {
             var opts = {
-                readOnly: "",
+                queryableBackupMode: "",
                 dbpath: this.paths[i]
             };
 
-            this.shardingTest.restartMongod(i, opts, () => {
-                makeDirectoryReadOnly(this.paths[i]);
-            });
+            this.shardingTest.restartMongod(i,
+                                            opts,
+                                            () => {
+                                                makeDirectoryReadOnly(this.paths[i]);
+                                            });
         }
 
         jsTest.log("restarting mongos...");
@@ -101,7 +99,6 @@ ShardedFixture.prototype.runExecPhase = function runExecPhase(test) {
 };
 
 function runReadOnlyTest(test) {
-
     printjson(test);
 
     assert.eq(typeof(test.exec), "function");

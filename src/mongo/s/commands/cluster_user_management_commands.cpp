@@ -52,6 +52,8 @@ using std::string;
 using std::stringstream;
 using std::vector;
 
+namespace {
+
 class CmdCreateUser : public Command {
 public:
     CmdCreateUser() : Command("createUser") {}
@@ -60,9 +62,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Adds a user to the system";
@@ -81,7 +80,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         return grid.catalogManager(txn)
-            ->runUserManagementWriteCommand(txn, this->name, dbname, cmdObj, &result);
+            ->runUserManagementWriteCommand(txn, getName(), dbname, cmdObj, &result);
     }
 
     virtual void redactForLogging(mutablebson::Document* cmdObj) {
@@ -98,9 +97,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Used to update a user, for example to change its password";
@@ -119,12 +115,12 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         auth::CreateOrUpdateUserArgs args;
-        Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, this->name, dbname, &args);
+        Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, getName(), dbname, &args);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -147,9 +143,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Drops a single user.";
@@ -175,7 +168,7 @@ public:
             return appendCommandStatus(result, status);
         }
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -194,9 +187,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Drops all users for a single database.";
@@ -215,7 +205,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -234,9 +224,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Grants roles to a user.";
@@ -258,12 +245,12 @@ public:
         vector<RoleName> roles;
         BSONObj unusedWriteConcern;
         Status status = auth::parseRolePossessionManipulationCommands(
-            cmdObj, this->name, dbname, &userNameString, &roles, &unusedWriteConcern);
+            cmdObj, getName(), dbname, &userNameString, &roles, &unusedWriteConcern);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -282,9 +269,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Revokes roles from a user.";
@@ -306,12 +290,12 @@ public:
         vector<RoleName> unusedRoles;
         BSONObj unusedWriteConcern;
         Status status = auth::parseRolePossessionManipulationCommands(
-            cmdObj, this->name, dbname, &userNameString, &unusedRoles, &unusedWriteConcern);
+            cmdObj, getName(), dbname, &userNameString, &unusedRoles, &unusedWriteConcern);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -332,9 +316,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     CmdUsersInfo() : Command("usersInfo") {}
 
@@ -367,9 +348,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Adds a role to the system";
@@ -388,7 +366,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         return grid.catalogManager(txn)
-            ->runUserManagementWriteCommand(txn, this->name, dbname, cmdObj, &result);
+            ->runUserManagementWriteCommand(txn, getName(), dbname, cmdObj, &result);
     }
 
 } cmdCreateRole;
@@ -401,9 +379,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Used to update a role";
@@ -422,7 +397,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -441,9 +416,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Grants privileges to a role";
@@ -462,7 +434,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -481,9 +453,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Revokes privileges from a role";
@@ -502,7 +471,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -521,9 +490,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Grants roles to another role.";
@@ -542,7 +508,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -561,9 +527,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Revokes roles from another role.";
@@ -582,7 +545,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -601,9 +564,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Drops a single role.  Before deleting the role completely it must remove it "
@@ -625,7 +585,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -644,9 +604,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Drops all roles from the given database.  Before deleting the roles completely "
@@ -669,7 +626,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -692,9 +649,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Returns information about roles.";
@@ -729,9 +683,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Invalidates the in-memory cache of user information";
@@ -775,9 +726,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual bool adminOnly() const {
         return true;
@@ -800,7 +748,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         return grid.catalogManager(txn)
-            ->runUserManagementWriteCommand(txn, this->name, dbname, cmdObj, &result);
+            ->runUserManagementWriteCommand(txn, getName(), dbname, cmdObj, &result);
     }
 
 } cmdMergeAuthzCollections;
@@ -855,9 +803,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
-    }
 
     virtual void help(stringstream& ss) const {
         ss << "Upgrades the auth data storage schema";
@@ -877,7 +822,7 @@ public:
              BSONObjBuilder& result) {
         // Run the authSchemaUpgrade command on the config servers
         if (!grid.catalogManager(txn)
-                 ->runUserManagementWriteCommand(txn, this->name, dbname, cmdObj, &result)) {
+                 ->runUserManagementWriteCommand(txn, getName(), dbname, cmdObj, &result)) {
             return false;
         }
 
@@ -895,6 +840,8 @@ public:
         }
         return true;
     }
+
 } cmdAuthSchemaUpgrade;
 
+}  // namespace
 }  // namespace mongo

@@ -102,10 +102,6 @@ Status addMongodOptions(moe::OptionSection* options) {
         .setSources(moe::SourceAllLegacy)
         .incompatibleWith("noauth");
 
-    general_options.addOptionChaining("noauth", "noauth", moe::Switch, "run without security")
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("auth");
-
     // Way to enable or disable auth in JSON Config
     general_options
         .addOptionChaining(
@@ -212,11 +208,12 @@ Status addMongodOptions(moe::OptionSection* options) {
                                       "each database will be stored in a separate directory");
 
     storage_options.addOptionChaining(
-                        "storage.readOnly",
-                        "readOnly",
+                        "storage.queryableBackupMode",
+                        "queryableBackupMode",
                         moe::Switch,
                         "enable read-only mode - if true the server will not accept writes.")
-        .setSources(moe::SourceAll);
+        .setSources(moe::SourceAll)
+        .hidden();
 
 
     general_options.addOptionChaining(
@@ -664,8 +661,8 @@ Status validateMongodOptions(const moe::Environment& params) {
     }
 #endif
 
-    if (params.count("storage.readOnly")) {
-        // Command line options that are disallowed when --readOnly is specified.
+    if (params.count("storage.queryableBackupMode")) {
+        // Command line options that are disallowed when --queryableBackupMode is specified.
         for (const auto& disallowedOption : {"replSet",
                                              "configSvr",
                                              "upgrade",
@@ -683,7 +680,7 @@ Status validateMongodOptions(const moe::Environment& params) {
                                              "fastsync"}) {
             if (params.count(disallowedOption)) {
                 return Status(ErrorCodes::BadValue,
-                              str::stream() << "Cannot specify both --readOnly and --"
+                              str::stream() << "Cannot specify both --queryableBackupMode and --"
                                             << disallowedOption);
             }
         }
@@ -812,21 +809,8 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
         }
     }
 
-    // "security.authorization" comes from the config file, so override it if "noauth" or
-    // "auth" are set since those come from the command line.
-    if (params->count("noauth")) {
-        Status ret =
-            params->set("security.authorization",
-                        (*params)["noauth"].as<bool>() ? moe::Value(std::string("disabled"))
-                                                       : moe::Value(std::string("enabled")));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("noauth");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
+    // "security.authorization" comes from the config file, so override it if "auth" is
+    // set since those come from the command line.
     if (params->count("auth")) {
         Status ret =
             params->set("security.authorization",
@@ -1064,21 +1048,14 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
         storageGlobalParams.directoryperdb = params["storage.directoryPerDB"].as<bool>();
     }
 
-    if (params.count("storage.readOnly") && params["storage.readOnly"].as<bool>()) {
+    if (params.count("storage.queryableBackupMode") &&
+        params["storage.queryableBackupMode"].as<bool>()) {
         storageGlobalParams.readOnly = true;
         storageGlobalParams.dur = false;
     }
 
     if (params.count("cpu")) {
         serverGlobalParams.cpu = params["cpu"].as<bool>();
-    }
-    if (params.count("security.authorization") &&
-        params["security.authorization"].as<std::string>() == "disabled") {
-        serverGlobalParams.isAuthEnabled = false;
-    }
-    if (params.count("security.authorization") &&
-        params["security.authorization"].as<std::string>() == "enabled") {
-        serverGlobalParams.isAuthEnabled = true;
     }
     if (params.count("storage.mmapv1.quota.enforced")) {
         mmapv1GlobalOptions.quota = params["storage.mmapv1.quota.enforced"].as<bool>();
@@ -1261,33 +1238,37 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
             return Status(ErrorCodes::BadValue, "bad --port number");
         }
     }
-    if (params.count("sharding.clusterRole") &&
-        params["sharding.clusterRole"].as<std::string>() == "configsvr") {
-        serverGlobalParams.configsvr = true;
-        serverGlobalParams.configsvrMode = replSettings.getReplSetString().empty()
-            ? CatalogManager::ConfigServerMode::SCCC
-            : CatalogManager::ConfigServerMode::CSRS;
-        mmapv1GlobalOptions.smallfiles = true;  // config server implies small files
+    if (params.count("sharding.clusterRole")) {
+        auto clusterRoleParam = params["sharding.clusterRole"].as<std::string>();
+        if (clusterRoleParam == "configsvr") {
+            serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
+            serverGlobalParams.configsvrMode = replSettings.getReplSetString().empty()
+                ? CatalogManager::ConfigServerMode::SCCC
+                : CatalogManager::ConfigServerMode::CSRS;
+            mmapv1GlobalOptions.smallfiles = true;  // config server implies small files
 
-        // If we haven't explicitly specified a journal option, default journaling to true for
-        // the config server role
-        if (!params.count("storage.journal.enabled")) {
-            storageGlobalParams.dur = true;
-        }
+            // If we haven't explicitly specified a journal option, default journaling to true for
+            // the config server role
+            if (!params.count("storage.journal.enabled")) {
+                storageGlobalParams.dur = true;
+            }
 
-        if (!params.count("storage.dbPath")) {
-            storageGlobalParams.dbpath = storageGlobalParams.kDefaultConfigDbPath;
-        }
-        if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::SCCC) {
-            // Set to true to force SCCC config servers to have an oplog for backup.
-            replSettings.setMaster(true);
-            if (!params.count("replication.oplogSizeMB"))
-                replSettings.setOplogSizeBytes(5 * 1024 * 1024);
+            if (!params.count("storage.dbPath")) {
+                storageGlobalParams.dbpath = storageGlobalParams.kDefaultConfigDbPath;
+            }
+            if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::SCCC) {
+                // Set to true to force SCCC config servers to have an oplog for backup.
+                replSettings.setMaster(true);
+                if (!params.count("replication.oplogSizeMB"))
+                    replSettings.setOplogSizeBytes(5 * 1024 * 1024);
+            }
+        } else if (clusterRoleParam == "shardsvr") {
+            serverGlobalParams.clusterRole = ClusterRole::ShardServer;
         }
     }
 
     if (params.count("sharding.configsvrMode")) {
-        if (!serverGlobalParams.configsvr) {
+        if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
             return Status(ErrorCodes::BadValue,
                           "Cannot set \"sharding.configsvrMode\" without "
                           "setting \"sharding.clusterRole\" to \"configsvr\"");

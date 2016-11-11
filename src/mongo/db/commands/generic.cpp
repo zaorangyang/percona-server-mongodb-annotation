@@ -1,30 +1,30 @@
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2012-2016 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
@@ -78,9 +78,6 @@ public:
     virtual bool adminOnly() const {
         return false;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
@@ -113,9 +110,6 @@ public:
         help << "a way to check that the server is alive. responds immediately even if server is "
                 "in a db lock.";
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
@@ -138,9 +132,6 @@ public:
     }
     virtual bool slaveOk() const {
         return true;
-    }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -173,9 +164,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(stringstream& help) const {
         help << "returns information about the daemon's host";
@@ -219,9 +207,6 @@ public:
 class LogRotateCmd : public Command {
 public:
     LogRotateCmd() : Command("logRotate") {}
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
     virtual bool slaveOk() const {
         return true;
     }
@@ -255,9 +240,6 @@ public:
         help << "get a list of all db commands";
     }
     ListCommandsCmd() : Command("listCommands", false) {}
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
     virtual bool slaveOk() const {
         return true;
     }
@@ -277,16 +259,16 @@ public:
         std::vector<Command*> commands;
         for (CommandMap::const_iterator it = _commands->begin(); it != _commands->end(); ++it) {
             // don't show oldnames
-            if (it->first == it->second->name)
+            if (it->first == it->second->getName())
                 commands.push_back(it->second);
         }
         std::sort(commands.begin(),
                   commands.end(),
-                  [](Command* lhs, Command* rhs) { return (lhs->name) < (rhs->name); });
+                  [](Command* lhs, Command* rhs) { return (lhs->getName()) < (rhs->getName()); });
 
         BSONObjBuilder b(result.subobjStart("commands"));
         for (const auto& c : commands) {
-            BSONObjBuilder temp(b.subobjStart(c->name));
+            BSONObjBuilder temp(b.subobjStart(c->getName()));
 
             {
                 stringstream help;
@@ -335,7 +317,7 @@ void CmdShutdown::shutdownHelper() {
 #if defined(_WIN32)
     // Signal the ServiceMain thread to shutdown.
     if (ntservice::shouldStartService()) {
-        signalShutdown();
+        shutdownNoTerminate();
 
         // Client expects us to abruptly close the socket as part of exiting
         // so this function is not allowed to return.
@@ -359,9 +341,6 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
@@ -383,9 +362,6 @@ public:
 
     virtual bool slaveOk() const {
         return true;
-    }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
     }
     virtual bool adminOnly() const {
         return true;
@@ -453,9 +429,6 @@ public:
     CmdGetCmdLineOpts() : Command("getCmdLineOpts") {}
     void help(stringstream& h) const {
         h << "get argv";
-    }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
     }
     virtual bool adminOnly() const {
         return true;

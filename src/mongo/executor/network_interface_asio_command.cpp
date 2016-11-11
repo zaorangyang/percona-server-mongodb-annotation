@@ -75,7 +75,7 @@ template <typename Handler>
 void asyncSendMessage(AsyncStreamInterface& stream, Message* m, Handler&& handler) {
     static_assert(IsNetworkHandler<Handler>::value,
                   "Handler passed to asyncSendMessage does not conform to NetworkHandler concept");
-    m->header().setResponseTo(0);
+    m->header().setResponseToMsgId(0);
     m->header().setId(nextMessageId());
     // TODO: Some day we may need to support vector messages.
     fassert(28708, m->buf() != 0);
@@ -174,7 +174,7 @@ NetworkInterfaceASIO::AsyncCommand::AsyncCommand(AsyncConnection* conn,
                                                  Date_t now,
                                                  const HostAndPort& target)
     : _conn(conn), _type(type), _toSend(std::move(command)), _start(now), _target(target) {
-    _toSend.header().setResponseTo(0);
+    _toSend.header().setResponseToMsgId(0);
 }
 
 NetworkInterfaceASIO::AsyncConnection& NetworkInterfaceASIO::AsyncCommand::conn() {
@@ -276,12 +276,17 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
         op->_timeoutAlarm->cancel();
     }
 
+    if (resp.getStatus().code() == ErrorCodes::ExceededTimeLimit) {
+        _numTimedOutOps.fetchAndAdd(1);
+    }
+
     if (op->_inSetup) {
         // If we are in setup we should only be here if we failed to connect.
         MONGO_ASIO_INVARIANT(!resp.isOK(), "Failed to connect in setup", op);
         // If we fail during connection, we won't be able to access any of op's members after
         // calling finish(), so we return here.
         LOG(1) << "Failed to connect to " << op->request().target << " - " << resp.getStatus();
+        _numFailedOps.fetchAndAdd(1);
         op->finish(resp);
         return;
     }
@@ -292,9 +297,13 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
         // we got from the pool to execute a command, but it failed for some reason.
         LOG(2) << "Failed to execute command: " << op->request().toString()
                << " reason: " << resp.getStatus();
-    }
 
-    op->finish(resp);
+        if (resp.getStatus().code() != ErrorCodes::CallbackCanceled) {
+            _numFailedOps.fetchAndAdd(1);
+        }
+    } else {
+        _numSucceededOps.fetchAndAdd(1);
+    }
 
     std::unique_ptr<AsyncOp> ownedOp;
 
@@ -309,6 +318,8 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
         ownedOp = std::move(iter->second);
         _inProgress.erase(iter);
     }
+
+    op->finish(resp);
 
     MONGO_ASIO_INVARIANT(static_cast<bool>(ownedOp), "Invalid AsyncOp", op);
 
@@ -364,7 +375,7 @@ void NetworkInterfaceASIO::_asyncRunCommand(AsyncOp* op, NetworkOpHandler handle
                         [this, op, recvMessageCallback, ec, bytes, cmd, handler] {
                             // validate response id
                             uint32_t expectedId = cmd->toSend().header().getId();
-                            uint32_t actualId = cmd->header().constView().getResponseTo();
+                            uint32_t actualId = cmd->header().constView().getResponseToMsgId();
                             if (actualId != expectedId) {
                                 LOG(3) << "got wrong response:"
                                        << " expected response id: " << expectedId

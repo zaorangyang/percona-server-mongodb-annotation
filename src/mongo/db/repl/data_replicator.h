@@ -37,7 +37,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/applier.h"
+#include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/database_cloner.h"
 #include "mongo/db/repl/optime.h"
@@ -56,7 +56,7 @@ class QueryFetcher;
 
 namespace repl {
 
-using Operations = Applier::Operations;
+using Operations = MultiApplier::Operations;
 using QueryResponseStatus = StatusWith<Fetcher::QueryResponse>;
 using CallbackArgs = ReplicationExecutor::CallbackArgs;
 using CBHStatus = StatusWith<ReplicationExecutor::CallbackHandle>;
@@ -110,11 +110,18 @@ struct DataReplicatorOptions {
     /** Function to sets this node into a specific follower mode. */
     using SetFollowerModeFn = stdx::function<bool(const MemberState&)>;
 
+    /** Function to get this node's slaveDelay. */
+    using GetSlaveDelayFn = stdx::function<Seconds()>;
+
     // Error and retry values
     Milliseconds syncSourceRetryWait{1000};
     Milliseconds initialSyncRetryWait{1000};
     Seconds blacklistSyncSourcePenaltyForNetworkConnectionError{10};
     Minutes blacklistSyncSourcePenaltyForOplogStartMissing{10};
+
+    // Batching settings.
+    size_t replBatchLimitBytes = 512 * 1024 * 1024;
+    size_t replBatchLimitOperations = 5000;
 
     // Replication settings
     NamespaceString localOplogNS = NamespaceString("local.oplog.rs");
@@ -125,12 +132,14 @@ struct DataReplicatorOptions {
     std::string scopeNS;
     BSONObj filterCriteria;
 
-    Applier::ApplyOperationFn applierFn;
+    MultiApplier::ApplyOperationFn applierFn;
+    MultiApplier::MultiApplyFn multiApplyFn;
     RollbackFn rollbackFn;
     Reporter::PrepareReplSetUpdatePositionCommandFn prepareReplSetUpdatePositionCommandFn;
     GetMyLastOptimeFn getMyLastOptime;
     SetMyLastOptimeFn setMyLastOptime;
     SetFollowerModeFn setFollowerMode;
+    GetSlaveDelayFn getSlaveDelay;
     SyncSourceSelector* syncSourceSelector = nullptr;
 
     std::string toString() const {
@@ -230,7 +239,7 @@ private:
     Timestamp _applyUntil(Timestamp);
     void _pauseApplier();
 
-    Operations _getNextApplierBatch_inlock();
+    StatusWith<Operations> _getNextApplierBatch_inlock();
     void _onApplyBatchFinish(const CallbackArgs&,
                              const TimestampStatus&,
                              const Operations&,
@@ -299,9 +308,9 @@ private:
     Handle _reporterHandle;               // (M)
     std::unique_ptr<Reporter> _reporter;  // (M)
 
-    bool _applierActive;                // (M)
-    bool _applierPaused;                // (X)
-    std::unique_ptr<Applier> _applier;  // (M)
+    bool _applierActive;                     // (M)
+    bool _applierPaused;                     // (X)
+    std::unique_ptr<MultiApplier> _applier;  // (M)
 
     HostAndPort _syncSource;              // (M)
     Timestamp _lastTimestampFetched;      // (MX)

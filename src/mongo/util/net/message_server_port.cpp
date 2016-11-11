@@ -53,6 +53,7 @@
 #include "mongo/util/net/message_port.h"
 #include "mongo/util/net/message_server.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 
 #ifdef __linux__  // TODO: consider making this ifndef _WIN32
@@ -75,19 +76,18 @@ class MessagingPortWithHandler : public MessagingPort {
 
 public:
     MessagingPortWithHandler(const std::shared_ptr<Socket>& socket,
-                             MessageHandler* handler,
+                             const std::shared_ptr<MessageHandler> handler,
                              long long connectionId)
         : MessagingPort(socket), _handler(handler) {
         setConnectionId(connectionId);
     }
 
-    MessageHandler* getHandler() const {
+    const std::shared_ptr<MessageHandler> getHandler() const {
         return _handler;
     }
 
 private:
-    // Not owned.
-    MessageHandler* const _handler;
+    const std::shared_ptr<MessageHandler> _handler;
 };
 
 }  // namespace
@@ -98,11 +98,10 @@ public:
      * Creates a new message server.
      *
      * @param opts
-     * @param handler the handler to use. Caller is responsible for managing this object
-     *     and should make sure that it lives longer than this server.
+     * @param handler the handler to use.
      */
-    PortMessageServer(const MessageServer::Options& opts, MessageHandler* handler)
-        : Listener("", opts.ipList, opts.port), _handler(handler) {}
+    PortMessageServer(const MessageServer::Options& opts, std::shared_ptr<MessageHandler> handler)
+        : Listener("", opts.ipList, opts.port), _handler(std::move(handler)) {}
 
     virtual void accepted(std::shared_ptr<Socket> psocket, long long connectionId) {
         ScopeGuard sleepAfterClosingPort = MakeGuard(sleepmillis, 2);
@@ -181,7 +180,7 @@ public:
     }
 
 private:
-    MessageHandler* _handler;
+    const std::shared_ptr<MessageHandler> _handler;
 
     /**
      * Handles incoming messages from a given socket.
@@ -201,7 +200,7 @@ private:
         invariant(arg);
         unique_ptr<MessagingPortWithHandler> portWithHandler(
             static_cast<MessagingPortWithHandler*>(arg));
-        MessageHandler* const handler = portWithHandler->getHandler();
+        const std::shared_ptr<MessageHandler> handler = portWithHandler->getHandler();
 
         setThreadName(std::string(str::stream() << "conn" << portWithHandler->connectionId()));
         portWithHandler->psock->setLogLevel(logger::LogSeverity::Debug(1));
@@ -245,24 +244,18 @@ private:
             log() << "DBException handling request, closing client connection: " << e << endl;
         } catch (std::exception& e) {
             error() << "Uncaught std::exception: " << e.what() << ", terminating" << endl;
-            dbexit(EXIT_UNCAUGHT);
+            quickExit(EXIT_UNCAUGHT);
         }
         portWithHandler->shutdown();
-
-// Normal disconnect path.
-#ifdef MONGO_CONFIG_SSL
-        SSLManagerInterface* manager = getSSLManager();
-        if (manager)
-            manager->cleanupThreadLocals();
-#endif
 
         return NULL;
     }
 };
 
 
-MessageServer* createServer(const MessageServer::Options& opts, MessageHandler* handler) {
-    return new PortMessageServer(opts, handler);
+MessageServer* createServer(const MessageServer::Options& opts,
+                            std::shared_ptr<MessageHandler> handler) {
+    return new PortMessageServer(opts, std::move(handler));
 }
 
 }  // namespace mongo

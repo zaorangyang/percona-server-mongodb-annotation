@@ -1,5 +1,8 @@
 // Test that setting readOnly mode on the command line causes readOnly to be properly set in both
 // isMaster and serverStatus output.
+//
+// This test requires mmapv1.
+// @tags: [requires_mmapv1]
 (function() {
     "use strict";
 
@@ -15,7 +18,7 @@
     MongoRunner.stopMongod(mongod);
 
     mongod = MongoRunner.runMongod(
-        {storageEngine: "mmapv1", readOnly: "", dbpath: dbpath, noCleanData: true});
+        {storageEngine: "mmapv1", queryableBackupMode: "", dbpath: dbpath, noCleanData: true});
     assert(mongod.getDB("admin").isMaster().readOnly);
     assert(mongod.getDB("admin").serverStatus().storageEngine.readOnly);
     MongoRunner.stopMongod(mongod);

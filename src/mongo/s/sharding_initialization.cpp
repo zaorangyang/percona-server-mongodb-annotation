@@ -58,7 +58,6 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
 
 namespace mongo {
 
@@ -76,8 +75,8 @@ std::unique_ptr<CatalogManager> makeCatalogManager(ServiceContext* service,
     std::unique_ptr<SecureRandom> rng(SecureRandom::create());
     std::string distLockProcessId = str::stream()
         << thisHost.toString() << ':'
-        << durationCount<Seconds>(service->getClockSource()->now().toDurationSinceEpoch()) << ':'
-        << static_cast<int32_t>(rng->nextInt64());
+        << durationCount<Seconds>(service->getPreciseClockSource()->now().toDurationSinceEpoch())
+        << ':' << static_cast<int32_t>(rng->nextInt64());
 
     auto distLockCatalog = stdx::make_unique<DistLockCatalogImpl>(shardRegistry);
     auto distLockManager =
@@ -173,9 +172,7 @@ std::unique_ptr<TaskExecutorPool> makeTaskExecutorPool(std::unique_ptr<NetworkIn
 
 }  // namespace
 
-Status initializeGlobalShardingState(OperationContext* txn,
-                                     const ConnectionString& configCS,
-                                     bool allowNetworking) {
+Status initializeGlobalShardingState(OperationContext* txn, const ConnectionString& configCS) {
     if (configCS.type() == ConnectionString::INVALID) {
         return {ErrorCodes::BadValue, "Unrecognized connection string."};
     }
@@ -200,11 +197,12 @@ Status initializeGlobalShardingState(OperationContext* txn,
     shardRegistry->startup();
     grid.init(std::move(catalogManager),
               std::move(shardRegistry),
-              stdx::make_unique<ClusterCursorManager>(getGlobalServiceContext()->getClockSource()));
+              stdx::make_unique<ClusterCursorManager>(
+                  getGlobalServiceContext()->getPreciseClockSource()));
 
     while (!inShutdown()) {
         try {
-            Status status = grid.catalogManager(txn)->startup(txn, allowNetworking);
+            Status status = grid.catalogManager(txn)->startup(txn);
             uassertStatusOK(status);
 
             if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::NONE) {

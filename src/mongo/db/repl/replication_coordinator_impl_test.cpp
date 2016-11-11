@@ -38,6 +38,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/handshake_args.h"
+#include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/old_update_position_args.h"
 #include "mongo/db/repl/operation_context_repl_mock.h"
@@ -89,6 +90,10 @@ struct OpTimeWithTermZero {
 
     operator boost::optional<OpTime>() const {
         return OpTime(timestamp, 0);
+    }
+
+    OpTime asOpTime() const {
+        return this->operator mongo::repl::OpTime();
     }
 
     Timestamp timestamp;
@@ -614,7 +619,7 @@ TEST_F(
     ReplCoordTest,
     NodeReturnsNoReplicationEnabledAndInfoConfigsvrWhenCheckReplEnabledForCommandWhileConfigsvr) {
     ReplSettings settings;
-    serverGlobalParams.configsvr = true;
+    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
     init(settings);
     start();
 
@@ -623,7 +628,7 @@ TEST_F(
     Status status = getReplCoord()->checkReplEnabledForCommand(&result);
     ASSERT_EQUALS(status, ErrorCodes::NoReplicationEnabled);
     ASSERT_EQUALS(result.obj()["info"].String(), "configsvr");
-    serverGlobalParams.configsvr = false;
+    serverGlobalParams.clusterRole = ClusterRole::None;
 }
 
 TEST_F(
@@ -2798,6 +2803,11 @@ TEST_F(ReplCoordTest, AwaitReplicationShouldResolveAsNormalDuringAReconfig) {
                                                                          << "node3:12345"
                                                                          << "_id" << 2))),
                        HostAndPort("node1", 12345));
+
+    // Turn off readconcern majority support, and snapshots.
+    disableReadConcernMajoritySupport();
+    disableSnapshots();
+
     ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     getReplCoord()->setMyLastAppliedOpTime(OpTimeWithTermZero(100, 2));
     getReplCoord()->setMyLastDurableOpTime(OpTimeWithTermZero(100, 2));
@@ -2941,6 +2951,11 @@ TEST_F(ReplCoordTest,
                                                                          << "node5:12345"
                                                                          << "_id" << 4))),
                        HostAndPort("node1", 12345));
+
+    // Turn off readconcern majority support, and snapshots.
+    disableReadConcernMajoritySupport();
+    disableSnapshots();
+
     ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     getReplCoord()->setMyLastAppliedOpTime(OpTimeWithTermZero(100, 1));
     getReplCoord()->setMyLastDurableOpTime(OpTimeWithTermZero(100, 1));
@@ -3982,32 +3997,6 @@ TEST_F(ReplCoordTest,
     getReplCoord()->setMyLastAppliedOpTimeForward(time2);
     getReplCoord()->setMyLastDurableOpTimeForward(time2);
     ASSERT_EQUALS(time3, getReplCoord()->getMyLastAppliedOpTime());
-}
-
-TEST_F(ReplCoordTest,
-       NodeChangesMyLastOpTimeWhenSetMyLastDurableOpTimeReceivesANewerOpTimeWithoutJournaling) {
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version" << 2 << "members" << BSON_ARRAY(BSON("host"
-                                                                              << "node1:12345"
-                                                                              << "_id" << 0))),
-                       HostAndPort("node1", 12345));
-
-
-    setStorageEngineDurable(false);
-
-    OpTime time1(Timestamp(100, 1), 1);
-    OpTime time2(Timestamp(100, 2), 1);
-    OpTime time3(Timestamp(100, 3), 1);
-
-    getReplCoord()->setMyLastAppliedOpTime(time1);
-    ASSERT_EQUALS(time1, getReplCoord()->getMyLastAppliedOpTime());
-    getReplCoord()->setMyLastAppliedOpTimeForward(time3);
-    ASSERT_EQUALS(time3, getReplCoord()->getMyLastAppliedOpTime());
-    ASSERT_EQUALS(time3, getReplCoord()->getMyLastDurableOpTime());
-    getReplCoord()->setMyLastAppliedOpTimeForward(time2);
-    ASSERT_EQUALS(time3, getReplCoord()->getMyLastAppliedOpTime());
-    ASSERT_EQUALS(time3, getReplCoord()->getMyLastDurableOpTime());
 }
 
 TEST_F(ReplCoordTest, OnlyForwardSyncProgressForOtherNodesWhenTheNodesAreBelievedToBeUp) {

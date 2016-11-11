@@ -69,7 +69,6 @@
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/message_port.h"
-#include "mongo/util/net/sock.h"
 
 namespace mongo {
 namespace repl {
@@ -361,6 +360,7 @@ void ReplicationCoordinatorExternalStateImpl::clearShardingState() {
 }
 
 void ReplicationCoordinatorExternalStateImpl::recoverShardingState(OperationContext* txn) {
+    uassertStatusOK(ShardingState::get(txn->getServiceContext())->initializeFromShardIdentity(txn));
     uassertStatusOK(ShardingStateRecovery::recover(txn));
 
     // There is a slight chance that some stale metadata might have been loaded before the latest

@@ -37,6 +37,8 @@ namespace mongo {
 const int DEFAULT_UNIX_PERMS = 0700;
 const int RATE_LIMIT_MAX = 1000;
 
+enum class ClusterRole { None, ShardServer, ConfigServer };
+
 struct ServerGlobalParams {
     std::string binaryName;  // mongod or mongos
     std::string cwd;         // cwd of when process started
@@ -55,7 +57,7 @@ struct ServerGlobalParams {
 
     std::atomic<bool> quiet{false};  // --quiet NOLINT
 
-    bool configsvr = false;  // --configsvr
+    ClusterRole clusterRole = ClusterRole::None;  // --configsvr/--shardsvr
     CatalogManager::ConfigServerMode configsvrMode =
         CatalogManager::ConfigServerMode::NONE;  // -- configsvrMode
 
@@ -116,7 +118,11 @@ struct ServerGlobalParams {
 
     BSONArray argvArray;
     BSONObj parsedOpts;
-    bool isAuthEnabled = false;
+
+    enum AuthState { kEnabled, kDisabled, kUndefined };
+
+    AuthState authState = AuthState::kUndefined;
+
     AtomicInt32 clusterAuthMode;  // --clusterAuthMode, the internal cluster auth mode
 
     enum ClusterAuthModes {

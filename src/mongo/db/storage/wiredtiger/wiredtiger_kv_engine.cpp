@@ -258,7 +258,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
 
     _sessionCache.reset(new WiredTigerSessionCache(this));
 
-    if (_durable) {
+    if (_durable && !_ephemeral) {
         _journalFlusher = stdx::make_unique<WiredTigerJournalFlusher>(_sessionCache.get());
         _journalFlusher->go();
     }

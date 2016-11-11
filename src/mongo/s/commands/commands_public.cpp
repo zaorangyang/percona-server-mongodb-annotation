@@ -43,6 +43,7 @@
 #include "mongo/db/commands/rename_collection.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/chunk_manager.h"
@@ -99,7 +100,7 @@ bool cursorCommandPassthrough(OperationContext* txn,
     }
     BSONObj response = cursor->nextSafe().getOwned();
     conn.done();
-    Status status = Command::getStatusFromCommandResult(response);
+    Status status = getStatusFromCommandResult(response);
     if (ErrorCodes::SendStaleConfig == status || ErrorCodes::RecvStaleConfig == status) {
         throw RecvStaleConfigException("command failed because of stale config", response);
     }
@@ -120,6 +121,14 @@ bool cursorCommandPassthrough(OperationContext* txn,
     return true;
 }
 
+BSONObj getQuery(const BSONObj& cmdObj) {
+    if (cmdObj["query"].type() == Object)
+        return cmdObj["query"].embeddedObject();
+    if (cmdObj["q"].type() == Object)
+        return cmdObj["q"].embeddedObject();
+    return BSONObj();
+}
+
 class PublicGridCommand : public Command {
 public:
     PublicGridCommand(const char* n, const char* oldname = NULL) : Command(n, false, oldname) {}
@@ -137,9 +146,6 @@ public:
     }
 
     // all grid commands are designed not to lock
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
 protected:
     bool passthrough(OperationContext* txn,
@@ -230,7 +236,7 @@ public:
         return appendCommandStatus(
             result,
             Status(ErrorCodes::IllegalOperation,
-                   str::stream() << "can't do command: " << name << " on sharded collection"));
+                   str::stream() << "can't do command: " << getName() << " on sharded collection"));
     }
 };
 
@@ -566,7 +572,7 @@ public:
         uassert(ErrorCodes::EmptyFieldName, "missing todb argument", !todb.empty());
         uassert(ErrorCodes::InvalidNamespace,
                 "invalid todb argument",
-                NamespaceString::validDBName(todb));
+                NamespaceString::validDBName(todb, NamespaceString::DollarInDbNameBehavior::Allow));
 
         auto confTo = uassertStatusOK(grid.implicitCreateDb(txn, todb));
         uassert(ErrorCodes::IllegalOperation,
@@ -1526,9 +1532,6 @@ public:
 
     virtual bool slaveOk() const {
         return true;
-    }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
     }
     virtual Status checkAuthForCommand(ClientBasic* client,
                                        const std::string& dbname,

@@ -121,13 +121,12 @@ CatalogManagerReplicaSet::CatalogManagerReplicaSet(std::unique_ptr<DistLockManag
 
 CatalogManagerReplicaSet::~CatalogManagerReplicaSet() = default;
 
-Status CatalogManagerReplicaSet::startup(OperationContext* txn, bool allowNetworking) {
+Status CatalogManagerReplicaSet::startup(OperationContext* txn) {
     _distLockManager->startUp();
     return Status::OK();
 }
 
-void CatalogManagerReplicaSet::shutDown(OperationContext* txn, bool allowNetworking) {
-    invariant(allowNetworking);
+void CatalogManagerReplicaSet::shutDown(OperationContext* txn) {
     LOG(1) << "CatalogManagerReplicaSet::shutDown() called.";
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -135,7 +134,7 @@ void CatalogManagerReplicaSet::shutDown(OperationContext* txn, bool allowNetwork
     }
 
     invariant(_distLockManager);
-    _distLockManager->shutDown(txn, allowNetworking);
+    _distLockManager->shutDown(txn);
 }
 
 Status CatalogManagerReplicaSet::shardCollection(OperationContext* txn,
@@ -333,7 +332,7 @@ StatusWith<ShardDrainingStatus> CatalogManagerReplicaSet::removeShard(OperationC
 
 StatusWith<OpTimePair<DatabaseType>> CatalogManagerReplicaSet::getDatabase(
     OperationContext* txn, const std::string& dbName) {
-    if (!NamespaceString::validDBName(dbName)) {
+    if (!NamespaceString::validDBName(dbName, NamespaceString::DollarInDbNameBehavior::Allow)) {
         return {ErrorCodes::InvalidNamespace, stream() << dbName << " is not a valid db name"};
     }
 
@@ -856,7 +855,7 @@ bool CatalogManagerReplicaSet::runUserManagementWriteCommand(OperationContext* t
     }
 
     result->appendElements(response.getValue());
-    return Command::getStatusFromCommandResult(response.getValue()).isOK();
+    return getStatusFromCommandResult(response.getValue()).isOK();
 }
 
 bool CatalogManagerReplicaSet::runReadCommandForTest(OperationContext* txn,
@@ -871,7 +870,7 @@ bool CatalogManagerReplicaSet::runReadCommandForTest(OperationContext* txn,
         txn, kConfigReadSelector, dbname, cmdBuilder.done());
     if (resultStatus.isOK()) {
         result->appendElements(resultStatus.getValue());
-        return Command::getStatusFromCommandResult(resultStatus.getValue()).isOK();
+        return getStatusFromCommandResult(resultStatus.getValue()).isOK();
     }
 
     return Command::appendCommandStatus(*result, resultStatus.getStatus());
@@ -885,7 +884,7 @@ bool CatalogManagerReplicaSet::runUserManagementReadCommand(OperationContext* tx
         txn, kConfigPrimaryPreferredSelector, dbname, cmdObj);
     if (resultStatus.isOK()) {
         result->appendElements(resultStatus.getValue());
-        return Command::getStatusFromCommandResult(resultStatus.getValue()).isOK();
+        return getStatusFromCommandResult(resultStatus.getValue()).isOK();
     }
 
     return Command::appendCommandStatus(*result, resultStatus.getStatus());
@@ -906,7 +905,7 @@ Status CatalogManagerReplicaSet::applyChunkOpsDeprecated(OperationContext* txn,
         return response.getStatus();
     }
 
-    Status status = Command::getStatusFromCommandResult(response.getValue());
+    Status status = getStatusFromCommandResult(response.getValue());
 
     if (MONGO_FAIL_POINT(failApplyChunkOps)) {
         status = Status(ErrorCodes::InternalError, "Failpoint 'failApplyChunkOps' generated error");
@@ -1242,7 +1241,7 @@ Status CatalogManagerReplicaSet::_createCappedConfigCollection(OperationContext*
         return result.getStatus();
     }
 
-    return Command::getStatusFromCommandResult(result.getValue());
+    return getStatusFromCommandResult(result.getValue());
 }
 
 StatusWith<long long> CatalogManagerReplicaSet::_runCountCommandOnConfig(OperationContext* txn,

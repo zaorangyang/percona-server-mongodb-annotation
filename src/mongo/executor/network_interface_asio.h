@@ -120,6 +120,12 @@ public:
     NetworkInterfaceASIO(Options = Options());
 
     std::string getDiagnosticString() override;
+
+    uint64_t getNumCanceledOps();
+    uint64_t getNumFailedOps();
+    uint64_t getNumSucceededOps();
+    uint64_t getNumTimedOutOps();
+
     void appendConnectionStats(ConnectionPoolStats* stats) const override;
     std::string getHostName() override;
     void startup() override;
@@ -351,6 +357,8 @@ private:
         // Type to represent the internal id of this request.
         using AsyncOpId = uint64_t;
 
+        static const TableRow kFieldLabels;
+
         // Return string representation of a given state.
         std::string _stateToString(State state) const;
 
@@ -503,6 +511,12 @@ private:
     stdx::mutex _inProgressMutex;
     std::unordered_map<AsyncOp*, std::unique_ptr<AsyncOp>> _inProgress;
     std::unordered_set<TaskExecutor::CallbackHandle> _inGetConnection;
+
+    // Operation counters
+    AtomicUInt64 _numCanceledOps;
+    AtomicUInt64 _numFailedOps;  // includes timed out ops but does not include canceled ops
+    AtomicUInt64 _numSucceededOps;
+    AtomicUInt64 _numTimedOutOps;
 
     stdx::mutex _executorMutex;
     bool _isExecutorRunnable;

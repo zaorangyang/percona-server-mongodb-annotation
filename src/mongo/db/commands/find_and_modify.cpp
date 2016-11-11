@@ -214,9 +214,6 @@ public:
     bool slaveOk() const override {
         return false;
     }
-    bool isWriteCommandForConfigServer() const override {
-        return true;
-    }
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
                                std::vector<Privilege>* out) override {
@@ -264,9 +261,7 @@ public:
             }
 
             auto css = CollectionShardingState::get(txn, nsString);
-            if (css) {
-                css->checkShardVersionOrThrow(txn);
-            }
+            css->checkShardVersionOrThrow(txn);
 
             Collection* const collection = autoColl.getCollection();
             auto statusWithPlanExecutor = getExecutorDelete(txn, collection, &parsedDelete);
@@ -299,9 +294,7 @@ public:
             }
 
             auto css = CollectionShardingState::get(txn, nsString);
-            if (css) {
-                css->checkShardVersionOrThrow(txn);
-            }
+            css->checkShardVersionOrThrow(txn);
 
             Collection* collection = autoColl.getCollection();
             auto statusWithPlanExecutor =
@@ -383,9 +376,7 @@ public:
                 }
 
                 auto css = CollectionShardingState::get(txn, nsString);
-                if (css) {
-                    css->checkShardVersionOrThrow(txn);
-                }
+                css->checkShardVersionOrThrow(txn);
 
                 Status isPrimary = checkCanAcceptWritesForDatabase(nsString);
                 if (!isPrimary.isOK()) {
@@ -445,9 +436,7 @@ public:
                 }
 
                 auto css = CollectionShardingState::get(txn, nsString);
-                if (css) {
-                    css->checkShardVersionOrThrow(txn);
-                }
+                css->checkShardVersionOrThrow(txn);
 
                 Status isPrimary = checkCanAcceptWritesForDatabase(nsString);
                 if (!isPrimary.isOK()) {

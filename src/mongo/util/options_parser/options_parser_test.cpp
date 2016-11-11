@@ -744,6 +744,30 @@ TEST(Parsing, ImplicitValueOverride) {
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");
+    argv.push_back("--port");
+    argv.push_back("5");
+    std::map<std::string, std::string> env_map;
+
+    ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
+    moe::Value value;
+    ASSERT_OK(environment.get(moe::Key("port"), &value));
+    int port;
+    ASSERT_OK(value.get(&port));
+    ASSERT_EQUALS(port, 5);
+}
+
+TEST(Parsing, ImplicitValueOverrideWithEqualsSign) {
+    moe::OptionsParser parser;
+    moe::Environment environment;
+
+    moe::OptionSection testOpts;
+    testOpts.addOptionChaining("help", "help", moe::Switch, "Display help");
+    testOpts.addOptionChaining("port", "port", moe::Int, "Port")
+        .setDefault(moe::Value(6))
+        .setImplicit(moe::Value(7));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
     argv.push_back("--port=5");
     std::map<std::string, std::string> env_map;
 

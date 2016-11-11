@@ -191,6 +191,14 @@ add_option('ssl',
     nargs=0
 )
 
+add_option('mmapv1',
+    choices=['auto', 'on', 'off'],
+    default='auto',
+    help='Enable MMapV1',
+    nargs='?',
+    type='choice',
+)
+
 add_option('wiredtiger',
     choices=['on', 'off'],
     const='on',
@@ -331,14 +339,6 @@ add_option('use-system-pcre',
 add_option('use-system-wiredtiger',
     help='use system version of wiredtiger library',
     nargs=0,
-)
-
-boost_choices = ['1.56']
-add_option('internal-boost',
-    choices=boost_choices,
-    default=boost_choices[0],
-    help='Specify internal boost version to use',
-    type='choice',
 )
 
 add_option('system-boost-lib-search-suffixes',
@@ -1487,6 +1487,17 @@ if env.TargetOSIs('posix'):
             env.Append( LINKFLAGS=["-fstack-protector"] )
             env.Append( SHLINKFLAGS=["-fstack-protector"] )
 
+mmapv1 = False
+if get_option('mmapv1') == 'auto':
+    # MMapV1 only supports little-endian architectures, and will fail to run on big-endian
+    # so disable MMapV1 on big-endian architectures
+    if endian == 'big':
+        mmapv1 = False
+    else:
+        mmapv1 = True
+elif get_option('mmapv1') == 'on':
+    mmapv1 = True
+
 wiredtiger = False
 if get_option('wiredtiger') == 'on':
     # Wiredtiger only supports 64-bit architecture, and will fail to compile on 32-bit
@@ -1545,14 +1556,6 @@ if get_option("system-boost-lib-search-suffixes") is not None:
         boostSuffixList = []
     else:
         boostSuffixList = boostSuffixList.split(',')
-
-# boostSuffix is used when using internal boost to select which version
-# of boost is in play.
-boostSuffix = "";
-if not use_system_version_of_library("boost"):
-    # Boost release numbers are x.y.z, where z is usually 0 which we do not include in
-    # the internal-boost option
-    boostSuffix = "-%s.0" % get_option( "internal-boost")
 
 # discover modules, and load the (python) module for each module's build.py
 mongo_modules = moduleconfig.discover_modules('src/mongo/db/modules', get_option('modules'))
@@ -1797,6 +1800,12 @@ def doConfigure(myenv):
         # Warn about redundant moves, such as moving a local variable in a return that is different
         # than the return type.
         AddToCXXFLAGSIfSupported(myenv, "-Wredundant-move")
+
+        # Disable warning about variables that may not be initialized
+        # Failures are triggered in the case of boost::optional in GCC 4.8.x
+        # TODO: re-evaluate when we move to GCC 5.3
+        # see: http://stackoverflow.com/questions/21755206/how-to-get-around-gcc-void-b-4-may-be-used-uninitialized-in-this-funct
+        AddToCXXFLAGSIfSupported(myenv, "-Wno-maybe-uninitialized")
 
     # Check if we need to disable null-conversion warnings
     if myenv.ToolchainIs('clang'):
@@ -2555,6 +2564,10 @@ checkErrorCodes()
 # --- lint ----
 
 def doLint( env , target , source ):
+    import buildscripts.eslint
+    if not buildscripts.eslint.lint(None, dirmode=True, glob=["jstests/", "src/mongo/"]):
+        raise Exception("ESLint errors")
+
     import buildscripts.clang_format
     if not buildscripts.clang_format.lint(None, []):
         raise Exception("clang-format lint errors")
@@ -2630,11 +2643,11 @@ Export("get_option")
 Export("has_option use_system_version_of_library")
 Export("serverJs")
 Export("usemozjs")
-Export("boostSuffix")
 Export('module_sconscripts')
 Export("debugBuild optBuild")
 Export("rocksdb")
 Export("wiredtiger")
+Export("mmapv1")
 Export("endian")
 Export("inmemory")
 Export("icuEnabled")

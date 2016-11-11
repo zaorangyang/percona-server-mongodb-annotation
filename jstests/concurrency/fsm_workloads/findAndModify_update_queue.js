@@ -11,9 +11,11 @@
  * This workload was designed to reproduce an issue similar to SERVER-18304 for update operations
  * using the findAndModify command where the old version of the document is returned.
  */
-load('jstests/concurrency/fsm_libs/extend_workload.js');  // for extendWorkload
+load('jstests/concurrency/fsm_libs/extend_workload.js');                  // for extendWorkload
 load('jstests/concurrency/fsm_workloads/findAndModify_remove_queue.js');  // for $config
-load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongod and isMMAPv1
+
+// For isMongod and supportsDocumentLevelConcurrency.
+load('jstests/concurrency/fsm_workload_helpers/server_types.js');
 
 var $config = extendWorkload(
     $config,
@@ -31,11 +33,8 @@ var $config = extendWorkload(
             };
         };
 
-        $config.data.getIndexSpec = function getIndexSpec() {
-            return {
-                counter: 1,
-                rand: -1
-            };
+        $config.data.getIndexSpecs = function getIndexSpecs() {
+            return [{counter: 1, rand: -1}];
         };
 
         $config.data.opName = 'updated';
@@ -53,11 +52,11 @@ var $config = extendWorkload(
                 assertAlways.commandWorked(res);
 
                 var doc = res.value;
-                if (isMongod(db) && !isMMAPv1(db)) {
-                    // MMAPv1 does not automatically retry if there was a conflict, so it is
-                    // expected
-                    // that it may return null in the case of a conflict. All other storage engines
-                    // should automatically retry the operation, and thus should never return null.
+                if (isMongod(db) && supportsDocumentLevelConcurrency(db)) {
+                    // Storage engines which do not support document-level concurrency will not
+                    // automatically retry if there was a conflict, so it is expected that it may
+                    // return null in the case of a conflict. All other storage engines should
+                    // automatically retry the operation, and thus should never return null.
                     assertWhenOwnColl.neq(
                         doc,
                         null,

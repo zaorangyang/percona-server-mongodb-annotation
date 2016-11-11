@@ -42,6 +42,7 @@
 #include "mongo/db/client_basic.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/client/shard_registry.h"
@@ -70,9 +71,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void help(std::stringstream& help) const {
         help << " example: { moveprimary : 'foo' , to : 'localhost:9999' }";

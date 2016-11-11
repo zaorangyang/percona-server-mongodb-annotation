@@ -58,90 +58,6 @@ using std::string;
 
 namespace {
 
-class TransferModsCommand : public Command {
-public:
-    TransferModsCommand() : Command("_transferMods") {}
-
-    void help(std::stringstream& h) const {
-        h << "internal";
-    }
-
-    virtual bool slaveOk() const {
-        return false;
-    }
-
-    virtual bool adminOnly() const {
-        return true;
-    }
-
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
-
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::internal);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-    }
-
-    bool run(OperationContext* txn,
-             const string&,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
-        const MigrationSessionId migrationSessionid(
-            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
-        return ShardingState::get(txn)->migrationSourceManager()->transferMods(
-            txn, migrationSessionid, errmsg, result);
-    }
-
-} transferModsCommand;
-
-class InitialCloneCommand : public Command {
-public:
-    InitialCloneCommand() : Command("_migrateClone") {}
-
-    void help(std::stringstream& h) const {
-        h << "internal";
-    }
-
-    virtual bool slaveOk() const {
-        return false;
-    }
-
-    virtual bool adminOnly() const {
-        return true;
-    }
-
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
-
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::internal);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-    }
-
-    bool run(OperationContext* txn,
-             const string&,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
-        const MigrationSessionId migrationSessionid(
-            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
-        return ShardingState::get(txn)->migrationSourceManager()->clone(
-            txn, migrationSessionid, errmsg, result);
-    }
-
-} initialCloneCommand;
-
 /* -----
    below this are the "to" side commands
 
@@ -190,9 +106,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -233,7 +146,7 @@ public:
         if (!shardingState->enabled()) {
             if (!cmdObj["configServer"].eoo()) {
                 dassert(cmdObj["configServer"].type() == String);
-                shardingState->initialize(txn, cmdObj["configServer"].String());
+                shardingState->initializeFromConfigConnString(txn, cmdObj["configServer"].String());
             } else {
                 errmsg = str::stream()
                     << "cannot start recv'ing chunk, "
@@ -316,9 +229,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -356,9 +266,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -401,9 +308,6 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,

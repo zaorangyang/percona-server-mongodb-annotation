@@ -93,7 +93,7 @@ void Command::execCommand(OperationContext* txn,
 
 void Command::execCommandClientBasic(OperationContext* txn,
                                      Command* c,
-                                     ClientBasic& client,
+                                     Client& client,
                                      int queryOptions,
                                      const char* ns,
                                      BSONObj& cmdObj,
@@ -102,10 +102,9 @@ void Command::execCommandClientBasic(OperationContext* txn,
 
     if (cmdObj.getBoolField("help")) {
         stringstream help;
-        help << "help for: " << c->name << " ";
+        help << "help for: " << c->getName() << " ";
         c->help(help);
         result.append("help", help.str());
-        result.append("lockType", c->isWriteCommandForConfigServer() ? 1 : 0);
         appendCommandStatus(result, true, "");
         return;
     }
@@ -144,31 +143,6 @@ void Command::execCommandClientBasic(OperationContext* txn,
     }
 
     appendCommandStatus(result, ok, errmsg);
-}
-
-void Command::runAgainstRegistered(OperationContext* txn,
-                                   const char* ns,
-                                   BSONObj& jsobj,
-                                   BSONObjBuilder& anObjBuilder,
-                                   int queryOptions) {
-    // It should be impossible for this uassert to fail since there should be no way to get
-    // into this function with any other collection name.
-    uassert(16618,
-            "Illegal attempt to run a command against a namespace other than $cmd.",
-            nsToCollectionSubstring(ns) == "$cmd");
-
-    BSONElement e = jsobj.firstElement();
-    std::string commandName = e.fieldName();
-    Command* c = e.type() ? Command::findCommand(commandName) : NULL;
-    if (!c) {
-        Command::appendCommandStatus(
-            anObjBuilder, false, str::stream() << "no such cmd: " << commandName);
-        anObjBuilder.append("code", ErrorCodes::CommandNotFound);
-        Command::unknownCommands.increment();
-        return;
-    }
-
-    execCommandClientBasic(txn, c, cc(), queryOptions, ns, jsobj, anObjBuilder);
 }
 
 void Command::registerError(OperationContext* txn, const DBException& exception) {}

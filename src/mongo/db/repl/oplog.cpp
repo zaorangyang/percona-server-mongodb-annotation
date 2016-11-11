@@ -105,7 +105,6 @@ using std::vector;
 namespace repl {
 std::string rsOplogName = "local.oplog.rs";
 std::string masterSlaveOplogName = "local.oplog.$main";
-int OPLOG_VERSION = 2;
 
 MONGO_FP_DECLARE(disableSnapshotting);
 
@@ -292,7 +291,7 @@ unique_ptr<OplogDocWriter> _logOpWriter(OperationContext* txn,
     if (optime.getTerm() != -1)
         b.append("t", optime.getTerm());
     b.append("h", hashNew);
-    b.append("v", OPLOG_VERSION);
+    b.append("v", OplogEntry::kOplogVersion);
     b.append("op", opstr);
     b.append("ns", nss.ns());
     if (fromMigrate)
@@ -665,8 +664,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          return renameCollection(txn,
                                  NamespaceString(cmd.firstElement().valuestrsafe()),
                                  NamespaceString(cmd["to"].valuestrsafe()),
-                                 cmd["stayTemp"].trueValue(),
-                                 cmd["dropTarget"].trueValue());
+                                 cmd["dropTarget"].trueValue(),
+                                 cmd["stayTemp"].trueValue());
      },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::NamespaceExists}}},
     {"applyOps",
@@ -1181,6 +1180,7 @@ void SnapshotThread::run() {
             SnapshotName name(0);  // assigned real value in block.
             {
                 // Make sure there are no in-flight capped inserts while we create our snapshot.
+                // This lock cannot be aquired until all writes holding the resource commit/abort.
                 Lock::ResourceLock cappedInsertLockForOtherDb(
                     txn->lockState(), resourceCappedInFlightForOtherDb, MODE_X);
                 Lock::ResourceLock cappedInsertLockForLocalDb(

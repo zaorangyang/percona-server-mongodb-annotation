@@ -179,9 +179,6 @@ public:
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
-    }
 
     CmdDropDatabase() : Command("dropDatabase") {}
 
@@ -192,7 +189,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         // disallow dropping the config database
-        if (serverGlobalParams.configsvr && (dbname == "config")) {
+        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer && (dbname == "config")) {
             return appendCommandStatus(result,
                                        Status(ErrorCodes::IllegalOperation,
                                               "Cannot drop 'config' database if mongod started "
@@ -238,9 +235,6 @@ public:
         help << "repair database.  also compacts. note: slow.";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
-    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -314,9 +308,6 @@ public:
         help << "http://docs.mongodb.org/manual/reference/command/profile/#dbcmd.profile";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
-    }
 
     virtual Status checkAuthForCommand(ClientBasic* client,
                                        const std::string& dbname,
@@ -418,9 +409,6 @@ public:
              "monitoring#MonitoringandDiagnostics-DatabaseRecord%2FReplay%28diagLoggingcommand%29";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
-    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -485,9 +473,6 @@ public:
         help << "drop a collection\n{drop : <collectionName>}";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
-    }
 
     virtual bool run(OperationContext* txn,
                      const string& dbname,
@@ -525,9 +510,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
-    }
 
     virtual void help(stringstream& help) const {
         help << "create a collection explicitly\n"
@@ -583,9 +565,6 @@ public:
         help << " example: { filemd5 : ObjectId(aaaaaaa) , root : \"fs\" }";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
         std::string collectionName = cmdObj.getStringField("root");
@@ -757,9 +736,6 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
     virtual void help(stringstream& help) const {
         help << "determine data size for a set of data in a certain range"
                 "\nexample: { dataSize:\"blog.posts\", keyPattern:{x:1}, min:{x:10}, max:{x:55} }"
@@ -889,7 +865,6 @@ public:
         if (!min.isEmpty()) {
             os << " between " << min << " and " << max;
         }
-        logIfSlow(timer, os.str());
 
         result.appendNumber("size", size);
         result.appendNumber("numObjects", numObjects);
@@ -905,9 +880,6 @@ public:
 
     virtual bool slaveOk() const {
         return true;
-    }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
     }
     virtual void help(stringstream& help) const {
         help
@@ -1016,9 +988,6 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
-    }
     virtual void help(stringstream& help) const {
         help << "Sets collection options.\n"
                 "Example: { collMod: 'foo', usePowerOf2Sizes:true }\n"
@@ -1051,9 +1020,6 @@ public:
 
     virtual bool slaveOk() const {
         return true;
-    }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
     }
     virtual void help(stringstream& help) const {
         help << "Get stats on a database. Not instantaneous. Slower for databases with large "
@@ -1142,9 +1108,6 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
     virtual void help(stringstream& help) const {
         help << "{whatsmyuri:1}";
     }
@@ -1168,9 +1131,6 @@ public:
 
     virtual bool slaveOk() const {
         return true;
-    }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
     }
     virtual Status checkAuthForCommand(ClientBasic* client,
                                        const std::string& dbname,
@@ -1259,7 +1219,6 @@ void Command::execCommand(OperationContext* txn,
 
         std::string dbname = request.getDatabase().toString();
         unique_ptr<MaintenanceModeSetter> mmSetter;
-
 
         std::array<BSONElement, std::tuple_size<decltype(neededFieldNames)>::value>
             extractedFields{};
@@ -1373,7 +1332,14 @@ void Command::execCommand(OperationContext* txn,
         if (!retval) {
             command->_commandsFailed.increment();
         }
-    } catch (const DBException& exception) {
+    } catch (const DBException& e) {
+        // If we got a stale config, wait in case the operation is stuck in a critical section
+        if (e.getCode() == ErrorCodes::SendStaleConfig) {
+            auto& sce = static_cast<const StaleConfigException&>(e);
+            ShardingState::get(txn)
+                ->onStaleShardVersion(txn, NamespaceString(sce.getns()), sce.getVersionReceived());
+        }
+
         BSONObj metadata = rpc::makeEmptyMetadata();
         if (ShardingState::get(txn)->enabled()) {
             auto opTime = grid.shardRegistry()->getConfigOpTime();
@@ -1382,7 +1348,7 @@ void Command::execCommand(OperationContext* txn,
             metadata = metadataBob.obj();
         }
 
-        Command::generateErrorResponse(txn, replyBuilder, exception, request, command, metadata);
+        Command::generateErrorResponse(txn, replyBuilder, e, request, command, metadata);
     }
 }
 
@@ -1426,7 +1392,7 @@ bool Command::run(OperationContext* txn,
                 auto result = appendCommandStatus(
                     inPlaceReplyBob,
                     {ErrorCodes::InvalidOptions,
-                     str::stream() << "Command " << name << " does not support "
+                     str::stream() << "Command " << getName() << " does not support "
                                    << repl::ReadConcernArgs::kReadConcernFieldName});
                 inPlaceReplyBob.doneFast();
                 replyBuilder->setMetadata(rpc::makeEmptyMetadata());
@@ -1440,7 +1406,8 @@ bool Command::run(OperationContext* txn,
                 readConcernResult.appendInfo(&inPlaceReplyBob);
                 if (!readConcernResult.getStatus().isOK()) {
                     if (ErrorCodes::ExceededTimeLimit == readConcernResult.getStatus()) {
-                        const int debugLevel = serverGlobalParams.configsvr ? 0 : 2;
+                        const int debugLevel =
+                            serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
                         LOG(debugLevel)
                             << "Command on database " << request.getDatabase()
                             << " timed out waiting for read concern to be satisfied. Command: "
@@ -1470,13 +1437,21 @@ bool Command::run(OperationContext* txn,
                     return result;
                 }
 
+                const int debugLevel =
+                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
+                LOG(debugLevel) << "Waiting for 'committed' snapshot to be available for reading: "
+                                << readConcernArgs;
                 Status status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
 
                 // Wait until a snapshot is available.
                 while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
+                    LOG(debugLevel)
+                        << "Snapshot not available for readConcern: " << readConcernArgs;
                     replCoord->waitUntilSnapshotCommitted(txn, SnapshotName::min());
                     status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
                 }
+
+                LOG(debugLevel) << "Using 'committed' snapshot. " << CurOp::get(txn)->query();
 
                 if (!status.isOK()) {
                     auto result = appendCommandStatus(inPlaceReplyBob, status);
@@ -1496,7 +1471,6 @@ bool Command::run(OperationContext* txn,
     // run expects const db std::string (can't bind to temporary)
     const std::string db = request.getDatabase().toString();
 
-
     // TODO: remove queryOptions parameter from command's run method.
     bool result = this->run(txn, db, cmd, 0, errmsg, inPlaceReplyBob);
     appendCommandStatus(inPlaceReplyBob, result, errmsg);
@@ -1513,7 +1487,7 @@ bool Command::run(OperationContext* txn,
 
         // For commands from mongos, append some info to help getLastError(w) work.
         // TODO: refactor out of here as part of SERVER-18326
-        if (isShardingAware || serverGlobalParams.configsvr) {
+        if (isShardingAware || serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
                 .writeToMetadata(&metadataBob, request.getProtocol());
         }

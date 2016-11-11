@@ -17,8 +17,11 @@ post:
           set -e
           set -o verbose
           cd ./clusters/${cluster}
-          if [ ! -f "test.success" ]; then yes yes | ./terraform destroy; fi
-          if [ ! -f "test.success" ]; then echo "Cluster DESTROYED."; fi
+          if [ ! -f "test.success" ]; then 
+            yes yes | ./terraform destroy
+            if [ $? != 0 ]; then yes yes | ./terraform destroy; fi
+            echo "Cluster DESTROYED."
+          fi
 
 functions:
   "prepare environment":
@@ -62,7 +65,7 @@ functions:
           set -o verbose
           cd ./clusters/${cluster}
           # create all resources and instances
-          ./setup-cluster.sh
+          ../../bin/setup-cluster.sh ${cluster}
           echo "EC2 Cluster CREATED."
           tar -czvf cluster_config.tgz ips.sh terraform.tfstate.backup terraform.tfstate cluster.tf terraform.tfvars variables.tf
     - command: s3.put
@@ -105,7 +108,7 @@ functions:
           cd ./clusters/${cluster}
           # configure mongodb cluster with wiredTiger
           ../../bin/config-${setup}.sh mongodb ${storageEngine} ${numShard} ${test}
-          echo "${cluster} MongoDB Replica Cluster STARTED."
+          echo "${cluster} MongoDB Cluster STARTED."
   "run test":
     - command: shell.exec
       params:
@@ -122,7 +125,7 @@ functions:
           rm -f ../../reports.tgz
           echo "Run test for ${test} with setup ${setup}"
           # run test
-          ./run-${test}.sh ${storageEngine} ${setup}
+          ../../bin/run-${test}.sh ${storageEngine} ${setup} ${cluster}
           rm -f ../perf.json
           chmod 766 perf.json
           cp ./perf.json ..
@@ -153,12 +156,10 @@ functions:
           set -o verbose
           cd ./clusters/${cluster}
           # destroy the EC2 cluster
-          yes yes | ./terraform destroy
+          yes yes | ./terraform destroy; true
           # make sure we destroy the cluster in case of AWS API timing issue
-          yes yes | ./terraform destroy
+          yes yes | ./terraform destroy; true
           echo "Cluster DESTROYED."
-          echo "All perf results"
-          cd ..
 
   "make test log artifact":
     - command: shell.exec
@@ -215,7 +216,7 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          python -u ../dsi/analysis/post_run_check.py --rev ${revision} -f history.json -t tags.json --refTag 3.0.9-Baseline --overrideFile ../dsi/analysis/master/system_perf_override.json --project_id sys-perf --task_name ${task_name} --variant ${build_variant}
+          python -u ../dsi/analysis/post_run_check.py --rev ${revision} -f history.json -t tags.json --refTag 3.2.1-Baseline --overrideFile ../dsi/analysis/master/system_perf_override.json --project_id sys-perf --task_name ${task_name} --variant ${build_variant}
 
   "compare":
     - command: shell.exec

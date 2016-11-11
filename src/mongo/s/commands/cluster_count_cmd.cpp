@@ -82,9 +82,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -100,6 +97,10 @@ public:
                      int options,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        uassert(
+            ErrorCodes::InvalidNamespace, "count command requires valid namespace", nss.isValid());
+
         long long skip = 0;
 
         if (cmdObj["skip"].isNumber()) {
@@ -113,11 +114,8 @@ public:
             return false;
         }
 
-        const string collection = cmdObj.firstElement().valuestrsafe();
-        const string fullns = dbname + "." + collection;
-
         BSONObjBuilder countCmdBuilder;
-        countCmdBuilder.append("count", collection);
+        countCmdBuilder.append("count", nss.coll());
 
         BSONObj filter;
         if (cmdObj["query"].isABSONObj()) {
@@ -152,7 +150,7 @@ public:
 
         vector<Strategy::CommandResult> countResult;
         Strategy::commandOp(
-            txn, dbname, countCmdBuilder.done(), options, fullns, filter, &countResult);
+            txn, dbname, countCmdBuilder.done(), options, nss.ns(), filter, &countResult);
 
         long long total = 0;
         BSONObjBuilder shardSubTotal(result.subobjStart("shards"));
@@ -196,7 +194,11 @@ public:
                            ExplainCommon::Verbosity verbosity,
                            const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                            BSONObjBuilder* out) const {
-        const string fullns = parseNs(dbname, cmdObj);
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        if (!nss.isValid()) {
+            return Status{ErrorCodes::InvalidNamespace,
+                          str::stream() << "Invalid collection name: " << nss.ns()};
+        }
 
         // Extract the targeting query.
         BSONObj targetingQuery;
@@ -214,7 +216,7 @@ public:
 
         vector<Strategy::CommandResult> shardResults;
         Strategy::commandOp(
-            txn, dbname, explainCmdBob.obj(), options, fullns, targetingQuery, &shardResults);
+            txn, dbname, explainCmdBob.obj(), options, nss.ns(), targetingQuery, &shardResults);
 
         long long millisElapsed = timer.millis();
 
