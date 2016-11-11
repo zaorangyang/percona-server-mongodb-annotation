@@ -6,9 +6,11 @@ Import("rocksdb")
 Import("wiredtiger")
 Import("inmemory")
 
+if has_option('audit'):
+    env.SConscript(dirs='audit')
+
 env.SConscript(
     dirs=[
-        'audit',
         'auth',
         'backup',
         'catalog',
