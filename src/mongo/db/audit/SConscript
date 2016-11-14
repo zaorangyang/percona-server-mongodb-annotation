@@ -2,4 +2,13 @@
 
 Import("env")
 
-env.Library('audit', ['audit_commands.cpp', 'audit_file.cpp', 'audit_options.cpp', 'audit.cpp'])
+env.Library(
+    target='audit',
+    source=[
+        'audit_commands.cpp',
+        'audit_file.cpp',
+        'audit_options.cpp',
+        'audit.cpp',
+    ],
+    LIBDEPS_DEPENDENTS=['$BUILD_DIR/mongo/db/commands'],
+)
