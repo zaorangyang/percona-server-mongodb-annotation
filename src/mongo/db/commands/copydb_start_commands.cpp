@@ -44,6 +44,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/copydb.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -78,9 +79,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -150,9 +148,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual Status checkAuthForCommand(ClientBasic* client,
                                        const std::string& dbname,
@@ -207,7 +202,7 @@ public:
         if (!authConn->runCommand(
                 fromDb, BSON("saslStart" << 1 << mechanismElement << payloadElement), ret)) {
             authConn.reset();
-            return appendCommandStatus(result, Command::getStatusFromCommandResult(ret));
+            return appendCommandStatus(result, getStatusFromCommandResult(ret));
         }
 
         result.appendElements(ret);

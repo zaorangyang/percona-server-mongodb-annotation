@@ -29,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/config.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
@@ -754,6 +755,63 @@ TEST_F(ExpressionFloorTest, FloatArg) {
 
 TEST_F(ExpressionFloorTest, NullArg) {
     assertEvaluates(Value(BSONNULL), Value(BSONNULL));
+}
+
+/* ------------------------ ExpressionRange --------------------------- */
+
+TEST(ExpressionRangeTest, ComputesStandardRange) {
+    assertExpectedResults("$range", {{{Value(0), Value(3)}, Value(BSON_ARRAY(0 << 1 << 2))}});
+}
+
+TEST(ExpressionRangeTest, ComputesRangeWithStep) {
+    assertExpectedResults("$range",
+                          {{{Value(0), Value(6), Value(2)}, Value(BSON_ARRAY(0 << 2 << 4))}});
+}
+
+TEST(ExpressionRangeTest, ComputesReverseRange) {
+    assertExpectedResults("$range",
+                          {{{Value(0), Value(-3), Value(-1)}, Value(BSON_ARRAY(0 << -1 << -2))}});
+}
+
+TEST(ExpressionRangeTest, ComputesRangeWithPositiveAndNegative) {
+    assertExpectedResults("$range",
+                          {{{Value(-2), Value(3)}, Value(BSON_ARRAY(-2 << -1 << 0 << 1 << 2))}});
+}
+
+TEST(ExpressionRangeTest, ComputesEmptyRange) {
+    assertExpectedResults("$range",
+                          {{{Value(-2), Value(3), Value(-1)}, Value(std::vector<Value>())}});
+}
+
+TEST(ExpressionRangeTest, ComputesRangeWithSameStartAndEnd) {
+    assertExpectedResults("$range", {{{Value(20), Value(20)}, Value(std::vector<Value>())}});
+}
+
+TEST(ExpressionRangeTest, ComputesRangeWithLargeNegativeStep) {
+    assertExpectedResults("$range",
+                          {{{Value(3), Value(-5), Value(-3)}, Value(BSON_ARRAY(3 << 0 << -3))}});
+}
+
+/* ------------------------ ExpressionReverseArray -------------------- */
+
+TEST(ExpressionReverseArrayTest, ReversesNormalArray) {
+    assertExpectedResults("$reverseArray",
+                          {{{Value(BSON_ARRAY(1 << 2 << 3))}, Value(BSON_ARRAY(3 << 2 << 1))}});
+}
+
+TEST(ExpressionReverseArrayTest, ReversesEmptyArray) {
+    assertExpectedResults("$reverseArray",
+                          {{{Value(std::vector<Value>())}, Value(std::vector<Value>())}});
+}
+
+TEST(ExpressionReverseArrayTest, ReversesOneElementArray) {
+    assertExpectedResults("$reverseArray", {{{Value(BSON_ARRAY(1))}, Value(BSON_ARRAY(1))}});
+}
+
+TEST(ExpressionReverseArrayTest, ReturnsNullWithNullishInput) {
+    assertExpectedResults(
+        "$reverseArray",
+        {{{Value(BSONNULL)}, Value(BSONNULL)}, {{Value(BSONUndefined)}, Value(BSONNULL)}});
 }
 
 /* ------------------------- ExpressionTrunc -------------------------- */
@@ -4236,7 +4294,60 @@ class NullMiddleGt : public ExpectedResultBase {
 
 }  // namespace Strcasecmp
 
-namespace Substr {
+namespace StrLenBytes {
+
+TEST(ExpressionStrLenBytes, ComputesLengthOfString) {
+    assertExpectedResults("$strLenBytes", {{{Value("abc")}, Value(3)}});
+}
+
+TEST(ExpressionStrLenBytes, ComputesLengthOfEmptyString) {
+    assertExpectedResults("$strLenBytes", {{{Value("")}, Value(0)}});
+}
+
+TEST(ExpressionStrLenBytes, ComputesLengthOfStringWithNull) {
+    assertExpectedResults("$strLenBytes",
+                          {{{Value(StringData("ab\0c", StringData::LiteralTag()))}, Value(4)}});
+}
+
+TEST(ExpressionStrLenCP, ComputesLengthOfStringWithNullAtEnd) {
+    assertExpectedResults("$strLenBytes",
+                          {{{Value(StringData("abc\0", StringData::LiteralTag()))}, Value(4)}});
+}
+
+}  // namespace StrLenBytes
+
+namespace StrLenCP {
+
+TEST(ExpressionStrLenCP, ComputesLengthOfASCIIString) {
+    assertExpectedResults("$strLenCP", {{{Value("abc")}, Value(3)}});
+}
+
+TEST(ExpressionStrLenCP, ComputesLengthOfEmptyString) {
+    assertExpectedResults("$strLenCP", {{{Value("")}, Value(0)}});
+}
+
+TEST(ExpressionStrLenCP, ComputesLengthOfStringWithNull) {
+    assertExpectedResults("$strLenCP",
+                          {{{Value(StringData("ab\0c", StringData::LiteralTag()))}, Value(4)}});
+}
+
+TEST(ExpressionStrLenCP, ComputesLengthOfStringWithNullAtEnd) {
+    assertExpectedResults("$strLenCP",
+                          {{{Value(StringData("abc\0", StringData::LiteralTag()))}, Value(4)}});
+}
+
+TEST(ExpressionStrLenCP, ComputesLengthOfStringWithAccent) {
+    assertExpectedResults("$strLenCP",
+                          {{{Value(StringData("a\0bâ", StringData::LiteralTag()))}, Value(4)}});
+}
+
+TEST(ExpressionStrLenCP, ComputesLengthOfStringWithSpecialCharacters) {
+    assertExpectedResults("$strLenCP", {{{Value("ºabøåß")}, Value(6)}});
+}
+
+}  // namespace StrLenCP
+
+namespace SubstrBytes {
 
 class ExpectedResultBase {
 public:
@@ -4259,7 +4370,7 @@ protected:
 
 private:
     BSONObj spec() {
-        return BSON("$substr" << BSON_ARRAY(str() << offset() << length()));
+        return BSON("$substrBytes" << BSON_ARRAY(str() << offset() << length()));
     }
 };
 
@@ -4344,6 +4455,154 @@ class DropEndingNull : public ExpectedResultBase {
 };
 
 }  // namespace Substr
+
+namespace SubstrCP {
+
+TEST(ExpressionSubstrCPTest, DoesThrowWithBadContinuationByte) {
+    VariablesIdGenerator idGenerator;
+    VariablesParseState vps(&idGenerator);
+
+    StringData continuationByte("\x80\x00", StringData::LiteralTag());
+    const auto expr = Expression::parseExpression(
+        BSON("$substrCP" << BSON_ARRAY(continuationByte << 0 << 1)).firstElement(), vps);
+    ASSERT_THROWS({ expr->evaluate(Document()); }, UserException);
+}
+
+TEST(ExpressionSubstrCPTest, DoesThrowWithInvalidLeadingByte) {
+    VariablesIdGenerator idGenerator;
+    VariablesParseState vps(&idGenerator);
+
+    StringData leadingByte("\xFF\x00", StringData::LiteralTag());
+    const auto expr = Expression::parseExpression(
+        BSON("$substrCP" << BSON_ARRAY(leadingByte << 0 << 1)).firstElement(), vps);
+    ASSERT_THROWS({ expr->evaluate(Document()); }, UserException);
+}
+
+TEST(ExpressionSubstrCPTest, WithStandardValue) {
+    assertExpectedResults("$substrCP", {{{Value("abc"), Value(0), Value(2)}, Value("ab")}});
+}
+
+TEST(ExpressionSubstrCPTest, WithNullCharacter) {
+    assertExpectedResults("$substrCP", {{{Value("abc\0d"), Value(2), Value(3)}, Value("c\0d")}});
+}
+
+TEST(ExpressionSubstrCPTest, WithNullCharacterAtEnd) {
+    assertExpectedResults("$substrCP", {{{Value("abc\0"), Value(2), Value(2)}, Value("c\0")}});
+}
+
+TEST(ExpressionSubstrCPTest, WithOutOfRangeString) {
+    assertExpectedResults("$substrCP", {{{Value("abc"), Value(3), Value(2)}, Value("")}});
+}
+
+TEST(ExpressionSubstrCPTest, WithPartiallyOutOfRangeString) {
+    assertExpectedResults("$substrCP", {{{Value("abc"), Value(1), Value(4)}, Value("bc")}});
+}
+
+TEST(ExpressionSubstrCPTest, WithUnicodeValue) {
+    assertExpectedResults("$substrCP", {{{Value("øø∫å"), Value(0), Value(4)}, Value("øø∫å")}});
+    assertExpectedResults("$substrBytes", {{{Value("øø∫å"), Value(0), Value(4)}, Value("øø")}});
+}
+
+TEST(ExpressionSubstrCPTest, WithMixedUnicodeAndASCIIValue) {
+    assertExpectedResults("$substrCP", {{{Value("a∫bøßabc"), Value(1), Value(4)}, Value("∫bøß")}});
+    assertExpectedResults("$substrBytes", {{{Value("a∫bøßabc"), Value(1), Value(4)}, Value("∫b")}});
+}
+
+}  // namespace SubstrCP
+
+namespace Type {
+
+TEST(ExpressionTypeTest, WithMinKeyValue) {
+    assertExpectedResults("$type", {{{Value(MINKEY)}, Value("minKey")}});
+}
+
+TEST(ExpressionTypeTest, WithDoubleValue) {
+    assertExpectedResults("$type", {{{Value(1.0)}, Value("double")}});
+}
+
+TEST(ExpressionTypeTest, WithStringValue) {
+    assertExpectedResults("$type", {{{Value("stringValue")}, Value("string")}});
+}
+
+TEST(ExpressionTypeTest, WithObjectValue) {
+    BSONObj objectVal = fromjson("{a: {$literal: 1}}");
+    assertExpectedResults("$type", {{{Value(objectVal)}, Value("object")}});
+}
+
+TEST(ExpressionTypeTest, WithArrayValue) {
+    assertExpectedResults("$type", {{{Value(BSON_ARRAY(1 << 2))}, Value("array")}});
+}
+
+TEST(ExpressionTypeTest, WithBinDataValue) {
+    BSONBinData binDataVal = BSONBinData("", 0, BinDataGeneral);
+    assertExpectedResults("$type", {{{Value(binDataVal)}, Value("binData")}});
+}
+
+TEST(ExpressionTypeTest, WithUndefinedValue) {
+    assertExpectedResults("$type", {{{Value(BSONUndefined)}, Value("undefined")}});
+}
+
+TEST(ExpressionTypeTest, WithOIDValue) {
+    assertExpectedResults("$type", {{{Value(OID())}, Value("objectId")}});
+}
+
+TEST(ExpressionTypeTest, WithBoolValue) {
+    assertExpectedResults("$type", {{{Value(true)}, Value("bool")}});
+}
+
+TEST(ExpressionTypeTest, WithDateValue) {
+    Date_t dateVal = BSON("" << DATENOW).firstElement().Date();
+    assertExpectedResults("$type", {{{Value(dateVal)}, Value("date")}});
+}
+
+TEST(ExpressionTypeTest, WithNullValue) {
+    assertExpectedResults("$type", {{{Value(BSONNULL)}, Value("null")}});
+}
+
+TEST(ExpressionTypeTest, WithRegexValue) {
+    assertExpectedResults("$type", {{{Value(BSONRegEx("a.b"))}, Value("regex")}});
+}
+
+TEST(ExpressionTypeTest, WithSymbolValue) {
+    assertExpectedResults("$type", {{{Value(BSONSymbol("a"))}, Value("symbol")}});
+}
+
+TEST(ExpressionTypeTest, WithDBRefValue) {
+    assertExpectedResults("$type", {{{Value(BSONDBRef("", OID()))}, Value("dbPointer")}});
+}
+
+TEST(ExpressionTypeTest, WithCodeWScopeValue) {
+    assertExpectedResults(
+        "$type", {{{Value(BSONCodeWScope("var x = 3", BSONObj()))}, Value("javascriptWithScope")}});
+}
+
+TEST(ExpressionTypeTest, WithCodeValue) {
+    assertExpectedResults("$type", {{{Value(BSONCode("var x = 3"))}, Value("javascript")}});
+}
+
+TEST(ExpressionTypeTest, WithIntValue) {
+    assertExpectedResults("$type", {{{Value(1)}, Value("int")}});
+}
+
+#ifdef MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT
+TEST(ExpressionTypeTest, WithDecimalValue) {
+    assertExpectedResults("$type", {{{Value(Decimal128(0.3))}, Value("decimal")}});
+}
+#endif
+
+TEST(ExpressionTypeTest, WithLongValue) {
+    assertExpectedResults("$type", {{{Value(1LL)}, Value("long")}});
+}
+
+TEST(ExpressionTypeTest, WithTimestampValue) {
+    assertExpectedResults("$type", {{{Value(Timestamp(0, 0))}, Value("timestamp")}});
+}
+
+TEST(ExpressionTypeTest, WithMaxKeyValue) {
+    assertExpectedResults("$type", {{{Value(MAXKEY)}, Value("maxKey")}});
+}
+
+}  // namespace Type
 
 namespace ToLower {
 
@@ -4811,11 +5070,11 @@ public:
         add<Strcasecmp::NullMiddleEq>();
         add<Strcasecmp::NullMiddleGt>();
 
-        add<Substr::FullNull>();
-        add<Substr::BeginAtNull>();
-        add<Substr::EndAtNull>();
-        add<Substr::DropBeginningNull>();
-        add<Substr::DropEndingNull>();
+        add<SubstrBytes::FullNull>();
+        add<SubstrBytes::BeginAtNull>();
+        add<SubstrBytes::EndAtNull>();
+        add<SubstrBytes::DropBeginningNull>();
+        add<SubstrBytes::DropEndingNull>();
 
         add<ToLower::NullBegin>();
         add<ToLower::NullMiddle>();

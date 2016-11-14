@@ -1,6 +1,5 @@
-// commands.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2009-2016 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -50,8 +49,6 @@ namespace mongo {
 class BSONObj;
 class BSONObjBuilder;
 class Client;
-class CurOp;
-class Database;
 class OperationContext;
 class Timer;
 
@@ -63,9 +60,9 @@ namespace rpc {
 class ServerSelectionMetadata;
 }  // namespace rpc
 
-/** mongodb "commands" (sent via db.$cmd.findOne(...))
-    subclass to make a command.  define a singleton object for it.
-    */
+/**
+ * Serves as a base for server commands. See the constructor for more details.
+ */
 class Command {
 protected:
     // The type of the first field in 'cmdObj' must be mongo::String. The first field is
@@ -79,9 +76,32 @@ protected:
 public:
     typedef StringMap<Command*> CommandMap;
 
+    /**
+     * Constructs a new command and causes it to be registered with the global commands list. It is
+     * not safe to construct commands other than when the server is starting up.
+     *
+     * @param webUI expose the command in the web ui as localhost:28017/<name>
+     * @param oldName an optional old, deprecated name for the command
+     */
+    Command(StringData name, bool webUI = false, StringData oldName = StringData());
+
     // NOTE: Do not remove this declaration, or relocate it in this class. We
     // are using this method to control where the vtable is emitted.
     virtual ~Command();
+
+    /**
+     * Returns the command's name. This value never changes for the lifetime of the command.
+     */
+    const std::string& getName() const {
+        return _name;
+    }
+
+    /**
+     * Returns whether this command is visible in the Web UI.
+     */
+    bool isWebUI() const {
+        return _webUI;
+    }
 
     // Return the namespace for the command. If the first field in 'cmdObj' is of type
     // mongo::String, then that field is interpreted as the collection name, and is
@@ -98,8 +118,6 @@ public:
     virtual std::size_t reserveBytesForReply() const {
         return 0u;
     }
-
-    const std::string name;
 
     /* run the given command
        implement this...
@@ -119,27 +137,14 @@ public:
      * Then we won't need to mutate the command object. At that point we can also make
      * this method virtual so commands can override it directly.
      */
-    /*virtual*/ bool run(OperationContext* txn,
-                         const rpc::RequestInterface& request,
-                         rpc::ReplyBuilderInterface* replyBuilder);
-
-
-    /**
-     * This designation for the command is only used by the 'help' call and has nothing to do
-     * with lock acquisition. The reason we need to have it there is because
-     * SyncClusterConnection uses this to determine whether the command is update and needs to
-     * be sent to all three servers or just one.
-     *
-     * Eventually when SyncClusterConnection is refactored out, we can get rid of it.
-     */
-    virtual bool isWriteCommandForConfigServer() const = 0;
+    bool run(OperationContext* txn,
+             const rpc::RequestInterface& request,
+             rpc::ReplyBuilderInterface* replyBuilder);
 
     /* Return true if only the admin ns has privileges to run this command. */
     virtual bool adminOnly() const {
         return false;
     }
-
-    void htmlHelp(std::stringstream&) const;
 
     /* Like adminOnly, but even stricter: we must either be authenticated for admin db,
        or, if running without auth, on the local interface.  Used for things which
@@ -194,9 +199,7 @@ public:
                            const BSONObj& cmdObj,
                            ExplainCommon::Verbosity verbosity,
                            const rpc::ServerSelectionMetadata& serverSelectionMetadata,
-                           BSONObjBuilder* out) const {
-        return Status(ErrorCodes::IllegalOperation, "Cannot explain cmd: " + name);
-    }
+                           BSONObjBuilder* out) const;
 
     /**
      * Checks if the given client is authorized to run this command on database "dbname"
@@ -253,11 +256,6 @@ public:
         return LogicalOp::opCommand;
     }
 
-    /** @param webUI expose the command in the web ui as localhost:28017/<name>
-        @param oldName an optional old, deprecated name for the command
-    */
-    Command(StringData _name, bool webUI = false, StringData oldName = StringData());
-
 protected:
     /**
      * Appends to "*out" the privileges required to run this command on database "dbname" with
@@ -271,44 +269,21 @@ protected:
         fassertFailed(16940);
     }
 
-    BSONObj getQuery(const BSONObj& cmdObj) {
-        if (cmdObj["query"].type() == Object)
-            return cmdObj["query"].embeddedObject();
-        if (cmdObj["q"].type() == Object)
-            return cmdObj["q"].embeddedObject();
-        return BSONObj();
-    }
-
-    static void logIfSlow(const Timer& cmdTimer, const std::string& msg);
-
     static CommandMap* _commands;
     static CommandMap* _commandsByBestName;
-    static CommandMap* _webCommands;
 
     // Counters for how many times this command has been executed and failed
     Counter64 _commandsExecuted;
     Counter64 _commandsFailed;
 
-    // Pointers to hold the metrics tree references
-    ServerStatusMetricField<Counter64> _commandsExecutedMetric;
-    ServerStatusMetricField<Counter64> _commandsFailedMetric;
-
 public:
     static const CommandMap* commandsByBestName() {
         return _commandsByBestName;
-    }
-    static const CommandMap* webCommands() {
-        return _webCommands;
     }
 
     // Counter for unknown commands
     static Counter64 unknownCommands;
 
-    static void runAgainstRegistered(OperationContext* txn,
-                                     const char* ns,
-                                     BSONObj& jsobj,
-                                     BSONObjBuilder& anObjBuilder,
-                                     int queryOptions = 0);
     static Command* findCommand(StringData name);
 
     /**
@@ -330,7 +305,7 @@ public:
     // of Client. This will happen as part of SERVER-18292
     static void execCommandClientBasic(OperationContext* txn,
                                        Command* c,
-                                       ClientBasic& client,
+                                       Client& client,
                                        int queryOptions,
                                        const char* ns,
                                        BSONObj& cmdObj,
@@ -341,11 +316,6 @@ public:
 
     // @return s.isOK()
     static bool appendCommandStatus(BSONObjBuilder& result, const Status& status);
-
-    // Converts "result" into a Status object.  The input is expected to be the object returned
-    // by running a command.  Returns ErrorCodes::CommandResultSchemaViolation if "result" does
-    // not look like the result of a command.
-    static Status getStatusFromCommandResult(const BSONObj& result);
 
     /**
      * Parses cursor options from the command request object "cmdObj".  Used by commands that
@@ -461,13 +431,19 @@ private:
      * authorized.
      */
     static Status _checkAuthorization(Command* c,
-                                      ClientBasic* client,
+                                      Client* client,
                                       const std::string& dbname,
                                       const BSONObj& cmdObj);
-};
 
-void runCommands(OperationContext* txn,
-                 const rpc::RequestInterface& request,
-                 rpc::ReplyBuilderInterface* replyBuilder);
+    // The full name of the command
+    const std::string _name;
+
+    // Whether the command is available in the web UI
+    const bool _webUI;
+
+    // Pointers to hold the metrics tree references
+    ServerStatusMetricField<Counter64> _commandsExecutedMetric;
+    ServerStatusMetricField<Counter64> _commandsFailedMetric;
+};
 
 }  // namespace mongo

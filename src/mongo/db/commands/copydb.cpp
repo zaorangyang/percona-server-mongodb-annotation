@@ -98,9 +98,6 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
 
     virtual Status checkAuthForCommand(ClientBasic* client,
                                        const std::string& dbname,
@@ -147,7 +144,7 @@ public:
             return false;
         }
 
-        if (!NamespaceString::validDBName(todb)) {
+        if (!NamespaceString::validDBName(todb, NamespaceString::DollarInDbNameBehavior::Allow)) {
             errmsg = "invalid todb name: " + todb;
             return false;
         }

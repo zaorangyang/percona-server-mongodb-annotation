@@ -45,6 +45,7 @@
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/config.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/auth_index_d.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
@@ -57,6 +58,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbmessage.h"
@@ -84,6 +86,7 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/restapi.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -178,7 +181,7 @@ public:
             }
 
             if (!dbresponse.response.empty()) {
-                port->reply(m, dbresponse.response, dbresponse.responseTo);
+                port->reply(m, dbresponse.response, dbresponse.responseToMsgId);
                 if (dbresponse.exhaustNS.size() > 0) {
                     MsgData::View header = dbresponse.response.header();
                     QueryResult::View qr = header.view2ptr();
@@ -190,7 +193,7 @@ public:
                         BufBuilder b(512);
                         b.appendNum((int)0 /*size set later in appendData()*/);
                         b.appendNum(header.getId());
-                        b.appendNum(header.getResponseTo());
+                        b.appendNum(header.getResponseToMsgId());
                         b.appendNum((int)dbGetMore);
                         b.appendNum((int)0);
                         b.appendStr(ns);
@@ -347,7 +350,7 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
             log() << "****";
             log() << "cannot do this upgrade without an upgrade in the middle";
             log() << "please do a --repair with 2.6 and then start this version";
-            dbexit(EXIT_NEED_UPGRADE);
+            quickExit(EXIT_NEED_UPGRADE);
             return;
         }
 
@@ -458,7 +461,8 @@ static void _initAndListen(int listenPort) {
     options.port = listenPort;
     options.ipList = serverGlobalParams.bind_ip;
 
-    MessageServer* server = createServer(options, new MyMessageHandler());
+    auto handler = std::make_shared<MyMessageHandler>();
+    MessageServer* server = createServer(options, std::move(handler));
     server->setAsTimeTracker();
 
     // This is what actually creates the sockets, but does not yet listen on them because we
@@ -652,6 +656,8 @@ static void _initAndListen(int listenPort) {
         startFTDC();
 
         if (!repl::getGlobalReplicationCoordinator()->isReplEnabled()) {
+            uassertStatusOK(ShardingState::get(startupOpCtx.get())
+                                ->initializeFromShardIdentity(startupOpCtx.get()));
             uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
         }
 
@@ -854,8 +860,89 @@ static void reportEventToSystemImpl(const char* msg) {
 }  // namespace mongo
 #endif  // if defined(_WIN32)
 
+static void shutdownServer() {
+    log(LogComponent::kNetwork) << "shutdown: going to close listening sockets..." << endl;
+    ListeningSockets::get()->closeAll();
+
+    log(LogComponent::kNetwork) << "shutdown: going to flush diaglog..." << endl;
+    _diaglog.flush();
+
+    // We drop the scope cache because leak sanitizer can't see across the
+    // thread we use for proxying MozJS requests. Dropping the cache cleans up
+    // the memory and makes leak sanitizer happy.
+    ScriptEngine::dropScopeCache();
+
+    getGlobalServiceContext()->shutdownGlobalStorageEngineCleanly();
+}
+
+// NOTE: This function may be called at any time after
+// registerShutdownTask is called below. It must not depend on the
+// prior execution of mongo initializers or the existence of threads.
+static void shutdownTask() {
+    // Global storage engine may not be started in all cases before we exit
+    if (getGlobalServiceContext()->getGlobalStorageEngine() == NULL) {
+        return;
+    }
+
+    // Shutdown Full-Time Data Capture
+    stopFTDC();
+
+    getGlobalServiceContext()->setKillAllOperations();
+
+    repl::getGlobalReplicationCoordinator()->shutdown();
+
+    Client& client = cc();
+    ServiceContext::UniqueOperationContext uniqueTxn;
+    OperationContext* txn = client.getOperationContext();
+    if (!txn) {
+        uniqueTxn = client.makeOperationContext();
+        txn = uniqueTxn.get();
+    }
+
+    ShardingState::get(txn)->shutDown(txn);
+
+    // We should always be able to acquire the global lock at shutdown.
+    //
+    // TODO: This call chain uses the locker directly, because we do not want to start an
+    // operation context, which also instantiates a recovery unit. Also, using the
+    // lockGlobalBegin/lockGlobalComplete sequence, we avoid taking the flush lock. This will
+    // all go away if we start acquiring the global/flush lock as part of ScopedTransaction.
+    //
+    // For a Windows service, dbexit does not call exit(), so we must leak the lock outside
+    // of this function to prevent any operations from running that need a lock.
+    //
+    DefaultLockerImpl* globalLocker = new DefaultLockerImpl();
+    LockResult result = globalLocker->lockGlobalBegin(MODE_X);
+    if (result == LOCK_WAITING) {
+        result = globalLocker->lockGlobalComplete(UINT_MAX);
+    }
+
+    invariant(LOCK_OK == result);
+
+    log(LogComponent::kControl) << "now exiting" << endl;
+
+    // Execute the graceful shutdown tasks, such as flushing the outstanding journal
+    // and data files, close sockets, etc.
+    try {
+        shutdownServer();
+    } catch (const DBException& ex) {
+        severe() << "shutdown failed with DBException " << ex;
+        std::terminate();
+    } catch (const std::exception& ex) {
+        severe() << "shutdown failed with std::exception: " << ex.what();
+        std::terminate();
+    } catch (...) {
+        severe() << "shutdown failed with exception";
+        std::terminate();
+    }
+
+    audit::logShutdown(&cc());
+}
+
 static int mongoDbMain(int argc, char* argv[], char** envp) {
     static StaticObserver staticObserver;
+
+    registerShutdownTask(shutdownTask);
 
 #if defined(_WIN32)
     mongo::reportEventToSystem = &mongo::reportEventToSystemImpl;

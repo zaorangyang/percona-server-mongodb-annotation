@@ -33,8 +33,6 @@
 namespace mongo {
 
 class BSONObj;
-class BSONObjBuilder;
-class StringData;
 
 struct CollationSpec;
 
@@ -50,13 +48,6 @@ public:
      * The resulting BSONObj is owned by the caller.
      */
     static BSONObj specToBSON(const CollationSpec& spec);
-
-    /**
-     * Appends 'key' to 'bob' as a BSONElement of BSONType string with field name 'fieldName'.
-     */
-    static void appendCollationKey(StringData fieldName,
-                                   const CollatorInterface::ComparisonKey& key,
-                                   BSONObjBuilder* bob);
 };
 
 }  // namespace mongo

@@ -102,7 +102,11 @@ public:
      * clear/reset state
      */
     void reset() {
-        _applierFn = [](OperationContext*, const BSONObj&) -> Status { return Status::OK(); };
+        _applierFn = [](const MultiApplier::Operations&) {};
+        _multiApplyFn = [](OperationContext*,
+                           const MultiApplier::Operations& ops,
+                           MultiApplier::ApplyOperationFn)
+                            -> StatusWith<OpTime> { return ops.back().getOpTime(); };
         _rollbackFn = [](OperationContext*, const OpTime&, const HostAndPort&)
                           -> Status { return Status::OK(); };
         _setMyLastOptime = [this](const OpTime& opTime) { _myLastOpTime = opTime; };
@@ -181,9 +185,11 @@ protected:
         launchExecutorThread();
         DataReplicatorOptions options;
         options.initialSyncRetryWait = Milliseconds(0);
-        options.applierFn = [this](OperationContext* txn, const BSONObj& operation) {
-            return _applierFn(txn, operation);
-        };
+        options.applierFn = [this](const MultiApplier::Operations& ops) { return _applierFn(ops); };
+        options.multiApplyFn =
+            [this](OperationContext* txn,
+                   const MultiApplier::Operations& ops,
+                   MultiApplier::ApplyOperationFn func) { return _multiApplyFn(txn, ops, func); };
         options.rollbackFn = [this](OperationContext* txn,
                                     const OpTime& lastOpTimeWritten,
                                     const HostAndPort& syncSource) -> Status {
@@ -199,6 +205,7 @@ protected:
             _memberState = state;
             return true;
         };
+        options.getSlaveDelay = [this]() { return Seconds(0); };
         options.syncSourceSelector = this;
         try {
             _dr.reset(new DataReplicator(options, &(getReplExecutor())));
@@ -213,7 +220,8 @@ protected:
         // Executor may still invoke callback before shutting down.
     }
 
-    Applier::ApplyOperationFn _applierFn;
+    MultiApplier::ApplyOperationFn _applierFn;
+    MultiApplier::MultiApplyFn _multiApplyFn;
     DataReplicatorOptions::RollbackFn _rollbackFn;
     DataReplicatorOptions::SetMyLastOptimeFn _setMyLastOptime;
     OpTime _myLastOpTime;
@@ -332,12 +340,11 @@ protected:
             const long long cursorId = cmdElem.numberLong();
             if (isGetMore && cursorId == 1LL) {
                 // process getmore requests from the oplog fetcher
-                auto respBSON =
-                    fromjson(str::stream() << "{ok:1, cursor:{id:NumberLong(1), ns:'local.oplog.rs'"
-                                              " , nextBatch:[{ts:Timestamp(" << ++c
-                                           << ",1), h:1, ns:'test.a', v:2, op:'u', o2:{_id:" << c
-                                           << "}, o:{$set:{a:1}}}"
-                                              "]}}");
+                auto respBSON = fromjson(str::stream()
+                                         << "{ok:1, cursor:{id:NumberLong(1), ns:'local.oplog.rs'"
+                                            " , nextBatch:[{ts:Timestamp(" << ++c
+                                         << ",1), h:1, ns:'test.a', v:" << OplogEntry::kOplogVersion
+                                         << ", op:'u', o2:{_id:" << c << "}, o:{$set:{a:1}}}]}}");
                 net->scheduleResponse(
                     noi,
                     net->now(),
@@ -412,14 +419,14 @@ TEST_F(InitialSyncTest, Complete) {
     const std::vector<BSONObj> responses = {
         // get latest oplog ts
         fromjson(
-            "{ok:1, cursor:{id:NumberLong(0), ns:'local.oplog.rs', firstBatch:["
-            "{ts:Timestamp(1,1), h:1, ns:'a.a', v:2, op:'i', o:{_id:1, a:1}}"
-            "]}}"),
+            str::stream() << "{ok:1, cursor:{id:NumberLong(0), ns:'local.oplog.rs', firstBatch:["
+                             "{ts:Timestamp(1,1), h:1, ns:'a.a', v:" << OplogEntry::kOplogVersion
+                          << ", op:'i', o:{_id:1, a:1}}]}}"),
         // oplog fetcher find
         fromjson(
-            "{ok:1, cursor:{id:NumberLong(1), ns:'local.oplog.rs', firstBatch:["
-            "{ts:Timestamp(1,1), h:1, ns:'a.a', v:2, op:'i', o:{_id:1, a:1}}"
-            "]}}"),
+            str::stream() << "{ok:1, cursor:{id:NumberLong(1), ns:'local.oplog.rs', firstBatch:["
+                             "{ts:Timestamp(1,1), h:1, ns:'a.a', v:" << OplogEntry::kOplogVersion
+                          << ", op:'i', o:{_id:1, a:1}}]}}"),
         // Clone Start
         // listDatabases
         fromjson("{ok:1, databases:[{name:'a'}]}"),
@@ -429,10 +436,10 @@ TEST_F(InitialSyncTest, Complete) {
             "{name:'a', options:{}} "
             "]}}"),
         // listIndexes:a
-        fromjson(
-            "{ok:1, cursor:{id:NumberLong(0), ns:'a.$cmd.listIndexes.a', firstBatch:["
-            "{v:1, key:{_id:1}, name:'_id_', ns:'a.a'}"
-            "]}}"),
+        fromjson(str::stream()
+                 << "{ok:1, cursor:{id:NumberLong(0), ns:'a.$cmd.listIndexes.a', firstBatch:["
+                    "{v:" << OplogEntry::kOplogVersion
+                 << ", key:{_id:1}, name:'_id_', ns:'a.a'}]}}"),
         // find:a
         fromjson(
             "{ok:1, cursor:{id:NumberLong(0), ns:'a.a', firstBatch:["
@@ -441,9 +448,9 @@ TEST_F(InitialSyncTest, Complete) {
         // Clone Done
         // get latest oplog ts
         fromjson(
-            "{ok:1, cursor:{id:NumberLong(0), ns:'local.oplog.rs', firstBatch:["
-            "{ts:Timestamp(2,2), h:1, ns:'b.c', v:2, op:'i', o:{_id:1, c:1}}"
-            "]}}"),
+            str::stream() << "{ok:1, cursor:{id:NumberLong(0), ns:'local.oplog.rs', firstBatch:["
+                             "{ts:Timestamp(2,2), h:1, ns:'b.c', v:" << OplogEntry::kOplogVersion
+                          << ", op:'i', o:{_id:1, c:1}}]}}"),
         // Applier starts ...
     };
     startSync();
@@ -452,27 +459,29 @@ TEST_F(InitialSyncTest, Complete) {
     verifySync();
 }
 
-TEST_F(InitialSyncTest, MissingDocOnApplyCompletes) {
+TEST_F(InitialSyncTest, MissingDocOnMultiApplyCompletes) {
     DataReplicatorOptions opts;
     int applyCounter{0};
-    _applierFn = [&](OperationContext* txn, const BSONObj& op) {
-        if (++applyCounter == 1) {
-            return Status(ErrorCodes::NoMatchingDocument, "failed: missing doc.");
-        }
-        return Status::OK();
-    };
+    _multiApplyFn =
+        [&](OperationContext*, const MultiApplier::Operations& ops, MultiApplier::ApplyOperationFn)
+            -> StatusWith<OpTime> {
+                if (++applyCounter == 1) {
+                    return Status(ErrorCodes::NoMatchingDocument, "failed: missing doc.");
+                }
+                return ops.back().getOpTime();
+            };
 
     const std::vector<BSONObj> responses = {
         // get latest oplog ts
         fromjson(
-            "{ok:1, cursor:{id:NumberLong(0), ns:'local.oplog.rs', firstBatch:["
-            "{ts:Timestamp(1,1), h:1, ns:'a.a', v:2, op:'i', o:{_id:1, a:1}}"
-            "]}}"),
+            str::stream() << "{ok:1, cursor:{id:NumberLong(0), ns:'local.oplog.rs', firstBatch:["
+                             "{ts:Timestamp(1,1), h:1, ns:'a.a', v:" << OplogEntry::kOplogVersion
+                          << ", op:'i', o:{_id:1, a:1}}]}}"),
         // oplog fetcher find
         fromjson(
-            "{ok:1, cursor:{id:NumberLong(1), ns:'local.oplog.rs', firstBatch:["
-            "{ts:Timestamp(1,1), h:1, ns:'a.a', v:2, op:'u', o2:{_id:1}, o:{$set:{a:1}}}"
-            "]}}"),
+            str::stream() << "{ok:1, cursor:{id:NumberLong(1), ns:'local.oplog.rs', firstBatch:["
+                             "{ts:Timestamp(1,1), h:1, ns:'a.a', v:" << OplogEntry::kOplogVersion
+                          << ", op:'u', o2:{_id:1}, o:{$set:{a:1}}}]}}"),
         // Clone Start
         // listDatabases
         fromjson("{ok:1, databases:[{name:'a'}]}"),
@@ -482,18 +491,18 @@ TEST_F(InitialSyncTest, MissingDocOnApplyCompletes) {
             "{name:'a', options:{}} "
             "]}}"),
         // listIndexes:a
-        fromjson(
-            "{ok:1, cursor:{id:NumberLong(0), ns:'a.$cmd.listIndexes.a', firstBatch:["
-            "{v:1, key:{_id:1}, name:'_id_', ns:'a.a'}"
-            "]}}"),
+        fromjson(str::stream()
+                 << "{ok:1, cursor:{id:NumberLong(0), ns:'a.$cmd.listIndexes.a', firstBatch:["
+                    "{v:" << OplogEntry::kOplogVersion
+                 << ", key:{_id:1}, name:'_id_', ns:'a.a'}]}}"),
         // find:a -- empty
         fromjson("{ok:1, cursor:{id:NumberLong(0), ns:'a.a', firstBatch:[]}}"),
         // Clone Done
         // get latest oplog ts
         fromjson(
-            "{ok:1, cursor:{id:NumberLong(0), ns:'local.oplog.rs', firstBatch:["
-            "{ts:Timestamp(2,2), h:1, ns:'b.c', v:2, op:'i', o:{_id:1, c:1}}"
-            "]}}"),
+            str::stream() << "{ok:1, cursor:{id:NumberLong(0), ns:'local.oplog.rs', firstBatch:["
+                             "{ts:Timestamp(2,2), h:1, ns:'b.c', v:" << OplogEntry::kOplogVersion
+                          << ", op:'i', o:{_id:1, c:1}}]}}"),
         // Applier starts ...
         // missing doc fetch -- find:a {_id:1}
         fromjson(
@@ -541,14 +550,14 @@ TEST_F(InitialSyncTest, FailsOnClone) {
     const std::vector<BSONObj> responses = {
         // get latest oplog ts
         fromjson(
-            "{ok:1, cursor:{id:NumberLong(0), ns:'local.oplog.rs', firstBatch:["
-            "{ts:Timestamp(1,1), h:1, ns:'a.a', v:2, op:'i', o:{_id:1, a:1}}"
-            "]}}"),
+            str::stream() << "{ok:1, cursor:{id:NumberLong(0), ns:'local.oplog.rs', firstBatch:["
+                             "{ts:Timestamp(1,1), h:1, ns:'a.a', v:" << OplogEntry::kOplogVersion
+                          << ", op:'i', o:{_id:1, a:1}}]}}"),
         // oplog fetcher find
         fromjson(
-            "{ok:1, cursor:{id:NumberLong(1), ns:'local.oplog.rs', firstBatch:["
-            "{ts:Timestamp(1,1), h:1, ns:'a.a', v:2, op:'i', o:{_id:1, a:1}}"
-            "]}}"),
+            str::stream() << "{ok:1, cursor:{id:NumberLong(1), ns:'local.oplog.rs', firstBatch:["
+                             "{ts:Timestamp(1,1), h:1, ns:'a.a', v:" << OplogEntry::kOplogVersion
+                          << ", op:'i', o:{_id:1, a:1}}]}}"),
         // Clone Start
         // listDatabases
         fromjson("{ok:0}")};
@@ -864,17 +873,20 @@ TEST_F(SteadyStateTest, RollbackTwoSyncSourcesSecondRollbackSucceeds) {
 TEST_F(SteadyStateTest, PauseDataReplicator) {
     auto operationToApply = BSON("op"
                                  << "a"
-                                 << "ts" << Timestamp(Seconds(123), 0));
+                                 << "v" << OplogEntry::kOplogVersion << "ts"
+                                 << Timestamp(Seconds(123), 0));
     stdx::mutex mutex;
     unittest::Barrier barrier(2U);
     Timestamp lastTimestampApplied;
     BSONObj operationApplied;
-    _applierFn = [&](OperationContext* txn, const BSONObj& op) {
-        stdx::lock_guard<stdx::mutex> lock(mutex);
-        operationApplied = op;
-        barrier.countDownAndWait();
-        return Status::OK();
-    };
+    _multiApplyFn =
+        [&](OperationContext*, const MultiApplier::Operations& ops, MultiApplier::ApplyOperationFn)
+            -> StatusWith<OpTime> {
+                stdx::lock_guard<stdx::mutex> lock(mutex);
+                operationApplied = ops.back().raw;
+                barrier.countDownAndWait();
+                return ops.back().getOpTime();
+            };
     DataReplicatorOptions::SetMyLastOptimeFn oldSetMyLastOptime = _setMyLastOptime;
     _setMyLastOptime = [&](const OpTime& opTime) {
         oldSetMyLastOptime(opTime);
@@ -945,17 +957,20 @@ TEST_F(SteadyStateTest, PauseDataReplicator) {
 TEST_F(SteadyStateTest, ApplyOneOperation) {
     auto operationToApply = BSON("op"
                                  << "a"
-                                 << "ts" << Timestamp(Seconds(123), 0));
+                                 << "v" << OplogEntry::kOplogVersion << "ts"
+                                 << Timestamp(Seconds(123), 0));
     stdx::mutex mutex;
     unittest::Barrier barrier(2U);
     Timestamp lastTimestampApplied;
     BSONObj operationApplied;
-    _applierFn = [&](OperationContext* txn, const BSONObj& op) {
-        stdx::lock_guard<stdx::mutex> lock(mutex);
-        operationApplied = op;
-        barrier.countDownAndWait();
-        return Status::OK();
-    };
+    _multiApplyFn =
+        [&](OperationContext*, const MultiApplier::Operations& ops, MultiApplier::ApplyOperationFn)
+            -> StatusWith<OpTime> {
+                stdx::lock_guard<stdx::mutex> lock(mutex);
+                operationApplied = ops.back().raw;
+                barrier.countDownAndWait();
+                return ops.back().getOpTime();
+            };
     DataReplicatorOptions::SetMyLastOptimeFn oldSetMyLastOptime = _setMyLastOptime;
     _setMyLastOptime = [&](const OpTime& opTime) {
         oldSetMyLastOptime(opTime);

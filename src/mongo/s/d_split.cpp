@@ -79,9 +79,6 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
     virtual void help(stringstream& help) const {
         help << "Internal command.\n";
     }
@@ -232,9 +229,6 @@ class SplitVector : public Command {
 public:
     SplitVector() : Command("splitVector", false) {}
     virtual bool slaveOk() const {
-        return false;
-    }
-    virtual bool isWriteCommandForConfigServer() const {
         return false;
     }
     virtual void help(stringstream& help) const {
@@ -555,9 +549,6 @@ public:
     virtual bool adminOnly() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
     virtual Status checkAuthForCommand(ClientBasic* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
@@ -638,7 +629,7 @@ public:
             }
 
             const string configdb = cmdObj["configdb"].String();
-            shardingState->initialize(txn, configdb);
+            shardingState->initializeFromConfigConnString(txn, configdb);
         }
 
         // Initialize our current shard name in the shard state if needed
@@ -690,9 +681,9 @@ public:
             // Mongos >= v3.2 sends the full version, v3.0 only sends the epoch.
             // TODO(SERVER-20742): Stop parsing epoch separately after 3.2.
             OID cmdEpoch;
-            auto& operationVersion = OperationShardingState::get(txn);
-            if (operationVersion.hasShardVersion()) {
-                cmdVersion = operationVersion.getShardVersion(nss);
+            auto& oss = OperationShardingState::get(txn);
+            if (oss.hasShardVersion()) {
+                cmdVersion = oss.getShardVersion(nss);
                 cmdEpoch = cmdVersion.epoch();
             } else {
                 BSONElement epochElem(cmdObj["epoch"]);

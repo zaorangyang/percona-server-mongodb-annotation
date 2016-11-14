@@ -185,8 +185,7 @@ void ComparisonMatchExpression::debugString(StringBuilder& debug, int level) con
             debug << "$gte";
             break;
         default:
-            debug << " UNKNOWN - should be impossible";
-            break;
+            invariant(false);
     }
     debug << " " << _rhs.toString(false);
 
@@ -199,7 +198,7 @@ void ComparisonMatchExpression::debugString(StringBuilder& debug, int level) con
     debug << "\n";
 }
 
-void ComparisonMatchExpression::toBSON(BSONObjBuilder* out) const {
+void ComparisonMatchExpression::serialize(BSONObjBuilder* out) const {
     string opString = "";
     switch (matchType()) {
         case LT:
@@ -218,8 +217,7 @@ void ComparisonMatchExpression::toBSON(BSONObjBuilder* out) const {
             opString = "$gte";
             break;
         default:
-            opString = " UNKNOWN - should be impossible";
-            break;
+            invariant(false);
     }
 
     out->append(path(), BSON(opString << _rhs));
@@ -307,7 +305,7 @@ void RegexMatchExpression::debugString(StringBuilder& debug, int level) const {
     debug << "\n";
 }
 
-void RegexMatchExpression::toBSON(BSONObjBuilder* out) const {
+void RegexMatchExpression::serialize(BSONObjBuilder* out) const {
     out->appendRegex(path(), _regex, _flags);
 }
 
@@ -342,7 +340,7 @@ void ModMatchExpression::debugString(StringBuilder& debug, int level) const {
     debug << "\n";
 }
 
-void ModMatchExpression::toBSON(BSONObjBuilder* out) const {
+void ModMatchExpression::serialize(BSONObjBuilder* out) const {
     out->append(path(), BSON("$mod" << BSON_ARRAY(_divisor << _remainder)));
 }
 
@@ -377,7 +375,7 @@ void ExistsMatchExpression::debugString(StringBuilder& debug, int level) const {
     debug << "\n";
 }
 
-void ExistsMatchExpression::toBSON(BSONObjBuilder* out) const {
+void ExistsMatchExpression::serialize(BSONObjBuilder* out) const {
     out->append(path(), BSON("$exists" << true));
 }
 
@@ -395,30 +393,29 @@ bool ExistsMatchExpression::equivalent(const MatchExpression* other) const {
 const std::string TypeMatchExpression::kMatchesAllNumbersAlias = "number";
 
 const std::unordered_map<std::string, BSONType> TypeMatchExpression::typeAliasMap = {
-    {"double", NumberDouble},
+    {typeName(NumberDouble), NumberDouble},
+    {typeName(String), String},
+    {typeName(Object), Object},
+    {typeName(Array), Array},
+    {typeName(BinData), BinData},
+    {typeName(Undefined), Undefined},
+    {typeName(jstOID), jstOID},
+    {typeName(Bool), Bool},
+    {typeName(Date), Date},
+    {typeName(jstNULL), jstNULL},
+    {typeName(RegEx), RegEx},
+    {typeName(DBRef), DBRef},
+    {typeName(Code), Code},
+    {typeName(Symbol), Symbol},
+    {typeName(CodeWScope), CodeWScope},
+    {typeName(NumberInt), NumberInt},
+    {typeName(bsonTimestamp), bsonTimestamp},
+    {typeName(NumberLong), NumberLong},
 #ifdef MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT
-    {"decimal", NumberDecimal},
+    {typeName(NumberDecimal), NumberDecimal},
 #endif
-    {"string", String},
-    {"object", Object},
-    {"array", Array},
-    {"binData", BinData},
-    {"undefined", Undefined},
-    {"objectId", jstOID},
-    {"bool", Bool},
-    {"date", Date},
-    {"null", jstNULL},
-    {"regex", RegEx},
-    {"dbPointer", DBRef},
-    {"javascript", Code},
-    {"symbol", Symbol},
-    {"javascriptWithScope", CodeWScope},
-    {"int", NumberInt},
-    {"timestamp", bsonTimestamp},
-    {"long", NumberLong},
-    {"decimal", NumberDecimal},
-    {"maxKey", MaxKey},
-    {"minKey", MinKey}};
+    {typeName(MaxKey), MaxKey},
+    {typeName(MinKey), MinKey}};
 
 Status TypeMatchExpression::initWithBSONType(StringData path, int type) {
     if (!isValidBSONType(type)) {
@@ -494,7 +491,7 @@ void TypeMatchExpression::debugString(StringBuilder& debug, int level) const {
     debug << "\n";
 }
 
-void TypeMatchExpression::toBSON(BSONObjBuilder* out) const {
+void TypeMatchExpression::serialize(BSONObjBuilder* out) const {
     if (matchesAllNumbers()) {
         out->append(path(), BSON("$type" << kMatchesAllNumbersAlias));
     } else {
@@ -591,13 +588,13 @@ void ArrayFilterEntries::debugString(StringBuilder& debug) const {
     debug << "]";
 }
 
-void ArrayFilterEntries::toBSON(BSONArrayBuilder* out) const {
+void ArrayFilterEntries::serialize(BSONArrayBuilder* out) const {
     for (BSONElementSet::const_iterator it = _equalities.begin(); it != _equalities.end(); ++it) {
         out->append(*it);
     }
     for (size_t i = 0; i < _regexes.size(); ++i) {
         BSONObjBuilder regexBob;
-        _regexes[i]->toBSON(&regexBob);
+        _regexes[i]->serialize(&regexBob);
         out->append(regexBob.obj().firstElement());
     }
     out->doneFast();
@@ -654,10 +651,10 @@ void InMatchExpression::debugString(StringBuilder& debug, int level) const {
     debug << "\n";
 }
 
-void InMatchExpression::toBSON(BSONObjBuilder* out) const {
+void InMatchExpression::serialize(BSONObjBuilder* out) const {
     BSONObjBuilder inBob(out->subobjStart(path()));
     BSONArrayBuilder arrBob(inBob.subarrayStart("$in"));
-    _arrayEntries.toBSON(&arrBob);
+    _arrayEntries.serialize(&arrBob);
     inBob.doneFast();
 }
 
@@ -878,7 +875,7 @@ void BitTestMatchExpression::debugString(StringBuilder& debug, int level) const 
     }
 }
 
-void BitTestMatchExpression::toBSON(BSONObjBuilder* out) const {
+void BitTestMatchExpression::serialize(BSONObjBuilder* out) const {
     string opString = "";
 
     switch (matchType()) {

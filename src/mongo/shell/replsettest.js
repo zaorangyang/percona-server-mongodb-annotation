@@ -311,7 +311,7 @@ var ReplSetTest = function(opts) {
     function _getLastCommittedOpTime(conn) {
         var replSetStatus =
             assert.commandWorked(conn.getDB("admin").runCommand({replSetGetStatus: 1}));
-        return replSetStatus.OpTimes.lastCommittedOpTime || {
+        return (replSetStatus.OpTimes || replSetStatus.optimes).lastCommittedOpTime || {
             ts: Timestamp(0, 0),
             t: NumberLong(0)
         };
@@ -326,7 +326,7 @@ var ReplSetTest = function(opts) {
     function _getReadConcernMajorityOpTime(conn) {
         var replSetStatus =
             assert.commandWorked(conn.getDB("admin").runCommand({replSetGetStatus: 1}));
-        return replSetStatus.OpTimes.readConcernMajorityOpTime || {
+        return (replSetStatus.OpTimes || replSetStatus.optimes).readConcernMajorityOpTime || {
             ts: Timestamp(0, 0),
             t: NumberLong(0)
         };
@@ -581,16 +581,22 @@ var ReplSetTest = function(opts) {
         }
     };
 
+    this._setDefaultConfigOptions = function(config) {
+        if (jsTestOptions().useLegacyReplicationProtocol &&
+            !config.hasOwnProperty("protocolVersion")) {
+            config.protocolVersion = 0;
+        }
+    };
+
     this.initiate = function(cfg, initCmd, timeout) {
         var master = this.nodes[0].getDB("admin");
         var config = cfg || this.getReplSetConfig();
         var cmd = {};
         var cmdKey = initCmd || 'replSetInitiate';
         timeout = timeout || 120000;
-        if (jsTestOptions().useLegacyReplicationProtocol &&
-            !config.hasOwnProperty("protocolVersion")) {
-            config.protocolVersion = 0;
-        }
+
+        this._setDefaultConfigOptions(config);
+
         cmd[cmdKey] = config;
         printjson(cmd);
 
@@ -626,10 +632,8 @@ var ReplSetTest = function(opts) {
         var newVersion = this.getReplSetConfigFromNode().version + 1;
         config.version = newVersion;
 
-        if (jsTestOptions().useLegacyReplicationProtocol &&
-            !config.hasOwnProperty("protocolVersion")) {
-            config.protocolVersion = 0;
-        }
+        this._setDefaultConfigOptions(config);
+
         try {
             assert.commandWorked(this.getPrimary().adminCommand({replSetReconfig: config}));
         } catch (e) {

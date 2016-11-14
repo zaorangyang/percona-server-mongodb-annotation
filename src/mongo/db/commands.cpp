@@ -1,8 +1,5 @@
-/* commands.cpp
-   db "commands" (sent via db.$cmd.findOne(...))
- */
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2009-2016 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -50,7 +47,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/write_ops/wc_error_detail.h"
@@ -60,12 +56,10 @@ namespace mongo {
 
 using std::string;
 using std::stringstream;
-using std::endl;
 
 using logger::LogComponent;
 
 Command::CommandMap* Command::_commandsByBestName;
-Command::CommandMap* Command::_webCommands;
 Command::CommandMap* Command::_commands;
 
 Counter64 Command::unknownCommands;
@@ -73,9 +67,11 @@ static ServerStatusMetricField<Counter64> displayUnknownCommands("commands.<UNKN
                                                                  &Command::unknownCommands);
 
 namespace {
+
 ExportedServerParameter<bool, ServerParameterType::kStartupOnly> testCommandsParameter(
     ServerParameterSet::getGlobal(), "enableTestCommands", &Command::testCommandsEnabled);
-}
+
+}  // namespace
 
 Command::~Command() = default;
 
@@ -111,7 +107,7 @@ string Command::parseNsCollectionRequired(const string& dbname, const BSONObj& c
 #if defined(CLC)
     DEV if (mongoutils::str::startsWith(coll, dbname + '.')) {
         log() << "DEBUG parseNs Command's collection name looks like it includes the db name\n"
-              << dbname << '\n' << coll << '\n' << cmdObj.toString() << endl;
+              << dbname << '\n' << coll << '\n' << cmdObj.toString();
         dassert(false);
     }
 #endif
@@ -127,82 +123,11 @@ ResourcePattern Command::parseResourcePattern(const std::string& dbname,
     return ResourcePattern::forExactNamespace(NamespaceString(ns));
 }
 
-void Command::htmlHelp(stringstream& ss) const {
-    string helpStr;
-    {
-        stringstream h;
-        help(h);
-        helpStr = h.str();
-    }
-    ss << "\n<tr><td>";
-    bool web = _webCommands->find(name) != _webCommands->end();
-    if (web)
-        ss << "<a href=\"/" << name << "?text=1\">";
-    ss << name;
-    if (web)
-        ss << "</a>";
-    ss << "</td>\n";
-    ss << "<td>";
-    if (isWriteCommandForConfigServer()) {
-        ss << "W ";
-    } else {
-        ss << "R ";
-    }
-    if (slaveOk())
-        ss << "S ";
-    if (adminOnly())
-        ss << "A";
-    ss << "</td>";
-    ss << "<td>";
-    if (helpStr != "no help defined") {
-        const char* p = helpStr.c_str();
-        while (*p) {
-            if (*p == '<') {
-                ss << "&lt;";
-                p++;
-                continue;
-            } else if (*p == '{')
-                ss << "<code>";
-            else if (*p == '}') {
-                ss << "}</code>";
-                p++;
-                continue;
-            }
-            if (strncmp(p, "http:", 5) == 0) {
-                ss << "<a href=\"";
-                const char* q = p;
-                while (*q && *q != ' ' && *q != '\n')
-                    ss << *q++;
-                ss << "\">";
-                q = p;
-                if (str::startsWith(q, "http://www.mongodb.org/display/"))
-                    q += 31;
-                while (*q && *q != ' ' && *q != '\n') {
-                    ss << (*q == '+' ? ' ' : *q);
-                    q++;
-                    if (*q == '#')
-                        while (*q && *q != ' ' && *q != '\n')
-                            q++;
-                }
-                ss << "</a>";
-                p = q;
-                continue;
-            }
-            if (*p == '\n')
-                ss << "<br>";
-            else
-                ss << *p;
-            p++;
-        }
-    }
-    ss << "</td>";
-    ss << "</tr>\n";
-}
-
-Command::Command(StringData _name, bool web, StringData oldName)
-    : name(_name.toString()),
-      _commandsExecutedMetric("commands." + _name.toString() + ".total", &_commandsExecuted),
-      _commandsFailedMetric("commands." + _name.toString() + ".failed", &_commandsFailed) {
+Command::Command(StringData name, bool webUI, StringData oldName)
+    : _name(name.toString()),
+      _webUI(webUI),
+      _commandsExecutedMetric("commands." + _name + ".total", &_commandsExecuted),
+      _commandsFailedMetric("commands." + _name + ".failed", &_commandsFailed) {
     // register ourself.
     if (_commands == 0)
         _commands = new CommandMap();
@@ -210,15 +135,9 @@ Command::Command(StringData _name, bool web, StringData oldName)
         _commandsByBestName = new CommandMap();
     Command*& c = (*_commands)[name];
     if (c)
-        log() << "warning: 2 commands with name: " << _name << endl;
+        log() << "warning: 2 commands with name: " << _name;
     c = this;
     (*_commandsByBestName)[name] = this;
-
-    if (web) {
-        if (_webCommands == 0)
-            _webCommands = new CommandMap();
-        (*_webCommands)[name] = this;
-    }
 
     if (!oldName.empty())
         (*_commands)[oldName.toString()] = this;
@@ -226,6 +145,15 @@ Command::Command(StringData _name, bool web, StringData oldName)
 
 void Command::help(stringstream& help) const {
     help << "no help defined";
+}
+
+Status Command::explain(OperationContext* txn,
+                        const string& dbname,
+                        const BSONObj& cmdObj,
+                        ExplainCommon::Verbosity verbosity,
+                        const rpc::ServerSelectionMetadata& serverSelectionMetadata,
+                        BSONObjBuilder* out) const {
+    return {ErrorCodes::IllegalOperation, str::stream() << "Cannot explain cmd: " << getName()};
 }
 
 Command* Command::findCommand(StringData name) {
@@ -264,10 +192,6 @@ void Command::appendCommandWCStatus(BSONObjBuilder& result, const Status& status
         wcError.setErrMessage(status.reason());
         result.append("writeConcernError", wcError.toBSON());
     }
-}
-
-Status Command::getStatusFromCommandResult(const BSONObj& result) {
-    return mongo::getStatusFromCommandResult(result);
 }
 
 Status Command::parseCommandCursorOptions(const BSONObj& cmdObj,
@@ -333,13 +257,6 @@ BSONObj Command::getRedactedCopyForLogging(const BSONObj& cmdObj) {
     return bob.obj();
 }
 
-void Command::logIfSlow(const Timer& timer, const string& msg) {
-    int ms = timer.millis();
-    if (ms > serverGlobalParams.slowMS) {
-        log() << msg << " took " << ms << " ms." << endl;
-    }
-}
-
 static Status _checkAuthorizationImpl(Command* c,
                                       ClientBasic* client,
                                       const std::string& dbname,
@@ -347,7 +264,8 @@ static Status _checkAuthorizationImpl(Command* c,
     namespace mmb = mutablebson;
     if (c->adminOnly() && dbname != "admin") {
         return Status(ErrorCodes::Unauthorized,
-                      str::stream() << c->name << " may only be run against the admin database.");
+                      str::stream() << c->getName()
+                                    << " may only be run against the admin database.");
     }
     if (AuthorizationSession::get(client)->getAuthorizationManager().isAuthEnabled()) {
         Status status = c->checkAuthForCommand(client, dbname, cmdObj);
@@ -364,14 +282,14 @@ static Status _checkAuthorizationImpl(Command* c,
     } else if (c->adminOnly() && c->localHostOnlyIfNoAuth(cmdObj) &&
                !client->getIsLocalHostConnection()) {
         return Status(ErrorCodes::Unauthorized,
-                      str::stream() << c->name
+                      str::stream() << c->getName()
                                     << " must run from localhost when running db without auth");
     }
     return Status::OK();
 }
 
 Status Command::_checkAuthorization(Command* c,
-                                    ClientBasic* client,
+                                    Client* client,
                                     const std::string& dbname,
                                     const BSONObj& cmdObj) {
     namespace mmb = mutablebson;
@@ -395,10 +313,9 @@ void Command::generateHelpResponse(OperationContext* txn,
                                    const Command& command) {
     std::stringstream ss;
     BSONObjBuilder helpBuilder;
-    ss << "help for: " << command.name << " ";
+    ss << "help for: " << command.getName() << " ";
     command.help(ss);
     helpBuilder.append("help", ss.str());
-    helpBuilder.append("lockType", command.isWriteCommandForConfigServer() ? 1 : 0);
 
     replyBuilder->setCommandReply(helpBuilder.done());
     replyBuilder->setMetadata(rpc::makeEmptyMetadata());
@@ -464,43 +381,6 @@ void Command::generateErrorResponse(OperationContext* txn,
                                     const DBException& exception) {
     LOG(1) << "assertion while executing command: " << exception.toString();
     _generateErrorResponse(txn, replyBuilder, exception, rpc::makeEmptyMetadata());
-}
-
-void runCommands(OperationContext* txn,
-                 const rpc::RequestInterface& request,
-                 rpc::ReplyBuilderInterface* replyBuilder) {
-    try {
-        dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kCommandReply);
-
-        Command* c = nullptr;
-        // In the absence of a Command object, no redaction is possible. Therefore
-        // to avoid displaying potentially sensitive information in the logs,
-        // we restrict the log message to the name of the unrecognized command.
-        // However, the complete command object will still be echoed to the client.
-        if (!(c = Command::findCommand(request.getCommandName()))) {
-            Command::unknownCommands.increment();
-            std::string msg = str::stream() << "no such command: '" << request.getCommandName()
-                                            << "'";
-            LOG(2) << msg;
-            uasserted(ErrorCodes::CommandNotFound,
-                      str::stream() << msg << ", bad cmd: '" << request.getCommandArgs() << "'");
-        }
-
-        LOG(2) << "run command " << request.getDatabase() << ".$cmd" << ' '
-               << c->getRedactedCopyForLogging(request.getCommandArgs());
-
-        {
-            // Try to set this as early as possible, as soon as we have figured out the command.
-            stdx::lock_guard<Client> lk(*txn->getClient());
-            CurOp::get(txn)->setLogicalOp_inlock(c->getLogicalOp());
-        }
-
-        Command::execCommand(txn, c, request, replyBuilder);
-    }
-
-    catch (const DBException& ex) {
-        Command::generateErrorResponse(txn, replyBuilder, ex, request);
-    }
 }
 
 }  // namespace mongo

@@ -227,9 +227,6 @@ env.Library(
         'concurrency/spin_lock',
         'foundation',
     ],
-    LIBDEPS_TAGS=[
-        'incomplete'
-    ],
 )
 
 env.CppUnitTest(
@@ -240,7 +237,6 @@ env.CppUnitTest(
     LIBDEPS=[
         "background_job",
         "concurrency/synchronization",
-        "net/network", # Temporary crutch since the ssl cleanup is hard coded in background.cpp
     ],
 )
 
@@ -259,7 +255,8 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
         # level configure check, though its effects should still be scoped just to these files.
         tcmspEnv.Append(
             CPPDEFINES=[
-                'MONGO_HAVE_GPERFTOOLS_GET_THREAD_CACHE_SIZE'
+                'MONGO_HAVE_GPERFTOOLS_GET_THREAD_CACHE_SIZE',
+                'MONGO_HAVE_GPERFTOOLS_SIZE_CLASS_STATS'
             ]
         )
 
@@ -337,13 +334,27 @@ if has_option('gcov'):
         ],
     )
 
+if has_option('use-cpu-profiler'):
+    quick_exit_env.Append(
+        CPPDEFINES=[
+            'MONGO_CPU_PROFILER',
+        ],
+    )
+
+    if not use_system_version_of_library('tcmalloc'):
+        quick_exit_env.InjectThirdPartyIncludePaths(
+            'tcmalloc'
+        )
+
 quick_exit_env.Library(
     target='quick_exit',
     source=[
         'quick_exit.cpp',
     ],
     LIBDEPS=[
-        # NOTE: You *must not* add any library dependencies to the quick_exit library
+        # NOTE: You *must not* add any other library dependencies to
+        # the quick_exit library
+        "$BUILD_DIR/third_party/shim_allocator",
     ]
 )
 

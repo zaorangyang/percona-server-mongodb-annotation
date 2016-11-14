@@ -79,6 +79,8 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/run_commands.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
@@ -89,6 +91,7 @@
 #include "mongo/platform/process_id.h"
 #include "mongo/rpc/command_reply_builder.h"
 #include "mongo/rpc/command_request.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/legacy_reply.h"
 #include "mongo/rpc/legacy_reply_builder.h"
 #include "mongo/rpc/legacy_request.h"
@@ -235,7 +238,7 @@ static void receivedCommand(OperationContext* txn,
                             Message& message) {
     invariant(nss.isCommand());
 
-    const MSGID responseTo = message.header().getId();
+    const int32_t responseToMsgId = message.header().getId();
 
     DbMessage dbMessage(message);
     QueryMessage queryMessage(dbMessage);
@@ -274,7 +277,7 @@ static void receivedCommand(OperationContext* txn,
     op->debug().responseLength = response.header().dataLen();
 
     dbResponse.response = std::move(response);
-    dbResponse.responseTo = responseTo;
+    dbResponse.responseToMsgId = responseToMsgId;
 }
 
 namespace {
@@ -282,7 +285,7 @@ namespace {
 void receivedRpc(OperationContext* txn, Client& client, DbResponse& dbResponse, Message& message) {
     invariant(message.operation() == dbCommand);
 
-    const MSGID responseTo = message.header().getId();
+    const int32_t responseToMsgId = message.header().getId();
 
     rpc::CommandReplyBuilder replyBuilder{};
 
@@ -315,7 +318,7 @@ void receivedRpc(OperationContext* txn, Client& client, DbResponse& dbResponse, 
     curOp->debug().responseLength = response.header().dataLen();
 
     dbResponse.response = std::move(response);
-    dbResponse.responseTo = responseTo;
+    dbResponse.responseToMsgId = responseToMsgId;
 }
 
 // In SERVER-7775 we reimplemented the pseudo-commands fsyncUnlock, inProg, and killOp
@@ -385,7 +388,7 @@ static void receivedQuery(OperationContext* txn,
                           Message& m) {
     invariant(!nss.isCommand());
 
-    MSGID responseTo = m.header().getId();
+    int32_t responseToMsgId = m.header().getId();
 
     DbMessage d(m);
     QueryMessage q(d);
@@ -399,13 +402,20 @@ static void receivedQuery(OperationContext* txn,
         uassertStatusOK(status);
 
         dbResponse.exhaustNS = runQuery(txn, q, nss, dbResponse.response);
-    } catch (const AssertionException& exception) {
+    } catch (const AssertionException& e) {
+        // If we got a stale config, wait in case the operation is stuck in a critical section
+        if (e.getCode() == ErrorCodes::SendStaleConfig) {
+            auto& sce = static_cast<const StaleConfigException&>(e);
+            ShardingState::get(txn)
+                ->onStaleShardVersion(txn, NamespaceString(sce.getns()), sce.getVersionReceived());
+        }
+
         dbResponse.response.reset();
-        generateLegacyQueryErrorResponse(&exception, q, &op, &dbResponse.response);
+        generateLegacyQueryErrorResponse(&e, q, &op, &dbResponse.response);
     }
 
     op.debug().responseLength = dbResponse.response.header().dataLen();
-    dbResponse.responseTo = responseTo;
+    dbResponse.responseToMsgId = responseToMsgId;
 }
 
 // Mongod on win32 defines a value for this function. In all other executables it is NULL.
@@ -539,7 +549,7 @@ void assembleResponse(OperationContext* txn,
         else
             dbresponse.response.setData(opReply, "i am fine - dbMsg deprecated");
 
-        dbresponse.responseTo = m.header().getId();
+        dbresponse.responseToMsgId = m.header().getId();
     } else {
         try {
             // The following operations all require authorization.
@@ -905,7 +915,9 @@ bool receivedGetMore(OperationContext* txn, DbResponse& dbresponse, Message& m, 
 
     try {
         const NamespaceString nsString(ns);
-        uassert(16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid());
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid ns [" << ns << "]",
+                nsString.isValid());
 
         Status status = AuthorizationSession::get(txn->getClient())
                             ->checkAuthForGetMore(nsString, cursorid, false);
@@ -943,7 +955,7 @@ bool receivedGetMore(OperationContext* txn, DbResponse& dbresponse, Message& m, 
     curop.debug().responseLength = dbresponse.response.header().dataLen();
     curop.debug().nreturned = msgdata.getNReturned();
 
-    dbresponse.responseTo = m.header().getId();
+    dbresponse.responseToMsgId = m.header().getId();
 
     if (exhaust) {
         curop.debug().exhaust = true;
@@ -1133,7 +1145,7 @@ static void insertSystemIndexes(OperationContext* txn, DbMessage& d, CurOp& curO
             Command::execCommand(txn, createIndexesCmd, cmdRequest, &cmdReplyBuilder);
             auto cmdReplyMsg = cmdReplyBuilder.done();
             rpc::LegacyReply cmdReply{&cmdReplyMsg};
-            uassertStatusOK(Command::getStatusFromCommandResult(cmdReply.getCommandReply()));
+            uassertStatusOK(getStatusFromCommandResult(cmdReply.getCommandReply()));
         } catch (const DBException& ex) {
             LastError::get(txn->getClient()).setLastError(ex.getCode(), ex.getInfo().msg);
             curOp.debug().exceptionInfo = ex.getInfo();
@@ -1213,135 +1225,6 @@ void receivedInsert(OperationContext* txn, const NamespaceString& nsString, Mess
     Lock::DBLock dbLock(txn->lockState(), nsString.db(), MODE_X);
 
     _receivedInsert(txn, nsString, ns, multi, keepGoing, op, false);
-}
-
-static AtomicUInt32 shutdownInProgress(0);
-
-bool inShutdown() {
-    return shutdownInProgress.loadRelaxed() != 0;
-}
-
-bool inShutdownStrict() {
-    return shutdownInProgress.load() != 0;
-}
-
-static void shutdownServer() {
-    log(LogComponent::kNetwork) << "shutdown: going to close listening sockets..." << endl;
-    ListeningSockets::get()->closeAll();
-
-    log(LogComponent::kNetwork) << "shutdown: going to flush diaglog..." << endl;
-    _diaglog.flush();
-
-    /* must do this before unmapping mem or you may get a seg fault */
-    log(LogComponent::kNetwork) << "shutdown: going to close sockets..." << endl;
-    stdx::thread close_socket_thread(stdx::bind(MessagingPort::closeAllSockets, 0));
-    close_socket_thread.detach();
-
-    // We drop the scope cache because leak sanitizer can't see across the
-    // thread we use for proxying MozJS requests. Dropping the cache cleans up
-    // the memory and makes leak sanitizer happy.
-    ScriptEngine::dropScopeCache();
-
-    getGlobalServiceContext()->shutdownGlobalStorageEngineCleanly();
-}
-
-// shutdownLock
-//
-// Protects:
-//  Ensures shutdown is single threaded.
-// Lock Ordering:
-//  No restrictions
-stdx::mutex shutdownLock;
-
-void signalShutdown() {
-    // Notify all threads shutdown has started
-    shutdownInProgress.fetchAndAdd(1);
-}
-
-void exitCleanly(ExitCode code) {
-    // Notify all threads shutdown has started
-    shutdownInProgress.fetchAndAdd(1);
-
-    // Grab the shutdown lock to prevent concurrent callers
-    stdx::lock_guard<stdx::mutex> lockguard(shutdownLock);
-
-    // Shutdown Full-Time Data Capture
-    stopFTDC();
-
-    // Global storage engine may not be started in all cases before we exit
-    if (getGlobalServiceContext()->getGlobalStorageEngine() == NULL) {
-        dbexit(code);  // returns only under a windows service
-        invariant(code == EXIT_WINDOWS_SERVICE_STOP);
-        return;
-    }
-
-    getGlobalServiceContext()->setKillAllOperations();
-
-    repl::getGlobalReplicationCoordinator()->shutdown();
-
-    Client& client = cc();
-    ServiceContext::UniqueOperationContext uniqueTxn;
-    OperationContext* txn = client.getOperationContext();
-    if (!txn) {
-        uniqueTxn = client.makeOperationContext();
-        txn = uniqueTxn.get();
-    }
-
-    ShardingState::get(txn)->shutDown(txn);
-
-    // We should always be able to acquire the global lock at shutdown.
-    //
-    // TODO: This call chain uses the locker directly, because we do not want to start an
-    // operation context, which also instantiates a recovery unit. Also, using the
-    // lockGlobalBegin/lockGlobalComplete sequence, we avoid taking the flush lock. This will
-    // all go away if we start acquiring the global/flush lock as part of ScopedTransaction.
-    //
-    // For a Windows service, dbexit does not call exit(), so we must leak the lock outside
-    // of this function to prevent any operations from running that need a lock.
-    //
-    DefaultLockerImpl* globalLocker = new DefaultLockerImpl();
-    LockResult result = globalLocker->lockGlobalBegin(MODE_X);
-    if (result == LOCK_WAITING) {
-        result = globalLocker->lockGlobalComplete(UINT_MAX);
-    }
-
-    invariant(LOCK_OK == result);
-
-    log(LogComponent::kControl) << "now exiting" << endl;
-
-    // Execute the graceful shutdown tasks, such as flushing the outstanding journal
-    // and data files, close sockets, etc.
-    try {
-        shutdownServer();
-    } catch (const DBException& ex) {
-        severe() << "shutdown failed with DBException " << ex;
-        std::terminate();
-    } catch (const std::exception& ex) {
-        severe() << "shutdown failed with std::exception: " << ex.what();
-        std::terminate();
-    } catch (...) {
-        severe() << "shutdown failed with exception";
-        std::terminate();
-    }
-
-    dbexit(code);
-}
-
-NOINLINE_DECL void dbexit(ExitCode rc, const char* why) {
-    audit::logShutdown(&cc());
-
-    log(LogComponent::kControl) << "dbexit: " << why << " rc: " << rc;
-
-#ifdef _WIN32
-    // Windows Service Controller wants to be told when we are down,
-    //  so don't call quickExit() yet, or say "really exiting now"
-    //
-    if (rc == EXIT_WINDOWS_SERVICE_STOP) {
-        return;
-    }
-#endif
-
-    quickExit(rc);
 }
 
 // ----- BEGIN Diaglog -----

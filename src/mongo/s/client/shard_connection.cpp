@@ -41,7 +41,6 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/stale_exception.h"
 #include "mongo/s/version_manager.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/exit.h"
@@ -93,9 +92,6 @@ public:
     ShardedPoolStats() : Command("shardConnPoolStats") {}
     virtual void help(stringstream& help) const {
         help << "stats about the shard connection pool";
-    }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
     }
     virtual bool slaveOk() const {
         return true;

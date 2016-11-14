@@ -34,6 +34,7 @@
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/util/mongoutils/str.h"
 
 using std::string;
@@ -58,6 +59,16 @@ ReadConcernArgs::ReadConcernArgs() = default;
 ReadConcernArgs::ReadConcernArgs(boost::optional<OpTime> opTime,
                                  boost::optional<ReadConcernLevel> level)
     : _opTime(std::move(opTime)), _level(std::move(level)) {}
+
+std::string ReadConcernArgs::toString() const {
+    return toBSON().toString();
+}
+
+BSONObj ReadConcernArgs::toBSON() const {
+    BSONObjBuilder bob;
+    appendInfo(&bob);
+    return bob.obj();
+}
 
 ReadConcernLevel ReadConcernArgs::getLevel() const {
     return _level.value_or(ReadConcernLevel::kLocalReadConcern);

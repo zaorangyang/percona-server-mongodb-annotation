@@ -157,6 +157,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
+        '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/query/command_request_response',
@@ -172,7 +173,9 @@ env.CppUnitTest(
         'curop_test.cpp',
     ],
     LIBDEPS=[
+        'auth/authorization_manager_mock_init',
         'curop',
+        'commands_test_crutch',
     ],
 )
 
@@ -370,10 +373,6 @@ env.Library(
         '$BUILD_DIR/mongo/util/concurrency/synchronization',
         'range_arithmetic',
     ],
-    LIBDEPS_TAGS=[
-        # Needs mongo::inShutdown
-        'incomplete',
-    ]
 )
 
 env.CppUnitTest(
@@ -383,6 +382,8 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/repl/replmocks',
+        'auth/authorization_manager_mock_init',
+        'commands_test_crutch',
         'common',
         'range_deleter',
     ],
@@ -500,12 +501,37 @@ env.Library(
         'auth/authorization_manager_global',
         'commands/server_status_core',
         'commands/test_commands_enabled',
-        'curop',
         'service_context',
     ],
     LIBDEPS_TAGS=[
         # Dependencies on Command::registerError and
         # Command::execCommand, which are not uniquely defined.
+        'incomplete',
+    ],
+)
+
+env.Library(
+    target="commands_test_crutch",
+    source=[
+        "commands_test_crutch.cpp",
+    ],
+    LIBDEPS=[
+        "commands",
+    ],
+)
+
+env.Library(
+    target='run_commands',
+    source=[
+        'run_commands.cpp',
+    ],
+    LIBDEPS=[
+        "commands",
+        "curop",
+    ],
+    LIBDEPS_TAGS=[
+        # Dependency on Command::execCommand, which is not uniquely
+        # defined.
         'incomplete',
     ],
 )
@@ -534,7 +560,7 @@ serverOnlyFiles = [
     "catalog/rename_collection.cpp",
     "clientcursor.cpp",
     "cloner.cpp",
-    "commands/apply_ops.cpp",
+    "commands/apply_ops_cmd.cpp",
     "commands/clone.cpp",
     "commands/clone_collection.cpp",
     "commands/collection_to_capped.cpp",
@@ -566,7 +592,7 @@ serverOnlyFiles = [
     "commands/parallel_collection_scan.cpp",
     "commands/pipeline_command.cpp",
     "commands/plan_cache_commands.cpp",
-    "commands/rename_collection.cpp",
+    "commands/rename_collection_cmd.cpp",
     "commands/repair_cursor.cpp",
     "commands/snapshot_management.cpp",
     "commands/test_commands.cpp",
@@ -689,6 +715,7 @@ serveronlyLibdeps = [
     "repl/rslog",
     "repl/sync_tail",
     "repl/topology_coordinator_impl",
+    "run_commands",
     "s/commands",
     "s/metadata",
     "s/sharding",

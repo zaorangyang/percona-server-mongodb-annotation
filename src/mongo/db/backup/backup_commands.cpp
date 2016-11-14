@@ -52,9 +52,6 @@ public:
             ? Status::OK()
             : Status(ErrorCodes::Unauthorized, "Unauthorized");
     }
-    bool isWriteCommandForConfigServer() const override {
-        return false;
-    }
     bool adminOnly() const override {
         return true;
     }

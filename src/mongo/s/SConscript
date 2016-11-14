@@ -149,6 +149,16 @@ env.CppUnitTest(
     ]
 )
 
+env.CppUnitTest(
+    target='chunk_manager_tests',
+    source=[
+        'chunk_manager_tests.cpp'
+    ],
+    LIBDEPS=[
+        'coreshard',
+        '$BUILD_DIR/mongo/s/catalog/replset/catalog_manager_replica_set_test_fixture']
+)
+
 # This library contains sharding functionality used by both mongod and mongos. Certain tests,
 # which exercise this functionality also link against it.
 env.Library(
@@ -201,10 +211,6 @@ env.Library(
         '$BUILD_DIR/mongo/util/concurrency/task',
         'write_ops/cluster_write_op',
         'write_ops/cluster_write_op_conversion',
-    ],
-    LIBDEPS_TAGS=[
-        # Depends on inShutdown
-        'incomplete',
     ],
 )
 

@@ -90,6 +90,7 @@ env.Library(
     LIBDEPS=[
         'replication_executor',
         'replmocks',
+        '$BUILD_DIR/mongo/db/commands_test_crutch',
         '$BUILD_DIR/mongo/executor/task_executor_test_fixture',
     ],
 )
@@ -101,6 +102,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'replication_executor_test_fixture',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/executor/task_executor_test_fixture',
         '$BUILD_DIR/mongo/unittest/concurrency',
     ],
@@ -206,17 +208,31 @@ env.Library(
 )
 
 env.Library(
+    target='oplog_entry',
+    source=[
+            'oplog_entry.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        'optime'
+    ],
+)
+
+env.Library(
     target='sync_tail',
     source=[
         'sync_tail.cpp',
-        'oplog_entry.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
+        '$BUILD_DIR/mongo/db/commands/server_status_core',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/curop',
+        '$BUILD_DIR/mongo/db/stats/timer_stats',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
+        'oplog_entry',
         'repl_coordinator_global',
     ],
     LIBDEPS_TAGS=[
@@ -271,6 +287,7 @@ env.CppUnitTest('topology_coordinator_impl_test',
                 'topology_coordinator_impl_test.cpp',
                 LIBDEPS=['topology_coordinator_impl',
                          'replica_set_messages',
+                         '$BUILD_DIR/mongo/db/commands_test_crutch',
                          '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
                 ])
 
@@ -278,6 +295,7 @@ env.CppUnitTest('topology_coordinator_impl_v1_test',
                 'topology_coordinator_impl_v1_test.cpp',
                 LIBDEPS=['topology_coordinator_impl',
                          'replica_set_messages',
+                         '$BUILD_DIR/mongo/db/commands_test_crutch',
                          '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
                 ])
 
@@ -322,6 +340,7 @@ env.Library('repl_coordinator_test_fixture',
             LIBDEPS=[
                 '$BUILD_DIR/mongo/unittest/unittest',
                 '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+                '$BUILD_DIR/mongo/db/commands_test_crutch',
                 'repl_coordinator_impl',
                 'replmocks',
                 'topology_coordinator_impl',\
@@ -342,13 +361,18 @@ env.CppUnitTest('replica_set_config_checks_test',
                 'replica_set_config_checks_test.cpp',
                 LIBDEPS=[
                     'repl_coordinator_impl',
-                    'replmocks'
+                    'replmocks',
+                    '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+                    '$BUILD_DIR/mongo/db/commands_test_crutch',
                 ])
 
 env.CppUnitTest('scatter_gather_test',
                 'scatter_gather_test.cpp',
                 LIBDEPS=['repl_coordinator_impl',
-                         'replmocks'])
+                         'replmocks',
+                         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+                         '$BUILD_DIR/mongo/db/commands_test_crutch',
+                ])
 
 env.CppUnitTest('check_quorum_for_config_change_test',
                 'check_quorum_for_config_change_test.cpp',
@@ -356,35 +380,51 @@ env.CppUnitTest('check_quorum_for_config_change_test',
                     'repl_coordinator_impl',
                     'replication_executor',
                     'replmocks',
+                    '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+                    '$BUILD_DIR/mongo/db/commands_test_crutch',
                 ])
 
 env.CppUnitTest('freshness_checker_test',
                 'freshness_checker_test.cpp',
                 LIBDEPS=['repl_coordinator_impl',
                          'replica_set_messages',
-                         'replmocks'])
+                         'replmocks',
+                         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+                         '$BUILD_DIR/mongo/db/commands_test_crutch',
+                ])
 
 env.CppUnitTest('vote_requester_test',
                 'vote_requester_test.cpp',
                 LIBDEPS=['repl_coordinator_impl',
                          'replica_set_messages',
-                         'replmocks'])
+                         'replmocks',
+                         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+                         '$BUILD_DIR/mongo/db/commands_test_crutch',
+                ])
 
 env.CppUnitTest('election_winner_declarer_test',
                 'election_winner_declarer_test.cpp',
                 LIBDEPS=['repl_coordinator_impl',
                          'replica_set_messages',
-                         'replmocks'])
+                         'replmocks',
+                         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+                         '$BUILD_DIR/mongo/db/commands_test_crutch',
+                ])
 
 env.CppUnitTest('elect_cmd_runner_test',
                 'elect_cmd_runner_test.cpp',
                 LIBDEPS=['repl_coordinator_impl',
                          'replica_set_messages',
-                         'replmocks'])
+                         'replmocks',
+                         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+                         '$BUILD_DIR/mongo/db/commands_test_crutch',
+                ])
 
 env.CppUnitTest('replication_coordinator_impl_elect_test',
                 'replication_coordinator_impl_elect_test.cpp',
-                LIBDEPS=['repl_coordinator_test_fixture'])
+                LIBDEPS=[
+                    'repl_coordinator_test_fixture',
+                ])
 
 env.CppUnitTest('replication_coordinator_impl_elect_v1_test',
                 'replication_coordinator_impl_elect_v1_test.cpp',
@@ -501,9 +541,14 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/lasterror',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
+        'repl_settings',
         'replica_set_messages',
+        'replication_executor',
     ],
     LIBDEPS_TAGS=[
         # Depends on files in serverOnlyFiles
@@ -530,6 +575,8 @@ env.CppUnitTest(
     source='reporter_test.cpp',
     LIBDEPS=[
         'reporter',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/db/commands_test_crutch',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
         '$BUILD_DIR/mongo/unittest/task_executor_proxy',
     ],
@@ -562,6 +609,7 @@ env.CppUnitTest(
     target='collection_cloner_test',
     source='collection_cloner_test.cpp',
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         'collection_cloner',
         'base_cloner_test_fixture',
     ],
@@ -581,6 +629,7 @@ env.CppUnitTest(
     target='database_cloner_test',
     source='database_cloner_test.cpp',
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         'database_cloner',
         'base_cloner_test_fixture',
     ],
@@ -637,6 +686,8 @@ env.CppUnitTest(
         'database_task',
         'replmocks',
         'task_runner_test_fixture',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/db/commands_test_crutch',
     ],
 )
 
@@ -658,15 +709,34 @@ env.CppUnitTest(
 
 env.Library(target='optime',
             source=[
+                'bson_extract_optime.cpp',
                 'optime.cpp',
             ],
             LIBDEPS=[
                 '$BUILD_DIR/mongo/base',
+                '$BUILD_DIR/mongo/bson/util/bson_extract',
             ],
-            LIBDEPS_TAGS=[
-                # Circular with bson_extract library
-                'incomplete',
-            ],
+)
+
+env.CppUnitTest(
+    target='optime_extract_test',
+    source=[
+        'optime_extract_test.cpp'
+    ],
+    LIBDEPS=[
+        'optime',
+    ],
+)
+
+env.Library(
+    target='multiapplier',
+    source=[
+        'multiapplier.cpp',
+    ],
+    LIBDEPS=[
+        'oplog_entry',
+        'replication_executor',
+    ],
 )
 
 env.Library(
@@ -675,6 +745,7 @@ env.Library(
         'applier.cpp',
     ],
     LIBDEPS=[
+        'oplog_entry',
         'replication_executor',
     ],
 )
@@ -686,6 +757,7 @@ env.CppUnitTest(
         'applier',
         'replication_executor_test_fixture',
         '$BUILD_DIR/mongo/unittest/concurrency',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
     ],
 )
 
@@ -698,6 +770,7 @@ env.Library(
         'applier',
         'collection_cloner',
         'database_cloner',
+        'multiapplier',
         'optime',
         'reporter',
         '$BUILD_DIR/mongo/client/fetcher',
@@ -713,6 +786,7 @@ env.CppUnitTest(
         'base_cloner_test_fixture',
         'data_replicator',
         'replication_executor_test_fixture',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/unittest/concurrency',
     ],
 )

@@ -1321,6 +1321,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     Date_t curTime = heartbeatTime + uptimeSecs;
     Timestamp electionTime(1, 2);
     OpTime oplogProgress(Timestamp(3, 4), 0);
+    OpTime oplogDurable(Timestamp(3, 4), 1);
     OpTime lastCommittedOpTime(Timestamp(2, 3), -1);
     OpTime readConcernMajorityOpTime(Timestamp(4, 5), -1);
     std::string setName = "mySet";
@@ -1331,7 +1332,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     hb.setElectionTime(electionTime);
     hb.setHbMsg("READY");
     hb.setAppliedOpTime(oplogProgress);
-    hb.setDurableOpTime(oplogProgress);
+    hb.setDurableOpTime(oplogDurable);
     StatusWith<ReplSetHeartbeatResponse> hbResponseGood = StatusWith<ReplSetHeartbeatResponse>(hb);
 
     updateConfig(
@@ -1376,6 +1377,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
             oplogProgress,
+            oplogDurable,
             lastCommittedOpTime,
             readConcernMajorityOpTime},
         &statusBuilder,
@@ -1386,9 +1388,14 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     // Test results for all non-self members
     ASSERT_EQUALS(setName, rsStatus["set"].String());
     ASSERT_EQUALS(curTime.asInt64(), rsStatus["date"].Date().asInt64());
-    ASSERT_EQUALS(lastCommittedOpTime.toBSON(), rsStatus["OpTimes"]["lastCommittedOpTime"].Obj());
-    ASSERT_EQUALS(readConcernMajorityOpTime.toBSON(),
-                  rsStatus["OpTimes"]["readConcernMajorityOpTime"].Obj());
+    ASSERT_EQUALS(lastCommittedOpTime.toBSON(), rsStatus["optimes"]["lastCommittedOpTime"].Obj());
+    {
+        const auto optimes = rsStatus["optimes"].Obj();
+        ASSERT_EQUALS(readConcernMajorityOpTime.toBSON(),
+                      optimes["readConcernMajorityOpTime"].Obj());
+        ASSERT_EQUALS(oplogProgress.getTimestamp(), optimes["appliedOpTime"].timestamp());
+        ASSERT_EQUALS((oplogDurable).getTimestamp(), optimes["durableOpTime"].timestamp());
+    }
     std::vector<BSONElement> memberArray = rsStatus["members"].Array();
     ASSERT_EQUALS(4U, memberArray.size());
     BSONObj member0Status = memberArray[0].Obj();
@@ -1485,6 +1492,7 @@ TEST_F(TopoCoordTest, NodeReturnsInvalidReplicaSetConfigInResponseToGetStatusWhe
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
+            oplogProgress,
             oplogProgress,
             OpTime(),
             OpTime()},
@@ -2183,6 +2191,7 @@ public:
             TopologyCoordinator::ReplSetStatusArgs{_firstRequestDate + Milliseconds(4000),
                                                    10,
                                                    OpTime(Timestamp(100, 0), 0),
+                                                   OpTime(Timestamp(100, 0), 0),
                                                    OpTime(),
                                                    OpTime()},
             &statusBuilder,
@@ -2196,9 +2205,9 @@ public:
         ASSERT_EQUALS(1, member1Status["health"].Double());
 
         ASSERT_EQUALS(Timestamp(0, 0),
-                      Timestamp(rsStatus["OpTimes"]["lastCommittedOpTime"]["ts"].timestampValue()));
-        ASSERT_EQUALS(-1LL, rsStatus["OpTimes"]["lastCommittedOpTime"]["t"].numberLong());
-        ASSERT_FALSE(rsStatus["OpTimes"].Obj().hasField("readConcernMajorityOpTime"));
+                      Timestamp(rsStatus["optimes"]["lastCommittedOpTime"]["ts"].timestampValue()));
+        ASSERT_EQUALS(-1LL, rsStatus["optimes"]["lastCommittedOpTime"]["t"].numberLong());
+        ASSERT_FALSE(rsStatus["optimes"].Obj().hasField("readConcernMajorityOpTime"));
     }
 
     Date_t firstRequestDate() {
@@ -2245,6 +2254,7 @@ public:
             cbData(),
             TopologyCoordinator::ReplSetStatusArgs{firstRequestDate() + Seconds(4),
                                                    10,
+                                                   OpTime(Timestamp(100, 0), 0),
                                                    OpTime(Timestamp(100, 0), 0),
                                                    OpTime(),
                                                    OpTime()},
@@ -2562,6 +2572,7 @@ TEST_F(HeartbeatResponseTestTwoRetries, NodeDoesNotRetryHeartbeatsAfterFailingTw
         TopologyCoordinator::ReplSetStatusArgs{firstRequestDate() + Milliseconds(4900),
                                                10,
                                                OpTime(Timestamp(100, 0), 0),
+                                               OpTime(Timestamp(100, 0), 0),
                                                OpTime(),
                                                OpTime()},
         &statusBuilder,
@@ -2802,6 +2813,7 @@ TEST_F(HeartbeatResponseTestTwoRetries,
         cbData(),
         TopologyCoordinator::ReplSetStatusArgs{firstRequestDate() + Milliseconds(7000),
                                                600,
+                                               OpTime(Timestamp(100, 0), 0),
                                                OpTime(Timestamp(100, 0), 0),
                                                OpTime(),
                                                OpTime()},
@@ -4255,7 +4267,7 @@ TEST_F(ShutdownInProgressTest, NodeReturnsShutDownInProgressWhenGetReplSetStatus
     BSONObjBuilder response;
     getTopoCoord().prepareStatusResponse(
         cbData(),
-        TopologyCoordinator::ReplSetStatusArgs{Date_t(), 0, OpTime(), OpTime(), OpTime()},
+        TopologyCoordinator::ReplSetStatusArgs{Date_t(), 0, OpTime(), OpTime(), OpTime(), OpTime()},
         &response,
         &result);
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, result);
@@ -5270,7 +5282,9 @@ TEST_F(TopoCoordTest, ShouldNotStandForElectionWhileAwareOfPrimary) {
 
     heartbeatFromMember(
         HostAndPort("h2"), "rs0", MemberState::RS_PRIMARY, OpTime(Timestamp(1, 0), 0));
-    ASSERT_FALSE(getTopoCoord().checkShouldStandForElection(now()++, OpTime()));
+    const auto status = getTopoCoord().checkShouldStandForElection(now()++, OpTime());
+    ASSERT_EQ(ErrorCodes::NodeNotElectable, status);
+    ASSERT_STRING_CONTAINS(status.reason(), "there is a Primary");
 }
 
 TEST_F(TopoCoordTest, ShouldNotStandForElectionWhileTooStale) {
@@ -5287,7 +5301,10 @@ TEST_F(TopoCoordTest, ShouldNotStandForElectionWhileTooStale) {
 
     heartbeatFromMember(
         HostAndPort("h2"), "rs0", MemberState::RS_SECONDARY, OpTime(Timestamp(10000, 0), 0));
-    ASSERT_FALSE(getTopoCoord().checkShouldStandForElection(now()++, OpTime(Timestamp(100, 0), 0)));
+    const auto status =
+        getTopoCoord().checkShouldStandForElection(now()++, OpTime(Timestamp(100, 0), 0));
+    ASSERT_EQ(ErrorCodes::NodeNotElectable, status);
+    ASSERT_STRING_CONTAINS(status.reason(), "my last optime is");
 }
 
 TEST_F(TopoCoordTest, VoteForMyselfFailsWhileNotCandidate) {
@@ -5319,12 +5336,10 @@ TEST_F(TopoCoordTest, NodeReturnsArbiterWhenGetMemberStateRunsAgainstArbiter) {
 }
 
 TEST_F(TopoCoordTest, ShouldNotStandForElectionWhileRemovedFromTheConfig) {
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
-    startCapturingLogMessages();
-    ASSERT_FALSE(getTopoCoord().checkShouldStandForElection(now()++, OpTime(Timestamp(10, 0), 0)));
-    stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("not a member of a valid replica set config"));
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Log());
+    const auto status =
+        getTopoCoord().checkShouldStandForElection(now()++, OpTime(Timestamp(10, 0), 0));
+    ASSERT_EQ(ErrorCodes::NodeNotElectable, status);
+    ASSERT_STRING_CONTAINS(status.reason(), "not a member of a valid replica set config");
 }
 
 TEST_F(TopoCoordTest, ShouldNotStandForElectionWhenAPositiveResponseWasGivenInTheVoteLeasePeriod) {
@@ -5361,12 +5376,10 @@ TEST_F(TopoCoordTest, ShouldNotStandForElectionWhenAPositiveResponseWasGivenInTh
     ASSERT_EQUALS(1, response["vote"].Int());
     ASSERT_EQUALS(remoteRound, response["round"].OID());
 
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
-    startCapturingLogMessages();
-    ASSERT_FALSE(getTopoCoord().checkShouldStandForElection(now()++, OpTime(Timestamp(10, 0), 0)));
-    stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("I recently voted for "));
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Log());
+    const auto status =
+        getTopoCoord().checkShouldStandForElection(now()++, OpTime(Timestamp(10, 0), 0));
+    ASSERT_EQ(ErrorCodes::NodeNotElectable, status);
+    ASSERT_STRING_CONTAINS(status.reason(), "I recently voted for ");
 }
 
 TEST_F(TopoCoordTest, NodeDoesNotGrantVotesToTwoDifferentNodesInTheSameTerm) {
@@ -5917,8 +5930,8 @@ TEST_F(TopoCoordTest, ProcessDeclareElectionWinner) {
 }
 
 TEST_F(TopoCoordTest, CSRSConfigServerRejectsPV0Config) {
-    ON_BLOCK_EXIT([]() { serverGlobalParams.configsvr = false; });
-    serverGlobalParams.configsvr = true;
+    ON_BLOCK_EXIT([]() { serverGlobalParams.clusterRole = ClusterRole::None; });
+    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
     TopologyCoordinatorImpl::Options options;
     options.configServerMode = CatalogManager::ConfigServerMode::CSRS;
     setOptions(options);
@@ -5938,8 +5951,8 @@ TEST_F(TopoCoordTest, CSRSConfigServerRejectsPV0Config) {
 }
 
 TEST_F(TopoCoordTest, SCCCConfigServerRejectsPV0Config) {
-    ON_BLOCK_EXIT([]() { serverGlobalParams.configsvr = false; });
-    serverGlobalParams.configsvr = true;
+    ON_BLOCK_EXIT([]() { serverGlobalParams.clusterRole = ClusterRole::None; });
+    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
     TopologyCoordinatorImpl::Options options;
     options.configServerMode = CatalogManager::ConfigServerMode::SCCC;
     setOptions(options);

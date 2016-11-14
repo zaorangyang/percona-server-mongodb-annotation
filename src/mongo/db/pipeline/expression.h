@@ -998,6 +998,7 @@ public:
 
 class ExpressionObject final : public Expression {
 public:
+    using FieldMap = std::map<std::string, boost::intrusive_ptr<Expression>>;
     boost::intrusive_ptr<Expression> optimize() final;
     bool isSimple() final;
     void addDependencies(DepsTracker* deps, std::vector<std::string>* path = NULL) const final;
@@ -1088,12 +1089,15 @@ public:
         _excludeId = b;
     }
 
+    const FieldMap& getChildExpressions() const {
+        return _expressions;
+    }
+
 private:
     explicit ExpressionObject(bool atRoot);
 
     // Mapping from fieldname to the Expression that generates its value.
     // NULL expression means inclusion from source document.
-    typedef std::map<std::string, boost::intrusive_ptr<Expression>> FieldMap;
     FieldMap _expressions;
 
     // this is used to maintain order for generated fields not in the source document
@@ -1120,6 +1124,12 @@ public:
 };
 
 class ExpressionPow final : public ExpressionFixedArity<ExpressionPow, 2> {
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+
+class ExpressionRange final : public ExpressionRangedArity<ExpressionRange, 2, 3> {
     Value evaluateInternal(Variables* vars) const final;
     const char* getOpName() const final;
 };
@@ -1201,6 +1211,13 @@ public:
 };
 
 
+class ExpressionReverseArray final : public ExpressionFixedArity<ExpressionReverseArray, 1> {
+public:
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+
 class ExpressionSlice final : public ExpressionRangedArity<ExpressionSlice, 2, 3> {
 public:
     Value evaluateInternal(Variables* vars) const final;
@@ -1228,8 +1245,27 @@ public:
 };
 
 
-class ExpressionSubstr final : public ExpressionFixedArity<ExpressionSubstr, 3> {
+class ExpressionSubstrBytes : public ExpressionFixedArity<ExpressionSubstrBytes, 3> {
 public:
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const;
+};
+
+
+class ExpressionSubstrCP final : public ExpressionFixedArity<ExpressionSubstrCP, 3> {
+public:
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+
+class ExpressionStrLenBytes final : public ExpressionFixedArity<ExpressionStrLenBytes, 1> {
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+
+class ExpressionStrLenCP final : public ExpressionFixedArity<ExpressionStrLenCP, 1> {
     Value evaluateInternal(Variables* vars) const final;
     const char* getOpName() const final;
 };
@@ -1263,7 +1299,41 @@ public:
 };
 
 
+class ExpressionType final : public ExpressionFixedArity<ExpressionType, 1> {
+public:
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+
 class ExpressionWeek final : public ExpressionFixedArity<ExpressionWeek, 1> {
+public:
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+
+    static int extract(const tm& tm);
+};
+
+
+class ExpressionIsoWeekYear final : public ExpressionFixedArity<ExpressionIsoWeekYear, 1> {
+public:
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+
+    static int extract(const tm& tm);
+};
+
+
+class ExpressionIsoDayOfWeek final : public ExpressionFixedArity<ExpressionIsoDayOfWeek, 1> {
+public:
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+
+    static int extract(const tm& tm);
+};
+
+
+class ExpressionIsoWeek final : public ExpressionFixedArity<ExpressionIsoWeek, 1> {
 public:
     Value evaluateInternal(Variables* vars) const final;
     const char* getOpName() const final;
@@ -1281,5 +1351,22 @@ public:
     static int extract(const tm& tm) {
         return tm.tm_year + 1900;
     }
+};
+
+
+class ExpressionZip final : public ExpressionFixedArity<ExpressionZip, 1> {
+public:
+    void addDependencies(DepsTracker* deps, std::vector<std::string>* path = nullptr) const final;
+    Value evaluateInternal(Variables* vars) const final;
+    boost::intrusive_ptr<Expression> optimize() final;
+    static boost::intrusive_ptr<Expression> parse(BSONElement expr,
+                                                  const VariablesParseState& vpsIn);
+    Value serialize(bool explain) const final;
+    const char* getOpName() const final;
+
+private:
+    bool _useLongestLength = false;
+    ExpressionVector _inputs;
+    ExpressionVector _defaults;
 };
 }

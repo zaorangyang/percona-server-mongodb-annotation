@@ -36,6 +36,7 @@
 namespace mongo {
 
 class BSONObj;
+class ServiceContext;
 template <typename T>
 class StatusWith;
 
@@ -49,6 +50,19 @@ public:
     CollatorFactoryInterface() = default;
 
     virtual ~CollatorFactoryInterface() {}
+
+    /**
+     * Returns the CollatorFactoryInterface object associated with the specified service context.
+     * This method must only be called if a CollatorFactoryInterface has been set on the service
+     * context.
+     */
+    static CollatorFactoryInterface* get(ServiceContext* serviceContext);
+
+    /**
+     * Sets the CollatorFactoryInterface object associated with the specified service context.
+     */
+    static void set(ServiceContext* serviceContext,
+                    std::unique_ptr<CollatorFactoryInterface> collatorFactory);
 
     /**
      * Parses 'spec' and, on success, returns the corresponding CollatorInterface.
