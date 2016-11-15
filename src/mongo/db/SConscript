@@ -231,6 +231,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context'
     ]
 )
 
@@ -471,6 +472,7 @@ env.Library(
         'service_context_noop.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/util/clock_sources',
         '$BUILD_DIR/mongo/util/concurrency/spin_lock',
         '$BUILD_DIR/mongo/util/decorable',
         '$BUILD_DIR/mongo/util/net/hostandport',
@@ -609,6 +611,7 @@ serverOnlyFiles = [
     "commands/list_collections.cpp",
     "commands/list_databases.cpp",
     "commands/list_indexes.cpp",
+    "commands/lock_info.cpp",
     "commands/mr.cpp",
     "commands/oplog_note.cpp",
     "commands/parallel_collection_scan.cpp",
@@ -703,6 +706,7 @@ serveronlyLibdeps = [
     "$BUILD_DIR/mongo/s/coreshard",
     "$BUILD_DIR/mongo/s/serveronly",
     "$BUILD_DIR/mongo/scripting/scripting_server",
+    "$BUILD_DIR/mongo/util/clock_sources",
     "$BUILD_DIR/mongo/util/elapsed_tracker",
     "$BUILD_DIR/mongo/util/net/network",
     "$BUILD_DIR/mongo/db/storage/mmap_v1/file_allocator",

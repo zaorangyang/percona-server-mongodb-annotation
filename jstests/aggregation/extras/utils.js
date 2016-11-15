@@ -8,8 +8,8 @@ function testExpression(coll, expression, result) {
 
     var res = coll.aggregate({$project: {output: expression}}).toArray();
 
-    assert.eq(res.length, 1);
-    assert.eq(res[0].output, result);
+    assert.eq(res.length, 1, tojson(res));
+    assert.eq(res[0].output, result, tojson(res));
 }
 
 /*
@@ -275,9 +275,8 @@ function assertErrorCode(coll, pipe, code, errmsg) {
         var error = assert.throws(function() {
             cursor.itcount();
         }, [], "expected error: " + code);
-        if (!error.message.search(code)) {
-            assert(false, "expected error: " + code + " got: " + error);
-        }
+
+        assert.eq(error.code, code);
     } else {
         assert.eq(cursorRes.code, code);
     }

@@ -50,7 +50,9 @@ namespace mongo {
 // SortKeyGenerator
 //
 
-SortKeyGenerator::SortKeyGenerator(const BSONObj& sortSpec, const BSONObj& queryObj) {
+SortKeyGenerator::SortKeyGenerator(OperationContext* txn,
+                                   const BSONObj& sortSpec,
+                                   const BSONObj& queryObj) {
     _hasBounds = false;
     _sortHasMeta = false;
     _rawSortSpec = sortSpec;
@@ -100,7 +102,7 @@ SortKeyGenerator::SortKeyGenerator(const BSONObj& sortSpec, const BSONObj& query
     _keyGen.reset(new BtreeKeyGeneratorV1(fieldNames, fixed, false /* not sparse */, nullptr));
 
     // The bounds checker only works on the Btree part of the sort key.
-    getBoundsForSort(queryObj, _btreeObj);
+    getBoundsForSort(txn, queryObj, _btreeObj);
 
     if (_hasBounds) {
         _boundsChecker.reset(new IndexBoundsChecker(&_bounds, _btreeObj, 1 /* == order */));
@@ -220,17 +222,28 @@ StatusWith<BSONObj> SortKeyGenerator::getSortKeyFromObject(const WorkingSetMembe
     return *keys.begin();
 }
 
-void SortKeyGenerator::getBoundsForSort(const BSONObj& queryObj, const BSONObj& sortObj) {
+void SortKeyGenerator::getBoundsForSort(OperationContext* txn,
+                                        const BSONObj& queryObj,
+                                        const BSONObj& sortObj) {
     QueryPlannerParams params;
     params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
     // We're creating a "virtual index" with key pattern equal to the sort order.
-    IndexEntry sortOrder(
-        sortObj, IndexNames::BTREE, true, false, false, "doesnt_matter", NULL, BSONObj());
+    IndexEntry sortOrder(sortObj,
+                         IndexNames::BTREE,
+                         true,
+                         MultikeyPaths{},
+                         false,
+                         false,
+                         "doesnt_matter",
+                         NULL,
+                         BSONObj());
     params.indices.push_back(sortOrder);
 
-    auto statusWithQueryForSort = CanonicalQuery::canonicalize(
-        NamespaceString("fake.ns"), queryObj, ExtensionsCallbackNoop());
+    auto lpq = stdx::make_unique<LiteParsedQuery>(NamespaceString("fake.ns"));
+    lpq->setFilter(queryObj);
+    auto statusWithQueryForSort =
+        CanonicalQuery::canonicalize(txn, std::move(lpq), ExtensionsCallbackNoop());
     verify(statusWithQueryForSort.isOK());
     std::unique_ptr<CanonicalQuery> queryForSort = std::move(statusWithQueryForSort.getValue());
 
@@ -287,7 +300,7 @@ bool SortKeyGeneratorStage::isEOF() {
 
 PlanStage::StageState SortKeyGeneratorStage::doWork(WorkingSetID* out) {
     if (!_sortKeyGen) {
-        _sortKeyGen = stdx::make_unique<SortKeyGenerator>(_sortSpec, _query);
+        _sortKeyGen = stdx::make_unique<SortKeyGenerator>(getOpCtx(), _sortSpec, _query);
         return PlanStage::NEED_TIME;
     }
 

@@ -137,6 +137,7 @@ void fillOutPlannerParams(OperationContext* txn,
         plannerParams->indices.push_back(IndexEntry(desc->keyPattern(),
                                                     desc->getAccessMethodName(),
                                                     desc->isMultikey(txn),
+                                                    ice->getMultikeyPaths(txn),
                                                     desc->isSparse(),
                                                     desc->unique(),
                                                     desc->indexName(),
@@ -268,6 +269,7 @@ Status prepareExecution(OperationContext* opCtx,
         // document, so we don't support covered projections. However, we might use the
         // simple inclusion fast path.
         if (NULL != canonicalQuery->getProj()) {
+            // TODO SERVER-23613: pass the appropriate collator to ProjectionStageParams.
             ProjectionStageParams params(ExtensionsCallbackReal(opCtx, &collection->ns()));
             params.projObj = canonicalQuery->getProj()->getProjObj();
 
@@ -624,6 +626,7 @@ StatusWith<unique_ptr<PlanStage>> applyProjection(OperationContext* txn,
                 "Cannot use a $meta sortKey projection in findAndModify commands."};
     }
 
+    // TODO SERVER-23613: pass the appropriate collator to ProjectionStageParams.
     ProjectionStageParams params(ExtensionsCallbackReal(txn, &nsString));
     params.projObj = proj;
     params.fullExpression = cq->root();
@@ -932,10 +935,13 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorGroup(OperationContext* txn,
     }
 
     const NamespaceString nss(request.ns);
+    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+    lpq->setFilter(request.query);
+    lpq->setExplain(request.explain);
+
     const ExtensionsCallbackReal extensionsCallback(txn, &nss);
 
-    auto statusWithCQ =
-        CanonicalQuery::canonicalize(nss, request.query, request.explain, extensionsCallback);
+    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -1152,18 +1158,14 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorCount(OperationContext* txn,
                                                       PlanExecutor::YieldPolicy yieldPolicy) {
     unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
 
+    auto lpq = stdx::make_unique<LiteParsedQuery>(request.getNs());
+    lpq->setFilter(request.getQuery());
+    lpq->setHint(request.getHint());
+    lpq->setExplain(explain);
+
     auto cq = CanonicalQuery::canonicalize(
-        request.getNs(),
-        request.getQuery(),
-        BSONObj(),  // sort
-        BSONObj(),  // projection
-        0,          // skip
-        0,          // limit
-        request.getHint(),
-        BSONObj(),  // min
-        BSONObj(),  // max
-        false,      // snapshot
-        explain,
+        txn,
+        std::move(lpq),
         collection
             ? static_cast<const ExtensionsCallback&>(ExtensionsCallbackReal(txn, &collection->ns()))
             : static_cast<const ExtensionsCallback&>(ExtensionsCallbackNoop()));
@@ -1315,6 +1317,7 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDistinct(OperationContext* txn,
             plannerParams.indices.push_back(IndexEntry(desc->keyPattern(),
                                                        desc->getAccessMethodName(),
                                                        desc->isMultikey(txn),
+                                                       ice->getMultikeyPaths(txn),
                                                        desc->isSparse(),
                                                        desc->unique(),
                                                        desc->indexName(),
@@ -1328,8 +1331,11 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDistinct(OperationContext* txn,
     // If there are no suitable indices for the distinct hack bail out now into regular planning
     // with no projection.
     if (plannerParams.indices.empty()) {
-        auto statusWithCQ =
-            CanonicalQuery::canonicalize(collection->ns(), query, isExplain, extensionsCallback);
+        auto lpq = stdx::make_unique<LiteParsedQuery>(collection->ns());
+        lpq->setFilter(query);
+        lpq->setExplain(isExplain);
+
+        auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
         if (!statusWithCQ.isOK()) {
             return statusWithCQ.getStatus();
         }
@@ -1346,19 +1352,12 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDistinct(OperationContext* txn,
     // (ie _id:1 being implied by default).
     BSONObj projection = getDistinctProjection(field);
 
-    // Apply a projection of the key.  Empty BSONObj() is for the sort.
-    auto statusWithCQ = CanonicalQuery::canonicalize(collection->ns(),
-                                                     query,
-                                                     BSONObj(),  // sort
-                                                     projection,
-                                                     0,          // skip
-                                                     0,          // limit
-                                                     BSONObj(),  // hint
-                                                     BSONObj(),  // min
-                                                     BSONObj(),  // max
-                                                     false,      // snapshot
-                                                     isExplain,
-                                                     extensionsCallback);
+    auto lpq = stdx::make_unique<LiteParsedQuery>(collection->ns());
+    lpq->setFilter(query);
+    lpq->setExplain(isExplain);
+    lpq->setProj(projection);
+
+    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -1444,8 +1443,12 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDistinct(OperationContext* txn,
     }
 
     // We drop the projection from the 'cq'.  Unfortunately this is not trivial.
+    auto lpqNoProjection = stdx::make_unique<LiteParsedQuery>(collection->ns());
+    lpqNoProjection->setFilter(query);
+    lpqNoProjection->setExplain(isExplain);
+
     statusWithCQ =
-        CanonicalQuery::canonicalize(collection->ns(), query, isExplain, extensionsCallback);
+        CanonicalQuery::canonicalize(txn, std::move(lpqNoProjection), extensionsCallback);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }

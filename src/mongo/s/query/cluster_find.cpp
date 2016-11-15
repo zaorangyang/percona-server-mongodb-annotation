@@ -43,6 +43,7 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_request.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
@@ -102,34 +103,13 @@ std::unique_ptr<LiteParsedQuery> transformQueryForShards(const LiteParsedQuery& 
         newProjection = projectionBuilder.obj();
     }
 
-    return LiteParsedQuery::makeAsFindCmd(lpq.nss(),
-                                          lpq.getFilter(),
-                                          newProjection,
-                                          lpq.getSort(),
-                                          lpq.getHint(),
-                                          lpq.getReadConcern(),
-                                          lpq.getCollation(),
-                                          boost::none,  // Don't forward skip.
-                                          newLimit,
-                                          lpq.getBatchSize(),
-                                          newNToReturn,
-                                          lpq.wantMore(),
-                                          lpq.isExplain(),
-                                          lpq.getComment(),
-                                          lpq.getMaxScan(),
-                                          lpq.getMaxTimeMS(),
-                                          lpq.getMin(),
-                                          lpq.getMax(),
-                                          lpq.returnKey(),
-                                          lpq.showRecordId(),
-                                          lpq.isSnapshot(),
-                                          lpq.hasReadPref(),
-                                          lpq.isTailable(),
-                                          lpq.isSlaveOk(),
-                                          lpq.isOplogReplay(),
-                                          lpq.isNoCursorTimeout(),
-                                          lpq.isAwaitData(),
-                                          lpq.isAllowPartialResults());
+    auto newLPQ = stdx::make_unique<LiteParsedQuery>(lpq);
+    newLPQ->setProj(newProjection);
+    newLPQ->setSkip(boost::none);
+    newLPQ->setLimit(newLimit);
+    newLPQ->setNToReturn(newNToReturn);
+    invariantOK(newLPQ->validate());
+    return newLPQ;
 }
 
 StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,

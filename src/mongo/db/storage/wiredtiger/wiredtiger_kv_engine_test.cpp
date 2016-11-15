@@ -33,7 +33,9 @@
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
+#include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
 
@@ -41,7 +43,7 @@ class WiredTigerKVHarnessHelper : public KVHarnessHelper {
 public:
     WiredTigerKVHarnessHelper() : _dbpath("wt-kv-harness") {
         _engine.reset(new WiredTigerKVEngine(
-            kWiredTigerEngineName, _dbpath.path(), "", 1, false, false, false, false));
+            kWiredTigerEngineName, _dbpath.path(), _cs.get(), "", 1, false, false, false, false));
     }
 
     virtual ~WiredTigerKVHarnessHelper() {
@@ -51,7 +53,7 @@ public:
     virtual KVEngine* restartEngine() {
         _engine.reset(NULL);
         _engine.reset(new WiredTigerKVEngine(
-            kWiredTigerEngineName, _dbpath.path(), "", 1, false, false, false, false));
+            kWiredTigerEngineName, _dbpath.path(), _cs.get(), "", 1, false, false, false, false));
         return _engine.get();
     }
 
@@ -60,6 +62,7 @@ public:
     }
 
 private:
+    const std::unique_ptr<ClockSource> _cs = stdx::make_unique<ClockSourceMock>();
     unittest::TempDir _dbpath;
     std::unique_ptr<WiredTigerKVEngine> _engine;
 };

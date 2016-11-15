@@ -43,12 +43,11 @@
 #include "mongo/s/config.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/commands/cluster_explain.h"
-#include "mongo/s/db_util.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
+#include "mongo/s/sharding_raii.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/commands/strategy.h"
-#include "mongo/s/write_ops/wc_error_detail.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -89,10 +88,9 @@ public:
                            BSONObjBuilder* out) const {
         const NamespaceString nss = parseNsCollectionRequired(dbName, cmdObj);
 
-        auto status = Grid::get(txn)->catalogCache()->getDatabase(txn, dbName);
-        uassertStatusOK(status);
+        auto scopedDB = uassertStatusOK(ScopedShardDatabase::getExisting(txn, dbName));
+        DBConfig* conf = scopedDB.db();
 
-        shared_ptr<DBConfig> conf = status.getValue();
         shared_ptr<ChunkManager> chunkMgr;
         shared_ptr<Shard> shard;
 
@@ -103,7 +101,7 @@ public:
 
             const BSONObj query = cmdObj.getObjectField("query");
 
-            StatusWith<BSONObj> status = _getShardKey(chunkMgr, query);
+            StatusWith<BSONObj> status = _getShardKey(txn, chunkMgr, query);
             if (!status.isOK()) {
                 return status.getStatus();
             }
@@ -154,7 +152,9 @@ public:
 
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
-        auto conf = uassertStatusOK(dbutil::implicitCreateDb(txn, dbName));
+        auto scopedDb = uassertStatusOK(ScopedShardDatabase::getOrCreate(txn, dbName));
+        DBConfig* conf = scopedDb.db();
+
         if (!conf->isShardingEnabled() || !conf->isSharded(nss.ns())) {
             return _runCommand(txn, conf, nullptr, conf->getPrimaryId(), nss, cmdObj, result);
         }
@@ -163,7 +163,7 @@ public:
 
         const BSONObj query = cmdObj.getObjectField("query");
 
-        StatusWith<BSONObj> status = _getShardKey(chunkMgr, query);
+        StatusWith<BSONObj> status = _getShardKey(txn, chunkMgr, query);
         if (!status.isOK()) {
             // Bad query
             return appendCommandStatus(result, status.getStatus());
@@ -185,7 +185,7 @@ public:
 
 private:
     shared_ptr<ChunkManager> _getChunkManager(OperationContext* txn,
-                                              shared_ptr<DBConfig> conf,
+                                              DBConfig* conf,
                                               const NamespaceString& nss) const {
         shared_ptr<ChunkManager> chunkMgr = conf->getChunkManager(txn, nss.ns());
         massert(13002, "shard internal error chunk manager should never be null", chunkMgr);
@@ -193,10 +193,12 @@ private:
         return chunkMgr;
     }
 
-    StatusWith<BSONObj> _getShardKey(shared_ptr<ChunkManager> chunkMgr,
+    StatusWith<BSONObj> _getShardKey(OperationContext* txn,
+                                     shared_ptr<ChunkManager> chunkMgr,
                                      const BSONObj& query) const {
         // Verify that the query has an equality predicate using the shard key
-        StatusWith<BSONObj> status = chunkMgr->getShardKeyPattern().extractShardKeyFromQuery(query);
+        StatusWith<BSONObj> status =
+            chunkMgr->getShardKeyPattern().extractShardKeyFromQuery(txn, query);
 
         if (!status.isOK()) {
             return status;
@@ -213,7 +215,7 @@ private:
     }
 
     bool _runCommand(OperationContext* txn,
-                     shared_ptr<DBConfig> conf,
+                     DBConfig* conf,
                      shared_ptr<ChunkManager> chunkManager,
                      const ShardId& shardId,
                      const NamespaceString& nss,

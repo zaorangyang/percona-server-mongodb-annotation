@@ -81,6 +81,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/storage/mmap_v1/aligned_builder.h"
 #include "mongo/db/storage/mmap_v1/dur_commitjob.h"
 #include "mongo/db/storage/mmap_v1/dur_journal.h"
@@ -93,6 +94,7 @@
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -227,7 +229,7 @@ public:
     virtual void closingFileNotification();
     virtual void commitAndStopDurThread();
 
-    void start();
+    void start(ClockSource* cs, int64_t serverStartMs);
 
 private:
     stdx::thread _durThreadHandle;
@@ -408,14 +410,17 @@ static stdx::mutex journalListenerMutex;
 
 
 // Declared in dur_preplogbuffer.cpp
-void PREPLOGBUFFER(JSectHeader& outHeader, AlignedBuilder& outBuffer);
+void PREPLOGBUFFER(JSectHeader& outHeader,
+                   AlignedBuilder& outBuffer,
+                   ClockSource* cs,
+                   int64_t serverStartMs);
 
 // Declared in dur_journal.cpp
 boost::filesystem::path getJournalDir();
 void preallocateFiles();
 
 // Forward declaration
-static void durThread();
+static void durThread(ClockSource* cs, int64_t serverStartMs);
 
 // Durability activity statistics
 Stats stats;
@@ -606,9 +611,9 @@ void DurableImpl::commitAndStopDurThread() {
     _durThreadHandle.join();
 }
 
-void DurableImpl::start() {
+void DurableImpl::start(ClockSource* cs, int64_t serverStartMs) {
     // Start the durability thread
-    stdx::thread t(durThread);
+    stdx::thread t(durThread, cs, serverStartMs);
     _durThreadHandle.swap(t);
 }
 
@@ -654,7 +659,7 @@ static void remapPrivateView(double fraction) {
 /**
  * The main durability thread loop. There is a single instance of this function running.
  */
-static void durThread() {
+static void durThread(ClockSource* cs, int64_t serverStartMs) {
     Client::initThread("durability");
 
     log() << "Durability thread started";
@@ -741,7 +746,7 @@ static void durThread() {
             } else {
                 // This copies all the in-memory changes into the journal writer's buffer.
                 JournalWriter::Buffer* const buffer = journalWriter.newBuffer();
-                PREPLOGBUFFER(buffer->getHeader(), buffer->getBuilder());
+                PREPLOGBUFFER(buffer->getHeader(), buffer->getBuilder(), cs, serverStartMs);
 
                 estimatedPrivateMapSize += commitJob.bytes();
                 commitCounter++;
@@ -867,12 +872,12 @@ static void durThread() {
  * Invoked at server startup. Recovers the database by replaying journal files and then
  * starts the durability thread.
  */
-void startup() {
+void startup(ClockSource* cs, int64_t serverStartMs) {
     if (!storageGlobalParams.dur) {
         return;
     }
 
-    journalMakeDir();
+    journalMakeDir(cs, serverStartMs);
 
     try {
         replayJournalFilesAtStartup();
@@ -889,7 +894,7 @@ void startup() {
 
     preallocateFiles();
 
-    durableImpl.start();
+    durableImpl.start(cs, serverStartMs);
     DurableInterface::_impl = &durableImpl;
 }
 

@@ -964,13 +964,13 @@ elif endian == "big":
 # NOTE: Remember to add a trailing comma to form any required one
 # element tuples, or your configure checks will fail in strange ways.
 processor_macros = {
-    'arm'    : { 'endian': 'little', 'defines': ('__arm__',) },
-    'arm64'  : { 'endian': 'little', 'defines': ('__arm64__', '__aarch64__')},
-    'i386'   : { 'endian': 'little', 'defines': ('__i386', '_M_IX86')},
-    'ppc64le': { 'endian': 'little', 'defines': ('__powerpc64__',)},
-    's390x'  : { 'endian': 'big',    'defines': ('__s390x__',)},
-    'sparc'  : { 'endian': 'big',    'defines': ('__sparc',)},
-    'x86_64' : { 'endian': 'little', 'defines': ('__x86_64', '_M_AMD64')},
+    'arm'     : { 'endian': 'little', 'defines': ('__arm__',) },
+    'aarch64' : { 'endian': 'little', 'defines': ('__arm64__', '__aarch64__')},
+    'i386'    : { 'endian': 'little', 'defines': ('__i386', '_M_IX86')},
+    'ppc64le' : { 'endian': 'little', 'defines': ('__powerpc64__',)},
+    's390x'   : { 'endian': 'big',    'defines': ('__s390x__',)},
+    'sparc'   : { 'endian': 'big',    'defines': ('__sparc',)},
+    'x86_64'  : { 'endian': 'little', 'defines': ('__x86_64', '_M_AMD64')},
 }
 
 def CheckForProcessor(context, which_arch):
@@ -1596,14 +1596,14 @@ def doConfigure(myenv):
     # bare compilers, and we should re-check at the very end that TryCompile and TryLink still
     # work with the flags we have selected.
     if myenv.ToolchainIs('msvc'):
-        compiler_minimum_string = "Microsoft Visual Studio 2013 Update 4"
+        compiler_minimum_string = "Microsoft Visual Studio 2015 Update 2"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(_MSC_VER)
         #error
         #endif
 
-        #if _MSC_VER < 1800 || (_MSC_VER == 1800 && _MSC_FULL_VER < 180031101)
+        #if _MSC_VER < 1900 || (_MSC_VER == 1900 && _MSC_FULL_VER < 190023918)
         #error %s or newer is required to build MongoDB
         #endif
 
@@ -1612,14 +1612,14 @@ def doConfigure(myenv):
         }
         """ % compiler_minimum_string)
     elif myenv.ToolchainIs('gcc'):
-        compiler_minimum_string = "GCC 4.8.2"
+        compiler_minimum_string = "GCC 5.3.0"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(__GNUC__) || defined(__clang__)
         #error
         #endif
 
-        #if (__GNUC__ < 4) || (__GNUC__ == 4 && __GNUC_MINOR__ < 8) || (__GNUC__ == 4 && __GNUC_MINOR__ == 8 && __GNUC_PATCHLEVEL__ < 2)
+        #if (__GNUC__ < 5) || (__GNUC__ == 5 && __GNUC_MINOR__ < 3) || (__GNUC__ == 5 && __GNUC_MINOR__ == 3 && __GNUC_PATCHLEVEL__ < 0)
         #error %s or newer is required to build MongoDB
         #endif
 
@@ -1985,23 +1985,24 @@ def doConfigure(myenv):
 
     conf.Finish()
 
-    # If we are using libstdc++, check to see if we are using a libstdc++ that is older than
-    # our GCC minimum of 4.8.2. This is primarly to help people using clang on OS X but
-    # forgetting to use --libc++ (or set the target OS X version high enough to get it as the
-    # default). We would, ideally, check the __GLIBCXX__ version, but for various reasons this
-    # is not workable. Instead, we switch on the fact that _GLIBCXX_PROFILE_UNORDERED wasn't
-    # introduced until libstdc++ 4.8.2. Yes, this is a terrible hack.
+    # If we are using libstdc++, check to see if we are using a
+    # libstdc++ that is older than our GCC minimum of 5.3.0. This is
+    # primarly to help people using clang on OS X but forgetting to
+    # use --libc++ (or set the target OS X version high enough to get
+    # it as the default). We would, ideally, check the __GLIBCXX__
+    # version, but for various reasons this is not workable. Instead,
+    # we switch on the fact that the <experimental/filesystem> header
+    # wasn't introduced until libstdc++ 5.3.0. Yes, this is a terrible
+    # hack.
     if usingLibStdCxx:
         def CheckModernLibStdCxx(context):
             test_body = """
-            #define _GLIBCXX_PROFILE
-            #include <unordered_map>
-            #if !defined(_GLIBCXX_PROFILE_UNORDERED)
-            #error libstdc++ older than 4.8.2
+            #if !__has_include(<experimental/filesystem>)
+            #error "libstdc++ from GCC 5.3.0 or newer is required"
             #endif
             """
 
-            context.Message('Checking for libstdc++ 4.8.2 or better... ')
+            context.Message('Checking for libstdc++ 5.3.0 or better... ')
             ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
             context.Result(ret)
             return ret
@@ -2010,8 +2011,9 @@ def doConfigure(myenv):
             'CheckModernLibStdCxx' : CheckModernLibStdCxx,
         })
 
-        if not conf.CheckModernLibStdCxx():
-            myenv.ConfError("When using libstdc++, MongoDB requires libstdc++ 4.8.2 or newer")
+        suppress_invalid = has_option("disable-minimum-compiler-version-enforcement")
+        if not conf.CheckModernLibStdCxx() and not suppress_invalid:
+            myenv.ConfError("When using libstdc++, MongoDB requires libstdc++ from GCC 5.3.0 or newer")
 
         conf.Finish()
 
@@ -2202,6 +2204,17 @@ def doConfigure(myenv):
     # because it is much faster.
     if myenv.ToolchainIs('gcc', 'clang'):
         AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+
+        # Disallow an executable stack. Also, issue a warning if any files are found that would
+        # cause the stack to become executable if the noexecstack flag was not in play, so that we
+        # can find them and fix them. We do this here after we check for ld.gold because the
+        # --warn-execstack is currently only offered with gold.
+        #
+        # TODO: Add -Wl,--fatal-warnings once WT-2629 is fixed. We probably can do that
+        # unconditionally above, and not need to do it as an AddToLINKFLAGSIfSupported step, since
+        # both gold and binutils ld both support it.
+        AddToLINKFLAGSIfSupported(myenv, "-Wl,-z,noexecstack")
+        AddToLINKFLAGSIfSupported(myenv, "-Wl,--warn-execstack")
 
     # Apply any link time optimization settings as selected by the 'lto' option.
     if has_option('lto'):

@@ -26,36 +26,53 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/shard_util.h"
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 namespace shardutil {
+namespace {
+
+const char kMinKey[] = "min";
+const char kMaxKey[] = "max";
+const char kShouldMigrate[] = "shouldMigrate";
+
+}  // namespace
 
 StatusWith<long long> retrieveTotalShardSize(OperationContext* txn, const ShardId& shardId) {
-    auto shardRegistry = Grid::get(txn)->shardRegistry();
-    auto listDatabasesStatus = shardRegistry->runIdempotentCommandOnShard(
-        txn,
-        shardId,
-        ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
-        "admin",
-        BSON("listDatabases" << 1));
+    auto shard = Grid::get(txn)->shardRegistry()->getShard(txn, shardId);
+    if (!shard) {
+        return Status(ErrorCodes::ShardNotFound,
+                      str::stream() << "shard " << shardId << " not found");
+    }
+    auto listDatabasesStatus =
+        shard->runCommand(txn,
+                          ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
+                          "admin",
+                          BSON("listDatabases" << 1),
+                          Shard::RetryPolicy::kIdempotent);
     if (!listDatabasesStatus.isOK()) {
-        return listDatabasesStatus.getStatus();
+        return std::move(listDatabasesStatus.getStatus());
+    }
+    if (!listDatabasesStatus.getValue().commandStatus.isOK()) {
+        return std::move(listDatabasesStatus.getValue().commandStatus);
     }
 
-    BSONElement totalSizeElem = listDatabasesStatus.getValue()["totalSize"];
+    BSONElement totalSizeElem = listDatabasesStatus.getValue().response["totalSize"];
     if (!totalSizeElem.isNumber()) {
         return {ErrorCodes::NoSuchKey, "totalSize field not found in listDatabases"};
     }
@@ -72,23 +89,28 @@ StatusWith<BSONObj> selectMedianKey(OperationContext* txn,
     BSONObjBuilder cmd;
     cmd.append("splitVector", nss.ns());
     cmd.append("keyPattern", shardKeyPattern.toBSON());
-    cmd.append("min", minKey);
-    cmd.append("max", maxKey);
+    cmd.append(kMinKey, minKey);
+    cmd.append(kMaxKey, maxKey);
     cmd.appendBool("force", true);
 
-    auto shardRegistry = Grid::get(txn)->shardRegistry();
-    auto cmdStatus = shardRegistry->runIdempotentCommandOnShard(
-        txn, shardId, ReadPreferenceSetting{ReadPreference::PrimaryPreferred}, "admin", cmd.obj());
+    auto shard = Grid::get(txn)->shardRegistry()->getShard(txn, shardId);
+    if (!shard) {
+        return Status(ErrorCodes::ShardNotFound,
+                      str::stream() << "shard " << shardId << " not found");
+    }
+    auto cmdStatus = shard->runCommand(txn,
+                                       ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
+                                       "admin",
+                                       cmd.obj(),
+                                       Shard::RetryPolicy::kIdempotent);
     if (!cmdStatus.isOK()) {
-        return cmdStatus.getStatus();
+        return std::move(cmdStatus.getStatus());
+    }
+    if (!cmdStatus.getValue().commandStatus.isOK()) {
+        return std::move(cmdStatus.getValue().commandStatus);
     }
 
-    const auto response = std::move(cmdStatus.getValue());
-
-    Status status = getStatusFromCommandResult(response);
-    if (!status.isOK()) {
-        return status;
-    }
+    const auto response = std::move(cmdStatus.getValue().response);
 
     BSONObjIterator it(response.getObjectField("splitKeys"));
     if (it.more()) {
@@ -110,25 +132,30 @@ StatusWith<std::vector<BSONObj>> selectChunkSplitPoints(OperationContext* txn,
     BSONObjBuilder cmd;
     cmd.append("splitVector", nss.ns());
     cmd.append("keyPattern", shardKeyPattern.toBSON());
-    cmd.append("min", minKey);
-    cmd.append("max", maxKey);
+    cmd.append(kMinKey, minKey);
+    cmd.append(kMaxKey, maxKey);
     cmd.append("maxChunkSizeBytes", chunkSizeBytes);
     cmd.append("maxSplitPoints", maxPoints);
     cmd.append("maxChunkObjects", maxObjs);
 
-    auto shardRegistry = Grid::get(txn)->shardRegistry();
-    auto cmdStatus = shardRegistry->runIdempotentCommandOnShard(
-        txn, shardId, ReadPreferenceSetting{ReadPreference::PrimaryPreferred}, "admin", cmd.obj());
+    auto shard = Grid::get(txn)->shardRegistry()->getShard(txn, shardId);
+    if (!shard) {
+        return Status(ErrorCodes::ShardNotFound,
+                      str::stream() << "shard " << shardId << " not found");
+    }
+    auto cmdStatus = shard->runCommand(txn,
+                                       ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
+                                       "admin",
+                                       cmd.obj(),
+                                       Shard::RetryPolicy::kIdempotent);
     if (!cmdStatus.isOK()) {
-        return cmdStatus.getStatus();
+        return std::move(cmdStatus.getStatus());
+    }
+    if (!cmdStatus.getValue().commandStatus.isOK()) {
+        return std::move(cmdStatus.getValue().commandStatus);
     }
 
-    const auto response = std::move(cmdStatus.getValue());
-
-    Status status = getStatusFromCommandResult(response);
-    if (!status.isOK()) {
-        return status;
-    }
+    const auto response = std::move(cmdStatus.getValue().response);
 
     std::vector<BSONObj> splitPoints;
 
@@ -138,6 +165,84 @@ StatusWith<std::vector<BSONObj>> selectChunkSplitPoints(OperationContext* txn,
     }
 
     return std::move(splitPoints);
+}
+
+StatusWith<boost::optional<ChunkRange>> splitChunkAtMultiplePoints(
+    OperationContext* txn,
+    const ShardId& shardId,
+    const NamespaceString& nss,
+    const ShardKeyPattern& shardKeyPattern,
+    ChunkVersion collectionVersion,
+    const BSONObj& minKey,
+    const BSONObj& maxKey,
+    const std::vector<BSONObj>& splitPoints) {
+    invariant(!splitPoints.empty());
+    invariant(minKey.woCompare(maxKey) < 0);
+
+    const size_t kMaxSplitPoints = 8192;
+
+    if (splitPoints.size() > kMaxSplitPoints) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Cannot split chunk in more than " << kMaxSplitPoints
+                              << " parts at a time."};
+    }
+
+    BSONObjBuilder cmd;
+    cmd.append("splitChunk", nss.ns());
+    cmd.append("configdb",
+               Grid::get(txn)->shardRegistry()->getConfigServerConnectionString().toString());
+    cmd.append("from", shardId);
+    cmd.append("keyPattern", shardKeyPattern.toBSON());
+    collectionVersion.appendForCommands(&cmd);
+    cmd.append(kMinKey, minKey);
+    cmd.append(kMaxKey, maxKey);
+    cmd.append("splitKeys", splitPoints);
+
+    BSONObj cmdObj = cmd.obj();
+
+    Status status{ErrorCodes::InternalError, "Uninitialized value"};
+    BSONObj cmdResponse;
+
+    auto shard = Grid::get(txn)->shardRegistry()->getShard(txn, shardId);
+    if (!shard) {
+        status =
+            Status(ErrorCodes::ShardNotFound, str::stream() << "shard " << shardId << " not found");
+    } else {
+        auto cmdStatus = shard->runCommand(txn,
+                                           ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                           "admin",
+                                           cmdObj,
+                                           Shard::RetryPolicy::kNotIdempotent);
+        if (!cmdStatus.isOK()) {
+            status = std::move(cmdStatus.getStatus());
+        } else {
+            status = std::move(cmdStatus.getValue().commandStatus);
+            cmdResponse = std::move(cmdStatus.getValue().response);
+        }
+    }
+
+    if (!status.isOK()) {
+        log() << "Split chunk " << cmdObj << " failed" << causedBy(status);
+        return {status.code(), str::stream() << "split failed due to " << status.toString()};
+    }
+
+    BSONElement shouldMigrateElement;
+    status = bsonExtractTypedField(cmdResponse, kShouldMigrate, Object, &shouldMigrateElement);
+    if (status.isOK()) {
+        auto chunkRangeStatus = ChunkRange::fromBSON(shouldMigrateElement.embeddedObject());
+        if (!chunkRangeStatus.isOK()) {
+            return chunkRangeStatus.getStatus();
+        }
+
+        return boost::optional<ChunkRange>(std::move(chunkRangeStatus.getValue()));
+    } else if (status != ErrorCodes::NoSuchKey) {
+        warning()
+            << "Chunk migration will be skipped because splitChunk returned invalid response: "
+            << cmdResponse << ". Extracting " << kShouldMigrate << " field failed"
+            << causedBy(status);
+    }
+
+    return boost::optional<ChunkRange>();
 }
 
 }  // namespace shardutil

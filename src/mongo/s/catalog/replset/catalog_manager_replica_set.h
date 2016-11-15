@@ -40,6 +40,10 @@ class NamespaceString;
 struct ReadPreferenceSetting;
 class VersionType;
 
+namespace executor {
+class TaskExecutor;
+}  // namespace executor
+
 /**
  * Implements the catalog manager for talking to replica set config servers.
  */
@@ -259,7 +263,7 @@ private:
     void _runBatchWriteCommand(OperationContext* txn,
                                const BatchedCommandRequest& request,
                                BatchedCommandResponse* response,
-                               const ShardRegistry::ErrorCodesSet& errorsToCheck);
+                               Shard::RetryPolicy retryPolicy);
 
     /**
      * Helper method for running a count command against the config server with appropriate

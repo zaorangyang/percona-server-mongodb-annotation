@@ -39,6 +39,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
@@ -50,6 +51,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
@@ -194,6 +196,12 @@ public:
             return appendCommandStatus(result, executor.getStatus());
         }
 
+        {
+            stdx::lock_guard<Client>(*txn->getClient());
+            CurOp::get(txn)
+                ->setPlanSummary_inlock(Explain::getPlanSummary(executor.getValue().get()));
+        }
+
         string key = cmdObj[kKeyField].valuestrsafe();
 
         int bufSize = BSONObjMaxUserSize - 4096;
@@ -245,13 +253,21 @@ public:
         }
 
 
+        auto curOp = CurOp::get(txn);
+
         // Get summary information about the plan.
         PlanSummaryStats stats;
         Explain::getSummaryStats(*executor.getValue(), &stats);
         if (collection) {
             collection->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
         }
-        CurOp::get(txn)->debug().setPlanSummaryMetrics(stats);
+        curOp->debug().setPlanSummaryMetrics(stats);
+
+        if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+            BSONObjBuilder execStatsBob;
+            Explain::getWinningPlanStats(executor.getValue().get(), &execStatsBob);
+            curOp->debug().execStats.set(execStatsBob.obj());
+        }
 
         verify(start == bb.buf());
 

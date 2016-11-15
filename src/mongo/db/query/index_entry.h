@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
 #include <string>
 
 #include "mongo/db/index/multikey_paths.h"
@@ -51,6 +50,7 @@ struct IndexEntry {
     IndexEntry(const BSONObj& kp,
                const std::string& accessMethod,
                bool mk,
+               const MultikeyPaths& mkp,
                bool sp,
                bool unq,
                const std::string& n,
@@ -58,6 +58,7 @@ struct IndexEntry {
                const BSONObj& io)
         : keyPattern(kp),
           multikey(mk),
+          multikeyPaths(mkp),
           sparse(sp),
           unique(unq),
           name(n),
@@ -106,7 +107,11 @@ struct IndexEntry {
 
     bool multikey;
 
-    boost::optional<MultikeyPaths> multikeyPaths;
+    // If non-empty, 'multikeyPaths' is a vector with size equal to the number of elements in the
+    // index key pattern. Each element in the vector is an ordered set of positions (starting at 0)
+    // into the corresponding indexed field that represent what prefixes of the indexed field cause
+    // the index to be multikey.
+    MultikeyPaths multikeyPaths;
 
     bool sparse;
 
@@ -125,7 +130,7 @@ struct IndexEntry {
 
     // Null if this index orders strings according to the simple binary compare. If non-null,
     // represents the collator used to generate index keys for indexed strings.
-    CollatorInterface* collator = nullptr;
+    const CollatorInterface* collator = nullptr;
 };
 
 }  // namespace mongo

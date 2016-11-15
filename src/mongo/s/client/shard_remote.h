@@ -36,8 +36,6 @@
 
 namespace mongo {
 
-using ShardId = std::string;
-
 /*
  * Maintains the targeting and command execution logic for a single shard. Performs polling of
  * the shard (if replica set).
@@ -61,7 +59,7 @@ public:
         return _originalConnString;
     }
 
-    std::shared_ptr<RemoteCommandTargeter> getTargeter() override {
+    std::shared_ptr<RemoteCommandTargeter> getTargeter() const override {
         return _targeter;
     }
 
@@ -70,19 +68,29 @@ public:
 
     std::string toString() const override;
 
+    bool isRetriableError(ErrorCodes::Error code, RetryPolicy options) final;
+
 private:
+    /**
+     * Returns the metadata that should be used when running commands against this shard with
+     * the given read preference.
+     *
+     * NOTE: This method returns a reference to a constant defined in shard_remote.cpp.  Be careful
+     * to never change it to return a reference to a temporary.
+     */
+    const BSONObj& _getMetadataForCommand(const ReadPreferenceSetting& readPref);
+
     StatusWith<CommandResponse> _runCommand(OperationContext* txn,
                                             const ReadPreferenceSetting& readPref,
                                             const std::string& dbname,
-                                            const BSONObj& cmdObj,
-                                            const BSONObj& metadata) override;
+                                            const BSONObj& cmdObj) final;
 
     StatusWith<QueryResponse> _exhaustiveFindOnConfig(OperationContext* txn,
                                                       const ReadPreferenceSetting& readPref,
                                                       const NamespaceString& nss,
                                                       const BSONObj& query,
                                                       const BSONObj& sort,
-                                                      boost::optional<long long> limit) override;
+                                                      boost::optional<long long> limit) final;
 
     /**
      * Connection string for the shard at the creation time.

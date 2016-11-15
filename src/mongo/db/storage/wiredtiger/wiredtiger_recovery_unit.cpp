@@ -30,10 +30,12 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
-#include "mongo/base/checked_cast.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/condition_variable.h"
@@ -160,11 +162,6 @@ bool WiredTigerRecoveryUnit::waitUntilDurable() {
 void WiredTigerRecoveryUnit::registerChange(Change* change) {
     invariant(_inUnitOfWork);
     _changes.push_back(change);
-}
-
-WiredTigerRecoveryUnit* WiredTigerRecoveryUnit::get(OperationContext* txn) {
-    invariant(txn);
-    return checked_cast<WiredTigerRecoveryUnit*>(txn->recoveryUnit());
 }
 
 void WiredTigerRecoveryUnit::assertInActiveTxn() const {

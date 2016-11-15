@@ -164,6 +164,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
 
     MongoRunner.logicalOptions = {
         runId: true,
+        env: true,
         pathOpts: true,
         remember: true,
         noRemember: true,
@@ -303,6 +304,17 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                 return true;
             };
 
+            var addOptionsToFullArgs = function(k, v) {
+                if (v === undefined || v === null)
+                    return;
+
+                fullArgs.push("--" + k);
+
+                if (v != "") {
+                    fullArgs.push("" + v);
+                }
+            };
+
             for (var k in o) {
                 // Make sure our logical option should be added to the array of options
                 if (!o.hasOwnProperty(k) || k in MongoRunner.logicalOptions ||
@@ -319,12 +331,14 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                             temp += "v";
                         fullArgs.push(temp);
                     }
+                } else if (k === "setParameter" && isObject(o[k])) {
+                    // If the value associated with the setParameter option is an object, we want
+                    // to add all key-value pairs in that object as separate --setParameters.
+                    Object.keys(o[k]).forEach(function(paramKey) {
+                        addOptionsToFullArgs(k, "" + paramKey + "=" + o[k][paramKey]);
+                    });
                 } else {
-                    if (o[k] == undefined || o[k] == null)
-                        continue;
-                    fullArgs.push("--" + k);
-                    if (o[k] != "")
-                        fullArgs.push("" + o[k]);
+                    addOptionsToFullArgs(k, o[k]);
                 }
             }
         } else {
@@ -612,6 +626,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
     MongoRunner.runMongod = function(opts) {
 
         opts = opts || {};
+        var env = undefined;
         var useHostName = true;
         var runId = null;
         var waitForConnect = true;
@@ -628,6 +643,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
             } else {
                 useHostName = true;  // Default to true
             }
+            env = opts.env;
             runId = opts.runId;
             waitForConnect = opts.waitForConnect;
 
@@ -641,11 +657,10 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
             opts = MongoRunner.arrOptions("mongod", opts);
         }
 
-        var mongod = MongoRunner.startWithArgs(opts, waitForConnect);
-        if (!waitForConnect)
-            mongod = {};
-        if (!mongod)
+        var mongod = MongoRunner._startWithArgs(opts, env, waitForConnect);
+        if (!mongod) {
             return null;
+        }
 
         mongod.commandLine = MongoRunner.arrToOpts(opts);
         mongod.name = (useHostName ? getHostName() : "localhost") + ":" + mongod.commandLine.port;
@@ -662,6 +677,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
     MongoRunner.runMongos = function(opts) {
         opts = opts || {};
 
+        var env = undefined;
         var useHostName = false;
         var runId = null;
         var waitForConnect = true;
@@ -674,15 +690,15 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
             useHostName = opts.useHostName || opts.useHostname;
             runId = opts.runId;
             waitForConnect = opts.waitForConnect;
+            env = opts.env;
 
             opts = MongoRunner.arrOptions("mongos", opts);
         }
 
-        var mongos = MongoRunner.startWithArgs(opts, waitForConnect);
-        if (!waitForConnect)
-            mongos = {};
-        if (!mongos)
+        var mongos = MongoRunner._startWithArgs(opts, env, waitForConnect);
+        if (!mongos) {
             return null;
+        }
 
         mongos.commandLine = MongoRunner.arrToOpts(opts);
         mongos.name = (useHostName ? getHostName() : "localhost") + ":" + mongos.commandLine.port;
@@ -933,33 +949,46 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
     }
 
     /**
-     * Start a mongo process with a particular argument array.  If we aren't waiting for connect,
-     * return null.
+     * Start a mongo process with a particular argument array.
+     * If we aren't waiting for connect, return {pid: <pid>}.
+     * If we are not waiting for connect:
+     *     returns connection to process on success;
+     *     otherwise returns null if we fail to connect.
      */
-    MongoRunner.startWithArgs = function(argArray, waitForConnect) {
+    MongoRunner._startWithArgs = function(argArray, env, waitForConnect) {
         // TODO: Make there only be one codepath for starting mongo processes
 
         argArray = appendSetParameterArgs(argArray);
         var port = _parsePort.apply(null, argArray);
-        var pid = _startMongoProgram.apply(null, argArray);
+        var pid = -1;
+        if (env === undefined) {
+            pid = _startMongoProgram.apply(null, argArray);
+        } else {
+            pid = _startMongoProgram({args: argArray, env: env});
+        }
+
+        if (!waitForConnect) {
+            return {
+                pid: pid,
+            };
+        }
 
         var conn = null;
-        if (waitForConnect) {
-            assert.soon(function() {
-                try {
-                    conn = new Mongo("127.0.0.1:" + port);
-                    return true;
-                } catch (e) {
-                    if (!checkProgram(pid)) {
-                        print("Could not start mongo program at " + port + ", process ended");
+        assert.soon(function() {
+            try {
+                conn = new Mongo("127.0.0.1:" + port);
+                conn.pid = pid;
+                return true;
+            } catch (e) {
+                if (!checkProgram(pid)) {
+                    print("Could not start mongo program at " + port + ", process ended");
 
-                        // Break out
-                        return true;
-                    }
+                    // Break out
+                    return true;
                 }
-                return false;
-            }, "unable to connect to mongo program on port " + port, 600 * 1000);
-        }
+            }
+            return false;
+        }, "unable to connect to mongo program on port " + port, 600 * 1000);
 
         return conn;
     };

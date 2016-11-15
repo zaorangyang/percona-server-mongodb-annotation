@@ -1,6 +1,4 @@
 // Confirms that profiled findAndModify execution contains all expected metrics with proper values.
-// TODO SERVER-23259: Add planSummary.
-// TODO SERVER-23264: Add execStats.
 
 (function() {
     "use strict";
@@ -37,6 +35,8 @@
     assert.eq(profileObj.nModified, 1, tojson(profileObj));
     assert.eq(profileObj.keysInserted, 1, tojson(profileObj));
     assert.eq(profileObj.keysDeleted, 1, tojson(profileObj));
+    assert.eq(profileObj.planSummary, "COLLSCAN", tojson(profileObj));
+    assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("numYield"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("responseLength"), tojson(profileObj));
 
@@ -59,6 +59,8 @@
     assert.eq(profileObj.docsExamined, 3, tojson(profileObj));
     assert.eq(profileObj.ndeleted, 1, tojson(profileObj));
     assert.eq(profileObj.keysDeleted, 1, tojson(profileObj));
+    assert.eq(profileObj.planSummary, "COLLSCAN", tojson(profileObj));
+    assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
 
     //
     // Update with {upsert: true} as findAndModify.
@@ -100,6 +102,7 @@
     assert.eq(profileObj.docsExamined, 1, tojson(profileObj));
     assert.eq(profileObj.nMatched, 1, tojson(profileObj));
     assert.eq(profileObj.nModified, 1, tojson(profileObj));
+    assert.eq(profileObj.planSummary, "IDHACK", tojson(profileObj));
 
     //
     // Update as findAndModify with projection.

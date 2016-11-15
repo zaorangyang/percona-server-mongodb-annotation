@@ -30,7 +30,6 @@
 
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
 
-
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/storage/kv/kv_catalog.h"
@@ -38,6 +37,7 @@
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
 
@@ -49,6 +49,8 @@ class MyOperationContext : public OperationContextNoop {
 public:
     MyOperationContext(KVEngine* engine) : OperationContextNoop(engine->newRecoveryUnit()) {}
 };
+
+const std::unique_ptr<ClockSource> clock = stdx::make_unique<ClockSourceMock>();
 }
 
 TEST(KVEngineTestHarness, SimpleRS1) {

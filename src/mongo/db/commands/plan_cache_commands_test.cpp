@@ -39,6 +39,7 @@
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/query_test_service_context.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -125,9 +126,14 @@ TEST(PlanCacheCommandsTest, planCacheListQueryShapesEmpty) {
 }
 
 TEST(PlanCacheCommandsTest, planCacheListQueryShapesOneKey) {
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
     // Create a canonical query
+    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+    lpq->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        nss, fromjson("{a: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -151,16 +157,20 @@ TEST(PlanCacheCommandsTest, planCacheListQueryShapesOneKey) {
  */
 
 TEST(PlanCacheCommandsTest, planCacheClearAllShapes) {
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
     // Create a canonical query
+    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+    lpq->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        nss, fromjson("{a: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     // Plan cache with one entry
     PlanCache planCache;
     QuerySolution qs;
-    OperationContextNoop txn;
 
     qs.cacheData.reset(createSolutionCacheData());
     std::vector<QuerySolution*> solns;
@@ -169,7 +179,7 @@ TEST(PlanCacheCommandsTest, planCacheClearAllShapes) {
     ASSERT_EQUALS(getShapes(planCache).size(), 1U);
 
     // Clear cache and confirm number of keys afterwards.
-    ASSERT_OK(PlanCacheClear::clear(&txn, &planCache, nss.ns(), BSONObj()));
+    ASSERT_OK(PlanCacheClear::clear(txn.get(), &planCache, nss.ns(), BSONObj()));
     ASSERT_EQUALS(getShapes(planCache).size(), 0U);
 }
 
@@ -268,13 +278,20 @@ TEST(PlanCacheCommandsTest, planCacheClearUnknownKey) {
 }
 
 TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
     // Create 2 canonical queries.
+    auto lpqA = stdx::make_unique<LiteParsedQuery>(nss);
+    lpqA->setFilter(fromjson("{a: 1}"));
     auto statusWithCQA = CanonicalQuery::canonicalize(
-        nss, fromjson("{a: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(lpqA), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQA.getStatus());
+    auto lpqB = stdx::make_unique<LiteParsedQuery>(nss);
+    lpqB->setFilter(fromjson("{b: 1}"));
     unique_ptr<CanonicalQuery> cqA = std::move(statusWithCQA.getValue());
     auto statusWithCQB = CanonicalQuery::canonicalize(
-        nss, fromjson("{b: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(lpqB), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQB.getStatus());
     unique_ptr<CanonicalQuery> cqB = std::move(statusWithCQB.getValue());
 
@@ -299,10 +316,9 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
 
     // Drop {b: 1} from cache. Make sure {a: 1} is still in cache afterwards.
     BSONObjBuilder bob;
-    OperationContextNoop txn;
 
-    ASSERT_OK(
-        PlanCacheClear::clear(&txn, &planCache, nss.ns(), BSON("query" << cqB->getQueryObj())));
+    ASSERT_OK(PlanCacheClear::clear(
+        txn.get(), &planCache, nss.ns(), BSON("query" << cqB->getQueryObj())));
     vector<BSONObj> shapesAfter = getShapes(planCache);
     ASSERT_EQUALS(shapesAfter.size(), 1U);
     ASSERT_EQUALS(shapesAfter[0], shapeA);
@@ -392,9 +408,14 @@ TEST(PlanCacheCommandsTest, planCacheListPlansUnknownKey) {
 }
 
 TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionTrue) {
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
     // Create a canonical query
+    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+    lpq->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        nss, fromjson("{a: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -412,9 +433,14 @@ TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionTrue) {
 }
 
 TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionFalse) {
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
     // Create a canonical query
+    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+    lpq->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        nss, fromjson("{a: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 

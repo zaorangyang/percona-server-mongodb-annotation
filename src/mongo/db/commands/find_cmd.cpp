@@ -147,7 +147,7 @@ public:
 
         ExtensionsCallbackReal extensionsCallback(txn, &nss);
         auto statusWithCQ =
-            CanonicalQuery::canonicalize(lpqStatus.getValue().release(), extensionsCallback);
+            CanonicalQuery::canonicalize(txn, std::move(lpqStatus.getValue()), extensionsCallback);
         if (!statusWithCQ.isOK()) {
             return statusWithCQ.getStatus();
         }
@@ -232,7 +232,7 @@ public:
 
         // Finish the parsing step by using the LiteParsedQuery to create a CanonicalQuery.
         ExtensionsCallbackReal extensionsCallback(txn, &nss);
-        auto statusWithCQ = CanonicalQuery::canonicalize(lpq.release(), extensionsCallback);
+        auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
         if (!statusWithCQ.isOK()) {
             return appendCommandStatus(result, statusWithCQ.getStatus());
         }
@@ -241,9 +241,6 @@ public:
         // Acquire locks.
         AutoGetCollectionForRead ctx(txn, nss);
         Collection* collection = ctx.getCollection();
-
-        const int dbProfilingLevel =
-            ctx.getDb() ? ctx.getDb()->getProfilingLevel() : serverGlobalParams.defaultProfile;
 
         // Get the execution plan for the query.
         auto statusWithPlanExecutor =
@@ -254,12 +251,17 @@ public:
 
         std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
+        {
+            stdx::lock_guard<Client>(*txn->getClient());
+            CurOp::get(txn)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+        }
+
         if (!collection) {
             // No collection. Just fill out curop indicating that there were zero results and
             // there is no ClientCursor id, and then return.
             const long long numResults = 0;
             const CursorId cursorId = 0;
-            endQueryOp(txn, collection, *exec, dbProfilingLevel, numResults, cursorId);
+            endQueryOp(txn, collection, *exec, numResults, cursorId);
             appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
             return true;
         }
@@ -333,9 +335,9 @@ public:
             cursor->setPos(numResults);
 
             // Fill out curop based on the results.
-            endQueryOp(txn, collection, *cursorExec, dbProfilingLevel, numResults, cursorId);
+            endQueryOp(txn, collection, *cursorExec, numResults, cursorId);
         } else {
-            endQueryOp(txn, collection, *exec, dbProfilingLevel, numResults, cursorId);
+            endQueryOp(txn, collection, *exec, numResults, cursorId);
         }
 
         // Generate the response object to send to the client.

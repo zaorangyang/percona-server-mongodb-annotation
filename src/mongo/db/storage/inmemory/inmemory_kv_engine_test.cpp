@@ -23,7 +23,9 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
+#include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
 
@@ -36,7 +38,7 @@ public:
     InMemoryKVHarnessHelper() : _dbpath("inmem-kv-harness") {
         const bool readOnly = false;
         _engine.reset(new WiredTigerKVEngine(
-            kInMemoryEngineName, _dbpath.path(),
+            kInMemoryEngineName, _dbpath.path(), _cs.get(),
             "in_memory=true,"
             "log=(enabled=false),"
             "file_manager=(close_idle_time=0),"
@@ -59,6 +61,7 @@ public:
     }
 
 private:
+    const std::unique_ptr<ClockSource> _cs = stdx::make_unique<ClockSourceMock>();
     unittest::TempDir _dbpath;
     std::unique_ptr<WiredTigerKVEngine> _engine;
 };

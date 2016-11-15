@@ -43,9 +43,11 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/s/start_chunk_clone_request.h"
+#include "mongo/db/service_context.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/chunk.h"
@@ -54,6 +56,7 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
@@ -395,7 +398,9 @@ Status MigrationChunkClonerSourceLegacy::nextCloneBatch(OperationContext* txn,
                                                         BSONArrayBuilder* arrBuilder) {
     dassert(txn->lockState()->isCollectionLockedForMode(_args.getNss().ns(), MODE_IS));
 
-    ElapsedTracker tracker(internalQueryExecYieldIterations, internalQueryExecYieldPeriodMS);
+    ElapsedTracker tracker(txn->getServiceContext()->getFastClockSource(),
+                           internalQueryExecYieldIterations,
+                           Milliseconds(internalQueryExecYieldPeriodMS));
 
     stdx::lock_guard<stdx::mutex> sl(_mutex);
 

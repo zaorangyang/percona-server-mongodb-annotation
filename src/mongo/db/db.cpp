@@ -1,32 +1,30 @@
-// @file db.cpp : Defines main() for the mongod program.
-
 /**
-*    Copyright (C) 2008-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2016 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
@@ -89,8 +87,10 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/restapi.h"
+#include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
+#include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
@@ -107,6 +107,7 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/s/sharding_initialization.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
@@ -116,6 +117,7 @@
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/net/message_server.h"
@@ -509,6 +511,7 @@ static void _initAndListen(int listenPort) {
     Client::initThread("initandlisten");
 
     _initWireSpec();
+    getGlobalServiceContext()->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
     getGlobalServiceContext()->setOpObserver(stdx::make_unique<OpObserver>());
 
     const repl::ReplSettings& replSettings = repl::getGlobalReplicationCoordinator()->getSettings();
@@ -736,14 +739,25 @@ static void _initAndListen(int listenPort) {
 
     if (!storageGlobalParams.readOnly) {
         startFTDC();
-
-        if (!repl::getGlobalReplicationCoordinator()->isReplEnabled()) {
+        if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
             uassertStatusOK(ShardingState::get(startupOpCtx.get())
                                 ->initializeFromShardIdentity(startupOpCtx.get()));
-            uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
+
+            // Note: For replica sets, ShardingStateRecovery happens on transition to primary.
+            if (!repl::getGlobalReplicationCoordinator()->isReplEnabled()) {
+                uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
+            }
+        } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+            uassertStatusOK(initializeGlobalShardingStateForMongod(ConnectionString::forLocal()));
         }
 
         logStartup(startupOpCtx.get());
+    } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        auto parseStatus = ShardIdentityType::fromBSON(serverGlobalParams.overrideShardIdentity);
+        uassertStatusOK(parseStatus);
+        uassertStatusOK(ShardingState::get(startupOpCtx.get())
+                            ->initializeFromShardIdentity(parseStatus.getValue(), Date_t::max()));
+        uassertStatusOK(reloadShardRegistryUntilSuccess(startupOpCtx.get()));
     }
 
     // MessageServer::run will return when exit code closes its socket and we don't need the

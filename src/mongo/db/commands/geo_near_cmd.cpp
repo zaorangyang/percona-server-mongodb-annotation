@@ -207,9 +207,12 @@ public:
         BSONObj projObj = BSON("$pt" << BSON("$meta" << LiteParsedQuery::metaGeoNearPoint) << "$dis"
                                      << BSON("$meta" << LiteParsedQuery::metaGeoNearDistance));
 
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(rewritten);
+        lpq->setProj(projObj);
+        lpq->setLimit(numWanted);
         const ExtensionsCallbackReal extensionsCallback(txn, &nss);
-        auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, rewritten, BSONObj(), projObj, 0, numWanted, BSONObj(), extensionsCallback);
+        auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
         if (!statusWithCQ.isOK()) {
             errmsg = "Can't parse filter / create query";
             return false;
@@ -228,6 +231,12 @@ public:
         }
 
         unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+
+        auto curOp = CurOp::get(txn);
+        {
+            stdx::lock_guard<Client>(*txn->getClient());
+            curOp->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+        }
 
         double totalDistance = 0;
         BSONObjBuilder resultBuilder(result.subarrayStart("results"));
@@ -309,12 +318,18 @@ public:
             stats.append("avgDistance", totalDistance / results);
         }
         stats.append("maxDistance", farthestDist);
-        stats.append("time", CurOp::get(txn)->elapsedMillis());
+        stats.append("time", curOp->elapsedMillis());
         stats.done();
 
         collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
 
-        CurOp::get(txn)->debug().setPlanSummaryMetrics(summary);
+        curOp->debug().setPlanSummaryMetrics(summary);
+
+        if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+            BSONObjBuilder execStatsBob;
+            Explain::getWinningPlanStats(exec.get(), &execStatsBob);
+            curOp->debug().execStats.set(execStatsBob.obj());
+        }
 
         return true;
     }

@@ -294,35 +294,43 @@ DiskLoc RecordStoreV1Base::getPrevRecordInExtent(OperationContext* txn, const Di
     return result;
 }
 
-StatusWith<RecordId> RecordStoreV1Base::insertRecord(OperationContext* txn,
-                                                     const DocWriter* doc,
-                                                     bool enforceQuota) {
-    int docSize = doc->documentSize();
-    if (docSize < 4) {
-        return StatusWith<RecordId>(ErrorCodes::InvalidLength, "record has to be >= 4 bytes");
+Status RecordStoreV1Base::insertRecordsWithDocWriter(OperationContext* txn,
+                                                     const DocWriter* const* docs,
+                                                     size_t nDocs,
+                                                     RecordId* idsOut) {
+    for (size_t i = 0; i < nDocs; i++) {
+        int docSize = docs[i]->documentSize();
+        if (docSize < 4) {
+            return Status(ErrorCodes::InvalidLength, "record has to be >= 4 bytes");
+        }
+        const int lenWHdr = docSize + MmapV1RecordHeader::HeaderSize;
+        if (lenWHdr > MaxAllowedAllocation) {
+            return Status(ErrorCodes::InvalidLength, "record has to be <= 16.5MB");
+        }
+        const int lenToAlloc = (docs[i]->addPadding() && shouldPadInserts())
+            ? quantizeAllocationSpace(lenWHdr)
+            : lenWHdr;
+
+        StatusWith<DiskLoc> loc = allocRecord(txn, lenToAlloc, /*enforceQuota=*/false);
+        if (!loc.isOK())
+            return loc.getStatus();
+
+        MmapV1RecordHeader* r = recordFor(loc.getValue());
+        fassert(17319, r->lengthWithHeaders() >= lenWHdr);
+
+        r = reinterpret_cast<MmapV1RecordHeader*>(txn->recoveryUnit()->writingPtr(r, lenWHdr));
+        docs[i]->writeDocument(r->data());
+
+        _addRecordToRecListInExtent(txn, r, loc.getValue());
+
+        _details->incrementStats(txn, r->netLength(), 1);
+
+        if (idsOut)
+            idsOut[i] = loc.getValue().toRecordId();
     }
-    const int lenWHdr = docSize + MmapV1RecordHeader::HeaderSize;
-    if (lenWHdr > MaxAllowedAllocation) {
-        return StatusWith<RecordId>(ErrorCodes::InvalidLength, "record has to be <= 16.5MB");
-    }
-    const int lenToAlloc =
-        (doc->addPadding() && shouldPadInserts()) ? quantizeAllocationSpace(lenWHdr) : lenWHdr;
 
-    StatusWith<DiskLoc> loc = allocRecord(txn, lenToAlloc, enforceQuota);
-    if (!loc.isOK())
-        return StatusWith<RecordId>(loc.getStatus());
 
-    MmapV1RecordHeader* r = recordFor(loc.getValue());
-    fassert(17319, r->lengthWithHeaders() >= lenWHdr);
-
-    r = reinterpret_cast<MmapV1RecordHeader*>(txn->recoveryUnit()->writingPtr(r, lenWHdr));
-    doc->writeDocument(r->data());
-
-    _addRecordToRecListInExtent(txn, r, loc.getValue());
-
-    _details->incrementStats(txn, r->netLength(), 1);
-
-    return StatusWith<RecordId>(loc.getValue().toRecordId());
+    return Status::OK();
 }
 
 
@@ -539,8 +547,7 @@ void RecordStoreV1Base::increaseStorageSize(OperationContext* txn, int size, boo
 }
 
 Status RecordStoreV1Base::validate(OperationContext* txn,
-                                   bool full,
-                                   bool scanData,
+                                   ValidateCmdLevel level,
                                    ValidateAdaptor* adaptor,
                                    ValidateResults* results,
                                    BSONObjBuilder* output) {
@@ -591,7 +598,7 @@ Status RecordStoreV1Base::validate(OperationContext* txn,
             extentDiskLoc = _details->firstExtent(txn);
             while (!extentDiskLoc.isNull()) {
                 Extent* thisExtent = _getExtent(txn, extentDiskLoc);
-                if (full) {
+                if (level == kValidateFull) {
                     extentData << thisExtent->dump();
                 }
                 if (!thisExtent->validates(extentDiskLoc, &results->errors)) {
@@ -628,7 +635,7 @@ Status RecordStoreV1Base::validate(OperationContext* txn,
         }
         output->append("extentCount", extentCount);
 
-        if (full)
+        if (level == kValidateFull)
             output->appendArray("extents", extentData.arr());
     }
 
@@ -678,7 +685,7 @@ Status RecordStoreV1Base::validate(OperationContext* txn,
         // 4444444444444444444444444
 
         set<DiskLoc> recs;
-        if (scanData) {
+        if (level == kValidateRecordStore || level == kValidateFull) {
             int n = 0;
             int nInvalid = 0;
             long long nQuantizedSize = 0;
@@ -711,9 +718,10 @@ Status RecordStoreV1Base::validate(OperationContext* txn,
                     ++nQuantizedSize;
                 }
 
-                if (full) {
+                if (level == kValidateFull) {
                     size_t dataSize = 0;
-                    const Status status = adaptor->validate(r->toRecordData(), &dataSize);
+                    const Status status =
+                        adaptor->validate(record->id, r->toRecordData(), &dataSize);
                     if (!status.isOK()) {
                         results->valid = false;
                         if (nInvalid == 0)  // only log once;
@@ -736,7 +744,7 @@ Status RecordStoreV1Base::validate(OperationContext* txn,
             }
             output->append("objectsFound", n);
 
-            if (full) {
+            if (level == kValidateFull) {
                 output->append("invalidObjects", nInvalid);
             }
 
@@ -744,7 +752,7 @@ Status RecordStoreV1Base::validate(OperationContext* txn,
             output->appendNumber("bytesWithHeaders", len);
             output->appendNumber("bytesWithoutHeaders", nlen);
 
-            if (full) {
+            if (level == kValidateFull) {
                 output->appendNumber("bytesBson", bsonLen);
             }
         }  // end scanData
@@ -799,7 +807,7 @@ Status RecordStoreV1Base::validate(OperationContext* txn,
         }
         output->appendNumber("deletedCount", ndel);
         output->appendNumber("deletedSize", delSize);
-        if (full) {
+        if (level == kValidateFull) {
             output->append("delBucketSizes", delBucketSizes.arr());
         }
 

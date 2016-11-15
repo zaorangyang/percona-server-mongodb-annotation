@@ -43,6 +43,7 @@
 #include "mongo/db/commands/rename_collection.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
@@ -55,9 +56,9 @@
 #include "mongo/s/commands/run_on_all_shards_cmd.h"
 #include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/config.h"
-#include "mongo/s/db_util.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/store_possible_cursor.h"
+#include "mongo/s/sharding_raii.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/log.h"
@@ -150,21 +151,21 @@ public:
 
 protected:
     bool passthrough(OperationContext* txn,
-                     shared_ptr<DBConfig> conf,
+                     DBConfig* conf,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         return _passthrough(txn, conf->name(), conf, cmdObj, 0, result);
     }
 
     bool adminPassthrough(OperationContext* txn,
-                          shared_ptr<DBConfig> conf,
+                          DBConfig* conf,
                           const BSONObj& cmdObj,
                           BSONObjBuilder& result) {
         return _passthrough(txn, "admin", conf, cmdObj, 0, result);
     }
 
     bool passthrough(OperationContext* txn,
-                     shared_ptr<DBConfig> conf,
+                     DBConfig* conf,
                      const BSONObj& cmdObj,
                      int options,
                      BSONObjBuilder& result) {
@@ -174,7 +175,7 @@ protected:
 private:
     bool _passthrough(OperationContext* txn,
                       const string& db,
-                      shared_ptr<DBConfig> conf,
+                      DBConfig* conf,
                       const BSONObj& cmdObj,
                       int options,
                       BSONObjBuilder& result) {
@@ -236,7 +237,7 @@ public:
 
         auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
         if (!conf->isSharded(fullns)) {
-            return passthrough(txn, conf, cmdObj, options, result);
+            return passthrough(txn, conf.get(), cmdObj, options, result);
         }
 
         return appendCommandStatus(
@@ -434,10 +435,10 @@ public:
 
         auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
         if (!conf->isShardingEnabled() || !conf->isSharded(nss.ns())) {
-            return passthrough(txn, conf, cmdObj, output);
+            return passthrough(txn, conf.get(), cmdObj, output);
         }
 
-        ChunkManagerPtr cm = conf->getChunkManager(txn, nss.ns());
+        shared_ptr<ChunkManager> cm = conf->getChunkManager(txn, nss.ns());
         massert(40051, "chunk manager should not be null", cm);
 
         vector<Strategy::CommandResult> results;
@@ -510,14 +511,13 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        auto status = dbutil::implicitCreateDb(txn, dbName);
-        if (!status.isOK()) {
-            return appendCommandStatus(result, status.getStatus());
+        auto dbStatus = ScopedShardDatabase::getOrCreate(txn, dbName);
+        if (!dbStatus.isOK()) {
+            return appendCommandStatus(result, dbStatus.getStatus());
         }
 
-        shared_ptr<DBConfig> conf = status.getValue();
-
-        return passthrough(txn, conf, cmdObj, result);
+        auto scopedDb = std::move(dbStatus.getValue());
+        return passthrough(txn, scopedDb.db(), cmdObj, result);
     }
 
 } createCmd;
@@ -559,7 +559,7 @@ public:
         const auto& db = status.getValue();
         if (!db->isShardingEnabled() || !db->isSharded(fullns.ns())) {
             log() << "\tdrop going to do passthrough";
-            return passthrough(txn, db, cmdObj, result);
+            return passthrough(txn, db.get(), cmdObj, result);
         }
 
         uassertStatusOK(grid.catalogManager(txn)->dropCollection(txn, fullns));
@@ -609,7 +609,7 @@ public:
                 "Source and destination collections must be on same shard",
                 shardFrom == shardTo);
 
-        return adminPassthrough(txn, confFrom, cmdObj, result);
+        return adminPassthrough(txn, confFrom.get(), cmdObj, result);
     }
 } renameCollectionCmd;
 
@@ -640,14 +640,14 @@ public:
                 "invalid todb argument",
                 NamespaceString::validDBName(todb, NamespaceString::DollarInDbNameBehavior::Allow));
 
-        auto confTo = uassertStatusOK(dbutil::implicitCreateDb(txn, todb));
+        auto scopedToDb = uassertStatusOK(ScopedShardDatabase::getOrCreate(txn, todb));
         uassert(ErrorCodes::IllegalOperation,
                 "cannot copy to a sharded database",
-                !confTo->isShardingEnabled());
+                !scopedToDb.db()->isShardingEnabled());
 
         const string fromhost = cmdObj.getStringField("fromhost");
         if (!fromhost.empty()) {
-            return adminPassthrough(txn, confTo, cmdObj, result);
+            return adminPassthrough(txn, scopedToDb.db(), cmdObj, result);
         } else {
             const string fromdb = cmdObj.getStringField("fromdb");
             uassert(13399, "need a fromdb argument", !fromdb.empty());
@@ -671,7 +671,7 @@ public:
             }
             BSONObj fixed = b.obj();
 
-            return adminPassthrough(txn, confTo, fixed, result);
+            return adminPassthrough(txn, scopedToDb.db(), fixed, result);
         }
     }
 } clusterCopyDBCmd;
@@ -704,12 +704,12 @@ public:
             result.appendBool("sharded", false);
             result.append("primary", conf->getPrimaryId());
 
-            return passthrough(txn, conf, cmdObj, result);
+            return passthrough(txn, conf.get(), cmdObj, result);
         }
 
         result.appendBool("sharded", true);
 
-        ChunkManagerPtr cm = conf->getChunkManager(txn, fullns);
+        shared_ptr<ChunkManager> cm = conf->getChunkManager(txn, fullns);
         massert(12594, "how could chunk manager be null!", cm);
 
         BSONObjBuilder shardStats;
@@ -869,10 +869,10 @@ public:
 
         auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, nsDBName));
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
-            return passthrough(txn, conf, cmdObj, result);
+            return passthrough(txn, conf.get(), cmdObj, result);
         }
 
-        ChunkManagerPtr cm = conf->getChunkManager(txn, fullns);
+        shared_ptr<ChunkManager> cm = conf->getChunkManager(txn, fullns);
         massert(13407, "how could chunk manager be null!", cm);
 
         BSONObj min = cmdObj.getObjectField("min");
@@ -1111,10 +1111,10 @@ public:
 
         shared_ptr<DBConfig> conf = status.getValue();
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
-            return passthrough(txn, conf, cmdObj, options, result);
+            return passthrough(txn, conf.get(), cmdObj, options, result);
         }
 
-        ChunkManagerPtr cm = conf->getChunkManager(txn, fullns);
+        shared_ptr<ChunkManager> cm = conf->getChunkManager(txn, fullns);
         massert(10420, "how could chunk manager be null!", cm);
 
         BSONObj query = getQuery(cmdObj);
@@ -1237,10 +1237,10 @@ public:
 
         auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
-            return passthrough(txn, conf, cmdObj, result);
+            return passthrough(txn, conf.get(), cmdObj, result);
         }
 
-        ChunkManagerPtr cm = conf->getChunkManager(txn, fullns);
+        shared_ptr<ChunkManager> cm = conf->getChunkManager(txn, fullns);
         massert(13091, "how could chunk manager be null!", cm);
         if (cm->getShardKeyPattern().toBSON() == BSON("files_id" << 1)) {
             BSONObj finder = BSON("files_id" << cmdObj.firstElement());
@@ -1368,10 +1368,10 @@ public:
 
         auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
-            return passthrough(txn, conf, cmdObj, options, result);
+            return passthrough(txn, conf.get(), cmdObj, options, result);
         }
 
-        ChunkManagerPtr cm = conf->getChunkManager(txn, fullns);
+        shared_ptr<ChunkManager> cm = conf->getChunkManager(txn, fullns);
         massert(13500, "how could chunk manager be null!", cm);
 
         BSONObj query = getQuery(cmdObj);
@@ -1546,7 +1546,7 @@ public:
         }
 
         shared_ptr<DBConfig> conf = status.getValue();
-        return passthrough(txn, conf, cmdObj, result);
+        return passthrough(txn, conf.get(), cmdObj, result);
     }
 } evalCmd;
 

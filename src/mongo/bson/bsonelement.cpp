@@ -381,7 +381,7 @@ std::vector<BSONElement> BSONElement::Array() const {
 */
 int BSONElement::woCompare(const BSONElement& e,
                            bool considerFieldName,
-                           StringData::ComparatorInterface* comparator) const {
+                           const StringData::ComparatorInterface* comparator) const {
     int lt = (int)canonicalType();
     int rt = (int)e.canonicalType();
     int x = lt - rt;
@@ -394,6 +394,31 @@ int BSONElement::woCompare(const BSONElement& e,
     }
     x = compareElementValues(*this, e, comparator);
     return x;
+}
+
+bool BSONElement::binaryEqual(const BSONElement& rhs) const {
+    const int elemSize = size();
+
+    if (elemSize != rhs.size()) {
+        return false;
+    }
+
+    return (elemSize == 0) || (memcmp(data, rhs.rawdata(), elemSize) == 0);
+}
+
+bool BSONElement::binaryEqualValues(const BSONElement& rhs) const {
+    // The binaryEqual method above implicitly compares the type, but we need to do so explicitly
+    // here. It doesn't make sense to consider to BSONElement objects as binaryEqual if they have
+    // the same bit pattern but different types (consider an integer and a double).
+    if (type() != rhs.type())
+        return false;
+
+    const int valueSize = valuesize();
+    if (valueSize != rhs.valuesize()) {
+        return false;
+    }
+
+    return (valueSize == 0) || (memcmp(value(), rhs.value(), valueSize) == 0);
 }
 
 BSONObj BSONElement::embeddedObjectUserCheck() const {
@@ -853,7 +878,7 @@ std::string escape(const std::string& s, bool escape_slash) {
  */
 int compareElementValues(const BSONElement& l,
                          const BSONElement& r,
-                         StringData::ComparatorInterface* comparator) {
+                         const StringData::ComparatorInterface* comparator) {
     int f;
 
     switch (l.type()) {

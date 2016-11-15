@@ -37,7 +37,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/util/time_support.h"
-#include "mongo/util/net/listen.h"  // for Listener::getElapsedTimeMillis()
 
 namespace mongo {
 
@@ -569,7 +568,6 @@ struct UpdateStats : public SpecificStats {
         : nMatched(0),
           nModified(0),
           isDocReplacement(false),
-          fastmod(false),
           fastmodinsert(false),
           inserted(false),
           nInvalidateSkips(0) {}
@@ -586,11 +584,6 @@ struct UpdateStats : public SpecificStats {
 
     // True iff this is a doc-replacement style update, as opposed to a $mod update.
     bool isDocReplacement;
-
-    // A 'fastmod' update is an in-place update that does not have to modify
-    // any indices. It's "fast" because the only work needed is changing the bits
-    // inside the document.
-    bool fastmod;
 
     // A 'fastmodinsert' is an insert resulting from an {upsert: true} update
     // which is a doc-replacement style update. It's "fast" because we don't need

@@ -51,8 +51,11 @@
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
+
+const std::unique_ptr<ClockSource> clockSource = stdx::make_unique<ClockSourceMock>();
 
 // How we access the external setParameter testing bool.
 extern std::atomic<bool> internalQueryForceIntersectionPlans;  // NOLINT
@@ -104,6 +107,10 @@ public:
         _client.remove(nss.ns(), obj);
     }
 
+    OperationContext* txn() {
+        return &_txn;
+    }
+
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _txn = *_txnPtr;
@@ -149,8 +156,9 @@ public:
 
         // Make the filter.
         BSONObj filterObj = BSON("foo" << 7);
-        StatusWithMatchExpression statusWithMatcher =
-            MatchExpressionParser::parse(filterObj, ExtensionsCallbackDisallowExtensions());
+        const CollatorInterface* collator = nullptr;
+        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
+            filterObj, ExtensionsCallbackDisallowExtensions(), collator);
         verify(statusWithMatcher.isOK());
         unique_ptr<MatchExpression> filter = std::move(statusWithMatcher.getValue());
         // Make the stage.
@@ -158,8 +166,10 @@ public:
             new CollectionScan(&_txn, csparams, sharedWs.get(), filter.get()));
 
         // Hand the plans off to the MPS.
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("foo" << 7));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, BSON("foo" << 7), ExtensionsCallbackDisallowExtensions());
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         verify(NULL != cq.get());
@@ -170,7 +180,7 @@ public:
         mps->addPlan(createQuerySolution(), secondRoot.release(), sharedWs.get());
 
         // Plan 0 aka the first plan aka the index scan should be the best.
-        PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL, clockSource.get());
         mps->pickBestPlan(&yieldPolicy);
         ASSERT(mps->bestPlanChosen());
         ASSERT_EQUALS(0, mps->bestPlanIdx());
@@ -214,11 +224,11 @@ public:
         Collection* collection = ctx.getCollection();
 
         // Query for both 'a' and 'b' and sort on 'b'.
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss,
-                                                         BSON("a" << 1 << "b" << 1),  // query
-                                                         BSON("b" << 1),              // sort
-                                                         BSONObj(),                   // proj
-                                                         ExtensionsCallbackDisallowExtensions());
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("a" << 1 << "b" << 1));
+        lpq->setSort(BSON("b" << 1));
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -254,7 +264,7 @@ public:
         }
 
         // This sets a backup plan.
-        PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL, clockSource.get());
         mps->pickBestPlan(&yieldPolicy);
         ASSERT(mps->bestPlanChosen());
         ASSERT(mps->hasBackupPlan());
@@ -320,8 +330,10 @@ public:
 
         AutoGetCollectionForRead ctx(&_txn, nss.ns());
 
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("x" << 1));
         auto cq = uassertStatusOK(CanonicalQuery::canonicalize(
-            nss, BSON("x" << 1), ExtensionsCallbackDisallowExtensions()));
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions()));
         unique_ptr<MultiPlanStage> mps =
             make_unique<MultiPlanStage>(&_txn, ctx.getCollection(), cq.get());
 
@@ -394,9 +406,10 @@ public:
         Collection* coll = ctx.getCollection();
 
         // Create the executor (Matching all documents).
-        auto queryObj = BSON("foo" << BSON("$gte" << 0));
-        auto cq = uassertStatusOK(
-            CanonicalQuery::canonicalize(nss, queryObj, ExtensionsCallbackDisallowExtensions()));
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("foo" << BSON("$gte" << 0)));
+        auto cq = uassertStatusOK(CanonicalQuery::canonicalize(
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions()));
         auto exec =
             uassertStatusOK(getExecutor(&_txn, coll, std::move(cq), PlanExecutor::YIELD_MANUAL));
 

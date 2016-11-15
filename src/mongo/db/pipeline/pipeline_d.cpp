@@ -116,6 +116,18 @@ public:
         return collection->infoCache()->getIndexUsageStats();
     }
 
+    bool hasUniqueIdIndex(const NamespaceString& ns) const final {
+        AutoGetCollectionForRead ctx(_ctx->opCtx, ns.ns());
+        Collection* collection = ctx.getCollection();
+
+        if (!collection) {
+            // Collection doesn't exist; the correct return value is questionable.
+            return false;
+        }
+
+        return collection->getIndexCatalog()->findIdIndex(_ctx->opCtx);
+    }
+
 private:
     intrusive_ptr<ExpressionContext> _ctx;
     DBDirectClient _client;
@@ -196,8 +208,12 @@ StatusWith<std::unique_ptr<PlanExecutor>> attemptToGetExecutor(
     const size_t plannerOpts) {
     const ExtensionsCallbackReal extensionsCallback(pExpCtx->opCtx, &pExpCtx->ns);
 
-    auto cq = CanonicalQuery::canonicalize(
-        pExpCtx->ns, queryObj, sortObj, projectionObj, extensionsCallback);
+    auto lpq = stdx::make_unique<LiteParsedQuery>(pExpCtx->ns);
+    lpq->setFilter(queryObj);
+    lpq->setSort(sortObj);
+    lpq->setProj(projectionObj);
+
+    auto cq = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of

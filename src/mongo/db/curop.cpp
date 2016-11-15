@@ -524,7 +524,6 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
 
     OPDEBUG_TOSTRING_HELP(keysExamined);
     OPDEBUG_TOSTRING_HELP(docsExamined);
-    OPDEBUG_TOSTRING_HELP_BOOL(idhack);
     OPDEBUG_TOSTRING_HELP_BOOL(hasSortStage);
     OPDEBUG_TOSTRING_HELP_BOOL(fromMultiPlanner);
     OPDEBUG_TOSTRING_HELP_BOOL(replanned);
@@ -532,11 +531,9 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
     OPDEBUG_TOSTRING_HELP(nModified);
     OPDEBUG_TOSTRING_HELP(ninserted);
     OPDEBUG_TOSTRING_HELP(ndeleted);
-    OPDEBUG_TOSTRING_HELP_BOOL(fastmod);
     OPDEBUG_TOSTRING_HELP_BOOL(fastmodinsert);
     OPDEBUG_TOSTRING_HELP_BOOL(upsert);
     OPDEBUG_TOSTRING_HELP_BOOL(cursorExhausted);
-    OPDEBUG_TOSTRING_HELP(keyUpdates);
 
     if (nmoved > 0) {
         s << " nmoved:" << nmoved;
@@ -649,14 +646,11 @@ void OpDebug::append(const CurOp& curop,
         appendAsObjOrString("updateobj", updateobj, maxElementSize, &b);
     }
 
-    const bool moved = (nmoved >= 1);
-
     OPDEBUG_APPEND_NUMBER(cursorid);
     OPDEBUG_APPEND_BOOL(exhaust);
 
     OPDEBUG_APPEND_NUMBER(keysExamined);
     OPDEBUG_APPEND_NUMBER(docsExamined);
-    OPDEBUG_APPEND_BOOL(idhack);
     OPDEBUG_APPEND_BOOL(hasSortStage);
     OPDEBUG_APPEND_BOOL(fromMultiPlanner);
     OPDEBUG_APPEND_BOOL(replanned);
@@ -664,12 +658,9 @@ void OpDebug::append(const CurOp& curop,
     OPDEBUG_APPEND_NUMBER(nModified);
     OPDEBUG_APPEND_NUMBER(ninserted);
     OPDEBUG_APPEND_NUMBER(ndeleted);
-    OPDEBUG_APPEND_BOOL(fastmod);
     OPDEBUG_APPEND_BOOL(fastmodinsert);
     OPDEBUG_APPEND_BOOL(upsert);
     OPDEBUG_APPEND_BOOL(cursorExhausted);
-    OPDEBUG_APPEND_NUMBER(keyUpdates);
-    OPDEBUG_APPEND_BOOL(moved);
 
     if (nmoved > 0) {
         b.appendNumber("nmoved", nmoved);
@@ -707,13 +698,18 @@ void OpDebug::append(const CurOp& curop,
     b.append("rateLimit",
              executionTime >= serverGlobalParams.slowMS ? 1 : serverGlobalParams.rateLimit);
 
-    execStats.append(b, "execStats");
+    if (!curop.getPlanSummary().empty()) {
+        b.append("planSummary", curop.getPlanSummary());
+    }
+
+    if (execStats.have()) {
+        execStats.append(b, "execStats");
+    }
 }
 
 void OpDebug::setPlanSummaryMetrics(const PlanSummaryStats& planSummaryStats) {
     keysExamined = planSummaryStats.totalKeysExamined;
     docsExamined = planSummaryStats.totalDocsExamined;
-    idhack = planSummaryStats.isIdhack;
     hasSortStage = planSummaryStats.hasSortStage;
     fromMultiPlanner = planSummaryStats.fromMultiPlanner;
     replanned = planSummaryStats.replanned;

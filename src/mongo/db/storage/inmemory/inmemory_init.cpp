@@ -68,6 +68,7 @@ public:
         const bool readOnly = false;
         WiredTigerKVEngine* kv = new WiredTigerKVEngine(getCanonicalName().toString(),
                                                         params.dbpath,
+                                                        getGlobalServiceContext()->getFastClockSource(),
                                                         wiredTigerGlobalOptions.engineConfig,
                                                         cacheMB,
                                                         durable,

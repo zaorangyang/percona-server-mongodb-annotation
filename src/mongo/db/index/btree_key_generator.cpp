@@ -219,7 +219,7 @@ void BtreeKeyGeneratorV0::getKeysImpl(std::vector<const char*> fieldNames,
 BtreeKeyGeneratorV1::BtreeKeyGeneratorV1(std::vector<const char*> fieldNames,
                                          std::vector<BSONElement> fixed,
                                          bool isSparse,
-                                         CollatorInterface* collator)
+                                         const CollatorInterface* collator)
     : BtreeKeyGenerator(fieldNames, fixed, isSparse),
       _emptyPositionalInfo(fieldNames.size()),
       _collator(collator) {
@@ -312,6 +312,7 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
     }
 
     if (multikeyPaths) {
+        invariant(multikeyPaths->empty());
         multikeyPaths->resize(fieldNames.size());
     }
     getKeysImplWithArray(fieldNames, fixed, obj, keys, 0, _emptyPositionalInfo, multikeyPaths);

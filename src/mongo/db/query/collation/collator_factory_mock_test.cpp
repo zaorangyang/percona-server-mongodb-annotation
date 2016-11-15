@@ -28,34 +28,17 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/init.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/query/collation/collator_factory_mock.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
 
 using namespace mongo;
 
-// Stub to avoid including the server environment library.
-MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-    setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
-    return Status::OK();
-}
-
 TEST(CollatorFactoryMockTest, CollatorFactoryMockConstructsReverseStringCollator) {
     CollatorFactoryMock factory;
     auto collator = factory.makeFromBSON(BSONObj());
-    ASSERT_OK(collator.getStatus());
-    ASSERT_GT(collator.getValue()->compare("abc", "cba"), 0);
-}
-
-// TODO SERVER-22371: Remove this test. We will decorate with a CollatorFactoryICU instead.
-TEST(CollatorFactoryMockTest, ServiceContextDecoratedWithCollatorFactoryMock) {
-    auto factory = CollatorFactoryInterface::get(getGlobalServiceContext());
-    auto collator = factory->makeFromBSON(BSONObj());
     ASSERT_OK(collator.getStatus());
     ASSERT_GT(collator.getValue()->compare("abc", "cba"), 0);
 }

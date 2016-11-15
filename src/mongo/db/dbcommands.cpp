@@ -642,12 +642,12 @@ public:
         BSONObj sort = BSON("files_id" << 1 << "n" << 1);
 
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            auto statusWithCQ =
-                CanonicalQuery::canonicalize(NamespaceString(ns),
-                                             query,
-                                             sort,
-                                             BSONObj(),
-                                             ExtensionsCallbackDisallowExtensions());
+            auto lpq = stdx::make_unique<LiteParsedQuery>(NamespaceString(ns));
+            lpq->setFilter(query);
+            lpq->setSort(sort);
+
+            auto statusWithCQ = CanonicalQuery::canonicalize(
+                txn, std::move(lpq), ExtensionsCallbackDisallowExtensions());
             if (!statusWithCQ.isOK()) {
                 uasserted(17240, "Can't canonicalize query " + query.toString());
                 return 0;
@@ -1551,28 +1551,26 @@ bool Command::run(OperationContext* txn,
         return result;
     }
 
-    if (this->supportsWriteConcern(cmd)) {
+    bool result;
+    if (!this->supportsWriteConcern(cmd)) {
+        // TODO: remove queryOptions parameter from command's run method.
+        result = this->run(txn, db, cmd, 0, errmsg, inPlaceReplyBob);
+    } else {
+        // Change the write concern while running the command.
+        const auto oldWC = txn->getWriteConcern();
+        ON_BLOCK_EXIT([&] { txn->setWriteConcern(oldWC); });
         txn->setWriteConcern(wcResult.getValue());
-    }
 
-    // TODO: remove queryOptions parameter from command's run method.
-    bool result = this->run(txn, db, cmd, 0, errmsg, inPlaceReplyBob);
+        result = this->run(txn, db, cmd, 0, errmsg, inPlaceReplyBob);
 
-    if (this->supportsWriteConcern(cmd)) {
-        if (shouldLog(logger::LogSeverity::Debug(1))) {
-            BSONObj oldWC = wcResult.getValue().toBSON();
-            BSONObj newWC = txn->getWriteConcern().toBSON();
-            if (oldWC != newWC) {
-                LOG(1) << "Provided writeConcern was overridden from " << oldWC << " to " << newWC
-                       << " for command " << cmd;
-            }
-        }
+        // Nothing in run() should change the writeConcern.
+        dassert(txn->getWriteConcern().toBSON() == wcResult.getValue().toBSON());
 
         WriteConcernResult res;
         auto waitForWCStatus =
             waitForWriteConcern(txn,
                                 repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
-                                txn->getWriteConcern(),
+                                wcResult.getValue(),
                                 &res);
         appendCommandWCStatus(inPlaceReplyBob, waitForWCStatus, res);
 

@@ -40,17 +40,24 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/util/clock_source_mock.h"
 #include "mongo/unittest/temp_dir.h"
 
 namespace mongo {
 bool isMongos() {
     return false;
 }
+
+std::unique_ptr<ServiceContextNoop> makeTestServiceContext() {
+    auto service = stdx::make_unique<ServiceContextNoop>();
+    service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+    return service;
+}
 }
 
 // Stub to avoid including the server environment library.
 MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-    setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
+    setGlobalServiceContext(makeTestServiceContext());
     return Status::OK();
 }
 
@@ -77,6 +84,35 @@ BSONObj toBson(const intrusive_ptr<DocumentSource>& source) {
 
 namespace DocumentSourceClass {
 using mongo::DocumentSource;
+
+TEST(TruncateSort, SortTruncatesNormalField) {
+    BSONObj sortKey = BSON("a" << 1 << "b" << 1 << "c" << 1);
+    auto truncated = DocumentSource::truncateSortSet({sortKey}, {"b"});
+    ASSERT_EQUALS(truncated.size(), 1U);
+    ASSERT_EQUALS(truncated.count(BSON("a" << 1)), 1U);
+}
+
+TEST(TruncateSort, SortTruncatesOnSubfield) {
+    BSONObj sortKey = BSON("a" << 1 << "b.c" << 1 << "d" << 1);
+    auto truncated = DocumentSource::truncateSortSet({sortKey}, {"b"});
+    ASSERT_EQUALS(truncated.size(), 1U);
+    ASSERT_EQUALS(truncated.count(BSON("a" << 1)), 1U);
+}
+
+TEST(TruncateSort, SortDoesNotTruncateOnParent) {
+    BSONObj sortKey = BSON("a" << 1 << "b" << 1 << "d" << 1);
+    auto truncated = DocumentSource::truncateSortSet({sortKey}, {"b.c"});
+    ASSERT_EQUALS(truncated.size(), 1U);
+    ASSERT_EQUALS(truncated.count(BSON("a" << 1 << "b" << 1 << "d" << 1)), 1U);
+}
+
+TEST(TruncateSort, TruncateSortDedupsSortCorrectly) {
+    BSONObj sortKeyOne = BSON("a" << 1 << "b" << 1);
+    BSONObj sortKeyTwo = BSON("a" << 1);
+    auto truncated = DocumentSource::truncateSortSet({sortKeyOne, sortKeyTwo}, {"b"});
+    ASSERT_EQUALS(truncated.size(), 1U);
+    ASSERT_EQUALS(truncated.count(BSON("a" << 1)), 1U);
+}
 
 template <size_t ArrayLen>
 set<string> arrayToSet(const char*(&array)[ArrayLen]) {
@@ -157,7 +193,9 @@ public:
         }
     }
 };
-}
+
+
+}  // namespace DocumentSourceClass
 
 namespace Mock {
 using mongo::DocumentSourceMock;
@@ -165,8 +203,8 @@ using mongo::DocumentSourceMock;
 class Base {
 public:
     Base()
-        : _service(),
-          _client(_service.makeClient("DocumentSourceTest")),
+        : _service(makeTestServiceContext()),
+          _client(_service->makeClient("DocumentSourceTest")),
           _opCtx(_client->makeOperationContext()),
           _ctx(new ExpressionContext(_opCtx.get(), NamespaceString(ns))) {}
 
@@ -175,7 +213,7 @@ protected:
         return _ctx;
     }
 
-    ServiceContextNoop _service;
+    std::unique_ptr<ServiceContextNoop> _service;
     ServiceContext::UniqueClient _client;
     ServiceContext::UniqueOperationContext _opCtx;
 
@@ -354,35 +392,41 @@ namespace DocumentSourceLookup {
 
 TEST(QueryForInput, NonArrayValueUsesEqQuery) {
     Document input = DOC("local" << 1);
-    BSONObj query = DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign");
-    ASSERT_EQ(query, BSON("foreign" << BSON("$eq" << 1)));
+    BSONObj query =
+        DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign", BSONObj());
+    ASSERT_EQ(query, fromjson("{$and: [{foreign: {$eq: 1}}, {}]}"));
 }
 
 TEST(QueryForInput, RegexValueUsesEqQuery) {
     BSONRegEx regex("^a");
     Document input = DOC("local" << Value(regex));
-    BSONObj query = DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign");
-    ASSERT_EQ(query, BSON("foreign" << BSON("$eq" << regex)));
+    BSONObj query =
+        DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign", BSONObj());
+    ASSERT_EQ(query,
+              BSON("$and" << BSON_ARRAY(BSON("foreign" << BSON("$eq" << regex)) << BSONObj())));
 }
 
 TEST(QueryForInput, ArrayValueUsesInQuery) {
     vector<Value> inputArray = {Value(1), Value(2)};
     Document input = DOC("local" << Value(inputArray));
-    BSONObj query = DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign");
-    ASSERT_EQ(query, BSON("foreign" << BSON("$in" << BSON_ARRAY(1 << 2))));
+    BSONObj query =
+        DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign", BSONObj());
+    ASSERT_EQ(query, fromjson("{$and: [{foreign: {$in: [1, 2]}}, {}]}"));
 }
 
 TEST(QueryForInput, ArrayValueWithRegexUsesOrQuery) {
     BSONRegEx regex("^a");
     vector<Value> inputArray = {Value(1), Value(regex), Value(2)};
     Document input = DOC("local" << Value(inputArray));
-    BSONObj query = DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign");
+    BSONObj query =
+        DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign", BSONObj());
     ASSERT_EQ(query,
-              BSON("$or" << BSON_ARRAY(BSON("foreign" << BSON("$eq" << Value(1)))
-                                       << BSON("foreign" << BSON("$eq" << regex))
-                                       << BSON("foreign" << BSON("$eq" << Value(2))))));
+              BSON("$and" << BSON_ARRAY(
+                       BSON("$or" << BSON_ARRAY(BSON("foreign" << BSON("$eq" << Value(1)))
+                                                << BSON("foreign" << BSON("$eq" << regex))
+                                                << BSON("foreign" << BSON("$eq" << Value(2)))))
+                       << BSONObj())));
 }
-
 
 }  // namespace DocumentSourceLookUp
 
