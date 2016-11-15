@@ -54,15 +54,7 @@ public:
                                   const StorageEngineLockFile*) const {
         syncInMemoryAndWiredTigerOptions();
 
-        size_t cacheMB = static_cast<size_t>(inMemoryGlobalOptions.cacheSizeGB * 1024);
-        if (cacheMB == 0) {
-            // Since the user didn't provide a cache size, choose a reasonable default value.
-            // We want to reserve 1GB for the system and binaries, but it's not bad to
-            // leave a fair amount left over for pagecache since that's compressed storage.
-            ProcessInfo pi;
-            double memSizeMB = pi.getMemSizeMB();
-            cacheMB = static_cast<size_t>(std::max((memSizeMB - 1024) * 0.6, 256.0));
-        }
+        size_t cacheMB = WiredTigerUtil::getCacheSizeMB(wiredTigerGlobalOptions.cacheSizeGB);
         const bool durable = false;
         const bool ephemeral = true;
         const bool readOnly = false;
@@ -132,6 +124,8 @@ private:
         // Re-create WiredTiger options to fill it with default values
         wiredTigerGlobalOptions = WiredTigerGlobalOptions();
 
+        wiredTigerGlobalOptions.cacheSizeGB =
+            inMemoryGlobalOptions.cacheSizeGB;
         wiredTigerGlobalOptions.statisticsLogDelaySecs =
             inMemoryGlobalOptions.statisticsLogDelaySecs;
         // Set InMemory configuration as part of engineConfig string
