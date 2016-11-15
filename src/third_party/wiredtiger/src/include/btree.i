@@ -1073,6 +1073,7 @@ __wt_page_can_evict(WT_SESSION_IMPL *session,
 	WT_BTREE *btree;
 	WT_PAGE_MODIFY *mod;
 	WT_TXN_GLOBAL *txn_global;
+	bool modified;
 
 	if (inmem_splitp != NULL)
 		*inmem_splitp = false;
@@ -1109,6 +1110,8 @@ __wt_page_can_evict(WT_SESSION_IMPL *session,
 	    !__wt_txn_visible_all(session, mod->mod_split_txn))
 		return (false);
 
+	modified = __wt_page_is_modified(page);
+
 	/*
 	 * If the file is being checkpointed, we can't evict dirty pages:
 	 * if we write a page and free the previous version of the page, that
@@ -1116,8 +1119,7 @@ __wt_page_can_evict(WT_SESSION_IMPL *session,
 	 * been written in the checkpoint, leaving the checkpoint inconsistent.
 	 */
 	if (btree->checkpointing &&
-	    (__wt_page_is_modified(page) ||
-	    mod->rec_result == WT_PM_REC_MULTIBLOCK)) {
+	    (modified || mod->rec_result == WT_PM_REC_MULTIBLOCK)) {
 		WT_STAT_FAST_CONN_INCR(session, cache_eviction_checkpoint);
 		WT_STAT_FAST_DATA_INCR(session, cache_eviction_checkpoint);
 		return (false);
@@ -1132,6 +1134,14 @@ __wt_page_can_evict(WT_SESSION_IMPL *session,
 		if (WT_TXNID_LE(txn_global->oldest_id, mod->inmem_split_txn))
 			return (false);
 	}
+
+	/*
+	 * If the page is clean, check if it has an update that is too new to
+	 * evict.
+	 */
+	if (!modified && mod != NULL &&
+	    !__wt_txn_visible_all(session, mod->rec_max_txn))
+		return (false);
 
 	return (true);
 }
@@ -1219,6 +1229,7 @@ __wt_page_release(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	 */
 	if (page->read_gen != WT_READGEN_OLDEST ||
 	    LF_ISSET(WT_READ_NO_EVICT) ||
+	    F_ISSET(session, WT_SESSION_NO_CACHE_CHECK) ||
 	    F_ISSET(btree, WT_BTREE_NO_EVICTION) ||
 	    !__wt_page_can_evict(session, page, true, NULL))
 		return (__wt_hazard_clear(session, page));

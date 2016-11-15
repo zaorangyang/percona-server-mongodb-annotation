@@ -29,24 +29,6 @@ disable_cleanup: true
 ## Some variables for convenience:
 variables:
 
-- &packaging_variants
-  - enterprise-linux-64-amazon-ami
-  - enterprise-rhel-57-64-bit
-  - enterprise-rhel-62-64-bit
-  - enterprise-rhel-70-64-bit
-  - enterprise-suse11-64
-  - enterprise-ubuntu1204-64
-  - enterprise-ubuntu1404-64
-  - enterprise-debian71-64
-  - rhel55
-  - rhel62
-  - rhel70
-  - suse11
-  - ubuntu1204
-  - ubuntu1404
-  - amazon
-  - debian71
-
 - &debug_symbol_variants
   - enterprise-linux-64-amazon-ami
   - enterprise-rhel-57-64-bit
@@ -67,7 +49,8 @@ variables:
   - ubuntu1404
   - debian71
   - solaris-64-bit
-  - osx
+  - osx-107
+  - osx-107-ssl
 
 #######################################
 #            Functions                #
@@ -92,6 +75,27 @@ functions:
       remote_file: mongodb-mongo-v3.0/${build_variant}/${revision}/binaries/mongo-${build_id}.${ext|tgz}
       bucket: mciuploads
       local_file: src/mongo-binaries.tgz
+
+  "check binary version" : &check_binary_version
+    command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        mongo_binary=$(find mongodb*/bin -name mongo${exe})
+        # There should only be one mongo shell
+        if [ $(echo $mongo_binary | wc -w) -ne 1 ]; then
+          echo "There is more than 1 extracted mongo binary: $mongo_binary"
+          exit 1
+        fi
+        bin_ver=$(${python|python} -c "import yaml; print(yaml.safe_load(open('compile_expansions.yml'))['version']);" | tr -d '[ \r\n]')
+        # Due to SERVER-23810, we cannot use $mongo_binary --quiet --nodb --eval "version();"
+        mongo_ver=$($mongo_binary --version | cut -f2 -d ':' | tr -d '[ \r\n]')
+        # The versions must match
+        if [ "$bin_ver" != "$mongo_ver" ]; then
+          echo "The mongo version is $mongo_ver, expected version is $bin_ver"
+          exit 1
+        fi
 
   "setup credentials" :
     command: shell.exec
@@ -158,48 +162,39 @@ functions:
   "build new tools" :
     command: shell.exec
     params:
-      working_dir: src
+      working_dir: src/mongo-tools
       script: |
         set -o verbose
-
-        # create the target directory for the binaries
-        mkdir -p src/mongo-tools
-
-        # clone into a different path so the binaries and package directory
-        # names do not conflict
-        ${gitvars} git clone https://github.com/mongodb/mongo-tools.git src/mongo-tools-repo
-        cd src/mongo-tools-repo
+        set -o errexit
 
         # make sure newlines in the scripts are handled correctly by windows
         if [ "Windows_NT" = "$OS" ]; then
             set -o igncr
         fi;
 
-        git checkout v3.0
         . ./${set_tools_gopath|set_gopath.sh}
 
-        # In RHEL 5.5, /usr/bin/ld can't handle --build-id parameters, so
-        # use a wrapper if it's present on the system
-        #
-        if [ -d /opt/ldwrapper/bin ]
-        then
-          export PATH=/opt/ldwrapper/bin:$PATH
-        fi
+        sed -i.bak "s/built-without-version-string/$(git describe)/" common/options/options.go
+        sed -i.bak "s/built-without-git-spec/$(git rev-parse HEAD)/" common/options/options.go
 
         for i in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog; do
-             ${gorootvars} go build -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec $(git rev-parse HEAD) -X github.com/mongodb/mongo-tools/common/options.VersionStr $(git --git-dir ../../.git describe)" ${tooltags|} -o "../mongo-tools/$i${exe|}" $i/main/$i.go
-             echo $i;
+             ${gorootvars} go build ${tooltags|} -o "../src/mongo-tools/$i${exe|}" $i/main/$i.go
+             "../src/mongo-tools/$i${exe|}" --version
         done
-        exit 0
 
 pre:
   - command: shell.exec
     params:
-      silent: true
       script: |
         ${killall_mci|pkill -9 mongod; pkill -9 mongos; pkill -9 mongo; pkill -9 bsondump; pkill -9 mongoimport; pkill -9 mongoexport; pkill -9 mongodump; pkill -9 mongorestore; pkill -9 mongostat; pkill -9 mongofiles; pkill -9 mongooplog; pkill -9 mongotop; pkill -9 mongobridge; pkill -9 mongod-2.6; pkill -9 mongos-2.6; pkill -9 mongo-2.6; pkill -9 bsondump-2.6; pkill -9 mongoimport-2.6; pkill -9 mongoexport-2.6; pkill -9 mongodump-2.6; pkill -9 mongorestore-2.6; pkill -9 mongostat-2.6; pkill -9 mongofiles-2.6; pkill -9 mongooplog-2.6; pkill -9 mongotop-2.6; pkill -9 mongobridge-2.6; pkill -9 mongod-2.4; pkill -9 mongos-2.4; pkill -9 mongo-2.4; pkill -9 bsondump-2.4; pkill -9 mongoimport-2.4; pkill -9 mongoexport-2.4; pkill -9 mongodump-2.4; pkill -9 mongorestore-2.4; pkill -9 mongostat-2.4; pkill -9 mongofiles-2.4; pkill -9 mongooplog-2.4; pkill -9 mongotop-2.4; pkill -9 buildlogger.py; pkill -9 smoke.py; pkill -9 python; pkill -9 cl; pkill -9 lock_mgr_test; pkill -9 background_job_test; pkill -9 repl_coordinator_impl_heartbeat_test} >/dev/null 2>&1
-        rm -rf src /data/db/*
-        exit 0
+
+        # Set errexit after running the pkill commands because pkill will exit with code 1 if it
+        # does not match any processes. This can occur when there are no left-over processes from
+        # a previous task.
+        set -o errexit
+        set -o verbose
+
+        rm -rf src /data/db/* ~/.aws
 
 post:
   - command: attach.results
@@ -211,6 +206,10 @@ post:
       script: |
         ${killall_mci|pkill -9 mongod; pkill -9 mongos; pkill -9 mongo; pkill -9 bsondump; pkill -9 mongoimport; pkill -9 mongoexport; pkill -9 mongodump; pkill -9 mongorestore; pkill -9 mongostat; pkill -9 mongofiles; pkill -9 mongooplog; pkill -9 mongotop; pkill -9 mongobridge; pkill -9 mongod-2.6; pkill -9 mongos-2.6; pkill -9 mongo-2.6; pkill -9 bsondump-2.6; pkill -9 mongoimport-2.6; pkill -9 mongoexport-2.6; pkill -9 mongodump-2.6; pkill -9 mongorestore-2.6; pkill -9 mongostat-2.6; pkill -9 mongofiles-2.6; pkill -9 mongooplog-2.6; pkill -9 mongotop-2.6; pkill -9 mongobridge-2.6; pkill -9 mongod-2.4; pkill -9 mongos-2.4; pkill -9 mongo-2.4; pkill -9 bsondump-2.4; pkill -9 mongoimport-2.4; pkill -9 mongoexport-2.4; pkill -9 mongodump-2.4; pkill -9 mongorestore-2.4; pkill -9 mongostat-2.4; pkill -9 mongofiles-2.4; pkill -9 mongooplog-2.4; pkill -9 mongotop-2.4; pkill -9 buildlogger.py; pkill -9 smoke.py; pkill -9 python; pkill -9 cl; pkill -9 lock_mgr_test; pkill -9 background_job_test; pkill -9 repl_coordinator_impl_heartbeat_test} >/dev/null 2>&1
         exit 0
+  - command: shell.exec
+    params:
+      script: |
+        rm -rf src /data/db/* ~/.aws
 
 timeout:
   - command: shell.exec
@@ -234,6 +233,7 @@ tasks:
         directory: src
         revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
           enterprise: ${enterprise_rev}
+          mongo-tools: ${mongo-tools_rev}
           rocksdb: ${rocksdb_rev}
     - command: git.apply_patch
       params:
@@ -260,7 +260,7 @@ tasks:
           rm -rf ${install_directory|/data/mongo-install-directory}
           ${scons|scons} ${compile_flags|} --use-new-tools all dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|}
 
-          ${gitvars} git describe | ${python|python} buildscripts/generate_compile_expansions.py | tee compile_expansions.yml
+          git describe | ${python|python} buildscripts/generate_compile_expansions.py | tee compile_expansions.yml
 
           ${asan_symbolizer} ${enable_lsan} ${python|python} buildscripts/smoke.py --with-cleanbb --mode files --from-file build/unittests.txt --dont-start-mongod  --report-file report.json core
 
@@ -303,6 +303,7 @@ tasks:
           - "./**.pdb"
           - "./**.msi"
           - "./etc/*san.suppressions"
+          - "./etc/repo_config.yaml"
           - "repo/**"
         exclude_files:
           - "*_test.pdb"
@@ -332,7 +333,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: src/distsrc.${ext|tgz}
-        remote_file: mongodb-mongo-master/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
+        remote_file: mongodb-mongo-v3.0/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
@@ -350,6 +351,7 @@ tasks:
         directory: src
         revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
           enterprise: ${enterprise_rev}
+          mongo-tools: ${mongo-tools_rev}
           rocksdb: ${rocksdb_rev}
     - command: git.apply_patch
       params:
@@ -372,6 +374,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -396,6 +399,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -420,6 +424,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -444,6 +449,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -468,6 +474,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -492,6 +499,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -516,6 +524,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -540,6 +549,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -564,6 +574,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -588,6 +599,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -612,6 +624,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -636,6 +649,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -660,6 +674,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -684,6 +699,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -708,6 +724,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -732,6 +749,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -756,6 +774,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -780,6 +799,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -804,6 +824,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -828,6 +849,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -852,6 +874,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -876,6 +899,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -900,6 +924,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -924,6 +949,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -948,6 +974,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -972,6 +999,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -994,6 +1022,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1018,6 +1047,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1042,6 +1072,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1058,7 +1089,7 @@ tasks:
 
           cp mongodb*/bin/* .
           rm -rf /data/install /data/multiversion
-          ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion "Linux/x86_64" "1.8" "2.0" "2.2" "2.4" "2.6"
+          ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion "base" "Linux/x86_64" "1.8" "2.0" "2.2" "2.4" "2.6"
           PATH=$PATH:/data/multiversion ${asan_symbolizer} ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} multiVersion
 
 - name: noPassthrough
@@ -1068,6 +1099,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1092,6 +1124,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1116,6 +1149,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1140,6 +1174,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1164,6 +1199,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1188,6 +1224,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1212,6 +1249,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1237,6 +1275,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1262,6 +1301,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1286,6 +1326,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1310,6 +1351,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1334,6 +1376,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1358,6 +1401,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1382,6 +1426,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1406,6 +1451,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1430,6 +1476,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1454,6 +1501,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1478,6 +1526,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1502,6 +1551,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1526,6 +1576,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1550,6 +1601,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1574,6 +1626,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1598,6 +1651,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1622,6 +1676,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1646,6 +1701,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1670,6 +1726,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1694,6 +1751,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1720,6 +1778,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1746,6 +1805,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1770,6 +1830,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1794,6 +1855,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1818,6 +1880,7 @@ tasks:
     - func: "fetch artifacts"
     - func: "fetch binaries"
     - func: "extract binaries"
+    - func: "check binary version"
     - func: "setup credentials"
     - func: "get buildnumber"
     - command: shell.exec
@@ -1847,7 +1910,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: mongodb-mongo-master/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
+        remote_file: mongodb-mongo-v3.0/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
         bucket: mciuploads
         local_file: src/distsrc.${ext|tgz}
         build_variants: [ linux-64, windows-64-2k8 ]
@@ -1861,13 +1924,36 @@ tasks:
         silent: true
         script: |
           set -o errexit
+
+          mkdir -p ~/.aws
+
+          cat <<EOF > ~/.aws/config
+          [default]
+          region = us-east-1
+          EOF
+
+          cat <<EOF > ~/.aws/credentials
+          [default]
+          aws_access_key_id = ${repo_aws_key}
+          aws_secret_access_key = ${repo_aws_secret}
+          EOF
+
+          cat <<EOF > notary_env.sh
+          export NOTARY_TOKEN=${signing_auth_token_30}
+          export NOTARY_TOKEN_DEB_LEGACY=${signing_auth_token_deb_legacy}
+          EOF
+
           echo "${signing_auth_token_30}" > signing_auth_token
+
     - command: shell.exec
       params:
         working_dir: src
         script: |
+          . ./notary_env.sh
+
           set -o errexit
           set -o verbose
+
           mv mongo-binaries.tgz mongodb-binaries.${ext|tgz}
           mv mongo-debugsymbols.tgz debugsymbols-*.${ext|tgz} || true
           cp mongodb-*.${ext|tgz} mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}
@@ -1877,22 +1963,12 @@ tasks:
 
           notary-client.py --key-name "server-3.0" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
-          if [ "${has_packages|}" = "true" ] ; then
-            for rpm in $(find repo/ -name \*.rpm) ; do
-              pushd $(dirname $rpm)
-              # Use --package-file-suffix "" to overwrite existing RPM's instead of saving new "-signed.rpm" RPM files
-              #
-              notary-client.py --key-name "server-3.0" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --archive-file-ext gpg --outputs sig --package-file-suffix "" $(basename $rpm)
-              popd
-            done
-            for release_file in $(find repo/ -name Release) ; do
-              pushd $(dirname $release_file)
-              notary-client.py --key-name "server-3.0" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --outputs sig Release
-              popd
-            done
+          if [ "${has_packages|}" = "true" ]; then
+             CURATOR_RELEASE="fab90fac3cb45c0ef411e647b3d621cbe053fe19"
+             curl -L -O http://boxes.10gen.com/build/curator/curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
+             tar -zxvf curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
+             ./curator repo --config ./etc/repo_config.yaml --distro ${packager_distro} --edition ${repo_edition} --version ${version} --arch "x86_64" --packages repo
           fi
-          tar zcvf repo-${push_arch}.tgz repo || true
-          rm signing_auth_token
 
     # Put the binaries tarball/zipfile
     - command: s3.put
@@ -2116,29 +2192,11 @@ tasks:
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.md5
 
-    # Put the tarred up Package repo
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        build_variants: *packaging_variants
-        local_file: src/repo-${push_arch}.tgz
-        bucket: build-push-testing
-        permissions: public-read
-        content_type: ${content_type|application/x-gzip}
-        remote_file: ${push_path}-STAGE/${push_name}/repo-${push_arch}-${task_id}.tgz
-
     - command: s3Copy.copy
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         s3_copy_files:
-            #Package repo tarballs
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/repo-${push_arch}-${task_id}.tgz', 'bucket': 'build-push-testing'},
-               'destination': {'path': 'packages/repo-${push_arch}-${suffix}.tgz', 'bucket': '${push_bucket}'},
-                build_variants: *packaging_variants
-                 }
-
             #Binaries
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
@@ -2250,6 +2308,11 @@ modules:
   prefix: src/mongo/db/modules
   branch: v3.0
 
+- name: mongo-tools
+  repo: git@github.com:mongodb/mongo-tools.git
+  prefix: .
+  branch: v3.0
+
 - name: bdb
   repo: git@github.com:10gen/bdb-module.git
   prefix: src/mongo/db/modules
@@ -2267,12 +2330,12 @@ buildvariants:
 
 - name: linux-64
   display_name: Linux 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - rhel55-test
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -2282,7 +2345,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel55-build
   - name: lint
   - name: aggregation
   - name: aggregation_WT
@@ -2309,7 +2372,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
@@ -2338,17 +2400,15 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: push
-    distros:
-    - rhel55-test
 
 - name: linux-64-debug
   display_name: Linux 64-bit DEBUG
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - rhel55-test
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux-debug
@@ -2358,7 +2418,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel55-build
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
@@ -2409,12 +2469,12 @@ buildvariants:
 
 - name: linux-64-duroff
   display_name: Linux 64-bit DUR OFF
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - rhel55-test
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux-duroff
@@ -2424,7 +2484,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel55-build
   - name: aggregation
   - name: aggregation_auth
   - name: auth
@@ -2458,17 +2518,18 @@ buildvariants:
 - name: linux-64-lsm
   stepback: false
   display_name: Linux 64-bit LSM
+  modules:
+  - mongo-tools
   run_on:
   - rhel55-test
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --cc=/opt/mongodbtoolchain/bin/gcc --cxx=/opt/mongodbtoolchain/bin/g++ --release --variant-dir="linux2/release"
     test_flags: --continue-on-failure --wiredTigerCollectionConfig=type=lsm --wiredTigerIndexConfig=type=lsm
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel55-build
   - name: aggregation_WT
   - name: auth_WT
   - name: dbtest_WT
@@ -2493,7 +2554,8 @@ buildvariants:
 
 - name: ubuntu1204
   display_name: SSL Ubuntu 1204 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - ubuntu1204-test
   expansions:
@@ -2507,6 +2569,7 @@ buildvariants:
     has_packages: true
     packager_script: packager.py
     packager_distro: ubuntu1204
+    repo_edition: org
   tasks:
   - name: compile
     distros:
@@ -2566,12 +2629,11 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: push
-    distros:
-    - rhel55-test
 
 - name: ubuntu1404
   display_name: SSL Ubuntu 1404 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - ubuntu1404-test
   expansions:
@@ -2585,6 +2647,7 @@ buildvariants:
     has_packages: true
     packager_script: packager.py
     packager_distro: ubuntu1404
+    repo_edition: org
   tasks:
   - name: compile
     distros:
@@ -2644,13 +2707,12 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: push
-    distros:
-    - rhel55-test
 
 - name: enterprise-linux-64-amazon-ami
   display_name: Enterprise Linux 64-bit Amazon AMI
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - linux-64-amzn-test
   expansions:
@@ -2664,6 +2726,7 @@ buildvariants:
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: amazon
+    repo_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -2693,12 +2756,11 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: push
-    distros:
-    - rhel55-test
 
 - name: amazon
   display_name: SSL Amazon 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - linux-64-amzn-test
   expansions:
@@ -2712,6 +2774,7 @@ buildvariants:
     has_packages: true
     packager_script: packager.py
     packager_distro: amazon
+    repo_edition: org
   tasks:
   - name: compile
     distros:
@@ -2771,17 +2834,15 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: push
-    distros:
-    - rhel55-test
 
 - name: linux-32
   display_name: Linux 32-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - rhel55-32
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: GOROOT=/opt/go32 PATH=/opt/go32/bin:$PATH
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH GOARCH=386 GOOS=linux
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -2791,7 +2852,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel55-build
   - name: aggregation
   - name: auth
   - name: dbtest
@@ -2807,17 +2868,15 @@ buildvariants:
   - name: sharding
   - name: tool
   - name: push
-    distros:
-    - rhel55-test
 
 - name: linux-32-debug
   display_name: Linux 32-bit DEBUG
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - rhel55-32
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: GOROOT=/opt/go32 PATH=/opt/go32/bin:$PATH
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH GOARCH=386 GOOS=linux
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux-debug
@@ -2827,7 +2886,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel55-build
   - name: aggregation
   - name: auth
   - name: dbtest
@@ -2849,7 +2908,8 @@ buildvariants:
 
 - name: windows-64
   display_name: Windows 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - windows-64-vs2013-test
   expansions:
@@ -2914,11 +2974,12 @@ buildvariants:
   - name: tool_WT
   - name: push
     distros:
-    - rhel55-test
+    - rhel70
 
 - name: windows-64-2k8
   display_name: Windows 64-bit 2008R2+
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - windows-64-vs2013-test
   expansions:
@@ -2979,11 +3040,12 @@ buildvariants:
   - name: tool_WT
   - name: push
     distros:
-    - rhel55-test
+    - rhel70
 
 - name: windows-64-2k8-debug
   display_name: Windows 64-bit 2008R2+ DEBUG
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - windows-64-vs2013-test
   expansions:
@@ -3042,6 +3104,7 @@ buildvariants:
   display_name: Enterprise Windows 64-bit
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - windows-64-vs2013-test
   expansions:
@@ -3074,11 +3137,12 @@ buildvariants:
   - name: sslSpecial
   - name: push
     distros:
-    - rhel55-test
+    - rhel70
 
 - name: windows-64-2k8-ssl
   display_name: SSL Windows 64-bit 2008R2+
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - windows-64-vs2013-test
   expansions:
@@ -3143,11 +3207,12 @@ buildvariants:
   - name: sslSpecial
   - name: push
     distros:
-    - rhel55-test
+    - rhel70
 
 - name: windows-32
   display_name: Windows 32-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - windows-32
   expansions:
@@ -3182,7 +3247,7 @@ buildvariants:
   - name: tool
   - name: push
     distros:
-    - rhel55-test
+    - rhel70
 
 ###########################################
 #             OSX buildvariants           #
@@ -3190,7 +3255,8 @@ buildvariants:
 
 - name: osx-107
   display_name: OS X 10.7
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - osx-1010
   expansions:
@@ -3249,11 +3315,12 @@ buildvariants:
   - name: tool_WT
   - name: push
     distros:
-    - rhel55-test
+    - rhel70
 
 - name: osx-107-ssl
   display_name: SSL OS X 10.7
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - osx-1010
   expansions:
@@ -3316,11 +3383,12 @@ buildvariants:
   - name: tool_WT
   - name: push
     distros:
-    - rhel55-test
+    - rhel70
 
 - name: osx-107-debug
   display_name: OS X 10.7 DEBUG
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - osx-1010
   expansions:
@@ -3363,12 +3431,12 @@ buildvariants:
   display_name: Enterprise RHEL 5.7 64-bit
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - rhel55-test
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
+    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl) -L/usr/lib64/sasl2" -tags 'sasl ssl'
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -3378,10 +3446,11 @@ buildvariants:
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: rhel57
+    repo_edition: enterprise
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel55-build
   - name: lint
   - name: audit
   - name: audit_WT
@@ -3395,13 +3464,12 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: push
-    distros:
-    - rhel55-test
 
 - name: enterprise-rhel-62-64-bit
   display_name: Enterprise RHEL 6.2 64-bit
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - rhel62-test
   expansions:
@@ -3416,6 +3484,7 @@ buildvariants:
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: rhel62
+    repo_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -3432,13 +3501,12 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: push
-    distros:
-    - rhel55-test
 
 - name: enterprise-rhel-70-64-bit
   display_name: Enterprise RHEL 7.0 64-bit
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - rhel70
   expansions:
@@ -3453,6 +3521,7 @@ buildvariants:
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: rhel70
+    repo_edition: enterprise
   tasks:
   - name: compile
   - name: audit
@@ -3467,18 +3536,16 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: push
-    distros:
-    - rhel55-test
 
 - name: rhel55
   display_name: SSL RHEL 5.5 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - rhel55-test
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
+    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl)" -tags 'ssl'
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -3488,10 +3555,11 @@ buildvariants:
     has_packages: true
     packager_script: packager.py
     packager_distro: rhel55
+    repo_edition: org
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel55-build
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
@@ -3516,7 +3584,6 @@ buildvariants:
   - name: jsCore_small_oplog_WT
   - name: mmap
   - name: mongosTest
-  - name: multiversion
   - name: noPassthrough
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
@@ -3547,12 +3614,11 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: push
-    distros:
-    - rhel55-test
 
 - name: rhel62
   display_name: SSL RHEL 6.2 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - rhel62-test
   expansions:
@@ -3567,6 +3633,7 @@ buildvariants:
     has_packages: true
     packager_script: packager.py
     packager_distro: rhel62
+    repo_edition: org
   tasks:
   - name: compile
     distros:
@@ -3626,12 +3693,11 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: push
-    distros:
-    - rhel55-test
 
 - name: rhel70
   display_name: SSL RHEL 7.0 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - rhel70
   expansions:
@@ -3646,6 +3712,7 @@ buildvariants:
     has_packages: true
     packager_script: packager.py
     packager_distro: rhel70
+    repo_edition: org
   tasks:
   - name: compile
     distros:
@@ -3705,8 +3772,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: push
-    distros:
-    - rhel55-test
 
 ###########################################
 #          Ubuntu buildvariants           #
@@ -3716,6 +3781,7 @@ buildvariants:
   display_name: Enterprise Ubuntu 1204 64-bit
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - ubuntu1204-test
   expansions:
@@ -3730,6 +3796,7 @@ buildvariants:
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: ubuntu1204
+    repo_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -3746,13 +3813,12 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: push
-    distros:
-    - rhel55-test
 
 - name: enterprise-ubuntu1404-64
   display_name: Enterprise Ubuntu 1404 64-bit
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - ubuntu1404-test
   expansions:
@@ -3767,6 +3833,7 @@ buildvariants:
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: ubuntu1404
+    repo_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -3783,8 +3850,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: push
-    distros:
-    - rhel55-test
 
 ###########################################
 #          SUSE buildvariants             #
@@ -3794,6 +3859,7 @@ buildvariants:
   display_name: Enterprise SUSE 11 64-bit
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - suse11-test
   expansions:
@@ -3808,6 +3874,7 @@ buildvariants:
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: suse11
+    repo_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -3824,12 +3891,11 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: push
-    distros:
-    - rhel55-test
 
 - name: suse11
   display_name: SSL SUSE 11 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - suse11-test
   expansions:
@@ -3844,6 +3910,7 @@ buildvariants:
     has_packages: true
     packager_script: packager.py
     packager_distro: suse11
+    repo_edition: org
   tasks:
   - name: compile
     distros:
@@ -3903,8 +3970,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: push
-    distros:
-    - rhel55-test
 
 
 ###########################################
@@ -3913,7 +3978,8 @@ buildvariants:
 
 - name: solaris-64-bit
   display_name: Solaris 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - solaris
   expansions:
@@ -3921,6 +3987,8 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: sunos5
     push_arch: x86_64
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
+    tooltags: -gccgoflags "-lsocket -lnsl"
     compile_flags: --cc=/opt/mongodbtoolchain/bin/gcc --cxx=/opt/mongodbtoolchain/bin/g++ --static-libstdc++ --64 -j$(kstat cpu | sort -u | grep -c "^module") --release OBJCOPY=/opt/mongodbtoolchain/bin/objcopy
     test_flags: --continue-on-failure
   tasks:
@@ -3950,7 +4018,7 @@ buildvariants:
   - name: tool
   - name: push
     distros:
-    - rhel55-test
+    - rhel70
 
 ###########################################
 #          Debian buildvariants           #
@@ -3960,6 +4028,7 @@ buildvariants:
   display_name: Enterprise Debian 7.1 64-bit
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - debian71-test
   expansions:
@@ -3974,6 +4043,7 @@ buildvariants:
     has_packages: true
     packager_script: packager-enterprise.py
     packager_distro: debian71
+    repo_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -3990,12 +4060,11 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: push
-    distros:
-    - rhel55-test
 
 - name: debian71
   display_name: SSL Debian 7.1 64-bit
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - debian71-test
   expansions:
@@ -4010,6 +4079,7 @@ buildvariants:
     has_packages: true
     packager_script: packager.py
     packager_distro: debian71
+    repo_edition: org
   tasks:
   - name: compile
     distros:
@@ -4069,8 +4139,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: push
-    distros:
-    - rhel55-test
 
 ###########################################
 #     Experimental buildvariants          #
@@ -4078,6 +4146,8 @@ buildvariants:
 
 - name: ubuntu1404-debug-asan
   display_name: z ASAN SSL Ubuntu 1404 64-bit DEBUG
+  modules:
+  - mongo-tools
   run_on:
   - ubuntu1404-build
   stepback: false
@@ -4144,78 +4214,3 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-
-- name: ubuntu1410-fast-clang
-  display_name: z Clang/libc++ Ubuntu 1410 64-bit SSL
-  run_on:
-  - ubuntu1410-test
-  stepback: false
-  expansions:
-    tooltags: "-tags 'ssl'"
-    compile_flags: --cc=/usr/bin/clang --cxx=/usr/bin/clang++ --libc++ --ssl -j$(grep -c ^processor /proc/cpuinfo) --variant-dir=build --distmod=ubuntu1410-clang
-    test_flags: --continue-on-failure
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: x86_64-ubuntu1410-clang
-  tasks:
-  - name: compile
-    distros:
-    - ubuntu1410-build
-  - name: aggregation
-  - name: aggregation_WT
-  - name: aggregation_auth
-  - name: auth
-  - name: auth_WT
-  - name: dbtest
-  - name: dbtest_WT
-  - name: disk
-  - name: durability
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth
-  - name: gle_auth_WT
-  - name: gle_auth_write_cmd
-  - name: gle_auth_write_cmd_WT
-  - name: jsCore
-  - name: jsCore_WT
-  - name: jsCore_auth
-  - name: jsCore_compatibility
-  - name: jsCore_compatibility_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: mmap
-  - name: mongosTest
-  - name: multiversion
-  - name: noPassthrough
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: parallel
-  - name: parallel_WT
-  - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_compatibility
-  - name: concurrency_compatibility_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
-  - name: sharding
-  - name: sharding_WT
-  - name: sharding_auth
-  - name: slow1
-  - name: slow1_WT
-  - name: slow2
-  - name: slow2_WT
-  - name: ssl
-  - name: sslSpecial
-  - name: tool
-  - name: tool_WT
-  - name: push
-    distros:
-    - rhel55-test

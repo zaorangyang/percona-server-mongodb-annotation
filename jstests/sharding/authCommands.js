@@ -49,6 +49,7 @@ st.rs1.getPrimary().getDB( 'admin' ).createUser({user: 'user',
 jsTestLog('Creating initial data');
 
 st.adminCommand( { enablesharding : "test" } );
+st.ensurePrimaryShard('test', 'test-rs0');
 st.adminCommand( { shardcollection : "test.foo" , key : { i : 1, j : 1 } } );
 
 // Stop the balancer, so no moveChunks will interfere with the splits we're testing
@@ -68,7 +69,8 @@ testDB.getLastError( 'majority' );
 assert.eq(1000, testDB.foo.count());
 
 // Wait for the balancer to start back up
-st.startBalancer()
+assert.writeOK(configDB.settings.update({_id: 'balancer'}, {$set: {_waitForDelete: true}}, true));
+st.startBalancer();
 
 // Make sure we've done at least some splitting, so the balancer will work
 assert.gt( configDB.chunks.find({ ns : 'test.foo' }).count(), 2 )
@@ -80,12 +82,7 @@ assert.soon( function() {
     return x < 2 && configDB.locks.findOne({ _id : 'test.foo' }).state == 0;
 }, "no balance happened", 5 * 60 * 1000 );
 
-assert.soon( function(){
-    print( "Waiting for migration cleanup to occur..." )
-    return testDB.foo.find().itcount() == testDB.foo.count();
-})
-
-var map = function() { emit (this.i, this.j) };
+var map = function() { emit (this.i, this.j); };
 var reduce = function( key, values ) {
     var jCount = 0;
     values.forEach( function(j) { jCount += j; } );
