@@ -47,7 +47,6 @@
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_explain.h"
 #include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
@@ -109,6 +108,7 @@ std::unique_ptr<LiteParsedQuery> transformQueryForShards(const LiteParsedQuery& 
                                           lpq.getSort(),
                                           lpq.getHint(),
                                           lpq.getReadConcern(),
+                                          lpq.getCollation(),
                                           boost::none,  // Don't forward skip.
                                           newLimit,
                                           lpq.getBatchSize(),
@@ -208,7 +208,7 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
     }
 
     auto ccc = ClusterClientCursorImpl::make(
-        shardRegistry->getExecutorPool()->getArbitraryExecutor(), std::move(params));
+        Grid::get(txn)->getExecutorPool()->getArbitraryExecutor(), std::move(params));
 
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
     int bytesBuffered = 0;

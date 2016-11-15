@@ -39,7 +39,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/s/commands/run_on_all_shards_cmd.h"
-#include "mongo/s/strategy.h"
+#include "mongo/s/commands/strategy.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -69,6 +69,10 @@ public:
             ResourcePattern::forClusterResource(), ActionType::inprog);
 
         return isAuthorized ? Status::OK() : Status(ErrorCodes::Unauthorized, "Unauthorized");
+    }
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
 
     void aggregateResults(const std::vector<ShardAndReply>& results, BSONObjBuilder& output) final {

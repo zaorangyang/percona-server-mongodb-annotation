@@ -38,7 +38,7 @@ namespace mongo {
 
 /**
  * This class represents the layout and content of the error that occurs while trying
- * to satisfy the write concern after executing the insert/update/delete runCommand.
+ * to satisfy the write concern after executing runCommand.
  */
 class WCErrorDetail {
     MONGO_DISALLOW_COPYING(WCErrorDetail);

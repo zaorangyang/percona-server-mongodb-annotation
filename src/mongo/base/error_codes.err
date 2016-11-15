@@ -154,8 +154,10 @@ error_code("OplogOutOfOrder", 152)
 error_code("ChunkTooBig", 153)
 error_code("InconsistentShardIdentity", 154)
 error_code("CannotApplyOplogWhilePrimary", 155)
+error_code("NeedsDocumentMove", 156)
 
 # Non-sequential error codes (for compatibility only)
+error_code("SocketException", 9001)
 error_code("RecvStaleConfig", 9996)
 error_code("NotMaster", 10107)
 error_code("CannotGrowDocumentInCappedNamespace", 10003)
@@ -183,3 +185,7 @@ error_class("Interruption", ["Interrupted",
 error_class("NotMasterError", ["NotMaster", "NotMasterNoSlaveOk"])
 error_class("StaleShardingError",
             ["RecvStaleConfig", "SendStaleConfig", "StaleShardVersion", "StaleEpoch"])
+error_class("WriteConcernError", ["WriteConcernFailed",
+                                  "WriteConcernLegacyOK",
+                                  "UnknownReplWriteConcern",
+                                  "CannotSatisfyWriteConcern"])

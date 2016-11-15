@@ -49,10 +49,12 @@
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/s/write_ops/wc_error_detail.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -80,6 +82,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return Pipeline::aggSupportsWriteConcern(cmd);
+    }
 
     virtual void help(std::stringstream& help) const {
         help << "Runs the sharded aggregation command";
@@ -199,7 +205,7 @@ public:
         if (!needSplit) {
             invariant(shardResults.size() == 1);
             invariant(shardResults[0].target.getServers().size() == 1);
-            auto executorPool = grid.shardRegistry()->getExecutorPool();
+            auto executorPool = grid.getExecutorPool();
             const BSONObj reply =
                 uassertStatusOK(storePossibleCursor(shardResults[0].target.getServers()[0],
                                                     shardResults[0].result,
@@ -224,6 +230,8 @@ public:
                 Value(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]);
         }
 
+        mergeCmd.setField("writeConcern", Value(cmdObj["writeConcern"]));
+
         // Not propagating readConcern to merger since it doesn't do local reads.
 
         string outputNsOrEmpty;
@@ -243,9 +251,13 @@ public:
             aggRunCommand(conn.get(), dbname, mergeCmd.freeze().toBson(), options);
         conn.done();
 
+        if (auto wcErrorElem = mergedResults["writeConcernError"]) {
+            appendWriteConcernErrorToCmdResponse(mergingShardId, wcErrorElem, result);
+        }
+
         // Copy output from merging (primary) shard to the output object from our command.
         // Also, propagates errmsg and code if ok == false.
-        result.appendElements(mergedResults);
+        result.appendElementsUnique(mergedResults);
 
         return mergedResults["ok"].trueValue();
     }
@@ -399,7 +411,7 @@ BSONObj PipelineCommand::aggRunCommand(DBClientBase* conn,
         throw RecvStaleConfigException("command failed because of stale config", result);
     }
 
-    auto executorPool = grid.shardRegistry()->getExecutorPool();
+    auto executorPool = grid.getExecutorPool();
     result = uassertStatusOK(storePossibleCursor(HostAndPort(cursor->originalHost()),
                                                  result,
                                                  executorPool->getArbitraryExecutor(),
@@ -417,7 +429,14 @@ bool PipelineCommand::aggPassthrough(OperationContext* txn,
     ShardConnection conn(shard->getConnString(), "");
     BSONObj result = aggRunCommand(conn.get(), conf->name(), cmd, queryOptions);
     conn.done();
-    out.appendElements(result);
+
+    // First append the properly constructed writeConcernError. It will then be skipped
+    // in appendElementsUnique.
+    if (auto wcErrorElem = result["writeConcernError"]) {
+        appendWriteConcernErrorToCmdResponse(shard->getId(), wcErrorElem, out);
+    }
+
+    out.appendElementsUnique(result);
     return result["ok"].trueValue();
 }
 

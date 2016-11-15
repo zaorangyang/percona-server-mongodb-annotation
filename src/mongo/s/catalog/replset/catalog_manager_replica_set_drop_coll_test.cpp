@@ -41,7 +41,7 @@
 #include "mongo/s/catalog/replset/catalog_manager_replica_set_test_fixture.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/chunk.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/write_ops/batched_update_request.h"
 #include "mongo/stdx/chrono.h"
@@ -92,7 +92,9 @@ public:
         onCommand([this, shard](const RemoteCommandRequest& request) {
             ASSERT_EQ(HostAndPort(shard.getHost()), request.target);
             ASSERT_EQ(_dropNS.db(), request.dbname);
-            ASSERT_EQ(BSON("drop" << _dropNS.coll()), request.cmdObj);
+            ASSERT_EQ(BSON("drop" << _dropNS.coll() << "writeConcern"
+                                  << BSON("w" << 0 << "wtimeout" << 0)),
+                      request.cmdObj);
 
             ASSERT_EQUALS(rpc::makeEmptyMetadata(), request.metadata);
 
@@ -213,7 +215,9 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
     onCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ(HostAndPort(shard1().getHost()), request.target);
         ASSERT_EQ(dropNS().db(), request.dbname);
-        ASSERT_EQ(BSON("drop" << dropNS().coll()), request.cmdObj);
+        ASSERT_EQ(
+            BSON("drop" << dropNS().coll() << "writeConcern" << BSON("w" << 0 << "wtimeout" << 0)),
+            request.cmdObj);
 
         ASSERT_EQUALS(rpc::makeEmptyMetadata(), request.metadata);
 
@@ -223,7 +227,9 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
     onCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ(HostAndPort(shard2().getHost()), request.target);
         ASSERT_EQ(dropNS().db(), request.dbname);
-        ASSERT_EQ(BSON("drop" << dropNS().coll()), request.cmdObj);
+        ASSERT_EQ(
+            BSON("drop" << dropNS().coll() << "writeConcern" << BSON("w" << 0 << "wtimeout" << 0)),
+            request.cmdObj);
 
         ASSERT_EQUALS(rpc::makeEmptyMetadata(), request.metadata);
 

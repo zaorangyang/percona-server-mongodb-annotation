@@ -125,10 +125,11 @@ Status addMongoShellOptions(moe::OptionSection* options) {
                                moe::Switch,
                                "disable the Javascript Just In Time compiler");
 
-    options->addOptionChaining("enableJavaScriptProtection",
-                               "enableJavaScriptProtection",
+    options->addOptionChaining("disableJavaScriptProtection",
+                               "disableJavaScriptProtection",
                                moe::Switch,
-                               "disable automatic JavaScript function marshalling");
+                               "allow automatic JavaScript function marshalling")
+        .incompatibleWith("enableJavaScriptProtection");
 
     Status ret = Status::OK();
 #ifdef MONGO_CONFIG_SSL
@@ -137,6 +138,14 @@ Status addMongoShellOptions(moe::OptionSection* options) {
         return ret;
     }
 #endif
+
+    options->addOptionChaining(
+                 "enableJavaScriptProtection",
+                 "enableJavaScriptProtection",
+                 moe::Switch,
+                 "disable automatic JavaScript function marshalling (defaults to true)")
+        .hidden()
+        .incompatibleWith("disableJavaScriptProtection");
 
     options->addOptionChaining("dbaddress", "dbaddress", moe::String, "dbaddress")
         .hidden()
@@ -266,8 +275,8 @@ Status storeMongoShellOptions(const moe::Environment& params,
     if (params.count("nodb")) {
         shellGlobalParams.nodb = true;
     }
-    if (params.count("enableJavaScriptProtection")) {
-        shellGlobalParams.javascriptProtection = true;
+    if (params.count("disableJavaScriptProtection")) {
+        shellGlobalParams.javascriptProtection = false;
     }
     if (params.count("norc")) {
         shellGlobalParams.norc = true;
@@ -379,16 +388,6 @@ Status storeMongoShellOptions(const moe::Environment& params,
         return Status(ErrorCodes::InvalidOptions, sb.str());
     }
 
-    return Status::OK();
-}
-
-Status validateMongoShellOptions(const moe::Environment& params) {
-#ifdef MONGO_CONFIG_SSL
-    Status ret = validateSSLMongoShellOptions(params);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
     return Status::OK();
 }
 }

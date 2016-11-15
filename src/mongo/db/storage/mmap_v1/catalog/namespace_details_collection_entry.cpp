@@ -360,16 +360,31 @@ void NamespaceDetailsCollectionCatalogEntry::_updateSystemNamespaces(OperationCo
 
     RecordData entry = _namespacesRecordStore->dataFor(txn, _namespacesRecordId);
     const BSONObj newEntry = applyUpdateOperators(entry.releaseToBson(), update);
-    StatusWith<RecordId> result = _namespacesRecordStore->updateRecord(
+
+    Status result = _namespacesRecordStore->updateRecord(
         txn, _namespacesRecordId, newEntry.objdata(), newEntry.objsize(), false, NULL);
-    fassert(17486, result.getStatus());
-    setNamespacesRecordId(txn, result.getValue());
+
+    if (ErrorCodes::NeedsDocumentMove == result) {
+        StatusWith<RecordId> newLocation = _namespacesRecordStore->insertRecord(
+            txn, newEntry.objdata(), newEntry.objsize(), false);
+        fassert(40074, newLocation.getStatus().isOK());
+
+        _namespacesRecordStore->deleteRecord(txn, _namespacesRecordId);
+
+        setNamespacesRecordId(txn, newLocation.getValue());
+    } else {
+        fassert(17486, result.isOK());
+    }
 }
 
 void NamespaceDetailsCollectionCatalogEntry::updateFlags(OperationContext* txn, int newValue) {
     NamespaceDetailsRSV1MetaData md(ns().ns(), _details);
     md.replaceUserFlags(txn, newValue);
     _updateSystemNamespaces(txn, BSON("$set" << BSON("options.flags" << newValue)));
+}
+
+void NamespaceDetailsCollectionCatalogEntry::clearTempFlag(OperationContext* txn) {
+    _updateSystemNamespaces(txn, BSON("$set" << BSON("options.temp" << false)));
 }
 
 void NamespaceDetailsCollectionCatalogEntry::updateValidator(OperationContext* txn,

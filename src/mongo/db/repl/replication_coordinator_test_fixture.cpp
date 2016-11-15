@@ -44,6 +44,7 @@
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
 
@@ -115,8 +116,7 @@ void ReplCoordTest::init() {
     _topo = new TopologyCoordinatorImpl(settings);
     stdx::function<bool()> _durablityLambda = [this]() -> bool { return _isStorageEngineDurable; };
     _net = new NetworkInterfaceMock;
-    _storage = new StorageInterfaceMock;
-    _replExec.reset(new ReplicationExecutor(_net, _storage, seed));
+    _replExec = stdx::make_unique<ReplicationExecutor>(_net, seed);
     _externalState = new ReplicationCoordinatorExternalStateMock;
     _repl.reset(new ReplicationCoordinatorImpl(
         _settings, _externalState, _topo, _replExec.get(), seed, &_durablityLambda));
@@ -140,7 +140,7 @@ void ReplCoordTest::start() {
     }
 
     OperationContextNoop txn;
-    _repl->startReplication(&txn);
+    _repl->startup(&txn);
     _repl->waitForStartUpComplete();
     _callShutdown = true;
 }
@@ -277,7 +277,10 @@ void ReplCoordTest::simulateSuccessfulV1Election() {
 
     ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     ASSERT(replCoord->getMemberState().secondary()) << replCoord->getMemberState().toString();
-    while (!replCoord->getMemberState().primary()) {
+    bool hasReadyRequests = true;
+    // Process requests until we're primary and consume the heartbeats for the notification
+    // of election win.
+    while (!replCoord->getMemberState().primary() || hasReadyRequests) {
         log() << "Waiting on network in state " << replCoord->getMemberState();
         getNet()->enterNetwork();
         if (net->now() < electionTimeoutWhen) {
@@ -302,18 +305,13 @@ void ReplCoordTest::simulateSuccessfulV1Election() {
                                              << ""
                                              << "term" << request.cmdObj["term"].Long()
                                              << "voteGranted" << true)));
-        } else if (request.cmdObj.firstElement().fieldNameStringData() ==
-                   "replSetDeclareElectionWinner") {
-            net->scheduleResponse(
-                noi,
-                net->now(),
-                makeResponseStatus(BSON("ok" << 1 << "term" << request.cmdObj["term"].Long())));
         } else {
             error() << "Black holing unexpected request to " << request.target << ": "
                     << request.cmdObj;
             net->blackHole(noi);
         }
         net->runReadyNetworkOperations();
+        hasReadyRequests = net->hasReadyRequests();
         getNet()->exitNetwork();
     }
     ASSERT(replCoord->isWaitingForApplierToDrain());
@@ -329,11 +327,6 @@ void ReplCoordTest::simulateSuccessfulV1Election() {
     ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
 
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
-
-    // Consume the notification of election win.
-    for (int i = 0; i < rsConfig.getNumMembers() - 1; i++) {
-        replyToReceivedHeartbeatV1();
-    }
 }
 
 void ReplCoordTest::simulateSuccessfulElection() {
@@ -342,7 +335,10 @@ void ReplCoordTest::simulateSuccessfulElection() {
     NetworkInterfaceMock* net = getNet();
     ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     ASSERT(replCoord->getMemberState().secondary()) << replCoord->getMemberState().toString();
-    while (!replCoord->getMemberState().primary()) {
+    bool hasReadyRequests = true;
+    // Process requests until we're primary and consume the heartbeats for the notification
+    // of election win.
+    while (!replCoord->getMemberState().primary() || hasReadyRequests) {
         log() << "Waiting on network in state " << replCoord->getMemberState();
         getNet()->enterNetwork();
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
@@ -375,6 +371,7 @@ void ReplCoordTest::simulateSuccessfulElection() {
             net->blackHole(noi);
         }
         net->runReadyNetworkOperations();
+        hasReadyRequests = net->hasReadyRequests();
         getNet()->exitNetwork();
     }
     ASSERT(replCoord->isWaitingForApplierToDrain());
@@ -390,11 +387,6 @@ void ReplCoordTest::simulateSuccessfulElection() {
     ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
 
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
-
-    // Consume the notification of election win.
-    for (int i = 0; i < rsConfig.getNumMembers() - 1; i++) {
-        replyToReceivedHeartbeat();
-    }
 }
 
 void ReplCoordTest::shutdown() {

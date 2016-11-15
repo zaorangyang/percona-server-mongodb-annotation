@@ -48,6 +48,7 @@
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
@@ -62,6 +63,7 @@ namespace {
 
 const char kKeyField[] = "key";
 const char kQueryField[] = "query";
+const char kCollationField[] = "collation";
 
 }  // namespace
 
@@ -74,6 +76,9 @@ public:
     }
     virtual bool slaveOverrideOk() const {
         return true;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
     bool supportsReadConcern() const final {
         return true;
@@ -124,6 +129,21 @@ public:
                                             << typeName(BSONType::jstNULL) << ", found "
                                             << typeName(queryElt.type()));
             }
+        }
+
+        // Extract the collation field, if it exists.
+        // TODO SERVER-23473: Pass this collation spec object down so that it can be converted into
+        // a CollatorInterface.
+        BSONObj collation;
+        if (BSONElement collationElt = cmdObj[kCollationField]) {
+            if (collationElt.type() != BSONType::Object) {
+                return Status(ErrorCodes::TypeMismatch,
+                              str::stream() << "\"" << kCollationField
+                                            << "\" had the wrong type. Expected "
+                                            << typeName(BSONType::Object) << ", found "
+                                            << typeName(collationElt.type()));
+            }
+            collation = collationElt.embeddedObject();
         }
 
         auto executor = getExecutorDistinct(
@@ -231,8 +251,7 @@ public:
         if (collection) {
             collection->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
         }
-        CurOp::get(txn)->debug().fromMultiPlanner = stats.fromMultiPlanner;
-        CurOp::get(txn)->debug().replanned = stats.replanned;
+        CurOp::get(txn)->debug().setPlanSummaryMetrics(stats);
 
         verify(start == bb.buf());
 

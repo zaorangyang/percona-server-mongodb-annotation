@@ -57,6 +57,12 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
+
+#include <iostream>
+#include <iomanip>
+#include <ctime>
+#include <chrono>
+
 namespace mongo {
 
 using std::shared_ptr;
@@ -112,6 +118,20 @@ VersionChoice chooseNewestVersion(ChunkVersion prevLocalVersion,
     return VersionChoice::Remote;
 }
 
+Date_t getDeadlineFromMaxTimeMS(OperationContext* txn) {
+    auto remainingTime = txn->getRemainingMaxTimeMicros();
+    if (remainingTime == 0) {
+        return Date_t::max();
+    }
+
+    if (remainingTime == 1) {
+        // 1 means maxTimeMS has exceeded.
+        return Date_t::now();
+    }
+
+    return Date_t::now() + Microseconds(remainingTime);
+}
+
 }  // namespace
 
 //
@@ -121,7 +141,8 @@ VersionChoice chooseNewestVersion(ChunkVersion prevLocalVersion,
 ShardingState::ShardingState()
     : _initializationState(static_cast<uint32_t>(InitializationState::kNew)),
       _initializationStatus(Status(ErrorCodes::InternalError, "Uninitialized value")),
-      _configServerTickets(kMaxConfigServerRefreshThreads) {}
+      _configServerTickets(kMaxConfigServerRefreshThreads),
+      _globalInit(initializeGlobalShardingStateForMongod) {}
 
 ShardingState::~ShardingState() = default;
 
@@ -173,21 +194,21 @@ void ShardingState::shutDown(OperationContext* txn) {
     }
 
     if (_getInitializationState() == InitializationState::kInitialized) {
-        grid.shardRegistry()->shutdown();
+        grid.getExecutorPool()->shutdownAndJoin();
         grid.catalogManager(txn)->shutDown(txn);
     }
 }
 
 void ShardingState::updateConfigServerOpTimeFromMetadata(OperationContext* txn) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    if (serverGlobalParams.configsvrMode != CatalogManager::ConfigServerMode::NONE) {
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         // Nothing to do if we're a config server ourselves.
         return;
     }
 
     boost::optional<repl::OpTime> opTime = rpc::ConfigServerMetadata::get(txn).getOpTime();
     if (opTime) {
-        grid.shardRegistry()->advanceConfigOpTime(*opTime);
+        grid.advanceConfigOpTime(*opTime);
     }
 }
 
@@ -250,58 +271,16 @@ ChunkVersion ShardingState::getVersion(const string& ns) {
     return ChunkVersion::UNSHARDED();
 }
 
-void ShardingState::splitChunk(OperationContext* txn,
-                               const string& ns,
-                               const BSONObj& min,
-                               const BSONObj& max,
-                               const vector<BSONObj>& splitKeys,
-                               ChunkVersion version) {
-    invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-    CollectionShardingStateMap::const_iterator it = _collections.find(ns);
-    verify(it != _collections.end());
-
-    ChunkType chunk;
-    chunk.setMin(min);
-    chunk.setMax(max);
-    string errMsg;
-
-    std::unique_ptr<CollectionMetadata> cloned(
-        it->second->getMetadata()->cloneSplit(chunk, splitKeys, version, &errMsg));
-    // uassert to match old behavior, TODO: report errors w/o throwing
-    uassert(16857, errMsg, NULL != cloned.get());
-
-    it->second->setMetadata(std::move(cloned));
-}
-
-void ShardingState::mergeChunks(OperationContext* txn,
-                                const string& ns,
-                                const BSONObj& minKey,
-                                const BSONObj& maxKey,
-                                ChunkVersion mergedVersion) {
-    invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-    CollectionShardingStateMap::const_iterator it = _collections.find(ns);
-    verify(it != _collections.end());
-
-    string errMsg;
-
-    std::unique_ptr<CollectionMetadata> cloned(
-        it->second->getMetadata()->cloneMerge(minKey, maxKey, mergedVersion, &errMsg));
-    // uassert to match old behavior, TODO: report errors w/o throwing
-    uassert(17004, errMsg, NULL != cloned.get());
-
-    it->second->setMetadata(std::move(cloned));
-}
-
 void ShardingState::resetMetadata(const string& ns) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     warning() << "resetting metadata for " << ns << ", this should only be used in testing";
 
     _collections.erase(ns);
+}
+
+void ShardingState::setGlobalInitMethodForTest(GlobalInitFunc func) {
+    _globalInit = func;
 }
 
 Status ShardingState::onStaleShardVersion(OperationContext* txn,
@@ -392,15 +371,17 @@ void ShardingState::initializeFromConfigConnString(OperationContext* txn, const 
         }
     }
 
-    uassertStatusOK(_waitForInitialization(txn));
-
+    uassertStatusOK(_waitForInitialization(getDeadlineFromMaxTimeMS(txn)));
+    uassertStatusOK(reloadShardRegistryUntilSuccess(txn));
     updateConfigServerOpTimeFromMetadata(txn);
 }
 
 Status ShardingState::initializeFromShardIdentity(OperationContext* txn) {
     invariant(!txn->lockState()->isLocked());
 
-    // TODO: SERVER-22663 if --shardsvr
+    if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+        return Status::OK();
+    }
 
     BSONObj shardIdentityBSON;
     try {
@@ -421,28 +402,24 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* txn) {
         return parseStatus.getStatus();
     }
 
-    return initializeFromShardIdentity(txn, parseStatus.getValue());
-}
-Status ShardingState::initializeFromShardIdentity(OperationContext* txn,
-                                                  const ShardIdentityType& shardIdentity) {
-    invariant(!txn->lockState()->isLocked());
+    auto status =
+        initializeFromShardIdentity(parseStatus.getValue(), getDeadlineFromMaxTimeMS(txn));
+    if (!status.isOK()) {
+        return status;
+    }
 
-    // TODO: SERVER-22663 if --shardsvr
+    return reloadShardRegistryUntilSuccess(txn);
+}
+
+// NOTE: This method can be called inside a database lock so it should never take any database
+// locks, perform I/O, or any long running operations.
+Status ShardingState::initializeFromShardIdentity(const ShardIdentityType& shardIdentity,
+                                                  Date_t deadline) {
+    if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+        return Status::OK();
+    }
 
     log() << "initializing sharding state with: " << shardIdentity;
-
-    auto parsedConfigConnStrStatus =
-        ConnectionString::parse(shardIdentity.getConfigsvrConnString());
-    if (!parsedConfigConnStrStatus.isOK()) {
-        return parsedConfigConnStrStatus.getStatus();
-    }
-
-    auto configSvrConnStr = parsedConfigConnStrStatus.getValue();
-    if (configSvrConnStr.type() != ConnectionString::SET) {
-        return {ErrorCodes::UnsupportedFormat,
-                str::stream() << "config server connection string can only be replica sets: "
-                              << configSvrConnStr.toString()};
-    }
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
@@ -451,7 +428,7 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* txn,
     // commands/setShardVersion. As well as all assignments to _initializationStatus and
     // _setInitializationState_inlock in this method.
     if (_getInitializationState() == InitializationState::kInitializing) {
-        auto waitStatus = _waitForInitialization_inlock(txn, lk);
+        auto waitStatus = _waitForInitialization_inlock(deadline, lk);
         if (!waitStatus.isOK()) {
             return waitStatus;
         }
@@ -463,6 +440,8 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* txn,
                                  "remain in this state until the instance is manually reset"
                               << causedBy(_initializationStatus)};
     }
+
+    auto configSvrConnStr = shardIdentity.getConfigsvrConnString();
 
     if (_getInitializationState() == InitializationState::kInitialized) {
         if (_shardName != shardIdentity.getShardName()) {
@@ -505,7 +484,7 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* txn,
             &ConfigServer::replicaSetChangeShardRegistryUpdateHook);
 
         try {
-            Status status = initializeGlobalShardingState(txn, configSvrConnStr);
+            Status status = _globalInit(configSvrConnStr);
 
             // For backwards compatibility with old style inits from metadata commands.
             if (status.isOK()) {
@@ -541,37 +520,33 @@ void ShardingState::_initializeImpl(ConnectionString configSvr) {
         &ConfigServer::replicaSetChangeShardRegistryUpdateHook);
 
     try {
-        Status status = initializeGlobalShardingState(txn.get(), configSvr);
+        Status status = _globalInit(configSvr);
         _signalInitializationComplete(status);
     } catch (const DBException& ex) {
         _signalInitializationComplete(ex.toStatus());
     }
 }
 
-Status ShardingState::_waitForInitialization(OperationContext* txn) {
+Status ShardingState::_waitForInitialization(Date_t deadline) {
     if (enabled())
         return Status::OK();
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    return _waitForInitialization_inlock(txn, lk);
+    return _waitForInitialization_inlock(deadline, lk);
 }
 
-Status ShardingState::_waitForInitialization_inlock(OperationContext* txn,
+Status ShardingState::_waitForInitialization_inlock(Date_t deadline,
                                                     stdx::unique_lock<stdx::mutex>& lk) {
     {
-        const Microseconds timeRemaining(txn->getRemainingMaxTimeMicros());
         while (_getInitializationState() == InitializationState::kInitializing ||
                _getInitializationState() == InitializationState::kNew) {
-            if (timeRemaining.count()) {
-                const auto deadline = stdx::chrono::system_clock::now() + timeRemaining;
-
-                if (stdx::cv_status::timeout ==
-                    _initializationFinishedCondition.wait_until(lk, deadline)) {
-                    return Status(ErrorCodes::ExceededTimeLimit,
-                                  "Initializing sharding state exceeded time limit");
-                }
-            } else {
+            if (deadline == Date_t::max()) {
                 _initializationFinishedCondition.wait(lk);
+            } else if (stdx::cv_status::timeout ==
+                       _initializationFinishedCondition.wait_until(lk,
+                                                                   deadline.toSystemTimePoint())) {
+                return Status(ErrorCodes::ExceededTimeLimit,
+                              "Initializing sharding state exceeded time limit");
             }
         }
     }
@@ -623,7 +598,7 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
                                        ChunkVersion* latestShardVersion) {
     invariant(!txn->lockState()->isLocked());
 
-    Status status = _waitForInitialization(txn);
+    Status status = _waitForInitialization(getDeadlineFromMaxTimeMS(txn));
     if (!status.isOK())
         return status;
 

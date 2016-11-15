@@ -74,39 +74,33 @@ const std::string kLocalDB = "local";
 
 StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* txn,
                                                     const BSONObj& cmdObj,
-                                                    const std::string& dbName) {
+                                                    const std::string& dbName,
+                                                    const bool supportsWriteConcern) {
     // The default write concern if empty is w : 1
     // Specifying w : 0 is/was allowed, but is interpreted identically to w : 1
     WriteConcernOptions writeConcern =
         repl::getGlobalReplicationCoordinator()->getGetLastErrorDefault();
-    if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
-        writeConcern.wNumNodes = 1;
-    }
 
-    BSONElement writeConcernElement;
-    Status wcStatus = bsonExtractTypedField(cmdObj, "writeConcern", Object, &writeConcernElement);
-    if (!wcStatus.isOK()) {
-        if (wcStatus == ErrorCodes::NoSuchKey) {
-            // Return default write concern if no write concern is given.
-            return writeConcern;
+    auto wcResult = WriteConcernOptions::extractWCFromCommand(cmdObj, dbName, writeConcern);
+    if (!wcResult.isOK()) {
+        return wcResult.getStatus();
+    }
+    writeConcern = wcResult.getValue();
+
+    // We didn't use the default, so the user supplied their own writeConcern.
+    if (!wcResult.getValue().usedDefault) {
+        // If it supports writeConcern and does not use the default, validate the writeConcern.
+        if (supportsWriteConcern) {
+            Status wcStatus = validateWriteConcern(txn, writeConcern, dbName);
+            if (!wcStatus.isOK()) {
+                return wcStatus;
+            }
+        } else {
+            // This command doesn't do writes so it should not be passed a writeConcern.
+            // If we did not use the default writeConcern, one was provided when it shouldn't have
+            // been by the user.
+            return Status(ErrorCodes::InvalidOptions, "Command does not support writeConcern");
         }
-        return wcStatus;
-    }
-
-    BSONObj writeConcernObj = writeConcernElement.Obj();
-    // Empty write concern is interpreted to default.
-    if (writeConcernObj.isEmpty()) {
-        return writeConcern;
-    }
-
-    wcStatus = writeConcern.parse(writeConcernObj);
-    if (!wcStatus.isOK()) {
-        return wcStatus;
-    }
-
-    wcStatus = validateWriteConcern(txn, writeConcern, dbName);
-    if (!wcStatus.isOK()) {
-        return wcStatus;
     }
 
     return writeConcern;
@@ -128,15 +122,6 @@ Status validateWriteConcern(OperationContext* txn,
         repl::getGlobalReplicationCoordinator()->getReplicationMode();
 
     if (isConfigServer) {
-        auto protocol = rpc::getOperationProtocol(txn);
-        // This here only for v3.0 backwards compatibility.
-        if (serverGlobalParams.configsvrMode != CatalogManager::ConfigServerMode::CSRS &&
-            replMode != repl::ReplicationCoordinator::modeReplSet &&
-            protocol == rpc::Protocol::kOpQuery && writeConcern.wNumNodes == 0 &&
-            writeConcern.wMode.empty()) {
-            return Status::OK();
-        }
-
         if (!writeConcern.validForConfigServers()) {
             return Status(
                 ErrorCodes::BadValue,
@@ -144,8 +129,8 @@ Status validateWriteConcern(OperationContext* txn,
                     << "w:1 and w:'majority' are the only valid write concerns when writing to "
                        "config servers, got: " << writeConcern.toBSON().toString());
         }
-        if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::CSRS &&
-            replMode == repl::ReplicationCoordinator::modeReplSet && !isLocalDb &&
+
+        if (replMode == repl::ReplicationCoordinator::modeReplSet && !isLocalDb &&
             writeConcern.wMode.empty()) {
             invariant(writeConcern.wNumNodes == 1);
             return Status(

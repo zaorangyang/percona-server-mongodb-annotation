@@ -41,6 +41,7 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -48,25 +49,26 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/matcher/matcher.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/query/get_executor.h"
-#include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/find_common.h"
+#include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_planner.h"
 #include "mongo/db/range_preserver.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/chunk.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
@@ -602,7 +604,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
         ScopedTransaction transaction(txn, MODE_X);
         Lock::GlobalWrite lock(txn->lockState());  // TODO(erh): why global???
         // replace: just rename from temp to final collection name, dropping previous collection
-        _db.dropCollection(_config.outputOptions.finalNamespace);
+        _db.dropCollection(_config.outputOptions.finalNamespace, txn->getWriteConcern());
         BSONObj info;
 
         if (!_db.runCommand("admin",
@@ -613,7 +615,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
             uasserted(10076, str::stream() << "rename failed: " << info);
         }
 
-        _db.dropCollection(_config.tempNamespace);
+        _db.dropCollection(_config.tempNamespace, txn->getWriteConcern());
     } else if (_config.outputOptions.outType == Config::MERGE) {
         // merge: upsert new docs into old collection
         {
@@ -632,7 +634,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
             Helpers::upsert(_txn, _config.outputOptions.finalNamespace, o);
             pm.hit();
         }
-        _db.dropCollection(_config.tempNamespace);
+        _db.dropCollection(_config.tempNamespace, txn->getWriteConcern());
         pm.finished();
     } else if (_config.outputOptions.outType == Config::REDUCE) {
         // reduce: apply reduce op on new result and existing one
@@ -705,7 +707,10 @@ void State::insert(const string& ns, const BSONObj& o) {
         if (!res.getValue().isEmpty()) {
             bo = res.getValue();
         }
-        uassertStatusOK(coll->insertDocument(_txn, bo, true));
+
+        // TODO: Consider whether to pass OpDebug for stats tracking under SERVER-23261.
+        OpDebug* const nullOpDebug = nullptr;
+        uassertStatusOK(coll->insertDocument(_txn, bo, nullOpDebug, true));
         wuow.commit();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "M/R insert", ns);
@@ -735,7 +740,10 @@ void State::_insertToInc(BSONObj& o) {
                                     << ". size in bytes: " << o.objsize()
                                     << ", max size: " << BSONObjMaxUserSize);
         }
-        uassertStatusOK(coll->insertDocument(_txn, o, true, false));
+
+        // TODO: Consider whether to pass OpDebug for stats tracking under SERVER-23261.
+        OpDebug* const nullOpDebug = nullptr;
+        uassertStatusOK(coll->insertDocument(_txn, o, nullOpDebug, true, false));
         wuow.commit();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "M/R insertToInc", _config.incLong);
@@ -1287,6 +1295,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return mrSupportsWriteConcern(cmd);
+    }
+
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {
@@ -1300,6 +1312,11 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         Timer t;
+
+        // Save and reset the write concern so that it doesn't get changed accidentally by
+        // DBDirectClient.
+        auto oldWC = txn->getWriteConcern();
+        ON_BLOCK_EXIT([txn, oldWC] { txn->setWriteConcern(oldWC); });
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmd))
@@ -1321,7 +1338,7 @@ public:
 
         uassert(16149, "cannot run map reduce without the js engine", globalScriptEngine);
 
-        CollectionMetadataPtr collMetadata;
+        shared_ptr<CollectionMetadata> collMetadata;
 
         // Prevent sharding state from changing during the MR.
         unique_ptr<RangePreserver> rangePreserver;
@@ -1498,11 +1515,14 @@ public:
                 // Record the indexes used by the PlanExecutor.
                 PlanSummaryStats stats;
                 Explain::getSummaryStats(*exec, &stats);
+
+                // TODO SERVER-23261: Confirm whether this is the correct place to gather all
+                // metrics. There is no harm adding here for the time being.
+                CurOp::get(txn)->debug().setPlanSummaryMetrics(stats);
+
                 Collection* coll = scopedAutoDb->getDb()->getCollection(config.ns);
                 invariant(coll);  // 'exec' hasn't been killed, so collection must be alive.
                 coll->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
-                CurOp::get(txn)->debug().fromMultiPlanner = stats.fromMultiPlanner;
-                CurOp::get(txn)->debug().replanned = stats.replanned;
             }
             pm.finished();
 
@@ -1588,6 +1608,9 @@ public:
     virtual bool slaveOverrideOk() const {
         return true;
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {
@@ -1608,6 +1631,11 @@ public:
                        str::stream() << "Can not execute mapReduce with output database "
                                      << dbname));
         }
+
+        // Save and reset the write concern so that it doesn't get changed accidentally by
+        // DBDirectClient.
+        auto oldWC = txn->getWriteConcern();
+        ON_BLOCK_EXIT([txn, oldWC] { txn->setWriteConcern(oldWC); });
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
@@ -1684,7 +1712,7 @@ public:
 
         shared_ptr<DBConfig> confOut = status.getValue();
 
-        vector<ChunkPtr> chunks;
+        vector<shared_ptr<Chunk>> chunks;
         if (confOut->isSharded(config.outputOptions.finalNamespace)) {
             ChunkManagerPtr cm = confOut->getChunkManager(txn, config.outputOptions.finalNamespace);
 
@@ -1694,7 +1722,7 @@ public:
             const ChunkMap& chunkMap = cm->getChunkMap();
 
             for (ChunkMap::const_iterator it = chunkMap.begin(); it != chunkMap.end(); ++it) {
-                ChunkPtr chunk = it->second;
+                shared_ptr<Chunk> chunk = it->second;
                 if (chunk->getShardId() == shardName) {
                     chunks.push_back(chunk);
                 }
@@ -1706,7 +1734,7 @@ public:
         BSONObj query;
         BSONArrayBuilder chunkSizes;
         while (true) {
-            ChunkPtr chunk;
+            shared_ptr<Chunk> chunk;
             if (chunks.size() > 0) {
                 chunk = chunks[index];
                 BSONObjBuilder b;

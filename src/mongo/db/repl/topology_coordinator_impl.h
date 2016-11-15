@@ -127,9 +127,8 @@ public:
         // A sync source is re-evaluated after it lags behind further than this amount.
         Seconds maxSyncSourceLagSecs{0};
 
-        // Whether or not this node is running as a config server, and if so whether it was started
-        // with --configsvrMode=SCCC.
-        CatalogManager::ConfigServerMode configServerMode{CatalogManager::ConfigServerMode::NONE};
+        // Whether or not this node is running as a config server.
+        ClusterRole clusterRole{ClusterRole::None};
     };
 
     /**
@@ -164,8 +163,7 @@ public:
     virtual void setElectionSleepUntil(Date_t newTime);
     virtual void setFollowerMode(MemberState::MS newMode);
     virtual void adjustMaintenanceCountBy(int inc);
-    virtual void prepareSyncFromResponse(const ReplicationExecutor::CallbackArgs& data,
-                                         const HostAndPort& target,
+    virtual void prepareSyncFromResponse(const HostAndPort& target,
                                          const OpTime& lastOpApplied,
                                          BSONObjBuilder* response,
                                          Status* result);
@@ -191,8 +189,7 @@ public:
                                               const OpTime& lastOpApplied,
                                               const OpTime& lastOpDurable,
                                               ReplSetHeartbeatResponse* response);
-    virtual void prepareStatusResponse(const ReplicationExecutor::CallbackArgs& data,
-                                       const ReplSetStatusArgs& rsStatusArgs,
+    virtual void prepareStatusResponse(const ReplSetStatusArgs& rsStatusArgs,
                                        BSONObjBuilder* response,
                                        Status* result);
     virtual void fillIsMasterForReplSet(IsMasterResponse* response);
@@ -223,8 +220,6 @@ public:
     virtual void prepareReplResponseMetadata(rpc::ReplSetMetadata* metadata,
                                              const OpTime& lastVisibleOpTime,
                                              const OpTime& lastCommitttedOpTime) const;
-    Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
-                                               long long* responseTerm);
     virtual void processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
                                             ReplSetRequestVotesResponse* response,
                                             const OpTime& lastAppliedOpTime);

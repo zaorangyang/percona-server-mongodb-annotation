@@ -45,7 +45,6 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/log.h"
 
@@ -56,6 +55,9 @@ using std::stringstream;
 
 class CompactCmd : public Command {
 public:
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
     virtual bool adminOnly() const {
         return false;
     }
@@ -90,7 +92,7 @@ public:
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        const std::string nsToCompact = parseNsCollectionRequired(db, cmdObj);
+        NamespaceString nss = parseNsCollectionRequired(db, cmdObj);
 
         repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
         if (replCoord->getMemberState().primary() && !cmdObj["force"].trueValue()) {
@@ -100,7 +102,6 @@ public:
             return false;
         }
 
-        NamespaceString nss(nsToCompact);
         if (!nss.isNormal()) {
             errmsg = "bad namespace name";
             return false;

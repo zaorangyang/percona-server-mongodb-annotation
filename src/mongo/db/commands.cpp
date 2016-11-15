@@ -86,16 +86,17 @@ string Command::parseNsFullyQualified(const string& dbname, const BSONObj& cmdOb
     return first.String();
 }
 
-string Command::parseNsCollectionRequired(const string& dbname, const BSONObj& cmdObj) const {
+NamespaceString Command::parseNsCollectionRequired(const string& dbname,
+                                                   const BSONObj& cmdObj) const {
     // Accepts both BSON String and Symbol for collection name per SERVER-16260
     // TODO(kangas) remove Symbol support in MongoDB 3.0 after Ruby driver audit
     BSONElement first = cmdObj.firstElement();
-    uassert(17009,
-            "no collection name specified",
-            first.canonicalType() == canonicalizeBSONType(mongo::String) &&
-                first.valuestrsize() > 0);
-    std::string coll = first.valuestr();
-    return dbname + '.' + coll;
+    uassert(40072,
+            str::stream() << "collection name has invalid type " << typeName(first.type()),
+            first.canonicalType() == canonicalizeBSONType(mongo::String));
+    NamespaceString nss(dbname, first.valuestr());
+    uassert(ErrorCodes::InvalidNamespace, "Not a valid namespace", nss.isValid());
+    return nss;
 }
 
 /*virtual*/ string Command::parseNs(const string& dbname, const BSONObj& cmdObj) const {
@@ -185,11 +186,16 @@ void Command::appendCommandStatus(BSONObjBuilder& result, bool ok, const std::st
     }
 }
 
-void Command::appendCommandWCStatus(BSONObjBuilder& result, const Status& status) {
-    if (!status.isOK()) {
+void Command::appendCommandWCStatus(BSONObjBuilder& result,
+                                    const Status& awaitReplicationStatus,
+                                    const WriteConcernResult& wcResult) {
+    if (!awaitReplicationStatus.isOK() && !result.hasField("writeConcernError")) {
         WCErrorDetail wcError;
-        wcError.setErrCode(status.code());
-        wcError.setErrMessage(status.reason());
+        wcError.setErrCode(awaitReplicationStatus.code());
+        wcError.setErrMessage(awaitReplicationStatus.reason());
+        if (wcResult.wTimedOut) {
+            wcError.setErrInfo(BSON("wtimeout" << true));
+        }
         result.append("writeConcernError", wcError.toBSON());
     }
 }
@@ -381,6 +387,29 @@ void Command::generateErrorResponse(OperationContext* txn,
                                     const DBException& exception) {
     LOG(1) << "assertion while executing command: " << exception.toString();
     _generateErrorResponse(txn, replyBuilder, exception, rpc::makeEmptyMetadata());
+}
+
+namespace {
+const std::unordered_set<std::string> userManagementCommands{"createUser",
+                                                             "updateUser",
+                                                             "dropUser",
+                                                             "dropAllUsersFromDatabase",
+                                                             "grantRolesToUser",
+                                                             "revokeRolesFromUser",
+                                                             "createRole",
+                                                             "updateRole",
+                                                             "dropRole",
+                                                             "dropAllRolesFromDatabase",
+                                                             "grantPrivilegesToRole",
+                                                             "revokePrivilegesFromRole",
+                                                             "grantRolesToRole",
+                                                             "revokeRolesFromRole",
+                                                             "_mergeAuthzCollections",
+                                                             "authSchemaUpgrade"};
+}  // namespace
+
+bool Command::isUserManagementCommand(const std::string& name) {
+    return userManagementCommands.count(name);
 }
 
 }  // namespace mongo

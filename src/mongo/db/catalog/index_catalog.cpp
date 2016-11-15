@@ -57,6 +57,7 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/ops/delete.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/operation_context.h"
@@ -132,7 +133,7 @@ IndexCatalogEntry* IndexCatalog::_setupInMemoryStructures(OperationContext* txn,
                                                           bool initFromDisk) {
     unique_ptr<IndexDescriptor> descriptorCleanup(descriptor);
 
-    Status status = _isSpecOk(descriptor->infoObj());
+    Status status = _isSpecOk(txn, descriptor->infoObj());
     if (!status.isOK() && status != ErrorCodes::IndexAlreadyExists) {
         severe() << "Found an invalid index " << descriptor->infoObj() << " on the "
                  << _collection->ns().ns() << " collection: " << status.reason();
@@ -270,14 +271,14 @@ Status IndexCatalog::_upgradeDatabaseMinorVersionIfNeeded(OperationContext* txn,
 
 StatusWith<BSONObj> IndexCatalog::prepareSpecForCreate(OperationContext* txn,
                                                        const BSONObj& original) const {
-    Status status = _isSpecOk(original);
+    Status status = _isSpecOk(txn, original);
     if (!status.isOK())
         return StatusWith<BSONObj>(status);
 
     BSONObj fixed = _fixIndexSpec(original);
 
     // we double check with new index spec
-    status = _isSpecOk(fixed);
+    status = _isSpecOk(txn, fixed);
     if (!status.isOK())
         return StatusWith<BSONObj>(status);
 
@@ -366,6 +367,11 @@ Status IndexCatalog::IndexBuildBlock::init() {
     const bool initFromDisk = false;
     _entry = _catalog->_setupInMemoryStructures(_txn, descriptorCleaner.release(), initFromDisk);
 
+    // Register this index with the CollectionInfoCache to regenerate the cache. This way, updates
+    // occurring while an index is being build in the background will be aware of whether or not
+    // they need to modify any indexes.
+    _collection->infoCache()->addedIndex(_txn, descriptor);
+
     return Status::OK();
 }
 
@@ -414,8 +420,6 @@ void IndexCatalog::IndexBuildBlock::success() {
     });
 
     entry->setIsReady(true);
-
-    collection->infoCache()->addedIndex(_txn, desc);
 }
 
 namespace {
@@ -451,7 +455,7 @@ Status _checkValidFilterExpressions(MatchExpression* expression, int level = 0) 
 }
 }
 
-Status IndexCatalog::_isSpecOk(const BSONObj& spec) const {
+Status IndexCatalog::_isSpecOk(OperationContext* txn, const BSONObj& spec) const {
     const NamespaceString& nss = _collection->ns();
 
     BSONElement vElt = spec["v"];
@@ -463,7 +467,7 @@ Status IndexCatalog::_isSpecOk(const BSONObj& spec) const {
         double v = vElt.Number();
 
         // SERVER-16893 Forbid use of v0 indexes with non-mmapv1 engines
-        if (v == 0 && !getGlobalServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
+        if (v == 0 && !txn->getServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
             return Status(ErrorCodes::CannotCreateIndex,
                           str::stream() << "use of v0 indexes is only allowed with the "
                                         << "mmapv1 storage engine");
@@ -551,6 +555,26 @@ Status IndexCatalog::_isSpecOk(const BSONObj& spec) const {
         Status status = _checkValidFilterExpressions(filterExpr.get());
         if (!status.isOK()) {
             return status;
+        }
+    }
+
+    BSONElement collationElement = spec.getField("collation");
+    if (collationElement) {
+        string pluginName = IndexNames::findPluginName(key);
+        if ((pluginName != IndexNames::BTREE) && (pluginName != IndexNames::GEO_2D) &&
+            (pluginName != IndexNames::GEO_2DSPHERE) && (pluginName != IndexNames::HASHED)) {
+            return Status(ErrorCodes::CannotCreateIndex,
+                          str::stream() << "\"collation\" not supported for index type "
+                                        << pluginName);
+        }
+        if (collationElement.type() != BSONType::Object) {
+            return Status(ErrorCodes::CannotCreateIndex,
+                          "\"collation\" for an index must be a document");
+        }
+        auto statusWithCollator = CollatorFactoryInterface::get(txn->getServiceContext())
+                                      ->makeFromBSON(collationElement.Obj());
+        if (!statusWithCollator.isOK()) {
+            return statusWithCollator.getStatus();
         }
     }
 
@@ -1111,7 +1135,8 @@ bool isDupsAllowed(IndexDescriptor* desc) {
 
 Status IndexCatalog::_indexFilteredRecords(OperationContext* txn,
                                            IndexCatalogEntry* index,
-                                           const std::vector<BsonRecord>& bsonRecords) {
+                                           const std::vector<BsonRecord>& bsonRecords,
+                                           int64_t* keysInsertedOut) {
     InsertDeleteOptions options;
     options.logIfError = false;
     options.dupsAllowed = isDupsAllowed(index->descriptor());
@@ -1123,16 +1148,21 @@ Status IndexCatalog::_indexFilteredRecords(OperationContext* txn,
             txn, *bsonRecord.docPtr, bsonRecord.id, options, &inserted);
         if (!status.isOK())
             return status;
+
+        if (keysInsertedOut) {
+            *keysInsertedOut += inserted;
+        }
     }
     return Status::OK();
 }
 
 Status IndexCatalog::_indexRecords(OperationContext* txn,
                                    IndexCatalogEntry* index,
-                                   const std::vector<BsonRecord>& bsonRecords) {
+                                   const std::vector<BsonRecord>& bsonRecords,
+                                   int64_t* keysInsertedOut) {
     const MatchExpression* filter = index->getFilterExpression();
     if (!filter)
-        return _indexFilteredRecords(txn, index, bsonRecords);
+        return _indexFilteredRecords(txn, index, bsonRecords, keysInsertedOut);
 
     std::vector<BsonRecord> filteredBsonRecords;
     for (auto bsonRecord : bsonRecords) {
@@ -1140,14 +1170,15 @@ Status IndexCatalog::_indexRecords(OperationContext* txn,
             filteredBsonRecords.push_back(bsonRecord);
     }
 
-    return _indexFilteredRecords(txn, index, filteredBsonRecords);
+    return _indexFilteredRecords(txn, index, filteredBsonRecords, keysInsertedOut);
 }
 
 Status IndexCatalog::_unindexRecord(OperationContext* txn,
                                     IndexCatalogEntry* index,
                                     const BSONObj& obj,
                                     const RecordId& loc,
-                                    bool logIfError) {
+                                    bool logIfError,
+                                    int64_t* keysDeletedOut) {
     InsertDeleteOptions options;
     options.logIfError = logIfError;
     options.dupsAllowed = isDupsAllowed(index->descriptor());
@@ -1165,15 +1196,24 @@ Status IndexCatalog::_unindexRecord(OperationContext* txn,
               << _collection->ns() << ". Status: " << status.toString();
     }
 
+    if (keysDeletedOut) {
+        *keysDeletedOut += removed;
+    }
+
     return Status::OK();
 }
 
 
 Status IndexCatalog::indexRecords(OperationContext* txn,
-                                  const std::vector<BsonRecord>& bsonRecords) {
+                                  const std::vector<BsonRecord>& bsonRecords,
+                                  int64_t* keysInsertedOut) {
+    if (keysInsertedOut) {
+        *keysInsertedOut = 0;
+    }
+
     for (IndexCatalogEntryContainer::const_iterator i = _entries.begin(); i != _entries.end();
          ++i) {
-        Status s = _indexRecords(txn, *i, bsonRecords);
+        Status s = _indexRecords(txn, *i, bsonRecords, keysInsertedOut);
         if (!s.isOK())
             return s;
     }
@@ -1184,14 +1224,19 @@ Status IndexCatalog::indexRecords(OperationContext* txn,
 void IndexCatalog::unindexRecord(OperationContext* txn,
                                  const BSONObj& obj,
                                  const RecordId& loc,
-                                 bool noWarn) {
+                                 bool noWarn,
+                                 int64_t* keysDeletedOut) {
+    if (keysDeletedOut) {
+        *keysDeletedOut = 0;
+    }
+
     for (IndexCatalogEntryContainer::const_iterator i = _entries.begin(); i != _entries.end();
          ++i) {
         IndexCatalogEntry* entry = *i;
 
         // If it's a background index, we DO NOT want to log anything.
         bool logIfError = entry->isReady(txn) ? !noWarn : false;
-        _unindexRecord(txn, entry, obj, loc, logIfError);
+        _unindexRecord(txn, entry, obj, loc, logIfError, keysDeletedOut);
     }
 }
 

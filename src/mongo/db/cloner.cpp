@@ -217,7 +217,8 @@ struct Cloner::Fun {
                 WriteUnitOfWork wunit(txn);
 
                 BSONObj doc = tmp;
-                Status status = collection->insertDocument(txn, doc, true);
+                OpDebug* const nullOpDebug = nullptr;
+                Status status = collection->insertDocument(txn, doc, nullOpDebug, true);
                 if (!status.isOK()) {
                     error() << "error: exception cloning object in " << from_collection << ' '
                             << status << " obj:" << doc;
@@ -470,8 +471,7 @@ Status Cloner::copyDb(OperationContext* txn,
                 return Status(ErrorCodes::HostUnreachable, errmsg);
             }
 
-            if (getGlobalAuthorizationManager()->isAuthEnabled() &&
-                !con->authenticateInternalUser()) {
+            if (isInternalAuthSet() && !con->authenticateInternalUser()) {
                 return Status(ErrorCodes::AuthenticationFailed,
                               "Unable to authenticate as internal user");
             }
@@ -611,7 +611,8 @@ Status Cloner::copyDb(OperationContext* txn,
                 // dupsAllowed in IndexCatalog::_unindexRecord and SERVER-17487.
                 for (set<RecordId>::const_iterator it = dups.begin(); it != dups.end(); ++it) {
                     WriteUnitOfWork wunit(txn);
-                    c->deleteDocument(txn, *it, false, true, true);
+                    OpDebug* const nullOpDebug = nullptr;
+                    c->deleteDocument(txn, *it, nullOpDebug, false, true);
                     wunit.commit();
                 }
 

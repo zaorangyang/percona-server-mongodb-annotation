@@ -49,15 +49,16 @@
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_explain.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/run_on_all_shards_cmd.h"
+#include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/config.h"
+#include "mongo/s/db_util.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/s/version_manager.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
@@ -111,7 +112,7 @@ bool cursorCommandPassthrough(OperationContext* txn,
     StatusWith<BSONObj> transformedResponse =
         storePossibleCursor(HostAndPort(cursor->originalHost()),
                             response,
-                            grid.shardRegistry()->getExecutorPool()->getArbitraryExecutor(),
+                            grid.getExecutorPool()->getArbitraryExecutor(),
                             grid.getCursorManager());
     if (!transformedResponse.isOK()) {
         return Command::appendCommandStatus(*out, transformedResponse.getStatus());
@@ -184,7 +185,12 @@ private:
         bool ok = conn->runCommand(db, cmdObj, res, passOptions() ? options : 0);
         conn.done();
 
-        result.appendElements(res);
+        // First append the properly constructed writeConcernError. It will then be skipped
+        // in appendElementsUnique.
+        if (auto wcErrorElem = res["writeConcernError"]) {
+            appendWriteConcernErrorToCmdResponse(shard->getId(), wcErrorElem, result);
+        }
+        result.appendElementsUnique(res);
         return ok;
     }
 };
@@ -251,6 +257,9 @@ public:
         ActionSet actions;
         actions.addAction(ActionType::dropIndex);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 } dropIndexesCmd;
 
@@ -361,6 +370,10 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
 } createIndexesCmd;
 
 class ReIndexCmd : public AllShardsCollectionCommand {
@@ -372,6 +385,10 @@ public:
         ActionSet actions;
         actions.addAction(ActionType::reIndex);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    }
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 } reIndexCmd;
 
@@ -385,12 +402,16 @@ public:
         actions.addAction(ActionType::collMod);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 } collectionModCmd;
 
 
-class ValidateCmd : public AllShardsCollectionCommand {
+class ValidateCmd : public PublicGridCommand {
 public:
-    ValidateCmd() : AllShardsCollectionCommand("validate") {}
+    ValidateCmd() : PublicGridCommand("validate") {}
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {
@@ -398,28 +419,61 @@ public:
         actions.addAction(ActionType::validate);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
-    virtual void aggregateResults(const vector<ShardAndReply>& results, BSONObjBuilder& output) {
-        for (vector<ShardAndReply>::const_iterator it(results.begin()), end(results.end());
-             it != end;
-             it++) {
-            const BSONObj& result = std::get<1>(*it);
-            const BSONElement valid = result["valid"];
-            if (!valid.eoo()) {
-                if (!valid.trueValue()) {
-                    output.appendBool("valid", false);
-                    return;
-                }
-            } else {
-                // Support pre-1.9.0 output with everything in a big string
-                const char* s = result["result"].valuestrsafe();
-                if (strstr(s, "exception") || strstr(s, "corrupt")) {
-                    output.appendBool("valid", false);
-                    return;
-                }
-            }
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    bool run(OperationContext* txn,
+             const string& dbName,
+             BSONObj& cmdObj,
+             int options,
+             string& errmsg,
+             BSONObjBuilder& output) {
+        const NamespaceString nss = parseNsCollectionRequired(dbName, cmdObj);
+
+        auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
+        if (!conf->isShardingEnabled() || !conf->isSharded(nss.ns())) {
+            return passthrough(txn, conf, cmdObj, output);
         }
 
-        output.appendBool("valid", true);
+        ChunkManagerPtr cm = conf->getChunkManager(txn, nss.ns());
+        massert(40051, "chunk manager should not be null", cm);
+
+        vector<Strategy::CommandResult> results;
+        Strategy::commandOp(txn, dbName, cmdObj, options, cm->getns(), BSONObj(), &results);
+
+        BSONObjBuilder rawResBuilder(output.subobjStart("raw"));
+        bool isValid = true;
+        bool errored = false;
+        for (const auto& cmdResult : results) {
+            const string& shardName = cmdResult.shardTargetId;
+            BSONObj result = cmdResult.result;
+            const BSONElement valid = result["valid"];
+            if (!valid.trueValue()) {
+                isValid = false;
+            }
+            if (!result["errmsg"].eoo()) {
+                // errmsg indicates a user error, so returning the message from one shard is
+                // sufficient.
+                errmsg = result["errmsg"].toString();
+                errored = true;
+            }
+            rawResBuilder.append(shardName, result);
+        }
+        rawResBuilder.done();
+
+        output.appendBool("valid", isValid);
+
+        int code = getUniqueCodeFromCommandResults(results);
+        if (code != 0) {
+            output.append("code", code);
+        }
+
+        if (errored) {
+            return false;
+        }
+        return true;
     }
 } validateCmd;
 
@@ -447,13 +501,16 @@ public:
 
         return Status(ErrorCodes::Unauthorized, "unauthorized");
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
     bool run(OperationContext* txn,
              const string& dbName,
              BSONObj& cmdObj,
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        auto status = grid.implicitCreateDb(txn, dbName);
+        auto status = dbutil::implicitCreateDb(txn, dbName);
         if (!status.isOK()) {
             return appendCommandStatus(result, status.getStatus());
         }
@@ -476,6 +533,10 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
     bool run(OperationContext* txn,
              const string& dbName,
              BSONObj& cmdObj,
@@ -491,24 +552,23 @@ public:
             return appendCommandStatus(result, status.getStatus());
         }
 
-        const string fullns = dbName + "." + cmdObj.firstElement().valuestrsafe();
+        const NamespaceString fullns = parseNsCollectionRequired(dbName, cmdObj);
 
         log() << "DROP: " << fullns;
 
         const auto& db = status.getValue();
-        if (!db->isShardingEnabled() || !db->isSharded(fullns)) {
+        if (!db->isShardingEnabled() || !db->isSharded(fullns.ns())) {
             log() << "\tdrop going to do passthrough";
             return passthrough(txn, db, cmdObj, result);
         }
 
-        uassertStatusOK(grid.catalogManager(txn)->dropCollection(txn, NamespaceString(fullns)));
+        uassertStatusOK(grid.catalogManager(txn)->dropCollection(txn, fullns));
 
         // Force a full reload next time the just dropped namespace is accessed
-        db->invalidateNs(fullns);
+        db->invalidateNs(fullns.ns());
 
         return true;
     }
-
 } dropCmd;
 
 class RenameCollectionCmd : public PublicGridCommand {
@@ -520,6 +580,9 @@ public:
         return rename_collection::checkAuthForRenameCollectionCommand(client, dbname, cmdObj);
     }
     virtual bool adminOnly() const {
+        return true;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
     bool run(OperationContext* txn,
@@ -561,6 +624,9 @@ public:
                                        const BSONObj& cmdObj) {
         return copydb::checkAuthForCopydbCommand(client, dbname, cmdObj);
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     bool run(OperationContext* txn,
              const string& dbName,
@@ -574,7 +640,7 @@ public:
                 "invalid todb argument",
                 NamespaceString::validDBName(todb, NamespaceString::DollarInDbNameBehavior::Allow));
 
-        auto confTo = uassertStatusOK(grid.implicitCreateDb(txn, todb));
+        auto confTo = uassertStatusOK(dbutil::implicitCreateDb(txn, todb));
         uassert(ErrorCodes::IllegalOperation,
                 "cannot copy to a sharded database",
                 !confTo->isShardingEnabled());
@@ -608,7 +674,6 @@ public:
             return adminPassthrough(txn, confTo, fixed, result);
         }
     }
-
 } clusterCopyDBCmd;
 
 class CollectionStats : public PublicGridCommand {
@@ -620,6 +685,10 @@ public:
         ActionSet actions;
         actions.addAction(ActionType::collStats);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    }
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
 
     bool run(OperationContext* txn,
@@ -786,6 +855,9 @@ public:
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
     bool run(OperationContext* txn,
              const string& dbName,
              BSONObj& cmdObj,
@@ -867,6 +939,10 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
 } convertToCappedCmd;
 
 class GroupCmd : public NotAllowedOnShardedCollectionCmd {
@@ -878,6 +954,10 @@ public:
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    }
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
 
     virtual bool passOptions() const {
@@ -964,6 +1044,9 @@ public:
     virtual bool passOptions() const {
         return true;
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
     virtual Status checkAuthForCommand(ClientBasic* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
@@ -1008,6 +1091,9 @@ public:
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
 
     bool run(OperationContext* txn,
@@ -1137,6 +1223,10 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::find));
     }
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
     bool run(OperationContext* txn,
              const string& dbName,
              BSONObj& cmdObj,
@@ -1264,6 +1354,9 @@ public:
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
     bool run(OperationContext* txn,
              const string& dbName,
@@ -1385,6 +1478,9 @@ public:
         // applyOps can do pretty much anything, so require all privileges.
         RoleGraph::generateUniversalPrivileges(out);
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
     virtual bool run(OperationContext* txn,
                      const string& dbName,
                      BSONObj& cmdObj,
@@ -1406,6 +1502,9 @@ public:
         actions.addAction(ActionType::compact);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
     virtual bool run(OperationContext* txn,
                      const string& dbName,
                      BSONObj& cmdObj,
@@ -1425,6 +1524,9 @@ public:
                                        std::vector<Privilege>* out) {
         // $eval can do pretty much anything, so require all privileges.
         RoleGraph::generateUniversalPrivileges(out);
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
     virtual bool run(OperationContext* txn,
                      const string& dbName,
@@ -1471,6 +1573,10 @@ public:
                       str::stream() << "Not authorized to create users on db: " << dbname);
     }
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
     bool run(OperationContext* txn,
              const string& dbName,
              BSONObj& cmdObj,
@@ -1510,6 +1616,10 @@ public:
                           << "Not authorized to list indexes on collection: " << ns.coll());
     }
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
     bool run(OperationContext* txn,
              const string& dbName,
              BSONObj& cmdObj,
@@ -1537,6 +1647,9 @@ public:
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return Status::OK();
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
 
     virtual bool run(OperationContext* txn,

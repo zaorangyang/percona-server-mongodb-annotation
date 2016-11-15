@@ -32,13 +32,13 @@
 #include <vector>
 
 #include "mongo/client/connpool.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/master_slave.h"
@@ -210,6 +210,9 @@ public:
                 "--slave in simple master/slave setups.\n";
         help << "{ isMaster : 1 }";
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
@@ -228,10 +231,8 @@ public:
 
         appendReplicationInfo(txn, result, 0);
 
-        if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::CSRS) {
+        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             result.append("configsvr", 1);
-        } else if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::SCCC) {
-            result.append("configsvr", 0);
         }
 
         result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);

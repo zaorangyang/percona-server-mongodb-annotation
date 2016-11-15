@@ -58,6 +58,9 @@ public:
     bool slaveOk() const override {
         return true;
     }
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
     bool run(mongo::OperationContext* txn,
              const std::string& db,
              BSONObj& cmdObj,

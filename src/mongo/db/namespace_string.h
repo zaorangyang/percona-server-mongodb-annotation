@@ -31,6 +31,7 @@
 #pragma once
 
 #include <algorithm>
+#include <iosfwd>
 #include <string>
 
 #include "mongo/base/string_data.h"
@@ -134,6 +135,9 @@ public:
     bool isSystem() const {
         return coll().startsWith("system.");
     }
+    bool isLocal() const {
+        return db() == "local";
+    }
     bool isSystemDotIndexes() const {
         return coll() == "system.indexes";
     }
@@ -160,6 +164,12 @@ public:
     }
     bool isNormal() const {
         return normal(_ns);
+    }
+
+    // Check if the NamespaceString references a special collection that cannot
+    // be used for generic data storage.
+    bool isVirtualized() const {
+        return virtualized(_ns);
     }
     bool isListCollectionsCursorNS() const;
     bool isListIndexesCursorNS() const;
@@ -227,6 +237,10 @@ public:
 
     static bool special(StringData ns);
 
+    // Check if `ns` references a special collection that cannot be used for
+    // generic data storage.
+    static bool virtualized(StringData ns);
+
     /**
      * Returns true for DBs with special meaning to mongodb.
      */
@@ -290,6 +304,8 @@ private:
     std::string _ns;
     size_t _dotIndex;
 };
+
+std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss);
 
 // "database.a.b.c" -> "database"
 inline StringData nsToDatabaseSubstring(StringData ns) {

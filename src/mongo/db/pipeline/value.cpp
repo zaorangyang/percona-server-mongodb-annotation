@@ -103,9 +103,10 @@ void ValueStorage::putString(StringData s) {
         shortStrSize = s.size();
         s.copyTo(shortStrStorage, false);  // no NUL
 
-        // All memory is zeroed before this is called.
-        // Note this may be past end of shortStrStorage and into nulTerminator
-        dassert(shortStrStorage[sizeNoNUL] == '\0');
+        // All memory is zeroed before this is called, so we know that
+        // the nulTerminator field will definitely contain a NUL byte.
+        dassert(((sizeNoNUL < sizeof(shortStrStorage)) && (shortStrStorage[sizeNoNUL] == '\0')) ||
+                (((shortStrStorage + sizeNoNUL) == &nulTerminator) && (nulTerminator == '\0')));
     } else {
         putRefCountable(RCString::create(s));
     }
@@ -822,7 +823,9 @@ void Value::hash_combine(size_t& seed) const {
 
         case mongo::NumberDecimal: {
             const Decimal128 dcml = getDecimal();
-            if (dcml.toAbs().isGreater(Decimal128(std::numeric_limits<double>::max())) &&
+            if (dcml.toAbs().isGreater(Decimal128(std::numeric_limits<double>::max(),
+                                                  Decimal128::kRoundTo34Digits,
+                                                  Decimal128::kRoundTowardZero)) &&
                 !dcml.isInfinite() && !dcml.isNaN()) {
                 // Normalize our decimal to force equivalent decimals
                 // in the same cohort to hash to the same value
@@ -1240,7 +1243,7 @@ Value Value::deserializeForSorter(BufReader& buf, const SorterDeserializeSetting
         }
 
         case BinData: {
-            BinDataType bdt = BinDataType(buf.read<char>());
+            BinDataType bdt = BinDataType(buf.read<unsigned char>());
             int size = buf.read<LittleEndian<int>>();
             const void* data = buf.skip(size);
             return Value(BSONBinData(data, size, bdt));

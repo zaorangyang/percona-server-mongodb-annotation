@@ -33,6 +33,7 @@
 #include <js/Conversions.h>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/platform/decimal128.h"
 #include "mongo/scripting/mozjs/exception.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/jsstringwrapper.h"
@@ -58,8 +59,15 @@ int ValueWriter::type() {
         return Undefined;
     if (_value.isString())
         return String;
-    if (JS_IsArrayObject(_context, _value))
+
+    bool isArray;
+
+    if (!JS_IsArrayObject(_context, _value, &isArray)) {
+        uasserted(ErrorCodes::BadValue, "unable to check if type is an array");
+    }
+    if (isArray)
         return Array;
+
     if (_value.isBoolean())
         return Bool;
 
@@ -72,8 +80,14 @@ int ValueWriter::type() {
 
     if (_value.isObject()) {
         JS::RootedObject obj(_context, _value.toObjectOrNull());
-        if (JS_ObjectIsDate(_context, obj))
+        bool isDate;
+
+        if (!JS_ObjectIsDate(_context, obj, &isDate)) {
+            uasserted(ErrorCodes::BadValue, "unable to check if type is a date");
+        }
+        if (isDate)
             return Date;
+
         if (JS_ObjectIsFunction(_context, obj))
             return Code;
 
@@ -90,7 +104,14 @@ std::string ValueWriter::typeAsString() {
         return "undefined";
     if (_value.isString())
         return "string";
-    if (JS_IsArrayObject(_context, _value))
+
+    bool isArray;
+
+    if (!JS_IsArrayObject(_context, _value, &isArray)) {
+        uasserted(ErrorCodes::BadValue, "unable to check if type is an array");
+    }
+
+    if (isArray)
         return "array";
     if (_value.isBoolean())
         return "boolean";
@@ -99,10 +120,21 @@ std::string ValueWriter::typeAsString() {
 
     if (_value.isObject()) {
         JS::RootedObject obj(_context, _value.toObjectOrNull());
-        if (JS_IsArrayObject(_context, obj))
+
+        if (!JS_IsArrayObject(_context, obj, &isArray)) {
+            uasserted(ErrorCodes::BadValue, "unable to check if type is an array");
+        }
+        if (isArray)
             return "array";
-        if (JS_ObjectIsDate(_context, obj))
+
+        bool isDate;
+
+        if (!JS_ObjectIsDate(_context, obj, &isDate)) {
+            uasserted(ErrorCodes::BadValue, "unable to check if type is a date");
+        }
+        if (isDate)
             return "date";
+
         if (JS_ObjectIsFunction(_context, obj))
             return "function";
 
@@ -164,7 +196,7 @@ int64_t ValueWriter::toInt64() {
 
 Decimal128 ValueWriter::toDecimal128() {
     if (_value.isNumber()) {
-        return Decimal128(toNumber());
+        return Decimal128(toNumber(), Decimal128::kRoundTo15Digits);
     }
 
     if (getScope(_context)->getProto<NumberIntInfo>().instanceOf(_value))

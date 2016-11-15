@@ -35,8 +35,8 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/functional.h"
-#include "mongo/util/decorable.h"
 #include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/tick_source.h"
 
 namespace mongo {
@@ -312,6 +312,16 @@ public:
      * Returns the tick/clock source set in this context.
      */
     TickSource* getTickSource() const;
+
+    /**
+     * Get a ClockSource implementation that may be less precise than the _preciseClockSource but
+     * may be cheaper to call.
+     */
+    ClockSource* getFastClockSource() const;
+
+    /**
+     * Get a ClockSource implementation that is very precise but may be expensive to call.
+     */
     ClockSource* getPreciseClockSource() const;
 
     /**
@@ -319,7 +329,18 @@ public:
      * destroyed. So make sure that no one is using the old source when calling this.
      */
     void setTickSource(std::unique_ptr<TickSource> newSource);
-    void setClockSource(std::unique_ptr<ClockSource> newSource);
+
+    /**
+     * Call this method with a ClockSource implementation that may be less precise than
+     * the _preciseClockSource but may be cheaper to call.
+     */
+    void setFastClockSource(std::unique_ptr<ClockSource> newSource);
+
+    /**
+     * Call this method with a ClockSource implementation that is very precise but
+     * may be expensive to call.
+     */
+    void setPreciseClockSource(std::unique_ptr<ClockSource> newSource);
 
 protected:
     ServiceContext() = default;
@@ -343,7 +364,17 @@ private:
     ClientSet _clients;
 
     std::unique_ptr<TickSource> _tickSource;
-    std::unique_ptr<ClockSource> _clockSource;
+
+    /**
+     * A ClockSource implementation that may be less precise than the _preciseClockSource but
+     * may be cheaper to call.
+     */
+    std::unique_ptr<ClockSource> _fastClockSource;
+
+    /**
+     * A ClockSource implementation that is very precise but may be expensive to call.
+     */
+    std::unique_ptr<ClockSource> _preciseClockSource;
 };
 
 /**

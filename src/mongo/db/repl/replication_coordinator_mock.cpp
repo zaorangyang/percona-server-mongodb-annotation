@@ -49,7 +49,7 @@ ReplicationCoordinatorMock::ReplicationCoordinatorMock(const ReplSettings& setti
     : _settings(settings) {}
 ReplicationCoordinatorMock::~ReplicationCoordinatorMock() {}
 
-void ReplicationCoordinatorMock::startReplication(OperationContext* txn) {
+void ReplicationCoordinatorMock::startup(OperationContext* txn) {
     // TODO
 }
 
@@ -375,11 +375,6 @@ Status ReplicationCoordinatorMock::processReplSetRequestVotes(
     OperationContext* txn,
     const ReplSetRequestVotesArgs& args,
     ReplSetRequestVotesResponse* response) {
-    return Status::OK();
-}
-
-Status ReplicationCoordinatorMock::processReplSetDeclareElectionWinner(
-    const ReplSetDeclareElectionWinnerArgs& args, long long* responseTerm) {
     return Status::OK();
 }
 

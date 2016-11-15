@@ -63,7 +63,7 @@
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/password_digest.h"
@@ -760,7 +760,7 @@ list<BSONObj> DBClientWithCommands::getCollectionInfos(const string& db, const B
     while (c->more()) {
         BSONObj obj = c->nextSafe();
         string ns = obj["name"].valuestr();
-        if (ns.find("$") != string::npos)
+        if (NamespaceString::virtualized(ns))
             continue;
         BSONObjBuilder b;
         b.append("name", ns.substr(db.size() + 1));

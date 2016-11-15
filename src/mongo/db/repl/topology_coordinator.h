@@ -208,8 +208,7 @@ public:
     ////////////////////////////////////////////////////////////
 
     // produces a reply to a replSetSyncFrom command
-    virtual void prepareSyncFromResponse(const ReplicationExecutor::CallbackArgs& data,
-                                         const HostAndPort& target,
+    virtual void prepareSyncFromResponse(const HostAndPort& target,
                                          const OpTime& lastOpApplied,
                                          BSONObjBuilder* response,
                                          Status* result) = 0;
@@ -254,8 +253,7 @@ public:
     };
 
     // produce a reply to a status request
-    virtual void prepareStatusResponse(const ReplicationExecutor::CallbackArgs& data,
-                                       const ReplSetStatusArgs& rsStatusArgs,
+    virtual void prepareStatusResponse(const ReplSetStatusArgs& rsStatusArgs,
                                        BSONObjBuilder* response,
                                        Status* result) = 0;
 
@@ -433,15 +431,6 @@ public:
     virtual void processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
                                             ReplSetRequestVotesResponse* response,
                                             const OpTime& lastAppliedOpTime) = 0;
-
-    /**
-     * Determines whether or not the newly elected primary is valid from our perspective.
-     * If it is, sets the _currentPrimaryIndex and term to the received values.
-     * If it is not, return ErrorCode::BadValue and the current term from our perspective.
-     * Populate responseTerm with the current term from our perspective.
-     */
-    virtual Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
-                                                       long long* responseTerm) = 0;
 
     /**
      * Loads an initial LastVote document, which was read from local storage.

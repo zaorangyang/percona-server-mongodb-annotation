@@ -32,7 +32,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/strategy.h"
+#include "mongo/s/commands/strategy.h"
 
 namespace mongo {
 
@@ -68,6 +68,10 @@ public:
         return true;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
     void help(stringstream& ss) const {
         ss << _helpText;

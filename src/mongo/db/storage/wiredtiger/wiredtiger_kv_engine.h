@@ -57,8 +57,7 @@ public:
                        bool durable,
                        bool ephemeral,
                        bool repair,
-                       bool readOnly,
-                       bool cacheInMB = false);
+                       bool readOnly);
 
     virtual ~WiredTigerKVEngine();
 

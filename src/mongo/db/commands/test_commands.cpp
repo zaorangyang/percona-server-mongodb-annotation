@@ -44,7 +44,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/log.h"
@@ -63,6 +62,9 @@ public:
         return false;
     }
     virtual bool slaveOk() const {
+        return true;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
     // No auth needed because it only works when enabled via command line.
@@ -99,7 +101,8 @@ public:
                 return false;
             }
         }
-        Status status = collection->insertDocument(txn, obj, false);
+        OpDebug* const nullOpDebug = nullptr;
+        Status status = collection->insertDocument(txn, obj, nullOpDebug, false);
         if (status.isOK()) {
             wunit.commit();
         }
@@ -110,6 +113,10 @@ public:
 /* for diagnostic / testing purposes. Enabled via command line. */
 class CmdSleep : public Command {
 public:
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
     virtual bool adminOnly() const {
         return true;
     }
@@ -204,6 +211,9 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -214,7 +224,7 @@ public:
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        const std::string fullNs = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString fullNs = parseNsCollectionRequired(dbname, cmdObj);
         int n = cmdObj.getIntField("n");
         bool inc = cmdObj.getBoolField("inc");  // inclusive range?
 
@@ -223,14 +233,14 @@ public:
                                        {ErrorCodes::BadValue, "n must be a positive integer"});
         }
 
-        OldClientWriteContext ctx(txn, fullNs);
+        OldClientWriteContext ctx(txn, fullNs.ns());
         Collection* collection = ctx.getCollection();
 
         if (!collection) {
             return appendCommandStatus(
                 result,
                 {ErrorCodes::NamespaceNotFound,
-                 str::stream() << "collection " << fullNs << " does not exist"});
+                 str::stream() << "collection " << fullNs.ns() << " does not exist"});
         }
 
         if (!collection->isCapped()) {
@@ -243,8 +253,12 @@ public:
             // Scan backwards through the collection to find the document to start truncating from.
             // We will remove 'n' documents, so start truncating from the (n + 1)th document to the
             // end.
-            std::unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
-                txn, fullNs, collection, PlanExecutor::YIELD_MANUAL, InternalPlanner::BACKWARD));
+            std::unique_ptr<PlanExecutor> exec(
+                InternalPlanner::collectionScan(txn,
+                                                fullNs.ns(),
+                                                collection,
+                                                PlanExecutor::YIELD_MANUAL,
+                                                InternalPlanner::BACKWARD));
 
             for (int i = 0; i < n + 1; ++i) {
                 PlanExecutor::ExecState state = exec->getNext(nullptr, &end);
@@ -271,6 +285,9 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -282,9 +299,9 @@ public:
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString nss = parseNsCollectionRequired(dbname, cmdObj);
 
-        return appendCommandStatus(result, emptyCapped(txn, NamespaceString(ns)));
+        return appendCommandStatus(result, emptyCapped(txn, nss));
     }
 };
 

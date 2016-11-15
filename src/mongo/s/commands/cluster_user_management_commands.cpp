@@ -44,7 +44,9 @@
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/write_ops/wc_error_detail.h"
 
 namespace mongo {
 
@@ -62,6 +64,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(stringstream& ss) const {
         ss << "Adds a user to the system";
@@ -97,6 +103,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(stringstream& ss) const {
         ss << "Used to update a user, for example to change its password";
@@ -144,6 +154,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
     virtual void help(stringstream& ss) const {
         ss << "Drops a single user.";
     }
@@ -188,6 +202,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
     virtual void help(stringstream& ss) const {
         ss << "Drops all users for a single database.";
     }
@@ -224,6 +242,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(stringstream& ss) const {
         ss << "Grants roles to a user.";
@@ -269,6 +291,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(stringstream& ss) const {
         ss << "Revokes roles from a user.";
@@ -317,6 +343,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
     CmdUsersInfo() : Command("usersInfo") {}
 
     virtual void help(stringstream& ss) const {
@@ -349,6 +379,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
     virtual void help(stringstream& ss) const {
         ss << "Adds a role to the system";
     }
@@ -379,6 +413,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(stringstream& ss) const {
         ss << "Used to update a role";
@@ -417,6 +455,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
     virtual void help(stringstream& ss) const {
         ss << "Grants privileges to a role";
     }
@@ -453,6 +495,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(stringstream& ss) const {
         ss << "Revokes privileges from a role";
@@ -491,6 +537,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
     virtual void help(stringstream& ss) const {
         ss << "Grants roles to another role.";
     }
@@ -528,6 +578,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
     virtual void help(stringstream& ss) const {
         ss << "Revokes roles from another role.";
     }
@@ -564,6 +618,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(stringstream& ss) const {
         ss << "Drops a single role.  Before deleting the role completely it must remove it "
@@ -604,6 +662,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(stringstream& ss) const {
         ss << "Drops all roles from the given database.  Before deleting the roles completely "
@@ -650,6 +712,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
     virtual void help(stringstream& ss) const {
         ss << "Returns information about roles.";
     }
@@ -683,6 +749,10 @@ public:
         return true;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
     virtual void help(stringstream& ss) const {
         ss << "Invalidates the in-memory cache of user information";
@@ -727,6 +797,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
     virtual bool adminOnly() const {
         return true;
     }
@@ -761,7 +835,10 @@ namespace {
  * Upgrades each shard serially, and stops on first failure.  Returned error indicates that
  * failure.
  */
-Status runUpgradeOnAllShards(OperationContext* txn, int maxSteps, const BSONObj& writeConcern) {
+Status runUpgradeOnAllShards(OperationContext* txn,
+                             int maxSteps,
+                             const BSONObj& writeConcern,
+                             BSONObjBuilder& result) {
     BSONObjBuilder cmdObjBuilder;
     cmdObjBuilder.append("authSchemaUpgrade", 1);
     cmdObjBuilder.append("maxSteps", maxSteps);
@@ -776,6 +853,7 @@ Status runUpgradeOnAllShards(OperationContext* txn, int maxSteps, const BSONObj&
     vector<string> shardIds;
     shardRegistry->getAllShardIds(&shardIds);
 
+    bool hasWCError = false;
     for (const auto& shardId : shardIds) {
         auto cmdResult = shardRegistry->runIdempotentCommandOnShard(
             txn, shardId, ReadPreferenceSetting{ReadPreference::PrimaryOnly}, "admin", cmdObj);
@@ -784,6 +862,14 @@ Status runUpgradeOnAllShards(OperationContext* txn, int maxSteps, const BSONObj&
             return Status(cmdResult.getStatus().code(),
                           str::stream() << "Failed to run authSchemaUpgrade on shard " << shardId
                                         << causedBy(cmdResult.getStatus()));
+        }
+
+        // If the result has a writeConcernError, append it.
+        if (!hasWCError) {
+            if (auto wcErrorElem = cmdResult.getValue()["writeConcernError"]) {
+                appendWriteConcernErrorToCmdResponse(shardId, wcErrorElem, result);
+                hasWCError = true;
+            }
         }
     }
 
@@ -803,6 +889,10 @@ public:
         return true;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(stringstream& ss) const {
         ss << "Upgrades the auth data storage schema";
@@ -834,9 +924,20 @@ public:
 
         // Optionally run the authSchemaUpgrade command on the individual shards
         if (parsedArgs.shouldUpgradeShards) {
-            status = runUpgradeOnAllShards(txn, parsedArgs.maxSteps, parsedArgs.writeConcern);
-            if (!status.isOK())
-                return appendCommandStatus(result, status);
+            status =
+                runUpgradeOnAllShards(txn, parsedArgs.maxSteps, parsedArgs.writeConcern, result);
+            if (!status.isOK()) {
+                // If the status is a write concern error, append a writeConcernError instead of
+                // and error message.
+                if (ErrorCodes::isWriteConcernError(status.code())) {
+                    WCErrorDetail wcError;
+                    wcError.setErrMessage(status.reason());
+                    wcError.setErrCode(status.code());
+                    result.append("writeConcernError", wcError.toBSON());
+                } else {
+                    return appendCommandStatus(result, status);
+                }
+            }
         }
         return true;
     }

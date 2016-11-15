@@ -34,7 +34,6 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/stdx/memory.h"
 
@@ -49,7 +48,7 @@ CatalogManagerMock::CatalogManagerMock() {
 
 CatalogManagerMock::~CatalogManagerMock() = default;
 
-Status CatalogManagerMock::startup(OperationContext* txn) {
+Status CatalogManagerMock::startup() {
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
@@ -86,8 +85,8 @@ Status CatalogManagerMock::updateDatabase(OperationContext* txn,
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
-StatusWith<OpTimePair<DatabaseType>> CatalogManagerMock::getDatabase(OperationContext* txn,
-                                                                     const string& dbName) {
+StatusWith<repl::OpTimeWith<DatabaseType>> CatalogManagerMock::getDatabase(OperationContext* txn,
+                                                                           const string& dbName) {
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
@@ -97,8 +96,8 @@ Status CatalogManagerMock::updateCollection(OperationContext* txn,
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
-StatusWith<OpTimePair<CollectionType>> CatalogManagerMock::getCollection(OperationContext* txn,
-                                                                         const string& collNs) {
+StatusWith<repl::OpTimeWith<CollectionType>> CatalogManagerMock::getCollection(
+    OperationContext* txn, const string& collNs) {
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
@@ -140,7 +139,7 @@ StatusWith<string> CatalogManagerMock::getTagForChunk(OperationContext* txn,
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
-StatusWith<OpTimePair<std::vector<ShardType>>> CatalogManagerMock::getAllShards(
+StatusWith<repl::OpTimeWith<std::vector<ShardType>>> CatalogManagerMock::getAllShards(
     OperationContext* txn) {
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
@@ -190,8 +189,7 @@ Status CatalogManagerMock::logChange(OperationContext* txn,
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
-StatusWith<SettingsType> CatalogManagerMock::getGlobalSettings(OperationContext* txn,
-                                                               const string& key) {
+StatusWith<BSONObj> CatalogManagerMock::getGlobalSettings(OperationContext* txn, StringData key) {
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
@@ -235,5 +233,7 @@ Status CatalogManagerMock::appendInfoForConfigServerDatabases(OperationContext* 
                                                               BSONArrayBuilder* builder) {
     return Status::OK();
 }
+
+void CatalogManagerMock::appendConnectionStats(executor::ConnectionPoolStats* stats) {}
 
 }  // namespace mongo

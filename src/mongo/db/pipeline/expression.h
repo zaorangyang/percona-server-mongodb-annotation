@@ -852,6 +852,13 @@ public:
 };
 
 
+class ExpressionIn final : public ExpressionFixedArity<ExpressionIn, 2> {
+public:
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+
 class ExpressionLet final : public Expression {
 public:
     boost::intrusive_ptr<Expression> optimize() final;
@@ -1135,6 +1142,25 @@ class ExpressionRange final : public ExpressionRangedArity<ExpressionRange, 2, 3
 };
 
 
+class ExpressionReduce final : public Expression {
+public:
+    void addDependencies(DepsTracker* deps, std::vector<std::string>* path = nullptr) const final;
+    Value evaluateInternal(Variables* vars) const final;
+    boost::intrusive_ptr<Expression> optimize() final;
+    static boost::intrusive_ptr<Expression> parse(BSONElement expr,
+                                                  const VariablesParseState& vpsIn);
+    Value serialize(bool explain) const final;
+
+private:
+    boost::intrusive_ptr<Expression> _input;
+    boost::intrusive_ptr<Expression> _initial;
+    boost::intrusive_ptr<Expression> _in;
+
+    Variables::Id _valueVar;
+    Variables::Id _thisVar;
+};
+
+
 class ExpressionSecond final : public ExpressionFixedArity<ExpressionSecond, 1> {
 public:
     Value evaluateInternal(Variables* vars) const final;
@@ -1275,6 +1301,25 @@ class ExpressionSubtract final : public ExpressionFixedArity<ExpressionSubtract,
 public:
     Value evaluateInternal(Variables* vars) const final;
     const char* getOpName() const final;
+};
+
+
+class ExpressionSwitch final : public ExpressionFixedArity<ExpressionSwitch, 1> {
+public:
+    void addDependencies(DepsTracker* deps, std::vector<std::string>* path = nullptr) const final;
+    Value evaluateInternal(Variables* vars) const final;
+    boost::intrusive_ptr<Expression> optimize() final;
+    static boost::intrusive_ptr<Expression> parse(BSONElement expr,
+                                                  const VariablesParseState& vpsIn);
+    Value serialize(bool explain) const final;
+    const char* getOpName() const final;
+
+private:
+    using ExpressionPair =
+        std::pair<boost::intrusive_ptr<Expression>, boost::intrusive_ptr<Expression>>;
+
+    boost::intrusive_ptr<Expression> _default;
+    std::vector<ExpressionPair> _branches;
 };
 
 

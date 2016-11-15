@@ -73,16 +73,6 @@ static bool twoDWontWrap(const Circle& circle, const IndexEntry& index) {
     return ret;
 }
 
-static bool collatorsMatch(const CollatorInterface* lhs, const CollatorInterface* rhs) {
-    if (lhs == nullptr && rhs == nullptr) {
-        return true;
-    }
-    if (lhs == nullptr || rhs == nullptr) {
-        return false;
-    }
-    return (*lhs == *rhs);
-}
-
 // Checks whether 'node' contains any comparison to an element of type 'type'. Nested objects and
 // arrays are not checked recursively. We assume 'node' is bounds-generating or is a recursive child
 // of a bounds-generating node, i.e. it does not contain AND, OR, ELEM_MATCH_OBJECT, or NOR.
@@ -188,7 +178,7 @@ bool QueryPlannerIXSelect::compatible(const BSONElement& elt,
 
     // String comparisons require the collators to match.
     if (boundsGeneratingNodeContainsComparisonToType(node, BSONType::String) &&
-        !collatorsMatch(collator, index.collator)) {
+        !CollatorInterface::collatorsMatch(collator, index.collator)) {
         return false;
     }
 
@@ -464,6 +454,28 @@ void clearAssignments(MatchExpression* node) {
 
     for (size_t i = 0; i < node->numChildren(); i++) {
         clearAssignments(node->getChild(i));
+    }
+}
+
+/**
+ * Finds bounds-generating leaf nodes in the subtree rooted at 'node' that are logically AND'ed
+ * together in the match expression tree, and returns them in the 'andRelated' out-parameter.
+ * Logical nodes like OR and array nodes other than elemMatch object are instead returned in the
+ * 'other' out-parameter.
+ */
+void partitionAndRelatedPreds(MatchExpression* node,
+                              std::vector<MatchExpression*>* andRelated,
+                              std::vector<MatchExpression*>* other) {
+    for (size_t i = 0; i < node->numChildren(); ++i) {
+        MatchExpression* child = node->getChild(i);
+        if (Indexability::isBoundsGenerating(child)) {
+            andRelated->push_back(child);
+        } else if (MatchExpression::ELEM_MATCH_OBJECT == child->matchType() ||
+                   MatchExpression::AND == child->matchType()) {
+            partitionAndRelatedPreds(child, andRelated, other);
+        } else {
+            other->push_back(child);
+        }
     }
 }
 
@@ -754,14 +766,24 @@ static void stripInvalidAssignmentsTo2dsphereIndex(MatchExpression* node, size_t
 
     bool hasGeoField = false;
 
-    for (size_t i = 0; i < node->numChildren(); ++i) {
-        MatchExpression* child = node->getChild(i);
+    // Split 'node' into those leaf predicates that are logically AND-related and everything else.
+    std::vector<MatchExpression*> andRelated;
+    std::vector<MatchExpression*> other;
+    partitionAndRelatedPreds(node, &andRelated, &other);
+
+    // Traverse through non and-related leaf nodes. These are generally logical nodes like OR, and
+    // there may be some assignments hiding inside that need to be stripped.
+    for (auto child : other) {
+        stripInvalidAssignmentsTo2dsphereIndex(child, idx);
+    }
+
+    // Traverse through the and-related leaf nodes. We strip all assignments to such nodes unless we
+    // find an assigned geo predicate.
+    for (auto child : andRelated) {
         RelevantTag* tag = static_cast<RelevantTag*>(child->getTag());
 
-        if (NULL == tag) {
-            // 'child' could be a logical operator.  Maybe there are some assignments hiding
-            // inside.
-            stripInvalidAssignmentsTo2dsphereIndex(child, idx);
+        if (!tag) {
+            // No tags to strip.
             continue;
         }
 
@@ -777,18 +799,14 @@ static void stripInvalidAssignmentsTo2dsphereIndex(MatchExpression* node, size_t
                 MatchExpression::GEO_NEAR == child->matchType()) {
                 hasGeoField = true;
             }
-        } else {
-            // Recurse on the children to ensure that they're not hiding any assignments
-            // to idx.
-            stripInvalidAssignmentsTo2dsphereIndex(child, idx);
         }
     }
 
     // If there isn't a geo predicate our results aren't a subset of what's in the geo index, so
     // if we use the index we'll miss results.
     if (!hasGeoField) {
-        for (size_t i = 0; i < node->numChildren(); ++i) {
-            stripInvalidAssignmentsTo2dsphereIndex(node->getChild(i), idx);
+        for (auto child : andRelated) {
+            stripInvalidAssignmentsTo2dsphereIndex(child, idx);
         }
     }
 }

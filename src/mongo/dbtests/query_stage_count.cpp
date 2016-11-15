@@ -28,6 +28,9 @@
 
 #include <memory>
 
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/collection_scan_common.h"
@@ -38,7 +41,6 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace QueryStageCount {
@@ -52,8 +54,7 @@ const int kInterjections = kDocuments;
 class CountStageTest {
 public:
     CountStageTest()
-        : _txn(),
-          _scopedXact(&_txn, MODE_IX),
+        : _scopedXact(&_txn, MODE_IX),
           _dbLock(_txn.lockState(), nsToDatabaseSubstring(ns()), MODE_X),
           _ctx(&_txn, ns()),
           _coll(NULL) {}
@@ -104,13 +105,15 @@ public:
 
     void insert(const BSONObj& doc) {
         WriteUnitOfWork wunit(&_txn);
-        _coll->insertDocument(&_txn, doc, false);
+        OpDebug* const nullOpDebug = nullptr;
+        _coll->insertDocument(&_txn, doc, nullOpDebug, false);
         wunit.commit();
     }
 
     void remove(const RecordId& recordId) {
         WriteUnitOfWork wunit(&_txn);
-        _coll->deleteDocument(&_txn, recordId);
+        OpDebug* const nullOpDebug = nullptr;
+        _coll->deleteDocument(&_txn, recordId, nullOpDebug);
         wunit.commit();
     }
 
@@ -224,7 +227,8 @@ public:
 
 protected:
     vector<RecordId> _recordIds;
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     ScopedTransaction _scopedXact;
     Lock::DBLock _dbLock;
     OldClientContext _ctx;

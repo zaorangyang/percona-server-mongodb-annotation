@@ -46,14 +46,19 @@
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
-#include "mongo/rpc/metadata/config_server_metadata.h"
+#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/sharding_network_connection_hook.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharding_egress_metadata_hook.h"
+#include "mongo/s/sharding_egress_metadata_hook_for_mongos.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/replset/catalog_manager_replica_set.h"
 #include "mongo/s/catalog/replset/dist_lock_catalog_impl.h"
 #include "mongo/s/catalog/replset/replset_dist_lock_manager.h"
+#include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -68,6 +73,11 @@ using executor::NetworkInterfaceThreadPool;
 using executor::TaskExecutorPool;
 using executor::ThreadPoolTaskExecutor;
 
+std::unique_ptr<ThreadPoolTaskExecutor> makeTaskExecutor(std::unique_ptr<NetworkInterface> net) {
+    auto netPtr = net.get();
+    return stdx::make_unique<ThreadPoolTaskExecutor>(
+        stdx::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
+}
 
 std::unique_ptr<CatalogManager> makeCatalogManager(ServiceContext* service,
                                                    ShardRegistry* shardRegistry,
@@ -86,73 +96,26 @@ std::unique_ptr<CatalogManager> makeCatalogManager(ServiceContext* service,
                                                   ReplSetDistLockManager::kDistLockPingInterval,
                                                   ReplSetDistLockManager::kDistLockExpirationTime);
 
-    return stdx::make_unique<CatalogManagerReplicaSet>(std::move(distLockManager));
+    return stdx::make_unique<CatalogManagerReplicaSet>(
+        std::move(distLockManager),
+        makeTaskExecutor(
+            executor::makeNetworkInterface("NetworkInterfaceASIO-AddShard-TaskExecutor")));
 }
 
-
-// Same logic as sharding_connection_hook.cpp.
-class ShardingEgressMetadataHook final : public rpc::EgressMetadataHook {
-public:
-    Status writeRequestMetadata(const HostAndPort& target, BSONObjBuilder* metadataBob) override {
-        try {
-            audit::writeImpersonatedUsersToMetadata(metadataBob);
-
-            // Add config server optime to metadata sent to shards.
-            auto shard = grid.shardRegistry()->getShardForHostNoReload(target);
-            if (!shard) {
-                return Status(ErrorCodes::ShardNotFound,
-                              str::stream() << "Shard not found for server: " << target.toString());
-            }
-            if (shard->isConfig()) {
-                return Status::OK();
-            }
-            rpc::ConfigServerMetadata(grid.shardRegistry()->getConfigOpTime())
-                .writeToMetadata(metadataBob);
-
-            return Status::OK();
-        } catch (...) {
-            return exceptionToStatus();
-        }
-    }
-
-    Status readReplyMetadata(const HostAndPort& replySource, const BSONObj& metadataObj) override {
-        try {
-            saveGLEStats(metadataObj, replySource.toString());
-
-            auto shard = grid.shardRegistry()->getShardForHostNoReload(replySource);
-            if (!shard) {
-                return Status::OK();
-            }
-            // If this host is a known shard of ours, look for a config server optime in the
-            // response metadata to use to update our notion of the current config server optime.
-            auto responseStatus = rpc::ConfigServerMetadata::readFromMetadata(metadataObj);
-            if (!responseStatus.isOK()) {
-                return responseStatus.getStatus();
-            }
-            auto opTime = responseStatus.getValue().getOpTime();
-            if (opTime.is_initialized()) {
-                grid.shardRegistry()->advanceConfigOpTime(opTime.get());
-            }
-            return Status::OK();
-        } catch (...) {
-            return exceptionToStatus();
-        }
-    }
-};
-
-std::unique_ptr<ThreadPoolTaskExecutor> makeTaskExecutor(std::unique_ptr<NetworkInterface> net) {
-    auto netPtr = net.get();
-    return stdx::make_unique<ThreadPoolTaskExecutor>(
-        stdx::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
-}
-
-std::unique_ptr<TaskExecutorPool> makeTaskExecutorPool(std::unique_ptr<NetworkInterface> fixedNet) {
+std::unique_ptr<TaskExecutorPool> makeTaskExecutorPool(std::unique_ptr<NetworkInterface> fixedNet,
+                                                       bool isMongos) {
     std::vector<std::unique_ptr<executor::TaskExecutor>> executors;
     for (size_t i = 0; i < TaskExecutorPool::getSuggestedPoolSize(); ++i) {
+        std::unique_ptr<rpc::EgressMetadataHook> metadataHook;
+        if (isMongos) {
+            metadataHook = stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>();
+        } else {
+            metadataHook = stdx::make_unique<rpc::ShardingEgressMetadataHook>();
+        };
         auto net = executor::makeNetworkInterface(
             "NetworkInterfaceASIO-TaskExecutorPool-" + std::to_string(i),
             stdx::make_unique<ShardingNetworkConnectionHook>(),
-            stdx::make_unique<ShardingEgressMetadataHook>());
+            std::move(metadataHook));
         auto netPtr = net.get();
         auto exec = stdx::make_unique<ThreadPoolTaskExecutor>(
             stdx::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
@@ -170,44 +133,79 @@ std::unique_ptr<TaskExecutorPool> makeTaskExecutorPool(std::unique_ptr<NetworkIn
     return executorPool;
 }
 
-}  // namespace
-
-Status initializeGlobalShardingState(OperationContext* txn, const ConnectionString& configCS) {
+Status initializeGlobalShardingState(const ConnectionString& configCS,
+                                     uint64_t maxChunkSizeBytes,
+                                     bool isMongos) {
     if (configCS.type() == ConnectionString::INVALID) {
         return {ErrorCodes::BadValue, "Unrecognized connection string."};
+    }
+
+    std::unique_ptr<rpc::EgressMetadataHook> metadataHook;
+    if (isMongos) {
+        metadataHook = stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>();
+    } else {
+        metadataHook = stdx::make_unique<rpc::ShardingEgressMetadataHook>();
     }
 
     auto network =
         executor::makeNetworkInterface("NetworkInterfaceASIO-ShardRegistry",
                                        stdx::make_unique<ShardingNetworkConnectionHook>(),
-                                       stdx::make_unique<ShardingEgressMetadataHook>());
+                                       std::move(metadataHook));
     auto networkPtr = network.get();
-    auto shardRegistry(
-        stdx::make_unique<ShardRegistry>(stdx::make_unique<RemoteCommandTargeterFactoryImpl>(),
-                                         makeTaskExecutorPool(std::move(network)),
-                                         networkPtr,
-                                         makeTaskExecutor(executor::makeNetworkInterface(
-                                             "NetworkInterfaceASIO-ShardRegistry-TaskExecutor")),
-                                         configCS));
+    auto executorPool = makeTaskExecutorPool(std::move(network), isMongos);
+    executorPool->startup();
+
+    auto shardFactory(
+        stdx::make_unique<ShardFactory>(stdx::make_unique<RemoteCommandTargeterFactoryImpl>()));
+    auto shardRegistry(stdx::make_unique<ShardRegistry>(std::move(shardFactory), configCS));
 
     auto catalogManager = makeCatalogManager(getGlobalServiceContext(),
                                              shardRegistry.get(),
                                              HostAndPort(getHostName(), serverGlobalParams.port));
 
-    shardRegistry->startup();
-    grid.init(std::move(catalogManager),
-              std::move(shardRegistry),
-              stdx::make_unique<ClusterCursorManager>(
-                  getGlobalServiceContext()->getPreciseClockSource()));
+    auto rawCatalogManager = catalogManager.get();
+    grid.init(
+        std::move(catalogManager),
+        stdx::make_unique<CatalogCache>(),
+        std::move(shardRegistry),
+        stdx::make_unique<ClusterCursorManager>(getGlobalServiceContext()->getPreciseClockSource()),
+        stdx::make_unique<BalancerConfiguration>(maxChunkSizeBytes),
+        std::move(executorPool),
+        networkPtr);
+
+    Status status = rawCatalogManager->startup();
+    if (!status.isOK()) {
+        return status;
+    }
+
+    return Status::OK();
+}
+
+}  // namespace
+
+Status initializeGlobalShardingStateForMongos(const ConnectionString& configCS,
+                                              uint64_t maxChunkSizeBytes) {
+    return initializeGlobalShardingState(configCS, maxChunkSizeBytes, true);
+}
+
+Status initializeGlobalShardingStateForMongod(const ConnectionString& configCS) {
+    return initializeGlobalShardingState(
+        configCS, ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes, false);
+}
+
+Status reloadShardRegistryUntilSuccess(OperationContext* txn) {
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        return Status::OK();
+    }
 
     while (!inShutdown()) {
-        try {
-            Status status = grid.catalogManager(txn)->startup(txn);
-            uassertStatusOK(status);
+        auto stopStatus = txn->checkForInterruptNoAssert();
+        if (!stopStatus.isOK()) {
+            return stopStatus;
+        }
 
-            if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::NONE) {
-                grid.shardRegistry()->reload(txn);
-            }
+        try {
+            grid.shardRegistry()->reload(txn);
             return Status::OK();
         } catch (const DBException& ex) {
             Status status = ex.toStatus();
@@ -225,7 +223,7 @@ Status initializeGlobalShardingState(OperationContext* txn, const ConnectionStri
         }
     }
 
-    return Status::OK();
+    return {ErrorCodes::ShutdownInProgress, "aborting shard loading attempt"};
 }
 
 }  // namespace mongo

@@ -41,7 +41,7 @@ public:
             "log=(enabled=false),"
             "file_manager=(close_idle_time=0),"
             "checkpoint=(wait=0,log_size=0)",
-            100, false, true, false, readOnly, true));
+            100, false, true, false, readOnly));
     }
 
     virtual ~InMemoryKVHarnessHelper() {

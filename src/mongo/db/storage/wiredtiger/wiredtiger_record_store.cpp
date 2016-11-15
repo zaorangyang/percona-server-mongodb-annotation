@@ -1367,12 +1367,12 @@ StatusWith<RecordId> WiredTigerRecordStore::insertRecord(OperationContext* txn,
     return insertRecord(txn, buf.get(), len, enforceQuota);
 }
 
-StatusWith<RecordId> WiredTigerRecordStore::updateRecord(OperationContext* txn,
-                                                         const RecordId& id,
-                                                         const char* data,
-                                                         int len,
-                                                         bool enforceQuota,
-                                                         UpdateNotifier* notifier) {
+Status WiredTigerRecordStore::updateRecord(OperationContext* txn,
+                                           const RecordId& id,
+                                           const char* data,
+                                           int len,
+                                           bool enforceQuota,
+                                           UpdateNotifier* notifier) {
     WiredTigerCursor curwrap(_uri, _tableId, true, txn);
     curwrap.assertInActiveTxn();
     WT_CURSOR* c = curwrap.get();
@@ -1402,7 +1402,7 @@ StatusWith<RecordId> WiredTigerRecordStore::updateRecord(OperationContext* txn,
         cappedDeleteAsNeeded(txn, id);
     }
 
-    return StatusWith<RecordId>(id);
+    return Status::OK();
 }
 
 bool WiredTigerRecordStore::updateWithDamagesSupported() const {
@@ -1504,7 +1504,7 @@ Status WiredTigerRecordStore::validate(OperationContext* txn,
         if (err == EBUSY) {
             const char* msg = "verify() returned EBUSY. Not treating as invalid.";
             warning() << msg;
-            results->errors.push_back(msg);
+            results->warnings.push_back(msg);
         } else if (err) {
             std::string msg = str::stream() << "verify() returned " << wiredtiger_strerror(err)
                                             << ". "
@@ -1521,7 +1521,10 @@ Status WiredTigerRecordStore::validate(OperationContext* txn,
     long long dataSizeTotal = 0;
     results->valid = true;
     Cursor cursor(txn, *this, true);
+    int interruptInterval = 4096;
     while (auto record = cursor.next()) {
+        if (!(nrecords % interruptInterval))
+            txn->checkForInterrupt();
         ++nrecords;
         auto dataSize = record->data.size();
         dataSizeTotal += dataSize;

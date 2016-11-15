@@ -180,6 +180,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
     CmdDropDatabase() : Command("dropDatabase") {}
 
     bool run(OperationContext* txn,
@@ -235,6 +239,10 @@ public:
         help << "repair database.  also compacts. note: slow.";
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -308,6 +316,10 @@ public:
         help << "http://docs.mongodb.org/manual/reference/command/profile/#dbcmd.profile";
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
     virtual Status checkAuthForCommand(ClientBasic* client,
                                        const std::string& dbname,
@@ -410,6 +422,10 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {
@@ -474,27 +490,31 @@ public:
     }
 
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
     virtual bool run(OperationContext* txn,
                      const string& dbname,
                      BSONObj& cmdObj,
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        const std::string nsToDrop = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString nsToDrop = parseNsCollectionRequired(dbname, cmdObj);
 
-        if (nsToDrop.find('$') != string::npos) {
-            errmsg = "can't drop collection with reserved $ character in name";
+        if (NamespaceString::virtualized(nsToDrop.ns())) {
+            errmsg = "can't drop a virtual collection";
             return false;
         }
 
         if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
              repl::ReplicationCoordinator::modeNone) &&
-            NamespaceString(nsToDrop).isOplog()) {
+            nsToDrop.isOplog()) {
             errmsg = "can't drop live oplog while replicating";
             return false;
         }
 
-        return appendCommandStatus(result, dropCollection(txn, NamespaceString(nsToDrop), result));
+        return appendCommandStatus(result, dropCollection(txn, nsToDrop, result));
     }
 
 } cmdDrop;
@@ -510,6 +530,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(stringstream& help) const {
         help << "create a collection explicitly\n"
@@ -565,6 +589,10 @@ public:
         help << " example: { filemd5 : ObjectId(aaaaaaa) , root : \"fs\" }";
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
     virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
         std::string collectionName = cmdObj.getStringField("root");
@@ -736,6 +764,9 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
     virtual void help(stringstream& help) const {
         help << "determine data size for a set of data in a certain range"
                 "\nexample: { dataSize:\"blog.posts\", keyPattern:{x:1}, min:{x:10}, max:{x:55} }"
@@ -881,6 +912,9 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
     virtual void help(stringstream& help) const {
         help
             << "{ collStats:\"blog.posts\" , scale : 1 } scale divides sizes e.g. for KB use 1024\n"
@@ -988,6 +1022,9 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
     virtual void help(stringstream& help) const {
         help << "Sets collection options.\n"
                 "Example: { collMod: 'foo', usePowerOf2Sizes:true }\n"
@@ -1008,8 +1045,8 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        const std::string ns = parseNsCollectionRequired(dbname, jsobj);
-        return appendCommandStatus(result, collMod(txn, NamespaceString(ns), jsobj, &result));
+        const NamespaceString nss = parseNsCollectionRequired(dbname, jsobj);
+        return appendCommandStatus(result, collMod(txn, nss, jsobj, &result));
     }
 
 } collectionModCommand;
@@ -1020,6 +1057,9 @@ public:
 
     virtual bool slaveOk() const {
         return true;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
     virtual void help(stringstream& help) const {
         help << "Get stats on a database. Not instantaneous. Slower for databases with large "
@@ -1108,6 +1148,9 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
     virtual void help(stringstream& help) const {
         help << "{whatsmyuri:1}";
     }
@@ -1131,6 +1174,9 @@ public:
 
     virtual bool slaveOk() const {
         return true;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
     virtual Status checkAuthForCommand(ClientBasic* client,
                                        const std::string& dbname,
@@ -1190,6 +1236,36 @@ const std::array<StringData, 4> neededFieldNames{LiteParsedQuery::cmdOptionMaxTi
                                                  LiteParsedQuery::queryOptionMaxTimeMS};
 }  // namespace
 
+void appendOpTimeMetadata(OperationContext* txn,
+                          const rpc::RequestInterface& request,
+                          BSONObjBuilder* metadataBob) {
+    const bool isShardingAware = ShardingState::get(txn)->enabled();
+    const bool isConfig = serverGlobalParams.clusterRole == ClusterRole::ConfigServer;
+    repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
+    const bool isReplSet =
+        replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+
+    if (isReplSet) {
+        // Attach our own last opTime.
+        repl::OpTime lastOpTimeFromClient =
+            repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
+        replCoord->prepareReplResponseMetadata(request, lastOpTimeFromClient, metadataBob);
+
+        // For commands from mongos, append some info to help getLastError(w) work.
+        // TODO: refactor out of here as part of SERVER-18236
+        if (isShardingAware || isConfig) {
+            rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
+                .writeToMetadata(metadataBob, request.getProtocol());
+        }
+    }
+
+    // If we're a shard other than the config shard, attach the last configOpTime we know about.
+    if (isShardingAware && !isConfig) {
+        auto opTime = grid.configOpTime();
+        rpc::ConfigServerMetadata(opTime).writeToMetadata(metadataBob);
+    }
+}
+
 /**
  * this handles
  - auth
@@ -1228,7 +1304,7 @@ void Command::execCommand(OperationContext* txn,
             CurOp::get(txn)->ensureStarted();
             // We disable last-error for help requests due to SERVER-11492, because config servers
             // use help requests to determine which commands are database writes, and so must be
-            // forwarded to all mirrored (SCCC) config servers.
+            // forwarded to all config servers.
             LastError::get(txn->getClient()).disable();
             generateHelpResponse(txn, request, replyBuilder, *command);
             return;
@@ -1340,15 +1416,10 @@ void Command::execCommand(OperationContext* txn,
                 ->onStaleShardVersion(txn, NamespaceString(sce.getns()), sce.getVersionReceived());
         }
 
-        BSONObj metadata = rpc::makeEmptyMetadata();
-        if (ShardingState::get(txn)->enabled()) {
-            auto opTime = grid.shardRegistry()->getConfigOpTime();
-            BSONObjBuilder metadataBob;
-            rpc::ConfigServerMetadata(opTime).writeToMetadata(&metadataBob);
-            metadata = metadataBob.obj();
-        }
+        BSONObjBuilder metadataBob;
+        appendOpTimeMetadata(txn, request, &metadataBob);
 
-        Command::generateErrorResponse(txn, replyBuilder, e, request, command, metadata);
+        Command::generateErrorResponse(txn, replyBuilder, e, request, command, metadataBob.done());
     }
 }
 
@@ -1471,33 +1542,55 @@ bool Command::run(OperationContext* txn,
     // run expects const db std::string (can't bind to temporary)
     const std::string db = request.getDatabase().toString();
 
+    StatusWith<WriteConcernOptions> wcResult =
+        extractWriteConcern(txn, cmd, db, this->supportsWriteConcern(cmd));
+    if (!wcResult.isOK()) {
+        auto result = appendCommandStatus(inPlaceReplyBob, wcResult.getStatus());
+        inPlaceReplyBob.doneFast();
+        replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+        return result;
+    }
+
+    if (this->supportsWriteConcern(cmd)) {
+        txn->setWriteConcern(wcResult.getValue());
+    }
+
     // TODO: remove queryOptions parameter from command's run method.
     bool result = this->run(txn, db, cmd, 0, errmsg, inPlaceReplyBob);
+
+    if (this->supportsWriteConcern(cmd)) {
+        if (shouldLog(logger::LogSeverity::Debug(1))) {
+            BSONObj oldWC = wcResult.getValue().toBSON();
+            BSONObj newWC = txn->getWriteConcern().toBSON();
+            if (oldWC != newWC) {
+                LOG(1) << "Provided writeConcern was overridden from " << oldWC << " to " << newWC
+                       << " for command " << cmd;
+            }
+        }
+
+        WriteConcernResult res;
+        auto waitForWCStatus =
+            waitForWriteConcern(txn,
+                                repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
+                                txn->getWriteConcern(),
+                                &res);
+        appendCommandWCStatus(inPlaceReplyBob, waitForWCStatus, res);
+
+        // SERVER-22421: This code is to ensure error response backwards compatibility with the
+        // user management commands. This can be removed in 3.6.
+        if (!waitForWCStatus.isOK() && isUserManagementCommand(this->getName())) {
+            BSONObj temp = inPlaceReplyBob.asTempObj().copy();
+            inPlaceReplyBob.resetToEmpty();
+            appendCommandStatus(inPlaceReplyBob, waitForWCStatus);
+            inPlaceReplyBob.appendElementsUnique(temp);
+        }
+    }
+
     appendCommandStatus(inPlaceReplyBob, result, errmsg);
     inPlaceReplyBob.doneFast();
 
     BSONObjBuilder metadataBob;
-
-    const bool isShardingAware = ShardingState::get(txn)->enabled();
-    bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-    if (isReplSet) {
-        repl::OpTime lastOpTimeFromClient =
-            repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
-        replCoord->prepareReplResponseMetadata(request, lastOpTimeFromClient, &metadataBob);
-
-        // For commands from mongos, append some info to help getLastError(w) work.
-        // TODO: refactor out of here as part of SERVER-18326
-        if (isShardingAware || serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
-                .writeToMetadata(&metadataBob, request.getProtocol());
-        }
-    }
-
-    if (isShardingAware) {
-        auto opTime = grid.shardRegistry()->getConfigOpTime();
-        rpc::ConfigServerMetadata(opTime).writeToMetadata(&metadataBob);
-    }
-
+    appendOpTimeMetadata(txn, request, &metadataBob);
     replyBuilder->setMetadata(metadataBob.done());
 
     return result;

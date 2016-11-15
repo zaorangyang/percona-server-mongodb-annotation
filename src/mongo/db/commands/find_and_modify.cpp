@@ -59,10 +59,12 @@
 #include "mongo/db/query/find_and_modify_request.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/s/d_state.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -214,6 +216,9 @@ public:
     bool slaveOk() const override {
         return false;
     }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
                                std::vector<Privilege>* out) override {
@@ -226,20 +231,21 @@ public:
                    ExplainCommon::Verbosity verbosity,
                    const rpc::ServerSelectionMetadata&,
                    BSONObjBuilder* out) const override {
-        const std::string fullNs = parseNsCollectionRequired(dbName, cmdObj);
-        Status allowedWriteStatus = userAllowedWriteNS(fullNs);
+        const NamespaceString fullNs = parseNsCollectionRequired(dbName, cmdObj);
+        Status allowedWriteStatus = userAllowedWriteNS(fullNs.ns());
         if (!allowedWriteStatus.isOK()) {
             return allowedWriteStatus;
         }
 
         StatusWith<FindAndModifyRequest> parseStatus =
-            FindAndModifyRequest::parseFromBSON(NamespaceString(fullNs), cmdObj);
+            FindAndModifyRequest::parseFromBSON(NamespaceString(fullNs.ns()), cmdObj);
         if (!parseStatus.isOK()) {
             return parseStatus.getStatus();
         }
 
         const FindAndModifyRequest& args = parseStatus.getValue();
         const NamespaceString& nsString = args.getNamespaceString();
+        OpDebug* opDebug = &CurOp::get(txn)->debug();
 
         if (args.isRemove()) {
             DeleteRequest request(nsString);
@@ -264,7 +270,8 @@ public:
             css->checkShardVersionOrThrow(txn);
 
             Collection* const collection = autoColl.getCollection();
-            auto statusWithPlanExecutor = getExecutorDelete(txn, collection, &parsedDelete);
+            auto statusWithPlanExecutor =
+                getExecutorDelete(txn, opDebug, collection, &parsedDelete);
             if (!statusWithPlanExecutor.isOK()) {
                 return statusWithPlanExecutor.getStatus();
             }
@@ -272,8 +279,7 @@ public:
             Explain::explainStages(exec.get(), verbosity, out);
         } else {
             UpdateRequest request(nsString);
-            const bool ignoreVersion = false;
-            UpdateLifecycleImpl updateLifecycle(ignoreVersion, nsString);
+            UpdateLifecycleImpl updateLifecycle(nsString);
             const bool isExplain = true;
             makeUpdateRequest(args, isExplain, &updateLifecycle, &request);
 
@@ -282,8 +288,6 @@ public:
             if (!parsedUpdateStatus.isOK()) {
                 return parsedUpdateStatus;
             }
-
-            OpDebug* opDebug = &CurOp::get(txn)->debug();
 
             // Explain calls of the findAndModify command are read-only, but we take write
             // locks so that the timing information is more accurate.
@@ -298,7 +302,7 @@ public:
 
             Collection* collection = autoColl.getCollection();
             auto statusWithPlanExecutor =
-                getExecutorUpdate(txn, collection, &parsedUpdate, opDebug);
+                getExecutorUpdate(txn, opDebug, collection, &parsedUpdate);
             if (!statusWithPlanExecutor.isOK()) {
                 return statusWithPlanExecutor.getStatus();
             }
@@ -317,27 +321,20 @@ public:
              BSONObjBuilder& result) override {
         // findAndModify command is not replicated directly.
         invariant(txn->writesAreReplicated());
-        const std::string fullNs = parseNsCollectionRequired(dbName, cmdObj);
-        Status allowedWriteStatus = userAllowedWriteNS(fullNs);
+        const NamespaceString fullNs = parseNsCollectionRequired(dbName, cmdObj);
+        Status allowedWriteStatus = userAllowedWriteNS(fullNs.ns());
         if (!allowedWriteStatus.isOK()) {
             return appendCommandStatus(result, allowedWriteStatus);
         }
 
         StatusWith<FindAndModifyRequest> parseStatus =
-            FindAndModifyRequest::parseFromBSON(NamespaceString(fullNs), cmdObj);
+            FindAndModifyRequest::parseFromBSON(NamespaceString(fullNs.ns()), cmdObj);
         if (!parseStatus.isOK()) {
             return appendCommandStatus(result, parseStatus.getStatus());
         }
 
         const FindAndModifyRequest& args = parseStatus.getValue();
         const NamespaceString& nsString = args.getNamespaceString();
-
-        StatusWith<WriteConcernOptions> wcResult = extractWriteConcern(txn, cmdObj, dbName);
-        if (!wcResult.isOK()) {
-            return appendCommandStatus(result, wcResult.getStatus());
-        }
-        txn->setWriteConcern(wcResult.getValue());
-        setupSynchronousCommit(txn);
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
@@ -349,6 +346,13 @@ public:
             MakeObjGuard(repl::ReplClientInfo::forClient(client),
                          &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
                          txn);
+
+        // If this is the local database, don't set last op.
+        if (dbName == "local") {
+            lastOpSetterGuard.Dismiss();
+        }
+
+        OpDebug* opDebug = &CurOp::get(txn)->debug();
 
         // Although usually the PlanExecutor handles WCE internally, it will throw WCEs when it is
         // executing a findAndModify. This is done to ensure that we can always match, modify, and
@@ -384,7 +388,8 @@ public:
                 }
 
                 Collection* const collection = autoDb.getDb()->getCollection(nsString.ns());
-                auto statusWithPlanExecutor = getExecutorDelete(txn, collection, &parsedDelete);
+                auto statusWithPlanExecutor =
+                    getExecutorDelete(txn, opDebug, collection, &parsedDelete);
                 if (!statusWithPlanExecutor.isOK()) {
                     return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
                 }
@@ -402,8 +407,7 @@ public:
                 if (collection) {
                     collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
                 }
-                CurOp::get(txn)->debug().fromMultiPlanner = summaryStats.fromMultiPlanner;
-                CurOp::get(txn)->debug().replanned = summaryStats.replanned;
+                CurOp::get(txn)->debug().setPlanSummaryMetrics(summaryStats);
 
                 // Fill out OpDebug with the number of deleted docs.
                 CurOp::get(txn)->debug().ndeleted = getDeleteStats(exec.get())->docsDeleted;
@@ -412,8 +416,7 @@ public:
                 appendCommandResponse(exec.get(), args.isRemove(), value, result);
             } else {
                 UpdateRequest request(nsString);
-                const bool ignoreVersion = false;
-                UpdateLifecycleImpl updateLifecycle(ignoreVersion, nsString);
+                UpdateLifecycleImpl updateLifecycle(nsString);
                 const bool isExplain = false;
                 makeUpdateRequest(args, isExplain, &updateLifecycle, &request);
 
@@ -422,8 +425,6 @@ public:
                 if (!parsedUpdateStatus.isOK()) {
                     return appendCommandStatus(result, parsedUpdateStatus);
                 }
-
-                OpDebug* opDebug = &CurOp::get(txn)->debug();
 
                 AutoGetOrCreateDb autoDb(txn, dbName, MODE_IX);
                 Lock::CollectionLock collLock(txn->lockState(), nsString.ns(), MODE_IX);
@@ -474,7 +475,7 @@ public:
                 }
 
                 auto statusWithPlanExecutor =
-                    getExecutorUpdate(txn, collection, &parsedUpdate, opDebug);
+                    getExecutorUpdate(txn, opDebug, collection, &parsedUpdate);
                 if (!statusWithPlanExecutor.isOK()) {
                     return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
                 }
@@ -492,7 +493,8 @@ public:
                 if (collection) {
                     collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
                 }
-                UpdateStage::fillOutOpDebug(getUpdateStats(exec.get()), &summaryStats, opDebug);
+                UpdateStage::recordUpdateStatsInOpDebug(getUpdateStats(exec.get()), opDebug);
+                opDebug->setPlanSummaryMetrics(summaryStats);
 
                 boost::optional<BSONObj> value = advanceStatus.getValue();
                 appendCommandResponse(exec.get(), args.isRemove(), value, result);
@@ -506,14 +508,6 @@ public:
             // that case.
             lastOpSetterGuard.Dismiss();
         }
-
-        WriteConcernResult res;
-        auto waitForWCStatus =
-            waitForWriteConcern(txn,
-                                repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
-                                txn->getWriteConcern(),
-                                &res);
-        appendCommandWCStatus(result, waitForWCStatus);
 
         return true;
     }

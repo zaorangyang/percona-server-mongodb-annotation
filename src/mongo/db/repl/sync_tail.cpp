@@ -40,28 +40,28 @@
 #include "mongo/base/counter.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/dbhelpers.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_timestamp.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/prefetch.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/timer_stats.h"
@@ -69,6 +69,7 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -417,7 +418,8 @@ void prefetchOp(const BSONObj& op) {
         try {
             // one possible tweak here would be to stay in the read lock for this database
             // for multiple prefetches if they are for the same database.
-            OperationContextImpl txn;
+            const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+            OperationContext& txn = *txnPtr;
             AutoGetCollectionForRead ctx(&txn, ns);
             Database* db = ctx.getDb();
             if (db) {
@@ -610,7 +612,8 @@ public:
 private:
     void run() {
         Client::initThread("ReplBatcher");
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         auto replCoord = ReplicationCoordinator::get(&txn);
 
         while (!_inShutdown.load()) {
@@ -682,14 +685,15 @@ private:
 void SyncTail::oplogApplication() {
     OpQueueBatcher batcher(this);
 
-    OperationContextImpl txn;
+    const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+    OperationContext& txn = *txnPtr;
     auto replCoord = ReplicationCoordinator::get(&txn);
     std::unique_ptr<ApplyBatchFinalizer> finalizer{
         getGlobalServiceContext()->getGlobalStorageEngine()->isDurable()
             ? new ApplyBatchFinalizerForJournal(replCoord)
             : new ApplyBatchFinalizer(replCoord)};
 
-    auto minValidBoundaries = getMinValid(&txn);
+    auto minValidBoundaries = StorageInterface::get(&txn)->getMinValid(&txn);
     OpTime originalEndOpTime(minValidBoundaries.end);
     OpTime lastWriteOpTime{replCoord->getMyLastAppliedOpTime()};
     while (!inShutdown()) {
@@ -723,8 +727,10 @@ void SyncTail::oplogApplication() {
                 replCoord->signalDrainComplete(&txn);
             }
 
-            // Reset when triggered in case it was from a rollback, safe to do at any time.
+            // Reset some values when triggered in case it was from a rollback.
+            minValidBoundaries = StorageInterface::get(&txn)->getMinValid(&txn);
             lastWriteOpTime = replCoord->getMyLastAppliedOpTime();
+            originalEndOpTime = minValidBoundaries.end;
 
             continue;  // This wasn't a real op. Don't try to apply it.
         }
@@ -765,7 +771,7 @@ void SyncTail::oplogApplication() {
         const OpTime end(std::max(originalEndOpTime, lastOpTime));
 
         // This write will not journal/checkpoint.
-        setMinValid(&txn, {start, end});
+        StorageInterface::get(&txn)->setMinValid(&txn, {start, end});
 
         lastWriteOpTime = multiApply(&txn, ops);
         if (lastWriteOpTime.isNull()) {
@@ -778,7 +784,7 @@ void SyncTail::oplogApplication() {
         }
 
         setNewTimestamp(lastWriteOpTime.getTimestamp());
-        setMinValid(&txn, end, DurableRequirement::None);
+        StorageInterface::get(&txn)->setMinValid(&txn, end, DurableRequirement::None);
         minValidBoundaries.start = {};
         minValidBoundaries.end = end;
         finalizer->record(lastWriteOpTime);
@@ -940,7 +946,8 @@ bool SyncTail::shouldRetry(OperationContext* txn, const BSONObj& o) {
             Collection* const coll = db->getOrCreateCollection(txn, nss.toString());
             invariant(coll);
 
-            Status status = coll->insertDocument(txn, missingObj, true);
+            OpDebug* const nullOpDebug = nullptr;
+            Status status = coll->insertDocument(txn, missingObj, nullOpDebug, true);
             uassert(15917,
                     str::stream() << "failed to insert missing doc: " << status.toString(),
                     status.isOK());
@@ -980,7 +987,8 @@ void multiSyncApply(const std::vector<OplogEntry>& ops) {
     }
     initializeWriterThread();
 
-    OperationContextImpl txn;
+    const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+    OperationContext& txn = *txnPtr;
     txn.setReplicatedWrites(false);
     DisableDocumentValidation validationDisabler(&txn);
 
@@ -1086,7 +1094,8 @@ void multiSyncApply(const std::vector<OplogEntry>& ops) {
 void multiInitialSyncApply(const std::vector<OplogEntry>& ops) {
     initializeWriterThread();
 
-    OperationContextImpl txn;
+    const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+    OperationContext& txn = *txnPtr;
     txn.setReplicatedWrites(false);
     DisableDocumentValidation validationDisabler(&txn);
 

@@ -89,6 +89,7 @@ baseSource=[
     'logger/ramlog.cpp',
     'logger/rotatable_file_manager.cpp',
     'logger/rotatable_file_writer.cpp',
+    'platform/decimal128.cpp',
     'platform/random.cpp',
     'platform/strnlen.cpp',
     'util/allocator.cpp',
@@ -118,15 +119,10 @@ baseLibDeps=[
     '$BUILD_DIR/third_party/murmurhash3/murmurhash3',
     '$BUILD_DIR/third_party/shim_boost',
     '$BUILD_DIR/third_party/shim_pcrecpp',
+    '$BUILD_DIR/third_party/shim_intel_decimal128',
     'util/debugger',
     'util/quick_exit',
 ]
-
-if GetOption('experimental-decimal-support') == 'on':
-    baseSource.append('platform/decimal128.cpp')
-    baseLibDeps.append('$BUILD_DIR/third_party/shim_intel_decimal128')
-else:
-    baseSource.append('platform/decimal128_dummy.cpp')
 
 env.Library(
     target='base',
@@ -213,7 +209,6 @@ env.Alias('generated-sources', generatedVersionFile)
 config_header_substs = (
     ('@mongo_config_byte_order@', 'MONGO_CONFIG_BYTE_ORDER'),
     ('@mongo_config_debug_build@', 'MONGO_CONFIG_DEBUG_BUILD'),
-    ('@mongo_config_experimental_decimal_support@', 'MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT'),
     ('@mongo_config_have_thread_local@', 'MONGO_CONFIG_HAVE_THREAD_LOCAL'),
     ('@mongo_config_have___declspec_thread@', 'MONGO_CONFIG_HAVE___DECLSPEC_THREAD'),
     ('@mongo_config_have___thread@', 'MONGO_CONFIG_HAVE___THREAD'),
@@ -225,6 +220,7 @@ config_header_substs = (
     ('@mongo_config_have_std_is_trivially_copyable@', 'MONGO_CONFIG_HAVE_STD_IS_TRIVIALLY_COPYABLE'),
     ('@mongo_config_have_std_enable_if_t@', 'MONGO_CONFIG_HAVE_STD_ENABLE_IF_T'),
     ('@mongo_config_have_std_make_unique@', 'MONGO_CONFIG_HAVE_STD_MAKE_UNIQUE'),
+    ('@mongo_config_have_std_align@', 'MONGO_CONFIG_HAVE_STD_ALIGN'),
     ('@mongo_config_have_strnlen@', 'MONGO_CONFIG_HAVE_STRNLEN'),
     ('@mongo_config_optimized_build@', 'MONGO_CONFIG_OPTIMIZED_BUILD'),
     ('@mongo_config_ssl@', 'MONGO_CONFIG_SSL'),
@@ -254,6 +250,7 @@ mongodLibDeps = [
     "db/repl/storage_interface_impl",
     "executor/network_interface_factory",
     's/commands/shared_cluster_commands',
+    "util/clock_sources",
     "util/ntservice",
 ]
 
@@ -292,17 +289,18 @@ env.Install(
 env.Install(
     '#/',
     env.Program(
-        "mongos",
-        [
-            "s/server.cpp",
-            "s/mongos_options.cpp",
-            "s/mongos_options_init.cpp",
+        target='mongos',
+        source=[
+            's/client/sharding_connection_hook_for_mongos.cpp',
+            's/mongos_options_init.cpp',
+            's/server.cpp',
         ],
         LIBDEPS=[
             'db/conn_pool_options',
             'db/commands/core',
             'db/mongodandmongos',
             's/client/sharding_connection_hook',
+            's/cluster_ops_impl',
             's/commands/cluster_commands',
             's/commands/shared_cluster_commands',
             's/coreshard',

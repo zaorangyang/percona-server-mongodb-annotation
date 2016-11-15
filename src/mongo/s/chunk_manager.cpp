@@ -45,6 +45,7 @@
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -54,6 +55,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/shard_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
@@ -243,10 +245,12 @@ bool ChunkManager::_load(OperationContext* txn,
         // interesting things here
         for (const auto& oldChunkMapEntry : oldChunkMap) {
             shared_ptr<Chunk> oldC = oldChunkMapEntry.second;
-            shared_ptr<Chunk> newC(new Chunk(
-                this, oldC->getMin(), oldC->getMax(), oldC->getShardId(), oldC->getLastmod()));
-
-            newC->setBytesWritten(oldC->getBytesWritten());
+            shared_ptr<Chunk> newC(new Chunk(this,
+                                             oldC->getMin(),
+                                             oldC->getMax(),
+                                             oldC->getShardId(),
+                                             oldC->getLastmod(),
+                                             oldC->getBytesWritten()));
 
             chunkMap.insert(make_pair(oldC->getMax(), newC));
         }
@@ -347,14 +351,9 @@ void ChunkManager::calcInitSplitsAndShards(OperationContext* txn,
                                            const set<ShardId>* initShardIds,
                                            vector<BSONObj>* splitPoints,
                                            vector<ShardId>* shardIds) const {
-    verify(_chunkMap.size() == 0);
+    invariant(_chunkMap.empty());
 
-    Chunk c(this,
-            _keyPattern.getKeyPattern().globalMin(),
-            _keyPattern.getKeyPattern().globalMax(),
-            primaryShardId);
-
-    if (!initPoints || !initPoints->size()) {
+    if (!initPoints || initPoints->empty()) {
         // discover split points
         const auto primaryShard = grid.shardRegistry()->getShard(txn, primaryShardId);
         const NamespaceString nss{getns()};
@@ -370,8 +369,18 @@ void ChunkManager::calcInitSplitsAndShards(OperationContext* txn,
         uassertStatusOK(getStatusFromCommandResult(result.getValue()));
         uassertStatusOK(bsonExtractIntegerField(result.getValue(), "n", &numObjects));
 
-        if (numObjects > 0)
-            c.pickSplitVector(txn, *splitPoints, Chunk::MaxChunkSize);
+        if (numObjects > 0) {
+            *splitPoints = uassertStatusOK(shardutil::selectChunkSplitPoints(
+                txn,
+                primaryShardId,
+                NamespaceString(_ns),
+                _keyPattern,
+                _keyPattern.getKeyPattern().globalMin(),
+                _keyPattern.getKeyPattern().globalMax(),
+                Grid::get(txn)->getBalancerConfiguration()->getMaxChunkSizeBytes(),
+                0,
+                0));
+        }
 
         // since docs already exists, must use primary shard
         shardIds->push_back(primaryShardId);
@@ -420,7 +429,7 @@ Status ChunkManager::createFirstChunks(OperationContext* txn,
             i < splitPoints.size() ? splitPoints[i] : _keyPattern.getKeyPattern().globalMax();
 
         ChunkType chunk;
-        chunk.setName(Chunk::genID(_ns, min));
+        chunk.setName(ChunkType::genID(_ns, min));
         chunk.setNS(_ns);
         chunk.setMin(min);
         chunk.setMax(max);
@@ -444,10 +453,11 @@ Status ChunkManager::createFirstChunks(OperationContext* txn,
     return Status::OK();
 }
 
-ChunkPtr ChunkManager::findIntersectingChunk(OperationContext* txn, const BSONObj& shardKey) const {
+shared_ptr<Chunk> ChunkManager::findIntersectingChunk(OperationContext* txn,
+                                                      const BSONObj& shardKey) const {
     {
         BSONObj chunkMin;
-        ChunkPtr chunk;
+        shared_ptr<Chunk> chunk;
         {
             ChunkMap::const_iterator it = _chunkMap.upper_bound(shardKey);
             if (it != _chunkMap.end()) {
@@ -807,11 +817,11 @@ void ChunkRangeManager::_insertRange(ChunkMap::const_iterator begin,
     }
 }
 
-int ChunkManager::getCurrentDesiredChunkSize() const {
+uint64_t ChunkManager::getCurrentDesiredChunkSize() const {
     // split faster in early chunks helps spread out an initial load better
-    const int minChunkSize = 1 << 20;  // 1 MBytes
+    const uint64_t minChunkSize = 1 << 20;  // 1 MBytes
 
-    int splitThreshold = Chunk::MaxChunkSize;
+    uint64_t splitThreshold = grid.getBalancerConfiguration()->getMaxChunkSizeBytes();
 
     int nc = numChunks();
 

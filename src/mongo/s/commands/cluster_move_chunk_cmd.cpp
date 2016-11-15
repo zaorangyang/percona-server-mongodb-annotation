@@ -38,6 +38,7 @@
 #include "mongo/db/client_basic.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
@@ -68,6 +69,9 @@ public:
         return true;
     }
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
     virtual void help(std::stringstream& help) const {
         help << "Example: move chunk that contains the doc {num : 7} to shard001\n"
@@ -99,20 +103,16 @@ public:
                      int options,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
-        ShardConnection::sync();
-
         Timer t;
 
         const NamespaceString nss(parseNs(dbname, cmdObj));
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << nss.ns() << " is not a valid namespace",
+                nss.isValid());
 
         std::shared_ptr<DBConfig> config;
 
         {
-            if (nss.size() == 0) {
-                return appendCommandStatus(
-                    result, Status(ErrorCodes::InvalidNamespace, "no namespace specified"));
-            }
-
             auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
             if (!status.isOK()) {
                 return appendCommandStatus(result, status.getStatus());
@@ -148,7 +148,7 @@ public:
         // so far, chunk size serves test purposes; it may or may not become a supported parameter
         long long maxChunkSizeBytes = cmdObj["maxChunkSizeBytes"].numberLong();
         if (maxChunkSizeBytes == 0) {
-            maxChunkSizeBytes = Chunk::MaxChunkSize;
+            maxChunkSizeBytes = Grid::get(txn)->getBalancerConfiguration()->getMaxChunkSizeBytes();
         }
 
         BSONObj find = cmdObj.getObjectField("find");
@@ -161,8 +161,8 @@ public:
         }
 
         // This refreshes the chunk metadata if stale.
-        ChunkManagerPtr info = config->getChunkManager(txn, nss.ns(), true);
-        ChunkPtr chunk;
+        shared_ptr<ChunkManager> info = config->getChunkManager(txn, nss.ns(), true);
+        shared_ptr<Chunk> chunk;
 
         if (!find.isEmpty()) {
             StatusWith<BSONObj> status = info->getShardKeyPattern().extractShardKeyFromQuery(find);

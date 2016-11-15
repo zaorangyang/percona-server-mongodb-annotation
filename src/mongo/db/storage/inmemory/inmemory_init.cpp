@@ -73,8 +73,7 @@ public:
                                                         durable,
                                                         ephemeral,
                                                         params.repair,
-                                                        readOnly,
-                                                        true);
+                                                        readOnly);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
         // Intentionally leaked.

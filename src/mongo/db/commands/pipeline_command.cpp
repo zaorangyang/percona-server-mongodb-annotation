@@ -51,8 +51,10 @@
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -154,6 +156,9 @@ public:
     PipelineCommand() : Command(Pipeline::commandName) {}  // command is called "aggregate"
 
     // Locks are managed manually, in particular by DocumentSourceCursor.
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return Pipeline::aggSupportsWriteConcern(cmd);
+    }
     virtual bool slaveOk() const {
         return false;
     }
@@ -199,6 +204,11 @@ public:
         if (!pPipeline.get())
             return false;
 
+        // Save and reset the write concern so that it doesn't get changed accidentally by
+        // DBDirectClient.
+        auto oldWC = txn->getWriteConcern();
+        ON_BLOCK_EXIT([txn, oldWC] { txn->setWriteConcern(oldWC); });
+
         // This is outside of the if block to keep the object alive until the pipeline is finished.
         BSONObj parsed;
         if (kDebugBuild && !pPipeline->isExplain() && !pCtx->inShard) {
@@ -238,8 +248,10 @@ public:
                 PlanSummaryStats stats;
                 Explain::getSummaryStats(*input, &stats);
                 collection->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
-                CurOp::get(txn)->debug().fromMultiPlanner = stats.fromMultiPlanner;
-                CurOp::get(txn)->debug().replanned = stats.replanned;
+
+                // TODO SERVER-23265: Confirm whether this is the correct place to gather all
+                // metrics. There is no harm adding here for the time being.
+                CurOp::get(txn)->debug().setPlanSummaryMetrics(stats);
             }
 
             // Create the PlanExecutor which returns results from the pipeline. The WorkingSet

@@ -47,6 +47,7 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/socket_exception.h"
 
 namespace mongo {
 
@@ -430,7 +431,7 @@ void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(
         if (allowShardVersionFailure &&
             (ErrorCodes::isNotMasterError(ErrorCodes::fromInt(errCode)) ||
              errCode == ErrorCodes::FailedToSatisfyReadPreference ||
-             errCode == 9001)) {  // socket exception
+             errCode == ErrorCodes::SocketException)) {
             // It's okay if we don't set the version when talking to a secondary, we can
             // be stale in any case.
 

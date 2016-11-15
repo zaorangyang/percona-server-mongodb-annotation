@@ -31,9 +31,9 @@
 #include <vector>
 
 #include "mongo/db/commands.h"
-#include "mongo/s/cluster_explain.h"
+#include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/cluster_commands_common.h"
-#include "mongo/s/strategy.h"
+#include "mongo/s/commands/strategy.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -82,6 +82,10 @@ public:
         return false;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,

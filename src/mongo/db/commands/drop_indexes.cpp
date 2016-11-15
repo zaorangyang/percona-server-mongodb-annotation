@@ -53,7 +53,6 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/log.h"
 
@@ -69,6 +68,9 @@ class CmdDropIndexes : public Command {
 public:
     virtual bool slaveOk() const {
         return false;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
     virtual void help(stringstream& help) const {
         help << "drop indexes for a collection";
@@ -88,8 +90,8 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        const std::string ns = parseNsCollectionRequired(dbname, jsobj);
-        return appendCommandStatus(result, dropIndexes(txn, NamespaceString(ns), jsobj, &result));
+        const NamespaceString nss = parseNsCollectionRequired(dbname, jsobj);
+        return appendCommandStatus(result, dropIndexes(txn, nss, jsobj, &result));
     }
 
 } cmdDropIndexes;
@@ -99,6 +101,9 @@ public:
     virtual bool slaveOk() const {
         return true;
     }  // can reindex on a secondary
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
     virtual void help(stringstream& help) const {
         help << "re-index a collection";
     }
@@ -119,22 +124,22 @@ public:
              BSONObjBuilder& result) {
         DBDirectClient db(txn);
 
-        const std::string toDeleteNs = parseNsCollectionRequired(dbname, jsobj);
+        const NamespaceString toDeleteNs = parseNsCollectionRequired(dbname, jsobj);
 
         LOG(0) << "CMD: reIndex " << toDeleteNs << endl;
 
         ScopedTransaction transaction(txn, MODE_IX);
         Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-        OldClientContext ctx(txn, toDeleteNs);
+        OldClientContext ctx(txn, toDeleteNs.ns());
 
-        Collection* collection = ctx.db()->getCollection(toDeleteNs);
+        Collection* collection = ctx.db()->getCollection(toDeleteNs.ns());
 
         if (!collection) {
             errmsg = "ns not found";
             return false;
         }
 
-        BackgroundOperation::assertNoBgOpInProgForNs(toDeleteNs);
+        BackgroundOperation::assertNoBgOpInProgForNs(toDeleteNs.ns());
 
         vector<BSONObj> all;
         {

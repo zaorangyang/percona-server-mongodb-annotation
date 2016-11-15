@@ -45,19 +45,18 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/initial_sync.h"
-#include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/socket_exception.h"
 
 namespace mongo {
 namespace repl {
@@ -80,7 +79,7 @@ void truncateAndResetOplog(OperationContext* txn,
                            ReplicationCoordinator* replCoord,
                            BackgroundSync* bgsync) {
     // Clear minvalid
-    setMinValid(txn, OpTime(), DurableRequirement::None);
+    StorageInterface::get(txn)->setMinValid(txn, OpTime(), DurableRequirement::None);
 
     AutoGetDb autoDb(txn, "local", MODE_X);
     massert(28585, "no local database found", autoDb.getDb());
@@ -277,6 +276,10 @@ bool _initialSyncApplyOplog(OperationContext* ctx, repl::InitialSync* syncer, Op
     return true;
 }
 
+
+// Number of connection retries allowed during initial sync.
+const auto kConnectRetryLimit = 10;
+
 /**
  * Do the initial sync for this member.  There are several steps to this process:
  *
@@ -306,7 +309,8 @@ Status _initialSync() {
     log() << "initial sync pending";
 
     BackgroundSync* bgsync(BackgroundSync::get());
-    OperationContextImpl txn;
+    const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+    OperationContext& txn = *txnPtr;
     txn.setReplicatedWrites(false);
     DisableDocumentValidation validationDisabler(&txn);
     ReplicationCoordinator* replCoord(getGlobalReplicationCoordinator());
@@ -316,15 +320,20 @@ Status _initialSync() {
 
     OplogReader r;
 
+    auto currentRetry = 0;
     while (r.getHost().empty()) {
         // We must prime the sync source selector so that it considers all candidates regardless
         // of oplog position, by passing in null OpTime as the last op fetched time.
         r.connectToSyncSource(&txn, OpTime(), replCoord);
+
         if (r.getHost().empty()) {
             std::string msg =
-                "no valid sync sources found in current replset to do an initial sync";
-            log() << msg;
-            return Status(ErrorCodes::InitialSyncOplogSourceMissing, msg);
+                "No valid sync source found in current replica set to do an initial sync.";
+            if (++currentRetry >= kConnectRetryLimit) {
+                return Status(ErrorCodes::InitialSyncOplogSourceMissing, msg);
+            }
+            LOG(1) << msg << ", retry " << currentRetry << " of " << kConnectRetryLimit;
+            sleepsecs(1);
         }
 
         if (inShutdown()) {
@@ -338,13 +347,12 @@ Status _initialSync() {
     BSONObj lastOp = r.getLastOp(rsOplogName);
     if (lastOp.isEmpty()) {
         std::string msg = "initial sync couldn't read remote oplog";
-        log() << msg;
         sleepsecs(15);
         return Status(ErrorCodes::InitialSyncFailure, msg);
     }
 
     // Add field to minvalid document to tell us to restart initial sync if we crash
-    setInitialSyncFlag(&txn);
+    StorageInterface::get(&txn)->setInitialSyncFlag(&txn);
 
     log() << "initial sync drop all databases";
     dropAllDatabasesExceptLocal(&txn);
@@ -430,12 +438,12 @@ Status _initialSync() {
 
         // Initial sync is now complete.  Flag this by setting minValid to the last thing
         // we synced.
-        setMinValid(&txn, lastOpTimeWritten, DurableRequirement::None);
+        StorageInterface::get(&txn)->setMinValid(&txn, lastOpTimeWritten, DurableRequirement::None);
         BackgroundSync::get()->setInitialSyncRequestedFlag(false);
     }
 
     // Clear the initial sync flag -- cannot be done under a db lock, or recursive.
-    clearInitialSyncFlag(&txn);
+    StorageInterface::get(&txn)->clearInitialSyncFlag(&txn);
 
     // Clear maint. mode.
     while (replCoord->getMaintenanceMode()) {
@@ -445,27 +453,33 @@ Status _initialSync() {
     log() << "initial sync done";
     return Status::OK();
 }
+
+stdx::mutex _initialSyncMutex;
+const auto kMaxFailedAttempts = 10;
+const auto kInitialSyncRetrySleepDuration = Seconds{5};
 }  // namespace
 
 void syncDoInitialSync() {
-    static const int maxFailedAttempts = 10;
+    stdx::unique_lock<stdx::mutex> lk(_initialSyncMutex, stdx::defer_lock);
+    if (!lk.try_lock()) {
+        uasserted(34474, "Initial Sync Already Active.");
+    }
 
     {
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         createOplog(&txn);
     }
 
     int failedAttempts = 0;
-    while (failedAttempts < maxFailedAttempts) {
+    while (failedAttempts < kMaxFailedAttempts) {
         try {
             // leave loop when successful
             Status status = _initialSync();
             if (status.isOK()) {
                 break;
-            }
-            if (status == ErrorCodes::InitialSyncOplogSourceMissing) {
-                sleepsecs(1);
-                return;
+            } else {
+                error() << status;
             }
         } catch (const DBException& e) {
             error() << e;
@@ -479,13 +493,13 @@ void syncDoInitialSync() {
             return;
         }
 
-        error() << "initial sync attempt failed, " << (maxFailedAttempts - ++failedAttempts)
+        error() << "initial sync attempt failed, " << (kMaxFailedAttempts - ++failedAttempts)
                 << " attempts remaining";
-        sleepsecs(5);
+        sleepmillis(durationCount<Milliseconds>(kInitialSyncRetrySleepDuration));
     }
 
     // No need to print a stack
-    if (failedAttempts >= maxFailedAttempts) {
+    if (failedAttempts >= kMaxFailedAttempts) {
         severe() << "The maximum number of retries have been exhausted for initial sync.";
         fassertFailedNoTrace(16233);
     }

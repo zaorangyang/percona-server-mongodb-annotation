@@ -1,4 +1,5 @@
 # -*- mode: python; -*-
+import atexit
 import copy
 import datetime
 import errno
@@ -23,6 +24,12 @@ from mongo_scons_utils import (
 import libdeps
 
 EnsureSConsVersion( 2, 3, 0 )
+
+def print_build_failures():
+    from SCons.Script import GetBuildFailures
+    for bf in GetBuildFailures():
+        print "%s failed: %s" % (bf.node, bf.errstr)
+atexit.register(print_build_failures)
 
 def versiontuple(v):
     return tuple(map(int, (v.split("."))))
@@ -128,11 +135,6 @@ def make_variant_dir_generator():
 #   the whole option. It is better to make all options take an optional on/off or true/false
 #   using the nargs='const' mechanism.
 #
-
-add_option('mute',
-    help='do not display commandlines for compiling and linking, to reduce screen noise',
-    nargs=0,
-)
 
 add_option('prefix',
     default='$BUILD_ROOT/install',
@@ -268,6 +270,15 @@ add_option('dbg',
     const='on',
     default='off',
     help='Enable runtime debugging checks',
+    nargs='?',
+    type='choice',
+)
+
+add_option('spider-monkey-dbg',
+    choices=['on', 'off'],
+    const='on',
+    default='off',
+    help='Enable SpiderMonkey debug mode',
     nargs='?',
     type='choice',
 )
@@ -461,12 +472,10 @@ add_option('cache-dir',
     help='Specify the directory to use for caching objects if --cache is in use',
 )
 
-add_option("experimental-decimal-support",
-    choices=['on', 'off'],
-    default='off',
-    const='on',
-    help="Enable experimental decimal128 type support",
-    nargs='?',
+add_option("cxx-std",
+    choices=["11", "14"],
+    default="11",
+    help="Select the C++ langauge standard to build with",
 )
 
 def find_mongo_custom_variables():
@@ -474,8 +483,6 @@ def find_mongo_custom_variables():
     for path in sys.path:
         probe = os.path.join(path, 'mongo_custom_variables.py')
         if os.path.isfile(probe):
-            if not has_option('mute'):
-                print "Using mongo variable customization file {0}".format(probe)
             files.append(probe)
     return files
 
@@ -594,8 +601,12 @@ def variable_distsrc_converter(val):
         return val + "/"
     return val
 
+variables_files = variable_shlex_converter(get_option('variables-files'))
+for file in variables_files:
+    print "Using variable customization file %s" % file
+
 env_vars = Variables(
-    files=variable_shlex_converter(get_option('variables-files')),
+    files=variables_files,
     args=ARGUMENTS
 )
 
@@ -733,6 +744,11 @@ env_vars.Add('TOOLS',
 env_vars.Add('VARIANT_DIR',
     help='Sets the name (or generator function) for the variant directory',
     default=default_variant_dir_generator,
+)
+
+env_vars.Add('VERBOSE',
+    help='Control build verbosity (auto, on/off true/false 1/0)',
+    default='auto',
 )
 
 # don't run configure if user calls --help
@@ -876,6 +892,18 @@ def conf_error(env, msg, *args):
 
 env.AddMethod(fatal_error, 'FatalError')
 env.AddMethod(conf_error, 'ConfError')
+
+# Normalize the VERBOSE Option, and make its value available as a
+# function.
+if env['VERBOSE'] == "auto":
+    env['VERBOSE'] = not sys.stdout.isatty()
+elif env['VERBOSE'] in ('1', "ON", "on", "True", "true", True):
+    env['VERBOSE'] = True
+elif env['VERBOSE'] in ('0', "OFF", "off", "False", "false", False):
+    env['VERBOSE'] = False
+else:
+    env.FatalError("Invalid value {0} for VERBOSE Variable", env['VERBOSE'])
+env.AddMethod(lambda env: env['VERBOSE'], 'Verbose')
 
 if has_option('variables-help'):
     print env_vars.GenerateHelpText(env)
@@ -1076,7 +1104,7 @@ env['TARGET_OS_FAMILY'] = 'posix' if env.TargetOSIs('posix') else env.GetTargetO
 # option as a new variable in the environment.
 if get_option('allocator') == "auto":
     if env.TargetOSIs('windows') or \
-       (env.TargetOSIs('linux') and (env['TARGET_ARCH'] in ['i386', 'x86_64', 'ppc64le'])):
+       env.TargetOSIs('linux'):
         env['MONGO_ALLOCATOR'] = "tcmalloc"
     else:
         env['MONGO_ALLOCATOR'] = "system"
@@ -1219,7 +1247,7 @@ if get_option('build-fast-and-loose') == "on" and \
     env.Decider('MD5-timestamp')
     env.SetOption('max_drift', 1)
 
-if has_option('mute'):
+if not env.Verbose():
     env.Append( CCCOMSTR = "Compiling $TARGET" )
     env.Append( CXXCOMSTR = env["CCCOMSTR"] )
     env.Append( SHCCCOMSTR = "Compiling $TARGET" )
@@ -1404,8 +1432,8 @@ elif env.TargetOSIs('windows'):
         # without having been initialized (implies /Od: no optimizations)
         env.Append( CCFLAGS=["/RTC1"] )
 
-        # Support large object files since some unit-test sources contain a lot of code
-        env.Append( CCFLAGS=["/bigobj"] )
+    # Support large object files since some unit-test sources contain a lot of code
+    env.Append( CCFLAGS=["/bigobj"] )
 
     # This gives 32-bit programs 4 GB of user address space in WOW64, ignored in 64-bit builds
     env.Append( LINKFLAGS=["/LARGEADDRESSAWARE"] )
@@ -1417,6 +1445,7 @@ elif env.TargetOSIs('windows'):
             'Psapi.lib',
             'advapi32.lib',
             'bcrypt.lib',
+            'crypt32.lib',
             'kernel32.lib',
             'shell32.lib',
             'version.lib',
@@ -1443,7 +1472,7 @@ if env.TargetOSIs('posix'):
                          "-Wno-unknown-pragmas",
                          "-Winvalid-pch"] )
     # env.Append( " -Wconversion" ) TODO: this doesn't really work yet
-    if env.TargetOSIs('linux', 'osx'):
+    if env.TargetOSIs('linux', 'osx', 'solaris'):
         if not has_option("disable-warnings-as-errors"):
             env.Append( CCFLAGS=["-Werror"] )
 
@@ -1489,12 +1518,10 @@ if env.TargetOSIs('posix'):
 
 mmapv1 = False
 if get_option('mmapv1') == 'auto':
-    # MMapV1 only supports little-endian architectures, and will fail to run on big-endian
-    # so disable MMapV1 on big-endian architectures
-    if endian == 'big':
-        mmapv1 = False
-    else:
-        mmapv1 = True
+    # The mmapv1 storage engine is only supported on x86
+    # targets. Unless explicitly requested, disable it on all other
+    # platforms.
+    mmapv1 = (env['TARGET_ARCH'] in ['i386', 'x86_64'])
 elif get_option('mmapv1') == 'on':
     mmapv1 = True
 
@@ -1514,9 +1541,6 @@ if get_option('inmemory') == 'on':
     inmemory = True
     if not wiredtiger:
         env.FatalError("InMemory engine requires WiredTiger to build")
-
-if get_option('experimental-decimal-support') == 'on':
-    env.SetConfigHeaderDefine("MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT")
 
 icuEnabled = False
 if get_option('icu') == 'on':
@@ -1871,13 +1895,17 @@ def doConfigure(myenv):
         conf.Finish()
 
     if not myenv.ToolchainIs('msvc'):
-        if not AddToCXXFLAGSIfSupported(myenv, '-std=c++11'):
-            myenv.ConfError('Compiler does not honor -std=c++11')
+        if get_option('cxx-std') == "11":
+            if not AddToCXXFLAGSIfSupported(myenv, '-std=c++11'):
+                myenv.ConfError('Compiler does not honor -std=c++11')
+        elif get_option('cxx-std') == "14":
+            if not AddToCXXFLAGSIfSupported(myenv, '-std=c++14'):
+                myenv.ConfError('Compiler does not honor -std=c++14')
         if not AddToCFLAGSIfSupported(myenv, '-std=c99'):
             myenv.ConfError("C++11 mode selected for C++ files, but can't enable C99 for C files")
 
     if using_system_version_of_cxx_libraries():
-        print( 'WARNING: System versions of C++ libraries must be compiled with C++11 support' )
+        print( 'WARNING: System versions of C++ libraries must be compiled with C++11/14 support' )
 
     # We appear to have C++11, or at least a flag to enable it. Check that the declared C++
     # language level is not less than C++11, and that we can at least compile an 'auto'
@@ -1900,12 +1928,34 @@ def doConfigure(myenv):
         context.Result(ret)
         return ret
 
+    def CheckCxx14(context):
+        test_body = """
+        #ifndef _MSC_VER
+        #if __cplusplus < 201402L
+        #error
+        #endif
+        #endif
+        auto DeducedReturnTypesAreACXX14Feature() {
+            return 0;
+        }
+        """
+
+        context.Message('Checking for C++14... ')
+        ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
+        context.Result(ret)
+        return ret
+
     conf = Configure(myenv, help=False, custom_tests = {
         'CheckCxx11' : CheckCxx11,
+        'CheckCxx14' : CheckCxx14,
     })
 
     if not conf.CheckCxx11():
         myenv.ConfError('C++11 support is required to build MongoDB')
+
+    if get_option('cxx-std') == "14":
+        if not conf.CheckCxx14():
+            myenv.ConfError('C++14 does not appear to work with the current toolchain')
 
     conf.Finish()
 
@@ -2134,8 +2184,8 @@ def doConfigure(myenv):
             tsan_options += "suppressions=\"%s\" " % myenv.File("#etc/tsan.suppressions").abspath
             myenv['ENV']['TSAN_OPTIONS'] = tsan_options
 
-        # By default, undefined behavior sanitizer doesn't stop on the first error. Make it so.
         if using_ubsan:
+            # By default, undefined behavior sanitizer doesn't stop on the first error. Make it so.
             AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover")
 
     if myenv.ToolchainIs('msvc') and optBuild:
@@ -2306,6 +2356,32 @@ def doConfigure(myenv):
 
     myenv = conf.Finish()
 
+    def CheckCXX11Align(context):
+        test_body = """
+        #include <memory>
+        int main(int argc, char **argv) {
+            char buf[100];
+            void* ptr = static_cast<void*>(buf);
+            std::size_t size = sizeof(buf);
+            auto foo = std::align(16, 16, ptr, size);
+            return 0;
+        }
+        """
+        context.Message('Checking for C++11 std::align support... ')
+        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
+        context.Result(ret)
+        return ret
+
+    # Check for std::align support
+    conf = Configure(myenv, help=False, custom_tests = {
+        'CheckCXX11Align': CheckCXX11Align,
+    })
+
+    if conf.CheckCXX11Align():
+        conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_ALIGN')
+
+    myenv = conf.Finish()
+
     def CheckBoostMinVersion(context):
         compile_test_body = textwrap.dedent("""
         #include <boost/version.hpp>
@@ -2331,6 +2407,13 @@ def doConfigure(myenv):
         if conf.env.TargetOSIs('windows'):
             sslLibName = "ssleay32"
             cryptoLibName = "libeay32"
+
+        # Used to import system certificate keychains
+        if conf.env.TargetOSIs('osx'):
+            conf.env.AppendUnique(FRAMEWORKS=[
+                'CoreFoundation',
+                'Security',
+            ])
 
         if not conf.CheckLibWithHeader(
                 sslLibName,
@@ -2569,7 +2652,7 @@ def doLint( env , target , source ):
         raise Exception("ESLint errors")
 
     import buildscripts.clang_format
-    if not buildscripts.clang_format.lint(None, []):
+    if not buildscripts.clang_format.lint_all(None):
         raise Exception("clang-format lint errors")
 
     import buildscripts.lint
