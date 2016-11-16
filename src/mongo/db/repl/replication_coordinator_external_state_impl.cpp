@@ -45,17 +45,18 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/master_slave.h"
-#include "mongo/db/repl/minvalid.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/rs_sync.h"
+#include "mongo/db/repl/rs_initialsync.h"
 #include "mongo/db/repl/snapshot_thread.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/s/sharding_state.h"
@@ -65,6 +66,7 @@
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
@@ -93,22 +95,50 @@ ReplicationCoordinatorExternalStateImpl::ReplicationCoordinatorExternalStateImpl
     : _startedThreads(false), _nextThreadId(0) {}
 ReplicationCoordinatorExternalStateImpl::~ReplicationCoordinatorExternalStateImpl() {}
 
+void ReplicationCoordinatorExternalStateImpl::startInitialSync(OnInitialSyncFinishedFn finished) {
+    _initialSyncThread.reset(new stdx::thread{[finished, this]() {
+        Client::initThreadIfNotAlready("initial sync");
+        log() << "Starting replication fetcher thread";
+
+        // Start bgsync.
+        BackgroundSync* bgsync = BackgroundSync::get();
+        invariant(!(bgsync == nullptr && !inShutdownStrict()));  // bgsync can be null @shutdown.
+        invariant(!_producerThread);  // The producer thread should not be init'd before this.
+        _producerThread.reset(
+            new stdx::thread(stdx::bind(&BackgroundSync::producerThread, bgsync)));
+        // Do initial sync.
+        syncDoInitialSync();
+        finished();
+    }});
+}
+
+void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication() {
+    if (!_producerThread) {
+        log() << "Starting replication fetcher thread";
+        BackgroundSync* bgsync = BackgroundSync::get();
+        _producerThread.reset(
+            new stdx::thread(stdx::bind(&BackgroundSync::producerThread, bgsync)));
+    }
+    log() << "Starting replication applier threads";
+    invariant(!_applierThread);
+    _applierThread.reset(new stdx::thread(runSyncThread));
+    log() << "Starting replication reporter thread";
+    invariant(!_syncSourceFeedbackThread);
+    _syncSourceFeedbackThread.reset(
+        new stdx::thread(stdx::bind(&SyncSourceFeedback::run, &_syncSourceFeedback)));
+}
+
 void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& settings) {
     stdx::lock_guard<stdx::mutex> lk(_threadMutex);
     if (_startedThreads) {
         return;
     }
-    log() << "Starting replication applier threads";
-    _applierThread.reset(new stdx::thread(runSyncThread));
-    BackgroundSync* bgsync = BackgroundSync::get();
-    _producerThread.reset(new stdx::thread(stdx::bind(&BackgroundSync::producerThread, bgsync)));
-    _syncSourceFeedbackThread.reset(
-        new stdx::thread(stdx::bind(&SyncSourceFeedback::run, &_syncSourceFeedback)));
+    log() << "Starting replication storage threads";
     if (settings.isMajorityReadConcernEnabled() || enableReplSnapshotThread) {
         _snapshotThread = SnapshotThread::start(getGlobalServiceContext());
     }
-    _startedThreads = true;
     getGlobalServiceContext()->getGlobalStorageEngine()->setJournalListener(this);
+    _startedThreads = true;
 }
 
 void ReplicationCoordinatorExternalStateImpl::startMasterSlave(OperationContext* txn) {
@@ -119,13 +149,21 @@ void ReplicationCoordinatorExternalStateImpl::shutdown() {
     stdx::lock_guard<stdx::mutex> lk(_threadMutex);
     if (_startedThreads) {
         log() << "Stopping replication applier threads";
-        _syncSourceFeedback.shutdown();
-        _syncSourceFeedbackThread->join();
-        _applierThread->join();
-        BackgroundSync* bgsync = BackgroundSync::get();
-        bgsync->shutdown();
-        _producerThread->join();
+        if (_syncSourceFeedbackThread) {
+            _syncSourceFeedback.shutdown();
+            _syncSourceFeedbackThread->join();
+        }
+        if (_applierThread) {
+            _applierThread->join();
+        }
 
+        if (_producerThread) {
+            BackgroundSync* bgsync = BackgroundSync::get();
+            if (bgsync) {
+                bgsync->shutdown();
+            }
+            _producerThread->join();
+        }
         if (_snapshotThread)
             _snapshotThread->shutdown();
     }
@@ -300,7 +338,7 @@ void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(const Timestamp
 }
 
 void ReplicationCoordinatorExternalStateImpl::cleanUpLastApplyBatch(OperationContext* txn) {
-    auto mv = getMinValid(txn);
+    auto mv = StorageInterface::get(txn)->getMinValid(txn);
 
     if (!mv.start.isNull()) {
         // If we are in the middle of a batch, and recoveringm then we need to truncate the oplog.
@@ -369,11 +407,17 @@ void ReplicationCoordinatorExternalStateImpl::recoverShardingState(OperationCont
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
-    BackgroundSync::get()->clearSyncTarget();
+    auto bgsync = BackgroundSync::get();
+    if (bgsync) {
+        bgsync->clearSyncTarget();
+    }
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToCancelFetcher() {
-    BackgroundSync::get()->cancelFetcher();
+    auto bgsync = BackgroundSync::get();
+    if (bgsync) {
+        bgsync->cancelFetcher();
+    }
 }
 
 void ReplicationCoordinatorExternalStateImpl::dropAllTempCollections(OperationContext* txn) {

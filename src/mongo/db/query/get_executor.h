@@ -135,7 +135,7 @@ StatusWith<std::unique_ptr<PlanExecutor>> getExecutorCount(OperationContext* txn
  * and delete flags like 'isMulti'. The caller must hold the appropriate MODE_X or MODE_IX
  * locks, and must not release these locks until after the returned PlanExecutor is deleted.
  *
- * The returned PlanExecutor will yield if and only if parsedDelete->canYield().
+ * The returned PlanExecutor will used the YieldPolicy returned by parsedDelete->yieldPolicy().
  *
  * Does not take ownership of its arguments.
  *
@@ -145,6 +145,7 @@ StatusWith<std::unique_ptr<PlanExecutor>> getExecutorCount(OperationContext* txn
  * If the query cannot be executed, returns a Status indicating why.
  */
 StatusWith<std::unique_ptr<PlanExecutor>> getExecutorDelete(OperationContext* txn,
+                                                            OpDebug* opDebug,
                                                             Collection* collection,
                                                             ParsedDelete* parsedDelete);
 
@@ -154,7 +155,7 @@ StatusWith<std::unique_ptr<PlanExecutor>> getExecutorDelete(OperationContext* tx
  * to calling this function, and must not release these locks until after the returned
  * PlanExecutor is deleted.
  *
- * The returned PlanExecutor will yield if and only if parsedUpdate->canYield().
+ * The returned PlanExecutor will used the YieldPolicy returned by parsedUpdate->yieldPolicy().
  *
  * Does not take ownership of its arguments.
  *
@@ -164,9 +165,9 @@ StatusWith<std::unique_ptr<PlanExecutor>> getExecutorDelete(OperationContext* tx
  * If the query cannot be executed, returns a Status indicating why.
  */
 StatusWith<std::unique_ptr<PlanExecutor>> getExecutorUpdate(OperationContext* txn,
+                                                            OpDebug* opDebug,
                                                             Collection* collection,
-                                                            ParsedUpdate* parsedUpdate,
-                                                            OpDebug* opDebug);
+                                                            ParsedUpdate* parsedUpdate);
 
 /**
  * Get a PlanExecutor for a group operation.

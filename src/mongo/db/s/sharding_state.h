@@ -36,16 +36,17 @@
 #include "mongo/bson/oid.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/migration_destination_manager.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
 class BSONObj;
 class BSONObjBuilder;
 struct ChunkVersion;
-class Client;
 class CollectionMetadata;
 class CollectionShardingState;
 class ConnectionString;
@@ -86,6 +87,8 @@ public:
         OperationContext* const _txn;
     };
 
+    using GlobalInitFunc = stdx::function<Status(const ConnectionString&)>;
+
     ShardingState();
     ~ShardingState();
 
@@ -118,23 +121,30 @@ public:
      *
      * Throws if initialization fails for any reason and the sharding state object becomes unusable
      * afterwards. Any sharding state operations afterwards will fail.
+     *
+     * Note that this will also try to connect to the config servers and will block until it
+     * succeeds.
      */
     void initializeFromConfigConnString(OperationContext* txn, const std::string& configSvr);
 
     /**
      * Initializes the sharding state of this server from the shard identity document from local
      * storage.
+     *
+     * Note that this will also try to connect to the config servers and will block until it
+     * succeeds.
      */
     Status initializeFromShardIdentity(OperationContext* txn);
 
     /**
      * Initializes the sharding state of this server from the shard identity document argument.
      * This is the more genaralized form of the initializeFromShardIdentity(OperationContext*)
-     * method that can accept the shard identity from any source.
-     * This method currently blocks for network and should not be called with database locks held.
+     * method that can accept the shard identity from any source. Note that shardIdentity must
+     * be valid.
+     *
+     * Returns ErrorCodes::ExceededTimeLimit if deadline has passed.
      */
-    Status initializeFromShardIdentity(OperationContext* txn,
-                                       const ShardIdentityType& shardIdentity);
+    Status initializeFromShardIdentity(const ShardIdentityType& shardIdentity, Date_t deadline);
 
     /**
      * Shuts down sharding machinery on the shard.
@@ -209,45 +219,6 @@ public:
     std::shared_ptr<CollectionMetadata> getCollectionMetadata(const std::string& ns);
 
     /**
-     * Creates and installs a new chunk metadata for a given collection by splitting one of its
-     * chunks in two or more. The version for the first split chunk should be provided. The
-     * subsequent chunks' version would be the latter with the minor portion incremented.
-     *
-     * The effect on clients will depend on the version used. If the major portion is the same
-     * as the current shards, clients shouldn't perceive the split.
-     *
-     * @param ns the collection
-     * @param min max the chunk that should be split
-     * @param splitKeys point in which to split
-     * @param version at which the new metadata should be at
-     */
-    void splitChunk(OperationContext* txn,
-                    const std::string& ns,
-                    const BSONObj& min,
-                    const BSONObj& max,
-                    const std::vector<BSONObj>& splitKeys,
-                    ChunkVersion version);
-
-    /**
-     * Creates and installs a new chunk metadata for a given collection by merging a range of
-     * chunks ['minKey', 'maxKey') into a single chunk with version 'mergedVersion'.
-     * The current metadata must overlap the range completely and minKey and maxKey must not
-     * divide an existing chunk.
-     *
-     * The merged chunk version must have a greater version than the current shard version,
-     * and if it has a greater major version clients will need to reload metadata.
-     *
-     * @param ns the collection
-     * @param minKey maxKey the range which should be merged
-     * @param newShardVersion the shard version the newly merged chunk should have
-     */
-    void mergeChunks(OperationContext* txn,
-                     const std::string& ns,
-                     const BSONObj& minKey,
-                     const BSONObj& maxKey,
-                     ChunkVersion mergedVersion);
-
-    /**
      * TESTING ONLY
      * Uninstalls the metadata for a given collection.
      */
@@ -261,6 +232,12 @@ public:
      * re-checked after acquiring some intent lock on that namespace.
      */
     boost::optional<NamespaceString> getActiveMigrationNss();
+
+    /**
+     * For testing only. Mock the initialization method used by initializeFromConfigConnString and
+     * initializeFromShardIdentity after all checks are performed.
+     */
+    void setGlobalInitMethodForTest(GlobalInitFunc func);
 
 private:
     friend class ScopedRegisterMigration;
@@ -314,8 +291,8 @@ private:
      * Blocking method, which waits for the initialization state to become kInitialized or kError
      * and returns the initialization status.
      */
-    Status _waitForInitialization(OperationContext* txn);
-    Status _waitForInitialization_inlock(OperationContext* txn, stdx::unique_lock<stdx::mutex>& lk);
+    Status _waitForInitialization(Date_t deadline);
+    Status _waitForInitialization_inlock(Date_t deadline, stdx::unique_lock<stdx::mutex>& lk);
 
     /**
      * Simple wrapper to cast the initialization state atomic uint64 to InitializationState value
@@ -386,6 +363,9 @@ private:
 
     // The id for the cluster this shard belongs to.
     OID _clusterId;
+
+    // Function for initializing the external sharding state components not owned here.
+    GlobalInitFunc _globalInit;
 };
 
 }  // namespace mongo

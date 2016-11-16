@@ -32,8 +32,8 @@
 
 #include <vector>
 
-#include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/client/remote_command_targeter_factory_mock.h"
+#include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -219,7 +219,7 @@ protected:
 
         // Expect the change log operation
         expectChangeLogInsert(configHost,
-                              shardRegistry()->getNetwork()->now(),
+                              network()->now(),
                               "addShard",
                               "",
                               BSON("name" << shardName << "host" << shardHost));
@@ -485,12 +485,11 @@ TEST_F(AddShardTest, UnreachableHost) {
         ASSERT_EQUALS("host unreachable", status.getStatus().reason());
     });
 
-    for (int i = 0; i < 3; i++) {  // ShardRegistry will retry 3 times
-        onCommandForAddShard([](const RemoteCommandRequest& request) {
-            ASSERT_EQ(request.target, HostAndPort("StandaloneHost:12345"));
-            return StatusWith<BSONObj>{ErrorCodes::HostUnreachable, "host unreachable"};
-        });
-    }
+    onCommandForAddShard([](const RemoteCommandRequest& request) {
+        ASSERT_EQ(request.target, HostAndPort("StandaloneHost:12345"));
+        return StatusWith<BSONObj>{ErrorCodes::HostUnreachable, "host unreachable"};
+    });
+
 
     future.timed_get(kFutureTimeout);
 }

@@ -12,6 +12,12 @@ env.InjectThirdPartyIncludePaths(libraries=['snappy', 'zlib'])
 if endian == "big":
     env.Append(CPPDEFINES=[('WORDS_BIGENDIAN', 1)])
 
+# WiredTiger is not currently alignment clean; see
+# https://jira.mongodb.org/browse/WT-2402.
+sanitizer_list = get_option('sanitize')
+if sanitizer_list and ('undefined' in sanitizer_list.split(',')):
+    env.Append(CCFLAGS=["-fno-sanitize=alignment"])
+
 env.Append(CPPPATH=[
         "src/include",
     ])
@@ -53,6 +59,9 @@ elif env.TargetOSIs('osx'):
     env.Append(CPPPATH=["build_darwin"])
 elif env.TargetOSIs('solaris'):
     env.Append(CPPPATH=["build_solaris"])
+    # For an explanation of __EXTENSIONS__,
+    # see http://docs.oracle.com/cd/E19253-01/816-5175/standards-5/index.html
+    env.Append(CPPDEFINES=["__EXTENSIONS__"])
 elif env.TargetOSIs('freebsd'):
     env.Append(CPPPATH=["build_freebsd"])
 elif env.TargetOSIs('openbsd'):

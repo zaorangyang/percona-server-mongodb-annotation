@@ -637,6 +637,7 @@ StatusWith<unique_ptr<PlanStage>> applyProjection(OperationContext* txn,
 //
 
 StatusWith<unique_ptr<PlanExecutor>> getExecutorDelete(OperationContext* txn,
+                                                       OpDebug* opDebug,
                                                        Collection* collection,
                                                        ParsedDelete* parsedDelete) {
     const DeleteRequest* request = parsedDelete->getRequest();
@@ -647,9 +648,9 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDelete(OperationContext* txn,
             uassert(
                 12050, "cannot delete from system namespace", legalClientSystemNS(nss.ns(), true));
         }
-        if (nss.ns().find('$') != string::npos) {
-            log() << "cannot delete from collection with reserved $ in name: " << nss;
-            uasserted(10100, "cannot delete from collection with reserved $ in name");
+        if (nss.isVirtualized()) {
+            log() << "cannot delete from a virtual collection: " << nss;
+            uasserted(10100, "cannot delete from a virtual collection");
         }
     }
 
@@ -672,10 +673,10 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDelete(OperationContext* txn,
     deleteStageParams.isExplain = request->isExplain();
     deleteStageParams.returnDeleted = request->shouldReturnDeleted();
     deleteStageParams.sort = request->getSort();
+    deleteStageParams.opDebug = opDebug;
 
     unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
-    PlanExecutor::YieldPolicy policy =
-        parsedDelete->canYield() ? PlanExecutor::YIELD_AUTO : PlanExecutor::YIELD_MANUAL;
+    const PlanExecutor::YieldPolicy policy = parsedDelete->yieldPolicy();
 
     if (!parsedDelete->hasParsedQuery()) {
         // This is the idhack fast-path for getting a PlanExecutor without doing the work
@@ -777,9 +778,9 @@ inline void validateUpdate(const char* ns, const BSONObj& updateobj, const BSONO
 }  // namespace
 
 StatusWith<unique_ptr<PlanExecutor>> getExecutorUpdate(OperationContext* txn,
+                                                       OpDebug* opDebug,
                                                        Collection* collection,
-                                                       ParsedUpdate* parsedUpdate,
-                                                       OpDebug* opDebug) {
+                                                       ParsedUpdate* parsedUpdate) {
     const UpdateRequest* request = parsedUpdate->getRequest();
     UpdateDriver* driver = parsedUpdate->getDriver();
 
@@ -814,8 +815,7 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorUpdate(OperationContext* txn,
         driver->refreshIndexKeys(lifecycle->getIndexKeys(txn));
     }
 
-    PlanExecutor::YieldPolicy policy =
-        parsedUpdate->canYield() ? PlanExecutor::YIELD_AUTO : PlanExecutor::YIELD_MANUAL;
+    const PlanExecutor::YieldPolicy policy = parsedUpdate->yieldPolicy();
 
     unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
     UpdateStageParams updateStageParams(request, driver, opDebug);

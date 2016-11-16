@@ -48,7 +48,6 @@
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
@@ -831,133 +830,6 @@ TEST_F(CatalogManagerReplSetTest, RunUserManagementWriteCommandNotMasterRetrySuc
     });
 
     // Now wait for the runUserManagementWriteCommand call to return
-    future.timed_get(kFutureTimeout);
-}
-
-TEST_F(CatalogManagerReplSetTest, GetGlobalSettingsBalancerDoc) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    // sample balancer doc
-    SettingsType st1;
-    st1.setKey(SettingsType::BalancerDocKey);
-    st1.setBalancerStopped(true);
-
-    auto future = launchAsync([this] {
-        return assertGet(
-            catalogManager()->getGlobalSettings(operationContext(), SettingsType::BalancerDocKey));
-    });
-
-    onFindCommand([this, st1](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
-
-        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.ns(), SettingsType::ConfigNS);
-
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
-
-        ASSERT_EQ(query->ns(), SettingsType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSON(SettingsType::key(SettingsType::BalancerDocKey)));
-
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
-
-        return vector<BSONObj>{st1.toBSON()};
-    });
-
-    const auto& actualBalSettings = future.timed_get(kFutureTimeout);
-    ASSERT_EQ(actualBalSettings.toBSON(), st1.toBSON());
-}
-
-TEST_F(CatalogManagerReplSetTest, GetGlobalSettingsChunkSizeDoc) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    // sample chunk size doc
-    SettingsType st1;
-    st1.setKey(SettingsType::ChunkSizeDocKey);
-    st1.setChunkSizeMB(80);
-
-    auto future = launchAsync([this] {
-        return assertGet(
-            catalogManager()->getGlobalSettings(operationContext(), SettingsType::ChunkSizeDocKey));
-    });
-
-    onFindCommand([this, st1](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
-
-        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.ns(), SettingsType::ConfigNS);
-
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
-
-        ASSERT_EQ(query->ns(), SettingsType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSON(SettingsType::key(SettingsType::ChunkSizeDocKey)));
-
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
-
-        return vector<BSONObj>{st1.toBSON()};
-    });
-
-    const auto& actualBalSettings = future.timed_get(kFutureTimeout);
-    ASSERT_EQ(actualBalSettings.toBSON(), st1.toBSON());
-}
-
-TEST_F(CatalogManagerReplSetTest, GetGlobalSettingsInvalidDoc) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    auto future = launchAsync([this] {
-        const auto balSettings =
-            catalogManager()->getGlobalSettings(operationContext(), "invalidKey");
-
-        ASSERT_EQ(balSettings.getStatus(), ErrorCodes::FailedToParse);
-    });
-
-    onFindCommand([this](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
-
-        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.ns(), SettingsType::ConfigNS);
-
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
-
-        ASSERT_EQ(query->ns(), SettingsType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSON(SettingsType::key("invalidKey")));
-
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
-
-        return vector<BSONObj>{
-            BSON("invalidKey"
-                 << "some value")  // invalid settings document -- key is required
-        };
-    });
-
-    future.timed_get(kFutureTimeout);
-}
-
-TEST_F(CatalogManagerReplSetTest, GetGlobalSettingsNonExistent) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    auto future = launchAsync([this] {
-        const auto chunkSizeSettings =
-            catalogManager()->getGlobalSettings(operationContext(), SettingsType::ChunkSizeDocKey);
-
-        ASSERT_EQ(chunkSizeSettings.getStatus(), ErrorCodes::NoMatchingDocument);
-    });
-
-    onFindCommand([this](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
-
-        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.ns(), SettingsType::ConfigNS);
-
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
-
-        ASSERT_EQ(query->ns(), SettingsType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSON(SettingsType::key(SettingsType::ChunkSizeDocKey)));
-
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
-
-        return vector<BSONObj>{};
-    });
-
     future.timed_get(kFutureTimeout);
 }
 
@@ -2445,7 +2317,7 @@ TEST_F(CatalogManagerReplSetTest, ReadAfterOpTimeFindThenCmd) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future1 = launchAsync([this] {
-        ASSERT_OK(catalogManager()->getGlobalSettings(operationContext(), "chunksize").getStatus());
+        ASSERT_OK(catalogManager()->getDatabase(operationContext(), "TestDB").getStatus());
     });
 
     OpTime highestOpTime;
@@ -2460,11 +2332,12 @@ TEST_F(CatalogManagerReplSetTest, ReadAfterOpTimeFindThenCmd) {
             BSONObjBuilder builder;
             metadata.writeToMetadata(&builder);
 
-            SettingsType settings;
-            settings.setKey("chunksize");
-            settings.setChunkSizeMB(2);
+            DatabaseType dbType;
+            dbType.setName("TestDB");
+            dbType.setPrimary("TestShard");
+            dbType.setSharded("true");
 
-            return std::make_tuple(vector<BSONObj>{settings.toBSON()}, builder.obj());
+            return std::make_tuple(vector<BSONObj>{dbType.toBSON()}, builder.obj());
         });
 
     future1.timed_get(kFutureTimeout);
@@ -2528,7 +2401,7 @@ TEST_F(CatalogManagerReplSetTest, ReadAfterOpTimeCmdThenFind) {
 
     // Return an older OpTime
     auto future2 = launchAsync([this] {
-        ASSERT_OK(catalogManager()->getGlobalSettings(operationContext(), "chunksize").getStatus());
+        ASSERT_OK(catalogManager()->getDatabase(operationContext(), "TestDB").getStatus());
     });
 
     const OpTime oldOpTime(Timestamp(3, 10), 5);
@@ -2539,11 +2412,12 @@ TEST_F(CatalogManagerReplSetTest, ReadAfterOpTimeCmdThenFind) {
         ASSERT_EQ(string("find"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
 
-        SettingsType settings;
-        settings.setKey("chunksize");
-        settings.setChunkSizeMB(2);
+        DatabaseType dbType;
+        dbType.setName("TestDB");
+        dbType.setPrimary("TestShard");
+        dbType.setSharded("true");
 
-        return vector<BSONObj>{settings.toBSON()};
+        return vector<BSONObj>{dbType.toBSON()};
     });
 
     future2.timed_get(kFutureTimeout);
@@ -2600,8 +2474,7 @@ TEST_F(CatalogManagerReplSetTest, RetryOnFindCommandNetworkErrorFailsAtMaxRetry)
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
-        BSONObjBuilder responseBuilder;
-        auto status = catalogManager()->getGlobalSettings(operationContext(), "test");
+        auto status = catalogManager()->getDatabase(operationContext(), "TestDB");
         ASSERT_EQ(ErrorCodes::HostUnreachable, status.getStatus().code());
     });
 
@@ -2617,15 +2490,8 @@ TEST_F(CatalogManagerReplSetTest, RetryOnFindCommandNetworkErrorFailsAtMaxRetry)
 TEST_F(CatalogManagerReplSetTest, RetryOnFindCommandNetworkErrorSucceedsAtMaxRetry) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    SettingsType st;
-    st.setKey(SettingsType::BalancerDocKey);
-    st.setBalancerStopped(true);
-
-    auto future = launchAsync([this, st] {
-        BSONObjBuilder responseBuilder;
-        auto docStatus = catalogManager()->getGlobalSettings(operationContext(), "test");
-        ASSERT_OK(docStatus.getStatus());
-        ASSERT_EQ(st.toBSON(), docStatus.getValue().toBSON());
+    auto future = launchAsync([&] {
+        ASSERT_OK(catalogManager()->getDatabase(operationContext(), "TestDB").getStatus());
     });
 
     for (int i = 0; i < kMaxCommandRetry - 1; ++i) {
@@ -2634,8 +2500,14 @@ TEST_F(CatalogManagerReplSetTest, RetryOnFindCommandNetworkErrorSucceedsAtMaxRet
         });
     }
 
-    onFindCommand(
-        [st](const RemoteCommandRequest& request) { return vector<BSONObj>{st.toBSON()}; });
+    onFindCommand([](const RemoteCommandRequest& request) {
+        DatabaseType dbType;
+        dbType.setName("TestDB");
+        dbType.setPrimary("TestShard");
+        dbType.setSharded("true");
+
+        return vector<BSONObj>{dbType.toBSON()};
+    });
 
     future.timed_get(kFutureTimeout);
 }

@@ -45,7 +45,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -53,7 +52,6 @@
 #include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/timer_stats.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
@@ -102,16 +100,6 @@ void runSyncThread() {
                 continue;
             }
 
-            bool initialSyncRequested = BackgroundSync::get()->getInitialSyncRequestedFlag();
-            // Check criteria for doing an initial sync:
-            // 1. If the oplog is empty, do an initial sync
-            // 2. If minValid has _initialSyncFlag set, do an initial sync
-            // 3. If initialSyncRequested is true
-            if (getGlobalReplicationCoordinator()->getMyLastAppliedOpTime().isNull() ||
-                getInitialSyncFlag() || initialSyncRequested) {
-                syncDoInitialSync();
-                continue;  // start from top again in case sync failed.
-            }
             if (!replCoord->setFollowerMode(MemberState::RS_RECOVERING)) {
                 continue;
             }

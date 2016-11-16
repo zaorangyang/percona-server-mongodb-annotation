@@ -1053,6 +1053,7 @@ var ShardingTest = function(params) {
                 useHostname: otherParams.useHostname,
                 noJournalPrealloc: otherParams.nopreallocj,
                 oplogSize: 16,
+                shardsvr: '',
                 pathOpts: Object.merge(pathOpts, {shard: i})
             };
 
@@ -1060,6 +1061,8 @@ var ShardingTest = function(params) {
             rsDefaults = Object.merge(rsDefaults, otherParams.rsOptions);
             rsDefaults = Object.merge(rsDefaults, otherParams["rs" + i]);
             rsDefaults.nodes = rsDefaults.nodes || otherParams.numReplicas;
+            var rsSettings = rsDefaults.settings;
+            delete rsDefaults.settings;
 
             var numReplicas = rsDefaults.nodes || 3;
             delete rsDefaults.nodes;
@@ -1077,7 +1080,7 @@ var ShardingTest = function(params) {
                 bridgeOptions: otherParams.bridgeOptions,
                 keyFile: keyFile,
                 protocolVersion: protocolVersion,
-                shardSvr: true
+                settings: rsSettings
             });
 
             this._rs[i] = {
@@ -1104,6 +1107,7 @@ var ShardingTest = function(params) {
                 noJournalPrealloc: otherParams.nopreallocj,
                 pathOpts: Object.merge(pathOpts, {shard: i}),
                 dbpath: "$testName$shard",
+                shardsvr: '',
                 keyFile: keyFile
             };
 
@@ -1353,30 +1357,31 @@ var ShardingTest = function(params) {
         }
     }
 
-    if (!otherParams.manualAddShard) {
-        this._shardNames = [];
+    try {
+        if (!otherParams.manualAddShard) {
+            this._shardNames = [];
 
-        var testName = this._testName;
-        var admin = this.admin;
-        var shardNames = this._shardNames;
+            var testName = this._testName;
+            var admin = this.admin;
+            var shardNames = this._shardNames;
 
-        this._connections.forEach(function(z) {
-            var n = z.name;
-            if (!n) {
-                n = z.host;
-                if (!n) {
-                    n = z;
-                }
-            }
+            this._connections.forEach(function(z) {
+                var n = z.name || z.host || z;
 
-            print("ShardingTest " + testName + " going to add shard : " + n);
+                print("ShardingTest " + testName + " going to add shard : " + n);
 
-            var result = admin.runCommand({addshard: n});
-            assert.commandWorked(result, "Failed to add shard " + n);
+                var result = admin.runCommand({addshard: n});
+                assert.commandWorked(result, "Failed to add shard " + n);
 
-            shardNames.push(result.shardAdded);
-            z.shardName = result.shardAdded;
-        });
+                shardNames.push(result.shardAdded);
+                z.shardName = result.shardAdded;
+            });
+        }
+    } catch (e) {
+        // Clean up the running procceses on failure
+        print("Failed to add shards, stopping cluster.");
+        this.stop();
+        throw e;
     }
 
     if (jsTestOptions().keyFile) {

@@ -38,16 +38,17 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/update.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/update_driver.h"
 #include "mongo/db/ops/update_lifecycle.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/update_index_data.h"
@@ -73,6 +74,11 @@ UpdateResult update(OperationContext* txn,
 
     const NamespaceString& nsString = request.getNamespaceString();
     Collection* collection = db->getCollection(nsString.ns());
+
+    // If this is the local database, don't set last op.
+    if (db->name() == "local") {
+        lastOpSetterGuard.Dismiss();
+    }
 
     // The update stage does not create its own collection.  As such, if the update is
     // an upsert, create the collection that the update stage inserts into beforehand.
@@ -108,7 +114,7 @@ UpdateResult update(OperationContext* txn,
     uassertStatusOK(parsedUpdate.parseRequest());
 
     std::unique_ptr<PlanExecutor> exec =
-        uassertStatusOK(getExecutorUpdate(txn, collection, &parsedUpdate, opDebug));
+        uassertStatusOK(getExecutorUpdate(txn, opDebug, collection, &parsedUpdate));
 
     uassertStatusOK(exec->executePlan());
     if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
@@ -121,7 +127,8 @@ UpdateResult update(OperationContext* txn,
     PlanSummaryStats summaryStats;
     Explain::getSummaryStats(*exec, &summaryStats);
     const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
-    UpdateStage::fillOutOpDebug(updateStats, &summaryStats, opDebug);
+    UpdateStage::recordUpdateStatsInOpDebug(updateStats, opDebug);
+    opDebug->setPlanSummaryMetrics(summaryStats);
 
     return UpdateStage::makeUpdateResult(updateStats);
 }

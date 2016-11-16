@@ -45,7 +45,6 @@
 #include "mongo/db/index_builder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/scopeguard.h"
@@ -66,6 +65,9 @@ public:
     }
     virtual bool slaveOk() const {
         return false;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
     virtual Status checkAuthForCommand(ClientBasic* client,
                                        const std::string& dbname,

@@ -1047,7 +1047,12 @@ class IntLongOverflow : public TwoOperandBase {
         return BSON("" << numeric_limits<long long>::max());
     }
     BSONObj expectedResult() {
-        return BSON("" << (numeric_limits<int>::max() + numeric_limits<long long>::max()));
+        // Aggregation currently treats signed integers as overflowing like unsigned integers do.
+        const auto im = numeric_limits<int>::max();
+        const auto llm = numeric_limits<long long>::max();
+        const auto result = static_cast<long long>(static_cast<unsigned int>(im) +
+                                                   static_cast<unsigned long long>(llm));
+        return BSON("" << result);
     }
 };
 
@@ -4584,11 +4589,9 @@ TEST(ExpressionTypeTest, WithIntValue) {
     assertExpectedResults("$type", {{{Value(1)}, Value("int")}});
 }
 
-#ifdef MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT
 TEST(ExpressionTypeTest, WithDecimalValue) {
     assertExpectedResults("$type", {{{Value(Decimal128(0.3))}, Value("decimal")}});
 }
-#endif
 
 TEST(ExpressionTypeTest, WithLongValue) {
     assertExpectedResults("$type", {{{Value(1LL)}, Value("long")}});

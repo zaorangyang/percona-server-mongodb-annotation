@@ -38,12 +38,14 @@
 namespace mongo {
 
 class BSONObj;
+class CatalogCache;
 class CatalogManager;
 class CatalogManagerReplicaSet;
 struct ChunkVersion;
 class CollectionType;
 class DistLockManagerMock;
 class NamespaceString;
+class ShardFactoryMock;
 class RemoteCommandTargeterFactoryMock;
 class RemoteCommandTargeterMock;
 class ShardRegistry;
@@ -87,6 +89,8 @@ protected:
     RemoteCommandTargeterMock* configTargeter() const;
 
     executor::NetworkInterfaceMock* network() const;
+
+    executor::TaskExecutor* executor() const;
 
     MessagingPortMock* getMessagingPort() const;
 

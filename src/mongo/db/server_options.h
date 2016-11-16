@@ -58,8 +58,6 @@ struct ServerGlobalParams {
     std::atomic<bool> quiet{false};  // --quiet NOLINT
 
     ClusterRole clusterRole = ClusterRole::None;  // --configsvr/--shardsvr
-    CatalogManager::ConfigServerMode configsvrMode =
-        CatalogManager::ConfigServerMode::NONE;  // -- configsvrMode
 
     bool cpu = false;  // --cpu show cpu time periodically
 
@@ -123,7 +121,8 @@ struct ServerGlobalParams {
 
     AuthState authState = AuthState::kUndefined;
 
-    AtomicInt32 clusterAuthMode;  // --clusterAuthMode, the internal cluster auth mode
+    bool transitionToAuth = false;  // --transitionToAuth, mixed mode for rolling auth upgrade
+    AtomicInt32 clusterAuthMode;    // --clusterAuthMode, the internal cluster auth mode
 
     enum ClusterAuthModes {
         ClusterAuthMode_undefined,

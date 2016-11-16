@@ -136,6 +136,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/auth/authcommon',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/dbmessage',
+        '$BUILD_DIR/mongo/db/write_concern_options',
         '$BUILD_DIR/mongo/executor/connection_pool_stats',
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
@@ -195,6 +196,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/s/coreshard',
     ]
 )
 
@@ -206,6 +208,7 @@ env.CppUnitTest(
         'replica_set_monitor_test.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/write_concern_options',
         'clientdriver'
     ]
 )
@@ -220,10 +223,11 @@ env.CppUnitTest(
         'scoped_db_conn_test.cpp',
     ],
     LIBDEPS=[
+        'clientdriver',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/util/net/message_server_port',
-        '$BUILD_DIR/mongo/s/coreshard',
-        '$BUILD_DIR/mongo/s/mongoscore',
+        '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/ntservice_mock',
     ],
     NO_CRUTCH=True,
@@ -236,8 +240,8 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/s/catalog/catalog_manager',
         '$BUILD_DIR/mongo/s/coreshard',
+        '$BUILD_DIR/mongo/util/net/network',
         'clientdriver',
     ],
 )
@@ -263,6 +267,7 @@ env.CppUnitTest(
         'fetcher',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/db/commands_test_crutch',
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
     ],
 )

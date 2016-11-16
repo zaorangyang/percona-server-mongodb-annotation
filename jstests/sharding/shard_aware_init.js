@@ -1,7 +1,9 @@
 /**
  * Tests for shard aware initialization during process startup (for standalone) and transition
  * to primary (for replica set nodes).
- * @tags: [requires_persistence]
+ * Note: test will deliberately cause a mongod instance to terminate abruptly and mongod instance
+ * without journaling will complain about unclean shutdown.
+ * @tags: [requires_persistence, requires_journaling]
  */
 
 (function() {
@@ -27,11 +29,46 @@
             clusterId: ObjectId()
         };
 
-        assert.writeOK(mongodConn.getDB('admin').system.version.insert(shardIdentityDoc));
+        /**
+         * Restarts the server without --shardsvr and replace the shardIdentity doc with a valid
+         * document. Then, restarts the server again with --shardsvr. This also returns a
+         * connection to the server after the last restart.
+         */
+        var restartAndFixShardIdentityDoc = function(startOptions) {
+            var options = Object.extend({}, startOptions);
+            delete options.shardsvr;
+            mongodConn = MongoRunner.runMongod(options);
+            waitForMaster(mongodConn);
 
-        //
-        // TODO: add assert checks here when opObserver for shardIdentity is implemented
-        //
+            var res = mongodConn.getDB('admin')
+                          .system.version.update({_id: 'shardIdentity'}, shardIdentityDoc);
+            assert.eq(1, res.nModified);
+
+            MongoRunner.stopMongod(mongodConn.port);
+
+            newMongodOptions.shardsvr = '';
+            mongodConn = MongoRunner.runMongod(newMongodOptions);
+            waitForMaster(mongodConn);
+
+            res = mongodConn.getDB('admin').runCommand({shardingState: 1});
+
+            assert(res.enabled);
+            assert.eq(shardIdentityDoc.configsvrConnectionString, res.configServer);
+            assert.eq(shardIdentityDoc.shardName, res.shardName);
+            assert.eq(shardIdentityDoc.clusterId, res.clusterId);
+
+            return mongodConn;
+        };
+
+        assert.writeOK(mongodConn.getDB('admin')
+                           .system.version.update({_id: 'shardIdentity'}, shardIdentityDoc, true));
+
+        var res = mongodConn.getDB('admin').runCommand({shardingState: 1});
+
+        assert(res.enabled);
+        assert.eq(shardIdentityDoc.configsvrConnectionString, res.configServer);
+        assert.eq(shardIdentityDoc.shardName, res.shardName);
+        assert.eq(shardIdentityDoc.clusterId, res.clusterId);
 
         //
         // Test normal startup
@@ -43,7 +80,7 @@
         mongodConn = MongoRunner.runMongod(newMongodOptions);
         waitForMaster(mongodConn);
 
-        var res = mongodConn.getDB('admin').runCommand({shardingState: 1});
+        res = mongodConn.getDB('admin').runCommand({shardingState: 1});
 
         assert(res.enabled);
         assert.eq(shardIdentityDoc.configsvrConnectionString, res.configServer);
@@ -51,8 +88,14 @@
         assert.eq(shardIdentityDoc.clusterId, res.clusterId);
 
         //
-        // Test badly formatted shardIdentity doc
+        // Test shardIdentity doc without configsvrConnectionString, resulting into parse error
         //
+
+        // Note: modification of the shardIdentity is allowed only when not running with --shardsvr
+        MongoRunner.stopMongod(mongodConn.port);
+        delete newMongodOptions.shardsvr;
+        mongodConn = MongoRunner.runMongod(newMongodOptions);
+        waitForMaster(mongodConn);
 
         assert.writeOK(mongodConn.getDB('admin').system.version.update(
             {_id: 'shardIdentity'},
@@ -60,30 +103,46 @@
 
         MongoRunner.stopMongod(mongodConn.port);
 
+        newMongodOptions.shardsvr = '';
         assert.throws(function() {
             mongodConn = MongoRunner.runMongod(newMongodOptions);
             waitForMaster(mongodConn);
         });
 
-        // TODO: add more bad format tests.
+        //
+        // Test that it is possible to fix the invalid shardIdentity doc by not passing --shardsvr
+        //
+
+        try {
+            // The server was terminated not by calling stopMongod earlier, this will cleanup
+            // the process from registry in shell_utils_launcher.
+            MongoRunner.stopMongod(newMongodOptions.port);
+        } catch (ex) {
+            if (!(ex instanceof (MongoRunner.StopError))) {
+                throw ex;
+            }
+        }
+
+        mongodConn = restartAndFixShardIdentityDoc(newMongodOptions);
+        res = mongodConn.getDB('admin').runCommand({shardingState: 1});
+        assert(res.enabled);
     };
 
     var st = new ShardingTest({shards: 1});
 
-    var mongod = MongoRunner.runMongod();
+    var mongod = MongoRunner.runMongod({shardsvr: ''});
 
     runTest(mongod, st.configRS.getURL());
 
     MongoRunner.stopMongod(mongod.port);
 
     var replTest = new ReplSetTest({nodes: 1});
-    replTest.startSet();
+    replTest.startSet({shardsvr: ''});
     replTest.initiate();
 
     runTest(replTest.getPrimary(), st.configRS.getURL());
 
-    // TODO: cleanup properly once --shardsvr checks are added
-    // replTest.stopSet();
+    replTest.stopSet();
 
     st.stop();
 

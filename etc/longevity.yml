@@ -87,18 +87,8 @@ functions:
           set -e
           set -v
           cd ./clusters/${cluster}
-          # show cluster details
-          cat ips.sh
-          ./update_run_config.sh
-          cat run-${test}.json
-          # clean up old artifact from the last test
-          rm -f ../perf.json
-          rm -rf ./reports
-          rm -f ../../reports.tgz
-          echo "Run test for ${test} with setup ${setup}"
-          # run test
+          echo "Run test for ${test}-${storageEngine} with setup ${setup}"
           ../../bin/run-${test}.sh ${storageEngine} ${setup} ${cluster}
-          mv perf.json ..
           cd ..
           cat perf.json >> perf_all.json
           echo "Complete test for ${test} with setup ${setup}!"
@@ -139,6 +129,8 @@ functions:
           cp ../ips.sh .
           cp ../../perf_all.json .
           cd ..
+          ../../bin/retrieve-diag-data.sh
+          ../../bin/generate-timeseries-html.sh
           rm -rf ../reports
           mv ./reports ..
 
@@ -160,6 +152,16 @@ functions:
             permissions: public-read
             content_type: ${content_type|application/x-gzip}
             display_name: ${test}-longevity-testlog
+    - command: s3.put
+      params:
+            aws_key: ${aws_key}
+            aws_secret: ${aws_secret}
+            local_file: dsi/clusters/reports/graphs/timeseries-p1.html
+            remote_file: dsi/${build_variant}/${revision}/${task_id}/${version_id}/logs/timeseries-p1-${test}-${build_id}.html
+            bucket: mciuploads
+            permissions: public-read
+            content_type: text/html
+            display_name: timeseries-p1.html
 
   "analyze":
     - command: json.get_history
@@ -233,6 +235,7 @@ tasks:
         use_csrs: "true"
     - func: "run test"
       vars:
+        storageEngine: "wiredTiger"
         test: "ycsb"
     - func: "make test log artifact"
     - func: "upload log file"
@@ -253,7 +256,8 @@ tasks:
         use_csrs: "true"
     - func: "run test"
       vars:
-        test: "ycsb-mmap"
+        storageEngine: "mmapv1"
+        test: "ycsb"
     - func: "make test log artifact"
     - func: "upload log file"
       vars:
@@ -266,14 +270,14 @@ buildvariants:
   display_name: Linux WT Shard
   batchtime: 40320 # 4 weeks
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ --release
     setup: shard
     cluster: longevity
     numShard: 3
     storageEngine: wiredTiger
 
   run_on:
-    - "linux-64-amzn-perf-longevity"
+    - "rhel70-perf-longevity"
   tasks:
     - name: compile
       distros:
@@ -284,14 +288,14 @@ buildvariants:
   display_name: Linux MMAPv1 Shard
   batchtime: 40320 # 4 week
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ --release
     setup: shard
     cluster: longevity
     numShard: 3
     storageEngine: mmapv1
 
   run_on:
-    - "linux-64-amzn-perf-longevity"
+    - "rhel70-perf-longevity"
   tasks:
     - name: compile
       distros:

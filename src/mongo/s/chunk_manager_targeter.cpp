@@ -34,9 +34,11 @@
 
 #include <boost/thread/tss.hpp>
 
+#include "mongo/s/chunk.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
+#include "mongo/s/db_util.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -44,7 +46,7 @@
 namespace mongo {
 
 using std::shared_ptr;
-using mongoutils::str::stream;
+using str::stream;
 using std::map;
 using std::set;
 using std::string;
@@ -227,9 +229,9 @@ CompareResult compareAllShardVersions(const ChunkManager* cachedChunkManager,
  * Whether or not the manager/primary pair is different from the other manager/primary pair.
  */
 bool isMetadataDifferent(const ChunkManagerPtr& managerA,
-                         const ShardPtr& primaryA,
+                         const shared_ptr<Shard>& primaryA,
                          const ChunkManagerPtr& managerB,
-                         const ShardPtr& primaryB) {
+                         const shared_ptr<Shard>& primaryB) {
     if ((managerA && !managerB) || (!managerA && managerB) || (primaryA && !primaryB) ||
         (!primaryA && primaryB))
         return true;
@@ -247,9 +249,9 @@ bool isMetadataDifferent(const ChunkManagerPtr& managerA,
 * of the metadata.
 */
 bool wasMetadataRefreshed(const ChunkManagerPtr& managerA,
-                          const ShardPtr& primaryA,
+                          const shared_ptr<Shard>& primaryA,
                           const ChunkManagerPtr& managerB,
-                          const ShardPtr& primaryB) {
+                          const shared_ptr<Shard>& primaryB) {
     if (isMetadataDifferent(managerA, primaryA, managerB, primaryB))
         return true;
 
@@ -268,7 +270,7 @@ ChunkManagerTargeter::ChunkManagerTargeter(const NamespaceString& nss, TargeterS
 
 
 Status ChunkManagerTargeter::init(OperationContext* txn) {
-    auto status = grid.implicitCreateDb(txn, _nss.db().toString());
+    auto status = dbutil::implicitCreateDb(txn, _nss.db().toString());
     if (!status.isOK()) {
         return status.getStatus();
     }
@@ -511,7 +513,7 @@ Status ChunkManagerTargeter::targetShardKey(OperationContext* txn,
                                             ShardEndpoint** endpoint) const {
     invariant(NULL != _manager);
 
-    ChunkPtr chunk = _manager->findIntersectingChunk(txn, shardKey);
+    shared_ptr<Chunk> chunk = _manager->findIntersectingChunk(txn, shardKey);
 
     // Track autosplit stats for sharded collections
     // Note: this is only best effort accounting and is not accurate.
@@ -621,9 +623,9 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* txn, bool* wasCha
     //
 
     ChunkManagerPtr lastManager = _manager;
-    ShardPtr lastPrimary = _primary;
+    shared_ptr<Shard> lastPrimary = _primary;
 
-    auto status = grid.implicitCreateDb(txn, _nss.db().toString());
+    auto status = dbutil::implicitCreateDb(txn, _nss.db().toString());
     if (!status.isOK()) {
         return status.getStatus();
     }
@@ -684,7 +686,7 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* txn, bool* wasCha
 }
 
 Status ChunkManagerTargeter::refreshNow(OperationContext* txn, RefreshType refreshType) {
-    auto status = grid.implicitCreateDb(txn, _nss.db().toString());
+    auto status = dbutil::implicitCreateDb(txn, _nss.db().toString());
     if (!status.isOK()) {
         return status.getStatus();
     }

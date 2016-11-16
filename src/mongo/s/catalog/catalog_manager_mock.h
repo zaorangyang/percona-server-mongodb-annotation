@@ -41,7 +41,7 @@ public:
     CatalogManagerMock();
     ~CatalogManagerMock();
 
-    Status startup(OperationContext* txn) override;
+    Status startup() override;
 
     void shutDown(OperationContext* txn) override;
 
@@ -66,15 +66,15 @@ public:
                           const std::string& dbName,
                           const DatabaseType& db) override;
 
-    StatusWith<OpTimePair<DatabaseType>> getDatabase(OperationContext* txn,
-                                                     const std::string& dbName) override;
+    StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(OperationContext* txn,
+                                                           const std::string& dbName) override;
 
     Status updateCollection(OperationContext* txn,
                             const std::string& collNs,
                             const CollectionType& coll) override;
 
-    StatusWith<OpTimePair<CollectionType>> getCollection(OperationContext* txn,
-                                                         const std::string& collNs) override;
+    StatusWith<repl::OpTimeWith<CollectionType>> getCollection(OperationContext* txn,
+                                                               const std::string& collNs) override;
 
     Status getCollections(OperationContext* txn,
                           const std::string* dbName,
@@ -102,7 +102,8 @@ public:
                                            const std::string& collectionNs,
                                            const ChunkType& chunk) override;
 
-    StatusWith<OpTimePair<std::vector<ShardType>>> getAllShards(OperationContext* txn) override;
+    StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
+        OperationContext* txn) override;
 
     bool runUserManagementWriteCommand(OperationContext* txn,
                                        const std::string& commandName,
@@ -131,8 +132,7 @@ public:
                      const std::string& ns,
                      const BSONObj& detail) override;
 
-    StatusWith<SettingsType> getGlobalSettings(OperationContext* txn,
-                                               const std::string& key) override;
+    StatusWith<BSONObj> getGlobalSettings(OperationContext* txn, StringData key) override;
 
     void writeConfigServerDirect(OperationContext* txn,
                                  const BatchedCommandRequest& request,
@@ -166,6 +166,8 @@ public:
 
     Status appendInfoForConfigServerDatabases(OperationContext* txn,
                                               BSONArrayBuilder* builder) override;
+
+    void appendConnectionStats(executor::ConnectionPoolStats* stats) override;
 
 private:
     std::unique_ptr<DistLockManagerMock> _mockDistLockMgr;

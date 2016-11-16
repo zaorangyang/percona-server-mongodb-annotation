@@ -33,7 +33,6 @@
 #include <list>
 #include <utility>
 
-#include "mongo/base/checked_cast.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -44,7 +43,6 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/operation_context_repl_mock.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface.h"
@@ -53,11 +51,10 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/rs_rollback.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -128,7 +125,7 @@ StatusWith<BSONObj> RollbackSourceMock::getCollectionInfo(const NamespaceString&
     return BSON("name" << nss.ns() << "options" << BSONObj());
 }
 
-class RSRollbackTest : public unittest::Test {
+class RSRollbackTest : public ServiceContextMongoDTest {
 protected:
     std::unique_ptr<OperationContext> _txn;
 
@@ -141,27 +138,18 @@ private:
 };
 
 void RSRollbackTest::setUp() {
-    ServiceContext* serviceContext = getGlobalServiceContext();
-    if (!serviceContext->getGlobalStorageEngine()) {
-        // When using the 'devnull' storage engine, it is fine for the temporary directory to
-        // go away after the global storage engine is initialized.
-        unittest::TempDir tempDir("rs_rollback_test");
-        mongo::storageGlobalParams.dbpath = tempDir.path();
-        mongo::storageGlobalParams.dbpath = tempDir.path();
-        mongo::storageGlobalParams.engine = "ephemeralForTest";
-        mongo::storageGlobalParams.engineSetByUser = true;
-        checked_cast<ServiceContextMongoD*>(getGlobalServiceContext())->createLockFile();
-        serviceContext->initializeGlobalStorageEngine();
-    }
-
+    ServiceContextMongoDTest::setUp();
     Client::initThreadIfNotAlready();
     _txn.reset(new OperationContextReplMock(&cc(), 1));
     _coordinator = new ReplicationCoordinatorRollbackMock();
 
-    setGlobalReplicationCoordinator(_coordinator);
+    auto serviceContext = mongo::getGlobalServiceContext();
+    ReplicationCoordinator::set(serviceContext,
+                                std::unique_ptr<ReplicationCoordinator>(_coordinator));
+    StorageInterface::set(serviceContext, stdx::make_unique<StorageInterfaceMock>());
 
     setOplogCollectionName();
-    repl::setMinValid(_txn.get(), {OpTime{}, OpTime{}});
+    repl::StorageInterface::get(_txn.get())->setMinValid(_txn.get(), {OpTime{}, OpTime{}});
 }
 
 void RSRollbackTest::tearDown() {
@@ -174,10 +162,12 @@ void RSRollbackTest::tearDown() {
     setGlobalReplicationCoordinator(nullptr);
 }
 
+
 void noSleep(Seconds seconds) {}
 
 TEST_F(RSRollbackTest, InconsistentMinValid) {
-    repl::setMinValid(_txn.get(),
+    repl::StorageInterface::get(_txn.get())
+        ->setMinValid(_txn.get(),
                       {OpTime(Timestamp(Seconds(0), 0), 0), OpTime(Timestamp(Seconds(1), 0), 0)});
     auto status = syncRollback(_txn.get(),
                                OplogInterfaceMock(kEmptyMockOperations),
@@ -782,9 +772,12 @@ TEST_F(RSRollbackTest, RollbackApplyOpsCommand) {
             coll = autoDb.getDb()->createCollection(_txn.get(), "test.t");
         }
         ASSERT(coll);
-        ASSERT_OK(coll->insertDocument(_txn.get(), BSON("_id" << 1 << "v" << 2), false));
-        ASSERT_OK(coll->insertDocument(_txn.get(), BSON("_id" << 2 << "v" << 4), false));
-        ASSERT_OK(coll->insertDocument(_txn.get(), BSON("_id" << 4), false));
+        OpDebug* const nullOpDebug = nullptr;
+        ASSERT_OK(
+            coll->insertDocument(_txn.get(), BSON("_id" << 1 << "v" << 2), nullOpDebug, false));
+        ASSERT_OK(
+            coll->insertDocument(_txn.get(), BSON("_id" << 2 << "v" << 4), nullOpDebug, false));
+        ASSERT_OK(coll->insertDocument(_txn.get(), BSON("_id" << 4), nullOpDebug, false));
         wuow.commit();
     }
     const auto commonOperation =

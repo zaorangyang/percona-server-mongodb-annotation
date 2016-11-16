@@ -41,20 +41,21 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/apply_ops.h"
 #include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/catalog/coll_mod.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/dbhash.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -62,15 +63,14 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_timestamp.h"
-#include "mongo/db/index_builder.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index_builder.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/delete.h"
-#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update.h"
+#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/optime.h"
@@ -81,8 +81,8 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/platform/random.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
@@ -488,8 +488,9 @@ OpTime writeOpsToOplog(OperationContext* txn, const std::vector<BSONObj>& ops) {
         OldClientContext ctx(txn, rsOplogName, _localDB);
         WriteUnitOfWork wunit(txn);
 
-        checkOplogInsert(
-            _localOplogCollection->insertDocuments(txn, ops.begin(), ops.end(), false));
+        OpDebug* const nullOpDebug = nullptr;
+        checkOplogInsert(_localOplogCollection->insertDocuments(
+            txn, ops.begin(), ops.end(), nullOpDebug, false));
         lastOptime =
             fassertStatusOK(ErrorCodes::InvalidBSON, OpTime::parseFromOplogEntry(ops.back()));
         wunit.commit();
@@ -498,6 +499,51 @@ OpTime writeOpsToOplog(OperationContext* txn, const std::vector<BSONObj>& ops) {
 
     return lastOptime;
 }
+
+namespace {
+long long getNewOplogSizeBytes(OperationContext* txn, const ReplSettings& replSettings) {
+    if (replSettings.getOplogSizeBytes() != 0) {
+        return replSettings.getOplogSizeBytes();
+    }
+    /* not specified. pick a default size */
+    ProcessInfo pi;
+    if (pi.getAddrSize() == 32) {
+        const auto sz = 50LL * 1024LL * 1024LL;
+        LOG(3) << "32bit system; choosing " << sz << " bytes oplog";
+        return sz;
+    }
+// First choose a minimum size.
+
+#if defined(__APPLE__)
+    // typically these are desktops (dev machines), so keep it smallish
+    const auto sz = 192 * 1024 * 1024;
+    LOG(3) << "Apple system; choosing " << sz << " bytes oplog";
+    return sz;
+#else
+    long long lowerBound = 0;
+    double bytes = 0;
+    if (txn->getClient()->getServiceContext()->getGlobalStorageEngine()->isEphemeral()) {
+        // in memory: 50MB minimum size
+        lowerBound = 50LL * 1024 * 1024;
+        bytes = pi.getMemSizeMB() * 1024 * 1024;
+        LOG(3) << "Ephemeral storage system; lowerBound: " << lowerBound << " bytes, " << bytes
+               << " bytes total memory";
+    } else {
+        // disk: 990MB minimum size
+        lowerBound = 990LL * 1024 * 1024;
+        bytes = File::freeSpace(storageGlobalParams.dbpath);  //-1 if call not supported.
+        LOG(3) << "Disk storage system; lowerBound: " << lowerBound << " bytes, " << bytes
+               << " bytes free space on device";
+    }
+    long long fivePct = static_cast<long long>(bytes * 0.05);
+    auto sz = std::max(fivePct, lowerBound);
+    // we use 5% of free [disk] space up to 50GB (1TB free)
+    const long long upperBound = 50LL * 1024 * 1024 * 1024;
+    sz = std::min(sz, upperBound);
+    return sz;
+#endif
+}
+}  // namespace
 
 void createOplog(OperationContext* txn, const std::string& oplogCollectionName, bool replEnabled) {
     ScopedTransaction transaction(txn, MODE_X);
@@ -530,29 +576,7 @@ void createOplog(OperationContext* txn, const std::string& oplogCollectionName, 
     }
 
     /* create an oplog collection, if it doesn't yet exist. */
-    long long sz = 0;
-    if (replSettings.getOplogSizeBytes() != 0) {
-        sz = replSettings.getOplogSizeBytes();
-    } else {
-        /* not specified. pick a default size */
-        sz = 50LL * 1024LL * 1024LL;
-        if (sizeof(int*) >= 8) {
-#if defined(__APPLE__)
-            // typically these are desktops (dev machines), so keep it smallish
-            sz = (256 - 64) * 1024 * 1024;
-#else
-            sz = 990LL * 1024 * 1024;
-            double free = File::freeSpace(storageGlobalParams.dbpath);  //-1 if call not supported.
-            long long fivePct = static_cast<long long>(free * 0.05);
-            if (fivePct > sz)
-                sz = fivePct;
-            // we use 5% of free space up to 50GB (1TB free)
-            static long long upperBound = 50LL * 1024 * 1024 * 1024;
-            if (fivePct > upperBound)
-                sz = upperBound;
-#endif
-        }
-    }
+    const auto sz = getNewOplogSizeBytes(txn, replSettings);
 
     log() << "******" << endl;
     log() << "creating replication oplog of size: " << (int)(sz / (1024 * 1024)) << "MB..." << endl;
@@ -588,11 +612,11 @@ void createOplog(OperationContext* txn) {
 namespace {
 NamespaceString parseNs(const string& ns, const BSONObj& cmdObj) {
     BSONElement first = cmdObj.firstElement();
-    uassert(28635,
-            "no collection name specified",
-            first.canonicalType() == canonicalizeBSONType(mongo::String) &&
-                first.valuestrsize() > 0);
+    uassert(40073,
+            str::stream() << "collection name has invalid type " << typeName(first.type()),
+            first.canonicalType() == canonicalizeBSONType(mongo::String));
     std::string coll = first.valuestr();
+    uassert(28635, "no collection name specified", !coll.empty());
     return NamespaceString(NamespaceString(ns).db().toString(), coll);
 }
 
@@ -797,7 +821,9 @@ Status applyOperation_inlock(OperationContext* txn,
             }
 
             WriteUnitOfWork wuow(txn);
-            status = collection->insertDocuments(txn, insertObjs.begin(), insertObjs.end(), true);
+            OpDebug* const nullOpDebug = nullptr;
+            status = collection->insertDocuments(
+                txn, insertObjs.begin(), insertObjs.end(), nullOpDebug, true);
             if (!status.isOK()) {
                 return status;
             }
@@ -828,7 +854,8 @@ Status applyOperation_inlock(OperationContext* txn,
             {
                 WriteUnitOfWork wuow(txn);
                 try {
-                    status = collection->insertDocument(txn, o, true);
+                    OpDebug* const nullOpDebug = nullptr;
+                    status = collection->insertDocument(txn, o, nullOpDebug, true);
                 } catch (DBException dbe) {
                     status = dbe.toStatus();
                 }
@@ -855,7 +882,7 @@ Status applyOperation_inlock(OperationContext* txn,
                 request.setQuery(b.done());
                 request.setUpdates(o);
                 request.setUpsert();
-                UpdateLifecycleImpl updateLifecycle(true, requestNs);
+                UpdateLifecycleImpl updateLifecycle(requestNs);
                 request.setLifecycle(&updateLifecycle);
 
                 UpdateResult res = update(txn, db, request, &debug);
@@ -886,7 +913,7 @@ Status applyOperation_inlock(OperationContext* txn,
         request.setQuery(updateCriteria);
         request.setUpdates(o);
         request.setUpsert(upsert);
-        UpdateLifecycleImpl updateLifecycle(true, requestNs);
+        UpdateLifecycleImpl updateLifecycle(requestNs);
         request.setLifecycle(&updateLifecycle);
 
         UpdateResult ur = update(txn, db, request, &debug);

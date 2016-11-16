@@ -187,7 +187,7 @@ Status modifyRecoveryDocument(OperationContext* txn,
         BSONObj updateObj = RecoveryDocument::createChangeObj(
             grid.shardRegistry()->getConfigServerConnectionString(),
             ShardingState::get(txn)->getShardName(),
-            grid.shardRegistry()->getConfigOpTime(),
+            grid.configOpTime(),
             change);
 
         LOG(1) << "Changing sharding recovery document " << updateObj;
@@ -197,7 +197,7 @@ Status modifyRecoveryDocument(OperationContext* txn,
         updateReq.setQuery(RecoveryDocument::getQuery());
         updateReq.setUpdates(updateObj);
         updateReq.setUpsert();
-        UpdateLifecycleImpl updateLifecycle(true, NamespaceString::kConfigCollectionNamespace);
+        UpdateLifecycleImpl updateLifecycle(NamespaceString::kConfigCollectionNamespace);
         updateReq.setLifecycle(&updateLifecycle);
 
         UpdateResult result = update(txn, autoGetOrCreateDb->getDb(), updateReq, &opDebug);
@@ -241,6 +241,10 @@ void ShardingStateRecovery::endMetadataOp(OperationContext* txn) {
 }
 
 Status ShardingStateRecovery::recover(OperationContext* txn) {
+    if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+        return Status::OK();
+    }
+
     if (!recoverShardingState) {
         warning()
             << "Not checking for ShardingState recovery document because the recoverShardingState "
@@ -280,7 +284,7 @@ Status ShardingStateRecovery::recover(OperationContext* txn) {
 
     if (!recoveryDoc.getMinOpTimeUpdaters()) {
         // Treat the minOpTime as up-to-date
-        grid.shardRegistry()->advanceConfigOpTime(recoveryDoc.getMinOpTime());
+        grid.advanceConfigOpTime(recoveryDoc.getMinOpTime());
         return Status::OK();
     }
 
@@ -298,8 +302,7 @@ Status ShardingStateRecovery::recover(OperationContext* txn) {
     if (!status.isOK())
         return status;
 
-    log() << "Sharding state recovered. New config server opTime is "
-          << grid.shardRegistry()->getConfigOpTime();
+    log() << "Sharding state recovered. New config server opTime is " << grid.configOpTime();
 
     // Finally, clear the recovery document so next time we don't need to recover
     status = modifyRecoveryDocument(txn, RecoveryDocument::Clear, kMajorityWriteConcern);

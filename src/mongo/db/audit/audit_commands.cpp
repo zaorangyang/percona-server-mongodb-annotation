@@ -48,6 +48,7 @@ namespace mongo {
         // methods need to be overridden.
         virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual bool slaveOk() const { return true; }
+        virtual bool supportsWriteConcern(const BSONObj& cmd) const { return false; }
     };
 
     class LogApplicationMessageCommand : public AuditCommand {

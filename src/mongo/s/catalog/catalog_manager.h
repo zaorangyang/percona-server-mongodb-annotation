@@ -34,9 +34,9 @@
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/repl/optime_with.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/optime_pair.h"
 
 namespace mongo {
 
@@ -54,7 +54,6 @@ class ConnectionString;
 class DatabaseType;
 class NamespaceString;
 class OperationContext;
-class SettingsType;
 class ShardKeyPattern;
 class ShardRegistry;
 class ShardType;
@@ -62,6 +61,10 @@ class Status;
 template <typename T>
 class StatusWith;
 class TagsType;
+
+namespace executor {
+struct ConnectionPoolStats;
+}
 
 /**
  * Used to indicate to the caller of the removeShard method whether draining of chunks for
@@ -84,12 +87,6 @@ class CatalogManager {
     MONGO_DISALLOW_COPYING(CatalogManager);
 
 public:
-    enum class ConfigServerMode {
-        NONE,
-        SCCC,
-        CSRS,
-    };
-
     virtual ~CatalogManager() = default;
 
     /**
@@ -97,7 +94,7 @@ public:
      * has been installed into the global 'grid' object. Implementation do not need to guarantee
      * thread safety so callers should employ proper synchronization when calling this method.
      */
-    virtual Status startup(OperationContext* txn) = 0;
+    virtual Status startup() = 0;
 
     /**
      * Performs necessary cleanup when shutting down cleanly.
@@ -184,8 +181,8 @@ public:
      * the failure. These are some of the known failures:
      *  - NamespaceNotFound - database does not exist
      */
-    virtual StatusWith<OpTimePair<DatabaseType>> getDatabase(OperationContext* txn,
-                                                             const std::string& dbName) = 0;
+    virtual StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(OperationContext* txn,
+                                                                   const std::string& dbName) = 0;
 
     /**
      * Updates or creates the metadata for a given collection.
@@ -204,8 +201,8 @@ public:
      * the failure. These are some of the known failures:
      *  - NamespaceNotFound - collection does not exist
      */
-    virtual StatusWith<OpTimePair<CollectionType>> getCollection(OperationContext* txn,
-                                                                 const std::string& collNs) = 0;
+    virtual StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
+        OperationContext* txn, const std::string& collNs) = 0;
 
     /**
      * Retrieves all collections undera specified database (or in the system).
@@ -281,7 +278,8 @@ public:
      * Retrieves all shards in this sharded cluster.
      * Returns a !OK status if an error occurs.
      */
-    virtual StatusWith<OpTimePair<std::vector<ShardType>>> getAllShards(OperationContext* txn) = 0;
+    virtual StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
+        OperationContext* txn) = 0;
 
     /**
      * Runs a user management command on the config servers, potentially synchronizing through
@@ -346,16 +344,16 @@ public:
                              const BSONObj& detail) = 0;
 
     /**
-     * Returns global settings for a certain key.
-     * @param key: key for SettingsType::ConfigNS document.
+     * Reads global sharding settings from the confing.settings collection. The key parameter is
+     * used as the _id of the respective setting document.
      *
-     * Returns ErrorCodes::NoMatchingDocument if no SettingsType::ConfigNS document
-     * with such key exists.
-     * Returns ErrorCodes::FailedToParse if we encountered an error while parsing
-     * the settings document.
+     * NOTE: This method should generally not be used directly and instead the respective
+     * configuration class should be used (e.g. BalancerConfiguration).
+     *
+     * Returns ErrorCodes::NoMatchingDocument if no such key exists or the BSON content of the
+     * setting otherwise.
      */
-    virtual StatusWith<SettingsType> getGlobalSettings(OperationContext* txn,
-                                                       const std::string& key) = 0;
+    virtual StatusWith<BSONObj> getGlobalSettings(OperationContext* txn, StringData key) = 0;
 
     /**
      * Directly sends the specified command to the config server and returns the response.
@@ -437,6 +435,11 @@ public:
      */
     virtual Status appendInfoForConfigServerDatabases(OperationContext* txn,
                                                       BSONArrayBuilder* builder) = 0;
+
+    /**
+     * Append information about the connection pools owned by the CatalogManager.
+     */
+    virtual void appendConnectionStats(executor::ConnectionPoolStats* stats) = 0;
 
 
     virtual StatusWith<DistLockManager::ScopedDistLock> distLock(

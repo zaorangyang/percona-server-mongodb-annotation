@@ -674,9 +674,7 @@ inline bool BSONElement::isNumber() const {
     switch (type()) {
         case NumberLong:
         case NumberDouble:
-#ifdef MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT
         case NumberDecimal:
-#endif
         case NumberInt:
             return true;
         default:
@@ -711,7 +709,7 @@ inline Decimal128 BSONElement::numberDecimal() const {
         case NumberDecimal:
             return _numberDecimal();
         default:
-            return 0;
+            return Decimal128::kNormalizedZero;
     }
 }
 
@@ -802,7 +800,10 @@ inline long long BSONElement::safeNumberLong() const {
 }
 
 inline BSONElement::BSONElement() {
-    static const char kEooElement[] = "";
+    // This needs to be 2 elements because we check the strlen of data + 1 and GCC sees that as
+    // accessing beyond the end of a constant string, even though we always check whether the
+    // element is an eoo.
+    static const char kEooElement[2] = {'\0', '\0'};
     data = kEooElement;
     fieldNameSize_ = 0;
     totalSize = 1;

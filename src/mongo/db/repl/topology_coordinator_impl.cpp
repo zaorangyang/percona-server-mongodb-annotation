@@ -40,7 +40,6 @@
 #include "mongo/db/repl/heartbeat_response_action.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/isself.h"
-#include "mongo/db/repl/repl_set_declare_election_winner_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
@@ -350,16 +349,10 @@ void TopologyCoordinatorImpl::clearSyncSourceBlacklist() {
     _syncSourceBlacklist.clear();
 }
 
-void TopologyCoordinatorImpl::prepareSyncFromResponse(const ReplicationExecutor::CallbackArgs& data,
-                                                      const HostAndPort& target,
+void TopologyCoordinatorImpl::prepareSyncFromResponse(const HostAndPort& target,
                                                       const OpTime& lastOpApplied,
                                                       BSONObjBuilder* response,
                                                       Status* result) {
-    if (data.status == ErrorCodes::CallbackCanceled) {
-        *result = Status(ErrorCodes::ShutdownInProgress, "replication system is shutting down");
-        return;
-    }
-
     response->append("syncFromRequested", target.toString());
 
     if (_selfIndex == -1) {
@@ -1507,15 +1500,9 @@ const MemberConfig* TopologyCoordinatorImpl::_currentPrimaryMember() const {
     return &(_rsConfig.getMemberAt(_currentPrimaryIndex));
 }
 
-void TopologyCoordinatorImpl::prepareStatusResponse(const ReplicationExecutor::CallbackArgs& data,
-                                                    const ReplSetStatusArgs& rsStatusArgs,
+void TopologyCoordinatorImpl::prepareStatusResponse(const ReplSetStatusArgs& rsStatusArgs,
                                                     BSONObjBuilder* response,
                                                     Status* result) {
-    if (data.status == ErrorCodes::CallbackCanceled) {
-        *result = Status(ErrorCodes::ShutdownInProgress, "replication system is shutting down");
-        return;
-    }
-
     // output for each member
     vector<BSONObj> membersOut;
     const MemberState myState = getMemberState();
@@ -2128,17 +2115,16 @@ MemberState TopologyCoordinatorImpl::getMemberState() const {
     }
 
     if (_rsConfig.isConfigServer()) {
-        if (_options.configServerMode == CatalogManager::ConfigServerMode::NONE) {
+        if (_options.clusterRole != ClusterRole::ConfigServer) {
             return MemberState::RS_REMOVED;
-        }
-        if (_options.configServerMode == CatalogManager::ConfigServerMode::CSRS) {
+        } else {
             invariant(_storageEngineSupportsReadCommitted != ReadCommittedSupport::kUnknown);
             if (_storageEngineSupportsReadCommitted == ReadCommittedSupport::kNo) {
                 return MemberState::RS_REMOVED;
             }
         }
     } else {
-        if (_options.configServerMode != CatalogManager::ConfigServerMode::NONE) {
+        if (_options.clusterRole == ClusterRole::ConfigServer) {
             return MemberState::RS_REMOVED;
         }
     }
@@ -2414,22 +2400,6 @@ void TopologyCoordinatorImpl::processReplSetRequestVotes(const ReplSetRequestVot
         }
         response->setVoteGranted(true);
     }
-}
-
-Status TopologyCoordinatorImpl::processReplSetDeclareElectionWinner(
-    const ReplSetDeclareElectionWinnerArgs& args, long long* responseTerm) {
-    *responseTerm = _term;
-    if (args.getReplSetName() != _rsConfig.getReplSetName()) {
-        return {ErrorCodes::BadValue, "replSet name does not match"};
-    } else if (args.getTerm() < _term) {
-        return {ErrorCodes::BadValue, "term has already passed"};
-    } else if (args.getTerm() == _term && _currentPrimaryIndex > -1 &&
-               args.getWinnerId() != _rsConfig.getMemberAt(_currentPrimaryIndex).getId()) {
-        return {ErrorCodes::BadValue, "term already has a primary"};
-    }
-
-    _currentPrimaryIndex = _rsConfig.findMemberIndexByConfigId(args.getWinnerId());
-    return Status::OK();
 }
 
 void TopologyCoordinatorImpl::loadLastVote(const LastVote& lastVote) {

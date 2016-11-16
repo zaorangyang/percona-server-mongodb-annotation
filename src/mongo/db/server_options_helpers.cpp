@@ -276,6 +276,7 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
         .setSources(moe::SourceAllLegacy)
         .incompatibleWith("auth")
         .incompatibleWith("keyFile")
+        .incompatibleWith("transitionToAuth")
         .incompatibleWith("clusterAuthMode");
 
     options->addOptionChaining(
@@ -293,6 +294,16 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
     options->addOptionChaining(
                  "net.http.port", "", moe::Switch, "port to listen on for http interface")
         .setSources(moe::SourceYAMLConfig);
+
+    options->addOptionChaining(
+                 "security.transitionToAuth",
+                 "transitionToAuth",
+                 moe::Switch,
+                 "For rolling access control upgrade. Attempt to authenticate over outgoing "
+                 "connections and proceed regardless of success. Accept incoming connections "
+                 "with or without authentication.")
+        .setSources(moe::SourceAllLegacy)
+        .incompatibleWith("noauth");
 
     options->addOptionChaining(
                  "security.clusterAuthMode",
@@ -787,6 +798,10 @@ Status storeServerOptions(const moe::Environment& params, const std::vector<std:
         serverGlobalParams.isHttpInterfaceEnabled = params["net.http.enabled"].as<bool>();
     }
 
+    if (params.count("security.transitionToAuth")) {
+        serverGlobalParams.transitionToAuth = params["security.transitionToAuth"].as<bool>();
+    }
+
     if (params.count("security.clusterAuthMode")) {
         std::string clusterAuthMode = params["security.clusterAuthMode"].as<std::string>();
 
@@ -950,10 +965,12 @@ Status storeServerOptions(const moe::Environment& params, const std::vector<std:
     if (params.count("security.keyFile")) {
         serverGlobalParams.keyFile =
             boost::filesystem::absolute(params["security.keyFile"].as<string>()).generic_string();
+        serverGlobalParams.authState = ServerGlobalParams::AuthState::kEnabled;
     }
 
-    if (params.count("security.authorization") &&
-        params["security.authorization"].as<std::string>() == "disabled") {
+    if (serverGlobalParams.transitionToAuth ||
+        (params.count("security.authorization") &&
+         params["security.authorization"].as<std::string>() == "disabled")) {
         serverGlobalParams.authState = ServerGlobalParams::AuthState::kDisabled;
     } else if (params.count("security.authorization") &&
                params["security.authorization"].as<std::string>() == "enabled") {
@@ -994,10 +1011,17 @@ Status storeServerOptions(const moe::Environment& params, const std::vector<std:
             }
         }
     }
+
     if (!params.count("security.clusterAuthMode") && params.count("security.keyFile")) {
         serverGlobalParams.clusterAuthMode.store(ServerGlobalParams::ClusterAuthMode_keyFile);
     }
-
+    int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
+    if (serverGlobalParams.transitionToAuth &&
+        (clusterAuthMode != ServerGlobalParams::ClusterAuthMode_keyFile &&
+         clusterAuthMode != ServerGlobalParams::ClusterAuthMode_x509)) {
+        return Status(ErrorCodes::BadValue,
+                      "--transitionToAuth must be used with keyFile or x509 authentication");
+    }
 #ifdef MONGO_CONFIG_SSL
     ret = storeSSLServerOptions(params);
     if (!ret.isOK()) {

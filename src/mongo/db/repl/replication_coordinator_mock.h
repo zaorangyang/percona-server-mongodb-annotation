@@ -52,7 +52,7 @@ public:
     ReplicationCoordinatorMock(const ReplSettings& settings);
     virtual ~ReplicationCoordinatorMock();
 
-    virtual void startReplication(OperationContext* txn);
+    virtual void startup(OperationContext* txn);
 
     virtual void shutdown();
 
@@ -216,9 +216,6 @@ public:
     virtual Status processReplSetRequestVotes(OperationContext* txn,
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response);
-
-    virtual Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
-                                                       long long* responseTerm);
 
     void prepareReplResponseMetadata(const rpc::RequestInterface& request,
                                      const OpTime& lastOpTimeFromClient,

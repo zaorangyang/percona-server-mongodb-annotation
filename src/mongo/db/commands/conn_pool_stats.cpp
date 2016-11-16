@@ -37,6 +37,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/s/client/shard_registry.h"
@@ -52,6 +53,10 @@ public:
         help << "stats about connections between servers in a replica set or sharded cluster.";
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
@@ -81,9 +86,10 @@ public:
         }
 
         // Sharding connections, if we have any.
-        auto registry = grid.shardRegistry();
-        if (registry) {
-            registry->appendConnectionStats(&stats);
+        auto grid = Grid::get(txn);
+        if (grid->shardRegistry()) {
+            grid->getExecutorPool()->appendConnectionStats(&stats);
+            grid->catalogManager(txn)->appendConnectionStats(&stats);
         }
 
         // Output to a BSON object.

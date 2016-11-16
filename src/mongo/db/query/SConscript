@@ -54,6 +54,9 @@ env.Library(
         "stage_builder.cpp",
     ],
     LIBDEPS=[
+        "collation/collator_factory_interface",
+        # TODO SERVER-22371: Replace collator_factory_mock with collator_factory_icu.
+        "collation/collator_factory_mock",
         "internal_plans",
         "query_common",
         "query_planner",
@@ -208,6 +211,7 @@ env.CppUnitTest(
         "canonical_query_test.cpp"
     ],
     LIBDEPS=[
+        "collation/collator_interface_mock",
         "query_planner",
     ],
 )

@@ -54,7 +54,6 @@
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -62,6 +61,7 @@
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/rslog.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/util/log.h"
 
 /* Scenarios
@@ -393,7 +393,7 @@ void syncFixUp(OperationContext* txn,
     // online until we get to that point in freshness.
     OpTime minValid = fassertStatusOK(28774, OpTime::parseFromOplogEntry(newMinValid));
     log() << "minvalid=" << minValid;
-    setMinValid(txn, {OpTime{}, minValid});
+    StorageInterface::get(txn)->setMinValid(txn, {OpTime{}, minValid});
 
     // any full collection resyncs required?
     if (!fixUpInfo.collectionsToResyncData.empty() ||
@@ -498,7 +498,7 @@ void syncFixUp(OperationContext* txn,
                 OpTime minValid = fassertStatusOK(28775, OpTime::parseFromOplogEntry(newMinValid));
                 log() << "minvalid=" << minValid;
                 const OpTime start{fixUpInfo.commonPoint, OpTime::kUninitializedTerm};
-                setMinValid(txn, {start, minValid});
+                StorageInterface::get(txn)->setMinValid(txn, {start, minValid});
             }
         } catch (const DBException& e) {
             err = "can't get/set minvalid: ";
@@ -751,7 +751,7 @@ void syncFixUp(OperationContext* txn,
                     request.setUpdates(idAndDoc.second);
                     request.setGod();
                     request.setUpsert();
-                    UpdateLifecycleImpl updateLifecycle(true, requestNs);
+                    UpdateLifecycleImpl updateLifecycle(requestNs);
                     request.setLifecycle(&updateLifecycle);
 
                     update(txn, ctx.db(), request, &debug);
@@ -879,24 +879,12 @@ Status _syncRollback(OperationContext* txn,
     } catch (...) {
         replCoord->incrementRollbackID();
 
-        if (!replCoord->setFollowerMode(MemberState::RS_RECOVERING)) {
-            warning() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING)
-                      << "; expected to be in state " << MemberState(MemberState::RS_ROLLBACK)
-                      << " but found self in " << replCoord->getMemberState();
-        }
-
         throw;
     }
     replCoord->incrementRollbackID();
 
-    // success - leave "ROLLBACK" state
-    // can go to SECONDARY once minvalid is achieved
-    if (!replCoord->setFollowerMode(MemberState::RS_RECOVERING)) {
-        warning() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING)
-                  << "; expected to be in state " << MemberState(MemberState::RS_ROLLBACK)
-                  << " but found self in " << replCoord->getMemberState();
-    }
-
+    // Success; leave "ROLLBACK" state intact until applier thread has reloaded the new minValid.
+    // Otherwise, the applier could transition the node to SECONDARY with an out-of-date minValid.
     return Status::OK();
 }
 

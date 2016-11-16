@@ -34,7 +34,7 @@
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/s/strategy.h"
+#include "mongo/s/commands/strategy.h"
 
 namespace mongo {
 
@@ -61,6 +61,10 @@ public:
         return true;
     }
 
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
     void help(stringstream& ss) const {
         ss << _helpText;

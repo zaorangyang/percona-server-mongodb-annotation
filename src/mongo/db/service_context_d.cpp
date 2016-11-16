@@ -58,7 +58,7 @@ namespace mongo {
 MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
     setGlobalServiceContext(stdx::make_unique<ServiceContextMongoD>());
     getGlobalServiceContext()->setTickSource(stdx::make_unique<SystemTickSource>());
-    getGlobalServiceContext()->setClockSource(stdx::make_unique<SystemClockSource>());
+    getGlobalServiceContext()->setPreciseClockSource(stdx::make_unique<SystemClockSource>());
     return Status::OK();
 }
 
@@ -320,11 +320,11 @@ void ServiceContextMongoD::registerKillOpListener(KillOpListenerInterface* liste
 
 std::unique_ptr<OperationContext> ServiceContextMongoD::_newOpCtx(Client* client) {
     invariant(&cc() == client);
-    return stdx::make_unique<OperationContextImpl>();
+    return std::unique_ptr<OperationContextImpl>(new OperationContextImpl());
 }
 
 void ServiceContextMongoD::setOpObserver(std::unique_ptr<OpObserver> opObserver) {
-    _opObserver.reset(opObserver.get());
+    _opObserver = std::move(opObserver);
 }
 
 OpObserver* ServiceContextMongoD::getOpObserver() {

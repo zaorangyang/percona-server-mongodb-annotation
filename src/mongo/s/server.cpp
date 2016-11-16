@@ -60,16 +60,23 @@
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balance.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_locks.h"
+#include "mongo/s/catalog/type_lockpings.h"
+#include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/client/sharding_connection_hook.h"
+#include "mongo/s/client/sharding_connection_hook_for_mongos.h"
+#include "mongo/s/cluster_write.h"
+#include "mongo/s/commands/request.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
-#include "mongo/s/request.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/s/version_mongos.h"
+#include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/admin_access.h"
@@ -81,6 +88,7 @@
 #include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_server.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/options_parser/startup_options.h"
@@ -123,7 +131,7 @@ static void cleanupTask() {
 
         auto cursorManager = grid.getCursorManager();
         cursorManager->shutdown();
-        grid.shardRegistry()->shutdown();
+        grid.getExecutorPool()->shutdownAndJoin();
         grid.catalogManager(txn)->shutDown(txn);
     }
 
@@ -194,15 +202,81 @@ public:
 
 DBClientBase* createDirectClient(OperationContext* txn) {
     uassert(10197, "createDirectClient not implemented for sharding yet", 0);
-    return 0;
+    return nullptr;
 }
 
 }  // namespace mongo
 
 using namespace mongo;
 
+static void reloadSettings(OperationContext* txn) {
+    Grid::get(txn)->getBalancerConfiguration()->refreshAndCheck(txn);
+
+    // Create the config data indexes
+    const bool unique = true;
+
+    Status result = clusterCreateIndex(
+        txn, ChunkType::ConfigNS, BSON(ChunkType::ns() << 1 << ChunkType::min() << 1), unique);
+    if (!result.isOK()) {
+        warning() << "couldn't create ns_1_min_1 index on config db" << causedBy(result);
+    }
+
+    result = clusterCreateIndex(
+        txn,
+        ChunkType::ConfigNS,
+        BSON(ChunkType::ns() << 1 << ChunkType::shard() << 1 << ChunkType::min() << 1),
+        unique);
+    if (!result.isOK()) {
+        warning() << "couldn't create ns_1_shard_1_min_1 index on config db" << causedBy(result);
+    }
+
+    result = clusterCreateIndex(txn,
+                                ChunkType::ConfigNS,
+                                BSON(ChunkType::ns() << 1 << ChunkType::DEPRECATED_lastmod() << 1),
+                                unique);
+    if (!result.isOK()) {
+        warning() << "couldn't create ns_1_lastmod_1 index on config db" << causedBy(result);
+    }
+
+    result = clusterCreateIndex(txn, ShardType::ConfigNS, BSON(ShardType::host() << 1), unique);
+    if (!result.isOK()) {
+        warning() << "couldn't create host_1 index on config db" << causedBy(result);
+    }
+
+    result = clusterCreateIndex(txn, LocksType::ConfigNS, BSON(LocksType::lockID() << 1), !unique);
+    if (!result.isOK()) {
+        warning() << "couldn't create lock id index on config db" << causedBy(result);
+    }
+
+    result = clusterCreateIndex(txn,
+                                LocksType::ConfigNS,
+                                BSON(LocksType::state() << 1 << LocksType::process() << 1),
+                                !unique);
+    if (!result.isOK()) {
+        warning() << "couldn't create state and process id index on config db" << causedBy(result);
+    }
+
+    result =
+        clusterCreateIndex(txn, LockpingsType::ConfigNS, BSON(LockpingsType::ping() << 1), !unique);
+    if (!result.isOK()) {
+        warning() << "couldn't create lockping ping time index on config db" << causedBy(result);
+    }
+
+    result = clusterCreateIndex(
+        txn, TagsType::ConfigNS, BSON(TagsType::ns() << 1 << TagsType::min() << 1), unique);
+    if (!result.isOK()) {
+        warning() << "could not create index ns_1_min_1: " << causedBy(result);
+    }
+}
+
 static Status initializeSharding(OperationContext* txn) {
-    Status status = initializeGlobalShardingState(txn, mongosGlobalParams.configdbs);
+    Status status = initializeGlobalShardingStateForMongos(mongosGlobalParams.configdbs,
+                                                           mongosGlobalParams.maxChunkSizeBytes);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = reloadShardRegistryUntilSuccess(txn);
     if (!status.isOK()) {
         return status;
     }
@@ -233,8 +307,8 @@ static ExitCode runMongosServer() {
     _initWireSpec();
 
     // Add sharding hooks to both connection pools - ShardingConnectionHook includes auth hooks
-    globalConnPool.addHook(new ShardingConnectionHook(false));
-    shardConnectionPool.addHook(new ShardingConnectionHook(true));
+    globalConnPool.addHook(new ShardingConnectionHookForMongos(false));
+    shardConnectionPool.addHook(new ShardingConnectionHookForMongos(true));
 
     ReplicaSetMonitor::setAsynchronousConfigChangeHook(
         &ConfigServer::replicaSetChangeConfigServerUpdateHook);
@@ -249,9 +323,10 @@ static ExitCode runMongosServer() {
         quickExit(EXIT_BADOPTIONS);
     }
 
+    auto opCtx = cc().makeOperationContext();
+
     {
-        auto txn = cc().makeOperationContext();
-        Status status = initializeSharding(txn.get());
+        Status status = initializeSharding(opCtx.get());
         if (!status.isOK()) {
             if (status == ErrorCodes::CallbackCanceled) {
                 invariant(inShutdown());
@@ -262,7 +337,7 @@ static ExitCode runMongosServer() {
             return EXIT_SHARDING_ERROR;
         }
 
-        ConfigServer::reloadSettings(txn.get());
+        reloadSettings(opCtx.get());
     }
 
 #if !defined(_WIN32)
@@ -286,13 +361,12 @@ static ExitCode runMongosServer() {
         return EXIT_SHARDING_ERROR;
     }
 
-    balancer.go();
+    Balancer::get(opCtx.get())->go();
     clusterCursorCleanupJob.go();
 
     UserCacheInvalidator cacheInvalidatorThread(getGlobalAuthorizationManager());
     {
-        auto txn = cc().makeOperationContext();
-        cacheInvalidatorThread.initialize(txn.get());
+        cacheInvalidatorThread.initialize(opCtx.get());
         cacheInvalidatorThread.go();
     }
 
@@ -393,7 +467,7 @@ MONGO_INITIALIZER(CreateAuthorizationExternalStateFactory)(InitializerContext* c
 MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
     setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
     getGlobalServiceContext()->setTickSource(stdx::make_unique<SystemTickSource>());
-    getGlobalServiceContext()->setClockSource(stdx::make_unique<SystemClockSource>());
+    getGlobalServiceContext()->setPreciseClockSource(stdx::make_unique<SystemClockSource>());
     return Status::OK();
 }
 
@@ -405,7 +479,6 @@ MONGO_INITIALIZER_GENERAL(setSSLManagerType,
     return Status::OK();
 }
 #endif
-}  // namespace
 
 int mongoSMain(int argc, char* argv[], char** envp) {
     static StaticObserver staticObserver;
@@ -442,6 +515,8 @@ int mongoSMain(int argc, char* argv[], char** envp) {
 
     return 20;
 }
+
+}  // namespace
 
 #if defined(_WIN32)
 // In Windows, wmain() is an alternate entry point for main(), and receives the same parameters

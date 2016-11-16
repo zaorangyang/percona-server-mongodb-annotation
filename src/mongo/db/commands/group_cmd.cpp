@@ -28,6 +28,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -39,6 +40,7 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 
 namespace mongo {
 
@@ -52,6 +54,10 @@ public:
     GroupCommand() : Command("group") {}
 
 private:
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
     virtual bool maintenanceOk() const {
         return false;
     }
@@ -168,8 +174,7 @@ private:
         if (coll) {
             coll->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
         }
-        CurOp::get(txn)->debug().fromMultiPlanner = summaryStats.fromMultiPlanner;
-        CurOp::get(txn)->debug().replanned = summaryStats.replanned;
+        CurOp::get(txn)->debug().setPlanSummaryMetrics(summaryStats);
 
         invariant(STAGE_GROUP == planExecutor->getRootStage()->stageType());
         GroupStage* groupStage = static_cast<GroupStage*>(planExecutor->getRootStage());
@@ -221,6 +226,16 @@ private:
             request->keyFunctionCode = p["$keyf"]._asCode();
         } else {
             // No key specified.  Use the entire object as the key.
+        }
+
+        BSONElement collationElt;
+        Status collationEltStatus =
+            bsonExtractTypedField(p, "collation", BSONType::Object, &collationElt);
+        if (!collationEltStatus.isOK() && (collationEltStatus != ErrorCodes::NoSuchKey)) {
+            return collationEltStatus;
+        }
+        if (collationEltStatus.isOK()) {
+            request->collation = collationElt.embeddedObject().getOwned();
         }
 
         BSONElement reduce = p["$reduce"];

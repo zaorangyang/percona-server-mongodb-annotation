@@ -41,7 +41,6 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -62,6 +61,9 @@ class CmdCreateIndex : public Command {
 public:
     CmdCreateIndex() : Command("createIndexes") {}
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
     virtual bool slaveOk() const {
         return false;
     }  // TODO: this could be made true...
@@ -292,8 +294,9 @@ public:
 
             for (size_t i = 0; i < specs.size(); i++) {
                 std::string systemIndexes = ns.getSystemIndexesCollection();
-                getGlobalServiceContext()->getOpObserver()->onCreateIndex(
-                    txn, systemIndexes, specs[i]);
+                auto opObserver = getGlobalServiceContext()->getOpObserver();
+                if (opObserver)
+                    opObserver->onCreateIndex(txn, systemIndexes, specs[i]);
             }
 
             wunit.commit();

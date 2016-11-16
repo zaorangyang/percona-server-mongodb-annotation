@@ -30,6 +30,7 @@
 
 #include <vector>
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
@@ -50,6 +51,7 @@
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/range_preserver.h"
 #include "mongo/platform/unordered_map.h"
 #include "mongo/util/log.h"
@@ -63,6 +65,9 @@ class Geo2dFindNearCmd : public Command {
 public:
     Geo2dFindNearCmd() : Command("geoNear") {}
 
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
     bool slaveOk() const {
         return true;
     }
@@ -161,7 +166,21 @@ public:
         }
         BSONObj rewritten = queryBob.obj();
 
-        // cout << "rewritten query: " << rewritten.toString() << endl;
+        // Extract the collation, if it exists.
+        // TODO SERVER-23473: Pass this collation spec object down so that it can be converted into
+        // a CollatorInterface.
+        BSONObj collation;
+        {
+            BSONElement collationElt;
+            Status collationEltStatus =
+                bsonExtractTypedField(cmdObj, "collation", BSONType::Object, &collationElt);
+            if (!collationEltStatus.isOK() && (collationEltStatus != ErrorCodes::NoSuchKey)) {
+                return appendCommandStatus(result, collationEltStatus);
+            }
+            if (collationEltStatus.isOK()) {
+                collation = collationElt.Obj();
+            }
+        }
 
         long long numWanted = 100;
         const char* limitName = !cmdObj["num"].eoo() ? "num" : "limit";
@@ -277,15 +296,11 @@ public:
                                                   << WorkingSetCommon::toStatusString(currObj)));
         }
 
-        // Fill out the stats subobj.
-        BSONObjBuilder stats(result.subobjStart("stats"));
-
-        // Fill in nscanned from the explain.
         PlanSummaryStats summary;
         Explain::getSummaryStats(*exec, &summary);
-        collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
-        CurOp::get(txn)->debug().fromMultiPlanner = summary.fromMultiPlanner;
-        CurOp::get(txn)->debug().replanned = summary.replanned;
+
+        // Fill out the stats subobj.
+        BSONObjBuilder stats(result.subobjStart("stats"));
 
         stats.appendNumber("nscanned", summary.totalKeysExamined);
         stats.appendNumber("objectsLoaded", summary.totalDocsExamined);
@@ -296,6 +311,10 @@ public:
         stats.append("maxDistance", farthestDist);
         stats.append("time", CurOp::get(txn)->elapsedMillis());
         stats.done();
+
+        collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+
+        CurOp::get(txn)->debug().setPlanSummaryMetrics(summary);
 
         return true;
     }

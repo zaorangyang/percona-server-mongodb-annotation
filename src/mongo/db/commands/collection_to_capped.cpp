@@ -39,7 +39,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -55,6 +54,9 @@ public:
     CmdCloneCollectionAsCapped() : Command("cloneCollectionAsCapped") {}
     virtual bool slaveOk() const {
         return false;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
     virtual void help(stringstream& help) const {
         help << "{ cloneCollectionAsCapped:<fromName>, toCollection:<toName>, size:<sizeInBytes> }";
@@ -128,6 +130,9 @@ public:
     CmdConvertToCapped() : Command("convertToCapped") {}
     virtual bool slaveOk() const {
         return false;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
     virtual void help(stringstream& help) const {
         help << "{ convertToCapped:<fromCollectionName>, size:<sizeInBytes> }";
