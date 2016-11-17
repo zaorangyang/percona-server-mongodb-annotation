@@ -13,7 +13,7 @@ auditTestShard(
         assert.commandWorked(testDB.dropDatabase());
         assert.commandWorked(st.s0.adminCommand({enableSharding: jsTestName()}));
 
-        auditColl = loadAuditEventsIntoCollection(st.s0, '/data/db/auditLog-s0.json', testDB.getName(), 'auditEvents');
+        auditColl = loadAuditEventsIntoCollection(st.s0, getDBPath() + '/auditLog-s0.json', testDB.getName(), 'auditEvents');
         assert.eq(1, auditColl.count({
             atype: "enableSharding",
             ts: withinTheLastFewSeconds(),

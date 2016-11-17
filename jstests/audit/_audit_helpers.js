@@ -1,3 +1,8 @@
+var getDBPath = function() {
+    return MongoRunner.dataDir !== undefined ?
+           MongoRunner.dataDir : '/data/db';
+}
+
 var auditTest = function(name, fn, serverParams) {
     var loudTestEcho = function(msg) {
         s = '----------------------------- AUDIT UNIT TEST: ' + msg + '-----------------------------';
@@ -7,8 +12,7 @@ var auditTest = function(name, fn, serverParams) {
 
     loudTestEcho(name + ' STARTING ');
     removeFile(auditPath);
-    var dbpath = TestData.testDir !== undefined ? 
-                 TestData.testDir : '/data/db';
+    var dbpath = getDBPath();
     var auditPath = dbpath + '/auditLog.json';
     removeFile(auditPath);
     var port = allocatePorts(1);
@@ -69,16 +73,18 @@ var auditTestShard = function(name, fn, serverParams) {
     }
 
     loudTestEcho(name + ' STARTING ');
+
+    var dbpath = getDBPath();
     var st = new ShardingTest({ name: 'auditTestSharding',
                                 verbose: 1,
                                 mongos: [
                                     Object.merge({
-                                        auditPath: '/data/db/auditLog-s0.json',
+                                        auditPath: dbpath + '/auditLog-s0.json',
                                         auditDestination: 'file',
                                         auditFormat: 'JSON'
                                     }, serverParams),
                                     Object.merge({
-                                        auditPath: '/data/db/auditLog-s1.json',
+                                        auditPath: dbpath + '/auditLog-s1.json',
                                         auditDestination: 'file',
                                         auditFormat: 'JSON'
                                     }, serverParams),
