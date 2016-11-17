@@ -35,6 +35,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/storage/engine_extension.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -53,7 +54,7 @@ class StorageEngineMetadata;
  * engine.  All StorageEngine(s) must be registered by calling registerFactory in order
  * to possibly be activated.
  */
-class StorageEngine {
+class StorageEngine : public percona::EngineExtension {
 public:
     /**
      * The interface for creating new instances of storage engines.

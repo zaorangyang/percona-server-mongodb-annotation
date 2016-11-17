@@ -106,8 +106,7 @@ bool CreateBackupCommand::run(mongo::OperationContext* txn,
     se->flushAllFiles(true);
 
     // Do the backup itself.
-    auto ee = getEngineExtension();
-    const auto status = ee->hotBackup(dest);
+    const auto status = se->hotBackup(dest);
 
     if (!status.isOK()) {
         errmsg = status.reason();
