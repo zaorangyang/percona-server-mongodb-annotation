@@ -2,6 +2,8 @@ selector:
   js_test:
     roots:
     - jstests/audit/*.js
+    exclude_files:
+    - jstests/audit/_*.js
 
 # audit tests start their own mongod's.
 executor:

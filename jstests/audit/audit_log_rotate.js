@@ -6,7 +6,8 @@ if (TestData.testData !== undefined) {
     load('jstests/audit/_audit_helpers.js');
 }
 
-var logDir = '/data/db';
+var logDir = getDBPath();
+
 var testDBName = jsTestName();
 
 var getRotatedLogFilePaths = function(auditPath) {
