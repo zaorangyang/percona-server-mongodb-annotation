@@ -72,6 +72,10 @@ public:
     KVDatabaseCatalogEntry* const _entry;
 };
 
+Status KVStorageEngine::hotBackup(const std::string& path) {
+    return _engine->hotBackup(path);
+}
+
 KVStorageEngine::KVStorageEngine(KVEngine* engine, const KVStorageEngineOptions& options)
     : _options(options), _engine(engine), _supportsDocLocking(_engine->supportsDocLocking()) {
     uassert(28601,
