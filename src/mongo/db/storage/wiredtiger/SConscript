@@ -94,7 +94,6 @@ if wiredtiger:
             'wiredtiger_record_store_mock.cpp',
             ],
         LIBDEPS=['storage_wiredtiger_core',
-                 '$BUILD_DIR/mongo/db/storage/engine_extension',
              ]
         )
 

@@ -55,6 +55,9 @@ struct KVStorageEngineOptions {
 };
 
 class KVStorageEngine final : public StorageEngine {
+    // percona::EngineExtension implementaion
+    Status hotBackup(const std::string& path) override;
+
 public:
     /**
      * @param engine - ownership passes to me
