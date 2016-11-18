@@ -28,16 +28,6 @@ namespace percona {
  * Storage engine extension interface.
  */
 class EngineExtension : public Backupable {
-protected:
-    EngineExtension();
-    virtual ~EngineExtension() {}
 };
-
-/**
- * Returns the singleton EngineExtension to storage engine interface
- * for querying for additional functionality.
- * Caller does not own the pointer.
- */
-EngineExtension* getEngineExtension();
 
 }  // end of percona namespace.
