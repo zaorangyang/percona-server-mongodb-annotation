@@ -189,7 +189,6 @@ public:
     }
 
     virtual void fullValidate(OperationContext* txn,
-                              bool full,
                               long long* numKeysOut,
                               ValidateResults* fullResults) const {
         // TODO check invariants?
@@ -259,13 +258,22 @@ public:
         boost::optional<IndexKeyEntry> seek(const BSONObj& key,
                                             bool inclusive,
                                             RequestedInfo parts) override {
-            const BSONObj query = stripFieldNames(key);
-            locate(query, _forward == inclusive ? RecordId::min() : RecordId::max());
-            _lastMoveWasRestore = false;
-            if (_isEOF)
-                return {};
-            dassert(inclusive ? compareKeys(_it->key, query) >= 0
-                              : compareKeys(_it->key, query) > 0);
+            if (key.isEmpty()) {
+                _it = inclusive ? _data.begin() : _data.end();
+                _isEOF = (_it == _data.end());
+                if (_isEOF) {
+                    return {};
+                }
+            } else {
+                const BSONObj query = stripFieldNames(key);
+                locate(query, _forward == inclusive ? RecordId::min() : RecordId::max());
+                _lastMoveWasRestore = false;
+                if (_isEOF)
+                    return {};
+                dassert(inclusive ? compareKeys(_it->key, query) >= 0
+                                  : compareKeys(_it->key, query) > 0);
+            }
+
             return *_it;
         }
 

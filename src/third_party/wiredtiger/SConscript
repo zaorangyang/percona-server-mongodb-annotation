@@ -102,6 +102,7 @@ wiredtiger_includes = """
         #include <inttypes.h>
         #endif
         #include <stdarg.h>
+        #include <stdbool.h>
         #include <stdint.h>
         #include <stdio.h>
     """

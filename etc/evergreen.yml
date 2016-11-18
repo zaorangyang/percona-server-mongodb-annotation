@@ -38,6 +38,26 @@ variables:
       run_multiple_jobs: false
       max_jobs: 0  # If set in combination with run_multiple_jobs, will cap the number of jobs used.
 
+- &jepsen_config_vars
+  jepsen_protocol_version: --protocol-version 1
+  jepsen_read_concern: ""
+  jepsen_read_with_find_and_modify: ""
+  jepsen_storage_engine: ""
+  jepsen_time_limit: --time-limit 300
+  jepsen_write_concern: ""
+
+# Template for running Jepsen tests
+- &run_jepsen_template
+  name: run_jepsen_template
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "do jepsen setup"
+  - func: "run jepsen test"
+    vars:
+      <<: *jepsen_config_vars
+
 - &run_jstestfuzz_tests
   func: "run tests"
   # Terminate the function when there has been no output to stdout for 30 minutes. E.g. when something is stuck in an infinite loop.
@@ -322,6 +342,59 @@ functions:
 
         ${path_prefix} ${san_symbolizer} ${san_options} ${rlp_environment} ${python|python} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json
 
+  "do jepsen setup" :
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          git clone git@github.com:10gen/jepsen.git
+          cd jepsen/jepsen
+          git checkout mongodb-master
+          lein install
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          # On each LXC host do the following:
+          #   Copy the mongodb tarball to /root
+          numVms=5
+          for i in $(seq 1 $numVms)
+          do
+            hostn=n$i
+            sudo cp -f mongo-binaries.tgz /var/lib/lxc/$hostn/rootfs/root/
+          done
+
+  "run jepsen test" :
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src/jepsen/mongodb
+        script: |
+          set -o verbose
+          set -o errexit
+          # Increase JVM heap space to 75% of total memory
+          heap_space=$(grep MemTotal: /proc/meminfo | awk '{printf "%0dm",$2*0.75/1024}')
+          sed -i -e "/:aot/i\  :jvm-opts [\"-Xmx$heap_space\"]" project.clj
+          lein run --tarball "file:///root/mongo-binaries.tgz" ${jepsen_protocol_version} ${jepsen_read_concern} ${jepsen_read_with_find_and_modify} ${jepsen_storage_engine} ${jepsen_time_limit} ${jepsen_write_concern}
+    - command: archive.targz_pack
+      params:
+        target: "src/jepsen-results.tgz"
+        source_dir: "src/jepsen/mongodb/store"
+        include:
+          - "./**"
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/jepsen-results.tgz
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/jepsen/jepsen-results-${task_id}-${execution}.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: Jepsen Test Results - ${execution}
+
   "run jstestfuzz":
     - command: shell.exec
       params:
@@ -409,20 +482,20 @@ functions:
 
         if [ "Windows_NT" = "$OS" ]; then
           # Get the list of Windows tasks (tasklist list format):
-          # - The second column (and beyond) has task name after the : (cut -f2- -d ':')
-          # - Remove leading whitespace with sed
+          # - Transpose the Image Name and PID
+          # - The first column has the process ID
+          # - The second column (and beyond) has task name
           # - Grep for the task names of interest while ignoring any names that are in the exclude list
-          # - Provide the unique process names (eliminate duplicates)
 
-          processes=$(tasklist /fo:list | grep 'Image Name:' | cut -f2- -d ':' | sed -e 's/^[ \t]*//' | grep -i -E "$process_kill_list" | grep -i -v -E "$process_exclude_list" | /usr/bin/sort -u)
-          # Kill the Windows process with the matching image name (/im) with force (/f)
-          kill_process () { echo "Killing process $1"; taskkill /im "$1" /f; }
+          processes=$(tasklist /fo:csv | awk -F'","' '{x=$1; gsub("\"","",x); print $2, x}' | grep -i -E "$process_kill_list" | grep -i -v -E "$process_exclude_list")
+
+          # Kill the Windows process by process ID with force (/f)
+          kill_process () { pid=$(echo $1 | cut -f1 -d ' '); echo "Killing process $1"; taskkill /pid "$pid" /f; }
         else
           # Get the list of Unix tasks (pgrep full & long):
           # - Grep for the task names of interest while ignoring any names that are in the exclude list
-          # - Remove leading whitespace with sed
-          # - The second column (and beyond) has task name (cut -f2- -d " ")
-          # - Provide the unique process names to eliminate duplicates (sort -u)
+          # - The first column has the process ID
+          # - The second column (and beyond) has task name
 
           # There are 2 "styles" of pgrep, figure out which one works
           pgrep_list_full=$(pgrep -f --list-full ".*" 2>&1 > /dev/null)
@@ -444,9 +517,11 @@ functions:
             fi
           fi
 
-          processes=$(echo "$pgrep_list" | $grep -i -v -E "$process_exclude_list" | sed -e 's/^[ \t]*//' | cut -f2- -d ' ' | sort -u)
-          # Kill the matching Unix process with the matching image name with signal KILL (9)
-          kill_process () { echo "Killing process $1"; pkill -9 -f "^$1\$"; }
+          # Since a process name might have a CR or LF in it, we need to delete any lines from
+          # pgrep which do not start with space(s) and 1 digit and trim any leading spaces.
+          processes=$(echo "$pgrep_list" | $grep -i -v -E "$process_exclude_list" | sed -e '/^ *[0-9]/!d; s/^ *//; s/[[:cntrl:]]//g;')
+          # Kill the Unix process ID with signal KILL (9)
+          kill_process () { pid=$(echo $1 | cut -f1 -d ' '); echo "Killing process $1"; kill -9 $pid; }
         fi
         # Since a full process name can have spaces, the IFS (internal field separator)
         # should not include a space, just a LF & CR
@@ -524,6 +599,30 @@ tasks:
     - func: "build new tools" # noop if ${newtools} is not "true"
     - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
     - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+
+          # We get the raw version string (r1.2.3-45-gabcdef) from git
+          MONGO_VERSION=$(git describe)
+          # If this is a patch build, we add the patch version id to the version string so we know
+          # this build was a patch, and which evergreen task it came from
+          if [ "${is_patch|}" = "true" ]; then
+            MONGO_VERSION="$MONGO_VERSION-patch-${version_id}"
+          fi
+
+          # This script converts the generated version string into a sanitized version string for
+          # use by scons and uploading artifacts.
+          echo $MONGO_VERSION | ${python|python} buildscripts/generate_compile_expansions.py | tee compile_expansions.yml
+
+    # Then we load the generated version data into the agent so we can use it in task definitions
+    - command: expansions.update
+      params:
+        file: src/compile_expansions.yml
+
+    - command: shell.exec
       type: test
       params:
         working_dir: src
@@ -532,9 +631,7 @@ tasks:
           set -o verbose
 
           rm -rf ${install_directory|/data/mongo-install-directory}
-          ${scons|scons} ${compile_flags|} --use-new-tools all dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|}
-
-          ${gitvars} git describe | ${python|python} buildscripts/generate_compile_expansions.py | tee compile_expansions.yml
+          ${scons|scons} ${compile_flags|} --use-new-tools all dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|} MONGO_VERSION=${version}
 
           mv mongodb-src-*.${ext|tgz} distsrc.${ext|tgz}
           mv mongodb-*-debugsymbols.${ext|tgz} mongo-debugsymbols.tgz || true
@@ -552,9 +649,6 @@ tasks:
           # On windows we need to make sure the paths in unittests.txt are compatible with cygwin tar
           sed 's|\\|/|g' build/unittests.txt > build/unittests-tarlist.txt
           ${tar|tar} -czvf mongodb-unittests.tgz -T build/unittests-tarlist.txt build/unittests.txt
-    - command: expansions.update
-      params:
-        file: src/compile_expansions.yml
     - command: shell.exec
       params:
         working_dir: src
@@ -661,6 +755,18 @@ tasks:
           set -o errexit
           set -o verbose
           ${scons|scons} ${compile_flags|} lint
+
+## jepsen WT ##
+- <<: *run_jepsen_template
+  name: jepsen_findAndModify_WT
+  commands:
+  - func: "do setup"
+  - func: "do jepsen setup"
+  - func: "run jepsen test"
+    vars:
+      <<: *jepsen_config_vars
+      jepsen_read_with_find_and_modify: --read-with-find-and-modify
+      jepsen_storage_engine: --storage-engine wiredTiger
 
 ## jstestfuzz mmapv1 ##
 - <<: *jstestfuzz_template
@@ -2790,6 +2896,9 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  - name: jepsen_findAndModify_WT
+    distros:
+    - ubuntu1404-jepsen
   - name: jsCore
   - name: jsCore_WT
   - name: jsCore_auth
@@ -3050,7 +3159,7 @@ buildvariants:
   display_name: Windows Vista
   modules: ~
   run_on:
-  - windows-64-vs2013-test
+  - windows-64-vs2015-test
   batchtime: 1440 # 1 day
   expansions:
     exe: ".exe"
@@ -3061,12 +3170,12 @@ buildvariants:
     msi_target: msi
     content_type: application/zip
     compile_flags: --release -j$(grep -c ^processor /proc/cpuinfo) VARIANT_DIR=win32
-    num_jobs_available: 1
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: aggregation
   - name: aggregation_WT
   - name: auth
@@ -3150,7 +3259,7 @@ buildvariants:
   display_name: Windows 2008R2
   modules: ~
   run_on:
-  - windows-64-vs2013-test
+  - windows-64-vs2015-test
   batchtime: 1440 # 1 day
   expansions:
     exe: ".exe"
@@ -3162,108 +3271,7 @@ buildvariants:
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --win-version-min=ws08r2 -j$(grep -c ^processor /proc/cpuinfo) MONGO_DISTMOD=2008plus VARIANT_DIR=win32
-    num_jobs_available: 1
-    ext: zip
-  tasks:
-  - name: compile
-    distros:
-    - windows-64-vs2013-compile
-  - name: aggregation
-  - name: aggregation_WT
-  - name: aggregation_read_concern_majority_passthrough_WT
-  - name: auth
-  - name: auth_WT
-  - name: dbtest
-  - name: dbtest_WT
-  - name: disk
-  - name: durability
-  - name: failpoints
-  - name: gle_auth
-  - name: gle_auth_WT
-  - name: gle_auth_write_cmd
-  - name: gle_auth_write_cmd_WT
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_WT
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: jsCore
-  - name: jsCore_WT
-  - name: jsCore_compatibility
-  - name: jsCore_compatibility_WT
-  - name: jsCore_decimal
-  - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
-  - name: jstestfuzz
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_WT
-  - name: mmap
-  - name: mongosTest
-  - name: multiversion
-  - name: noPassthrough
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
-  - name: parallel
-  - name: parallel_WT
-  - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_WT
-  - name: read_concern_majority_passthrough_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replication
-  - name: replication_WT
-  - name: sharding
-  - name: sharding_WT
-  - name: slow1
-  - name: slow1_WT
-  - name: serial_run
-  - name: serial_run_WT
-  - name: sharded_collections_jscore_passthrough
-  - name: sharded_collections_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough_wire_ops_WT
-  - name: sharding_last_stable_mongos
-  - name: tool
-  - name: tool_WT
-  - name: unittests
-  - name: push
-    distros:
-    - rhel55-test
-
-- name: windows-64-2k8-2015
-  display_name: Windows 2008R2 VS2015
-  modules: ~
-  run_on:
-  - windows-64-vs2015-test
-  batchtime: 1440 # 1 day
-  expansions:
-    exe: ".exe"
-    multiversion_platform_arch: "win32/x86_64-2008plus"
-    msi_target: msi
-    content_type: application/zip
-    compile_flags: --win-version-min=ws08r2 -j$(grep -c ^processor /proc/cpuinfo) VARIANT_DIR=win32
-    num_jobs_available: 2
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
   tasks:
   - name: compile
@@ -3348,12 +3356,15 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
+  - name: push
+    distros:
+    - rhel55-test
 
 - name: windows-64-2k8-debug
   display_name: "* Windows 2008R2 DEBUG"
   modules: ~
   run_on:
-  - windows-64-vs2013-test
+  - windows-64-vs2015-test
   expansions:
     exe: ".exe"
     push_path: win32
@@ -3361,13 +3372,13 @@ buildvariants:
     push_name: win32-debug
     push_arch: x86_64-2008plus
     content_type: application/zip
-    num_jobs_available: 1
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     compile_flags: --dbg=on --opt=on --win-version-min=ws08r2 -j$(grep -c ^processor /proc/cpuinfo) MONGO_DISTMOD=2008plus
     ext: zip
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_read_concern_majority_passthrough_WT
@@ -3405,28 +3416,28 @@ buildvariants:
     # Some concurrency workloads require a lot of memory, so we use machines
     # with more RAM for these suites.
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: concurrency_WT
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: concurrency_replication
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: concurrency_replication_WT
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: concurrency_sharded
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: concurrency_sharded_WT
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: concurrency_simultaneous
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: concurrency_simultaneous_WT
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: read_concern_majority_passthrough_WT
   - name: read_only
   - name: read_only_WT
@@ -3447,7 +3458,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - windows-64-vs2013-test
+  - windows-64-vs2015-test
   expansions:
     tooltags: "-tags 'ssl sasl'"
     exe: ".exe"
@@ -3459,12 +3470,12 @@ buildvariants:
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib" -j$(grep -c ^processor /proc/cpuinfo) --dynamic-windows --win-version-min=ws08r2 VARIANT_DIR=win32
-    num_jobs_available: 1
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: audit
   - name: audit_WT
   - name: auth_audit
@@ -3503,7 +3514,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - windows-64-vs2013-test
+  - windows-64-vs2015-test
   batchtime: 1440 # 1 day
   expansions:
     tooltags: "-tags 'ssl sasl'"
@@ -3516,20 +3527,20 @@ buildvariants:
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib" -j$(grep -c ^processor /proc/cpuinfo) --dynamic-windows --win-version-min=ws08r2 VARIANT_DIR=win32
-    num_jobs_available: 1
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling
     ext: zip
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: audit
   - name: audit_WT
   - name: auth_audit
   - name: dbtest
   - name: concurrency
     distros:
-    - windows-64-vs2013-compile  # Some workloads require a lot of memory, use a bigger machine for this suite.
+    - windows-64-vs2015-compile  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
   - name: concurrency_sharded
   - name: concurrency_simultaneous
@@ -3553,7 +3564,7 @@ buildvariants:
   display_name: SSL Windows 2008R2
   modules: ~
   run_on:
-  - windows-64-vs2013-test
+  - windows-64-vs2015-test
   batchtime: 1440 # 1 day
   expansions:
     exe: ".exe"
@@ -3566,12 +3577,12 @@ buildvariants:
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=2008plus-ssl CPPPATH="c:/openssl/include" LIBPATH="c:/openssl/lib" -j$(grep -c ^processor /proc/cpuinfo) --dynamic-windows --win-version-min=ws08r2 VARIANT_DIR=win32
-    num_jobs_available: 1
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2013-compile
+    - windows-64-vs2015-compile
   - name: aggregation
   - name: aggregation_WT
   - name: auth
@@ -4842,6 +4853,9 @@ buildvariants:
   - name: dbtest
   - name: dbtest_WT
   - name: ese_WT
+  - name: jepsen_findAndModify_WT
+    distros:
+    - ubuntu1404-jepsen
   - name: jsCore
   - name: jsCore_auth
   - name: jstestfuzz
@@ -5698,12 +5712,13 @@ buildvariants:
   - name: aggregation_WT
   - name: aggregation_auth
   - name: auth
-  - name: concurrency
-    distros:
-    - rhel62-build  # Some workloads require a lot of memory, use a bigger machine for this suite.
-  - name: concurrency_replication
-  - name: concurrency_sharded
-  - name: concurrency_simultaneous
+  # Disabled due to SERVER-21965
+  # - name: concurrency
+  #   distros:
+  #   - rhel62-build  # Some workloads require a lot of memory, use a bigger machine for this suite.
+  # - name: concurrency_replication
+  # - name: concurrency_sharded
+  # - name: concurrency_simultaneous
   - name: dbtest
   - name: failpoints
   - name: failpoints_auth
@@ -5723,9 +5738,10 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_small_oplog
   - name: jsCore_small_oplog_rs
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded_WT
+  # Disabled due to SERVER-21965
+  # - name: jstestfuzz_WT
+  # - name: jstestfuzz_replication_WT
+  # - name: jstestfuzz_sharded_WT
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -5781,6 +5797,89 @@ buildvariants:
   - name: concurrency_replication
   - name: concurrency_sharded
   - name: concurrency_simultaneous
+  - name: dbtest
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth
+  - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_write_cmd
+  - name: gle_auth_write_cmd
+  - name: integration_tests_replset
+  - name: integration_tests_standalone
+  - name: jsCore
+  - name: jsCore_WT
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_op_query
+  - name: jsCore_small_oplog
+  - name: jsCore_small_oplog_rs
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: read_concern_majority_passthrough_WT
+  - name: replicasets_WT
+  - name: replicasets_auth
+  - name: replicasets_legacy
+  - name: replication_WT
+  - name: replication_auth
+  - name: sasl
+  - name: sharded_collections_jscore_passthrough
+  - name: sharding
+  - name: sharding_auth
+  - name: sharding_auth_audit_WT
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_jscore_passthrough
+  - name: sharding_jscore_passthrough_wire_ops_WT
+  - name: sharding_op_query_WT
+  - name: slow1
+  - name: serial_run
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: tool
+  - name: unittests
+
+- name: enterprise-rhel-72-s390x-inmem
+  display_name: Enterprise RHEL 7.2 s390x (inMemory) DEBUG
+  modules:
+  - enterprise
+  run_on:
+  - rhel72-zseries-build
+  - rhel72-zseries-test
+  batchtime: 10080 # 7 days
+  stepback: false
+  expansions:
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
+    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
+    compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    num_jobs_available: 2
+    test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_mmapv1,requires_journaling
+  tasks:
+  - name: compile
+    distros:
+    - rhel72-zseries-build
+  - name: aggregation_WT
+  - name: aggregation_auth
+  - name: aggregation_read_concern_majority_passthrough_WT
+  - name: audit
+  - name: auth
+  - name: auth_audit
+  - name: bulk_gle_passthrough
+  - name: concurrency
+    distros:
+    - rhel72-zseries-build
+  - name: concurrency_replication
+    distros:
+    - rhel72-zseries-build
+  - name: concurrency_sharded
+    distros:
+    - rhel72-zseries-build
+  - name: concurrency_simultaneous
+    distros:
+    - rhel72-zseries-build
   - name: dbtest
   - name: failpoints
   - name: failpoints_auth
@@ -5903,7 +6002,7 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     san_symbolizer: ASAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer-3.5
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1
-    compile_flags: CC=/usr/bin/clang CXX=/usr/bin/clang++ --dbg=on --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip VARIANT_DIR=build
+    compile_flags: CC=/usr/bin/clang CXX=/usr/bin/clang++ --dbg=on --opt=on --allocator=system --sanitize=address --ssl --libc++ -j$(grep -c ^processor /proc/cpuinfo) --nostrip VARIANT_DIR=build
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: -j1 # Avoid starting too many mongod's under ASAN build.
   tasks:
@@ -6025,7 +6124,7 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     san_symbolizer: ASAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer-3.5
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1
-    compile_flags: CC=/usr/bin/clang CXX=/usr/bin/clang++ --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip VARIANT_DIR=build
+    compile_flags: CC=/usr/bin/clang CXX=/usr/bin/clang++ --opt=on --allocator=system --sanitize=address --ssl --libc++ -j$(grep -c ^processor /proc/cpuinfo) --nostrip VARIANT_DIR=build
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: -j1 # Avoid starting too many mongod's under ASAN build.
   tasks:

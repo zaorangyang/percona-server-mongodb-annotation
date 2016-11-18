@@ -30,6 +30,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/client/remote_command_targeter_factory_mock.h"
+#include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/executor/network_interface_mock.h"
@@ -40,10 +41,12 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/service_context_noop.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager_mock.h"
 #include "mongo/s/client/shard_factory.h"
+#include "mongo/s/client/shard_remote.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
@@ -74,8 +77,29 @@ void initGrid(OperationContext* txn, const ConnectionString& configConnString) {
     executorPool->addExecutors(std::move(executorsForPool), std::move(fixedExec));
     executorPool->startup();
 
-    auto shardFactory(
-        stdx::make_unique<ShardFactory>(stdx::make_unique<RemoteCommandTargeterFactoryMock>()));
+    auto targeterFactory = stdx::make_unique<RemoteCommandTargeterFactoryMock>();
+    auto targeterFactoryPtr = targeterFactory.get();
+
+    ShardFactory::BuilderCallable setBuilder =
+        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+            return stdx::make_unique<ShardRemote>(
+                shardId, connStr, targeterFactoryPtr->create(connStr));
+        };
+
+    ShardFactory::BuilderCallable masterBuilder =
+        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+            return stdx::make_unique<ShardRemote>(
+                shardId, connStr, targeterFactoryPtr->create(connStr));
+        };
+
+    ShardFactory::BuildersMap buildersMap{
+        {ConnectionString::SET, std::move(setBuilder)},
+        {ConnectionString::MASTER, std::move(masterBuilder)},
+    };
+
+    auto shardFactory =
+        stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
+
     auto shardRegistry(stdx::make_unique<ShardRegistry>(std::move(shardFactory), configConnString));
 
     grid.init(
@@ -91,6 +115,7 @@ void initGrid(OperationContext* txn, const ConnectionString& configConnString) {
 class ShardingStateTest : public mongo::unittest::Test {
 public:
     void setUp() override {
+        _service.setFastClockSource(stdx::make_unique<ClockSourceMock>());
         _service.setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
 
         serverGlobalParams.clusterRole = ClusterRole::ShardServer;

@@ -53,8 +53,9 @@ using std::vector;
  * Utility function to create MatchExpression
  */
 unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj) {
+    const CollatorInterface* collator = nullptr;
     StatusWithMatchExpression status =
-        MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions());
+        MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions(), collator);
     ASSERT_TRUE(status.isOK());
     return std::move(status.getValue());
 }

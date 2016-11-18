@@ -70,7 +70,8 @@ protected:
     bool checkValid() {
         ValidateResults results;
         BSONObjBuilder output;
-        ASSERT_OK(collection()->validate(&_txn, _full, false, &results, &output));
+        ASSERT_OK(collection()->validate(
+            &_txn, _full ? kValidateFull : kValidateIndex, &results, &output));
 
         //  Check if errors are reported if and only if valid is set to false.
         ASSERT_EQ(results.valid, results.errors.empty());
@@ -447,7 +448,7 @@ public:
     ValidatePartialIndex() : ValidateBase(true) {}
 
     void run() {
-        // Create a new collection, insert two records and check it's valid.
+        // Create a new collection, insert three records and check it's valid.
         Database* db = _ctx.db();
         OpDebug* const nullOpDebug = nullptr;
         Collection* coll;
@@ -460,6 +461,10 @@ public:
             ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 1 << "a" << 1), nullOpDebug, true));
             id1 = coll->getCursor(&_txn)->next()->id;
             ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 2 << "a" << 2), nullOpDebug, true));
+            // Explicitly test that multi-key partial indexes containing documents that
+            // don't match the filter expression are handled correctly.
+            ASSERT_OK(coll->insertDocument(
+                &_txn, BSON("_id" << 3 << "a" << BSON_ARRAY(-1 << -2 << -3)), nullOpDebug, true));
             wunit.commit();
         }
 

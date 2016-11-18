@@ -1,5 +1,4 @@
 // Confirms that profiled find execution contains all expected metrics with proper values.
-// TODO SERVER-23259: Add planSummary.
 
 (function() {
     "use strict";
@@ -33,6 +32,8 @@
     assert.eq(profileObj.keysExamined, 1, tojson(profileObj));
     assert.eq(profileObj.docsExamined, 1, tojson(profileObj));
     assert.eq(profileObj.nreturned, 1, tojson(profileObj));
+    assert.eq(profileObj.planSummary, "IXSCAN { a: 1.0 }", tojson(profileObj));
+    assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
     assert.eq(profileObj.query.filter, {a: 1}, tojson(profileObj));
     if (isLegacyReadMode) {
         assert.eq(profileObj.query.ntoreturn, -1, tojson(profileObj));
@@ -43,8 +44,6 @@
     }
     assert.eq(profileObj.cursorExhausted, true, tojson(profileObj));
     assert(!profileObj.hasOwnProperty("cursorid"), tojson(profileObj));
-    assert.eq("IXSCAN", profileObj.execStats.inputStage.inputStage.stage, tojson(profileObj));
-    assert.eq("LIMIT", profileObj.execStats.stage, tojson(profileObj));
     assert(profileObj.hasOwnProperty("responseLength"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("millis"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("numYield"), tojson(profileObj));

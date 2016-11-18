@@ -1,6 +1,4 @@
 // Confirms that profiled update execution contains all expected metrics with proper values.
-// TODO SERVER-23259: Add planSummary.
-// TODO SERVER-23264: Add execStats.
 
 (function() {
     "use strict";
@@ -29,13 +27,14 @@
 
     assert.eq(profileObj.ns, coll.getFullName(), tojson(profileObj));
     assert.eq(profileObj.op, "update", tojson(profileObj));
-    assert.eq(profileObj.keyUpdates, 1, tojson(profileObj));
     assert.eq(profileObj.keysExamined, 1, tojson(profileObj));
     assert.eq(profileObj.docsExamined, 1, tojson(profileObj));
     assert.eq(profileObj.keysInserted, 1, tojson(profileObj));
     assert.eq(profileObj.keysDeleted, 1, tojson(profileObj));
     assert.eq(profileObj.nMatched, 1, tojson(profileObj));
     assert.eq(profileObj.nModified, 1, tojson(profileObj));
+    assert.eq(profileObj.planSummary, "IXSCAN { a: 1.0 }", tojson(profileObj));
+    assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("millis"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("numYield"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("locks"), tojson(profileObj));
@@ -52,13 +51,14 @@
     assert.writeOK(coll.update({a: {$gte: 5}}, {$set: {c: 1}, $inc: {a: -10}}, {multi: true}));
     profileObj = getLatestProfilerEntry(testDB);
 
-    assert.eq(profileObj.keyUpdates, 1, tojson(profileObj));
     assert.eq(profileObj.keysExamined, 5, tojson(profileObj));
     assert.eq(profileObj.docsExamined, 5, tojson(profileObj));
     assert.eq(profileObj.keysInserted, 5, tojson(profileObj));
     assert.eq(profileObj.keysDeleted, 5, tojson(profileObj));
     assert.eq(profileObj.nMatched, 5, tojson(profileObj));
     assert.eq(profileObj.nModified, 5, tojson(profileObj));
+    assert.eq(profileObj.planSummary, "IXSCAN { a: 1.0 }", tojson(profileObj));
+    assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
 
     //
     // Confirm metrics for insert on update with "upsert: true".
@@ -69,8 +69,9 @@
     }
     assert.commandWorked(coll.createIndex({a: 1}));
 
-    coll.update({_id: "new value", a: 4}, {$inc: {b: 1}}, {upsert: true});
+    assert.writeOK(coll.update({_id: "new value", a: 4}, {$inc: {b: 1}}, {upsert: true}));
     profileObj = getLatestProfilerEntry(testDB);
+
     assert.eq(profileObj.query, {_id: "new value", a: 4}, tojson(profileObj));
     assert.eq(profileObj.updateobj, {$inc: {b: 1}}, tojson(profileObj));
     assert.eq(profileObj.keysExamined, 0, tojson(profileObj));
@@ -79,6 +80,25 @@
     assert.eq(profileObj.nMatched, 0, tojson(profileObj));
     assert.eq(profileObj.nModified, 0, tojson(profileObj));
     assert.eq(profileObj.upsert, true, tojson(profileObj));
+    assert.eq(profileObj.planSummary, "IXSCAN { _id: 1 }", tojson(profileObj));
+    assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
+
+    //
+    // Confirm 'nmoved' for MMAPv1.
+    //
+    if (db.serverStatus().storageEngine.name === "mmapv1") {
+        coll.drop();
+        assert.writeOK(coll.insert({_id: 1}));
+
+        assert.writeOK(coll.update({_id: 1}, {$set: {b: new Array(128).toString()}}));
+        profileObj = getLatestProfilerEntry(testDB);
+
+        assert.eq(profileObj.keysInserted, 1, tojson(profileObj));
+        assert.eq(profileObj.keysDeleted, 1, tojson(profileObj));
+        assert.eq(profileObj.nMatched, 1, tojson(profileObj));
+        assert.eq(profileObj.nModified, 1, tojson(profileObj));
+        assert.eq(profileObj.nmoved, 1, tojson(profileObj));
+    }
 
     //
     // Confirm "fromMultiPlanner" metric.

@@ -35,11 +35,11 @@
 #include <boost/thread/tss.hpp>
 
 #include "mongo/s/chunk.h"
-#include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
-#include "mongo/s/db_util.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharding_raii.h"
+#include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -110,8 +110,8 @@ UpdateType getUpdateExprType(const BSONObj& updateExpr) {
  *     { _id : { $lt : 30 } } => false
  *     { foo : <anything> } => false
  */
-bool isExactIdQuery(const BSONObj& query) {
-    StatusWith<BSONObj> status = virtualIdShardKey.extractShardKeyFromQuery(query);
+bool isExactIdQuery(OperationContext* txn, const BSONObj& query) {
+    StatusWith<BSONObj> status = virtualIdShardKey.extractShardKeyFromQuery(txn, query);
     if (!status.isOK()) {
         return false;
     }
@@ -228,9 +228,9 @@ CompareResult compareAllShardVersions(const ChunkManager* cachedChunkManager,
 /**
  * Whether or not the manager/primary pair is different from the other manager/primary pair.
  */
-bool isMetadataDifferent(const ChunkManagerPtr& managerA,
+bool isMetadataDifferent(const shared_ptr<ChunkManager>& managerA,
                          const shared_ptr<Shard>& primaryA,
-                         const ChunkManagerPtr& managerB,
+                         const shared_ptr<ChunkManager>& managerB,
                          const shared_ptr<Shard>& primaryB) {
     if ((managerA && !managerB) || (!managerA && managerB) || (primaryA && !primaryB) ||
         (!primaryA && primaryB))
@@ -248,9 +248,9 @@ bool isMetadataDifferent(const ChunkManagerPtr& managerA,
 * Whether or not the manager/primary pair was changed or refreshed from a previous version
 * of the metadata.
 */
-bool wasMetadataRefreshed(const ChunkManagerPtr& managerA,
+bool wasMetadataRefreshed(const shared_ptr<ChunkManager>& managerA,
                           const shared_ptr<Shard>& primaryA,
-                          const ChunkManagerPtr& managerB,
+                          const shared_ptr<ChunkManager>& managerB,
                           const shared_ptr<Shard>& primaryB) {
     if (isMetadataDifferent(managerA, primaryA, managerB, primaryB))
         return true;
@@ -270,13 +270,13 @@ ChunkManagerTargeter::ChunkManagerTargeter(const NamespaceString& nss, TargeterS
 
 
 Status ChunkManagerTargeter::init(OperationContext* txn) {
-    auto status = dbutil::implicitCreateDb(txn, _nss.db().toString());
-    if (!status.isOK()) {
-        return status.getStatus();
+    auto dbStatus = ScopedShardDatabase::getOrCreate(txn, _nss.db());
+    if (!dbStatus.isOK()) {
+        return dbStatus.getStatus();
     }
 
-    shared_ptr<DBConfig> config = status.getValue();
-    config->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
+    auto scopedDb = std::move(dbStatus.getValue());
+    scopedDb.db()->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
 
     return Status::OK();
 }
@@ -372,7 +372,7 @@ Status ChunkManagerTargeter::targetUpdate(OperationContext* txn,
         if (updateType == UpdateType_OpStyle) {
             // Target using the query
             StatusWith<BSONObj> status =
-                _manager->getShardKeyPattern().extractShardKeyFromQuery(query);
+                _manager->getShardKeyPattern().extractShardKeyFromQuery(txn, query);
 
             // Bad query
             if (!status.isOK())
@@ -404,7 +404,8 @@ Status ChunkManagerTargeter::targetUpdate(OperationContext* txn,
         }
 
         // Validate that single (non-multi) sharded updates are targeted by shard key or _id
-        if (!updateDoc.getMulti() && shardKey.isEmpty() && !isExactIdQuery(updateDoc.getQuery())) {
+        if (!updateDoc.getMulti() && shardKey.isEmpty() &&
+            !isExactIdQuery(txn, updateDoc.getQuery())) {
             return Status(ErrorCodes::ShardKeyNotFound,
                           stream() << "update " << updateDoc.toBSON()
                                    << " does not contain _id or shard key for pattern "
@@ -441,7 +442,7 @@ Status ChunkManagerTargeter::targetDelete(OperationContext* txn,
 
         // Get the shard key
         StatusWith<BSONObj> status =
-            _manager->getShardKeyPattern().extractShardKeyFromQuery(deleteDoc.getQuery());
+            _manager->getShardKeyPattern().extractShardKeyFromQuery(txn, deleteDoc.getQuery());
 
         // Bad query
         if (!status.isOK())
@@ -451,7 +452,7 @@ Status ChunkManagerTargeter::targetDelete(OperationContext* txn,
 
         // Validate that single (limit-1) sharded deletes are targeted by shard key or _id
         if (deleteDoc.getLimit() == 1 && shardKey.isEmpty() &&
-            !isExactIdQuery(deleteDoc.getQuery())) {
+            !isExactIdQuery(txn, deleteDoc.getQuery())) {
             return Status(ErrorCodes::ShardKeyNotFound,
                           stream() << "delete " << deleteDoc.toBSON()
                                    << " does not contain _id or shard key for pattern "
@@ -622,16 +623,16 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* txn, bool* wasCha
     // Get the latest metadata information from the cache if there were issues
     //
 
-    ChunkManagerPtr lastManager = _manager;
+    shared_ptr<ChunkManager> lastManager = _manager;
     shared_ptr<Shard> lastPrimary = _primary;
 
-    auto status = dbutil::implicitCreateDb(txn, _nss.db().toString());
-    if (!status.isOK()) {
-        return status.getStatus();
+    auto dbStatus = ScopedShardDatabase::getOrCreate(txn, _nss.db());
+    if (!dbStatus.isOK()) {
+        return dbStatus.getStatus();
     }
 
-    shared_ptr<DBConfig> config = status.getValue();
-    config->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
+    auto scopedDb = std::move(dbStatus.getValue());
+    scopedDb.db()->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
 
     // We now have the latest metadata from the cache.
 
@@ -686,12 +687,12 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* txn, bool* wasCha
 }
 
 Status ChunkManagerTargeter::refreshNow(OperationContext* txn, RefreshType refreshType) {
-    auto status = dbutil::implicitCreateDb(txn, _nss.db().toString());
-    if (!status.isOK()) {
-        return status.getStatus();
+    auto dbStatus = ScopedShardDatabase::getOrCreate(txn, _nss.db());
+    if (!dbStatus.isOK()) {
+        return dbStatus.getStatus();
     }
 
-    shared_ptr<DBConfig> config = status.getValue();
+    auto scopedDb = std::move(dbStatus.getValue());
 
     // Try not to spam the configs
     refreshBackoff();
@@ -699,23 +700,23 @@ Status ChunkManagerTargeter::refreshNow(OperationContext* txn, RefreshType refre
     // TODO: Improve synchronization and make more explicit
     if (refreshType == RefreshType_RefreshChunkManager) {
         try {
-            // Forces a remote check of the collection info, synchronization between threads
-            // happens internally.
-            config->getChunkManagerIfExists(txn, _nss.ns(), true);
-        } catch (const DBException& ex) {
-            return Status(ErrorCodes::UnknownError, ex.toString());
-        }
-        config->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
-    } else if (refreshType == RefreshType_ReloadDatabase) {
-        try {
-            // Dumps the db info, reloads it all, synchronization between threads happens
-            // internally.
-            config->reload(txn);
+            // Forces a remote check of the collection info, synchronization between threads happens
+            // internally
+            scopedDb.db()->getChunkManagerIfExists(txn, _nss.ns(), true);
         } catch (const DBException& ex) {
             return Status(ErrorCodes::UnknownError, ex.toString());
         }
 
-        config->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
+        scopedDb.db()->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
+    } else if (refreshType == RefreshType_ReloadDatabase) {
+        try {
+            // Dumps the db info, reloads it all, synchronization between threads happens internally
+            scopedDb.db()->reload(txn);
+        } catch (const DBException& ex) {
+            return Status(ErrorCodes::UnknownError, ex.toString());
+        }
+
+        scopedDb.db()->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
     }
 
     return Status::OK();

@@ -28,6 +28,9 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard.h"
 
@@ -35,7 +38,6 @@ namespace mongo {
 
 class ChunkManager;
 class ChunkType;
-class MigrationSecondaryThrottleOptions;
 class OperationContext;
 
 /**
@@ -126,45 +128,9 @@ public:
      *
      * @throws UserException
      */
-    Status split(OperationContext* txn,
-                 SplitPointMode mode,
-                 size_t* resultingSplits,
-                 BSONObj* res) const;
-
-    /**
-     * Splits this chunk at the given key (or keys)
-     *
-     * @param splitPoints the vector of keys that should be used to divide this chunk
-     * @param res the object containing details about the split execution
-     *
-     * @throws UserException
-     */
-    Status multiSplit(OperationContext* txn,
-                      const std::vector<BSONObj>& splitPoints,
-                      BSONObj* res) const;
-
-    //
-    // migration support
-    //
-
-    /**
-     * Issues a migrate request for this chunk
-     *
-     * @param to shard to move this chunk to
-     * @param chunSize maximum number of bytes beyond which the migrate should no go trhough
-     * @param writeConcern detailed write concern. NULL means the default write concern.
-     * @param waitForDelete whether chunk move should wait for cleanup or return immediately
-     * @param maxTimeMS max time for the migrate request
-     * @param res the object containing details about the migrate execution
-     * @return true if move was successful
-     */
-    bool moveAndCommit(OperationContext* txn,
-                       const ShardId& to,
-                       long long chunkSize,
-                       const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                       bool waitForDelete,
-                       int maxTimeMS,
-                       BSONObj& res) const;
+    StatusWith<boost::optional<ChunkRange>> split(OperationContext* txn,
+                                                  SplitPointMode mode,
+                                                  size_t* resultingSplits) const;
 
     /**
      * marks this chunk as a jumbo chunk
@@ -256,7 +222,5 @@ private:
      */
     static int mkDataWritten();
 };
-
-typedef std::shared_ptr<const Chunk> ChunkPtr;
 
 }  // namespace mongo

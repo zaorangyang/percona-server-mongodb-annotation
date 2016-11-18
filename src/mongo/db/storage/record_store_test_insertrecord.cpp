@@ -28,6 +28,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/storage/record_store_test_harness.h"
 
 
@@ -127,7 +129,7 @@ TEST(RecordStoreTestHarness, InsertRecordUsingDocWriter) {
             StringDocWriter docWriter("my record", false);
 
             WriteUnitOfWork uow(opCtx.get());
-            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), &docWriter, false);
+            StatusWith<RecordId> res = rs->insertRecordWithDocWriter(opCtx.get(), &docWriter);
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -161,7 +163,7 @@ TEST(RecordStoreTestHarness, InsertMultipleRecordsUsingDocWriter) {
             StringDocWriter docWriter(ss.str(), false);
 
             WriteUnitOfWork uow(opCtx.get());
-            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), &docWriter, false);
+            StatusWith<RecordId> res = rs->insertRecordWithDocWriter(opCtx.get(), &docWriter);
             ASSERT_OK(res.getStatus());
             locs[i] = res.getValue();
             uow.commit();

@@ -50,6 +50,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/s/catalog/config_server_version.h"
@@ -126,6 +127,37 @@ void toBatchError(const Status& status, BatchedCommandResponse* response) {
     response->setOk(false);
 }
 
+/**
+ * Takes the response from running a batch write command and writes the appropriate response into
+ * *batchResponse, while also returning the Status of the operation.
+ */
+Status _processBatchWriteResponse(StatusWith<Shard::CommandResponse> response,
+                                  BatchedCommandResponse* batchResponse) {
+    Status status(ErrorCodes::InternalError, "status not set");
+
+    if (!response.isOK()) {
+        status = response.getStatus();
+    } else if (!response.getValue().commandStatus.isOK()) {
+        status = response.getValue().commandStatus;
+    } else if (!response.getValue().writeConcernStatus.isOK()) {
+        status = response.getValue().writeConcernStatus;
+    } else {
+        string errmsg;
+        if (!batchResponse->parseBSON(response.getValue().response, &errmsg)) {
+            status = Status(ErrorCodes::FailedToParse,
+                            str::stream() << "Failed to parse config server response: " << errmsg);
+        } else {
+            status = batchResponse->toStatus();
+        }
+    }
+
+    if (!status.isOK()) {
+        toBatchError(status, batchResponse);
+    }
+
+    return status;
+}
+
 }  // namespace
 
 StatusWith<ShardType> CatalogManagerReplicaSet::_validateHostAsShard(
@@ -146,24 +178,67 @@ StatusWith<ShardType> CatalogManagerReplicaSet::_validateHostAsShard(
     invariant(shardConn);
     auto targeter = shardConn->getTargeter();
 
-    // Is it mongos?
-    auto cmdStatus = _runCommandForAddShard(txn, targeter.get(), "admin", BSON("isdbgrid" << 1));
+    // Check whether any host in the connection is already part of the cluster.
+    shardRegistry->reload(txn);
+    for (const auto& hostAndPort : connectionString.getServers()) {
+        std::shared_ptr<Shard> shard;
+        shard = shardRegistry->getShardNoReload(hostAndPort.toString());
+        if (shard) {
+            return {ErrorCodes::OperationFailed,
+                    str::stream() << "'" << hostAndPort.toString() << "' "
+                                  << "is already a member of the existing shard '"
+                                  << shard->getConnString().toString() << "' (" << shard->getId()
+                                  << ")."};
+        }
+    }
+
+    // Check for mongos and older version mongod connections, and whether the hosts
+    // can be found for the user specified replset.
+    auto cmdStatus = _runCommandForAddShard(txn, targeter.get(), "admin", BSON("isMaster" << 1));
     if (!cmdStatus.isOK()) {
-        return cmdStatus.getStatus();
+        if (cmdStatus == ErrorCodes::RPCProtocolNegotiationFailed) {
+            // Mongos to mongos commands are no longer supported in the wire protocol
+            // (because mongos does not support OP_COMMAND), similarly for a new mongos
+            // and an old mongod. So the call will fail in such cases.
+            // TODO: If/When mongos ever supports opCommands, this logic will break because
+            // cmdStatus will be OK.
+            return {ErrorCodes::RPCProtocolNegotiationFailed,
+                    str::stream() << shardConn->toString()
+                                  << " does not recognize the RPC protocol being used. This is"
+                                  << " likely because it contains a node that is a mongos or an old"
+                                  << " version of mongod."};
+        } else {
+            return cmdStatus.getStatus();
+        }
     }
 
-    // (ok == 1) implies that it is a mongos
-    if (getStatusFromCommandResult(cmdStatus.getValue()).isOK()) {
-        return {ErrorCodes::OperationFailed, "can't add a mongos process as a shard"};
-    }
-
-    // Is it a replica set?
-    cmdStatus = _runCommandForAddShard(txn, targeter.get(), "admin", BSON("isMaster" << 1));
-    if (!cmdStatus.isOK()) {
-        return cmdStatus.getStatus();
-    }
-
+    // Check for a command response error
     BSONObj resIsMaster = cmdStatus.getValue();
+    Status resIsMasterStatus = getStatusFromCommandResult(resIsMaster);
+    if (!resIsMasterStatus.isOK()) {
+        return {resIsMasterStatus.code(),
+                str::stream() << "Error running isMaster against " << shardConn->toString() << ": "
+                              << causedBy(resIsMasterStatus)};
+    }
+
+    // Check whether there is a master. If there isn't, the replica set may not have been
+    // initiated. If the connection is a standalone, it will return true for isMaster.
+    bool isMaster;
+    Status status = bsonExtractBooleanField(resIsMaster, "ismaster", &isMaster);
+    if (!status.isOK()) {
+        return Status(status.code(),
+                      str::stream() << "isMaster returned invalid 'ismaster' "
+                                    << "field when attempting to add "
+                                    << connectionString.toString()
+                                    << " as a shard: " << status.reason());
+    }
+    if (!isMaster) {
+        return {ErrorCodes::NotMaster,
+                str::stream()
+                    << connectionString.toString()
+                    << " does not have a master. If this is a replica set, ensure that it has a"
+                    << " healthy primary and that the set has been properly initiated."};
+    }
 
     const string providedSetName = connectionString.getSetName();
     const string foundSetName = resIsMaster["setName"].str();
@@ -190,35 +265,11 @@ StatusWith<ShardType> CatalogManagerReplicaSet::_validateHostAsShard(
                               << ") does not match the actual set name " << foundSetName};
     }
 
-    // Is it a mongos config server?
-    cmdStatus = _runCommandForAddShard(txn, targeter.get(), "admin", BSON("replSetGetStatus" << 1));
-    if (!cmdStatus.isOK()) {
-        return cmdStatus.getStatus();
-    }
-
-    BSONObj res = cmdStatus.getValue();
-
-    if (getStatusFromCommandResult(res).isOK()) {
-        bool isConfigServer;
-        Status status =
-            bsonExtractBooleanFieldWithDefault(res, "configsvr", false, &isConfigServer);
-        if (!status.isOK()) {
-            return Status(status.code(),
-                          str::stream() << "replSetGetStatus returned invalid \"configsvr\" "
-                                        << "field when attempting to add "
-                                        << connectionString.toString()
-                                        << " as a shard: " << status.reason());
-        }
-
-        if (isConfigServer) {
-            return {ErrorCodes::OperationFailed,
-                    str::stream() << "Cannot add " << connectionString.toString()
-                                  << " as a shard since it is part of a config server replica set"};
-        }
-    } else if ((res["info"].type() == String) && (res["info"].String() == "configsvr")) {
+    // Is it a config server?
+    if (resIsMaster.hasField("configsvr")) {
         return {ErrorCodes::OperationFailed,
-                "the specified mongod is a legacy-style config "
-                "server and cannot be used as a shard server"};
+                str::stream() << "Cannot add " << connectionString.toString()
+                              << " as a shard since it is a config server"};
     }
 
     // If the shard is part of a replica set, make sure all the hosts mentioned in the connection
@@ -440,11 +491,17 @@ StatusWith<string> CatalogManagerReplicaSet::addShard(OperationContext* txn,
     Status result = insertConfigDocument(txn, ShardType::ConfigNS, shardType.toBSON());
     if (!result.isOK()) {
         log() << "error adding shard: " << shardType.toBSON() << " err: " << result.reason();
+        if (result == ErrorCodes::DuplicateKey) {
+            return {ErrorCodes::DuplicateKey,
+                    str::stream() << "Received DuplicateKey error when inserting into the "
+                                  << "config.shards collection. This most likely means that "
+                                  << "either the shard name '" << shardType.getName()
+                                  << "' or the connection string '"
+                                  << shardConnectionString.toString()
+                                  << "' is already in use in this cluster"};
+        }
         return result;
     }
-
-    // Make sure the new shard is visible
-    grid.shardRegistry()->reload(txn);
 
     // Add all databases which were discovered on the new shard
     for (const string& dbName : dbNamesStatus.getValue()) {
@@ -466,6 +523,12 @@ StatusWith<string> CatalogManagerReplicaSet::addShard(OperationContext* txn,
     shardDetails.append("host", shardConnectionString.toString());
 
     logChange(txn, "addShard", "", shardDetails.obj());
+
+    // Make sure the new shard is visible from this point on. Do the reload twice in case there was
+    // a concurrent reload, which started before we added the shard.
+    if (!Grid::get(txn)->shardRegistry()->reload(txn)) {
+        Grid::get(txn)->shardRegistry()->reload(txn);
+    }
 
     return shardType.getName();
 }
@@ -552,7 +615,7 @@ Status CatalogManagerReplicaSet::logAction(OperationContext* txn,
     if (_actionLogCollectionCreated.load() == 0) {
         Status result = _createCappedConfigCollection(
             txn, kActionLogCollectionName, kActionLogCollectionSizeMB);
-        if (result.isOK() || result == ErrorCodes::NamespaceExists) {
+        if (result.isOK()) {
             _actionLogCollectionCreated.store(1);
         } else {
             log() << "couldn't create config.actionlog collection:" << causedBy(result);
@@ -570,7 +633,7 @@ Status CatalogManagerReplicaSet::logChange(OperationContext* txn,
     if (_changeLogCollectionCreated.load() == 0) {
         Status result = _createCappedConfigCollection(
             txn, kChangeLogCollectionName, kChangeLogCollectionSizeMB);
-        if (result.isOK() || result == ErrorCodes::NamespaceExists) {
+        if (result.isOK()) {
             _changeLogCollectionCreated.store(1);
         } else {
             log() << "couldn't create config.changelog collection:" << causedBy(result);
@@ -717,12 +780,12 @@ Status CatalogManagerReplicaSet::shardCollection(OperationContext* txn,
         return scopedDistLock.getStatus();
     }
 
-    auto status = getDatabase(txn, nsToDatabase(ns));
-    if (!status.isOK()) {
-        return status.getStatus();
+    auto getDBStatus = getDatabase(txn, nsToDatabase(ns));
+    if (!getDBStatus.isOK()) {
+        return getDBStatus.getStatus();
     }
 
-    ShardId dbPrimaryShardId = status.getValue().value.getPrimary();
+    ShardId dbPrimaryShardId = getDBStatus.getValue().value.getPrimary();
     const auto primaryShard = grid.shardRegistry()->getShard(txn, dbPrimaryShardId);
 
     {
@@ -786,15 +849,22 @@ Status CatalogManagerReplicaSet::shardCollection(OperationContext* txn,
         manager->getVersion(),
         true);
 
-    auto ssvStatus = grid.shardRegistry()->runIdempotentCommandOnShard(
-        txn,
-        dbPrimaryShardId,
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        "admin",
-        ssv.toBSON());
-    if (!ssvStatus.isOK()) {
+    auto shard = Grid::get(txn)->shardRegistry()->getShard(txn, dbPrimaryShardId);
+    if (!shard) {
+        return {ErrorCodes::ShardNotFound,
+                str::stream() << "shard " << dbPrimaryShardId << " not found"};
+    }
+
+    auto ssvResponse = shard->runCommand(txn,
+                                         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                         "admin",
+                                         ssv.toBSON(),
+                                         Shard::RetryPolicy::kIdempotent);
+    auto status = ssvResponse.isOK() ? std::move(ssvResponse.getValue().commandStatus)
+                                     : std::move(ssvResponse.getStatus());
+    if (!status.isOK()) {
         warning() << "could not update initial version of " << ns << " on shard primary "
-                  << dbPrimaryShardId << ssvStatus.getStatus();
+                  << dbPrimaryShardId << causedBy(status);
     }
 
     logChange(txn, "shardCollection.end", ns, BSON("version" << manager->getVersion().toString()));
@@ -1061,25 +1131,38 @@ Status CatalogManagerReplicaSet::dropCollection(OperationContext* txn, const Nam
     auto* shardRegistry = grid.shardRegistry();
 
     for (const auto& shardEntry : allShards) {
-        auto dropResult = shardRegistry->runIdempotentCommandOnShard(
+        auto shard = shardRegistry->getShard(txn, shardEntry.getName());
+        if (!shard) {
+            return {ErrorCodes::ShardNotFound,
+                    str::stream() << "shard " << shardEntry.getName() << " not found"};
+        }
+        auto dropResult = shard->runCommand(
             txn,
-            shardEntry.getName(),
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
             ns.db().toString(),
-            BSON("drop" << ns.coll() << "writeConcern" << txn->getWriteConcern().toBSON()));
+            BSON("drop" << ns.coll() << "writeConcern" << txn->getWriteConcern().toBSON()),
+            Shard::RetryPolicy::kIdempotent);
 
         if (!dropResult.isOK()) {
             return Status(dropResult.getStatus().code(),
                           dropResult.getStatus().reason() + " at " + shardEntry.getName());
         }
 
-        auto dropStatus = getStatusFromCommandResult(dropResult.getValue());
-        if (!dropStatus.isOK()) {
-            if (dropStatus.code() == ErrorCodes::NamespaceNotFound) {
+        auto dropStatus = std::move(dropResult.getValue().commandStatus);
+        auto wcStatus = std::move(dropResult.getValue().writeConcernStatus);
+        if (!dropStatus.isOK() || !wcStatus.isOK()) {
+            if (dropStatus.code() == ErrorCodes::NamespaceNotFound && wcStatus.isOK()) {
+                // Generally getting NamespaceNotFound is okay to ignore as it simply means that
+                // the collection has already been dropped or doesn't exist on this shard.
+                // If, however, we get NamespaceNotFound but also have a write concern error then we
+                // can't confirm whether the fact that the namespace doesn't exist is actually
+                // committed.  Thus we must still fail on NamespaceNotFound if there is also a write
+                // concern error. This can happen if we call drop, it succeeds but with a write
+                // concern error, then we retry the drop.
                 continue;
             }
 
-            errors.emplace(shardEntry.getHost(), dropResult.getValue());
+            errors.emplace(shardEntry.getHost(), std::move(dropResult.getValue().response));
         }
     }
 
@@ -1131,34 +1214,39 @@ Status CatalogManagerReplicaSet::dropCollection(OperationContext* txn, const Nam
             ChunkVersion::DROPPED(),
             true);
 
-        auto ssvResult = shardRegistry->runIdempotentCommandOnShard(
-            txn,
-            shardEntry.getName(),
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            "admin",
-            ssv.toBSON());
+        auto shard = shardRegistry->getShard(txn, shardEntry.getName());
+        if (!shard) {
+            return {ErrorCodes::ShardNotFound,
+                    str::stream() << "shard " << shardEntry.getName() << " not found"};
+        }
+
+        auto ssvResult = shard->runCommand(txn,
+                                           ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                           "admin",
+                                           ssv.toBSON(),
+                                           Shard::RetryPolicy::kIdempotent);
 
         if (!ssvResult.isOK()) {
             return ssvResult.getStatus();
         }
 
-        auto ssvStatus = getStatusFromCommandResult(ssvResult.getValue());
+        auto ssvStatus = std::move(ssvResult.getValue().commandStatus);
         if (!ssvStatus.isOK()) {
             return ssvStatus;
         }
 
-        auto unsetShardingStatus = shardRegistry->runIdempotentCommandOnShard(
-            txn,
-            shardEntry.getName(),
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            "admin",
-            BSON("unsetSharding" << 1));
+        auto unsetShardingStatus =
+            shard->runCommand(txn,
+                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                              "admin",
+                              BSON("unsetSharding" << 1),
+                              Shard::RetryPolicy::kIdempotent);
 
         if (!unsetShardingStatus.isOK()) {
             return unsetShardingStatus.getStatus();
         }
 
-        auto unsetShardingResult = getStatusFromCommandResult(unsetShardingStatus.getValue());
+        auto unsetShardingResult = std::move(unsetShardingStatus.getValue().commandStatus);
         if (!unsetShardingResult.isOK()) {
             return unsetShardingResult;
         }
@@ -1398,15 +1486,25 @@ bool CatalogManagerReplicaSet::runUserManagementWriteCommand(OperationContext* t
         cmdToRun = modifiedCmd.obj();
     }
 
-    auto response = grid.shardRegistry()->runCommandOnConfigWithRetries(
-        txn, dbname, cmdToRun, ShardRegistry::kNotMasterErrors);
+    auto response = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
+        txn,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        dbname,
+        cmdToRun,
+        Shard::RetryPolicy::kNotIdempotent);
 
     if (!response.isOK()) {
         return Command::appendCommandStatus(*result, response.getStatus());
     }
+    if (!response.getValue().commandStatus.isOK()) {
+        return Command::appendCommandStatus(*result, response.getValue().commandStatus);
+    }
+    if (!response.getValue().writeConcernStatus.isOK()) {
+        return Command::appendCommandStatus(*result, response.getValue().writeConcernStatus);
+    }
 
-    result->appendElements(response.getValue());
-    return getStatusFromCommandResult(response.getValue()).isOK();
+    result->appendElements(response.getValue().response);
+    return true;
 }
 
 bool CatalogManagerReplicaSet::runReadCommandForTest(OperationContext* txn,
@@ -1417,11 +1515,11 @@ bool CatalogManagerReplicaSet::runReadCommandForTest(OperationContext* txn,
     cmdBuilder.appendElements(cmdObj);
     _appendReadConcern(&cmdBuilder);
 
-    auto resultStatus = grid.shardRegistry()->runIdempotentCommandOnConfig(
-        txn, kConfigReadSelector, dbname, cmdBuilder.done());
+    auto resultStatus = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
+        txn, kConfigReadSelector, dbname, cmdBuilder.done(), Shard::RetryPolicy::kIdempotent);
     if (resultStatus.isOK()) {
-        result->appendElements(resultStatus.getValue());
-        return getStatusFromCommandResult(resultStatus.getValue()).isOK();
+        result->appendElements(resultStatus.getValue().response);
+        return resultStatus.getValue().commandStatus.isOK();
     }
 
     return Command::appendCommandStatus(*result, resultStatus.getStatus());
@@ -1431,11 +1529,11 @@ bool CatalogManagerReplicaSet::runUserManagementReadCommand(OperationContext* tx
                                                             const std::string& dbname,
                                                             const BSONObj& cmdObj,
                                                             BSONObjBuilder* result) {
-    auto resultStatus = grid.shardRegistry()->runIdempotentCommandOnConfig(
-        txn, kConfigPrimaryPreferredSelector, dbname, cmdObj);
+    auto resultStatus = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
+        txn, kConfigPrimaryPreferredSelector, dbname, cmdObj, Shard::RetryPolicy::kIdempotent);
     if (resultStatus.isOK()) {
-        result->appendElements(resultStatus.getValue());
-        return getStatusFromCommandResult(resultStatus.getValue()).isOK();
+        result->appendElements(resultStatus.getValue().response);
+        return resultStatus.getValue().commandStatus.isOK();
     }
 
     return Command::appendCommandStatus(*result, resultStatus.getStatus());
@@ -1449,14 +1547,20 @@ Status CatalogManagerReplicaSet::applyChunkOpsDeprecated(OperationContext* txn,
     BSONObj cmd = BSON("applyOps" << updateOps << "preCondition" << preCondition
                                   << kWriteConcernField << kMajorityWriteConcern.toBSON());
 
-    auto response = grid.shardRegistry()->runCommandOnConfigWithRetries(
-        txn, "config", cmd, ShardRegistry::kAllRetriableErrors);
+    auto response = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
+        txn,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        "config",
+        cmd,
+        Shard::RetryPolicy::kIdempotent);
 
     if (!response.isOK()) {
         return response.getStatus();
     }
 
-    Status status = getStatusFromCommandResult(response.getValue());
+    Status status = response.getValue().commandStatus.isOK()
+        ? std::move(response.getValue().writeConcernStatus)
+        : std::move(response.getValue().commandStatus);
 
     if (MONGO_FAIL_POINT(failApplyChunkOps)) {
         status = Status(ErrorCodes::InternalError, "Failpoint 'failApplyChunkOps' generated error");
@@ -1489,7 +1593,7 @@ Status CatalogManagerReplicaSet::applyChunkOpsDeprecated(OperationContext* txn,
                                    << "operation metadata: " << causedBy(chunkStatus)
                                    << ". applyChunkOpsDeprecated failed to get confirmation "
                                    << "of commit. Unable to save chunk ops. Command: " << cmd
-                                   << ". Result: " << response.getValue();
+                                   << ". Result: " << response.getValue().response;
         } else if (!newestChunk.empty()) {
             invariant(newestChunk.size() == 1);
             log() << "chunk operation commit confirmed";
@@ -1498,7 +1602,7 @@ Status CatalogManagerReplicaSet::applyChunkOpsDeprecated(OperationContext* txn,
             errMsg = str::stream() << "chunk operation commit failed: version "
                                    << lastChunkVersion.toString() << " doesn't exist in namespace"
                                    << nss << ". Unable to save chunk ops. Command: " << cmd
-                                   << ". Result: " << response.getValue();
+                                   << ". Result: " << response.getValue().response;
         }
         return Status(status.code(), errMsg);
     }
@@ -1523,14 +1627,13 @@ void CatalogManagerReplicaSet::writeConfigServerDirect(OperationContext* txn,
         return;
     }
 
-    _runBatchWriteCommand(txn, batchRequest, batchResponse, ShardRegistry::kNotMasterErrors);
+    _runBatchWriteCommand(txn, batchRequest, batchResponse, Shard::RetryPolicy::kNotIdempotent);
 }
 
-void CatalogManagerReplicaSet::_runBatchWriteCommand(
-    OperationContext* txn,
-    const BatchedCommandRequest& batchRequest,
-    BatchedCommandResponse* batchResponse,
-    const ShardRegistry::ErrorCodesSet& errorsToCheck) {
+void CatalogManagerReplicaSet::_runBatchWriteCommand(OperationContext* txn,
+                                                     const BatchedCommandRequest& batchRequest,
+                                                     BatchedCommandResponse* batchResponse,
+                                                     Shard::RetryPolicy retryPolicy) {
     const std::string dbname = batchRequest.getNS().db().toString();
     invariant(dbname == "config" || dbname == "admin");
 
@@ -1539,30 +1642,19 @@ void CatalogManagerReplicaSet::_runBatchWriteCommand(
     const BSONObj cmdObj = batchRequest.toBSON();
 
     for (int retry = 1; retry <= kMaxWriteRetry; ++retry) {
-        // runCommandOnConfigWithRetries already does its own retries based on the generic command
-        // errors. If this fails, we know that it has done all the retries that it could do so there
-        // is no need to retry anymore.
-        auto response =
-            grid.shardRegistry()->runCommandOnConfigWithRetries(txn, dbname, cmdObj, errorsToCheck);
-        if (!response.isOK()) {
-            toBatchError(response.getStatus(), batchResponse);
-            return;
-        }
+        auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+        auto response = configShard->runCommand(
+            txn,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            dbname,
+            cmdObj,
+            Shard::RetryPolicy::kNoRetry);  // We're handling our own retries here.
 
-        string errmsg;
-        if (!batchResponse->parseBSON(response.getValue(), &errmsg)) {
-            toBatchError(
-                Status(ErrorCodes::FailedToParse,
-                       str::stream() << "Failed to parse config server response: " << errmsg),
-                batchResponse);
-            return;
-        }
-
-        // If one of the write operations failed (which is reported in the error details), see if
-        // this is a retriable error as well.
-        Status status = batchResponse->toStatus();
-        if (errorsToCheck.count(status.code()) && retry < kMaxWriteRetry) {
-            LOG(1) << "Command failed with retriable error and will be retried" << causedBy(status);
+        Status status = _processBatchWriteResponse(response, batchResponse);
+        if (retry < kMaxWriteRetry && configShard->isRetriableError(status.code(), retryPolicy)) {
+            batchResponse->clear();
+            LOG(1) << "Batch write command failed with retriable error and will be retried"
+                   << causedBy(status);
             continue;
         }
 
@@ -1588,11 +1680,19 @@ Status CatalogManagerReplicaSet::insertConfigDocument(OperationContext* txn,
     request.setNS(nss);
     request.setWriteConcern(kMajorityWriteConcern.toBSON());
 
+    auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
     for (int retry = 1; retry <= kMaxWriteRetry; retry++) {
         BatchedCommandResponse response;
-        _runBatchWriteCommand(txn, request, &response, ShardRegistry::kNotMasterErrors);
+        _runBatchWriteCommand(txn, request, &response, Shard::RetryPolicy::kNoRetry);
 
         Status status = response.toStatus();
+
+        if (retry < kMaxWriteRetry &&
+            configShard->isRetriableError(status.code(), Shard::RetryPolicy::kIdempotent)) {
+            // Pretend like the operation is idempotent because we're handling DuplicateKey errors
+            // specially
+            continue;
+        }
 
         // If we get DuplicateKey error on the first attempt to insert, this definitively means that
         // we are trying to insert the same entry a second time, so error out. If it happens on a
@@ -1631,10 +1731,6 @@ Status CatalogManagerReplicaSet::insertConfigDocument(OperationContext* txn,
             }
         }
 
-        if (ShardRegistry::kAllRetriableErrors.count(status.code()) && (retry < kMaxWriteRetry)) {
-            continue;
-        }
-
         return status;
     }
 
@@ -1666,7 +1762,7 @@ StatusWith<bool> CatalogManagerReplicaSet::updateConfigDocument(OperationContext
     request.setWriteConcern(kMajorityWriteConcern.toBSON());
 
     BatchedCommandResponse response;
-    _runBatchWriteCommand(txn, request, &response, ShardRegistry::kAllRetriableErrors);
+    _runBatchWriteCommand(txn, request, &response, Shard::RetryPolicy::kIdempotent);
 
     Status status = response.toStatus();
     if (!status.isOK()) {
@@ -1696,7 +1792,7 @@ Status CatalogManagerReplicaSet::removeConfigDocuments(OperationContext* txn,
     request.setWriteConcern(kMajorityWriteConcern.toBSON());
 
     BatchedCommandResponse response;
-    _runBatchWriteCommand(txn, request, &response, ShardRegistry::kAllRetriableErrors);
+    _runBatchWriteCommand(txn, request, &response, Shard::RetryPolicy::kIdempotent);
 
     return response.toStatus();
 }
@@ -1786,13 +1882,31 @@ Status CatalogManagerReplicaSet::_createCappedConfigCollection(OperationContext*
                                                                StringData collName,
                                                                int cappedSize) {
     BSONObj createCmd = BSON("create" << collName << "capped" << true << "size" << cappedSize);
-    auto result = grid.shardRegistry()->runCommandOnConfigWithRetries(
-        txn, "config", createCmd, ShardRegistry::kAllRetriableErrors);
+
+    auto result = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
+        txn,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        "config",
+        createCmd,
+        Shard::RetryPolicy::kIdempotent);
+
     if (!result.isOK()) {
         return result.getStatus();
     }
 
-    return getStatusFromCommandResult(result.getValue());
+    if (!result.getValue().commandStatus.isOK()) {
+        if (result.getValue().commandStatus == ErrorCodes::NamespaceExists) {
+            if (result.getValue().writeConcernStatus.isOK()) {
+                return Status::OK();
+            } else {
+                return result.getValue().writeConcernStatus;
+            }
+        } else {
+            return result.getValue().commandStatus;
+        }
+    }
+
+    return result.getValue().writeConcernStatus;
 }
 
 StatusWith<long long> CatalogManagerReplicaSet::_runCountCommandOnConfig(OperationContext* txn,
@@ -1803,13 +1917,20 @@ StatusWith<long long> CatalogManagerReplicaSet::_runCountCommandOnConfig(Operati
     countBuilder.append("query", query);
     _appendReadConcern(&countBuilder);
 
-    auto resultStatus = grid.shardRegistry()->runIdempotentCommandOnConfig(
-        txn, kConfigReadSelector, ns.db().toString(), countBuilder.done());
+    auto resultStatus = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
+        txn,
+        kConfigReadSelector,
+        ns.db().toString(),
+        countBuilder.done(),
+        Shard::RetryPolicy::kIdempotent);
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
     }
+    if (!resultStatus.getValue().commandStatus.isOK()) {
+        return resultStatus.getValue().commandStatus;
+    }
 
-    auto responseObj = std::move(resultStatus.getValue());
+    auto responseObj = std::move(resultStatus.getValue().response);
 
     long long result;
     auto status = bsonExtractIntegerField(responseObj, "n", &result);
@@ -1922,8 +2043,8 @@ StatusWith<repl::OpTimeWith<vector<BSONObj>>> CatalogManagerReplicaSet::_exhaust
     const BSONObj& query,
     const BSONObj& sort,
     boost::optional<long long> limit) {
-    auto response =
-        grid.shardRegistry()->exhaustiveFindOnConfig(txn, readPref, nss, query, sort, limit);
+    auto response = Grid::get(txn)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+        txn, readPref, nss, query, sort, limit);
     if (!response.isOK()) {
         return response.getStatus();
     }
@@ -1940,14 +2061,21 @@ void CatalogManagerReplicaSet::_appendReadConcern(BSONObjBuilder* builder) {
 
 Status CatalogManagerReplicaSet::appendInfoForConfigServerDatabases(OperationContext* txn,
                                                                     BSONArrayBuilder* builder) {
-    auto resultStatus = grid.shardRegistry()->runIdempotentCommandOnConfig(
-        txn, kConfigPrimaryPreferredSelector, "admin", BSON("listDatabases" << 1));
+    auto resultStatus = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
+        txn,
+        kConfigPrimaryPreferredSelector,
+        "admin",
+        BSON("listDatabases" << 1),
+        Shard::RetryPolicy::kIdempotent);
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
     }
+    if (!resultStatus.getValue().commandStatus.isOK()) {
+        return resultStatus.getValue().commandStatus;
+    }
 
-    auto listDBResponse = resultStatus.getValue();
+    auto listDBResponse = std::move(resultStatus.getValue().response);
     BSONElement dbListArray;
     auto dbListStatus = bsonExtractTypedField(listDBResponse, "databases", Array, &dbListArray);
     if (!dbListStatus.isOK()) {

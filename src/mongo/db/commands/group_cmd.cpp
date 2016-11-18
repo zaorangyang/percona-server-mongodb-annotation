@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/util/bson_extract.h"
@@ -34,6 +36,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/group.h"
@@ -41,6 +44,7 @@
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -49,6 +53,10 @@ using std::string;
 
 namespace {
 
+/**
+ * The group command is deprecated. Users should prefer the aggregation framework or mapReduce. See
+ * http://dochub.mongodb.org/core/group-command-deprecation for more detail.
+ */
 class GroupCommand : public Command {
 public:
     GroupCommand() : Command("group") {}
@@ -134,6 +142,11 @@ private:
                      int options,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
+        RARELY {
+            warning() << "The group command is deprecated. See "
+                         "http://dochub.mongodb.org/core/group-command-deprecation.";
+        }
+
         GroupRequest groupRequest;
         Status parseRequestStatus = _parseRequest(dbname, cmdObj, &groupRequest);
         if (!parseRequestStatus.isOK()) {
@@ -150,6 +163,12 @@ private:
         }
 
         unique_ptr<PlanExecutor> planExecutor = std::move(statusWithPlanExecutor.getValue());
+
+        auto curOp = CurOp::get(txn);
+        {
+            stdx::lock_guard<Client>(*txn->getClient());
+            curOp->setPlanSummary_inlock(Explain::getPlanSummary(planExecutor.get()));
+        }
 
         // Group executors return ADVANCED exactly once, with the entire group result.
         BSONObj retval;
@@ -174,7 +193,13 @@ private:
         if (coll) {
             coll->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
         }
-        CurOp::get(txn)->debug().setPlanSummaryMetrics(summaryStats);
+        curOp->debug().setPlanSummaryMetrics(summaryStats);
+
+        if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+            BSONObjBuilder execStatsBob;
+            Explain::getWinningPlanStats(planExecutor.get(), &execStatsBob);
+            curOp->debug().execStats.set(execStatsBob.obj());
+        }
 
         invariant(STAGE_GROUP == planExecutor->getRootStage()->stageType());
         GroupStage* groupStage = static_cast<GroupStage*>(planExecutor->getRootStage());

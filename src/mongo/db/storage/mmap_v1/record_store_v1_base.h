@@ -39,7 +39,6 @@
 namespace mongo {
 
 class DeletedRecord;
-class DocWriter;
 class ExtentManager;
 class MmapV1RecordHeader;
 class OperationContext;
@@ -195,9 +194,10 @@ public:
                                       int len,
                                       bool enforceQuota);
 
-    StatusWith<RecordId> insertRecord(OperationContext* txn,
-                                      const DocWriter* doc,
-                                      bool enforceQuota);
+    Status insertRecordsWithDocWriter(OperationContext* txn,
+                                      const DocWriter* const* docs,
+                                      size_t nDocs,
+                                      RecordId* idsOut) final;
 
     virtual Status updateRecord(OperationContext* txn,
                                 const RecordId& oldLocation,
@@ -219,8 +219,7 @@ public:
     void increaseStorageSize(OperationContext* txn, int size, bool enforceQuota);
 
     virtual Status validate(OperationContext* txn,
-                            bool full,
-                            bool scanData,
+                            ValidateCmdLevel level,
                             ValidateAdaptor* adaptor,
                             ValidateResults* results,
                             BSONObjBuilder* output);

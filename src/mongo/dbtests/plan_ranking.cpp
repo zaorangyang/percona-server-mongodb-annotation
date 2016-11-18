@@ -50,9 +50,12 @@
 #include "mongo/db/query/query_planner_test_lib.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/dbtests/dbtests.h"
-
+#include "mongo/stdx/memory.h"
+#include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
+
+const std::unique_ptr<ClockSource> clockSource = stdx::make_unique<ClockSourceMock>();
 
 // How we access the external setParameter testing bool.
 extern std::atomic<bool> internalQueryForceIntersectionPlans;  // NOLINT
@@ -129,7 +132,7 @@ public:
             _mps->addPlan(solutions[i], root, ws.get());
         }
         // This is what sets a backup plan, should we test for it.
-        PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL, clockSource.get());
         _mps->pickBestPlan(&yieldPolicy);
         ASSERT(_mps->bestPlanChosen());
 
@@ -146,6 +149,10 @@ public:
     bool hasBackupPlan() const {
         ASSERT(NULL != _mps.get());
         return _mps->hasBackupPlan();
+    }
+
+    OperationContext* txn() {
+        return &_txn;
     }
 
 protected:
@@ -193,8 +200,10 @@ public:
 
         // Run the query {a:4, b:1}.
         {
+            auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+            lpq->setFilter(BSON("a" << 100 << "b" << 1));
             auto statusWithCQ = CanonicalQuery::canonicalize(
-                nss, BSON("a" << 100 << "b" << 1), ExtensionsCallbackDisallowExtensions());
+                txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
             verify(statusWithCQ.isOK());
             cq = std::move(statusWithCQ.getValue());
             ASSERT(cq.get());
@@ -211,8 +220,10 @@ public:
 
         // And run the same query again.
         {
+            auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+            lpq->setFilter(BSON("a" << 100 << "b" << 1));
             auto statusWithCQ = CanonicalQuery::canonicalize(
-                nss, BSON("a" << 100 << "b" << 1), ExtensionsCallbackDisallowExtensions());
+                txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
             verify(statusWithCQ.isOK());
             cq = std::move(statusWithCQ.getValue());
         }
@@ -245,8 +256,10 @@ public:
         addIndex(BSON("b" << 1));
 
         // Run the query {a:1, b:{$gt:1}.
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("a" << 1 << "b" << BSON("$gt" << 1)));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, BSON("a" << 1 << "b" << BSON("$gt" << 1)), ExtensionsCallbackDisallowExtensions());
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -283,12 +296,12 @@ public:
         addIndex(BSON("a" << 1));
         addIndex(BSON("a" << 1 << "b" << 1));
 
-        // Query for a==27 with projection that wants 'a' and 'b'.  BSONObj() is for sort.
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss,
-                                                         BSON("a" << 27),
-                                                         BSONObj(),
-                                                         BSON("_id" << 0 << "a" << 1 << "b" << 1),
-                                                         ExtensionsCallbackDisallowExtensions());
+        // Query for a==27 with projection that wants 'a' and 'b'.
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("a" << 27));
+        lpq->setProj(BSON("_id" << 0 << "a" << 1 << "b" << 1));
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -320,9 +333,10 @@ public:
         addIndex(BSON("b" << 1));
 
         // There is no data that matches this query but we don't know that until EOF.
-        BSONObj queryObj = BSON("a" << 1 << "b" << 1 << "c" << 99);
-        auto statusWithCQ =
-            CanonicalQuery::canonicalize(nss, queryObj, ExtensionsCallbackDisallowExtensions());
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("a" << 1 << "b" << 1 << "c" << 99));
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -357,12 +371,12 @@ public:
 
         // There is no data that matches this query ({a:2}).  Both scans will hit EOF before
         // returning any data.
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("a" << 2));
+        lpq->setProj(BSON("_id" << 0 << "a" << 1 << "b" << 1));
 
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss,
-                                                         BSON("a" << 2),
-                                                         BSONObj(),
-                                                         BSON("_id" << 0 << "a" << 1 << "b" << 1),
-                                                         ExtensionsCallbackDisallowExtensions());
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -393,8 +407,10 @@ public:
         addIndex(BSON("b" << 1));
 
         // Run the query {a:N+1, b:1}.  (No such document.)
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("a" << N + 1 << "b" << 1));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, BSON("a" << N + 1 << "b" << 1), ExtensionsCallbackDisallowExtensions());
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -428,10 +444,10 @@ public:
         addIndex(BSON("b" << 1));
 
         // Run the query {a:N+1, b:1}.  (No such document.)
-        auto statusWithCQ =
-            CanonicalQuery::canonicalize(nss,
-                                         BSON("a" << BSON("$gte" << N + 1) << "b" << 1),
-                                         ExtensionsCallbackDisallowExtensions());
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("a" << BSON("$gte" << N + 1) << "b" << 1));
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -458,11 +474,11 @@ public:
 
         // Run a query with a sort.  The blocking sort won't produce any data during the
         // evaluation period.
-        BSONObj queryObj = BSON("_id" << BSON("$gte" << 20 << "$lte" << 200));
-        BSONObj sortObj = BSON("c" << 1);
-        BSONObj projObj = BSONObj();
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("_id" << BSON("$gte" << 20 << "$lte" << 200)));
+        lpq->setSort(BSON("c" << 1));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, queryObj, sortObj, projObj, ExtensionsCallbackDisallowExtensions());
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -489,8 +505,10 @@ public:
         }
 
         // Look for A Space Odyssey.
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("foo" << 2001));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, BSON("foo" << 2001), ExtensionsCallbackDisallowExtensions());
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -521,11 +539,11 @@ public:
         addIndex(BSON("d" << 1 << "e" << 1));
 
         // Query: find({a: 1}).sort({d: 1})
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss,
-                                                         BSON("a" << 1),
-                                                         BSON("d" << 1),  // sort
-                                                         BSONObj(),       // projection
-                                                         ExtensionsCallbackDisallowExtensions());
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(BSON("a" << 1));
+        lpq->setSort(BSON("d" << 1));
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -560,8 +578,10 @@ public:
         // Solutions using either 'a' or 'b' will take a long time to start producing
         // results. However, an index scan on 'b' will start producing results sooner
         // than an index scan on 'a'.
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(fromjson("{a: 1, b: 1, c: {$gte: 5000}}"));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, fromjson("{a: 1, b: 1, c: {$gte: 5000}}"), ExtensionsCallbackDisallowExtensions());
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -591,8 +611,10 @@ public:
         addIndex(BSON("b" << 1 << "c" << 1));
         addIndex(BSON("a" << 1));
 
+        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
+        lpq->setFilter(fromjson("{a: 9, b: {$ne: 10}, c: 9}"));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, fromjson("{a: 9, b: {$ne: 10}, c: 9}"), ExtensionsCallbackDisallowExtensions());
+            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());

@@ -34,6 +34,12 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/platform/atomic_word.h"
 
+namespace mongoutils {
+namespace str {
+class stream;
+}
+}
+
 namespace mongo {
 
 /**
@@ -69,7 +75,15 @@ public:
      * caused the error, and a unique position in the where the error occurred
      * (similar to an assert number)
      */
-    Status(ErrorCodes::Error code, std::string reason, int location = 0);
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code,
+                                        std::string reason,
+                                        int location = 0);
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code,
+                                        const char* reason,
+                                        int location = 0);
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code,
+                                        const mongoutils::str::stream& reason,
+                                        int location = 0);
 
     inline Status(const Status& other);
     inline Status& operator=(const Status& other);

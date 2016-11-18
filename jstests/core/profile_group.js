@@ -1,6 +1,4 @@
 // Confirms that profiled group execution contains all expected metrics with proper values.
-// TODO SERVER-23259: Add planSummary.
-// TODO SERVER-23264: Add execStats.
 
 (function() {
     "use strict";
@@ -31,6 +29,8 @@
     assert.eq(profileObj.op, "command", tojson(profileObj));
     assert.eq(profileObj.keysExamined, 2, tojson(profileObj));
     assert.eq(profileObj.docsExamined, 2, tojson(profileObj));
+    assert.eq(profileObj.planSummary, "IXSCAN { b: 1.0 }", tojson(profileObj));
+    assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
     assert.eq(profileObj.protocol, getProfilerProtocolStringForCommand(conn), tojson(profileObj));
     assert.eq(profileObj.command.group.key, {a: 1, b: 1}, tojson(profileObj));
     assert(profileObj.hasOwnProperty("responseLength"), tojson(profileObj));

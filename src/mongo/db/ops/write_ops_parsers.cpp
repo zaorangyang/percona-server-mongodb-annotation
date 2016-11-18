@@ -96,8 +96,7 @@ void parseWriteCommand(StringData dbName,
 
         const StringData fieldName = field.fieldNameStringData();
         if (fieldName == "bypassDocumentValidation") {
-            checkType(Bool, field);
-            op->bypassDocumentValidation = field.Bool();
+            op->bypassDocumentValidation = field.trueValue();
         } else if (fieldName == "ordered") {
             checkType(Bool, field);
             op->continueOnError = !field.Bool();
@@ -164,6 +163,9 @@ UpdateOp parseUpdateCommand(StringData dbName, const BSONObj& cmd) {
                 haveU = true;
                 checkType(Object, field);
                 update.update = field.Obj();
+            } else if (fieldName == "collation") {
+                checkType(Object, field);
+                update.collation = field.Obj();
             } else if (fieldName == "multi") {
                 checkType(Bool, field);
                 update.multi = field.Bool();
@@ -200,6 +202,9 @@ DeleteOp parseDeleteCommand(StringData dbName, const BSONObj& cmd) {
                 haveQ = true;
                 checkType(Object, field);
                 del.query = field.Obj();
+            } else if (fieldName == "collation") {
+                checkType(Object, field);
+                del.collation = field.Obj();
             } else if (fieldName == "limit") {
                 haveLimit = true;
                 uassert(ErrorCodes::TypeMismatch,

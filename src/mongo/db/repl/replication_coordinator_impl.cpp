@@ -751,6 +751,7 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* txn) {
     _drainFinishedCond.notify_all();
     lk.unlock();
 
+    _externalState->updateShardIdentityConfigString(txn);
     _externalState->dropAllTempCollections(txn);
 
     // This is done for compatibility with PV0 replicas wrt how "n" ops are processed.
@@ -1960,6 +1961,13 @@ void ReplicationCoordinatorImpl::fillIsMasterForReplSet(IsMasterResponse* respon
     {
         LockGuard topoLock(_topoMutex);
         _topCoord->fillIsMasterForReplSet(response);
+    }
+
+    OpTime lastOpTime = getMyLastAppliedOpTime();
+    response->setLastWrite(lastOpTime, lastOpTime.getTimestamp().getSecs());
+    if (_currentCommittedSnapshot) {
+        OpTime majorityOpTime = _currentCommittedSnapshot->opTime;
+        response->setLastMajorityWrite(majorityOpTime, majorityOpTime.getTimestamp().getSecs());
     }
 
     if (isWaitingForApplierToDrain()) {

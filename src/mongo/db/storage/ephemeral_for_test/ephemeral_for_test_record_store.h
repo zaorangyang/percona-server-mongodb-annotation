@@ -65,9 +65,10 @@ public:
                                               int len,
                                               bool enforceQuota);
 
-    virtual StatusWith<RecordId> insertRecord(OperationContext* txn,
-                                              const DocWriter* doc,
-                                              bool enforceQuota);
+    virtual Status insertRecordsWithDocWriter(OperationContext* txn,
+                                              const DocWriter* const* docs,
+                                              size_t nDocs,
+                                              RecordId* idsOut);
 
     virtual Status updateRecord(OperationContext* txn,
                                 const RecordId& oldLocation,
@@ -92,8 +93,7 @@ public:
     virtual void temp_cappedTruncateAfter(OperationContext* txn, RecordId end, bool inclusive);
 
     virtual Status validate(OperationContext* txn,
-                            bool full,
-                            bool scanData,
+                            ValidateCmdLevel level,
                             ValidateAdaptor* adaptor,
                             ValidateResults* results,
                             BSONObjBuilder* output);

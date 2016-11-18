@@ -43,6 +43,7 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
@@ -55,6 +56,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/client/shard_remote.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/set_shard_version_request.h"
@@ -85,6 +87,7 @@ const stdx::chrono::seconds ShardingTestFixture::kFutureTimeout{5};
 
 void ShardingTestFixture::setUp() {
     _service = stdx::make_unique<ServiceContextNoop>();
+    _service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
     _service->setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
     _messagePort = stdx::make_unique<MessagingPortMock>();
     _client = _service->makeClient("ShardingTestFixture", _messagePort.get());
@@ -125,13 +128,40 @@ void ShardingTestFixture::setUp() {
         "CatalogManagerReplSetTest", {HostAndPort{"TestHost1"}, HostAndPort{"TestHost2"}});
 
     auto targeterFactory(stdx::make_unique<RemoteCommandTargeterFactoryMock>());
-    _targeterFactory = targeterFactory.get();
+    auto targeterFactoryPtr = targeterFactory.get();
+    _targeterFactory = targeterFactoryPtr;
 
     auto configTargeter(stdx::make_unique<RemoteCommandTargeterMock>());
     _configTargeter = configTargeter.get();
     _targeterFactory->addTargeterToReturn(configCS, std::move(configTargeter));
 
-    auto shardFactory(stdx::make_unique<ShardFactory>(std::move(targeterFactory)));
+    ShardFactory::BuilderCallable setBuilder =
+        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+            return stdx::make_unique<ShardRemote>(
+                shardId, connStr, targeterFactoryPtr->create(connStr));
+        };
+
+    ShardFactory::BuilderCallable masterBuilder =
+        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+            return stdx::make_unique<ShardRemote>(
+                shardId, connStr, targeterFactoryPtr->create(connStr));
+        };
+
+    ShardFactory::BuilderCallable customBuilder =
+        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+            return stdx::make_unique<ShardRemote>(
+                shardId, connStr, targeterFactoryPtr->create(connStr));
+        };
+
+    ShardFactory::BuildersMap buildersMap{
+        {ConnectionString::SET, std::move(setBuilder)},
+        {ConnectionString::MASTER, std::move(masterBuilder)},
+        {ConnectionString::CUSTOM, std::move(customBuilder)},
+    };
+
+    auto shardFactory =
+        stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
+
     auto shardRegistry(stdx::make_unique<ShardRegistry>(std::move(shardFactory), configCS));
     executorPool->startup();
 

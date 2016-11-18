@@ -48,6 +48,7 @@
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/mmap_v1/file_allocator.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/log.h"
 
 
@@ -220,12 +221,11 @@ void clearTmpFiles() {
 }
 }  // namespace
 
-MMAPV1Engine::MMAPV1Engine(const StorageEngineLockFile* lockFile)
-    : MMAPV1Engine(lockFile, stdx::make_unique<MmapV1ExtentManager::Factory>()) {}
-
-MMAPV1Engine::MMAPV1Engine(const StorageEngineLockFile* lockFile,
-                           std::unique_ptr<ExtentManager::Factory> extentManagerFactory)
-    : _extentManagerFactory(std::move(extentManagerFactory)) {
+MMAPV1Engine::MMAPV1Engine(const StorageEngineLockFile* lockFile, ClockSource* cs)
+    : _recordAccessTracker(cs),
+      _extentManagerFactory(stdx::make_unique<MmapV1ExtentManager::Factory>()),
+      _clock(cs),
+      _startMs(_clock->now().toMillisSinceEpoch()) {
     // TODO check non-journal subdirs if using directory-per-db
     checkReadAhead(storageGlobalParams.dbpath);
 
@@ -244,7 +244,7 @@ void MMAPV1Engine::finishInit() {
 
     // Replays the journal (if needed) and starts the background thread. This requires the
     // ability to create OperationContexts.
-    dur::startup();
+    dur::startup(_clock, _startMs);
 }
 
 MMAPV1Engine::~MMAPV1Engine() {

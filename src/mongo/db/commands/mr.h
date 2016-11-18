@@ -206,6 +206,7 @@ public:
 
     BSONObj filter;
     BSONObj sort;
+    BSONObj collation;
     long long limit;
 
     // functions
@@ -305,7 +306,7 @@ public:
 
     void finalReduce(BSONList& values);
 
-    void finalReduce(CurOp* op, ProgressMeterHolder& pm);
+    void finalReduce(OperationContext* txn, CurOp* op, ProgressMeterHolder& pm);
 
     // ------- cleanup/data positioning ----------
 

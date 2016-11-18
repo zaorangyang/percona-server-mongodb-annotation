@@ -456,7 +456,6 @@ void Explain::statsToBSON(const PlanStageStats& stats,
             bob->appendNumber("nWouldModify", spec->nModified);
             bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
             bob->appendBool("wouldInsert", spec->inserted);
-            bob->appendBool("fastmod", spec->fastmod);
             bob->appendBool("fastmodinsert", spec->fastmodinsert);
         }
     }
@@ -770,9 +769,6 @@ void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsO
         statsOut->totalDocsExamined +=
             getDocsExamined(stages[i]->stageType(), stages[i]->getSpecificStats());
 
-        if (STAGE_IDHACK == stages[i]->stageType()) {
-            statsOut->isIdhack = true;
-        }
         if (STAGE_SORT == stages[i]->stageType()) {
             statsOut->hasSortStage = true;
         }

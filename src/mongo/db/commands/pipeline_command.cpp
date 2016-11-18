@@ -54,7 +54,6 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -204,11 +203,6 @@ public:
         if (!pPipeline.get())
             return false;
 
-        // Save and reset the write concern so that it doesn't get changed accidentally by
-        // DBDirectClient.
-        auto oldWC = txn->getWriteConcern();
-        ON_BLOCK_EXIT([txn, oldWC] { txn->setWriteConcern(oldWC); });
-
         // This is outside of the if block to keep the object alive until the pipeline is finished.
         BSONObj parsed;
         if (kDebugBuild && !pPipeline->isExplain() && !pCtx->inShard) {
@@ -249,9 +243,21 @@ public:
                 Explain::getSummaryStats(*input, &stats);
                 collection->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
 
+                auto curOp = CurOp::get(txn);
+                {
+                    stdx::lock_guard<Client>(*txn->getClient());
+                    curOp->setPlanSummary_inlock(Explain::getPlanSummary(input.get()));
+                }
+
                 // TODO SERVER-23265: Confirm whether this is the correct place to gather all
                 // metrics. There is no harm adding here for the time being.
-                CurOp::get(txn)->debug().setPlanSummaryMetrics(stats);
+                curOp->debug().setPlanSummaryMetrics(stats);
+
+                if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+                    BSONObjBuilder execStatsBob;
+                    Explain::getWinningPlanStats(input.get(), &execStatsBob);
+                    curOp->debug().execStats.set(execStatsBob.obj());
+                }
             }
 
             // Create the PlanExecutor which returns results from the pipeline. The WorkingSet

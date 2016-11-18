@@ -459,7 +459,7 @@ class TwoDPtInAnnulusExpression : public LeafMatchExpression {
 public:
     TwoDPtInAnnulusExpression(const R2Annulus& annulus, StringData twoDPath)
         : LeafMatchExpression(INTERNAL_2D_POINT_IN_ANNULUS), _annulus(annulus) {
-        initPath(twoDPath);
+        setPath(twoDPath);
     }
 
     void serialize(BSONObjBuilder* out) const final {
@@ -743,7 +743,9 @@ GeoNear2DSphereStage::GeoNear2DSphereStage(const GeoNearParams& nearParams,
     _specificStats.keyPattern = s2Index->keyPattern();
     _specificStats.indexName = s2Index->indexName();
     _specificStats.indexVersion = s2Index->version();
-    ExpressionParams::parse2dsphereParams(s2Index->infoObj(), &_indexParams);
+    // TODO SERVER-23968: change nullptr to the appropriate collator.
+    const CollatorInterface* collator = nullptr;
+    ExpressionParams::initialize2dsphereParams(s2Index->infoObj(), collator, &_indexParams);
 }
 
 GeoNear2DSphereStage::~GeoNear2DSphereStage() {}

@@ -42,6 +42,7 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/platform/random.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/catalog_cache.h"
@@ -54,7 +55,6 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/s/write_ops/wc_error_detail.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -143,7 +143,7 @@ public:
         BSONObj firstMatchQuery = pipeline->getInitialQuery();
         ChunkManagerPtr chunkMgr = conf->getChunkManager(txn, fullns);
         BSONObj shardKeyMatches = uassertStatusOK(
-            chunkMgr->getShardKeyPattern().extractShardKeyFromQuery(firstMatchQuery));
+            chunkMgr->getShardKeyPattern().extractShardKeyFromQuery(txn, firstMatchQuery));
 
         // Don't need to split pipeline if the first $match is an exact match on shard key, unless
         // there is a stage that needs to be run on the primary shard.

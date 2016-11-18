@@ -49,7 +49,8 @@ S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterfac
     : IndexAccessMethod(btreeState, btree) {
     const IndexDescriptor* descriptor = btreeState->descriptor();
 
-    ExpressionParams::parse2dsphereParams(descriptor->infoObj(), &_params);
+    ExpressionParams::initialize2dsphereParams(
+        descriptor->infoObj(), btreeState->getCollator(), &_params);
 
     int geoFields = 0;
 
@@ -102,7 +103,9 @@ BSONObj S2AccessMethod::fixSpec(const BSONObj& specObj) {
     return specObj;
 }
 
-void S2AccessMethod::getKeys(const BSONObj& obj, BSONObjSet* keys) const {
+void S2AccessMethod::getKeys(const BSONObj& obj,
+                             BSONObjSet* keys,
+                             MultikeyPaths* multikeyPaths) const {
     ExpressionKeysPrivate::getS2Keys(obj, _descriptor->keyPattern(), _params, keys);
 }
 

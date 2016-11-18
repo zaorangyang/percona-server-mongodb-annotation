@@ -68,7 +68,6 @@
 #include "mongo/rpc/command_request.h"
 #include "mongo/rpc/command_request_builder.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/stale_exception.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -276,11 +275,6 @@ static WriteResult performCreateIndexes(OperationContext* txn, const InsertOp& w
     // seem worth it since users that want faster index builds should just use the createIndexes
     // command rather than a legacy emulation.
     LastOpFixer lastOpFixer(txn, wholeOp.ns);
-
-    // Creating an index can change the writeConcern. Make sure we set it back to what it was.
-    const auto oldWC = txn->getWriteConcern();
-    ON_BLOCK_EXIT([&] { txn->setWriteConcern(oldWC); });
-
     WriteResult out;
     for (auto&& spec : wholeOp.documents) {
         try {
@@ -297,29 +291,14 @@ static WriteResult performCreateIndexes(OperationContext* txn, const InsertOp& w
 }
 
 static void insertDocuments(OperationContext* txn,
-                            const NamespaceString& ns,
+                            Collection* collection,
                             std::vector<BSONObj>::const_iterator begin,
                             std::vector<BSONObj>::const_iterator end) {
-    auto& curOp = *CurOp::get(txn);
-    boost::optional<AutoGetCollection> collection;
-    while (true) {
-        txn->checkForInterrupt();
-        collection.emplace(txn, ns, MODE_IX);
-        if (collection->getCollection())
-            break;
-
-        collection.reset();  // unlock.
-        makeCollection(txn, ns);
-    }
-
-    curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
-    assertCanWrite_inlock(txn, ns);
-
     // Intentionally not using a WRITE_CONFLICT_RETRY_LOOP. That is handled by the caller so it can
     // react to oversized batches.
     WriteUnitOfWork wuow(txn);
-    uassertStatusOK(collection->getCollection()->insertDocuments(
-        txn, begin, end, &curOp.debug(), /*enforceQuota*/ true));
+    uassertStatusOK(collection->insertDocuments(
+        txn, begin, end, &CurOp::get(txn)->debug(), /*enforceQuota*/ true));
     wuow.commit();
 }
 
@@ -331,22 +310,45 @@ static bool insertBatchAndHandleErrors(OperationContext* txn,
                                        const std::vector<BSONObj>& batch,
                                        LastOpFixer* lastOpFixer,
                                        WriteResult* out) {
+    if (batch.empty())
+        return true;
+
     auto& curOp = *CurOp::get(txn);
-    if (batch.size() > 1) {
-        // First try doing it all together. If all goes well, this is all we need to do.
-        try {
+
+    boost::optional<AutoGetCollection> collection;
+    auto acquireCollection = [&] {
+        while (true) {
+            txn->checkForInterrupt();
+            collection.emplace(txn, wholeOp.ns, MODE_IX);
+            if (collection->getCollection())
+                break;
+
+            collection.reset();  // unlock.
+            makeCollection(txn, wholeOp.ns);
+        }
+
+        curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
+        assertCanWrite_inlock(txn, wholeOp.ns);
+    };
+
+    try {
+        acquireCollection();
+        if (!collection->getCollection()->isCapped() && batch.size() > 1) {
+            // First try doing it all together. If all goes well, this is all we need to do.
+            // See Collection::_insertDocuments for why we do all capped inserts one-at-a-time.
             lastOpFixer->startingOp();
-            insertDocuments(txn, wholeOp.ns, batch.begin(), batch.end());
+            insertDocuments(txn, collection->getCollection(), batch.begin(), batch.end());
             lastOpFixer->finishedOpSuccessfully();
             globalOpCounters.gotInserts(batch.size());
             std::fill_n(
                 std::back_inserter(out->results), batch.size(), WriteResult::SingleResult{1});
             curOp.debug().ninserted += batch.size();
             return true;
-        } catch (const DBException& ex) {
-            // Ignore this failure and behave as-if we never tried to do the combined batch insert.
-            // The loop below will handle reporting any non-transient errors.
         }
+    } catch (const DBException& ex) {
+        collection.reset();
+        // Ignore this failure and behave as-if we never tried to do the combined batch insert.
+        // The loop below will handle reporting any non-transient errors.
     }
 
     // Try to insert the batch one-at-a-time. This path is executed both for singular batches, and
@@ -355,11 +357,20 @@ static bool insertBatchAndHandleErrors(OperationContext* txn,
         globalOpCounters.gotInsert();
         try {
             MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-                lastOpFixer->startingOp();
-                insertDocuments(txn, wholeOp.ns, it, it + 1);
-                lastOpFixer->finishedOpSuccessfully();
-                out->results.emplace_back(WriteResult::SingleResult{1});
-                curOp.debug().ninserted++;
+                try {
+                    if (!collection)
+                        acquireCollection();
+                    lastOpFixer->startingOp();
+                    insertDocuments(txn, collection->getCollection(), it, it + 1);
+                    lastOpFixer->finishedOpSuccessfully();
+                    out->results.emplace_back(WriteResult::SingleResult{1});
+                    curOp.debug().ninserted++;
+                } catch (...) {
+                    // Release the lock following any error. Among other things, this ensures that
+                    // we don't sleep in the WCE retry loop with the lock held.
+                    collection.reset();
+                    throw;
+                }
             }
             MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "insert", wholeOp.ns.ns());
         } catch (const DBException& ex) {
@@ -467,6 +478,7 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* txn,
     UpdateRequest request(ns);
     request.setLifecycle(&updateLifecycle);
     request.setQuery(op.query);
+    request.setCollation(op.collation);
     request.setUpdates(op.update);
     request.setMulti(op.multi);
     request.setUpsert(op.upsert);
@@ -498,12 +510,24 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* txn,
 
     auto exec = uassertStatusOK(
         getExecutorUpdate(txn, &curOp.debug(), collection->getCollection(), &parsedUpdate));
+
+    {
+        stdx::lock_guard<Client>(*txn->getClient());
+        CurOp::get(txn)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+    }
+
     uassertStatusOK(exec->executePlan());
 
     PlanSummaryStats summary;
     Explain::getSummaryStats(*exec, &summary);
     if (collection->getCollection()) {
         collection->getCollection()->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+    }
+
+    if (curOp.shouldDBProfile(curOp.elapsedMillis())) {
+        BSONObjBuilder execStatsBob;
+        Explain::getWinningPlanStats(exec.get(), &execStatsBob);
+        curOp.debug().execStats.set(execStatsBob.obj());
     }
 
     const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
@@ -566,6 +590,7 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* txn,
 
     DeleteRequest request(ns);
     request.setQuery(op.query);
+    request.setCollation(op.collation);
     request.setMulti(op.multi);
     request.setYieldPolicy(PlanExecutor::YIELD_AUTO);  // ParsedDelete overrides this for $isolated.
 
@@ -585,6 +610,12 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* txn,
 
     auto exec = uassertStatusOK(
         getExecutorDelete(txn, &curOp.debug(), collection.getCollection(), &parsedDelete));
+
+    {
+        stdx::lock_guard<Client>(*txn->getClient());
+        CurOp::get(txn)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+    }
+
     uassertStatusOK(exec->executePlan());
     long long n = DeleteStage::getNumDeleted(*exec);
     curOp.debug().ndeleted = n;
@@ -595,6 +626,13 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* txn,
         collection.getCollection()->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
     }
     curOp.debug().setPlanSummaryMetrics(summary);
+
+    if (curOp.shouldDBProfile(curOp.elapsedMillis())) {
+        BSONObjBuilder execStatsBob;
+        Explain::getWinningPlanStats(exec.get(), &execStatsBob);
+        curOp.debug().execStats.set(execStatsBob.obj());
+    }
+
     LastError::get(txn->getClient()).recordDelete(n);
 
     return {n};

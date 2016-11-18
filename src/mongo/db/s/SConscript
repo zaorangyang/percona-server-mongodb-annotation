@@ -12,7 +12,6 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/range_arithmetic',
-        '$BUILD_DIR/mongo/s/catalog/catalog_types',
         '$BUILD_DIR/mongo/s/common',
         '$BUILD_DIR/mongo/db/service_context',
     ]
@@ -55,6 +54,7 @@ env.Library(
         'move_timing_helper.cpp',
         'operation_sharding_state.cpp',
         'sharded_connection_info.cpp',
+        'sharding_initialization_mongod.cpp',
         'sharding_state.cpp',
         'sharding_state_recovery.cpp',
     ],
@@ -160,3 +160,23 @@ env.CppUnitTest(
     ],
     NO_CRUTCH = True,
 )
+
+env.CppUnitTest(
+    target='collection_sharding_state_test',
+    source=[
+        'collection_sharding_state_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/client/remote_command_targeter_mock',
+        '$BUILD_DIR/mongo/db/serveronly',
+        '$BUILD_DIR/mongo/executor/network_test_env',
+        '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
+        '$BUILD_DIR/mongo/s/catalog/catalog_manager_mock',
+        '$BUILD_DIR/mongo/s/coreshard',
+        '$BUILD_DIR/mongo/util/clock_source_mock',
+        '$BUILD_DIR/mongo/util/net/message_port_mock',
+        '$BUILD_DIR/mongo/util/ntservice_mock',
+    ],
+    NO_CRUTCH = True,
+)
+

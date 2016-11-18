@@ -39,6 +39,7 @@
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
+#include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/audit.h"
@@ -57,8 +58,9 @@
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/startup_warnings_common.h"
 #include "mongo/db/wire_version.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/s/balance.h"
+#include "mongo/s/balancer/balancer.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_locks.h"
@@ -66,6 +68,8 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard_connection.h"
+#include "mongo/s/client/shard_remote.h"
+#include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/sharding_connection_hook_for_mongos.h"
 #include "mongo/s/cluster_write.h"
@@ -84,6 +88,7 @@
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/net/message.h"
@@ -270,8 +275,34 @@ static void reloadSettings(OperationContext* txn) {
 }
 
 static Status initializeSharding(OperationContext* txn) {
-    Status status = initializeGlobalShardingStateForMongos(mongosGlobalParams.configdbs,
-                                                           mongosGlobalParams.maxChunkSizeBytes);
+    auto targeterFactory = stdx::make_unique<RemoteCommandTargeterFactoryImpl>();
+    auto targeterFactoryPtr = targeterFactory.get();
+
+    ShardFactory::BuilderCallable setBuilder =
+        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+            return stdx::make_unique<ShardRemote>(
+                shardId, connStr, targeterFactoryPtr->create(connStr));
+        };
+
+    ShardFactory::BuilderCallable masterBuilder =
+        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+            return stdx::make_unique<ShardRemote>(
+                shardId, connStr, targeterFactoryPtr->create(connStr));
+        };
+
+    ShardFactory::BuildersMap buildersMap{
+        {ConnectionString::SET, std::move(setBuilder)},
+        {ConnectionString::MASTER, std::move(masterBuilder)},
+    };
+
+    auto shardFactory =
+        stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
+
+    Status status = initializeGlobalShardingState(mongosGlobalParams.configdbs,
+                                                  mongosGlobalParams.maxChunkSizeBytes,
+                                                  std::move(shardFactory),
+                                                  true);
+
     if (!status.isOK()) {
         return status;
     }
@@ -361,7 +392,7 @@ static ExitCode runMongosServer() {
         return EXIT_SHARDING_ERROR;
     }
 
-    Balancer::get(opCtx.get())->go();
+    Balancer::get(opCtx.get())->start(opCtx.get());
     clusterCursorCleanupJob.go();
 
     UserCacheInvalidator cacheInvalidatorThread(getGlobalAuthorizationManager());
@@ -413,6 +444,8 @@ static int _main() {
         return EXIT_FAILURE;
 
     startSignalProcessingThread();
+
+    getGlobalServiceContext()->setFastClockSource(FastClockSourceFactory::create(Milliseconds{10}));
 
     // we either have a setting where all processes are in localhost or none are
     std::vector<HostAndPort> configServers = mongosGlobalParams.configdbs.getServers();
@@ -467,6 +500,7 @@ MONGO_INITIALIZER(CreateAuthorizationExternalStateFactory)(InitializerContext* c
 MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
     setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
     getGlobalServiceContext()->setTickSource(stdx::make_unique<SystemTickSource>());
+    getGlobalServiceContext()->setFastClockSource(stdx::make_unique<SystemClockSource>());
     getGlobalServiceContext()->setPreciseClockSource(stdx::make_unique<SystemClockSource>());
     return Status::OK();
 }

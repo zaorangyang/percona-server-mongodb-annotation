@@ -38,27 +38,33 @@
 
 namespace mongo {
 
+class OperationContext;
+
 class CanonicalQuery {
 public:
     /**
      * If parsing succeeds, returns a std::unique_ptr<CanonicalQuery> representing the parsed
      * query (which will never be NULL).  If parsing fails, returns an error Status.
      *
+     * 'txn' must point to a valid OperationContext, but 'txn' does not need to outlive the returned
+     * CanonicalQuery.
+     *
      * Used for legacy find through the OP_QUERY message.
      */
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        const QueryMessage& qm, const ExtensionsCallback& extensionsCallback);
+        OperationContext* txn,
+        const QueryMessage& qm,
+        const ExtensionsCallback& extensionsCallback);
 
     /**
-     * Takes ownership of 'lpq'.
-     *
      * If parsing succeeds, returns a std::unique_ptr<CanonicalQuery> representing the parsed
      * query (which will never be NULL).  If parsing fails, returns an error Status.
      *
-     * Used for finds using the find command path.
+     * 'txn' must point to a valid OperationContext, but 'txn' does not need to outlive the returned
+     *  CanonicalQuery.
      */
-    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(LiteParsedQuery* lpq,
-                                                                    const ExtensionsCallback&);
+    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
+        OperationContext* txn, std::unique_ptr<LiteParsedQuery> lpq, const ExtensionsCallback&);
 
     /**
      * For testing or for internal clients to use.
@@ -72,64 +78,9 @@ public:
      * Does not take ownership of 'root'.
      */
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
+        OperationContext* txn,
         const CanonicalQuery& baseQuery,
         MatchExpression* root,
-        const ExtensionsCallback& extensionsCallback);
-
-    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        NamespaceString nss, const BSONObj& query, const ExtensionsCallback& extensionsCallback);
-
-    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        NamespaceString nss,
-        const BSONObj& query,
-        bool explain,
-        const ExtensionsCallback& extensionsCallback);
-
-    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        NamespaceString nss,
-        const BSONObj& query,
-        long long skip,
-        long long limit,
-        const ExtensionsCallback& extensionsCallback);
-
-    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        NamespaceString nss,
-        const BSONObj& query,
-        const BSONObj& sort,
-        const BSONObj& proj,
-        const ExtensionsCallback& extensionsCallback);
-
-    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        NamespaceString nss,
-        const BSONObj& query,
-        const BSONObj& sort,
-        const BSONObj& proj,
-        long long skip,
-        long long limit,
-        const ExtensionsCallback& extensionsCallback);
-
-    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        NamespaceString nss,
-        const BSONObj& query,
-        const BSONObj& sort,
-        const BSONObj& proj,
-        long long skip,
-        long long limit,
-        const BSONObj& hint,
-        const ExtensionsCallback& extensionsCallback);
-
-    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        NamespaceString nss,
-        const BSONObj& query,
-        const BSONObj& sort,
-        const BSONObj& proj,
-        long long skip,
-        long long limit,
-        const BSONObj& hint,
-        const BSONObj& minObj,
-        const BSONObj& maxObj,
-        bool snapshot,
-        bool explain,
         const ExtensionsCallback& extensionsCallback);
 
     /**
@@ -220,7 +171,7 @@ private:
     /**
      * Takes ownership of 'root' and 'lpq'.
      */
-    Status init(LiteParsedQuery* lpq,
+    Status init(std::unique_ptr<LiteParsedQuery> lpq,
                 const ExtensionsCallback& extensionsCallback,
                 MatchExpression* root);
 

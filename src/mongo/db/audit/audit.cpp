@@ -93,7 +93,7 @@ namespace audit {
     class WritableAuditLog : public logger::AuditLog {
     public:
         WritableAuditLog(const BSONObj &filter)
-            : _matcher(filter.getOwned(), ExtensionsCallbackDisallowExtensions()) {
+            : _matcher(filter.getOwned(), ExtensionsCallbackDisallowExtensions(), nullptr) {
         }
         virtual ~WritableAuditLog() {}
 

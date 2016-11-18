@@ -60,7 +60,7 @@ typedef BSONObjBuilder bob;
 */
 int compareElementValues(const BSONElement& l,
                          const BSONElement& r,
-                         StringData::ComparatorInterface* comparator = nullptr);
+                         const StringData::ComparatorInterface* comparator = nullptr);
 
 /** BSONElement represents an "element" in a BSONObj.  So for the object { a : 3, b : "abc" },
     'a : 3' is the first element (key+value).
@@ -486,6 +486,20 @@ public:
         return !operator==(r);
     }
 
+    /**
+     * Compares the raw bytes of the two BSONElements, including the field names. This will treat
+     * different types (e.g. integers and doubles) as distinct values, even if they have the same
+     * field name and bit pattern in the value portion of the BSON element.
+     */
+    bool binaryEqual(const BSONElement& rhs) const;
+
+    /**
+     * Compares the raw bytes of the two BSONElements, excluding the field names. This will treat
+     * different types (e.g integers and doubles) as distinct values, even if they have the same bit
+     * pattern in the value portion of the BSON element.
+     */
+    bool binaryEqualValues(const BSONElement& rhs) const;
+
     /** Well ordered comparison.
         @return <0: l<r. 0:l==r. >0:l>r
         order by type, field name, and field value.
@@ -494,7 +508,7 @@ public:
     */
     int woCompare(const BSONElement& e,
                   bool considerFieldName = true,
-                  StringData::ComparatorInterface* comparator = nullptr) const;
+                  const StringData::ComparatorInterface* comparator = nullptr) const;
 
     /**
      * Functor compatible with std::hash for std::unordered_{map,set}

@@ -44,6 +44,7 @@
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
@@ -292,7 +293,9 @@ public:
      * Callers must ensure no document validation is performed for this collection when calling
      * this method.
      */
-    Status insertDocument(OperationContext* txn, const DocWriter* doc, bool enforceQuota);
+    Status insertDocumentsForOplog(OperationContext* txn,
+                                   const DocWriter* const* docs,
+                                   size_t nDocs);
 
     Status insertDocument(OperationContext* txn,
                           const BSONObj& doc,
@@ -345,15 +348,12 @@ public:
     Status truncate(OperationContext* txn);
 
     /**
-     * @param full - does more checks
-     * @param scanData - scans each document
      * @return OK if the validate run successfully
      *         OK will be returned even if corruption is found
      *         deatils will be in result
      */
     Status validate(OperationContext* txn,
-                    bool full,
-                    bool scanData,
+                    ValidateCmdLevel level,
                     ValidateResults* results,
                     BSONObjBuilder* output);
 
@@ -434,6 +434,12 @@ public:
      */
     void notifyCappedWaitersIfNeeded();
 
+    /**
+     * Get a pointer to the collection's default collator. The pointer must not be used after this
+     * Collection is destroyed.
+     */
+    const CollatorInterface* getDefaultCollator() const;
+
 private:
     /**
      * Returns a non-ok Status if document does not pass this collection's validator.
@@ -512,6 +518,10 @@ private:
 
     // The earliest snapshot that is allowed to use this collection.
     boost::optional<SnapshotName> _minVisibleSnapshot;
+
+    // The default collation which is applied to operations and indices which have no collation of
+    // their own. If null, the default collation is simple binary compare.
+    std::unique_ptr<CollatorInterface> _collator;
 
     friend class Database;
     friend class IndexCatalog;

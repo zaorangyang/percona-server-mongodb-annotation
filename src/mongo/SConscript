@@ -40,6 +40,7 @@ env.SConscript(
         'scripting',
         'shell',
         'tools',
+        'transport',
         'unittest',
         'util',
     ],
@@ -120,6 +121,7 @@ baseLibDeps=[
     '$BUILD_DIR/third_party/shim_boost',
     '$BUILD_DIR/third_party/shim_pcrecpp',
     '$BUILD_DIR/third_party/shim_intel_decimal128',
+    '$BUILD_DIR/third_party/shim_tz',
     'util/debugger',
     'util/quick_exit',
 ]
@@ -306,6 +308,7 @@ env.Install(
             's/coreshard',
             's/mongoscore',
             's/sharding_initialization',
+            'util/clock_sources',
             'util/ntservice',
             'util/options_parser/options_parser_init',
         ]))

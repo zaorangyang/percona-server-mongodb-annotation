@@ -1,6 +1,4 @@
 // Confirms that profiled geonear execution contains all expected metrics with proper values.
-// TODO SERVER-23259: Add planSummary.
-// TODO SERVER-23264: Add execStats.
 
 (function() {
     "use strict";
@@ -33,6 +31,10 @@
     assert.eq(profileObj.op, "command", tojson(profileObj));
     assert.eq(profileObj.keysExamined, 82, tojson(profileObj));
     assert.eq(profileObj.docsExamined, 10, tojson(profileObj));
+    assert.eq(
+        profileObj.planSummary, "GEO_NEAR_2DSPHERE { loc: \"2dsphere\" }", tojson(profileObj));
+    assert.eq(
+        profileObj.execStats, {"$msg": "query not recording (too large)"}, tojson(profileObj));
     assert.eq(profileObj.protocol, getProfilerProtocolStringForCommand(conn), tojson(profileObj));
     assert.eq(coll.getName(), profileObj.command.geoNear, tojson(profileObj));
     assert(profileObj.hasOwnProperty("responseLength"), tojson(profileObj));

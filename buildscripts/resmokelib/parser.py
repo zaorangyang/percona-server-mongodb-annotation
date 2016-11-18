@@ -4,6 +4,7 @@ Parser for command line arguments.
 
 from __future__ import absolute_import
 
+import collections
 import os
 import os.path
 import optparse
@@ -102,6 +103,9 @@ def parse_command_line():
                       help=("Comma separated list of tags. Any jstest that contains any of the"
                             " specified tags will be excluded from any suites that are run."))
 
+    parser.add_option("-f", "--findSuites", action="store_true", dest="find_suites",
+                      help="List the names of the suites that will execute the specified tests.")
+
     parser.add_option("--includeWithAllTags", dest="include_with_all_tags", metavar="TAG1,TAG2",
                       help=("Comma separated list of tags. For the jstest portion of the suite(s),"
                             " only tests which have all of the specified tags will be run."))
@@ -195,6 +199,7 @@ def parse_command_line():
     parser.set_defaults(executor_file="with_server",
                         logger_file="console",
                         dry_run="off",
+                        find_suites=False,
                         list_suites=False,
                         prealloc_journal="off")
 
@@ -252,12 +257,47 @@ def update_config_vars(values):
         raise optparse.OptionValueError("Unknown option(s): %s" % (config.keys()))
 
 
+def create_test_membership_map(fail_on_missing_selector=False):
+    """
+    Returns a dict keyed by test name containing all of the suites that will run that test.
+    Since this iterates through every available suite, it should only be run once.
+    """
+
+    test_membership = collections.defaultdict(list)
+    suite_names = get_named_suites()
+    for suite_name in suite_names:
+        try:
+            suite_config = _get_suite_config(suite_name)
+            suite = testing.suite.Suite(suite_name, suite_config)
+        except IOError as err:
+            # If unittests.txt or integration_tests.txt aren't there we'll ignore the error because
+            # unittests haven't been built yet (this is highly likely using find interactively).
+            if err.filename in _config.EXTERNAL_SUITE_SELECTORS:
+                if not fail_on_missing_selector:
+                    continue
+            raise
+
+        for group in suite.test_groups:
+            for testfile in group.tests:
+                if isinstance(testfile, dict):
+                    continue
+                test_membership[testfile].append(suite_name)
+    return test_membership
+
+
 def get_suites(values, args):
     if (values.suite_files is None and not args) or (values.suite_files is not None and args):
         raise optparse.OptionValueError("Must specify either --suites or a list of tests")
 
     # If there are no suites specified, but there are args, assume they are jstests.
     if args:
+        # Do not change the execution order of the jstests passed as args, unless a tag option is
+        # specified. If an option is specified, then sort the tests for consistent execution order.
+        _config.ORDER_TESTS_BY_NAME = any(tag_filter is not None for
+                                          tag_filter in (_config.EXCLUDE_WITH_ALL_TAGS,
+                                                         _config.EXCLUDE_WITH_ANY_TAGS,
+                                                         _config.INCLUDE_WITH_ALL_TAGS,
+                                                         _config.INCLUDE_WITH_ANY_TAGS))
         # No specified config, just use the following, and default the logging and executor.
         suite_config = _make_jstests_config(args)
         _ensure_executor(suite_config, values.executor_file)

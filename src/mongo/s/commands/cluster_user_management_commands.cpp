@@ -41,12 +41,12 @@
 #include "mongo/config.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/write_ops/wc_error_detail.h"
 
 namespace mongo {
 
@@ -175,9 +175,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         UserName userName;
-        BSONObj unusedWriteConcern;
-        Status status =
-            auth::parseAndValidateDropUserCommand(cmdObj, dbname, &userName, &unusedWriteConcern);
+        Status status = auth::parseAndValidateDropUserCommand(cmdObj, dbname, &userName);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -265,9 +263,8 @@ public:
              BSONObjBuilder& result) {
         string userNameString;
         vector<RoleName> roles;
-        BSONObj unusedWriteConcern;
         Status status = auth::parseRolePossessionManipulationCommands(
-            cmdObj, getName(), dbname, &userNameString, &roles, &unusedWriteConcern);
+            cmdObj, getName(), dbname, &userNameString, &roles);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -314,9 +311,8 @@ public:
              BSONObjBuilder& result) {
         string userNameString;
         vector<RoleName> unusedRoles;
-        BSONObj unusedWriteConcern;
         Status status = auth::parseRolePossessionManipulationCommands(
-            cmdObj, getName(), dbname, &userNameString, &unusedRoles, &unusedWriteConcern);
+            cmdObj, getName(), dbname, &userNameString, &unusedRoles);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -855,18 +851,27 @@ Status runUpgradeOnAllShards(OperationContext* txn,
 
     bool hasWCError = false;
     for (const auto& shardId : shardIds) {
-        auto cmdResult = shardRegistry->runIdempotentCommandOnShard(
-            txn, shardId, ReadPreferenceSetting{ReadPreference::PrimaryOnly}, "admin", cmdObj);
-
-        if (!cmdResult.isOK()) {
-            return Status(cmdResult.getStatus().code(),
+        auto shard = shardRegistry->getShard(txn, shardId);
+        if (!shard) {
+            return {ErrorCodes::ShardNotFound,
+                    str::stream() << "shard " << shardId << " not found"};
+        }
+        auto cmdResult = shard->runCommand(txn,
+                                           ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                           "admin",
+                                           cmdObj,
+                                           Shard::RetryPolicy::kIdempotent);
+        auto status = cmdResult.isOK() ? std::move(cmdResult.getValue().commandStatus)
+                                       : std::move(cmdResult.getStatus());
+        if (!status.isOK()) {
+            return Status(status.code(),
                           str::stream() << "Failed to run authSchemaUpgrade on shard " << shardId
                                         << causedBy(cmdResult.getStatus()));
         }
 
         // If the result has a writeConcernError, append it.
         if (!hasWCError) {
-            if (auto wcErrorElem = cmdResult.getValue()["writeConcernError"]) {
+            if (auto wcErrorElem = cmdResult.getValue().response["writeConcernError"]) {
                 appendWriteConcernErrorToCmdResponse(shardId, wcErrorElem, result);
                 hasWCError = true;
             }
@@ -930,7 +935,7 @@ public:
                 // If the status is a write concern error, append a writeConcernError instead of
                 // and error message.
                 if (ErrorCodes::isWriteConcernError(status.code())) {
-                    WCErrorDetail wcError;
+                    WriteConcernErrorDetail wcError;
                     wcError.setErrMessage(status.reason());
                     wcError.setErrCode(status.code());
                     result.append("writeConcernError", wcError.toBSON());
