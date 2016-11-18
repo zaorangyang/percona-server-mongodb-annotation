@@ -152,7 +152,7 @@ void CappedInsertNotifier::_wait(stdx::unique_lock<stdx::mutex>& lk,
     while (!_dead && prevVersion == _version) {
         if (timeout == Microseconds::max()) {
             _notifier.wait(lk);
-        } else if (stdx::cv_status::timeout == _notifier.wait_for(lk, timeout)) {
+        } else if (stdx::cv_status::timeout == _notifier.wait_for(lk, timeout.toSystemDuration())) {
             return;
         }
     }
@@ -198,6 +198,8 @@ Collection::Collection(OperationContext* txn,
       _needCappedLock(supportsDocLocking() && _recordStore->isCapped() && _ns.db() != "local"),
       _infoCache(this),
       _indexCatalog(this),
+      _collator(
+          uassertStatusOK(parseCollation(txn, _details->getCollectionOptions(txn).collation))),
       _validatorDoc(_details->getCollectionOptions(txn).validator.getOwned()),
       _validator(uassertStatusOK(parseValidator(_validatorDoc))),
       _validationAction(uassertStatusOK(
@@ -206,9 +208,7 @@ Collection::Collection(OperationContext* txn,
           _parseValidationLevel(_details->getCollectionOptions(txn).validationLevel))),
       _cursorManager(fullNS),
       _cappedNotifier(_recordStore->isCapped() ? new CappedInsertNotifier() : nullptr),
-      _mustTakeCappedLockOnInsert(isCapped() && !_ns.isSystemDotProfile() && !_ns.isOplog()),
-      _collator(
-          uassertStatusOK(parseCollation(txn, _details->getCollectionOptions(txn).collation))) {
+      _mustTakeCappedLockOnInsert(isCapped() && !_ns.isSystemDotProfile() && !_ns.isOplog()) {
     _magic = 1357924;
     _indexCatalog.init(txn);
     if (isCapped())
@@ -306,7 +306,9 @@ StatusWithMatchExpression Collection::parseValidator(const BSONObj& validator) c
     if (ns().isOnInternalDb()) {
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "Document validators are not allowed on collections in"
-                              << " the " << ns().db() << " database"};
+                              << " the "
+                              << ns().db()
+                              << " database"};
     }
 
     {
@@ -315,9 +317,8 @@ StatusWithMatchExpression Collection::parseValidator(const BSONObj& validator) c
             return status;
     }
 
-    // TODO SERVER-23687: Pass the appropriate CollatorInterface* instead of nullptr.
-    auto statusWithMatcher =
-        MatchExpressionParser::parse(validator, ExtensionsCallbackDisallowExtensions(), nullptr);
+    auto statusWithMatcher = MatchExpressionParser::parse(
+        validator, ExtensionsCallbackDisallowExtensions(), _collator.get());
     if (!statusWithMatcher.isOK())
         return statusWithMatcher.getStatus();
 
@@ -359,7 +360,8 @@ Status Collection::insertDocuments(OperationContext* txn,
         if (hasIdIndex && (*it)["_id"].eoo()) {
             return Status(ErrorCodes::InternalError,
                           str::stream() << "Collection::insertDocument got "
-                                           "document without _id for ns:" << _ns.ns());
+                                           "document without _id for ns:"
+                                        << _ns.ns());
         }
 
         auto status = checkValidation(txn, *it);
@@ -601,7 +603,9 @@ StatusWith<RecordId> Collection::updateDocument(OperationContext* txn,
     if (_recordStore->isCapped() && oldSize != newDoc.objsize())
         return {ErrorCodes::CannotGrowDocumentInCappedNamespace,
                 str::stream() << "Cannot change the size of a document in a capped collection: "
-                              << oldSize << " != " << newDoc.objsize()};
+                              << oldSize
+                              << " != "
+                              << newDoc.objsize()};
 
     // At the end of this step, we will have a map of UpdateTickets, one per index, which
     // represent the index updates needed to be done, based on the changes between oldDoc and
@@ -1040,10 +1044,20 @@ public:
             if (!descriptor->isMultikey(_txn) && documentKeySet.size() > 1) {
                 string msg = str::stream() << "Index " << descriptor->indexName()
                                            << " is not multi-key but has more than one"
-                                           << " key in one or more document(s)";
+                                           << " key in document " << recordId;
                 results.errors.push_back(msg);
                 results.valid = false;
             }
+
+            if (descriptor->isPartial()) {
+                const IndexCatalogEntry* ice = _indexCatalog->getEntry(descriptor);
+                if (!ice->getFilterExpression()->matchesBSON(recordBson)) {
+                    continue;
+                }
+            }
+
+            uint32_t indexNsHash;
+            MurmurHash3_x86_32(indexNs.c_str(), indexNs.size(), 0, &indexNsHash);
 
             for (const auto& key : documentKeySet) {
                 if (key.objsize() >= IndexKeyMaxSize) {
@@ -1051,7 +1065,7 @@ public:
                     _longKeys[indexNs]++;
                     continue;
                 }
-                uint32_t indexEntryHash = hashIndexEntry(key, recordId);
+                uint32_t indexEntryHash = hashIndexEntry(key, recordId, indexNsHash);
                 uint64_t& indexEntryCount = (*_ikc)[indexEntryHash];
 
                 if (indexEntryCount != 0) {
@@ -1078,21 +1092,41 @@ public:
     }
 
     /**
-     * Create one hash map of all entries for all indexes in a collection.
-     * This ensures that we only need to do one collection scan when validating
-     * a document against all the indexes that point to it.
+     * Traverse the index to validate the entries and cache index keys for later use.
      */
-    void cacheIndexInfo(const IndexAccessMethod* iam,
-                        const IndexDescriptor* descriptor,
-                        long long numKeys) {
-        _keyCounts[descriptor->indexNamespace()] = numKeys;
+    void traverseIndex(const IndexAccessMethod* iam,
+                       const IndexDescriptor* descriptor,
+                       ValidateResults& results,
+                       long long numKeys) {
+        auto indexNs = descriptor->indexNamespace();
+        _keyCounts[indexNs] = numKeys;
+
+        uint32_t indexNsHash;
+        MurmurHash3_x86_32(indexNs.c_str(), indexNs.size(), 0, &indexNsHash);
 
         if (_level == kValidateFull) {
+            const auto& key = descriptor->keyPattern();
+            BSONObj prevIndexEntryKey;
+            bool isFirstEntry = true;
+
             std::unique_ptr<SortedDataInterface::Cursor> cursor = iam->newCursor(_txn, true);
             // Seeking to BSONObj() is equivalent to seeking to the first entry of an index.
             for (auto indexEntry = cursor->seek(BSONObj(), true); indexEntry;
                  indexEntry = cursor->next()) {
-                uint32_t keyHash = hashIndexEntry(indexEntry->key, indexEntry->loc);
+                // Ensure that the index entries are in increasing or decreasing order.
+                if (!isFirstEntry && (indexEntry->key).woCompare(prevIndexEntryKey, key) < 0) {
+                    if (results.valid) {
+                        results.errors.push_back(
+                            "one or more indexes are not in strictly ascending or descending "
+                            "order");
+                    }
+                    results.valid = false;
+                }
+                isFirstEntry = false;
+                prevIndexEntryKey = indexEntry->key;
+
+                // Cache the index keys to cross-validate with documents later.
+                uint32_t keyHash = hashIndexEntry(indexEntry->key, indexEntry->loc, indexNsHash);
                 if ((*_ikc)[keyHash] == 0) {
                     _indexKeyCountTableNumEntries++;
                 }
@@ -1171,11 +1205,10 @@ private:
     IndexCatalog* _indexCatalog;             // Not owned.
     ValidateResultsMap* _indexNsResultsMap;  // Not owned.
 
-    uint32_t hashIndexEntry(const BSONObj& key, const RecordId& loc) {
-        uint32_t hash;
+    uint32_t hashIndexEntry(const BSONObj& key, const RecordId& loc, uint32_t hash) {
         // We're only using KeyString to get something hashable here, so version doesn't matter.
         KeyString ks(KeyString::Version::V1, key, Ordering::make(BSONObj()), loc);
-        MurmurHash3_x86_32(ks.getTypeBits().getBuffer(), ks.getTypeBits().getSize(), 0, &hash);
+        MurmurHash3_x86_32(ks.getTypeBits().getBuffer(), ks.getTypeBits().getSize(), hash, &hash);
         MurmurHash3_x86_32(ks.getBuffer(), ks.getSize(), hash, &hash);
         return hash % kKeyCountTableSize;
     }
@@ -1209,12 +1242,12 @@ Status Collection::validate(OperationContext* txn,
             keysPerIndex.appendNumber(descriptor->indexNamespace(),
                                       static_cast<long long>(numKeys));
 
-            indexNsResultsMap[descriptor->indexNamespace()] = curIndexResults;
             if (curIndexResults.valid) {
-                indexValidator->cacheIndexInfo(iam, descriptor, numKeys);
+                indexValidator->traverseIndex(iam, descriptor, curIndexResults, numKeys);
             } else {
                 results->valid = false;
             }
+            indexNsResultsMap[descriptor->indexNamespace()] = curIndexResults;
         }
 
         // Validate RecordStore and, if `level == kValidateFull`, cross validate indexes and

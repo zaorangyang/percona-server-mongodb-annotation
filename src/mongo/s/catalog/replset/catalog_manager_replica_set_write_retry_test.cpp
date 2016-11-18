@@ -54,7 +54,6 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/stdx/chrono.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -69,7 +68,6 @@ using executor::TaskExecutor;
 using std::set;
 using std::string;
 using std::vector;
-using stdx::chrono::milliseconds;
 using unittest::assertGet;
 
 using InsertRetryTest = CatalogManagerReplSetTestFixture;
@@ -166,7 +164,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
         auto query =
-            assertGet(LiteParsedQuery::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
+            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
         ASSERT_EQ(BSON("_id" << 1), query->getFilter());
 
         return vector<BSONObj>{objToInsert};
@@ -201,7 +199,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
         auto query =
-            assertGet(LiteParsedQuery::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
+            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
         ASSERT_EQ(BSON("_id" << 1), query->getFilter());
 
         return vector<BSONObj>();
@@ -236,7 +234,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
         auto query =
-            assertGet(LiteParsedQuery::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
+            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
         ASSERT_EQ(BSON("_id" << 1), query->getFilter());
 
         return vector<BSONObj>{BSON("_id" << 1 << "Value"
@@ -292,7 +290,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[0]);
         auto query =
-            assertGet(LiteParsedQuery::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
+            assertGet(QueryRequest::makeFromFindCommand(kTestNamespace, request.cmdObj, false));
         ASSERT_EQ(BSON("_id" << 1), query->getFilter());
 
         return vector<BSONObj>{objToInsert};

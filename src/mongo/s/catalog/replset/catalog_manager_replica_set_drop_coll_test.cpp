@@ -33,7 +33,6 @@
 #include "mongo/bson/json.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
@@ -44,7 +43,7 @@
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/write_ops/batched_update_request.h"
-#include "mongo/stdx/chrono.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
@@ -53,7 +52,6 @@ using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 using std::string;
 using std::vector;
-using stdx::chrono::milliseconds;
 using unittest::assertGet;
 
 class DropColl2ShardTest : public CatalogManagerReplSetTestFixture {
@@ -63,9 +61,10 @@ public:
 
         getMessagingPort()->setRemote(_clientHost);
         configTargeter()->setFindHostReturnValue(_configHost);
+        configTargeter()->setConnectionStringReturnValue(_configCS);
 
         distLock()->expectLock(
-            [this](StringData name, StringData whyMessage, milliseconds, milliseconds) {
+            [this](StringData name, StringData whyMessage, Milliseconds, Milliseconds) {
                 ASSERT_EQUALS(_dropNS.ns(), name);
                 ASSERT_EQUALS("drop", whyMessage);
             },
@@ -164,6 +163,8 @@ public:
 
 private:
     const HostAndPort _configHost{"TestHost1"};
+    const ConnectionString _configCS{
+        ConnectionString::forReplicaSet("configReplSet", {_configHost})};
     const HostAndPort _clientHost{"client:123"};
     const NamespaceString _dropNS{"test.user"};
 
@@ -263,7 +264,7 @@ TEST_F(DropColl2ShardTest, ConfigTargeterError) {
 }
 
 TEST_F(DropColl2ShardTest, DistLockBusy) {
-    distLock()->expectLock([](StringData, StringData, milliseconds, milliseconds) {},
+    distLock()->expectLock([](StringData, StringData, Milliseconds, Milliseconds) {},
                            {ErrorCodes::LockBusy, "test lock taken"});
 
     auto future = launchAsync([this] {

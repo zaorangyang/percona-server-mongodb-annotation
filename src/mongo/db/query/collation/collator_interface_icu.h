@@ -31,7 +31,10 @@
 #include "mongo/db/query/collation/collator_interface.h"
 
 #include <memory>
-#include <unicode/coll.h>
+
+namespace icu {
+class Collator;
+}  // namespace icu
 
 namespace mongo {
 
@@ -42,6 +45,8 @@ namespace mongo {
 class CollatorInterfaceICU final : public CollatorInterface {
 public:
     CollatorInterfaceICU(CollationSpec spec, std::unique_ptr<icu::Collator> collator);
+
+    std::unique_ptr<CollatorInterface> clone() const final;
 
     int compare(StringData left, StringData right) const final;
 

@@ -33,6 +33,7 @@
 #include "mongo/db/repl/collection_cloner.h"
 
 #include "mongo/util/assert_util.h"
+#include "mongo/util/destructor_guard.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -106,8 +107,8 @@ std::string CollectionCloner::getDiagnosticString() const {
     output << " active: " << _active;
     output << " listIndexes fetcher: " << _listIndexesFetcher.getDiagnosticString();
     output << " find fetcher: " << _findFetcher.getDiagnosticString();
-    output << " database worked callback handle: " << (_dbWorkCallbackHandle.isValid() ? "valid"
-                                                                                       : "invalid");
+    output << " database worked callback handle: "
+           << (_dbWorkCallbackHandle.isValid() ? "valid" : "invalid");
     return output;
 }
 

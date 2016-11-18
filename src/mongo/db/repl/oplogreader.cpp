@@ -98,7 +98,8 @@ bool OplogReader::connect(const HostAndPort& host) {
             error() << errmsg << endl;
             return false;
         }
-        _conn->port().tag |= executor::NetworkInterface::kMessagingPortKeepOpen;
+        _conn->port().setTag(_conn->port().getTag() |
+                             executor::NetworkInterface::kMessagingPortKeepOpen);
         _host = host;
     }
     return true;
@@ -138,7 +139,8 @@ HostAndPort OplogReader::getHost() const {
 void OplogReader::connectToSyncSource(OperationContext* txn,
                                       const OpTime& lastOpTimeFetched,
                                       ReplicationCoordinator* replCoord) {
-    const Timestamp sentinelTimestamp(duration_cast<Seconds>(Milliseconds(curTimeMillis64())), 0);
+    const Timestamp sentinelTimestamp(duration_cast<Seconds>(Date_t::now().toDurationSinceEpoch()),
+                                      0);
     const OpTime sentinel(sentinelTimestamp, std::numeric_limits<long long>::max());
     OpTime oldestOpTimeSeen = sentinel;
 

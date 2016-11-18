@@ -37,36 +37,15 @@ class OperationContextImpl final : public OperationContext {
 public:
     virtual ~OperationContextImpl();
 
-    virtual RecoveryUnit* recoveryUnit() const override;
-
-    virtual RecoveryUnit* releaseRecoveryUnit() override;
-
-    virtual RecoveryUnitState setRecoveryUnit(RecoveryUnit* unit, RecoveryUnitState state) override;
-
     virtual ProgressMeter* setMessage_inlock(const char* msg,
                                              const std::string& name,
                                              unsigned long long progressMeterTotal,
                                              int secondsBetween) override;
 
-    virtual std::string getNS() const override;
-
-    virtual uint64_t getRemainingMaxTimeMicros() const override;
-
-    virtual void checkForInterrupt() override;
-    virtual Status checkForInterruptNoAssert() override;
-
-    virtual bool isPrimaryFor(StringData ns) override;
-
-    virtual void setReplicatedWrites(bool writesAreReplicated = true) override;
-    virtual bool writesAreReplicated() const override;
-
 private:
     friend class ServiceContextMongoD;
 
-    OperationContextImpl();
-
-    std::unique_ptr<RecoveryUnit> _recovery;
-    bool _writesAreReplicated;
+    OperationContextImpl(Client* client, unsigned opId);
 };
 
 }  // namespace mongo

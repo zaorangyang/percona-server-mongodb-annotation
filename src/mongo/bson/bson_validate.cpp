@@ -28,8 +28,8 @@
  */
 
 #include <cstring>
-#include <vector>
 #include <limits>
+#include <vector>
 
 #include "mongo/base/data_view.h"
 #include "mongo/bson/bson_validate.h"
@@ -232,7 +232,7 @@ Status validateElementInfo(Buffer* buffer,
             return Status::OK();
 
         case NumberDecimal:
-            if (Decimal128::enabled && buffer->version() != BSONVersion::kV1_0) {
+            if (buffer->version() != BSONVersion::kV1_0) {
                 if (!buffer->skip(sizeof(Decimal128::Value)))
                     return makeError("Invalid bson", idElem);
                 return Status::OK();

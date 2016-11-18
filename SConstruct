@@ -390,15 +390,6 @@ add_option('use-system-asio',
     nargs=0,
 )
 
-add_option('icu',
-    choices=['on', 'off'],
-    const='on',
-    default='off',
-    help='Enable ICU',
-    nargs='?',
-    type='choice',
-)
-
 add_option('use-system-icu',
     help="use system version of ICU",
     nargs=0,
@@ -509,6 +500,13 @@ add_option('variable-parse-mode',
 
 add_option('modules',
     help="Comma-separated list of modules to build. Empty means none. Default is all.",
+)
+
+add_option('runtime-hardening',
+    choices=["on", "off"],
+    default="off",
+    help="Enable runtime hardening features (e.g. stack smash protection)",
+    type='choice',
 )
 
 try:
@@ -1028,16 +1026,42 @@ def CheckForOS(context, which_os):
     context.Result(ret)
     return ret
 
+def CheckForCXXLink(context):
+    test_body = """
+    #include <iostream>
+    #include <cstdlib>
+
+    int main() {
+        std::cout << "Hello, World" << std::endl;
+        return EXIT_SUCCESS;
+    }
+    """
+    context.Message('Checking that the C++ compiler can link a C++ program... ')
+    ret = context.TryLink(textwrap.dedent(test_body), ".cpp")
+    context.Result(ret)
+    return ret
+
 detectConf = Configure(detectEnv, help=False, custom_tests = {
     'CheckForToolchain' : CheckForToolchain,
     'CheckForProcessor': CheckForProcessor,
     'CheckForOS': CheckForOS,
+    'CheckForCXXLink': CheckForCXXLink,
 })
 
-if not detectConf.CheckCXX():
-    env.FatalError("C++ compiler {0} doesn't work", detectEnv['CXX'])
 if not detectConf.CheckCC():
-    env.FatalError("C compiler {0} doesn't work", detectEnv['CC'])
+    env.ConfError(
+        "C compiler {0} doesn't work",
+        detectEnv['CC'])
+
+if not detectConf.CheckCXX():
+    env.ConfError(
+        "C++ compiler {0} doesn't work",
+        detectEnv['CXX'])
+
+if not detectConf.CheckForCXXLink():
+    env.ConfError(
+        "C++ compiler {0} can't link C++ programs",
+        detectEnv['CXX'])
 
 toolchain_search_sequence = [ "GCC", "clang" ]
 if is_running_os('windows'):
@@ -1048,10 +1072,10 @@ for candidate_toolchain in toolchain_search_sequence:
         break
 
 if not detected_toolchain:
-    env.FatalError("Couldn't identity the C++ compiler")
+    env.ConfError("Couldn't identify the C++ compiler")
 
 if not detectConf.CheckForToolchain(detected_toolchain, "C", "CC", ".c"):
-    env.FatalError("C compiler does not match identified C++ compiler")
+    env.ConfError("C compiler does not match identified C++ compiler")
 
 # Now that we've detected the toolchain, we add methods to the env
 # to get the canonical name of the toolchain and to test whether
@@ -1074,13 +1098,13 @@ if env['TARGET_ARCH']:
 else:
     detected_processor = detectConf.CheckForProcessor(None)
     if not detected_processor:
-        Exit(1)
+        env.ConfError("Failed to detect a supported target architecture")
     env['TARGET_ARCH'] = detected_processor
 
 if env['TARGET_OS'] not in os_macros:
     print "No special config for [{0}] which probably means it won't work".format(env['TARGET_OS'])
 elif not detectConf.CheckForOS(env['TARGET_OS']):
-    env.FatalError("TARGET_OS ({0}) is not supported by compiler", env['TARGET_OS'])
+    env.ConfError("TARGET_OS ({0}) is not supported by compiler", env['TARGET_OS'])
 
 detectConf.Finish()
 
@@ -1132,14 +1156,12 @@ link_model = get_option('link-model')
 if link_model == "auto":
     link_model = "object" if (env.TargetOSIs('windows') or has_option("release")) else "static"
 elif has_option("release") and link_model != "object":
-    print("The link model for release builds is required to be 'object'")
-    Exit(1)
+    env.FatalError("The link model for release builds is required to be 'object'")
 
 # The only link model currently supported on Windows is 'object', since there is no equivalent
 # to --whole-archive.
 if env.TargetOSIs('windows') and link_model != 'object':
-    print("Windows builds must use the 'object' link model");
-    Exit(1);
+    env.FatalError("Windows builds must use the 'object' link model");
 
 # The 'object' mode for libdeps is enabled by setting _LIBDEPS to $_LIBDEPS_OBJS. The other two
 # modes operate in library mode, enabled by setting _LIBDEPS to $_LIBDEPS_LIBS.
@@ -1481,15 +1503,10 @@ if env.TargetOSIs('posix'):
 
     # SERVER-9761: Ensure early detection of missing symbols in dependent libraries at program
     # startup.
-    #
-    # TODO: Is it necessary to add to both linkflags and shlinkflags, or are LINKFLAGS
-    # propagated to SHLINKFLAGS?
     if env.TargetOSIs('osx'):
         env.Append( LINKFLAGS=["-Wl,-bind_at_load"] )
-        env.Append( SHLINKFLAGS=["-Wl,-bind_at_load"] )
     else:
         env.Append( LINKFLAGS=["-Wl,-z,now"] )
-        env.Append( SHLINKFLAGS=["-Wl,-z,now"] )
         env.Append( LINKFLAGS=["-rdynamic"] )
 
     env.Append( LIBS=[] )
@@ -1510,11 +1527,14 @@ if env.TargetOSIs('posix'):
     else:
         env.Append( CCFLAGS=["-O0"] )
 
-    if debugBuild:
-        if not optBuild:
-            env.Append( CCFLAGS=["-fstack-protector"] )
-            env.Append( LINKFLAGS=["-fstack-protector"] )
-            env.Append( SHLINKFLAGS=["-fstack-protector"] )
+    # Promote linker warnings into errors. We can't yet do this on OS X because its linker considers
+    # noall_load obsolete and warns about it.
+    if not env.TargetOSIs('osx'):
+        env.Append(
+            LINKFLAGS=[
+                "-Wl,--fatal-warnings",
+            ],
+        )
 
 mmapv1 = False
 if get_option('mmapv1') == 'auto':
@@ -1541,11 +1561,6 @@ if get_option('inmemory') == 'on':
     inmemory = True
     if not wiredtiger:
         env.FatalError("InMemory engine requires WiredTiger to build")
-
-icuEnabled = False
-if get_option('icu') == 'on':
-    icuEnabled = True
-    env.SetConfigHeaderDefine("MONGO_CONFIG_ICU_ENABLED")
 
 if env['TARGET_ARCH'] == 'i386':
     # If we are using GCC or clang to target 32 bit, set the ISA minimum to 'nocona',
@@ -1831,6 +1846,49 @@ def doConfigure(myenv):
         # see: http://stackoverflow.com/questions/21755206/how-to-get-around-gcc-void-b-4-may-be-used-uninitialized-in-this-funct
         AddToCXXFLAGSIfSupported(myenv, "-Wno-maybe-uninitialized")
 
+    if get_option('runtime-hardening') == "on":
+        # Clang honors these flags, but doesn't actually do anything with them for compatibility, so we
+        # need to only do this for GCC. On clang, we do things differently. Note that we need to add
+        # these to the LINKFLAGS as well, since otherwise we might not link libssp when we need to (see
+        # SERVER-12456).
+        if myenv.ToolchainIs('gcc'):
+            if AddToCCFLAGSIfSupported(myenv, '-fstack-protector-strong'):
+                myenv.Append(
+                    LINKFLAGS=[
+                        '-fstack-protector-strong',
+                    ]
+                )
+            elif AddToCCFLAGSIfSupported(myenv, '-fstack-protector-all'):
+                myenv.Append(
+                    LINKFLAGS=[
+                        '-fstack-protector-all',
+                    ]
+                )
+        elif myenv.ToolchainIs('clang'):
+            # TODO: Clang stack hardening. There are several interesting
+            # things to try here, but they each have consequences we need
+            # to investigate.
+            #
+            # - fsanitize=bounds: This does static bounds checking. We can
+            #   probably turn this on along with fsanitize-trap so that we
+            #   don't depend on the ASAN runtime.
+            #
+            # - fsanitize=safestack: This looks very interesting, and is
+            #   probably what we want. However there are a few problems:
+            #
+            #   - It relies on having the RT library available, and it is
+            #     unclear whether we can ship binaries that depend on
+            #     that.
+            #
+            #   - It is incompatible with a shared object build.
+            #
+            #   - It may not work with SpiderMonkey due to needing to
+            #     inform the GC about the stacks so that mark-sweep
+            #
+            # - fsanitize=cfi: Again, very interesting, however it
+            #   requires LTO builds.
+            pass
+
     # Check if we need to disable null-conversion warnings
     if myenv.ToolchainIs('clang'):
         def CheckNullConversion(context):
@@ -1867,7 +1925,7 @@ def doConfigure(myenv):
     usingLibStdCxx = False
     if has_option('libc++'):
         if not myenv.ToolchainIs('clang'):
-            myenv.ConfError('libc++ is currently only supported for clang')
+            myenv.FatalError('libc++ is currently only supported for clang')
         if env.TargetOSIs('osx') and has_option('osx-version-min') and versiontuple(min_version) < versiontuple('10.7'):
             print("Warning: You passed option 'libc++'. You probably want to also pass 'osx-version-min=10.7' or higher for libc++ support.")
         if AddToCXXFLAGSIfSupported(myenv, '-stdlib=libc++'):
@@ -2022,12 +2080,12 @@ def doConfigure(myenv):
         # dependencies, then turn on the debugging features in libstdc++.
         # TODO: Need a new check here.
         if not debugBuild:
-            myenv.ConfError("--use-glibcxx-debug requires --dbg=on")
+            myenv.FatalError("--use-glibcxx-debug requires --dbg=on")
         if not usingLibStdCxx:
-            myenv.ConfError("--use-glibcxx-debug is only compatible with the GNU implementation "
+            myenv.FatalError("--use-glibcxx-debug is only compatible with the GNU implementation "
                 "of the C++ standard libary")
         if using_system_version_of_cxx_libraries():
-            myenv.ConfError("--use-glibcxx-debug not compatible with system versions of "
+            myenv.FatalError("--use-glibcxx-debug not compatible with system versions of "
                 "C++ libraries.")
         myenv.Append(CPPDEFINES=["_GLIBCXX_DEBUG"]);
 
@@ -2180,15 +2238,27 @@ def doConfigure(myenv):
             myenv['ENV']['LSAN_SYMBOLIZER_PATH'] = llvm_symbolizer
             tsan_options = "external_symbolizer_path=\"%s\" " % llvm_symbolizer
         elif using_lsan:
-            myenv.ConfError("Using the leak sanitizer requires a valid symbolizer")
+            myenv.FatalError("Using the leak sanitizer requires a valid symbolizer")
 
         if using_tsan:
             tsan_options += "suppressions=\"%s\" " % myenv.File("#etc/tsan.suppressions").abspath
             myenv['ENV']['TSAN_OPTIONS'] = tsan_options
 
         if using_ubsan:
-            # By default, undefined behavior sanitizer doesn't stop on the first error. Make it so.
-            AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover")
+            # By default, undefined behavior sanitizer doesn't stop on
+            # the first error. Make it so. Newer versions of clang
+            # have renamed the flag.
+            if not AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover"):
+                AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover=undefined")
+
+            # Ideally, we would apply this only in the WiredTiger
+            # directory until WT-2631 is resolved, but we can't rely
+            # on the flag being supported until clang-3.6, which isn't
+            # our minimum, and we don't have access to
+            # AddToCCFFLAGSIfSupported in the scope of the WT
+            # Sconscript.
+            #
+            AddToCCFLAGSIfSupported(myenv, "-fno-sanitize=nonnull-attribute")
 
     if myenv.ToolchainIs('msvc') and optBuild:
         # http://blogs.msdn.com/b/vcblog/archive/2013/09/11/introducing-gw-compiler-switch.aspx
@@ -2216,6 +2286,9 @@ def doConfigure(myenv):
         AddToLINKFLAGSIfSupported(myenv, "-Wl,-z,noexecstack")
         AddToLINKFLAGSIfSupported(myenv, "-Wl,--warn-execstack")
 
+        # If possible with the current linker, mark relocations as read-only.
+        AddToLINKFLAGSIfSupported(myenv, "-Wl,-z,relro")
+
     # Apply any link time optimization settings as selected by the 'lto' option.
     if has_option('lto'):
         if myenv.ToolchainIs('msvc'):
@@ -2237,6 +2310,43 @@ def doConfigure(myenv):
                     "but selected compiler does not honor -flto" )
         else:
             myenv.ConfError("Don't know how to enable --lto on current toolchain")
+
+    if get_option('runtime-hardening') == "on":
+        # Older glibc doesn't work well with _FORTIFY_SOURCE=2. Selecting 2.11 as the minimum was an
+        # emperical decision, as that is the oldest non-broken glibc we seem to require. It is possible
+        # that older glibc's work, but we aren't trying.
+        #
+        # https://gforge.inria.fr/tracker/?func=detail&group_id=131&atid=607&aid=14070
+        # https://github.com/jedisct1/libsodium/issues/202
+        def CheckForGlibcKnownToSupportFortify(context):
+            test_body="""
+            #include <features.h>
+            #if !__GLIBC_PREREQ(2, 11)
+            #error
+            #endif
+            """
+            context.Message('Checking for glibc with non-broken _FORTIFY_SOURCE...')
+            ret = context.TryCompile(textwrap.dedent(test_body), ".c")
+            context.Result(ret)
+            return ret
+
+        conf = Configure(myenv, help=False, custom_tests = {
+            'CheckForFortify': CheckForGlibcKnownToSupportFortify,
+        })
+
+        # Fortify only possibly makes sense on POSIX systems, and we know that clang is not a valid
+        # combination:
+        #
+        # http://lists.llvm.org/pipermail/cfe-dev/2015-November/045852.html
+        #
+        if env.TargetOSIs('posix') and not env.ToolchainIs('clang') and conf.CheckForFortify():
+            conf.env.Append(
+                CPPDEFINES=[
+                    ('_FORTIFY_SOURCE', 2),
+                ],
+            )
+
+        myenv = conf.Finish()
 
     # We set this to work around https://gcc.gnu.org/bugzilla/show_bug.cgi?id=43052
     if not myenv.ToolchainIs('msvc'):
@@ -2267,8 +2377,7 @@ def doConfigure(myenv):
             myenv.SetConfigHeaderDefine(macro_name)
     conf.Finish()
     if not haveTriviallyConstructibleThreadLocals:
-        print "Compiler must support a thread local storage class for trivially constructible types"
-        Exit(1)
+        env.ConfError("Compiler must support a thread local storage class for trivially constructible types")
 
     # not all C++11-enabled gcc versions have type properties
     def CheckCXX11IsTriviallyCopyable(context):
@@ -2506,6 +2615,17 @@ def doConfigure(myenv):
     if use_system_version_of_library("intel_decimal128"):
         conf.FindSysLibDep("intel_decimal128", ["bid"])
 
+    if use_system_version_of_library("icu"):
+        conf.FindSysLibDep("icudata", ["icudata"])
+        # We can't use FindSysLibDep() for icui18n and icuuc below, since SConf.CheckLib() (which
+        # FindSysLibDep() relies on) doesn't expose an 'extra_libs' parameter to indicate that the
+        # library being tested has additional dependencies (icuuc depends on icudata, and icui18n
+        # depends on both). As a workaround, we skip the configure check for these two libraries and
+        # manually assign the library name. We hope that if the user has icudata installed on their
+        # system, then they also have icu18n and icuuc installed.
+        conf.env['LIBDEPS_ICUI18N_SYSLIBDEP'] = 'icui18n'
+        conf.env['LIBDEPS_ICUUC_SYSLIBDEP'] = 'icuuc'
+
     if wiredtiger and use_system_version_of_library("wiredtiger"):
         if not conf.CheckCXXHeader( "wiredtiger.h" ):
             myenv.ConfError("Cannot find wiredtiger headers")
@@ -2596,7 +2716,7 @@ def doConfigure(myenv):
     elif myenv['MONGO_ALLOCATOR'] == 'system':
         pass
     else:
-        myenv.ConfError("Invalid --allocator parameter: $MONGO_ALLOCATOR")
+        myenv.FatalError("Invalid --allocator parameter: $MONGO_ALLOCATOR")
 
     def CheckStdAtomic(context, base_type, extra_message):
         test_body = """
@@ -2746,7 +2866,6 @@ Export("wiredtiger")
 Export("mmapv1")
 Export("endian")
 Export("inmemory")
-Export("icuEnabled")
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])

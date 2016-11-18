@@ -26,16 +26,16 @@
  *    it in the license file.
  */
 
-#include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/plan_executor.h"
-#include "mongo/db/query/query_planner_params.h"
-#include "mongo/db/query/query_settings.h"
-#include "mongo/db/query/query_solution.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_driver.h"
 #include "mongo/db/ops/update_request.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/query_settings.h"
+#include "mongo/db/query/query_solution.h"
 
 namespace mongo {
 
@@ -135,6 +135,8 @@ StatusWith<std::unique_ptr<PlanExecutor>> getExecutorCount(OperationContext* txn
  * and delete flags like 'isMulti'. The caller must hold the appropriate MODE_X or MODE_IX
  * locks, and must not release these locks until after the returned PlanExecutor is deleted.
  *
+ * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
+ *
  * The returned PlanExecutor will used the YieldPolicy returned by parsedDelete->yieldPolicy().
  *
  * Does not take ownership of its arguments.
@@ -154,6 +156,8 @@ StatusWith<std::unique_ptr<PlanExecutor>> getExecutorDelete(OperationContext* tx
  * and update modifiers. The caller must hold the appropriate MODE_X or MODE_IX locks prior
  * to calling this function, and must not release these locks until after the returned
  * PlanExecutor is deleted.
+ *
+ * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
  *
  * The returned PlanExecutor will used the YieldPolicy returned by parsedUpdate->yieldPolicy().
  *

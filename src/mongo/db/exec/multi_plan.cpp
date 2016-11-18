@@ -38,8 +38,8 @@
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/explain.h"
@@ -47,8 +47,8 @@
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/storage/record_fetcher.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
@@ -190,10 +190,11 @@ size_t MultiPlanStage::getTrialPeriodNumToReturn(const CanonicalQuery& query) {
     // Determine the number of results which we will produce during the plan
     // ranking phase before stopping.
     size_t numResults = static_cast<size_t>(internalQueryPlanEvaluationMaxResults);
-    if (query.getParsed().getNToReturn()) {
-        numResults = std::min(static_cast<size_t>(*query.getParsed().getNToReturn()), numResults);
-    } else if (query.getParsed().getLimit()) {
-        numResults = std::min(static_cast<size_t>(*query.getParsed().getLimit()), numResults);
+    if (query.getQueryRequest().getNToReturn()) {
+        numResults =
+            std::min(static_cast<size_t>(*query.getQueryRequest().getNToReturn()), numResults);
+    } else if (query.getQueryRequest().getLimit()) {
+        numResults = std::min(static_cast<size_t>(*query.getQueryRequest().getLimit()), numResults);
     }
 
     return numResults;
@@ -203,7 +204,7 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // Adds the amount of time taken by pickBestPlan() to executionTimeMillis. There's lots of
     // execution work that happens here, so this is needed for the time accounting to
     // make sense.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
+    ScopedTimer timer(getClock(), &_commonStats.executionTimeMillis);
 
     size_t numWorks = getTrialPeriodWorks(getOpCtx(), _collection);
     size_t numResults = getTrialPeriodNumToReturn(*_query);

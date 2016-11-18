@@ -35,14 +35,18 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collation_serializer.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -54,8 +58,11 @@ using std::ostringstream;
 using std::string;
 using std::vector;
 
+namespace dps = ::mongo::dotted_path_support;
+
 const char Pipeline::commandName[] = "aggregate";
 const char Pipeline::pipelineName[] = "pipeline";
+const char Pipeline::collationName[] = "collation";
 const char Pipeline::explainName[] = "explain";
 const char Pipeline::fromRouterName[] = "fromRouter";
 const char Pipeline::serverPipelineName[] = "serverPipeline";
@@ -82,7 +89,7 @@ intrusive_ptr<Pipeline> Pipeline::parseCommand(string& errmsg,
         }
 
         // maxTimeMS is also for the command processor.
-        if (str::equals(pFieldName, LiteParsedQuery::cmdOptionMaxTimeMS)) {
+        if (str::equals(pFieldName, QueryRequest::cmdOptionMaxTimeMS)) {
             continue;
         }
 
@@ -98,6 +105,19 @@ intrusive_ptr<Pipeline> Pipeline::parseCommand(string& errmsg,
 
         // ignore writeConcern since it's handled externally
         if (str::equals(pFieldName, "writeConcern")) {
+            continue;
+        }
+
+        if (str::equals(pFieldName, collationName)) {
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << collationName << " must be an object, not a "
+                                  << typeName(cmdElement.type()),
+                    cmdElement.type() == BSONType::Object);
+            auto statusWithCollator =
+                CollatorFactoryInterface::get(pCtx->opCtx->getServiceContext())
+                    ->makeFromBSON(cmdElement.Obj());
+            uassertStatusOK(statusWithCollator.getStatus());
+            pCtx->collator = std::move(statusWithCollator.getValue());
             continue;
         }
 
@@ -217,7 +237,7 @@ Status Pipeline::checkAuthForCommand(ClientBasic* client,
 
     std::vector<Privilege> privileges;
 
-    if (cmdObj.getFieldDotted("pipeline.0.$indexStats")) {
+    if (dps::extractElementAtPath(cmdObj, "pipeline.0.$indexStats")) {
         Privilege::addPrivilegeToPrivilegeVector(
             &privileges,
             Privilege(ResourcePattern::forAnyNormalResource(), ActionType::indexStats));
@@ -437,6 +457,11 @@ Document Pipeline::serialize() const {
         serialized.setField(bypassDocumentValidationCommandOption(), Value(true));
     }
 
+    if (pCtx->collator.get()) {
+        serialized.setField(collationName,
+                            Value(CollationSerializer::specToBSON(pCtx->collator->getSpec())));
+    }
+
     return serialized.freeze();
 }
 
@@ -477,7 +502,8 @@ void Pipeline::run(BSONObjBuilder& result) {
         // object will be too large, assert. the extra 1KB is for headers
         uassert(16389,
                 str::stream() << "aggregation result exceeds maximum document size ("
-                              << BSONObjMaxUserSize / (1024 * 1024) << "MB)",
+                              << BSONObjMaxUserSize / (1024 * 1024)
+                              << "MB)",
                 resultArray.len() < BSONObjMaxUserSize - 1024);
     }
 

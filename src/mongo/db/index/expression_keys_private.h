@@ -30,9 +30,10 @@
 
 #include <vector>
 
-#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/hasher.h"
+#include "mongo/db/index/multikey_paths.h"
 
 namespace mongo {
 
@@ -125,7 +126,8 @@ public:
     static void getS2Keys(const BSONObj& obj,
                           const BSONObj& keyPattern,
                           const S2IndexingParams& params,
-                          BSONObjSet* keys);
+                          BSONObjSet* keys,
+                          MultikeyPaths* multikeyPaths);
 };
 
 }  // namespace mongo

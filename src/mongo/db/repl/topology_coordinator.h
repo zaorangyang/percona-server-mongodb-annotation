@@ -28,8 +28,8 @@
 
 #pragma once
 
-#include <string>
 #include <iosfwd>
+#include <string>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
@@ -165,8 +165,7 @@ public:
      */
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const OpTime& myLastOpTime,
-                                        const OpTime& syncSourceLastOpTime,
-                                        bool syncSourceHasSyncSource,
+                                        const rpc::ReplSetMetadata& metadata,
                                         Date_t now) const = 0;
 
     /**
@@ -415,9 +414,9 @@ public:
     /**
      * Prepares a BSONObj describing the current term, primary, and lastOp information.
      */
-    virtual void prepareReplResponseMetadata(rpc::ReplSetMetadata* metadata,
-                                             const OpTime& lastVisibleOpTime,
-                                             const OpTime& lastCommittedOpTime) const = 0;
+    virtual void prepareReplMetadata(rpc::ReplSetMetadata* metadata,
+                                     const OpTime& lastVisibleOpTime,
+                                     const OpTime& lastCommittedOpTime) const = 0;
 
     /**
      * Writes into 'output' all the information needed to generate a summary of the current

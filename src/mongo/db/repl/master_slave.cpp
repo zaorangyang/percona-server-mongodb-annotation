@@ -218,8 +218,6 @@ void ReplSource::save(OperationContext* txn) {
     LOG(1) << "Saving repl source: " << o << endl;
 
     {
-        OpDebug debug;
-
         OldClientContext ctx(txn, "local.sources", false);
 
         const NamespaceString requestNs("local.sources");
@@ -229,7 +227,7 @@ void ReplSource::save(OperationContext* txn) {
         request.setUpdates(o);
         request.setUpsert();
 
-        UpdateResult res = update(txn, ctx.db(), request, &debug);
+        UpdateResult res = update(txn, ctx.db(), request);
 
         verify(!res.modifiers);
         verify(res.numMatched == 1 || !res.upserted.isEmpty());
@@ -977,8 +975,8 @@ int ReplSource::_sync_pullOpLog(OperationContext* txn, int& nApplied) {
                   << ((nextOpTime < syncedTo) ? "<??" : ">") << " syncedTo "
                   << syncedTo.toStringLong() << '\n'
                   << "time diff: " << (nextOpTime.getSecs() - syncedTo.getSecs()) << "sec\n"
-                  << "tailing: " << tailing << '\n' << "data too stale, halting replication"
-                  << endl;
+                  << "tailing: " << tailing << '\n'
+                  << "data too stale, halting replication" << endl;
             replInfo = replAllDead = "data too stale halted replication";
             verify(syncedTo < nextOpTime);
             throw SyncException();

@@ -37,10 +37,10 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/collection_cloner.h"
-#include "mongo/db/repl/database_cloner.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
+#include "mongo/db/repl/database_cloner.h"
+#include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_executor.h"
@@ -136,8 +136,6 @@ struct DataReplicatorOptions {
     std::string scopeNS;
     BSONObj filterCriteria;
 
-    MultiApplier::ApplyOperationFn applierFn;
-    MultiApplier::MultiApplyFn multiApplyFn;
     RollbackFn rollbackFn;
     Reporter::PrepareReplSetUpdatePositionCommandFn prepareReplSetUpdatePositionCommandFn;
     GetMyLastOptimeFn getMyLastOptime;

@@ -29,9 +29,9 @@
 
 #pragma once
 
+#include "mongo/config.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/config.h"
 
 namespace mongo {
 
@@ -58,11 +58,6 @@ enum class BSONVersion { kV1_0, kV1_1, kLatest = kV1_1 };
     to KeyString V1 indexes on non-MMAP storage engines. Set by enableBSON1_1 server parameter.
 */
 extern bool enableBSON1_1;
-
-/**
-    For use by mongo shell, which does not use server parameters.
-*/
-void enableLatestBSONVersion();
 
 /**
     the complete list of valid BSON types
@@ -112,7 +107,7 @@ enum BSONType {
     /** 128 bit decimal */
     NumberDecimal = 19,
     /** max type that is not MaxKey */
-    JSTypeMax = Decimal128::enabled ? 19 : 18,
+    JSTypeMax = 19,
     /** larger than all other types */
     MaxKey = 127
 };

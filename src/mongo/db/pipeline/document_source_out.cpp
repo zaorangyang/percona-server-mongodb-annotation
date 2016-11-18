@@ -29,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/util/destructor_guard.h"
 
 namespace mongo {
 
@@ -86,7 +87,8 @@ void DocumentSourceOut::prepTempCollection() {
         bool ok = conn->runCommand(_outputNs.db().toString(), cmd.done(), info);
         uassert(16994,
                 str::stream() << "failed to create temporary $out collection '" << _tempNs.ns()
-                              << "': " << info.toString(),
+                              << "': "
+                              << info.toString(),
                 ok);
     }
 
@@ -102,7 +104,10 @@ void DocumentSourceOut::prepTempCollection() {
         BSONObj err = conn->getLastErrorDetailed();
         uassert(16995,
                 str::stream() << "copying index for $out failed."
-                              << " index: " << indexBson << " error: " << err,
+                              << " index: "
+                              << indexBson
+                              << " error: "
+                              << err,
                 DBClientWithCommands::getLastErrorString(err).empty());
     }
 }

@@ -32,10 +32,10 @@
 
 #include <pcrecpp.h>
 
-#include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/bson/json.h"
+#include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
@@ -55,9 +55,9 @@
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/batched_insert_request.h"
 #include "mongo/s/write_ops/batched_update_request.h"
-#include "mongo/stdx/chrono.h"
 #include "mongo/stdx/future.h"
 #include "mongo/util/log.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
@@ -70,7 +70,6 @@ using rpc::ReplSetMetadata;
 using repl::OpTime;
 using std::string;
 using std::vector;
-using stdx::chrono::milliseconds;
 using unittest::assertGet;
 
 using CatalogManagerReplSetTest = CatalogManagerReplSetTestFixture;
@@ -100,30 +99,30 @@ TEST_F(CatalogManagerReplSetTest, GetCollectionExisting) {
             catalogManager()->getCollection(operationContext(), expectedColl.getNs().ns()));
     });
 
-    onFindWithMetadataCommand([this, &expectedColl, newOpTime](
-        const RemoteCommandRequest& request) {
+    onFindWithMetadataCommand(
+        [this, &expectedColl, newOpTime](const RemoteCommandRequest& request) {
 
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+            ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
 
-        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
+            const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+            ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+            auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
-        // Ensure the query is correct
-        ASSERT_EQ(query->ns(), CollectionType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSON(CollectionType::fullNs(expectedColl.getNs().ns())));
-        ASSERT_EQ(query->getSort(), BSONObj());
-        ASSERT_EQ(query->getLimit().get(), 1);
+            // Ensure the query is correct
+            ASSERT_EQ(query->ns(), CollectionType::ConfigNS);
+            ASSERT_EQ(query->getFilter(), BSON(CollectionType::fullNs(expectedColl.getNs().ns())));
+            ASSERT_EQ(query->getSort(), BSONObj());
+            ASSERT_EQ(query->getLimit().get(), 1);
 
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
+            checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
-        ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, OID(), 30, -1);
-        BSONObjBuilder builder;
-        metadata.writeToMetadata(&builder);
+            ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, OID(), 30, -1);
+            BSONObjBuilder builder;
+            metadata.writeToMetadata(&builder);
 
-        return std::make_tuple(vector<BSONObj>{expectedColl.toBSON()}, builder.obj());
-    });
+            return std::make_tuple(vector<BSONObj>{expectedColl.toBSON()}, builder.obj());
+        });
 
     // Now wait for the getCollection call to return
     const auto collOpTimePair = future.timed_get(kFutureTimeout);
@@ -171,7 +170,7 @@ TEST_F(CatalogManagerReplSetTest, GetDatabaseExisting) {
 
         ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), DatabaseType::ConfigNS);
         ASSERT_EQ(query->getFilter(), BSON(DatabaseType::name(expectedDb.getName())));
@@ -400,7 +399,7 @@ TEST_F(CatalogManagerReplSetTest, GetAllShardsValid) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), ShardType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), ShardType::ConfigNS);
         ASSERT_EQ(query->getFilter(), BSONObj());
@@ -450,7 +449,6 @@ TEST_F(CatalogManagerReplSetTest, GetChunksForNSWithSortAndLimit) {
     OID oid = OID::gen();
 
     ChunkType chunkA;
-    chunkA.setName("chunk0000");
     chunkA.setNS("TestDB.TestColl");
     chunkA.setMin(BSON("a" << 1));
     chunkA.setMax(BSON("a" << 100));
@@ -458,7 +456,6 @@ TEST_F(CatalogManagerReplSetTest, GetChunksForNSWithSortAndLimit) {
     chunkA.setShard("shard0000");
 
     ChunkType chunkB;
-    chunkB.setName("chunk0001");
     chunkB.setNS("TestDB.TestColl");
     chunkB.setMin(BSON("a" << 100));
     chunkB.setMax(BSON("a" << 200));
@@ -497,7 +494,7 @@ TEST_F(CatalogManagerReplSetTest, GetChunksForNSWithSortAndLimit) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), ChunkType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), ChunkType::ConfigNS);
         ASSERT_EQ(query->getFilter(), chunksQuery);
@@ -544,7 +541,7 @@ TEST_F(CatalogManagerReplSetTest, GetChunksForNSNoSortNoLimit) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), ChunkType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), ChunkType::ConfigNS);
         ASSERT_EQ(query->getFilter(), chunksQuery);
@@ -580,7 +577,6 @@ TEST_F(CatalogManagerReplSetTest, GetChunksForNSInvalidChunk) {
 
     onFindCommand([&chunksQuery](const RemoteCommandRequest& request) {
         ChunkType chunkA;
-        chunkA.setName("chunk0000");
         chunkA.setNS("TestDB.TestColl");
         chunkA.setMin(BSON("a" << 1));
         chunkA.setMax(BSON("a" << 100));
@@ -588,7 +584,6 @@ TEST_F(CatalogManagerReplSetTest, GetChunksForNSInvalidChunk) {
         chunkA.setShard("shard0000");
 
         ChunkType chunkB;
-        chunkB.setName("chunk0001");
         chunkB.setNS("TestDB.TestColl");
         chunkB.setMin(BSON("a" << 100));
         chunkB.setMax(BSON("a" << 200));
@@ -663,9 +658,13 @@ TEST_F(CatalogManagerReplSetTest, RunUserManagementWriteCommandSuccess) {
         // Since no write concern was sent we will add w:majority
         ASSERT_EQUALS(BSON("dropUser"
                            << "test"
-                           << "writeConcern" << BSON("w"
-                                                     << "majority"
-                                                     << "wtimeout" << 0) << "maxTimeMS" << 30000),
+                           << "writeConcern"
+                           << BSON("w"
+                                   << "majority"
+                                   << "wtimeout"
+                                   << 0)
+                           << "maxTimeMS"
+                           << 30000),
                       request.cmdObj);
 
         ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
@@ -684,14 +683,14 @@ TEST_F(CatalogManagerReplSetTest, RunUserManagementWriteCommandInvalidWriteConce
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     BSONObjBuilder responseBuilder;
-    bool ok =
-        catalogManager()->runUserManagementWriteCommand(operationContext(),
-                                                        "dropUser",
-                                                        "test",
-                                                        BSON("dropUser"
-                                                             << "test"
-                                                             << "writeConcern" << BSON("w" << 2)),
-                                                        &responseBuilder);
+    bool ok = catalogManager()->runUserManagementWriteCommand(operationContext(),
+                                                              "dropUser",
+                                                              "test",
+                                                              BSON("dropUser"
+                                                                   << "test"
+                                                                   << "writeConcern"
+                                                                   << BSON("w" << 2)),
+                                                              &responseBuilder);
     ASSERT_FALSE(ok);
 
     Status commandStatus = getStatusFromCommandResult(responseBuilder.obj());
@@ -706,38 +705,42 @@ TEST_F(CatalogManagerReplSetTest, RunUserManagementWriteCommandRewriteWriteConce
     distLock()->expectLock(
         [](StringData name,
            StringData whyMessage,
-           milliseconds waitFor,
-           milliseconds lockTryInterval) {
+           Milliseconds waitFor,
+           Milliseconds lockTryInterval) {
             ASSERT_EQUALS("authorizationData", name);
             ASSERT_EQUALS("dropUser", whyMessage);
         },
         Status::OK());
 
-    auto future =
-        launchAsync([this] {
-            BSONObjBuilder responseBuilder;
-            bool ok =
-                catalogManager()->runUserManagementWriteCommand(
-                    operationContext(),
-                    "dropUser",
-                    "test",
-                    BSON("dropUser"
-                         << "test"
-                         << "writeConcern" << BSON("w" << 1 << "wtimeout" << 30)),
-                    &responseBuilder);
-            ASSERT_FALSE(ok);
+    auto future = launchAsync([this] {
+        BSONObjBuilder responseBuilder;
+        bool ok =
+            catalogManager()->runUserManagementWriteCommand(operationContext(),
+                                                            "dropUser",
+                                                            "test",
+                                                            BSON("dropUser"
+                                                                 << "test"
+                                                                 << "writeConcern"
+                                                                 << BSON("w" << 1 << "wtimeout"
+                                                                             << 30)),
+                                                            &responseBuilder);
+        ASSERT_FALSE(ok);
 
-            Status commandStatus = getStatusFromCommandResult(responseBuilder.obj());
-            ASSERT_EQUALS(ErrorCodes::UserNotFound, commandStatus);
-        });
+        Status commandStatus = getStatusFromCommandResult(responseBuilder.obj());
+        ASSERT_EQUALS(ErrorCodes::UserNotFound, commandStatus);
+    });
 
     onCommand([](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("test", request.dbname);
         ASSERT_EQUALS(BSON("dropUser"
                            << "test"
-                           << "writeConcern" << BSON("w"
-                                                     << "majority"
-                                                     << "wtimeout" << 30) << "maxTimeMS" << 30000),
+                           << "writeConcern"
+                           << BSON("w"
+                                   << "majority"
+                                   << "wtimeout"
+                                   << 30)
+                           << "maxTimeMS"
+                           << 30000),
                       request.cmdObj);
 
         ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
@@ -820,9 +823,13 @@ TEST_F(CatalogManagerReplSetTest, RunUserManagementWriteCommandNotMasterRetrySuc
         // Since no write concern was sent we will add w:majority
         ASSERT_EQUALS(BSON("dropUser"
                            << "test"
-                           << "writeConcern" << BSON("w"
-                                                     << "majority"
-                                                     << "wtimeout" << 0) << "maxTimeMS" << 30000),
+                           << "writeConcern"
+                           << BSON("w"
+                                   << "majority"
+                                   << "wtimeout"
+                                   << 0)
+                           << "maxTimeMS"
+                           << 30000),
                       request.cmdObj);
 
         ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
@@ -876,28 +883,28 @@ TEST_F(CatalogManagerReplSetTest, GetCollectionsValidResultsNoDb) {
         return collections;
     });
 
-    onFindWithMetadataCommand([this, coll1, coll2, coll3, newOpTime](
-        const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+    onFindWithMetadataCommand(
+        [this, coll1, coll2, coll3, newOpTime](const RemoteCommandRequest& request) {
+            ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
 
-        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
+            const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+            ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+            auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
-        ASSERT_EQ(query->ns(), CollectionType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSONObj());
-        ASSERT_EQ(query->getSort(), BSONObj());
+            ASSERT_EQ(query->ns(), CollectionType::ConfigNS);
+            ASSERT_EQ(query->getFilter(), BSONObj());
+            ASSERT_EQ(query->getSort(), BSONObj());
 
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
+            checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
-        ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, OID(), 30, -1);
-        BSONObjBuilder builder;
-        metadata.writeToMetadata(&builder);
+            ReplSetMetadata metadata(10, OpTime(), newOpTime, 100, OID(), 30, -1);
+            BSONObjBuilder builder;
+            metadata.writeToMetadata(&builder);
 
-        return std::make_tuple(vector<BSONObj>{coll1.toBSON(), coll2.toBSON(), coll3.toBSON()},
-                               builder.obj());
-    });
+            return std::make_tuple(vector<BSONObj>{coll1.toBSON(), coll2.toBSON(), coll3.toBSON()},
+                                   builder.obj());
+        });
 
     const auto& actualColls = future.timed_get(kFutureTimeout);
     ASSERT_EQ(3U, actualColls.size());
@@ -940,7 +947,7 @@ TEST_F(CatalogManagerReplSetTest, GetCollectionsValidResultsWithDb) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), CollectionType::ConfigNS);
         {
@@ -988,7 +995,7 @@ TEST_F(CatalogManagerReplSetTest, GetCollectionsInvalidCollectionType) {
 
         ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), CollectionType::ConfigNS);
         {
@@ -1034,7 +1041,7 @@ TEST_F(CatalogManagerReplSetTest, GetDatabasesForShardValid) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), DatabaseType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), DatabaseType::ConfigNS);
         ASSERT_EQ(query->getFilter(), BSON(DatabaseType::primary(dbt1.getPrimary())));
@@ -1108,7 +1115,7 @@ TEST_F(CatalogManagerReplSetTest, GetTagsForCollection) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), TagsType::ConfigNS);
         ASSERT_EQ(query->getFilter(), BSON(TagsType::ns("TestDB.TestColl")));
@@ -1177,7 +1184,6 @@ TEST_F(CatalogManagerReplSetTest, GetTagForChunkOneTagFound) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     ChunkType chunk;
-    chunk.setName("chunk0000");
     chunk.setNS("test.coll");
     chunk.setMin(BSON("a" << 1));
     chunk.setMax(BSON("a" << 100));
@@ -1195,13 +1201,14 @@ TEST_F(CatalogManagerReplSetTest, GetTagForChunkOneTagFound) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), TagsType::ConfigNS);
         ASSERT_EQ(query->getFilter(),
-                  BSON(TagsType::ns(chunk.getNS())
-                       << TagsType::min() << BSON("$lte" << chunk.getMin()) << TagsType::max()
-                       << BSON("$gte" << chunk.getMax())));
+                  BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
+                                                   << BSON("$lte" << chunk.getMin())
+                                                   << TagsType::max()
+                                                   << BSON("$gte" << chunk.getMax())));
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
@@ -1222,7 +1229,6 @@ TEST_F(CatalogManagerReplSetTest, GetTagForChunkNoTagFound) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     ChunkType chunk;
-    chunk.setName("chunk0000");
     chunk.setNS("test.coll");
     chunk.setMin(BSON("a" << 1));
     chunk.setMax(BSON("a" << 100));
@@ -1240,13 +1246,14 @@ TEST_F(CatalogManagerReplSetTest, GetTagForChunkNoTagFound) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), TagsType::ConfigNS);
         ASSERT_EQ(query->getFilter(),
-                  BSON(TagsType::ns(chunk.getNS())
-                       << TagsType::min() << BSON("$lte" << chunk.getMin()) << TagsType::max()
-                       << BSON("$gte" << chunk.getMax())));
+                  BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
+                                                   << BSON("$lte" << chunk.getMin())
+                                                   << TagsType::max()
+                                                   << BSON("$gte" << chunk.getMax())));
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
@@ -1261,7 +1268,6 @@ TEST_F(CatalogManagerReplSetTest, GetTagForChunkInvalidTagDoc) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     ChunkType chunk;
-    chunk.setName("chunk0000");
     chunk.setNS("test.coll");
     chunk.setMin(BSON("a" << 1));
     chunk.setMax(BSON("a" << 100));
@@ -1282,13 +1288,14 @@ TEST_F(CatalogManagerReplSetTest, GetTagForChunkInvalidTagDoc) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
 
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), TagsType::ConfigNS);
         ASSERT_EQ(query->getFilter(),
-                  BSON(TagsType::ns(chunk.getNS())
-                       << TagsType::min() << BSON("$lte" << chunk.getMin()) << TagsType::max()
-                       << BSON("$gte" << chunk.getMax())));
+                  BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
+                                                   << BSON("$lte" << chunk.getMin())
+                                                   << TagsType::max()
+                                                   << BSON("$gte" << chunk.getMax())));
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
@@ -1396,7 +1403,8 @@ TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecatedSuccessful) {
             ASSERT_EQUALS("config", request.dbname);
             ASSERT_EQUALS(BSON("w"
                                << "majority"
-                               << "wtimeout" << 15000),
+                               << "wtimeout"
+                               << 15000),
                           request.cmdObj["writeConcern"].Obj());
             ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
             ASSERT_EQUALS(updateOps, request.cmdObj["applyOps"].Obj());
@@ -1439,7 +1447,6 @@ TEST_F(CatalogManagerReplSetTest, ApplyChunkOpsDeprecatedSuccessfulWithCheck) {
     onFindCommand([this](const RemoteCommandRequest& request) {
         OID oid = OID::gen();
         ChunkType chunk;
-        chunk.setName("chunk0000");
         chunk.setNS("TestDB.TestColl");
         chunk.setMin(BSON("a" << 1));
         chunk.setMax(BSON("a" << 100));
@@ -1510,7 +1517,7 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseSuccess) {
         ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(ShardType::ConfigNS, query->ns());
         ASSERT_EQ(BSONObj(), query->getFilter());
@@ -1540,8 +1547,8 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseSuccess) {
 
     distLock()->expectLock([dbname](StringData name,
                                     StringData whyMessage,
-                                    stdx::chrono::milliseconds waitFor,
-                                    stdx::chrono::milliseconds lockTryInterval) {},
+                                    Milliseconds waitFor,
+                                    Milliseconds lockTryInterval) {},
                            Status::OK());
 
 
@@ -1639,8 +1646,8 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseDistLockHeld) {
     distLock()->expectLock(
         [dbname](StringData name,
                  StringData whyMessage,
-                 milliseconds waitFor,
-                 milliseconds lockTryInterval) {
+                 Milliseconds waitFor,
+                 Milliseconds lockTryInterval) {
             ASSERT_EQUALS(dbname, name);
             ASSERT_EQUALS("createDatabase", whyMessage);
         },
@@ -1658,8 +1665,8 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseDBExists) {
 
     distLock()->expectLock([dbname](StringData name,
                                     StringData whyMessage,
-                                    stdx::chrono::milliseconds waitFor,
-                                    stdx::chrono::milliseconds lockTryInterval) {},
+                                    Milliseconds waitFor,
+                                    Milliseconds lockTryInterval) {},
                            Status::OK());
 
 
@@ -1672,7 +1679,7 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseDBExists) {
         ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         BSONObjBuilder queryBuilder;
         queryBuilder.appendRegex(
@@ -1697,8 +1704,8 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseDBExistsDifferentCase) {
 
     distLock()->expectLock([dbname](StringData name,
                                     StringData whyMessage,
-                                    stdx::chrono::milliseconds waitFor,
-                                    stdx::chrono::milliseconds lockTryInterval) {},
+                                    Milliseconds waitFor,
+                                    Milliseconds lockTryInterval) {},
                            Status::OK());
 
 
@@ -1711,7 +1718,7 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseDBExistsDifferentCase) {
         ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         BSONObjBuilder queryBuilder;
         queryBuilder.appendRegex(
@@ -1735,8 +1742,8 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseNoShards) {
 
     distLock()->expectLock([dbname](StringData name,
                                     StringData whyMessage,
-                                    stdx::chrono::milliseconds waitFor,
-                                    stdx::chrono::milliseconds lockTryInterval) {},
+                                    Milliseconds waitFor,
+                                    Milliseconds lockTryInterval) {},
                            Status::OK());
 
 
@@ -1758,7 +1765,7 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseNoShards) {
     onFindCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(ShardType::ConfigNS, query->ns());
         ASSERT_EQ(BSONObj(), query->getFilter());
@@ -1797,7 +1804,7 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS(configHost, request.target);
         ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(ShardType::ConfigNS, query->ns());
         ASSERT_EQ(BSONObj(), query->getFilter());
@@ -1827,8 +1834,8 @@ TEST_F(CatalogManagerReplSetTest, createDatabaseDuplicateKeyOnInsert) {
 
     distLock()->expectLock([dbname](StringData name,
                                     StringData whyMessage,
-                                    stdx::chrono::milliseconds waitFor,
-                                    stdx::chrono::milliseconds lockTryInterval) {},
+                                    Milliseconds waitFor,
+                                    Milliseconds lockTryInterval) {},
                            Status::OK());
 
 
@@ -1935,10 +1942,7 @@ TEST_F(CatalogManagerReplSetTest, EnableShardingNoDBExists) {
     shardTargeter->setFindHostReturnValue(HostAndPort("shard0:12"));
 
     distLock()->expectLock(
-        [](StringData name,
-           StringData whyMessage,
-           stdx::chrono::milliseconds,
-           stdx::chrono::milliseconds) {
+        [](StringData name, StringData whyMessage, Milliseconds, Milliseconds) {
             ASSERT_EQ("test", name);
             ASSERT_FALSE(whyMessage.empty());
         },
@@ -1955,7 +1959,7 @@ TEST_F(CatalogManagerReplSetTest, EnableShardingNoDBExists) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(DatabaseType::ConfigNS, nss.toString());
 
-        auto queryResult = LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false);
+        auto queryResult = QueryRequest::makeFromFindCommand(nss, request.cmdObj, false);
         ASSERT_OK(queryResult.getStatus());
 
         const auto& query = queryResult.getValue();
@@ -2022,9 +2026,8 @@ TEST_F(CatalogManagerReplSetTest, EnableShardingNoDBExists) {
 TEST_F(CatalogManagerReplSetTest, EnableShardingLockBusy) {
     configTargeter()->setFindHostReturnValue(HostAndPort("config:123"));
 
-    distLock()->expectLock(
-        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
-        {ErrorCodes::LockBusy, "lock taken"});
+    distLock()->expectLock([](StringData, StringData, Milliseconds, Milliseconds) {},
+                           {ErrorCodes::LockBusy, "lock taken"});
 
     auto status = catalogManager()->enableSharding(operationContext(), "test");
     ASSERT_EQ(ErrorCodes::LockBusy, status.code());
@@ -2040,9 +2043,7 @@ TEST_F(CatalogManagerReplSetTest, EnableShardingDBExistsWithDifferentCase) {
 
     setupShards(vector<ShardType>{shard});
 
-    distLock()->expectLock(
-        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
-        Status::OK());
+    distLock()->expectLock([](StringData, StringData, Milliseconds, Milliseconds) {}, Status::OK());
 
     auto future = launchAsync([this] {
         auto status = catalogManager()->enableSharding(operationContext(), "test");
@@ -2069,9 +2070,7 @@ TEST_F(CatalogManagerReplSetTest, EnableShardingDBExists) {
 
     setupShards(vector<ShardType>{shard});
 
-    distLock()->expectLock(
-        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
-        Status::OK());
+    distLock()->expectLock([](StringData, StringData, Milliseconds, Milliseconds) {}, Status::OK());
 
     auto future = launchAsync([this] {
         auto status = catalogManager()->enableSharding(operationContext(), "test");
@@ -2127,9 +2126,7 @@ TEST_F(CatalogManagerReplSetTest, EnableShardingFailsWhenTheDatabaseIsAlreadySha
 
     setupShards(vector<ShardType>{shard});
 
-    distLock()->expectLock(
-        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
-        Status::OK());
+    distLock()->expectLock([](StringData, StringData, Milliseconds, Milliseconds) {}, Status::OK());
 
     auto future = launchAsync([this] {
         auto status = catalogManager()->enableSharding(operationContext(), "test");
@@ -2155,9 +2152,7 @@ TEST_F(CatalogManagerReplSetTest, EnableShardingDBExistsInvalidFormat) {
 
     setupShards(vector<ShardType>{shard});
 
-    distLock()->expectLock(
-        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
-        Status::OK());
+    distLock()->expectLock([](StringData, StringData, Milliseconds, Milliseconds) {}, Status::OK());
 
     auto future = launchAsync([this] {
         auto status = catalogManager()->enableSharding(operationContext(), "test");
@@ -2177,9 +2172,7 @@ TEST_F(CatalogManagerReplSetTest, EnableShardingDBExistsInvalidFormat) {
 TEST_F(CatalogManagerReplSetTest, EnableShardingNoDBExistsNoShards) {
     configTargeter()->setFindHostReturnValue(HostAndPort("config:123"));
 
-    distLock()->expectLock(
-        [](StringData, StringData, stdx::chrono::milliseconds, stdx::chrono::milliseconds) {},
-        Status::OK());
+    distLock()->expectLock([](StringData, StringData, Milliseconds, Milliseconds) {}, Status::OK());
 
     auto future = launchAsync([this] {
         auto status = catalogManager()->enableSharding(operationContext(), "test");

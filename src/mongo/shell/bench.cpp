@@ -34,14 +34,14 @@
 
 #include "mongo/shell/bench.h"
 
-#include <pcrecpp.h>
 #include <iostream>
+#include <pcrecpp.h>
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/scripting/bson_template_evaluator.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/thread.h"
@@ -322,7 +322,8 @@ BenchRunOp opFromBson(const BSONObj& op) {
         } else if (name == "query") {
             uassert(34389,
                     str::stream() << "Field 'query' is only valid for findOne, find, update, and "
-                                     "remove types. Type is " << opType,
+                                     "remove types. Type is "
+                                  << opType,
                     (opType == "findOne") || (opType == "query") ||
                         (opType == "find" || (opType == "update") || (opType == "delete") ||
                          (opType == "remove")));
@@ -614,22 +615,22 @@ bool BenchRunWorker::shouldCollectStats() const {
 void doNothing(const BSONObj&) {}
 
 /**
- * Issues the query 'lpq' against 'conn' using read commands. Returns the size of the result set
+ * Issues the query 'qr' against 'conn' using read commands. Returns the size of the result set
  * returned by the query.
  *
- * If 'lpq' has the 'wantMore' flag set to false and the 'limit' option set to 1LL, then the caller
+ * If 'qr' has the 'wantMore' flag set to false and the 'limit' option set to 1LL, then the caller
  * may optionally specify a pointer to an object in 'objOut', which will be filled in with the
  * single object in the query result set (or the empty object, if the result set is empty).
- * If 'lpq' doesn't have these options set, then nullptr must be passed for 'objOut'.
+ * If 'qr' doesn't have these options set, then nullptr must be passed for 'objOut'.
  *
  * On error, throws a UserException.
  */
 int runQueryWithReadCommands(DBClientBase* conn,
-                             unique_ptr<LiteParsedQuery> lpq,
+                             unique_ptr<QueryRequest> qr,
                              BSONObj* objOut = nullptr) {
-    std::string dbName = lpq->nss().db().toString();
+    std::string dbName = qr->nss().db().toString();
     BSONObj findCommandResult;
-    bool res = conn->runCommand(dbName, lpq->asFindCommand(), findCommandResult);
+    bool res = conn->runCommand(dbName, qr->asFindCommand(), findCommandResult);
     uassert(ErrorCodes::CommandFailed,
             str::stream() << "find command failed; reply was: " << findCommandResult,
             res);
@@ -639,7 +640,7 @@ int runQueryWithReadCommands(DBClientBase* conn,
     int count = cursorResponse.getBatch().size();
 
     if (objOut) {
-        invariant(lpq->getLimit() && *lpq->getLimit() == 1 && !lpq->wantMore());
+        invariant(qr->getLimit() && *qr->getLimit() == 1 && !qr->wantMore());
         // Since this is a "single batch" query, we can simply grab the first item in the result set
         // and return here.
         *objOut = (count > 0) ? cursorResponse.getBatch()[0] : BSONObj();
@@ -647,9 +648,9 @@ int runQueryWithReadCommands(DBClientBase* conn,
     }
 
     while (cursorResponse.getCursorId() != 0) {
-        GetMoreRequest getMoreRequest(lpq->nss(),
+        GetMoreRequest getMoreRequest(qr->nss(),
                                       cursorResponse.getCursorId(),
-                                      lpq->getBatchSize(),
+                                      qr->getBatchSize(),
                                       boost::none,   // maxTimeMS
                                       boost::none,   // term
                                       boost::none);  // lastKnownCommittedOpTime
@@ -713,15 +714,15 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
                         BSONObj fixedQuery = fixQuery(op.query, bsonTemplateEvaluator);
                         BSONObj result;
                         if (op.useReadCmd) {
-                            auto lpq = stdx::make_unique<LiteParsedQuery>(NamespaceString(op.ns));
-                            lpq->setFilter(fixedQuery);
-                            lpq->setProj(op.projection);
-                            lpq->setLimit(1LL);
-                            lpq->setWantMore(false);
-                            invariantOK(lpq->validate());
+                            auto qr = stdx::make_unique<QueryRequest>(NamespaceString(op.ns));
+                            qr->setFilter(fixedQuery);
+                            qr->setProj(op.projection);
+                            qr->setLimit(1LL);
+                            qr->setWantMore(false);
+                            invariantOK(qr->validate());
 
                             BenchRunEventTrace _bret(&stats.findOneCounter);
-                            runQueryWithReadCommands(conn, std::move(lpq), &result);
+                            runQueryWithReadCommands(conn, std::move(qr), &result);
                         } else {
                             BenchRunEventTrace _bret(&stats.findOneCounter);
                             result = conn->findOne(op.ns, fixedQuery);
@@ -815,22 +816,22 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
                                     "cannot use 'options' in combination with read commands",
                                     !op.options);
 
-                            auto lpq = stdx::make_unique<LiteParsedQuery>(NamespaceString(op.ns));
-                            lpq->setFilter(fixedQuery);
-                            lpq->setProj(op.projection);
+                            auto qr = stdx::make_unique<QueryRequest>(NamespaceString(op.ns));
+                            qr->setFilter(fixedQuery);
+                            qr->setProj(op.projection);
                             if (op.skip) {
-                                lpq->setSkip(op.skip);
+                                qr->setSkip(op.skip);
                             }
                             if (op.limit) {
-                                lpq->setLimit(op.limit);
+                                qr->setLimit(op.limit);
                             }
                             if (op.batchSize) {
-                                lpq->setBatchSize(op.batchSize);
+                                qr->setBatchSize(op.batchSize);
                             }
-                            invariantOK(lpq->validate());
+                            invariantOK(qr->validate());
 
                             BenchRunEventTrace _bret(&stats.queryCounter);
-                            count = runQueryWithReadCommands(conn, std::move(lpq));
+                            count = runQueryWithReadCommands(conn, std::move(qr));
                         } else {
                             // Use special query function for exhaust query option.
                             if (op.options & QueryOption_Exhaust) {
@@ -886,8 +887,9 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
                                 BSONObjBuilder builder;
                                 builder.append("update", nsToCollectionSubstring(op.ns));
                                 BSONArrayBuilder docBuilder(builder.subarrayStart("updates"));
-                                docBuilder.append(BSON("q" << query << "u" << update << "multi"
-                                                           << op.multi << "upsert" << op.upsert));
+                                docBuilder.append(BSON(
+                                    "q" << query << "u" << update << "multi" << op.multi << "upsert"
+                                        << op.upsert));
                                 docBuilder.done();
                                 builder.append("writeConcern", op.writeConcern);
                                 conn->runCommand(nsToDatabaseSubstring(op.ns).toString(),
@@ -1082,7 +1084,8 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
                     {
                         stats.trappedErrors.push_back(BSON("error" << ex.what() << "op"
                                                                    << opTypeName.find(op.op)->second
-                                                                   << "count" << count));
+                                                                   << "count"
+                                                                   << count));
                     }
                     if (_config->breakOnTrap)
                         return;
@@ -1169,11 +1172,11 @@ void BenchRunner::start() {
         if (_config->username != "") {
             string errmsg;
             if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
-                uasserted(16704,
-                          str::stream()
-                              << "User " << _config->username
-                              << " could not authenticate to admin db; admin db access is "
-                                 "required to use benchRun with auth enabled");
+                uasserted(
+                    16704,
+                    str::stream() << "User " << _config->username
+                                  << " could not authenticate to admin db; admin db access is "
+                                     "required to use benchRun with auth enabled");
             }
         }
 
@@ -1206,11 +1209,11 @@ void BenchRunner::stop() {
             string errmsg;
             // this can only fail if admin access was revoked since start of run
             if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
-                uasserted(16705,
-                          str::stream()
-                              << "User " << _config->username
-                              << " could not authenticate to admin db; admin db access is "
-                                 "still required to use benchRun with auth enabled");
+                uasserted(
+                    16705,
+                    str::stream() << "User " << _config->username
+                                  << " could not authenticate to admin db; admin db access is "
+                                     "still required to use benchRun with auth enabled");
             }
         }
     }

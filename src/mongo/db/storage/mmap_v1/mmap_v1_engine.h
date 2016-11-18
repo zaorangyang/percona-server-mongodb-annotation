@@ -32,8 +32,8 @@
 
 #include <map>
 
-#include "mongo/db/storage/mmap_v1/record_access_tracker.h"
 #include "mongo/db/storage/mmap_v1/extent_manager.h"
+#include "mongo/db/storage/mmap_v1/record_access_tracker.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/stdx/mutex.h"
 
@@ -46,6 +46,10 @@ class MMAPV1DatabaseCatalogEntry;
 class MMAPV1Engine : public StorageEngine {
 public:
     MMAPV1Engine(const StorageEngineLockFile* lockFile, ClockSource* cs);
+
+    MMAPV1Engine(const StorageEngineLockFile* lockFile,
+                 ClockSource* cs,
+                 std::unique_ptr<ExtentManager::Factory> extentManagerFactory);
     virtual ~MMAPV1Engine();
 
     void finishInit();

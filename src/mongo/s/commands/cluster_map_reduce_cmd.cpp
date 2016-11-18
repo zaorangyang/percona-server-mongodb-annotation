@@ -42,15 +42,15 @@
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/client/shard_connection.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard_connection.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/commands/sharded_command_processing.h"
-#include "mongo/s/config.h"
-#include "mongo/s/catalog/dist_lock_manager.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/commands/strategy.h"
+#include "mongo/s/config.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/sharding_raii.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/util/log.h"
@@ -67,7 +67,7 @@ namespace {
 
 AtomicUInt32 JOB_NUMBER;
 
-const stdx::chrono::milliseconds kNoDistLockTimeout(-1);
+const Milliseconds kNoDistLockTimeout(-1);
 
 /**
  * Generates a unique name for the temporary M/R output collection.
@@ -94,7 +94,7 @@ BSONObj fixForShards(const BSONObj& orig,
         if (fn == bypassDocumentValidationCommandOption() || fn == "map" || fn == "mapreduce" ||
             fn == "mapReduce" || fn == "mapparams" || fn == "reduce" || fn == "query" ||
             fn == "sort" || fn == "scope" || fn == "verbose" || fn == "$queryOptions" ||
-            fn == "readConcern" || fn == LiteParsedQuery::cmdOptionMaxTimeMS) {
+            fn == "readConcern" || fn == QueryRequest::cmdOptionMaxTimeMS) {
             b.append(e);
         } else if (fn == "out" || fn == "finalize" || fn == "writeConcern") {
             // We don't want to copy these
@@ -319,7 +319,9 @@ public:
                 Strategy::commandOp(txn, dbname, shardedCommand, 0, nss.ns(), q, &mrCommandResults);
             } catch (DBException& e) {
                 e.addContext(str::stream() << "could not run map command on all shards for ns "
-                                           << nss.ns() << " and query " << q);
+                                           << nss.ns()
+                                           << " and query "
+                                           << q);
                 throw;
             }
 
@@ -341,8 +343,8 @@ public:
 
                 if (!ok) {
                     // At this point we will return
-                    errmsg = str::stream()
-                        << "MR parallel processing failed: " << singleResult.toString();
+                    errmsg = str::stream() << "MR parallel processing failed: "
+                                           << singleResult.toString();
                     continue;
                 }
 
@@ -404,7 +406,7 @@ public:
         BSONObj aggCounts = aggCountsB.done();
         finalCmd.append("counts", aggCounts);
 
-        if (auto elem = cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS])
+        if (auto elem = cmdObj[QueryRequest::cmdOptionMaxTimeMS])
             finalCmd.append(elem);
         if (auto elem = cmdObj[bypassDocumentValidationCommandOption()])
             finalCmd.append(elem);
@@ -503,7 +505,9 @@ public:
                     ok = true;
                 } catch (DBException& e) {
                     e.addContext(str::stream() << "could not run final reduce on all shards for "
-                                               << nss.ns() << ", output " << outputCollNss.ns());
+                                               << nss.ns()
+                                               << ", output "
+                                               << outputCollNss.ns());
                     throw;
                 }
 

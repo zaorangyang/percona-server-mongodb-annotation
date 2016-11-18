@@ -32,9 +32,9 @@
 
 #include "mongo/scripting/mozjs/implscope.h"
 
+#include <js/CharacterEncoding.h>
 #include <jscustomallocator.h>
 #include <jsfriendapi.h>
-#include <js/CharacterEncoding.h>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/operation_context.h"
@@ -367,13 +367,13 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
     execSetup(JSFiles::assert);
     execSetup(JSFiles::types);
 
-    // install process-specific utilities in the global scope (dependancy: types.js, assert.js)
-    if (_engine->getScopeInitCallback())
-        _engine->getScopeInitCallback()(*this);
-
     // install global utility functions
     installGlobalUtils(*this);
     _mongoHelpersProto.install(_global);
+
+    // install process-specific utilities in the global scope (dependancy: types.js, assert.js)
+    if (_engine->getScopeInitCallback())
+        _engine->getScopeInitCallback()(*this);
 }
 
 MozJSImplScope::~MozJSImplScope() {
@@ -772,9 +772,7 @@ void MozJSImplScope::installBSONTypes() {
     _nativeFunctionProto.install(_global);
     _numberIntProto.install(_global);
     _numberLongProto.install(_global);
-    if (Decimal128::enabled) {
-        _numberDecimalProto.install(_global);
-    }
+    _numberDecimalProto.install(_global);
     _objectProto.install(_global);
     _oidProto.install(_global);
     _regExpProto.install(_global);

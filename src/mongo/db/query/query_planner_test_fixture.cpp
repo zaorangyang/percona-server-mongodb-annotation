@@ -34,10 +34,10 @@
 
 #include <algorithm>
 
-#include "mongo/db/namespace_string.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_lib.h"
@@ -139,6 +139,19 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, const CollatorInterface* col
     params.indices.push_back(entry);
 }
 
+void QueryPlannerTest::addIndex(BSONObj keyPattern,
+                                MatchExpression* filterExpr,
+                                const CollatorInterface* collator) {
+    const bool sparse = false;
+    const bool unique = false;
+    const bool multikey = false;
+    const char name[] = "my_partial_index_with_collator";
+    const BSONObj infoObj;
+    IndexEntry entry(keyPattern, multikey, sparse, unique, name, filterExpr, infoObj);
+    entry.collator = collator;
+    params.indices.push_back(entry);
+}
+
 void QueryPlannerTest::runQuery(BSONObj query) {
     runQuerySortProjSkipNToReturn(query, BSONObj(), BSONObj(), 0, 0);
 }
@@ -206,27 +219,27 @@ void QueryPlannerTest::runQueryFull(const BSONObj& query,
     solns.clear();
     cq.reset();
 
-    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-    lpq->setFilter(query);
-    lpq->setSort(sort);
-    lpq->setProj(proj);
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(query);
+    qr->setSort(sort);
+    qr->setProj(proj);
     if (skip) {
-        lpq->setSkip(skip);
+        qr->setSkip(skip);
     }
     if (ntoreturn) {
         if (ntoreturn < 0) {
             ASSERT_NE(ntoreturn, std::numeric_limits<long long>::min());
             ntoreturn = -ntoreturn;
-            lpq->setWantMore(false);
+            qr->setWantMore(false);
         }
-        lpq->setNToReturn(ntoreturn);
+        qr->setNToReturn(ntoreturn);
     }
-    lpq->setHint(hint);
-    lpq->setMin(minObj);
-    lpq->setMax(maxObj);
-    lpq->setSnapshot(snapshot);
+    qr->setHint(hint);
+    qr->setMin(minObj);
+    qr->setMax(maxObj);
+    qr->setSnapshot(snapshot);
     auto statusWithCQ =
-        CanonicalQuery::canonicalize(txn(), std::move(lpq), ExtensionsCallbackNoop());
+        CanonicalQuery::canonicalize(txn(), std::move(qr), ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
     cq = std::move(statusWithCQ.getValue());
 
@@ -283,27 +296,27 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
     solns.clear();
     cq.reset();
 
-    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-    lpq->setFilter(query);
-    lpq->setSort(sort);
-    lpq->setProj(proj);
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(query);
+    qr->setSort(sort);
+    qr->setProj(proj);
     if (skip) {
-        lpq->setSkip(skip);
+        qr->setSkip(skip);
     }
     if (ntoreturn) {
         if (ntoreturn < 0) {
             ASSERT_NE(ntoreturn, std::numeric_limits<long long>::min());
             ntoreturn = -ntoreturn;
-            lpq->setWantMore(false);
+            qr->setWantMore(false);
         }
-        lpq->setNToReturn(ntoreturn);
+        qr->setNToReturn(ntoreturn);
     }
-    lpq->setHint(hint);
-    lpq->setMin(minObj);
-    lpq->setMax(maxObj);
-    lpq->setSnapshot(snapshot);
+    qr->setHint(hint);
+    qr->setMin(minObj);
+    qr->setMax(maxObj);
+    qr->setSnapshot(snapshot);
     auto statusWithCQ =
-        CanonicalQuery::canonicalize(txn(), std::move(lpq), ExtensionsCallbackNoop());
+        CanonicalQuery::canonicalize(txn(), std::move(qr), ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
     cq = std::move(statusWithCQ.getValue());
 
@@ -318,11 +331,11 @@ void QueryPlannerTest::runQueryAsCommand(const BSONObj& cmdObj) {
     invariant(nss.isValid());
 
     const bool isExplain = false;
-    std::unique_ptr<LiteParsedQuery> lpq(
-        assertGet(LiteParsedQuery::makeFromFindCommand(nss, cmdObj, isExplain)));
+    std::unique_ptr<QueryRequest> qr(
+        assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
 
     auto statusWithCQ =
-        CanonicalQuery::canonicalize(txn(), std::move(lpq), ExtensionsCallbackNoop());
+        CanonicalQuery::canonicalize(txn(), std::move(qr), ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
     cq = std::move(statusWithCQ.getValue());
 
@@ -399,13 +412,13 @@ void QueryPlannerTest::assertHasOneSolutionOf(const std::vector<std::string>& so
     FAIL(ss);
 }
 
-std::unique_ptr<MatchExpression> QueryPlannerTest::parseMatchExpression(const BSONObj& obj) {
-    const CollatorInterface* collator = nullptr;
+std::unique_ptr<MatchExpression> QueryPlannerTest::parseMatchExpression(
+    const BSONObj& obj, const CollatorInterface* collator) {
     StatusWithMatchExpression status =
         MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions(), collator);
     if (!status.isOK()) {
-        FAIL(str::stream() << "failed to parse query: " << obj.toString()
-                           << ". Reason: " << status.getStatus().toString());
+        FAIL(str::stream() << "failed to parse query: " << obj.toString() << ". Reason: "
+                           << status.getStatus().toString());
     }
     return std::move(status.getValue());
 }

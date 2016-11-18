@@ -21,7 +21,9 @@ load('./jstests/multiVersion/libs/multi_cluster.js');
             shardOptions: {binVersion: "last-stable"},
 
             rsOptions: {binVersion: "last-stable"},
-            rs: isRSCluster
+            rs: isRSCluster,
+            // TODO: SERVER-24163 remove after v3.4
+            waitForCSRSSecondaries: false
         };
 
         var testCRUD = function(mongos) {
@@ -30,8 +32,8 @@ load('./jstests/multiVersion/libs/multi_cluster.js');
 
             var unshardedDB = mongos.getDB('unshareded');
             assert.commandWorked(unshardedDB.runCommand({insert: 'foo', documents: [{x: 1}]}));
-            assert.commandWorked(unshardedDB.runCommand(
-                {update: 'foo', updates: [{q: {x: 1}, u: {$set: {y: 1}}}]}));
+            assert.commandWorked(
+                unshardedDB.runCommand({update: 'foo', updates: [{q: {x: 1}, u: {$set: {y: 1}}}]}));
             var doc = unshardedDB.foo.findOne({x: 1});
             assert.eq(1, doc.y);
             assert.commandWorked(

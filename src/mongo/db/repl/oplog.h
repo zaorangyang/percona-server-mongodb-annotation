@@ -28,27 +28,21 @@
 
 #pragma once
 
-#include <cstddef>
-#include <deque>
 #include <string>
+#include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/base/disallow_copying.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/stdx/functional.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
-class BSONObj;
 class Collection;
-struct CollectionOptions;
 class Database;
 class NamespaceString;
 class OperationContext;
-class Timestamp;
-class RecordId;
 
 namespace repl {
 class ReplSettings;
@@ -58,24 +52,12 @@ class ReplSettings;
  */
 void truncateOplogTo(OperationContext* txn, Timestamp truncateTimestamp);
 
-/**
- * Create a new capped collection for the oplog if it doesn't yet exist.
- * If the collection already exists, set the 'last' OpTime if master/slave (side effect!)
- */
-void createOplog(OperationContext* txn, const std::string& oplogCollectionName, bool replEnabled);
-
 /*
  * Create a new capped collection for the oplog using createOplog() if it doesn't yet exist.
  * Collection name will be "_oplogCollectionName" initialized in setOplogCollectionName().
  * This will be either local.oplog.rs (replica sets) or local.oplog.$main (master/slave)
  */
 void createOplog(OperationContext* txn);
-
-// This function writes ops into the replica-set oplog;
-// used internally by replication secondaries after they have applied ops.  Updates the global
-// optime.
-// Returns the optime for the last op inserted.
-OpTime writeOpsToOplog(OperationContext* txn, const std::vector<BSONObj>& ops);
 
 extern std::string rsOplogName;
 extern std::string masterSlaveOplogName;
@@ -102,19 +84,7 @@ void logOps(OperationContext* txn,
 
 /* For 'u' records, 'obj' captures the mutation made to the object but not
  * the object itself. 'o2' captures the the criteria for the object that will be modified.
- *
- * Sets replCoord last optime if 'updateReplOpTime' is true.
  */
-void _logOp(OperationContext* txn,
-            const char* opstr,
-            const char* ns,
-            const BSONObj& obj,
-            const BSONObj* o2,
-            bool fromMigrate,
-            const std::string& oplogCollectionName,
-            ReplicationCoordinator::Mode replicationMode,
-            bool updateReplOpTime);
-
 void logOp(OperationContext* txn,
            const char* opstr,
            const char* ns,
@@ -166,6 +136,11 @@ void setOplogCollectionName();
  * Signal any waiting AwaitData queries on the oplog that there is new data or metadata available.
  */
 void signalOplogWaiters();
+
+/**
+ * Check that the oplog is capped, and abort the process if it is not.
+ */
+void checkForCappedOplog(OperationContext* txn);
 
 }  // namespace repl
 }  // namespace mongo

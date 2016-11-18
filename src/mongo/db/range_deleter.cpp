@@ -36,8 +36,8 @@
 #include <memory>
 
 #include "mongo/db/client.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/exit.h"
@@ -83,8 +83,8 @@ static void logCursorsWaiting(RangeDeleteEntry* entry) {
     // We always log the first cursors waiting message (so we have cursor ids in the logs).
     // After 15 minutes (the cursor timeout period), we start logging additional messages at
     // a 1 minute interval.
-    static const auto kLogCursorsThreshold = stdx::chrono::minutes{15};
-    static const auto kLogCursorsInterval = stdx::chrono::minutes{1};
+    static const auto kLogCursorsThreshold = Minutes{15};
+    static const auto kLogCursorsInterval = Minutes{1};
 
     Date_t currentTime = jsTime();
     Milliseconds elapsedMillisSinceQueued{0};
@@ -423,8 +423,8 @@ void RangeDeleter::doWork() {
         {
             stdx::unique_lock<stdx::mutex> sl(_queueMutex);
             while (_taskQueue.empty()) {
-                _taskQueueNotEmptyCV.wait_for(sl,
-                                              stdx::chrono::milliseconds(kNotEmptyTimeoutMillis));
+                _taskQueueNotEmptyCV.wait_for(
+                    sl, Milliseconds(kNotEmptyTimeoutMillis).toSystemDuration());
 
                 if (stopRequested()) {
                     log() << "stopping range deleter worker" << endl;

@@ -74,7 +74,7 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // Adds the amount of time taken by pickBestPlan() to executionTimeMillis. There's lots of
     // execution work that happens here, so this is needed for the time accounting to
     // make sense.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
+    ScopedTimer timer(getClock(), &_commonStats.executionTimeMillis);
 
     // If we work this many times during the trial period, then we will replan the
     // query from scratch.
@@ -209,7 +209,8 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache) {
     if (!status.isOK()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "error processing query: " << _canonicalQuery->toString()
-                                    << " planner returned error: " << status.reason());
+                                    << " planner returned error: "
+                                    << status.reason());
     }
 
     OwnedPointerVector<QuerySolution> solutions(rawSolutions);
@@ -335,8 +336,8 @@ void CachedPlanStage::updatePlanCache() {
         LOG(5) << _canonicalQuery->ns()
                << ": Failed to update cache with feedback: " << fbs.toString() << " - "
                << "(query: " << _canonicalQuery->getQueryObj()
-               << "; sort: " << _canonicalQuery->getParsed().getSort()
-               << "; projection: " << _canonicalQuery->getParsed().getProj()
+               << "; sort: " << _canonicalQuery->getQueryRequest().getSort()
+               << "; projection: " << _canonicalQuery->getQueryRequest().getProj()
                << ") is no longer in plan cache.";
     }
 }

@@ -30,7 +30,9 @@
 
 #include "mongo/db/query/collation/collator_factory_icu.h"
 
+#include <unicode/coll.h>
 #include <unicode/errorcode.h>
+#include <unicode/ucol.h>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/util/bson_extract.h"
@@ -181,9 +183,13 @@ StatusWith<CollationSpec::CaseFirstType> stringToCaseFirstType(const std::string
     } else {
         return {ErrorCodes::FailedToParse,
                 str::stream() << "Field '" << CollationSpec::kCaseFirstField << "' must be '"
-                              << CollationSpec::kCaseFirstUpper << "', '"
-                              << CollationSpec::kCaseFirstLower << "', or '"
-                              << CollationSpec::kCaseFirstOff << "'. Got: " << caseFirst};
+                              << CollationSpec::kCaseFirstUpper
+                              << "', '"
+                              << CollationSpec::kCaseFirstLower
+                              << "', or '"
+                              << CollationSpec::kCaseFirstOff
+                              << "'. Got: "
+                              << caseFirst};
     }
 }
 
@@ -202,7 +208,8 @@ StatusWith<CollationSpec::StrengthType> integerToStrengthType(long long strength
     }
     return {ErrorCodes::FailedToParse,
             str::stream() << "Field '" << CollationSpec::kStrengthField
-                          << "' must be an integer 1 through 5. Got: " << strength};
+                          << "' must be an integer 1 through 5. Got: "
+                          << strength};
 }
 
 StatusWith<CollationSpec::AlternateType> stringToAlternateType(const std::string& alternate) {
@@ -213,8 +220,11 @@ StatusWith<CollationSpec::AlternateType> stringToAlternateType(const std::string
     } else {
         return {ErrorCodes::FailedToParse,
                 str::stream() << "Field '" << CollationSpec::kAlternateField << "' must be '"
-                              << CollationSpec::kAlternateNonIgnorable << "' or '"
-                              << CollationSpec::kAlternateShifted << "'. Got: " << alternate};
+                              << CollationSpec::kAlternateNonIgnorable
+                              << "' or '"
+                              << CollationSpec::kAlternateShifted
+                              << "'. Got: "
+                              << alternate};
     }
 }
 
@@ -226,8 +236,11 @@ StatusWith<CollationSpec::MaxVariableType> stringToMaxVariableType(const std::st
     } else {
         return {ErrorCodes::FailedToParse,
                 str::stream() << "Field '" << CollationSpec::kMaxVariableField << "' must be '"
-                              << CollationSpec::kMaxVariablePunct << "' or '"
-                              << CollationSpec::kMaxVariableSpace << "'. Got: " << maxVariable};
+                              << CollationSpec::kMaxVariablePunct
+                              << "' or '"
+                              << CollationSpec::kMaxVariableSpace
+                              << "'. Got: "
+                              << maxVariable};
     }
 }
 
@@ -257,8 +270,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to get '" << CollationSpec::kCaseLevelField
-                                  << "' attribute from icu::Collator: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute from icu::Collator: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
         parsedSpec.caseLevel = attributeToBool(caseLevelAttribute);
     } else if (!parseStatus.isOK()) {
@@ -272,8 +287,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to set '" << CollationSpec::kCaseLevelField
-                                  << "' attribute: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
     }
 
@@ -288,8 +305,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to get '" << CollationSpec::kCaseFirstField
-                                  << "' attribute from icu::Collator: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute from icu::Collator: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
         parsedSpec.caseFirst = getCaseFirstFromAttribute(caseFirstAttribute);
     } else if (!parseStatus.isOK()) {
@@ -311,8 +330,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to set '" << CollationSpec::kCaseFirstField
-                                  << "' attribute: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
     }
 
@@ -327,8 +348,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to get '" << CollationSpec::kStrengthField
-                                  << "' attribute from icu::Collator: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute from icu::Collator: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
         parsedSpec.strength = getStrengthFromAttribute(strengthAttribute);
     } else if (!parseStatus.isOK()) {
@@ -349,8 +372,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to set '" << CollationSpec::kStrengthField
-                                  << "' attribute: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
     }
 
@@ -366,8 +391,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to get '" << CollationSpec::kNumericOrderingField
-                                  << "' attribute from icu::Collator: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute from icu::Collator: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
         parsedSpec.numericOrdering = attributeToBool(numericOrderingAttribute);
     } else if (!parseStatus.isOK()) {
@@ -382,8 +409,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to set '" << CollationSpec::kNumericOrderingField
-                                  << "' attribute: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
     }
 
@@ -399,8 +428,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to get '" << CollationSpec::kAlternateField
-                                  << "' attribute from icu::Collator: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute from icu::Collator: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
         parsedSpec.alternate = getAlternateFromAttribute(alternateAttribute);
     } else if (!parseStatus.isOK()) {
@@ -422,8 +453,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to set '" << CollationSpec::kAlternateField
-                                  << "' attribute: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
     }
 
@@ -450,8 +483,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to set '" << CollationSpec::kMaxVariableField
-                                  << "' attribute: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
     }
 
@@ -467,8 +502,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to get '" << CollationSpec::kNormalizationField
-                                  << "' attribute from icu::Collator: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute from icu::Collator: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
         parsedSpec.normalization = attributeToBool(normalizationAttribute);
     } else if (!parseStatus.isOK()) {
@@ -483,8 +520,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to set '" << CollationSpec::kNormalizationField
-                                  << "' attribute: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
     }
 
@@ -500,8 +539,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to get '" << CollationSpec::kBackwardsField
-                                  << "' attribute from icu::Collator: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute from icu::Collator: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
         parsedSpec.backwards = attributeToBool(backwardsAttribute);
     } else if (!parseStatus.isOK()) {
@@ -516,8 +557,10 @@ StatusWith<CollationSpec> parseToCollationSpec(const BSONObj& spec,
             icuError.set(status);
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Failed to set '" << CollationSpec::kBackwardsField
-                                  << "' attribute: " << icuError.errorName()
-                                  << ". Collation spec: " << spec};
+                                  << "' attribute: "
+                                  << icuError.errorName()
+                                  << ". Collation spec: "
+                                  << spec};
         }
     }
 
@@ -541,9 +584,54 @@ StatusWith<std::string> parseLocaleID(const BSONObj& spec) {
     if (localeID.find('\0') != std::string::npos) {
         return {ErrorCodes::BadValue,
                 str::stream() << "Field '" << CollationSpec::kLocaleField
-                              << "' cannot contain null byte. Collation spec: " << spec};
+                              << "' cannot contain null byte. Collation spec: "
+                              << spec};
     }
     return localeID;
+}
+
+// Returns a non-OK status if any part of the locale ID is invalid or not recognized by ICU.
+Status validateLocaleID(const BSONObj& spec,
+                        const std::string& originalID,
+                        const icu::Collator& collator) {
+    UErrorCode status = U_ZERO_ERROR;
+    icu::Locale collatorLocale = collator.getLocale(ULOC_VALID_LOCALE, status);
+    if (U_FAILURE(status)) {
+        icu::ErrorCode icuError;
+        icuError.set(status);
+        return {ErrorCodes::OperationFailed,
+                str::stream() << "Failed to get locale from icu::Collator: " << icuError.errorName()
+                              << ". Collation spec: "
+                              << spec};
+    }
+
+    if (originalID.empty()) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Field '" << CollationSpec::kLocaleField
+                              << "' cannot be the empty string in: "
+                              << spec};
+    }
+
+    // Check that each component of the locale ID is recognized by ICU. If ICU 1) cannot parse the
+    // locale id, 2) has to do any sort of locale id canonicalization, 3) does not recognize some
+    // component of the locale, or 4) has no data to support some component of the locale, then the
+    // resulting icu::Locale name will not match the requested locale. In this case we return an
+    // error to the user. In the error message to the user, we report the locale that ICU *would
+    // have* used, which the application can supply as an alternative.
+    const char* collatorLocaleName = collatorLocale.getName();
+    if (StringData(originalID) != StringData(collatorLocaleName)) {
+        str::stream ss;
+        ss << "Field '" << CollationSpec::kLocaleField << "' is invalid in: " << spec;
+
+        if (!str::equals(kFallbackLocaleName, collatorLocaleName) &&
+            !str::equals("", collatorLocaleName)) {
+            ss << ". Did you mean '" << collatorLocaleName << "'?";
+        }
+
+        return {ErrorCodes::BadValue, ss};
+    }
+
+    return Status::OK();
 }
 
 }  // namespace
@@ -563,7 +651,8 @@ StatusWith<std::unique_ptr<CollatorInterface>> CollatorFactoryICU::makeFromBSON(
             return {ErrorCodes::FailedToParse,
                     str::stream() << "If " << CollationSpec::kLocaleField << "="
                                   << CollationSpec::kSimpleBinaryComparison
-                                  << ", no other fields should be present in: " << spec};
+                                  << ", no other fields should be present in: "
+                                  << spec};
         }
         return {nullptr};
     }
@@ -572,8 +661,8 @@ StatusWith<std::unique_ptr<CollatorInterface>> CollatorFactoryICU::makeFromBSON(
     auto userLocale = icu::Locale::createFromName(parsedLocaleID.getValue().c_str());
     if (userLocale.isBogus()) {
         return {ErrorCodes::BadValue,
-                str::stream() << "Field '" << CollationSpec::kLocaleField
-                              << "' is not valid in: " << spec};
+                str::stream() << "Field '" << CollationSpec::kLocaleField << "' is not valid in: "
+                              << spec};
     }
 
     // Construct an icu::Collator.
@@ -584,25 +673,13 @@ StatusWith<std::unique_ptr<CollatorInterface>> CollatorFactoryICU::makeFromBSON(
         icuError.set(status);
         return {ErrorCodes::OperationFailed,
                 str::stream() << "Failed to create collator: " << icuError.errorName()
-                              << ". Collation spec: " << spec};
+                              << ". Collation spec: "
+                              << spec};
     }
 
-    // Check that the locale ID is recognized by ICU. Constructing an icu::Collator from an
-    // unrecognized locale will cause the collator to fall back on the default locale.
-    icu::Locale collatorLocale = icuCollator->getLocale(ULOC_VALID_LOCALE, status);
-    if (U_FAILURE(status)) {
-        icu::ErrorCode icuError;
-        icuError.set(status);
-        return {ErrorCodes::OperationFailed,
-                str::stream() << "Failed to get locale from icu::Collator: " << icuError.errorName()
-                              << ". Collation spec: " << spec};
-    }
-    const char* collatorLocaleBaseName = collatorLocale.getBaseName();
-    if (str::equals("", collatorLocaleBaseName) ||
-        str::equals(kFallbackLocaleName, collatorLocaleBaseName)) {
-        return {ErrorCodes::BadValue,
-                str::stream() << "Field '" << CollationSpec::kLocaleField
-                              << "' is not a recognized ICU locale in: " << spec};
+    Status localeValidationStatus = validateLocaleID(spec, parsedLocaleID.getValue(), *icuCollator);
+    if (!localeValidationStatus.isOK()) {
+        return localeValidationStatus;
     }
 
     // Construct a CollationSpec using the options provided in spec or the defaults in icuCollator.

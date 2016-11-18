@@ -80,29 +80,31 @@ const Milliseconds kOplogSocketTimeout(30000);
  */
 class DataReplicatorExternalStateBackgroundSync : public DataReplicatorExternalStateImpl {
 public:
-    DataReplicatorExternalStateBackgroundSync(ReplicationCoordinator* replicationCoordinator,
-                                              BackgroundSync* bgsync);
+    DataReplicatorExternalStateBackgroundSync(
+        ReplicationCoordinator* replicationCoordinator,
+        ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
+        BackgroundSync* bgsync);
     bool shouldStopFetching(const HostAndPort& source,
-                            const OpTime& sourceOpTime,
-                            bool sourceHasSyncSource) override;
+                            const rpc::ReplSetMetadata& metadata) override;
 
 private:
     BackgroundSync* _bgsync;
 };
 
 DataReplicatorExternalStateBackgroundSync::DataReplicatorExternalStateBackgroundSync(
-    ReplicationCoordinator* replicationCoordinator, BackgroundSync* bgsync)
-    : DataReplicatorExternalStateImpl(replicationCoordinator), _bgsync(bgsync) {}
+    ReplicationCoordinator* replicationCoordinator,
+    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
+    BackgroundSync* bgsync)
+    : DataReplicatorExternalStateImpl(replicationCoordinator, replicationCoordinatorExternalState),
+      _bgsync(bgsync) {}
 
-bool DataReplicatorExternalStateBackgroundSync::shouldStopFetching(const HostAndPort& source,
-                                                                   const OpTime& sourceOpTime,
-                                                                   bool sourceHasSyncSource) {
+bool DataReplicatorExternalStateBackgroundSync::shouldStopFetching(
+    const HostAndPort& source, const rpc::ReplSetMetadata& metadata) {
     if (_bgsync->shouldStopFetching()) {
         return true;
     }
 
-    return DataReplicatorExternalStateImpl::shouldStopFetching(
-        source, sourceOpTime, sourceHasSyncSource);
+    return DataReplicatorExternalStateImpl::shouldStopFetching(source, metadata);
 }
 
 /**
@@ -121,9 +123,6 @@ size_t getSize(const BSONObj& o) {
 }  // namespace
 
 MONGO_FP_DECLARE(rsBgSyncProduce);
-
-BackgroundSync* BackgroundSync::s_instance = 0;
-stdx::mutex BackgroundSync::s_mutex;
 
 // The number and time spent reading batches off the network
 static TimerStats getmoreReplStats;
@@ -150,26 +149,14 @@ static ServerStatusMetricField<int> displayBufferMaxSize("repl.buffer.maxSizeByt
                                                          &bufferMaxSizeGauge);
 
 
-BackgroundSyncInterface::~BackgroundSyncInterface() {}
-
 BackgroundSync::BackgroundSync()
     : _buffer(bufferMaxSizeGauge, &getSize),
       _threadPoolTaskExecutor(makeThreadPool(),
                               executor::makeNetworkInterface("NetworkInterfaceASIO-BGSync")),
       _replCoord(getGlobalReplicationCoordinator()),
-      _dataReplicatorExternalState(
-          stdx::make_unique<DataReplicatorExternalStateBackgroundSync>(_replCoord, this)),
       _syncSourceResolver(_replCoord),
       _lastOpTimeFetched(Timestamp(std::numeric_limits<int>::max(), 0),
                          std::numeric_limits<long long>::max()) {}
-
-BackgroundSync* BackgroundSync::get() {
-    stdx::unique_lock<stdx::mutex> lock(s_mutex);
-    if (s_instance == NULL && !inShutdown()) {
-        s_instance = new BackgroundSync();
-    }
-    return s_instance;
-}
 
 void BackgroundSync::shutdown() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -184,7 +171,8 @@ void BackgroundSync::shutdown() {
     }
 }
 
-void BackgroundSync::producerThread() {
+void BackgroundSync::producerThread(
+    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState) {
     Client::initThread("rsBackgroundSync");
     AuthorizationSession::get(cc())->grantInternalAuthorization();
 
@@ -196,7 +184,7 @@ void BackgroundSync::producerThread() {
 
     while (!inShutdown()) {
         try {
-            _producerThread();
+            _producerThread(replicationCoordinatorExternalState);
         } catch (const DBException& e) {
             std::string msg(str::stream() << "sync producer problem: " << e.toString());
             error() << msg;
@@ -222,7 +210,8 @@ void BackgroundSync::_signalNoNewDataForApplier() {
     }
 }
 
-void BackgroundSync::_producerThread() {
+void BackgroundSync::_producerThread(
+    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState) {
     const MemberState state = _replCoord->getMemberState();
     // Stop when the state changes to primary.
     if (_replCoord->isWaitingForApplierToDrain() || state.primary()) {
@@ -256,10 +245,12 @@ void BackgroundSync::_producerThread() {
         start(&txn);
     }
 
-    _produce(&txn);
+    _produce(&txn, replicationCoordinatorExternalState);
 }
 
-void BackgroundSync::_produce(OperationContext* txn) {
+void BackgroundSync::_produce(
+    OperationContext* txn,
+    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState) {
     // this oplog reader does not do a handshake because we don't want the server it's syncing
     // from to track how far it has synced
     {
@@ -300,8 +291,8 @@ void BackgroundSync::_produce(OperationContext* txn) {
         log() << "Our newest OpTime : " << lastOpTimeFetched;
         log() << "Earliest OpTime available is " << syncSourceResp.earliestOpTimeSeen;
         log() << "See http://dochub.mongodb.org/core/resyncingaverystalereplicasetmember";
-        StorageInterface::get(txn)
-            ->setMinValid(txn, {lastOpTimeFetched, syncSourceResp.earliestOpTimeSeen});
+        StorageInterface::get(txn)->setMinValid(
+            txn, {lastOpTimeFetched, syncSourceResp.earliestOpTimeSeen});
         auto status = _replCoord->setMaintenanceMode(true);
         if (!status.isOK()) {
             warning() << "Failed to transition into maintenance mode.";
@@ -339,6 +330,8 @@ void BackgroundSync::_produce(OperationContext* txn) {
 
     // "lastFetched" not used. Already set in _enqueueDocuments.
     Status fetcherReturnStatus = Status::OK();
+    DataReplicatorExternalStateBackgroundSync dataReplicatorExternalState(
+        _replCoord, replicationCoordinatorExternalState, this);
     OplogFetcher* oplogFetcher;
     try {
         auto config = _replCoord->getConfig();
@@ -354,7 +347,7 @@ void BackgroundSync::_produce(OperationContext* txn) {
                                             source,
                                             NamespaceString(rsOplogName),
                                             config,
-                                            _dataReplicatorExternalState.get(),
+                                            &dataReplicatorExternalState,
                                             stdx::bind(&BackgroundSync::_enqueueDocuments,
                                                        this,
                                                        stdx::placeholders::_1,
@@ -433,10 +426,11 @@ void BackgroundSync::_produce(OperationContext* txn) {
         if (!boundaries.start.isNull() || boundaries.end > lastApplied) {
             fassertNoTrace(18750,
                            Status(ErrorCodes::UnrecoverableRollbackError,
-                                  str::stream()
-                                      << "need to rollback, but in inconsistent state. "
-                                      << "minvalid: " << boundaries.end.toString()
-                                      << " > our last optime: " << lastApplied.toString()));
+                                  str::stream() << "need to rollback, but in inconsistent state. "
+                                                << "minvalid: "
+                                                << boundaries.end.toString()
+                                                << " > our last optime: "
+                                                << lastApplied.toString()));
         }
 
         _rollback(txn, source, getConnection);
@@ -654,26 +648,6 @@ long long BackgroundSync::_readLastAppliedHash(OperationContext* txn) {
         fassertFailed(18902);
     }
     return hash;
-}
-
-bool BackgroundSync::getInitialSyncRequestedFlag() const {
-    stdx::lock_guard<stdx::mutex> lock(_initialSyncMutex);
-    return _initialSyncRequestedFlag;
-}
-
-void BackgroundSync::setInitialSyncRequestedFlag(bool value) {
-    stdx::lock_guard<stdx::mutex> lock(_initialSyncMutex);
-    _initialSyncRequestedFlag = value;
-}
-
-BackgroundSync::IndexPrefetchConfig BackgroundSync::getIndexPrefetchConfig() const {
-    stdx::lock_guard<stdx::mutex> lock(_indexPrefetchMutex);
-    return _indexPrefetchConfig;
-}
-
-void BackgroundSync::setIndexPrefetchConfig(const IndexPrefetchConfig cfg) {
-    stdx::lock_guard<stdx::mutex> lock(_indexPrefetchMutex);
-    _indexPrefetchConfig = cfg;
 }
 
 bool BackgroundSync::shouldStopFetching() const {

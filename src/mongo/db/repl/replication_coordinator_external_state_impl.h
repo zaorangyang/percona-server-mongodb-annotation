@@ -32,12 +32,14 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/sync_source_feedback.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/concurrency/old_thread_pool.h"
 
 namespace mongo {
 namespace repl {
@@ -57,9 +59,7 @@ public:
 
     virtual void startMasterSlave(OperationContext* txn);
     virtual void shutdown();
-    virtual Status initializeReplSetStorage(OperationContext* txn,
-                                            const BSONObj& config,
-                                            bool updateReplOpTime);
+    virtual Status initializeReplSetStorage(OperationContext* txn, const BSONObj& config);
     virtual void logTransitionToPrimaryToOplog(OperationContext* txn);
     virtual void forwardSlaveProgress();
     virtual OID ensureMe(OperationContext* txn);
@@ -87,6 +87,12 @@ public:
     virtual void notifyOplogMetadataWaiters();
     virtual double getElectionTimeoutOffsetLimitFraction() const;
     virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* txn) const;
+    virtual StatusWith<OpTime> multiApply(OperationContext* txn,
+                                          const MultiApplier::Operations& ops,
+                                          MultiApplier::ApplyOperationFn applyOperation) override;
+    virtual void multiSyncApply(const MultiApplier::Operations& ops) override;
+    virtual void multiInitialSyncApply(const MultiApplier::Operations& ops,
+                                       const HostAndPort& source) override;
 
     std::string getNextOpContextThreadName();
 
@@ -105,6 +111,13 @@ private:
     // for forwarding replication progress information upstream when there is chained
     // replication.
     SyncSourceFeedback _syncSourceFeedback;
+
+    // The BackgroundSync class is responsible for pulling ops off the network from the sync source
+    // and into a BlockingQueue.
+    // We can't create it on construction because it needs a fully constructed
+    // ReplicationCoordinator, but this ExternalState object is constructed prior to the
+    // ReplicationCoordinator.
+    std::unique_ptr<BackgroundSync> _bgSync;
 
     // Thread running SyncSourceFeedback::run().
     std::unique_ptr<stdx::thread> _syncSourceFeedbackThread;
@@ -126,6 +139,9 @@ private:
     StartInitialSyncFn _startInitialSyncIfNeededFn;
     StartSteadyReplicationFn _startSteadReplicationFn;
     std::unique_ptr<stdx::thread> _initialSyncThread;
+
+    // Used by repl::multiApply() to apply the sync source's operations in parallel.
+    std::unique_ptr<OldThreadPool> _writerPool;
 };
 
 }  // namespace repl

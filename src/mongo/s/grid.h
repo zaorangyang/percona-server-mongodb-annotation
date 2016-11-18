@@ -31,6 +31,7 @@
 #include <memory>
 
 #include "mongo/db/repl/optime.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -76,11 +77,15 @@ public:
               executor::NetworkInterface* network);
 
     /**
+     * Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
+     * it can be deleted.
      * @return true if shards and config servers are allowed to use 'localhost' in address
      */
     bool allowLocalHost() const;
 
     /**
+     * Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
+     * it can be deleted.
      * @param whether to allow shards and config servers to use 'localhost' in address
      */
     void setAllowLocalHost(bool allow);
@@ -117,8 +122,18 @@ public:
         return _balancerConfig.get();
     }
 
+    /**
+     * Returns the the last optime that a shard or config server has reported as the current
+     * committed optime on the config server.
+     * NOTE: This is not valid to call on a config server instance.
+     */
     repl::OpTime configOpTime() const;
 
+    /**
+     * Called whenever a mongos or shard gets a response from a config server or shard and updates
+     * what we've seen as the last config server optime.
+     * NOTE: This is not valid to call on a config server instance.
+     */
     void advanceConfigOpTime(repl::OpTime opTime);
 
     /**
@@ -151,9 +166,12 @@ private:
     mutable stdx::mutex _mutex;
 
     // Last known highest opTime from the config server that should be used when doing reads.
+    // This value is updated any time a shard or mongos talks to a config server or a shard.
     repl::OpTime _configOpTime;
 
-    // can 'localhost' be used in shard addresses?
+    // Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
+    // it can be deleted.
+    // Can 'localhost' be used in shard addresses?
     bool _allowLocalShard;
 };
 

@@ -57,10 +57,7 @@
 
 namespace mongo {
 
-UpdateResult update(OperationContext* txn,
-                    Database* db,
-                    const UpdateRequest& request,
-                    OpDebug* opDebug) {
+UpdateResult update(OperationContext* txn, Database* db, const UpdateRequest& request) {
     invariant(db);
 
     // Explain should never use this helper.
@@ -99,7 +96,8 @@ UpdateResult update(OperationContext* txn,
             if (userInitiatedWritesAndNotPrimary) {
                 uassertStatusOK(Status(ErrorCodes::NotMaster,
                                        str::stream() << "Not primary while creating collection "
-                                                     << nsString.ns() << " during upsert"));
+                                                     << nsString.ns()
+                                                     << " during upsert"));
             }
             WriteUnitOfWork wuow(txn);
             collection = db->createCollection(txn, nsString.ns(), CollectionOptions());
@@ -113,8 +111,9 @@ UpdateResult update(OperationContext* txn,
     ParsedUpdate parsedUpdate(txn, &request);
     uassertStatusOK(parsedUpdate.parseRequest());
 
+    OpDebug* const nullOpDebug = nullptr;
     std::unique_ptr<PlanExecutor> exec =
-        uassertStatusOK(getExecutorUpdate(txn, opDebug, collection, &parsedUpdate));
+        uassertStatusOK(getExecutorUpdate(txn, nullOpDebug, collection, &parsedUpdate));
 
     uassertStatusOK(exec->executePlan());
     if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
@@ -124,11 +123,7 @@ UpdateResult update(OperationContext* txn,
         lastOpSetterGuard.Dismiss();
     }
 
-    PlanSummaryStats summaryStats;
-    Explain::getSummaryStats(*exec, &summaryStats);
     const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
-    UpdateStage::recordUpdateStatsInOpDebug(updateStats, opDebug);
-    opDebug->setPlanSummaryMetrics(summaryStats);
 
     return UpdateStage::makeUpdateResult(updateStats);
 }

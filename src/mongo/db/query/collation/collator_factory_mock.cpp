@@ -30,7 +30,7 @@
 
 #include "mongo/db/query/collation/collator_factory_mock.h"
 
-#include "mongo/base/init.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/stdx/memory.h"

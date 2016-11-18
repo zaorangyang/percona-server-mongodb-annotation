@@ -39,7 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/executor/network_interface_mock.h"
@@ -60,11 +60,12 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/set_shard_version_request.h"
-#include "mongo/s/sharding_egress_metadata_hook.h"
+#include "mongo/s/sharding_egress_metadata_hook_for_mongos.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
 
@@ -72,7 +73,7 @@ using executor::NetworkInterfaceMock;
 using executor::NetworkTestEnv;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
-using rpc::ShardingEgressMetadataHook;
+using rpc::ShardingEgressMetadataHookForMongos;
 using unittest::assertGet;
 
 using std::string;
@@ -83,26 +84,27 @@ ShardingTestFixture::ShardingTestFixture() = default;
 
 ShardingTestFixture::~ShardingTestFixture() = default;
 
-const stdx::chrono::seconds ShardingTestFixture::kFutureTimeout{5};
+const Seconds ShardingTestFixture::kFutureTimeout{5};
 
 void ShardingTestFixture::setUp() {
     _service = stdx::make_unique<ServiceContextNoop>();
     _service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
     _service->setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
+    _service->setTickSource(stdx::make_unique<TickSourceMock>());
     _messagePort = stdx::make_unique<MessagingPortMock>();
     _client = _service->makeClient("ShardingTestFixture", _messagePort.get());
     _opCtx = _client->makeOperationContext();
 
     // Set up executor pool used for most operations.
     auto fixedNet = stdx::make_unique<executor::NetworkInterfaceMock>();
-    fixedNet->setEgressMetadataHook(stdx::make_unique<ShardingEgressMetadataHook>());
+    fixedNet->setEgressMetadataHook(stdx::make_unique<ShardingEgressMetadataHookForMongos>());
     _mockNetwork = fixedNet.get();
     auto fixedExec = makeThreadPoolTestExecutor(std::move(fixedNet));
     _networkTestEnv = stdx::make_unique<NetworkTestEnv>(fixedExec.get(), _mockNetwork);
     _executor = fixedExec.get();
 
     auto netForPool = stdx::make_unique<executor::NetworkInterfaceMock>();
-    netForPool->setEgressMetadataHook(stdx::make_unique<ShardingEgressMetadataHook>());
+    netForPool->setEgressMetadataHook(stdx::make_unique<ShardingEgressMetadataHookForMongos>());
     auto execForPool = makeThreadPoolTestExecutor(std::move(netForPool));
     std::vector<std::unique_ptr<executor::TaskExecutor>> executorsForPool;
     executorsForPool.emplace_back(std::move(execForPool));
@@ -167,14 +169,13 @@ void ShardingTestFixture::setUp() {
 
     // For now initialize the global grid object. All sharding objects will be accessible from there
     // until we get rid of it.
-    grid.init(
-        std::move(cm),
-        stdx::make_unique<CatalogCache>(),
-        std::move(shardRegistry),
-        stdx::make_unique<ClusterCursorManager>(_service->getPreciseClockSource()),
-        stdx::make_unique<BalancerConfiguration>(ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes),
-        std::move(executorPool),
-        _mockNetwork);
+    grid.init(std::move(cm),
+              stdx::make_unique<CatalogCache>(),
+              std::move(shardRegistry),
+              stdx::make_unique<ClusterCursorManager>(_service->getPreciseClockSource()),
+              stdx::make_unique<BalancerConfiguration>(),
+              std::move(executorPool),
+              _mockNetwork);
 }
 
 void ShardingTestFixture::tearDown() {
@@ -282,7 +283,7 @@ void ShardingTestFixture::expectGetShards(const std::vector<ShardType>& shards) 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.toString(), ShardType::ConfigNS);
 
-        auto queryResult = LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false);
+        auto queryResult = QueryRequest::makeFromFindCommand(nss, request.cmdObj, false);
         ASSERT_OK(queryResult.getStatus());
 
         const auto& query = queryResult.getValue();
@@ -341,8 +342,9 @@ void ShardingTestFixture::expectConfigCollectionCreate(const HostAndPort& config
         ASSERT_EQUALS(configHost, request.target);
         ASSERT_EQUALS("config", request.dbname);
 
-        BSONObj expectedCreateCmd = BSON("create" << collName << "capped" << true << "size"
-                                                  << cappedSize << "maxTimeMS" << 30000);
+        BSONObj expectedCreateCmd =
+            BSON("create" << collName << "capped" << true << "size" << cappedSize << "maxTimeMS"
+                          << 30000);
         ASSERT_EQUALS(expectedCreateCmd, request.cmdObj);
 
         return response;

@@ -36,19 +36,20 @@
 
 #include "mongo/db/fts/fts_index_format.h"
 #include "mongo/db/fts/fts_spec.h"
+#include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
 namespace fts {
 
 using std::string;
+using unittest::assertGet;
 
 TEST(FTSIndexFormat, Simple1) {
-    FTSSpec spec(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                     << "text"))));
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
+                                                               << "text")))));
     BSONObjSet keys;
     FTSIndexFormat::getKeys(spec,
                             BSON("data"
@@ -64,14 +65,16 @@ TEST(FTSIndexFormat, Simple1) {
 }
 
 TEST(FTSIndexFormat, ExtraBack1) {
-    FTSSpec spec(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                     << "text"
-                                                     << "x" << 1))));
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
+                                                               << "text"
+                                                               << "x"
+                                                               << 1)))));
     BSONObjSet keys;
     FTSIndexFormat::getKeys(spec,
                             BSON("data"
                                  << "cat"
-                                 << "x" << 5),
+                                 << "x"
+                                 << 5),
                             &keys);
 
     ASSERT_EQUALS(1U, keys.size());
@@ -83,36 +86,15 @@ TEST(FTSIndexFormat, ExtraBack1) {
     ASSERT_EQUALS(5, i.next().numberInt());
 }
 
-/*
-TEST( FTSIndexFormat, ExtraBackArray1 ) {
-    FTSSpec spec( FTSSpec::fixSpec( BSON( "key" << BSON( "data" << "text" <<
-                                                         "x.y" << 1 ) ) ) );
-    BSONObjSet keys;
-    FTSIndexFormat::getKeys( spec,
-                             BSON( "data" << "cat" <<
-                                   "x" << BSON_ARRAY( BSON( "y" << 1 ) <<
-                                                      BSON( "y" << 2 ) ) ),
-                             &keys );
-
-    ASSERT_EQUALS( 1U, keys.size() );
-    BSONObj key = *(keys.begin());
-    log() << "e: " << key << endl;
-    ASSERT_EQUALS( 3, key.nFields() );
-    BSONObjIterator i( key );
-    ASSERT_EQUALS( StringData("cat"), i.next().valuestr() );
-    ASSERT( i.next().numberDouble() > 0 );
-    ASSERT_EQUALS( 5, i.next().numberInt() );
-}
-*/
-
 TEST(FTSIndexFormat, ExtraFront1) {
-    FTSSpec spec(FTSSpec::fixSpec(BSON("key" << BSON("x" << 1 << "data"
-                                                         << "text"))));
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << 1 << "data"
+                                                                   << "text")))));
     BSONObjSet keys;
     FTSIndexFormat::getKeys(spec,
                             BSON("data"
                                  << "cat"
-                                 << "x" << 5),
+                                 << "x"
+                                 << 5),
                             &keys);
 
     ASSERT_EQUALS(1U, keys.size());
@@ -125,8 +107,8 @@ TEST(FTSIndexFormat, ExtraFront1) {
 }
 
 TEST(FTSIndexFormat, StopWords1) {
-    FTSSpec spec(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                     << "text"))));
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
+                                                               << "text")))));
 
     BSONObjSet keys1;
     FTSIndexFormat::getKeys(spec,
@@ -173,8 +155,10 @@ void assertEqualsIndexKeys(std::set<std::string>& expectedKeys, const BSONObjSet
  * Terms that are too long are not truncated in version 1.
  */
 TEST(FTSIndexFormat, LongWordsTextIndexVersion1) {
-    FTSSpec spec(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                     << "text") << "textIndexVersion" << 1)));
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
+                                                               << "text")
+                                                       << "textIndexVersion"
+                                                       << 1))));
     BSONObjSet keys;
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
@@ -201,8 +185,10 @@ TEST(FTSIndexFormat, LongWordsTextIndexVersion1) {
  * characters of the term to form the index key.
  */
 TEST(FTSIndexFormat, LongWordTextIndexVersion2) {
-    FTSSpec spec(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                     << "text") << "textIndexVersion" << 2)));
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
+                                                               << "text")
+                                                       << "textIndexVersion"
+                                                       << 2))));
     BSONObjSet keys;
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
@@ -234,8 +220,10 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion2) {
  * characters of the term to form the index key.
  */
 TEST(FTSIndexFormat, LongWordTextIndexVersion3) {
-    FTSSpec spec(FTSSpec::fixSpec(BSON("key" << BSON("data"
-                                                     << "text") << "textIndexVersion" << 3)));
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
+                                                               << "text")
+                                                       << "textIndexVersion"
+                                                       << 3))));
     BSONObjSet keys;
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"

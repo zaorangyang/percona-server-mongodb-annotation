@@ -49,8 +49,8 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/chunk.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/log.h"
@@ -88,8 +88,8 @@ BSONObj createRecvChunkCommitRequest(const NamespaceString& nss,
  */
 class DeleteNotificationStage final : public PlanStage {
 public:
-    DeleteNotificationStage(MigrationChunkClonerSourceLegacy* cloner)
-        : PlanStage("SHARDING_NOTIFY_DELETE", nullptr), _cloner(cloner) {}
+    DeleteNotificationStage(MigrationChunkClonerSourceLegacy* cloner, OperationContext* txn)
+        : PlanStage("SHARDING_NOTIFY_DELETE", txn), _cloner(cloner) {}
 
     void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) override {
         if (type == INVALIDATION_DELETION) {
@@ -231,10 +231,10 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
     invariant(!txn->lockState()->isLocked());
     auto scopedGuard = MakeGuard([&] { cancelClone(txn); });
 
-    const Milliseconds startTime(curTimeMillis64());
+    const auto startTime = Date_t::now();
 
     int iteration = 0;
-    while ((Milliseconds(curTimeMillis64()) - startTime) < maxTimeToWait) {
+    while ((Date_t::now() - startTime) < maxTimeToWait) {
         // Exponential sleep backoff, up to 1024ms. Don't sleep much on the first few iterations,
         // since we want empty chunk migrations to be fast.
         sleepmillis(1 << std::min(iteration, 10));
@@ -400,7 +400,7 @@ Status MigrationChunkClonerSourceLegacy::nextCloneBatch(OperationContext* txn,
 
     ElapsedTracker tracker(txn->getServiceContext()->getFastClockSource(),
                            internalQueryExecYieldIterations,
-                           Milliseconds(internalQueryExecYieldPeriodMS));
+                           Milliseconds(internalQueryExecYieldPeriodMS.load()));
 
     stdx::lock_guard<stdx::mutex> sl(_mutex);
 
@@ -514,7 +514,8 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* txn
     if (!idx) {
         return {ErrorCodes::IndexNotFound,
                 str::stream() << "can't find index with prefix " << _shardKeyPattern.toBSON()
-                              << " in storeCurrentLocs for " << _args.getNss().ns()};
+                              << " in storeCurrentLocs for "
+                              << _args.getNss().ns()};
     }
 
     // Install the stage, which will listen for notifications on the collection
@@ -527,7 +528,7 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* txn
         auto statusWithPlanExecutor =
             PlanExecutor::make(txn,
                                stdx::make_unique<WorkingSet>(),
-                               stdx::make_unique<DeleteNotificationStage>(this),
+                               stdx::make_unique<DeleteNotificationStage>(this, txn),
                                collection,
                                PlanExecutor::YIELD_MANUAL);
         invariant(statusWithPlanExecutor.isOK());
@@ -604,10 +605,19 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* txn
         return {
             ErrorCodes::ChunkTooBig,
             str::stream() << "Cannot move chunk: the maximum number of documents for a chunk is "
-                          << maxRecsWhenFull << ", the maximum chunk size is "
-                          << _args.getMaxChunkSizeBytes() << ", average document size is "
-                          << avgRecSize << ". Found " << recCount << " documents in chunk "
-                          << " ns: " << _args.getNss().ns() << " " << _args.getMinKey() << " -> "
+                          << maxRecsWhenFull
+                          << ", the maximum chunk size is "
+                          << _args.getMaxChunkSizeBytes()
+                          << ", average document size is "
+                          << avgRecSize
+                          << ". Found "
+                          << recCount
+                          << " documents in chunk "
+                          << " ns: "
+                          << _args.getNss().ns()
+                          << " "
+                          << _args.getMinKey()
+                          << " -> "
                           << _args.getMaxKey()};
     }
 

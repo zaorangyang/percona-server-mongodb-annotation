@@ -30,13 +30,14 @@ functions:
         script: |
           rm -rf ./*
           mkdir src
+    - command: manifest.load
     - command: git.get_project
       params:
         directory: src
         revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
           dsi: ${dsi_rev}
           workloads: ${workloads_rev}
-          ycsb: ${ycsb_rev}
+          YCSB: ${YCSB_rev}
     - command: git.apply_patch
       params:
         directory: src
@@ -68,7 +69,7 @@ functions:
           # create all resources and instances
           ../../bin/setup-cluster.sh ${cluster}
           echo "EC2 Cluster CREATED."
-          tar -czvf cluster_config.tgz ips.sh terraform.tfstate cluster.tf terraform.tfvars variables.tf
+          tar -czvf cluster_config.tgz ips.sh ips.py terraform.tfstate cluster.tf terraform.tfvars variables.tf
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -106,8 +107,9 @@ functions:
         script: |
           set -e
           set -o verbose
+          source ./venv/bin/activate
           cd ./clusters/${cluster}
-          ../../bin/configure-mongodb-cluster.sh ${setup} ${storageEngine}
+          ../../bin/mongodb_setup.py ${setup} ${storageEngine}
           echo "${cluster} MongoDB Cluster STARTED."
   "run test":
     - command: shell.exec
@@ -158,6 +160,7 @@ functions:
           cd ./clusters/${cluster}/reports
           # move additional file here
           cp ../ips.sh .
+          cp ../ips.py .
           if [ -f "../terraform.log" ]; then cp ../terraform.log .; fi
           cp ../../perf.json .
           cd ..
@@ -238,6 +241,7 @@ functions:
           set -o verbose
           rm -rf ./src
           mkdir src
+    - command: manifest.load
     - command: git.get_project
       params:
         directory: src
@@ -275,6 +279,7 @@ functions:
 tasks:
 - name: compile
   commands:
+    - command: manifest.load
     - command: git.get_project
       params:
         directory: src
@@ -475,7 +480,7 @@ modules:
   prefix: workloads
   branch: master
 
-- name: ycsb
+- name: YCSB
   repo: git@github.com:mongodb-labs/YCSB.git
   prefix: YCSB
   branch: evergreen
@@ -493,7 +498,7 @@ buildvariants:
   modules: &modules
     - dsi
     - workloads
-    - ycsb
+    - YCSB
   expansions:
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ --release
     setup: single-replica
@@ -530,6 +535,7 @@ buildvariants:
 - name: linux-standalone-c3-4xlarge
   display_name: Linux Standalone (c3.4xlarge trial)
   batchtime: 480 # 8 hours
+  disabled: true
   modules: *modules
   expansions:
     setup: standalone
@@ -547,6 +553,7 @@ buildvariants:
   display_name: Linux Standalone (c3.2xlarge trial)
   batchtime: 480 # 8 hours
   modules: *modules
+  disabled: true
   expansions:
     setup: standalone
     cluster: single-c3-2xlarge
@@ -614,6 +621,7 @@ buildvariants:
   display_name: Windows Standalone (trial)
   batchtime: 480 # 8 hours
   modules: *modules
+  disabled: true
   expansions:
     setup: standalone-win
     cluster: windows-single
@@ -637,6 +645,7 @@ buildvariants:
   display_name: Windows 1-node ReplSet (trial)
   batchtime: 480 # 8 hours
   modules: *modules
+  disabled: true
   expansions:
     setup: replica-win
     cluster: windows-single

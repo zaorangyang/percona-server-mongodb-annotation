@@ -146,17 +146,17 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         if (replMetadata.isOK() && _rsConfig.isInitialized() && _rsConfig.hasReplicaSetId() &&
             replMetadata.getValue().getReplicaSetId().isSet() &&
             _rsConfig.getReplicaSetId() != replMetadata.getValue().getReplicaSetId()) {
-            responseStatus =
-                Status(ErrorCodes::InvalidReplicaSetConfig,
-                       str::stream()
-                           << "replica set IDs do not match, ours: " << _rsConfig.getReplicaSetId()
-                           << "; remote node's: " << replMetadata.getValue().getReplicaSetId());
+            responseStatus = Status(ErrorCodes::InvalidReplicaSetConfig,
+                                    str::stream() << "replica set IDs do not match, ours: "
+                                                  << _rsConfig.getReplicaSetId()
+                                                  << "; remote node's: "
+                                                  << replMetadata.getValue().getReplicaSetId());
             // Ignore metadata.
             replMetadata = responseStatus;
         }
         if (replMetadata.isOK()) {
-            // Asynchronous stepdown could happen, but it will be queued in executor after
-            // this function, so we cannot and don't need to wait for it to finish.
+            // Asynchronous stepdown could happen, but it will wait for _topoMutex and execute
+            // after this function, so we cannot and don't need to wait for it to finish.
             _processReplSetMetadata_incallback(replMetadata.getValue());
         }
     }
@@ -300,7 +300,7 @@ void remoteStepdownCallback(const ReplicationExecutor::RemoteCommandCallbackArgs
 }  // namespace
 
 void ReplicationCoordinatorImpl::_requestRemotePrimaryStepdown(const HostAndPort& target) {
-    RemoteCommandRequest request(target, "admin", BSON("replSetStepDown" << 1));
+    RemoteCommandRequest request(target, "admin", BSON("replSetStepDown" << 20));
 
     log() << "Requesting " << target << " step down from primary";
     CBHStatus cbh = _replExecutor.scheduleRemoteCommand(request, remoteStepdownCallback);
@@ -435,14 +435,16 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
 
     if (!myIndex.getStatus().isOK() && myIndex.getStatus() != ErrorCodes::NodeNotFound) {
         warning() << "Not persisting new configuration in heartbeat response to disk because "
-                     "it is invalid: " << myIndex.getStatus();
+                     "it is invalid: "
+                  << myIndex.getStatus();
     } else {
         Status status = _externalState->storeLocalConfigDocument(cbd.txn, newConfig.toBSON());
 
         lk.lock();
         if (!status.isOK()) {
             error() << "Ignoring new configuration in heartbeat response because we failed to"
-                       " write it to stable storage; " << status;
+                       " write it to stable storage; "
+                    << status;
             invariant(_rsConfigState == kConfigHBReconfiguring);
             if (_rsConfig.isInitialized()) {
                 _setConfigState_inlock(kConfigSteady);

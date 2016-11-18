@@ -37,17 +37,17 @@
 #include <memory>
 
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
@@ -454,7 +454,8 @@ void syncFixUp(OperationContext* txn,
                 auto status = options.parse(optionsField.Obj());
                 if (!status.isOK()) {
                     throw RSFatalException(str::stream() << "Failed to parse options " << info
-                                                         << ": " << status.toString());
+                                                         << ": "
+                                                         << status.toString());
                 }
             } else {
                 // Use default options.
@@ -467,19 +468,19 @@ void syncFixUp(OperationContext* txn,
 
             auto status = collection->setValidator(txn, options.validator);
             if (!status.isOK()) {
-                throw RSFatalException(str::stream()
-                                       << "Failed to set validator: " << status.toString());
+                throw RSFatalException(str::stream() << "Failed to set validator: "
+                                                     << status.toString());
             }
             status = collection->setValidationAction(txn, options.validationAction);
             if (!status.isOK()) {
-                throw RSFatalException(str::stream()
-                                       << "Failed to set validationAction: " << status.toString());
+                throw RSFatalException(str::stream() << "Failed to set validationAction: "
+                                                     << status.toString());
             }
 
             status = collection->setValidationLevel(txn, options.validationLevel);
             if (!status.isOK()) {
-                throw RSFatalException(str::stream()
-                                       << "Failed to set validationLevel: " << status.toString());
+                throw RSFatalException(str::stream() << "Failed to set validationLevel: "
+                                                     << status.toString());
             }
 
             wuow.commit();
@@ -742,7 +743,6 @@ void syncFixUp(OperationContext* txn,
                     }
                 } else {
                     // TODO faster...
-                    OpDebug debug;
                     updates++;
 
                     const NamespaceString requestNs(doc.ns);
@@ -755,7 +755,7 @@ void syncFixUp(OperationContext* txn,
                     UpdateLifecycleImpl updateLifecycle(requestNs);
                     request.setLifecycle(&updateLifecycle);
 
-                    update(txn, ctx.db(), request, &debug);
+                    update(txn, ctx.db(), request);
                 }
             } catch (const DBException& e) {
                 log() << "exception in rollback ns:" << doc.ns << ' ' << pattern.toString() << ' '
@@ -823,7 +823,8 @@ Status _syncRollback(OperationContext* txn,
         if (!replCoord->setFollowerMode(MemberState::RS_ROLLBACK)) {
             return Status(ErrorCodes::OperationFailed,
                           str::stream() << "Cannot transition from "
-                                        << replCoord->getMemberState().toString() << " to "
+                                        << replCoord->getMemberState().toString()
+                                        << " to "
                                         << MemberState(MemberState::RS_ROLLBACK).toString());
         }
     }
@@ -834,8 +835,9 @@ Status _syncRollback(OperationContext* txn,
     {
         log() << "rollback 2 FindCommonPoint";
         try {
-            auto processOperationForFixUp =
-                [&how](const BSONObj& operation) { return refetch(how, operation); };
+            auto processOperationForFixUp = [&how](const BSONObj& operation) {
+                return refetch(how, operation);
+            };
             auto res = syncRollBackLocalOperations(
                 localOplog, rollbackSource.getOplog(), processOperationForFixUp);
             if (!res.isOK()) {
@@ -857,7 +859,8 @@ Status _syncRollback(OperationContext* txn,
             return Status(ErrorCodes::UnrecoverableRollbackError,
                           str::stream()
                               << "need to rollback, but unable to determine common point between"
-                                 " local and remote oplog: " << e.what(),
+                                 " local and remote oplog: "
+                              << e.what(),
                           18752);
         } catch (const DBException& e) {
             warning() << "rollback 2 exception " << e.toString() << "; sleeping 1 min";
@@ -913,11 +916,9 @@ Status syncRollback(OperationContext* txn,
                     const OplogInterface& localOplog,
                     const RollbackSource& rollbackSource,
                     ReplicationCoordinator* replCoord) {
-    return syncRollback(txn,
-                        localOplog,
-                        rollbackSource,
-                        replCoord,
-                        [](Seconds seconds) { sleepsecs(durationCount<Seconds>(seconds)); });
+    return syncRollback(txn, localOplog, rollbackSource, replCoord, [](Seconds seconds) {
+        sleepsecs(durationCount<Seconds>(seconds));
+    });
 }
 
 }  // namespace repl

@@ -32,8 +32,8 @@
 
 #include "mongo/db/commands/find_and_modify.h"
 
-#include <memory>
 #include <boost/optional.hpp>
+#include <memory>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
@@ -127,7 +127,8 @@ StatusWith<boost::optional<BSONObj>> advanceExecutor(OperationContext* txn,
         const std::string opstr = isRemove ? "delete" : "update";
         return {ErrorCodes::OperationFailed,
                 str::stream() << "executor returned " << PlanExecutor::statestr(state)
-                              << " while executing " << opstr};
+                              << " while executing "
+                              << opstr};
     }
 
     invariant(state == PlanExecutor::IS_EOF);
@@ -142,6 +143,7 @@ void makeUpdateRequest(const FindAndModifyRequest& args,
     requestOut->setProj(args.getFields());
     requestOut->setUpdates(args.getUpdateObj());
     requestOut->setSort(args.getSort());
+    requestOut->setCollation(args.getCollation());
     requestOut->setUpsert(args.isUpsert());
     requestOut->setReturnDocs(args.shouldReturnNew() ? UpdateRequest::RETURN_NEW
                                                      : UpdateRequest::RETURN_OLD);
@@ -155,6 +157,7 @@ void makeDeleteRequest(const FindAndModifyRequest& args, bool explain, DeleteReq
     requestOut->setQuery(args.getQuery());
     requestOut->setProj(args.getFields());
     requestOut->setSort(args.getSort());
+    requestOut->setCollation(args.getCollation());
     requestOut->setMulti(false);
     requestOut->setYieldPolicy(PlanExecutor::YIELD_AUTO);
     requestOut->setReturnDeleted(true);  // Always return the old value.
@@ -376,8 +379,8 @@ public:
                 // Attach the namespace and database profiling level to the current op.
                 {
                     stdx::lock_guard<Client> lk(*txn->getClient());
-                    CurOp::get(txn)
-                        ->enter_inlock(nsString.ns().c_str(), autoDb.getDb()->getProfilingLevel());
+                    CurOp::get(txn)->enter_inlock(nsString.ns().c_str(),
+                                                  autoDb.getDb()->getProfilingLevel());
                 }
 
                 auto css = CollectionShardingState::get(txn, nsString);
@@ -421,7 +424,7 @@ public:
                 if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
                     BSONObjBuilder execStatsBob;
                     Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-                    opDebug->execStats.set(execStatsBob.obj());
+                    curOp->debug().execStats = execStatsBob.obj();
                 }
 
                 boost::optional<BSONObj> value = advanceStatus.getValue();
@@ -444,8 +447,8 @@ public:
                 // Attach the namespace and database profiling level to the current op.
                 {
                     stdx::lock_guard<Client> lk(*txn->getClient());
-                    CurOp::get(txn)
-                        ->enter_inlock(nsString.ns().c_str(), autoDb.getDb()->getProfilingLevel());
+                    CurOp::get(txn)->enter_inlock(nsString.ns().c_str(),
+                                                  autoDb.getDb()->getProfilingLevel());
                 }
 
                 auto css = CollectionShardingState::get(txn, nsString);
@@ -516,7 +519,7 @@ public:
                 if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
                     BSONObjBuilder execStatsBob;
                     Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-                    opDebug->execStats.set(execStatsBob.obj());
+                    curOp->debug().execStats = execStatsBob.obj();
                 }
 
                 boost::optional<BSONObj> value = advanceStatus.getValue();

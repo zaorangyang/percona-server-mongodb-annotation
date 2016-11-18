@@ -37,6 +37,7 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/parallel.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -90,6 +91,8 @@ using std::string;
 using std::stringstream;
 using std::unique_ptr;
 using std::vector;
+
+namespace dps = ::mongo::dotted_path_support;
 
 namespace mr {
 
@@ -416,7 +419,9 @@ void State::prepTempCollection() {
             if (!status.isOK()) {
                 uasserted(17305,
                           str::stream() << "createIndex failed for mr incLong ns: "
-                                        << _config.incLong << " err: " << status.code());
+                                        << _config.incLong
+                                        << " err: "
+                                        << status.code());
             }
             wuow.commit();
         }
@@ -511,7 +516,9 @@ void State::appendResults(BSONObjBuilder& final) {
             BSONObj idKey = BSON("_id" << 1);
             if (!_db.runCommand("admin",
                                 BSON("splitVector" << _config.outputOptions.finalNamespace
-                                                   << "keyPattern" << idKey << "maxChunkSizeBytes"
+                                                   << "keyPattern"
+                                                   << idKey
+                                                   << "maxChunkSizeBytes"
                                                    << _config.splitInfo),
                                 res)) {
                 uasserted(15921, str::stream() << "splitVector failed: " << res);
@@ -622,7 +629,8 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
         if (!_db.runCommand("admin",
                             BSON("renameCollection" << _config.tempNamespace << "to"
                                                     << _config.outputOptions.finalNamespace
-                                                    << "stayTemp" << _config.shardedFirstPass),
+                                                    << "stayTemp"
+                                                    << _config.shardedFirstPass),
                             info)) {
             uasserted(10076, str::stream() << "rename failed: " << info);
         }
@@ -749,8 +757,10 @@ void State::_insertToInc(BSONObj& o) {
         if (o.objsize() > BSONObjMaxUserSize) {
             uasserted(ErrorCodes::BadValue,
                       str::stream() << "object to insert too large for incremental collection"
-                                    << ". size in bytes: " << o.objsize()
-                                    << ", max size: " << BSONObjMaxUserSize);
+                                    << ". size in bytes: "
+                                    << o.objsize()
+                                    << ", max size: "
+                                    << BSONObjMaxUserSize);
         }
 
         // TODO: Consider whether to pass OpDebug for stats tracking under SERVER-23261.
@@ -1060,10 +1070,10 @@ void State::finalReduce(OperationContext* txn, CurOp* curOp, ProgressMeterHolder
     const NamespaceString nss(_config.incLong);
     const ExtensionsCallbackReal extensionsCallback(_txn, &nss);
 
-    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-    lpq->setSort(sortKey);
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setSort(sortKey);
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
+    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
     verify(statusWithCQ.isOK());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -1083,7 +1093,7 @@ void State::finalReduce(OperationContext* txn, CurOp* curOp, ProgressMeterHolder
         o = o.getOwned();  // we will be accessing outside of the lock
         pm.hit();
 
-        if (o.woSortOrder(prev, sortKey) == 0) {
+        if (dps::compareObjectsAccordingToSort(o, prev, sortKey) == 0) {
             // object is same as previous, add to array
             all.push_back(o);
             if (pm->hits() % 100 == 0) {
@@ -1366,6 +1376,16 @@ public:
             }
         }
 
+        // Ensure that the RangePreserver is freed under the lock. This is necessary since the
+        // RangePreserver's destructor unpins a ClientCursor, and access to the CursorManager must
+        // be done under the lock.
+        ON_BLOCK_EXIT([txn, &config, &rangePreserver] {
+            if (rangePreserver) {
+                AutoGetCollectionForRead ctx(txn, config.ns);
+                rangePreserver.reset();
+            }
+        });
+
         bool shouldHaveData = false;
 
         BSONObjBuilder countsBuilder;
@@ -1424,14 +1444,15 @@ public:
                 unique_ptr<ScopedTransaction> scopedXact(new ScopedTransaction(txn, MODE_IS));
                 unique_ptr<AutoGetDb> scopedAutoDb(new AutoGetDb(txn, nss.db(), MODE_S));
 
-                auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-                lpq->setFilter(config.filter);
-                lpq->setSort(config.sort);
+                auto qr = stdx::make_unique<QueryRequest>(nss);
+                qr->setFilter(config.filter);
+                qr->setSort(config.sort);
+                qr->setCollation(config.collation);
 
                 const ExtensionsCallbackReal extensionsCallback(txn, &nss);
 
                 auto statusWithCQ =
-                    CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
+                    CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
                 if (!statusWithCQ.isOK()) {
                     uasserted(17238, "Can't canonicalize query " + config.filter.toString());
                     return 0;
@@ -1545,7 +1566,7 @@ public:
                 if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
                     BSONObjBuilder execStatsBob;
                     Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-                    curOp->debug().execStats.set(execStatsBob.obj());
+                    curOp->debug().execStats = execStatsBob.obj();
                 }
             }
             pm.finished();
@@ -1782,7 +1803,7 @@ public:
                         continue;
                     }
 
-                    if (t.woSortOrder(*(values.begin()), sortKey) == 0) {
+                    if (dps::compareObjectsAccordingToSort(t, *(values.begin()), sortKey) == 0) {
                         values.push_back(t);
                         continue;
                     }

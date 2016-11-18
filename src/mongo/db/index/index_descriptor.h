@@ -32,8 +32,9 @@
 
 #include <string>
 
-#include "mongo/db/jsobj.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/jsobj.h"
 
 #include "mongo/util/stacktrace.h"
 
@@ -97,6 +98,14 @@ public:
         return _keyPattern;
     }
 
+    /**
+     * Test only command for testing behavior resulting from an incorrect key
+     * pattern.
+     */
+    void setKeyPatternForTest(BSONObj newKeyPattern) {
+        _keyPattern = newKeyPattern;
+    }
+
     // How many fields do we index / are in the key pattern?
     int getNumFields() const {
         _checkOk();
@@ -153,9 +162,14 @@ public:
     }
 
     // Is this index multikey?
-    bool isMultikey(OperationContext* txn) const {
+    bool isMultikey(OperationContext* opCtx) const {
         _checkOk();
-        return _collection->getIndexCatalog()->isMultikey(txn, this);
+        return _collection->getIndexCatalog()->isMultikey(opCtx, this);
+    }
+
+    MultikeyPaths getMultikeyPaths(OperationContext* opCtx) const {
+        _checkOk();
+        return _collection->getIndexCatalog()->getMultikeyPaths(opCtx, this);
     }
 
     bool isIdIndex() const {

@@ -32,8 +32,8 @@
 
 #include "mongo/db/index/btree_access_method.h"
 
-#include <vector>
 #include <utility>
+#include <vector>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
@@ -43,6 +43,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
@@ -109,7 +110,9 @@ IndexAccessMethod::IndexAccessMethod(IndexCatalogEntry* btreeState, SortedDataIn
 
 bool IndexAccessMethod::ignoreKeyTooLong(OperationContext* txn) {
     // Ignore this error if we're on a secondary or if the user requested it
-    return !txn->isPrimaryFor(_btreeState->ns()) || !failIndexKeyTooLong;
+    const auto canAcceptWritesForNs = repl::ReplicationCoordinator::get(txn)->canAcceptWritesFor(
+        NamespaceString(_btreeState->ns()));
+    return !canAcceptWritesForNs || !failIndexKeyTooLong;
 }
 
 // Find the keys for obj, put them in the tree pointing to loc

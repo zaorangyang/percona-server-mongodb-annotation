@@ -34,7 +34,7 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
@@ -71,8 +71,7 @@ protected:
             const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
             ASSERT_EQ(nss.ns(), "config.settings");
 
-            auto query =
-                assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+            auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
             ASSERT_EQ(query->ns(), "config.settings");
             ASSERT_EQ(query->getFilter(), BSON("_id" << key));
@@ -95,7 +94,7 @@ protected:
 TEST_F(BalancerConfigurationTestFixture, NoConfigurationDocuments) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    BalancerConfiguration config(1024 * 1024ULL);
+    BalancerConfiguration config;
 
     auto future = launchAsync([&] { ASSERT_OK(config.refreshAndCheck(operationContext())); });
 
@@ -107,13 +106,13 @@ TEST_F(BalancerConfigurationTestFixture, NoConfigurationDocuments) {
     ASSERT(config.isBalancerActive());
     ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
               config.getSecondaryThrottle().getSecondaryThrottle());
-    ASSERT_EQ(1024 * 1024ULL, config.getMaxChunkSizeBytes());
+    ASSERT_EQ(64 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
 }
 
 TEST_F(BalancerConfigurationTestFixture, ChunkSizeSettingsDocumentOnly) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    BalancerConfiguration config(1024 * 1024ULL);
+    BalancerConfiguration config;
 
     auto future = launchAsync([&] { ASSERT_OK(config.refreshAndCheck(operationContext())); });
 
@@ -131,7 +130,7 @@ TEST_F(BalancerConfigurationTestFixture, ChunkSizeSettingsDocumentOnly) {
 TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentOnly) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    BalancerConfiguration config(1024 * 1024ULL);
+    BalancerConfiguration config;
 
     auto future = launchAsync([&] { ASSERT_OK(config.refreshAndCheck(operationContext())); });
 
@@ -144,7 +143,7 @@ TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentOnly) {
     ASSERT(!config.isBalancerActive());
     ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
               config.getSecondaryThrottle().getSecondaryThrottle());
-    ASSERT_EQ(1024 * 1024ULL, config.getMaxChunkSizeBytes());
+    ASSERT_EQ(64 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
 }
 
 TEST(BalancerSettingsType, BalancerDisabled) {
@@ -194,41 +193,44 @@ TEST(BalancerSettingsType, BalancingWindowStopLessThanStart) {
 }
 
 TEST(BalancerSettingsType, InvalidBalancingWindowStartEqualsStop) {
-    ASSERT_NOT_OK(
-        BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start"
-                                                                   << "00:00"
-                                                                   << "stop"
-                                                                   << "00:00"))).getStatus());
+    ASSERT_NOT_OK(BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start"
+                                                                             << "00:00"
+                                                                             << "stop"
+                                                                             << "00:00")))
+                      .getStatus());
 }
 
 TEST(BalancerSettingsType, InvalidBalancingWindowTimeFormat) {
     ASSERT_NOT_OK(BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start"
                                                                              << "23"
                                                                              << "stop"
-                                                                             << "6"))).getStatus());
-
-    ASSERT_NOT_OK(BalancerSettingsType::fromBSON(
-                      BSON("activeWindow" << BSON("start" << 23LL << "stop"
-                                                          << "6:00"))).getStatus());
+                                                                             << "6")))
+                      .getStatus());
 
     ASSERT_NOT_OK(
-        BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start"
-                                                                   << "23:00"
-                                                                   << "stop" << 6LL))).getStatus());
+        BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start" << 23LL << "stop"
+                                                                           << "6:00")))
+            .getStatus());
+
+    ASSERT_NOT_OK(BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start"
+                                                                             << "23:00"
+                                                                             << "stop"
+                                                                             << 6LL)))
+                      .getStatus());
 }
 
 TEST(BalancerSettingsType, InvalidBalancingWindowFormat) {
-    ASSERT_NOT_OK(
-        BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("begin"
-                                                                   << "23:00"
-                                                                   << "stop"
-                                                                   << "6:00"))).getStatus());
+    ASSERT_NOT_OK(BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("begin"
+                                                                             << "23:00"
+                                                                             << "stop"
+                                                                             << "6:00")))
+                      .getStatus());
 
-    ASSERT_NOT_OK(
-        BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start"
-                                                                   << "23:00"
-                                                                   << "end"
-                                                                   << "6:00"))).getStatus());
+    ASSERT_NOT_OK(BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start"
+                                                                             << "23:00"
+                                                                             << "end"
+                                                                             << "6:00")))
+                      .getStatus());
 }
 
 TEST(ChunkSizeSettingsType, NormalValues) {
@@ -255,7 +257,8 @@ TEST(ChunkSizeSettingsType, IllegalValues) {
     ASSERT_NOT_OK(ChunkSizeSettingsType::fromBSON(BSON("value" << -1)).getStatus());
     ASSERT_NOT_OK(ChunkSizeSettingsType::fromBSON(BSON("value" << 1025)).getStatus());
     ASSERT_NOT_OK(ChunkSizeSettingsType::fromBSON(BSON("value"
-                                                       << "WrongType")).getStatus());
+                                                       << "WrongType"))
+                      .getStatus());
     ASSERT_NOT_OK(ChunkSizeSettingsType::fromBSON(BSON("IllegalKey" << 1)).getStatus());
 }
 

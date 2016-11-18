@@ -49,8 +49,8 @@
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
@@ -137,8 +137,8 @@ public:
         }
         const GetMoreRequest& request = parseStatus.getValue();
 
-        return AuthorizationSession::get(client)
-            ->checkAuthForGetMore(request.nss, request.cursorid, request.term.is_initialized());
+        return AuthorizationSession::get(client)->checkAuthForGetMore(
+            request.nss, request.cursorid, request.term.is_initialized());
     }
 
     bool run(OperationContext* txn,
@@ -277,7 +277,7 @@ public:
         // Reset timeout timer on the cursor since the cursor is still in use.
         cursor->setIdleTime(0);
 
-        const bool hasOwnMaxTime = curOp->isMaxTimeSet();
+        const bool hasOwnMaxTime = txn->hasDeadline();
 
         if (!hasOwnMaxTime) {
             // There is no time limit set directly on this getMore command. If the cursor is
@@ -285,10 +285,15 @@ public:
             // any leftover time from the maxTimeMS of the operation that spawned this cursor,
             // applying it to this getMore.
             if (isCursorAwaitData(cursor)) {
-                Seconds awaitDataTimeout(1);
-                curOp->setMaxTimeMicros(durationCount<Microseconds>(awaitDataTimeout));
-            } else {
-                curOp->setMaxTimeMicros(cursor->getLeftoverMaxTimeMicros());
+                uassert(40117,
+                        "Illegal attempt to set operation deadline within DBDirectClient",
+                        !txn->getClient()->isInDirectClient());
+                txn->setDeadlineAfterNowBy(Seconds{1});
+            } else if (cursor->getLeftoverMaxTimeMicros() < Microseconds::max()) {
+                uassert(40118,
+                        "Illegal attempt to set operation deadline within DBDirectClient",
+                        !txn->getClient()->isInDirectClient());
+                txn->setDeadlineAfterNowBy(cursor->getLeftoverMaxTimeMicros());
             }
         }
         txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
@@ -302,9 +307,17 @@ public:
         exec->reattachToOperationContext(txn);
         exec->restoreState();
 
+        auto planSummary = Explain::getPlanSummary(exec);
         {
             stdx::lock_guard<Client>(*txn->getClient());
-            curOp->setPlanSummary_inlock(Explain::getPlanSummary(exec));
+            curOp->setPlanSummary_inlock(planSummary);
+
+            // Ensure that the original query or command object is available in the slow query log,
+            // profiler and currentOp.
+            auto originatingCommand = cursor->getQuery();
+            if (!originatingCommand.isEmpty()) {
+                curOp->setOriginatingCommand_inlock(originatingCommand);
+            }
         }
 
         uint64_t notifierVersion = 0;
@@ -357,7 +370,7 @@ public:
                 ctx.reset();
 
                 // Block waiting for data.
-                Microseconds timeout(curOp->getRemainingMaxTimeMicros());
+                const auto timeout = txn->getRemainingMaxTimeMicros();
                 notifier->wait(notifierVersion, timeout);
                 notifier.reset();
 
@@ -387,7 +400,7 @@ public:
         if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
             BSONObjBuilder execStatsBob;
             Explain::getWinningPlanStats(exec, &execStatsBob);
-            curOp->debug().execStats.set(execStatsBob.obj());
+            curOp->debug().execStats = execStatsBob.obj();
         }
 
         if (shouldSaveCursorGetMore(state, exec, isCursorTailable(cursor))) {
@@ -400,7 +413,7 @@ public:
             // from a previous find, then don't roll remaining micros over to the next
             // getMore.
             if (!hasOwnMaxTime) {
-                cursor->setLeftoverMaxTimeMicros(curOp->getRemainingMaxTimeMicros());
+                cursor->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
             }
 
             cursor->incPos(numResults);

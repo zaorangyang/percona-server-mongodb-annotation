@@ -167,8 +167,6 @@ public:
         BSONObj rewritten = queryBob.obj();
 
         // Extract the collation, if it exists.
-        // TODO SERVER-23473: Pass this collation spec object down so that it can be converted into
-        // a CollatorInterface.
         BSONObj collation;
         {
             BSONElement collationElt;
@@ -204,15 +202,16 @@ public:
             uassert(17297, "distanceMultiplier must be non-negative", distanceMultiplier >= 0);
         }
 
-        BSONObj projObj = BSON("$pt" << BSON("$meta" << LiteParsedQuery::metaGeoNearPoint) << "$dis"
-                                     << BSON("$meta" << LiteParsedQuery::metaGeoNearDistance));
+        BSONObj projObj = BSON("$pt" << BSON("$meta" << QueryRequest::metaGeoNearPoint) << "$dis"
+                                     << BSON("$meta" << QueryRequest::metaGeoNearDistance));
 
-        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-        lpq->setFilter(rewritten);
-        lpq->setProj(projObj);
-        lpq->setLimit(numWanted);
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(rewritten);
+        qr->setProj(projObj);
+        qr->setLimit(numWanted);
+        qr->setCollation(collation);
         const ExtensionsCallbackReal extensionsCallback(txn, &nss);
-        auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
+        auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
         if (!statusWithCQ.isOK()) {
             errmsg = "Can't parse filter / create query";
             return false;
@@ -328,7 +327,7 @@ public:
         if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
             BSONObjBuilder execStatsBob;
             Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-            curOp->debug().execStats.set(execStatsBob.obj());
+            curOp->debug().execStats = execStatsBob.obj();
         }
 
         return true;

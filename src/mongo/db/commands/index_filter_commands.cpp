@@ -30,8 +30,8 @@
 
 #include "mongo/platform/basic.h"
 
-#include <string>
 #include <sstream>
+#include <string>
 
 #include "mongo/base/init.h"
 #include "mongo/base/owned_pointer_vector.h"
@@ -105,8 +105,8 @@ static Status getQuerySettingsAndPlanCache(OperationContext* txn,
 // available to the client.
 //
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SetupIndexFilterCommands,
-                                     MONGO_NO_PREREQUISITES)(InitializerContext* context) {
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetupIndexFilterCommands, MONGO_NO_PREREQUISITES)
+(InitializerContext* context) {
     new ListFilters();
     new ClearFilters();
     new SetFilter();
@@ -322,11 +322,11 @@ Status ClearFilters::clear(OperationContext* txn,
         invariant(entry);
 
         // Create canonical query.
-        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-        lpq->setFilter(entry->query);
-        lpq->setSort(entry->sort);
-        lpq->setProj(entry->projection);
-        auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(entry->query);
+        qr->setSort(entry->sort);
+        qr->setProj(entry->projection);
+        auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
         invariantOK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 

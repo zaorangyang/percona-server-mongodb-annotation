@@ -35,6 +35,7 @@
 
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db.h"
 #include "mongo/db/dbdirectclient.h"
@@ -50,6 +51,8 @@ using std::numeric_limits;
 using std::string;
 using std::stringstream;
 using std::vector;
+
+namespace dps = ::mongo::dotted_path_support;
 
 class ClientBase {
 public:
@@ -190,9 +193,11 @@ public:
                             << "b"),
                        BSON("$set" << BSON("a"
                                            << "c")));
-        ASSERT(!_client.findOne(ns(),
-                                BSON("a"
-                                     << "c")).isEmpty());
+        ASSERT(!_client
+                    .findOne(ns(),
+                             BSON("a"
+                                  << "c"))
+                    .isEmpty());
     }
 };
 
@@ -207,9 +212,11 @@ public:
                             << "b"),
                        BSON("$set" << BSON("a"
                                            << "cd")));
-        ASSERT(!_client.findOne(ns(),
-                                BSON("a"
-                                     << "cd")).isEmpty());
+        ASSERT(!_client
+                    .findOne(ns(),
+                             BSON("a"
+                                  << "cd"))
+                    .isEmpty());
     }
 };
 
@@ -363,9 +370,11 @@ public:
                        Query(),
                        BSON("$set" << BSON("a.b"
                                            << "llll")));
-        ASSERT(!_client.findOne(ns(),
-                                BSON("a.b"
-                                     << "llll")).isEmpty());
+        ASSERT(!_client
+                    .findOne(ns(),
+                             BSON("a.b"
+                                  << "llll"))
+                    .isEmpty());
     }
 };
 
@@ -377,10 +386,11 @@ public:
                        Query(),
                        BSON("$set" << BSON("a.b"
                                            << "lllll")));
-        ASSERT(_client.findOne(ns(),
-                               BSON("a.b"
-                                    << "lllll")).woCompare(fromjson("{'_id':0,a:{b:'lllll'}}")) ==
-               0);
+        ASSERT(_client
+                   .findOne(ns(),
+                            BSON("a.b"
+                                 << "lllll"))
+                   .woCompare(fromjson("{'_id':0,a:{b:'lllll'}}")) == 0);
     }
 };
 
@@ -392,10 +402,11 @@ public:
                        BSONObj(),
                        BSON("$set" << BSON("a.b"
                                            << "lllll")));
-        ASSERT(_client.findOne(ns(),
-                               BSON("a.b"
-                                    << "lllll")).woCompare(fromjson("{'_id':0,a:{b:'lllll'}}")) ==
-               0);
+        ASSERT(_client
+                   .findOne(ns(),
+                            BSON("a.b"
+                                 << "lllll"))
+                   .woCompare(fromjson("{'_id':0,a:{b:'lllll'}}")) == 0);
     }
 };
 
@@ -1383,8 +1394,8 @@ struct ProjectKeyCmp {
     ProjectKeyCmp(BSONObj pattern) : sortPattern(pattern) {}
 
     int operator()(const BSONObj& left, const BSONObj& right) const {
-        BSONObj keyLeft = left.extractFields(sortPattern, true);
-        BSONObj keyRight = right.extractFields(sortPattern, true);
+        BSONObj keyLeft = dps::extractElementsBasedOnTemplate(left, sortPattern, true);
+        BSONObj keyRight = dps::extractElementsBasedOnTemplate(right, sortPattern, true);
         return keyLeft.woCompare(keyRight, sortPattern) < 0;
     }
 };
@@ -1652,8 +1663,8 @@ public:
     void run() {
         _client.insert(ns(), fromjson("{'_id':0,x:[{a:1},{a:3}]}"));
         // { $push : { x : { $each : [ {a:2} ], $sort: {a:1}, $slice:-2 } } }
-        BSONObj pushObj = BSON("$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1)
-                                       << "$slice" << -2.0);
+        BSONObj pushObj = BSON(
+            "$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1) << "$slice" << -2.0);
         _client.update(ns(), Query(), BSON("$push" << BSON("x" << pushObj)));
         BSONObj expected = fromjson("{'_id':0,x:[{a:2},{a:3}]}");
         BSONObj result = _client.findOne(ns(), Query());
@@ -1667,8 +1678,9 @@ public:
         BSONObj expected = fromjson("{'_id':0,x:[{a:1},{a:3}]}");
         _client.insert(ns(), expected);
         // { $push : { x : { $each : [ {a:2} ], $sort : {a:1}, $sort: {a:1} } } }
-        BSONObj pushObj = BSON("$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1)
-                                       << "$sort" << BSON("a" << 1));
+        BSONObj pushObj =
+            BSON("$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1) << "$sort"
+                         << BSON("a" << 1));
         _client.update(ns(), Query(), BSON("$push" << BSON("x" << pushObj)));
         BSONObj result = _client.findOne(ns(), Query());
         ASSERT_EQUALS(result, expected);
@@ -1748,7 +1760,9 @@ public:
             ns(), BSON("_id" << 0 << "a" << 1 << "x" << BSONObj() << "x" << BSONObj() << "z" << 5));
         _client.update(ns(), BSONObj(), BSON("$set" << BSON("x.b" << 1 << "x.c" << 1)));
         ASSERT_EQUALS(BSON("_id" << 0 << "a" << 1 << "x" << BSON("b" << 1 << "c" << 1) << "x"
-                                 << BSONObj() << "z" << 5),
+                                 << BSONObj()
+                                 << "z"
+                                 << 5),
                       _client.findOne(ns(), BSONObj()));
     }
 };
@@ -1762,7 +1776,9 @@ public:
         _client.update(
             ns(), BSONObj(), BSON("$set" << BSON("x.b" << 1 << "x.c" << 1 << "x.d" << 1)));
         ASSERT_EQUALS(BSON("_id" << 0 << "x" << BSON("b" << 1 << "c" << 1 << "d" << 1) << "x"
-                                 << BSONObj() << "x" << BSONObj()),
+                                 << BSONObj()
+                                 << "x"
+                                 << BSONObj()),
                       _client.findOne(ns(), BSONObj()));
     }
 };

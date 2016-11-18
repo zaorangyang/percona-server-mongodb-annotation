@@ -79,6 +79,7 @@ env.Library(
     source=[
         'check_sharding_index_command.cpp',
         'cleanup_orphaned_cmd.cpp',
+        'config/configsvr_add_shard_command.cpp',
         'get_shard_version_command.cpp',
         'merge_chunks_command.cpp',
         'migration_chunk_cloner_source_legacy_commands.cpp',
@@ -91,6 +92,7 @@ env.Library(
         'unset_sharding_command.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/bson/dotted_path_support',
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
         '$BUILD_DIR/mongo/s/serveronly',

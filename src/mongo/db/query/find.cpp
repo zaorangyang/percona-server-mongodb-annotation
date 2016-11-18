@@ -42,7 +42,6 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/query/explain.h"
@@ -55,6 +54,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/stale_exception.h"
@@ -88,12 +88,12 @@ bool shouldSaveCursor(OperationContext* txn,
         return false;
     }
 
-    const LiteParsedQuery& pq = exec->getCanonicalQuery()->getParsed();
-    if (!pq.wantMore() && !pq.isTailable()) {
+    const QueryRequest& qr = exec->getCanonicalQuery()->getQueryRequest();
+    if (!qr.wantMore() && !qr.isTailable()) {
         return false;
     }
 
-    if (pq.getNToReturn().value_or(0) == 1) {
+    if (qr.getNToReturn().value_or(0) == 1) {
         return false;
     }
 
@@ -103,7 +103,7 @@ bool shouldSaveCursor(OperationContext* txn,
     // SERVER-13955: we should be able to create a tailable cursor that waits on
     // an empty collection. Right now we do not keep a cursor if the collection
     // has zero records.
-    if (pq.isTailable()) {
+    if (qr.isTailable()) {
         return collection && collection->numRecords(txn) != 0U;
     }
 
@@ -130,7 +130,6 @@ void beginQueryOp(OperationContext* txn,
                   long long ntoreturn,
                   long long ntoskip) {
     auto curOp = CurOp::get(txn);
-    curOp->debug().query = queryObj;
     curOp->debug().ntoreturn = ntoreturn;
     curOp->debug().ntoskip = ntoskip;
     stdx::lock_guard<Client> lk(*txn->getClient());
@@ -162,7 +161,7 @@ void endQueryOp(OperationContext* txn,
     if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
         BSONObjBuilder statsBob;
         Explain::getWinningPlanStats(&exec, &statsBob);
-        curOp->debug().execStats.set(statsBob.obj());
+        curOp->debug().execStats = statsBob.obj();
     }
 }
 
@@ -312,7 +311,9 @@ QueryResult::View getMore(OperationContext* txn,
         // there for the cursor.
         uassert(ErrorCodes::Unauthorized,
                 str::stream() << "Requested getMore on namespace " << ns << ", but cursor "
-                              << cursorid << " belongs to namespace " << cc->ns(),
+                              << cursorid
+                              << " belongs to namespace "
+                              << cc->ns(),
                 ns == cc->ns());
         *isCursorAuthorized = true;
 
@@ -324,16 +325,13 @@ QueryResult::View getMore(OperationContext* txn,
 
         // If the operation that spawned this cursor had a time limit set, apply leftover
         // time to this getmore.
-        curOp.setMaxTimeMicros(cc->getLeftoverMaxTimeMicros());
-        txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
-
-        // Ensure that the original query or command object is available in the slow query log,
-        // profiler, and currentOp.
-        curOp.debug().query = cc->getQuery();
-        {
-            stdx::lock_guard<Client> lk(*txn->getClient());
-            curOp.setQuery_inlock(cc->getQuery());
+        if (cc->getLeftoverMaxTimeMicros() < Microseconds::max()) {
+            uassert(40136,
+                    "Illegal attempt to set operation deadline within DBDirectClient",
+                    !txn->getClient()->isInDirectClient());
+            txn->setDeadlineAfterNowBy(cc->getLeftoverMaxTimeMicros());
         }
+        txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
         cc->updateSlaveLocation(txn);
 
@@ -367,9 +365,14 @@ QueryResult::View getMore(OperationContext* txn,
         exec->reattachToOperationContext(txn);
         exec->restoreState();
 
+        auto planSummary = Explain::getPlanSummary(exec);
         {
             stdx::lock_guard<Client>(*txn->getClient());
-            CurOp::get(txn)->setPlanSummary_inlock(Explain::getPlanSummary(exec));
+            curOp.setPlanSummary_inlock(planSummary);
+
+            // Ensure that the original query or command object is available in the slow query log,
+            // profiler and currentOp.
+            curOp.setQuery_inlock(cc->getQuery());
         }
 
         PlanExecutor::ExecState state;
@@ -416,7 +419,7 @@ QueryResult::View getMore(OperationContext* txn,
         if (curOp.shouldDBProfile(curOp.elapsedMillis())) {
             BSONObjBuilder execStatsBob;
             Explain::getWinningPlanStats(exec, &execStatsBob);
-            curOp.debug().execStats.set(execStatsBob.obj());
+            curOp.debug().execStats = execStatsBob.obj();
         }
 
         // We have to do this before re-acquiring locks in the agg case because
@@ -467,7 +470,7 @@ QueryResult::View getMore(OperationContext* txn,
 
             // If the getmore had a time limit, remaining time is "rolled over" back to the
             // cursor (for use by future getmore ops).
-            cc->setLeftoverMaxTimeMicros(curOp.getRemainingMaxTimeMicros());
+            cc->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
         }
     }
 
@@ -501,9 +504,9 @@ std::string runQuery(OperationContext* txn,
 
     auto statusWithCQ = CanonicalQuery::canonicalize(txn, q, ExtensionsCallbackReal(txn, &nss));
     if (!statusWithCQ.isOK()) {
-        uasserted(
-            17287,
-            str::stream() << "Can't canonicalize query: " << statusWithCQ.getStatus().toString());
+        uasserted(17287,
+                  str::stream() << "Can't canonicalize query: "
+                                << statusWithCQ.getStatus().toString());
     }
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
     invariant(cq.get());
@@ -519,11 +522,11 @@ std::string runQuery(OperationContext* txn,
     std::unique_ptr<PlanExecutor> exec = uassertStatusOK(
         getExecutorFind(txn, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO));
 
-    const LiteParsedQuery& pq = exec->getCanonicalQuery()->getParsed();
+    const QueryRequest& qr = exec->getCanonicalQuery()->getQueryRequest();
 
     // If it's actually an explain, do the explain and return rather than falling through
     // to the normal query execution loop.
-    if (pq.isExplain()) {
+    if (qr.isExplain()) {
         BufBuilder bb;
         bb.skip(sizeof(QueryResult::Value));
 
@@ -533,9 +536,6 @@ std::string runQuery(OperationContext* txn,
         // Add the resulting object to the return buffer.
         BSONObj explainObj = explainBob.obj();
         bb.appendBuf((void*)explainObj.objdata(), explainObj.objsize());
-
-        // TODO: Does this get overwritten/do we really need to set this twice?
-        curOp.debug().query = q.query;
 
         // Set query result fields.
         QueryResult::View qr = bb.buf();
@@ -552,11 +552,16 @@ std::string runQuery(OperationContext* txn,
     }
 
     // Handle query option $maxTimeMS (not used with commands).
-    curOp.setMaxTimeMicros(static_cast<unsigned long long>(pq.getMaxTimeMS()) * 1000);
+    if (qr.getMaxTimeMS() > 0) {
+        uassert(40116,
+                "Illegal attempt to set operation deadline within DBDirectClient",
+                !txn->getClient()->isInDirectClient());
+        txn->setDeadlineAfterNowBy(Milliseconds{qr.getMaxTimeMS()});
+    }
     txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
     // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
-    bool slaveOK = pq.isSlaveOk() || pq.hasReadPref();
+    bool slaveOK = qr.isSlaveOk() || qr.hasReadPref();
     Status serveReadsStatus =
         repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor(txn, nss, slaveOK);
     uassertStatusOK(serveReadsStatus);
@@ -597,16 +602,16 @@ std::string runQuery(OperationContext* txn,
         ++numResults;
 
         // Possibly note slave's position in the oplog.
-        if (pq.isOplogReplay()) {
+        if (qr.isOplogReplay()) {
             BSONElement e = obj["ts"];
             if (Date == e.type() || bsonTimestamp == e.type()) {
                 slaveReadTill = e.timestamp();
             }
         }
 
-        if (FindCommon::enoughForFirstBatch(pq, numResults)) {
-            LOG(5) << "Enough for first batch, wantMore=" << pq.wantMore()
-                   << " ntoreturn=" << pq.getNToReturn().value_or(0) << " numResults=" << numResults
+        if (FindCommon::enoughForFirstBatch(qr, numResults)) {
+            LOG(5) << "Enough for first batch, wantMore=" << qr.wantMore()
+                   << " ntoreturn=" << qr.getNToReturn().value_or(0) << " numResults=" << numResults
                    << endl;
             break;
         }
@@ -648,20 +653,20 @@ std::string runQuery(OperationContext* txn,
                              exec.release(),
                              nss.ns(),
                              txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
-                             pq.getOptions(),
-                             pq.getFilter());
+                             qr.getOptions(),
+                             qr.getFilter());
         ccId = cc->cursorid();
 
         LOG(5) << "caching executor with cursorid " << ccId << " after returning " << numResults
                << " results" << endl;
 
         // TODO document
-        if (pq.isOplogReplay() && !slaveReadTill.isNull()) {
+        if (qr.isOplogReplay() && !slaveReadTill.isNull()) {
             cc->slaveReadTill(slaveReadTill);
         }
 
         // TODO document
-        if (pq.isExhaust()) {
+        if (qr.isExhaust()) {
             curOp.debug().exhaust = true;
         }
 
@@ -669,7 +674,7 @@ std::string runQuery(OperationContext* txn,
 
         // If the query had a time limit, remaining time is "rolled over" to the cursor (for
         // use by future getmore ops).
-        cc->setLeftoverMaxTimeMicros(curOp.getRemainingMaxTimeMicros());
+        cc->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
 
         endQueryOp(txn, collection, *cc->getExecutor(), numResults, ccId);
     } else {
@@ -682,12 +687,12 @@ std::string runQuery(OperationContext* txn,
     bb.decouple();
 
     // Fill out the output buffer's header.
-    QueryResult::View qr = result.header().view2ptr();
-    qr.setCursorId(ccId);
-    qr.setResultFlagsToOk();
-    qr.msgdata().setOperation(opReply);
-    qr.setStartingFrom(0);
-    qr.setNReturned(numResults);
+    QueryResult::View queryResultView = result.header().view2ptr();
+    queryResultView.setCursorId(ccId);
+    queryResultView.setResultFlagsToOk();
+    queryResultView.msgdata().setOperation(opReply);
+    queryResultView.setStartingFrom(0);
+    queryResultView.setNReturned(numResults);
 
     // curOp.debug().exhaust is set above.
     return curOp.debug().exhaust ? nss.ns() : "";

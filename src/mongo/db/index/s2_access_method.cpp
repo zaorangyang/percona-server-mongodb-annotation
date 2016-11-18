@@ -33,11 +33,11 @@
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/db/geo/geoparser.h"
 #include "mongo/db/geo/geoconstants.h"
-#include "mongo/db/index_names.h"
+#include "mongo/db/geo/geoparser.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/expression_params.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/log.h"
 
@@ -80,7 +80,7 @@ S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterfac
 }
 
 // static
-BSONObj S2AccessMethod::fixSpec(const BSONObj& specObj) {
+StatusWith<BSONObj> S2AccessMethod::fixSpec(const BSONObj& specObj) {
     // If the spec object has the field "2dsphereIndexVersion", validate it.  If it doesn't, add
     // {2dsphereIndexVersion: 3}, which is the default for newly-built indexes.
 
@@ -92,21 +92,58 @@ BSONObj S2AccessMethod::fixSpec(const BSONObj& specObj) {
         return bob.obj();
     }
 
-    const int indexVersion = indexVersionElt.numberInt();
-    uassert(17394,
-            str::stream() << "unsupported geo index version { " << kIndexVersionFieldName << " : "
-                          << indexVersionElt << " }, only support versions: [" << S2_INDEX_VERSION_1
-                          << "," << S2_INDEX_VERSION_2 << "," << S2_INDEX_VERSION_3 << "]",
-            indexVersionElt.isNumber() &&
-                (indexVersion == S2_INDEX_VERSION_3 || indexVersion == S2_INDEX_VERSION_2 ||
-                 indexVersion == S2_INDEX_VERSION_1));
+    if (!indexVersionElt.isNumber()) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "Invalid type for geo index version { " << kIndexVersionFieldName
+                              << " : "
+                              << indexVersionElt
+                              << " }, only versions: ["
+                              << S2_INDEX_VERSION_1
+                              << ","
+                              << S2_INDEX_VERSION_2
+                              << ","
+                              << S2_INDEX_VERSION_3
+                              << "] are supported"};
+    }
+
+    if (indexVersionElt.type() == BSONType::NumberDouble &&
+        !std::isnormal(indexVersionElt.numberDouble())) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "Invalid value for geo index version { " << kIndexVersionFieldName
+                              << " : "
+                              << indexVersionElt
+                              << " }, only versions: ["
+                              << S2_INDEX_VERSION_1
+                              << ","
+                              << S2_INDEX_VERSION_2
+                              << ","
+                              << S2_INDEX_VERSION_3
+                              << "] are supported"};
+    }
+
+    const auto indexVersion = indexVersionElt.numberLong();
+    if (indexVersion != S2_INDEX_VERSION_1 && indexVersion != S2_INDEX_VERSION_2 &&
+        indexVersion != S2_INDEX_VERSION_3) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "unsupported geo index version { " << kIndexVersionFieldName
+                              << " : "
+                              << indexVersionElt
+                              << " }, only versions: ["
+                              << S2_INDEX_VERSION_1
+                              << ","
+                              << S2_INDEX_VERSION_2
+                              << ","
+                              << S2_INDEX_VERSION_3
+                              << "] are supported"};
+    }
+
     return specObj;
 }
 
 void S2AccessMethod::getKeys(const BSONObj& obj,
                              BSONObjSet* keys,
                              MultikeyPaths* multikeyPaths) const {
-    ExpressionKeysPrivate::getS2Keys(obj, _descriptor->keyPattern(), _params, keys);
+    ExpressionKeysPrivate::getS2Keys(obj, _descriptor->keyPattern(), _params, keys, multikeyPaths);
 }
 
 }  // namespace mongo

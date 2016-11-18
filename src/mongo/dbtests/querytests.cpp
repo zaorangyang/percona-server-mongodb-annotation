@@ -43,7 +43,6 @@
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/query/find.h"
-#include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
 #include "mongo/dbtests/dbtests.h"
@@ -199,7 +198,8 @@ public:
         bool ok = cl.runCommand("unittests",
                                 BSON("godinsert"
                                      << "querytests"
-                                     << "obj" << BSONObj()),
+                                     << "obj"
+                                     << BSONObj()),
                                 info);
         ASSERT(ok);
 
@@ -590,7 +590,12 @@ public:
         _client.runCommand("unittests",
                            BSON("create"
                                 << "querytests.TailableQueryOnId"
-                                << "capped" << true << "size" << 8192 << "autoIndexId" << true),
+                                << "capped"
+                                << true
+                                << "size"
+                                << 8192
+                                << "autoIndexId"
+                                << true),
                            info);
         insertA(ns, 0);
         insertA(ns, 1);
@@ -676,7 +681,10 @@ public:
         _client.runCommand("unittests",
                            BSON("create"
                                 << "querytests.OplogReplaySlaveReadTill"
-                                << "capped" << true << "size" << 8192),
+                                << "capped"
+                                << true
+                                << "size"
+                                << 8192),
                            info);
 
         Date_t one = Date_t::fromMillisSinceEpoch(getNextGlobalTimestamp().asLL());
@@ -1285,14 +1293,18 @@ public:
             ASSERT_EQUALS(17, _client.findOne(ns(), b.obj())["z"].number());
         }
         ASSERT_EQUALS(17,
-                      _client.findOne(ns(),
-                                      BSON("x"
-                                           << "eliot"))["z"].number());
+                      _client
+                          .findOne(ns(),
+                                   BSON("x"
+                                        << "eliot"))["z"]
+                          .number());
         ASSERT_OK(dbtests::createIndex(&_txn, ns(), BSON("x" << 1)));
         ASSERT_EQUALS(17,
-                      _client.findOne(ns(),
-                                      BSON("x"
-                                           << "eliot"))["z"].number());
+                      _client
+                          .findOne(ns(),
+                                   BSON("x"
+                                        << "eliot"))["z"]
+                          .number());
     }
 };
 
@@ -1314,7 +1326,8 @@ public:
                                 ctx.db(),
                                 ns(),
                                 fromjson("{ capped : true, size : 2000, max: 10000 }"),
-                                false).isOK());
+                                false)
+                       .isOK());
             wunit.commit();
         }
 
@@ -1452,7 +1465,11 @@ public:
         ASSERT(_client.runCommand("unittests",
                                   BSON("create"
                                        << "querytests.findingstart"
-                                       << "capped" << true << "$nExtents" << 5 << "autoIndexId"
+                                       << "capped"
+                                       << true
+                                       << "$nExtents"
+                                       << 5
+                                       << "autoIndexId"
                                        << false),
                                   info));
 
@@ -1499,7 +1516,11 @@ public:
         ASSERT(_client.runCommand("unittests",
                                   BSON("create"
                                        << "querytests.findingstart"
-                                       << "capped" << true << "$nExtents" << 5 << "autoIndexId"
+                                       << "capped"
+                                       << true
+                                       << "$nExtents"
+                                       << 5
+                                       << "autoIndexId"
                                        << false),
                                   info));
 
@@ -1547,7 +1568,11 @@ public:
         ASSERT(_client.runCommand("unittests",
                                   BSON("create"
                                        << "querytests.findingstart"
-                                       << "capped" << true << "$nExtents" << 5 << "autoIndexId"
+                                       << "capped"
+                                       << true
+                                       << "$nExtents"
+                                       << 5
+                                       << "autoIndexId"
                                        << false),
                                   info));
 
@@ -1600,7 +1625,10 @@ public:
         ASSERT(_client.runCommand("unittests",
                                   BSON("create"
                                        << "querytests.exhaust"
-                                       << "capped" << true << "size" << 8192),
+                                       << "capped"
+                                       << true
+                                       << "size"
+                                       << 8192),
                                   info));
         _client.insert(ns(), BSON("ts" << 0));
         Message message;

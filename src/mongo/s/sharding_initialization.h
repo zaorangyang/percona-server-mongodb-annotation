@@ -31,6 +31,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "mongo/stdx/functional.h"
+
 namespace mongo {
 
 class ConnectionString;
@@ -38,14 +40,20 @@ class OperationContext;
 class ShardFactory;
 class Status;
 
+namespace rpc {
+class ShardingEgressMetadataHook;
+using ShardingEgressMetadataHookBuilder =
+    stdx::function<std::unique_ptr<ShardingEgressMetadataHook>()>;
+}  // namespace rpc
+
 /**
  * Takes in the connection string for reaching the config servers and initializes the global
  * CatalogManager, ShardingRegistry, and grid objects.
  */
 Status initializeGlobalShardingState(const ConnectionString& configCS,
-                                     uint64_t maxChunkSizeBytes,
                                      std::unique_ptr<ShardFactory> shardFactory,
-                                     bool isMongos);
+                                     rpc::ShardingEgressMetadataHookBuilder hookBuilder);
+
 /**
  * Tries to contact the config server and reload the shard registry until it succeeds or
  * is interrupted.

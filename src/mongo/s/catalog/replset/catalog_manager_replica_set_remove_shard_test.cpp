@@ -62,7 +62,7 @@ using std::string;
 using std::vector;
 using unittest::assertGet;
 
-static const stdx::chrono::seconds kFutureTimeout{5};
+static const Seconds kFutureTimeout{5};
 
 const BSONObj kReplSecondaryOkMetadata{[] {
     BSONObjBuilder o;
@@ -183,7 +183,7 @@ TEST_F(RemoveShardTest, RemoveShardStartDraining) {
         ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(ShardType::ConfigNS, query->ns());
         ASSERT_EQ(BSONObj(), query->getFilter());
@@ -355,7 +355,7 @@ TEST_F(RemoveShardTest, RemoveShardCompletion) {
         ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(ShardType::ConfigNS, query->ns());
         ASSERT_EQ(BSONObj(), query->getFilter());

@@ -131,9 +131,9 @@ TEST(CollectionOptions, InvalidStorageEngineField) {
 
 TEST(CollectionOptions, ParseEngineField) {
     CollectionOptions opts;
-    ASSERT_OK(opts.parse(fromjson(
-        "{unknownField: 1, "
-        "storageEngine: {storageEngine1: {x: 1, y: 2}, storageEngine2: {a: 1, b:2}}}")));
+    ASSERT_OK(opts.parse(
+        fromjson("{unknownField: 1, "
+                 "storageEngine: {storageEngine1: {x: 1, y: 2}, storageEngine2: {a: 1, b:2}}}")));
     checkRoundTrip(opts);
 
     // Unrecognized field should not be present in BSON representation.
@@ -191,6 +191,11 @@ TEST(CollectionOptions, ModifyStorageEngineField) {
 TEST(CollectionOptions, FailToParseCollationThatIsNotAnObject) {
     CollectionOptions options;
     ASSERT_NOT_OK(options.parse(fromjson("{collation: 'notAnObject'}")));
+}
+
+TEST(CollectionOptions, FailToParseCollationThatIsAnEmptyObject) {
+    CollectionOptions options;
+    ASSERT_NOT_OK(options.parse(fromjson("{collation: {}}")));
 }
 
 TEST(CollectionOptions, CollationFieldParsesCorrectly) {

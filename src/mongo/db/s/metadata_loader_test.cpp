@@ -71,7 +71,8 @@ protected:
     void expectFindOnConfigSendChunksDefault() {
         BSONObj chunk = BSON(
             ChunkType::name("test.foo-a_MinKey")
-            << ChunkType::ns("test.foo") << ChunkType::min(BSON("a" << MINKEY))
+            << ChunkType::ns("test.foo")
+            << ChunkType::min(BSON("a" << MINKEY))
             << ChunkType::max(BSON("a" << MAXKEY))
             << ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(_maxCollVersion.toLong()))
             << ChunkType::DEPRECATED_epoch(_maxCollVersion.epoch())
@@ -103,7 +104,6 @@ protected:
         for (const auto chunkVal : chunks.vector()) {
             ChunkType chunk(*chunkVal);
 
-            chunk.setName(OID::gen().toString());
             if (!chunk.isVersionSet()) {
                 chunk.setVersion(version);
                 version.incMajor();
@@ -280,7 +280,6 @@ TEST_F(MetadataLoaderFixture, CheckNumChunk) {
     chunkType.setMin(BSON("a" << MINKEY));
     chunkType.setMax(BSON("a" << MAXKEY));
     chunkType.setVersion(ChunkVersion(1, 0, epoch));
-    chunkType.setName(OID::gen().toString());
     ASSERT(chunkType.validate().isOK());
 
     auto future = launchAsync([this] {

@@ -63,9 +63,9 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/index_builder.h"
-#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builder.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
@@ -90,13 +90,14 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/rpc/request_interface.h"
-#include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
+#include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/rpc/protocol.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/rpc/request_interface.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
@@ -642,12 +643,12 @@ public:
         BSONObj sort = BSON("files_id" << 1 << "n" << 1);
 
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            auto lpq = stdx::make_unique<LiteParsedQuery>(NamespaceString(ns));
-            lpq->setFilter(query);
-            lpq->setSort(sort);
+            auto qr = stdx::make_unique<QueryRequest>(NamespaceString(ns));
+            qr->setFilter(query);
+            qr->setSort(sort);
 
             auto statusWithCQ = CanonicalQuery::canonicalize(
-                txn, std::move(lpq), ExtensionsCallbackDisallowExtensions());
+                txn, std::move(qr), ExtensionsCallbackDisallowExtensions());
             if (!statusWithCQ.isOK()) {
                 uasserted(17240, "Can't canonicalize query " + query.toString());
                 return 0;
@@ -1230,10 +1231,10 @@ const std::size_t kQueryOptionMaxTimeMSField = 3;
 
 // We make an array of the fields we need so we can call getFields once. This saves repeated
 // scans over the command object.
-const std::array<StringData, 4> neededFieldNames{LiteParsedQuery::cmdOptionMaxTimeMS,
+const std::array<StringData, 4> neededFieldNames{QueryRequest::cmdOptionMaxTimeMS,
                                                  Command::kHelpFieldName,
                                                  ChunkVersion::kShardVersionField,
-                                                 LiteParsedQuery::queryOptionMaxTimeMS};
+                                                 QueryRequest::queryOptionMaxTimeMS};
 }  // namespace
 
 void appendOpTimeMetadata(OperationContext* txn,
@@ -1249,8 +1250,9 @@ void appendOpTimeMetadata(OperationContext* txn,
         // Attach our own last opTime.
         repl::OpTime lastOpTimeFromClient =
             repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
-        replCoord->prepareReplResponseMetadata(request, lastOpTimeFromClient, metadataBob);
-
+        if (request.getMetadata().hasField(rpc::kReplSetMetadataFieldName)) {
+            replCoord->prepareReplMetadata(lastOpTimeFromClient, metadataBob);
+        }
         // For commands from mongos, append some info to help getLastError(w) work.
         // TODO: refactor out of here as part of SERVER-18236
         if (isShardingAware || isConfig) {
@@ -1358,13 +1360,18 @@ void Command::execCommand(OperationContext* txn,
 
         // Handle command option maxTimeMS.
         int maxTimeMS = uassertStatusOK(
-            LiteParsedQuery::parseMaxTimeMS(extractedFields[kCmdOptionMaxTimeMSField]));
+            QueryRequest::parseMaxTimeMS(extractedFields[kCmdOptionMaxTimeMSField]));
 
         uassert(ErrorCodes::InvalidOptions,
                 "no such command option $maxTimeMs; use maxTimeMS instead",
                 extractedFields[kQueryOptionMaxTimeMSField].eoo());
 
-        CurOp::get(txn)->setMaxTimeMicros(static_cast<unsigned long long>(maxTimeMS) * 1000);
+        if (maxTimeMS > 0) {
+            uassert(40119,
+                    "Illegal attempt to set operation deadline within DBDirectClient",
+                    !txn->getClient()->isInDirectClient());
+            txn->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
+        }
 
         // Operations are only versioned against the primary. We also make sure not to redo shard
         // version handling if this command was issued via the direct client.
@@ -1386,7 +1393,8 @@ void Command::execCommand(OperationContext* txn,
                     34422,
                     str::stream()
                         << "Received a command with sharding chunk version information but this "
-                           "node is not sharding aware: " << request.getCommandArgs().jsonString(),
+                           "node is not sharding aware: "
+                        << request.getCommandArgs().jsonString(),
                     !oss.hasShardVersion() ||
                         ChunkVersion::isIgnoredVersion(oss.getShardVersion(commandNS)));
             }
@@ -1412,8 +1420,8 @@ void Command::execCommand(OperationContext* txn,
         // If we got a stale config, wait in case the operation is stuck in a critical section
         if (e.getCode() == ErrorCodes::SendStaleConfig) {
             auto& sce = static_cast<const StaleConfigException&>(e);
-            ShardingState::get(txn)
-                ->onStaleShardVersion(txn, NamespaceString(sce.getns()), sce.getVersionReceived());
+            ShardingState::get(txn)->onStaleShardVersion(
+                txn, NamespaceString(sce.getns()), sce.getVersionReceived());
         }
 
         BSONObjBuilder metadataBob;
@@ -1516,8 +1524,8 @@ bool Command::run(OperationContext* txn,
 
                 // Wait until a snapshot is available.
                 while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
-                    LOG(debugLevel)
-                        << "Snapshot not available for readConcern: " << readConcernArgs;
+                    LOG(debugLevel) << "Snapshot not available for readConcern: "
+                                    << readConcernArgs;
                     replCoord->waitUntilSnapshotCommitted(txn, SnapshotName::min());
                     status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
                 }

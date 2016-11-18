@@ -112,7 +112,9 @@ Status UpdateDriver::parse(const BSONObj& updateExpr, const bool multi) {
                           str::stream() << "Modifiers operate on fields but we found type "
                                         << typeName(outerModElem.type())
                                         << " instead. For example: {$mod: {<field>: ...}}"
-                                        << " not {" << outerModElem.toString() << "}");
+                                        << " not {"
+                                        << outerModElem.toString()
+                                        << "}");
         }
 
         // Check whether there are indeed mods under this modifier.
@@ -120,7 +122,9 @@ Status UpdateDriver::parse(const BSONObj& updateExpr, const bool multi) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "'" << outerModElem.fieldName()
                                         << "' is empty. You must specify a field like so: "
-                                           "{" << outerModElem.fieldName() << ": {<field>: ...}}");
+                                           "{"
+                                        << outerModElem.fieldName()
+                                        << ": {<field>: ...}}");
         }
 
         BSONObjIterator innerIter(outerModElem.embeddedObject());
@@ -146,7 +150,9 @@ inline Status UpdateDriver::addAndParse(const modifiertable::ModifierType type,
     if (elem.eoo()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "'" << elem.fieldName() << "' has no value in : " << elem
-                                    << " which is not allowed for any $" << type << " mod.");
+                                    << " which is not allowed for any $"
+                                    << type
+                                    << " mod.");
     }
 
     unique_ptr<ModifierInterface> mod(modifiertable::makeUpdateMod(type));
@@ -174,9 +180,9 @@ Status UpdateDriver::populateDocumentWithQueryFields(OperationContext* txn,
     // We canonicalize the query to collapse $and/$or, and the namespace is not needed.  Also,
     // because this is for the upsert case, where we insert a new document if one was not found, the
     // $where/$text clauses do not make sense, hence empty ExtensionsCallback.
-    auto lpq = stdx::make_unique<LiteParsedQuery>(NamespaceString(""));
-    lpq->setFilter(query);
-    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), ExtensionsCallbackNoop());
+    auto qr = stdx::make_unique<QueryRequest>(NamespaceString(""));
+    qr->setFilter(query);
+    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), ExtensionsCallbackNoop());
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -275,7 +281,8 @@ Status UpdateDriver::update(StringData matchedField,
             if (!targetFields->insert(execInfo.fieldRef[i], &other)) {
                 return Status(ErrorCodes::ConflictingUpdateOperators,
                               str::stream() << "Cannot update '" << other->dottedField()
-                                            << "' and '" << execInfo.fieldRef[i]->dottedField()
+                                            << "' and '"
+                                            << execInfo.fieldRef[i]->dottedField()
                                             << "' at the same time");
             }
 
@@ -371,7 +378,8 @@ BSONObj UpdateDriver::makeOplogEntryQuery(const BSONObj& doc, bool multi) const 
     } else {
         uassert(16980,
                 str::stream() << "Multi-update operations require all documents to "
-                                 "have an '_id' field. " << doc.toString(false, false),
+                                 "have an '_id' field. "
+                              << doc.toString(false, false),
                 !multi);
         return doc;
     }

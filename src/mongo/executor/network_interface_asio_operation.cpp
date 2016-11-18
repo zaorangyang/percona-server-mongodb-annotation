@@ -34,7 +34,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/executor/async_stream_interface.h"
 #include "mongo/executor/connection_pool_asio.h"
 #include "mongo/executor/downconvert_find_and_getmore_commands.h"
@@ -200,7 +200,7 @@ Status NetworkInterfaceASIO::AsyncOp::beginCommand(const RemoteCommandRequest& r
                                                    rpc::EgressMetadataHook* metadataHook) {
     // Check if we need to downconvert find or getMore commands.
     StringData commandName = request.cmdObj.firstElement().fieldNameStringData();
-    const auto isFindCmd = commandName == LiteParsedQuery::kFindCommandName;
+    const auto isFindCmd = commandName == QueryRequest::kFindCommandName;
     const auto isGetMoreCmd = commandName == GetMoreRequest::kGetMoreCommandName;
     const auto isFindOrGetMoreCmd = isFindCmd || isGetMoreCmd;
 
@@ -370,9 +370,9 @@ bool NetworkInterfaceASIO::AsyncOp::operator==(const AsyncOp& other) const {
 }
 
 bool NetworkInterfaceASIO::AsyncOp::_hasSeenState(AsyncOp::State state) const {
-    return std::any_of(std::begin(_states),
-                       std::end(_states),
-                       [state](AsyncOp::State _state) { return _state == state; });
+    return std::any_of(std::begin(_states), std::end(_states), [state](AsyncOp::State _state) {
+        return _state == state;
+    });
 }
 
 void NetworkInterfaceASIO::AsyncOp::_transitionToState(AsyncOp::State newState) {
@@ -393,9 +393,9 @@ void NetworkInterfaceASIO::AsyncOp::_transitionToState_inlock(AsyncOp::State new
     // multiple times.  Ignore that transition if we're already cancelled.
     if (newState == State::kCanceled) {
         // Find the current state
-        auto iter = std::find_if_not(_states.rbegin(),
-                                     _states.rend(),
-                                     [](const State& state) { return state == State::kNoState; });
+        auto iter = std::find_if_not(_states.rbegin(), _states.rend(), [](const State& state) {
+            return state == State::kNoState;
+        });
 
         // If its cancelled, just return
         if (iter != _states.rend() && *iter == State::kCanceled) {

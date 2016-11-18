@@ -32,8 +32,8 @@
 
 #include "mongo/db/service_context.h"
 #include "mongo/executor/network_test_env.h"
-#include "mongo/util/net/message_port_mock.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/net/message_port_mock.h"
 
 namespace mongo {
 
@@ -67,7 +67,7 @@ public:
     ~ShardingTestFixture();
 
 protected:
-    static const stdx::chrono::seconds kFutureTimeout;
+    static const Seconds kFutureTimeout;
 
     template <typename Lambda>
     executor::NetworkTestEnv::FutureHandle<typename std::result_of<Lambda()>::type> launchAsync(
