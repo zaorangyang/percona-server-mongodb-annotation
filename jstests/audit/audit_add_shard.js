@@ -15,7 +15,7 @@ auditTestShard(
         var hostandport = conn1.host;
         assert.commandWorked(st.s0.adminCommand({addshard: hostandport}));
 
-        auditColl = loadAuditEventsIntoCollection(st.s0, '/data/db/auditLog-s0.json', jsTestName(), 'auditEvents');
+        auditColl = loadAuditEventsIntoCollection(st.s0, getDBPath() + '/auditLog-s0.json', jsTestName(), 'auditEvents');
         assert.eq(1, auditColl.count({
             atype: "addShard",
             ts: withinTheLastFewSeconds(),
