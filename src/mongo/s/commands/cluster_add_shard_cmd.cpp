@@ -88,6 +88,12 @@ public:
                      BSONObjBuilder& result) {
         auto parsedRequest = uassertStatusOK(AddShardRequest::parseFromMongosCommand(cmdObj));
 
+        audit::logAddShard(ClientBasic::getCurrent(),
+                           parsedRequest.hasName() ? parsedRequest.getName() : "",
+                           parsedRequest.getConnString().toString(),
+                           parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize()
+                                                      : 0 /*kMaxSizeMBDefault*/);
+
         auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
         auto cmdResponseStatus =
             uassertStatusOK(configShard->runCommand(txn,
