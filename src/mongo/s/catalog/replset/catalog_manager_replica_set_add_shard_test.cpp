@@ -35,7 +35,7 @@
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/catalog/replset/catalog_manager_replica_set.h"
@@ -189,7 +189,7 @@ protected:
                 ASSERT_EQ(nss.toString(), DatabaseType::ConfigNS);
 
                 auto query =
-                    assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+                    assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
                 ASSERT_EQ(query->ns(), DatabaseType::ConfigNS);
                 ASSERT_EQ(query->getFilter(), BSON(DatabaseType::name(dbname)));
@@ -234,13 +234,16 @@ TEST_F(AddShardTest, Standalone) {
     expectListDatabases(shardTarget,
                         std::vector<BSONObj>{BSON("name"
                                                   << "local"
-                                                  << "sizeOnDisk" << 1000),
+                                                  << "sizeOnDisk"
+                                                  << 1000),
                                              BSON("name"
                                                   << "TestDB1"
-                                                  << "sizeOnDisk" << 2000),
+                                                  << "sizeOnDisk"
+                                                  << 2000),
                                              BSON("name"
                                                   << "TestDB2"
-                                                  << "sizeOnDisk" << 5000)});
+                                                  << "sizeOnDisk"
+                                                  << 5000)});
 
     // Make sure the shard add code checks for the presence of each of the two databases we returned
     // in the previous call, in the config server metadata
@@ -309,13 +312,16 @@ TEST_F(AddShardTest, StandaloneGenerateName) {
     expectListDatabases(shardTarget,
                         std::vector<BSONObj>{BSON("name"
                                                   << "local"
-                                                  << "sizeOnDisk" << 1000),
+                                                  << "sizeOnDisk"
+                                                  << 1000),
                                              BSON("name"
                                                   << "TestDB1"
-                                                  << "sizeOnDisk" << 2000),
+                                                  << "sizeOnDisk"
+                                                  << 2000),
                                              BSON("name"
                                                   << "TestDB2"
-                                                  << "sizeOnDisk" << 5000)});
+                                                  << "sizeOnDisk"
+                                                  << 5000)});
 
     // Make sure the shard add code checks for the presence of each of the two databases we returned
     // in the previous call, in the config server metadata
@@ -332,7 +338,7 @@ TEST_F(AddShardTest, StandaloneGenerateName) {
         ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.toString(), ShardType::ConfigNS);
-        auto query = assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), ShardType::ConfigNS);
 
@@ -629,7 +635,8 @@ TEST_F(AddShardTest, ShardIsCSRSConfigServer) {
 
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "config"
-                                        << "configsvr" << true);
+                                        << "configsvr"
+                                        << true);
     expectValidationCheck(shardTarget, commandResponse);
 
     future.timed_get(kFutureTimeout);
@@ -660,7 +667,8 @@ TEST_F(AddShardTest, ReplicaSetMissingHostsProvidedInSeedList) {
     hosts.append("host1:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts" << hosts.arr());
+                                        << "hosts"
+                                        << hosts.arr());
     expectValidationCheck(shardTarget, commandResponse);
 
     future.timed_get(kFutureTimeout);
@@ -692,7 +700,8 @@ TEST_F(AddShardTest, ShardNameIsConfig) {
     hosts.append("host2:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts" << hosts.arr());
+                                        << "hosts"
+                                        << hosts.arr());
     expectValidationCheck(shardTarget, commandResponse);
 
     future.timed_get(kFutureTimeout);
@@ -724,7 +733,8 @@ TEST_F(AddShardTest, ShardContainsExistingDatabase) {
     hosts.append("host2:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts" << hosts.arr());
+                                        << "hosts"
+                                        << hosts.arr());
     expectValidationCheck(shardTarget, commandResponse);
 
     expectListDatabases(shardTarget,
@@ -739,7 +749,9 @@ TEST_F(AddShardTest, ShardContainsExistingDatabase) {
     future.timed_get(kFutureTimeout);
 }
 
-TEST_F(AddShardTest, ExistingShardName) {
+// TODO(SERVER-24213): Test adding a new shard with an existing shard name, but different
+// shard membership
+TEST_F(AddShardTest, ReAddExistingShard) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
         stdx::make_unique<RemoteCommandTargeterMock>());
     ConnectionString connString =
@@ -754,9 +766,7 @@ TEST_F(AddShardTest, ExistingShardName) {
     auto future = launchAsync([this, expectedShardName, connString] {
         auto status =
             catalogManager()->addShard(operationContext(), &expectedShardName, connString, 100);
-        ASSERT_EQUALS(ErrorCodes::DuplicateKey, status);
-        ASSERT_STRING_CONTAINS(status.getStatus().reason(),
-                               "Received DuplicateKey error when inserting");
+        ASSERT_OK(status);
     });
 
     BSONArrayBuilder hosts;
@@ -764,7 +774,8 @@ TEST_F(AddShardTest, ExistingShardName) {
     hosts.append("host2:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts" << hosts.arr());
+                                        << "hosts"
+                                        << hosts.arr());
     expectValidationCheck(shardTarget, commandResponse);
 
     expectListDatabases(shardTarget,
@@ -828,7 +839,8 @@ TEST_F(AddShardTest, SuccessfullyAddReplicaSet) {
     hosts.append("host2:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts" << hosts.arr());
+                                        << "hosts"
+                                        << hosts.arr());
     expectValidationCheck(shardTarget, commandResponse);
 
     expectListDatabases(shardTarget,
@@ -884,7 +896,8 @@ TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
     hosts.append("host2:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts" << hosts.arr());
+                                        << "hosts"
+                                        << hosts.arr());
     expectValidationCheck(shardTarget, commandResponse);
 
     expectListDatabases(shardTarget,
@@ -964,7 +977,8 @@ TEST_F(AddShardTest, ReplicaSetExtraHostsDiscovered) {
     hosts.append("host2:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts" << hosts.arr());
+                                        << "hosts"
+                                        << hosts.arr());
     expectValidationCheck(shardTarget, commandResponse);
 
     expectListDatabases(shardTarget, {});

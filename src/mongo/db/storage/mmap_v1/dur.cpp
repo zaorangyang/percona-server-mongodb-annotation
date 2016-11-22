@@ -488,10 +488,15 @@ void Stats::S::_asObj(BSONObjBuilder* builder) const {
       << _journaledBytes / (_uncompressedBytes + 1.0) << "commitsInWriteLock" << _commitsInWriteLock
       << "earlyCommits" << 0 << "timeMs"
       << BSON("dt" << _durationMillis << "prepLogBuffer" << (unsigned)(_prepLogBufferMicros / 1000)
-                   << "writeToJournal" << (unsigned)(_writeToJournalMicros / 1000)
-                   << "writeToDataFiles" << (unsigned)(_writeToDataFilesMicros / 1000)
-                   << "remapPrivateView" << (unsigned)(_remapPrivateViewMicros / 1000) << "commits"
-                   << (unsigned)(_commitsMicros / 1000) << "commitsInWriteLock"
+                   << "writeToJournal"
+                   << (unsigned)(_writeToJournalMicros / 1000)
+                   << "writeToDataFiles"
+                   << (unsigned)(_writeToDataFilesMicros / 1000)
+                   << "remapPrivateView"
+                   << (unsigned)(_remapPrivateViewMicros / 1000)
+                   << "commits"
+                   << (unsigned)(_commitsMicros / 1000)
+                   << "commitsInWriteLock"
                    << (unsigned)(_commitsInWriteLockMicros / 1000));
 
     if (storageGlobalParams.journalCommitIntervalMs != 0) {
@@ -687,7 +692,7 @@ static void durThread(ClockSource* cs, int64_t serverStartMs) {
         }
 
         // +1 so it never goes down to zero
-        const unsigned oneThird = (ms / 3) + 1;
+        const int64_t oneThird = (ms / 3) + 1;
 
         // Reset the stats based on the reset interval
         if (stats.curr()->getCurrentDurationMillis() > DurStatsResetIntervalMillis) {
@@ -699,7 +704,7 @@ static void durThread(ClockSource* cs, int64_t serverStartMs) {
 
             for (unsigned i = 0; i <= 2; i++) {
                 if (stdx::cv_status::no_timeout ==
-                    flushRequested.wait_for(lock, Milliseconds(oneThird))) {
+                    flushRequested.wait_for(lock, Milliseconds(oneThird).toSystemDuration())) {
                     // Someone forced a flush
                     break;
                 }

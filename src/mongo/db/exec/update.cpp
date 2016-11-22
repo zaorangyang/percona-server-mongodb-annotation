@@ -33,15 +33,16 @@
 #include "mongo/db/exec/update.h"
 
 #include "mongo/bson/mutable/algorithm.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/exec/write_stage_common.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/update_lifecycle.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -54,6 +55,7 @@ using std::vector;
 using stdx::make_unique;
 
 namespace mb = mutablebson;
+namespace dps = ::mongo::dotted_path_support;
 
 namespace {
 
@@ -146,7 +148,8 @@ Status validateDollarPrefixElement(const mb::ConstElement elem, const bool deep)
         // not an okay, $ prefixed field name.
         return Status(ErrorCodes::DollarPrefixedFieldName,
                       str::stream() << "The dollar ($) prefixed field '" << elem.getFieldName()
-                                    << "' in '" << mb::getFullName(elem)
+                                    << "' in '"
+                                    << mb::getFullName(elem)
                                     << "' is not valid for storage.");
     }
 
@@ -198,7 +201,8 @@ Status storageValid(const mb::ConstElement& elem, const bool deep) {
             // Field name cannot have a "." in it.
             return Status(ErrorCodes::DottedFieldName,
                           str::stream() << "The dotted field '" << elem.getFieldName() << "' in '"
-                                        << mb::getFullName(elem) << "' is not valid for storage.");
+                                        << mb::getFullName(elem)
+                                        << "' is not valid for storage.");
         }
     }
 
@@ -340,13 +344,16 @@ inline Status validate(const BSONObj& original,
                     return Status(ErrorCodes::ImmutableField,
                                   mongoutils::str::stream()
                                       << "After applying the update to the document with "
-                                      << newIdElem.toString() << ", the '" << current.dottedField()
+                                      << newIdElem.toString()
+                                      << ", the '"
+                                      << current.dottedField()
                                       << "' (required and immutable) field was "
-                                         "found to have been removed --" << original);
+                                         "found to have been removed --"
+                                      << original);
             }
         } else {
             // Find the potentially affected field in the original document.
-            const BSONElement oldElem = original.getFieldDotted(current.dottedField());
+            const BSONElement oldElem = dps::extractElementAtPath(original, current.dottedField());
             const BSONElement oldIdElem = original.getField(idFieldName);
 
             // Ensure no arrays since neither _id nor shard keys can be in an array, or one.
@@ -358,7 +365,8 @@ inline Status validate(const BSONObj& original,
                         mongoutils::str::stream()
                             << "After applying the update to the document {"
                             << (oldIdElem.ok() ? oldIdElem.toString() : newIdElem.toString())
-                            << " , ...}, the (immutable) field '" << current.dottedField()
+                            << " , ...}, the (immutable) field '"
+                            << current.dottedField()
                             << "' was found to be an array or array descendant.");
                 }
                 currElem = currElem.parent();
@@ -369,8 +377,10 @@ inline Status validate(const BSONObj& original,
                 return Status(ErrorCodes::ImmutableField,
                               mongoutils::str::stream()
                                   << "After applying the update to the document {"
-                                  << oldElem.toString() << " , ...}, the (immutable) field '"
-                                  << current.dottedField() << "' was found to have been altered to "
+                                  << oldElem.toString()
+                                  << " , ...}, the (immutable) field '"
+                                  << current.dottedField()
+                                  << "' was found to have been altered to "
                                   << newElem.toString());
             }
         }
@@ -1031,6 +1041,7 @@ const UpdateStats* UpdateStage::getUpdateStats(const PlanExecutor* exec) {
 }
 
 void UpdateStage::recordUpdateStatsInOpDebug(const UpdateStats* updateStats, OpDebug* opDebug) {
+    invariant(opDebug);
     opDebug->nMatched = updateStats->nMatched;
     opDebug->nModified = updateStats->nModified;
     opDebug->upsert = updateStats->inserted;

@@ -32,11 +32,13 @@
 
 #include "mongo/s/grid.h"
 
+#include "mongo/db/server_options.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/stdx/memory.h"
@@ -77,6 +79,8 @@ void Grid::init(std::unique_ptr<CatalogManager> catalogManager,
     _balancerConfig = std::move(balancerConfig);
     _executorPool = std::move(executorPool);
     _network = network;
+
+    _shardRegistry->startup();
 }
 
 bool Grid::allowLocalHost() const {
@@ -88,11 +92,15 @@ void Grid::setAllowLocalHost(bool allow) {
 }
 
 repl::OpTime Grid::configOpTime() const {
+    invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
+
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _configOpTime;
 }
 
 void Grid::advanceConfigOpTime(repl::OpTime opTime) {
+    invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
+
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (_configOpTime < opTime) {
         _configOpTime = opTime;

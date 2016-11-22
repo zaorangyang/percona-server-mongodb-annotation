@@ -50,13 +50,13 @@
 #include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/move_timing_helper.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/logger/ramlog.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -260,8 +260,14 @@ Status MigrationDestinationManager::start(const string& ns,
     if (_sessionId) {
         return Status(ErrorCodes::ConflictingOperationInProgress,
                       str::stream() << "Active migration already in progress "
-                                    << "ns: " << _ns << ", from: " << _from << ", min: " << _min
-                                    << ", max: " << _max);
+                                    << "ns: "
+                                    << _ns
+                                    << ", from: "
+                                    << _from
+                                    << ", min: "
+                                    << _min
+                                    << ", max: "
+                                    << _max);
     }
 
     _state = READY;
@@ -326,10 +332,11 @@ bool MigrationDestinationManager::startCommit(const MigrationSessionId& sessionI
 
     _state = COMMIT_START;
 
-    const auto deadline = stdx::chrono::system_clock::now() + Seconds(30);
+    const auto deadline = Date_t::now() + Seconds(30);
 
     while (_sessionId) {
-        if (stdx::cv_status::timeout == _isActiveCV.wait_until(lock, deadline)) {
+        if (stdx::cv_status::timeout ==
+            _isActiveCV.wait_until(lock, deadline.toSystemTimePoint())) {
             _state = FAIL;
             log() << "startCommit never finished!" << migrateLog;
             return false;
@@ -977,9 +984,16 @@ Status MigrationDestinationManager::_notePending(OperationContext* txn,
     if (!metadata || metadata->getCollVersion().epoch() != epoch) {
         return {ErrorCodes::StaleShardVersion,
                 str::stream() << "could not note chunk "
-                              << "[" << min << "," << max << ")"
-                              << " as pending because the epoch for " << nss.ns()
-                              << " has changed from " << epoch << " to "
+                              << "["
+                              << min
+                              << ","
+                              << max
+                              << ")"
+                              << " as pending because the epoch for "
+                              << nss.ns()
+                              << " has changed from "
+                              << epoch
+                              << " to "
                               << (metadata ? metadata->getCollVersion().epoch()
                                            : ChunkVersion::UNSHARDED().epoch())};
     }
@@ -1022,10 +1036,18 @@ Status MigrationDestinationManager::_forgetPending(OperationContext* txn,
     if (!metadata || metadata->getCollVersion().epoch() != epoch) {
         return {ErrorCodes::StaleShardVersion,
                 str::stream() << "no need to forget pending chunk "
-                              << "[" << min << "," << max << ")"
-                              << " because the epoch for " << nss.ns() << " has changed from "
-                              << epoch << " to " << (metadata ? metadata->getCollVersion().epoch()
-                                                              : ChunkVersion::UNSHARDED().epoch())};
+                              << "["
+                              << min
+                              << ","
+                              << max
+                              << ")"
+                              << " because the epoch for "
+                              << nss.ns()
+                              << " has changed from "
+                              << epoch
+                              << " to "
+                              << (metadata ? metadata->getCollVersion().epoch()
+                                           : ChunkVersion::UNSHARDED().epoch())};
     }
 
     ChunkType chunk;

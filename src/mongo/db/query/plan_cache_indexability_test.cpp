@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/index_entry.h"
@@ -40,8 +42,8 @@ std::unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj) {
     StatusWithMatchExpression status =
         MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions(), collator);
     if (!status.isOK()) {
-        FAIL(str::stream() << "failed to parse query: " << obj.toString()
-                           << ". Reason: " << status.getStatus().toString());
+        FAIL(str::stream() << "failed to parse query: " << obj.toString() << ". Reason: "
+                           << status.getStatus().toString());
     }
     return std::move(status.getValue());
 }

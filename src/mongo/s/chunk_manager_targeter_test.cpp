@@ -61,10 +61,10 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr) {
 
     BSONObj queryObj = fromjson(queryStr);
     const NamespaceString nss("test.foo");
-    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-    lpq->setFilter(queryObj);
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(queryObj);
     auto statusWithCQ =
-        CanonicalQuery::canonicalize(txn.get(), std::move(lpq), ExtensionsCallbackNoop());
+        CanonicalQuery::canonicalize(txn.get(), std::move(qr), ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -319,7 +319,8 @@ TEST(CMCollapseTreeTest, Regex) {
     OrderedIntervalList expected;
     expected.intervals.push_back(Interval(BSON(""
                                                << ""
-                                               << "" << BSONObj()),
+                                               << ""
+                                               << BSONObj()),
                                           true,
                                           false));
     BSONObjBuilder builder;

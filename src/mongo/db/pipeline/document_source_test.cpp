@@ -37,11 +37,12 @@
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/util/clock_source_mock.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
 bool isMongos() {
@@ -51,6 +52,7 @@ bool isMongos() {
 std::unique_ptr<ServiceContextNoop> makeTestServiceContext() {
     auto service = stdx::make_unique<ServiceContextNoop>();
     service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+    service->setTickSource(stdx::make_unique<TickSourceMock>());
     return service;
 }
 }
@@ -115,7 +117,7 @@ TEST(TruncateSort, TruncateSortDedupsSortCorrectly) {
 }
 
 template <size_t ArrayLen>
-set<string> arrayToSet(const char*(&array)[ArrayLen]) {
+set<string> arrayToSet(const char* (&array)[ArrayLen]) {
     set<string> out;
     for (size_t i = 0; i < ArrayLen; i++)
         out.insert(array[i]);
@@ -835,8 +837,9 @@ class TwoValuesTwoKeys : public CheckResultsBase {
     virtual BSONObj groupSpec() {
         return BSON("_id"
                     << "$_id"
-                    << "a" << BSON("$push"
-                                   << "$a"));
+                    << "a"
+                    << BSON("$push"
+                            << "$a"));
     }
     virtual string expectedResultSetString() {
         return "[{_id:0,a:[1]},{_id:1,a:[2]}]";
@@ -854,8 +857,9 @@ class FourValuesTwoKeys : public CheckResultsBase {
     virtual BSONObj groupSpec() {
         return BSON("_id"
                     << "$id"
-                    << "a" << BSON("$push"
-                                   << "$a"));
+                    << "a"
+                    << BSON("$push"
+                            << "$a"));
     }
     virtual string expectedResultSetString() {
         return "[{_id:0,a:[1,3]},{_id:1,a:[2,4]}]";
@@ -873,8 +877,10 @@ class FourValuesTwoKeysTwoAccumulators : public CheckResultsBase {
     virtual BSONObj groupSpec() {
         return BSON("_id"
                     << "$id"
-                    << "list" << BSON("$push"
-                                      << "$a") << "sum"
+                    << "list"
+                    << BSON("$push"
+                            << "$a")
+                    << "sum"
                     << BSON("$sum" << BSON("$divide" << BSON_ARRAY("$a" << 2))));
     }
     virtual string expectedResultSetString() {
@@ -890,8 +896,9 @@ class GroupNullUndefinedIds : public CheckResultsBase {
     virtual BSONObj groupSpec() {
         return BSON("_id"
                     << "$a"
-                    << "sum" << BSON("$sum"
-                                     << "$b"));
+                    << "sum"
+                    << BSON("$sum"
+                            << "$b"));
     }
     virtual string expectedResultSetString() {
         return "[{_id:null,sum:110}]";
@@ -955,8 +962,9 @@ public:
         // Create a group source.
         createGroup(BSON("_id"
                          << "$x"
-                         << "list" << BSON("$push"
-                                           << "$y")));
+                         << "list"
+                         << BSON("$push"
+                                 << "$y")));
         // Create a merger version of the source.
         intrusive_ptr<DocumentSource> group = createMerger();
         // Attach the merger to the synthetic shard results.
@@ -1799,13 +1807,15 @@ TEST_F(SampleFromRandomCursorBasics, MimicNonOptimized) {
         ASSERT_TRUE((*doc).hasRandMetaField());
         secondTotal += (*doc).getRandMetaField();
     }
-    // The average random meta value of the first document should be about 0.75.
-    ASSERT_GTE(firstTotal / nTrials, 0.74);
-    ASSERT_LTE(firstTotal / nTrials, 0.76);
+    // The average random meta value of the first document should be about 0.75. We assume that
+    // 10000 trials is sufficient for us to apply the Central Limit Theorem. Using an error
+    // tolerance of 0.02 gives us a spurious failure rate approximately equal to 10^-24.
+    ASSERT_GTE(firstTotal / nTrials, 0.73);
+    ASSERT_LTE(firstTotal / nTrials, 0.77);
 
     // The average random meta value of the second document should be about 0.5.
-    ASSERT_GTE(secondTotal / nTrials, 0.49);
-    ASSERT_LTE(secondTotal / nTrials, 0.51);
+    ASSERT_GTE(secondTotal / nTrials, 0.48);
+    ASSERT_LTE(secondTotal / nTrials, 0.52);
 }
 }  // namespace DocumentSourceSampleFromRandomCursor
 
@@ -2344,7 +2354,8 @@ private:
     void createUnwind(bool preserveNullAndEmptyArrays, bool includeArrayIndex) {
         auto specObj =
             DOC("$unwind" << DOC("path" << unwindFieldPath() << "preserveNullAndEmptyArrays"
-                                        << preserveNullAndEmptyArrays << "includeArrayIndex"
+                                        << preserveNullAndEmptyArrays
+                                        << "includeArrayIndex"
                                         << (includeArrayIndex ? Value(indexPath()) : Value())));
         _unwind = static_cast<DocumentSourceUnwind*>(
             DocumentSourceUnwind::createFromBson(specObj.toBson().firstElement(), ctx()).get());
@@ -2392,11 +2403,12 @@ private:
     }
 
     BSONObj expectedSerialization(bool preserveNullAndEmptyArrays, bool includeArrayIndex) const {
-        return DOC("$unwind" << DOC(
-                       "path" << Value(unwindFieldPath()) << "preserveNullAndEmptyArrays"
-                              << (preserveNullAndEmptyArrays ? Value(true) : Value())
-                              << "includeArrayIndex"
-                              << (includeArrayIndex ? Value(indexPath()) : Value()))).toBson();
+        return DOC("$unwind" << DOC("path" << Value(unwindFieldPath())
+                                           << "preserveNullAndEmptyArrays"
+                                           << (preserveNullAndEmptyArrays ? Value(true) : Value())
+                                           << "includeArrayIndex"
+                                           << (includeArrayIndex ? Value(indexPath()) : Value())))
+            .toBson();
     }
 
     /** Assert that iterator state accessors consistently report the source is exhausted. */
@@ -2907,7 +2919,8 @@ TEST_F(InvalidUnwindSpec, NonDollarPrefixedPath) {
 TEST_F(InvalidUnwindSpec, NonBoolPreserveNullAndEmptyArrays) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "preserveNullAndEmptyArrays" << 2))),
+                                                           << "preserveNullAndEmptyArrays"
+                                                           << 2))),
                        UserException,
                        28809);
 }
@@ -2915,7 +2928,8 @@ TEST_F(InvalidUnwindSpec, NonBoolPreserveNullAndEmptyArrays) {
 TEST_F(InvalidUnwindSpec, NonStringIncludeArrayIndex) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "includeArrayIndex" << 2))),
+                                                           << "includeArrayIndex"
+                                                           << 2))),
                        UserException,
                        28810);
 }
@@ -2947,13 +2961,16 @@ TEST_F(InvalidUnwindSpec, DollarPrefixedIncludeArrayIndex) {
 TEST_F(InvalidUnwindSpec, UnrecognizedOption) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "preserveNullAndEmptyArrays" << true
-                                                           << "foo" << 3))),
+                                                           << "preserveNullAndEmptyArrays"
+                                                           << true
+                                                           << "foo"
+                                                           << 3))),
                        UserException,
                        28811);
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "foo" << 3))),
+                                                           << "foo"
+                                                           << 3))),
                        UserException,
                        28811);
 }
@@ -3302,9 +3319,8 @@ public:
         match1->optimizeAt(container.begin(), &container);
         ASSERT_EQUALS(container.size(), 1U);
         ASSERT_EQUALS(match1->getQuery(),
-                      fromjson(
-                          "{'$and': [{'$and': [{a:1}, {b:1}]},"
-                          "{c:1}]}"));
+                      fromjson("{'$and': [{'$and': [{a:1}, {b:1}]},"
+                               "{c:1}]}"));
     }
 };
 
@@ -3350,11 +3366,11 @@ TEST(ObjectForMatch, ShouldExtractEntireArrayFromPrefixOfDottedField) {
 namespace DocumentSourceLookUp {
 using mongo::DocumentSourceLookUp;
 
-class OutputSort : public Mock::Base {
+class OutputSortTruncatesOnEquality : public Mock::Base {
 public:
     void run() {
         intrusive_ptr<DocumentSourceMock> source = DocumentSourceMock::create();
-        source->sorts = {BSON("a" << 1 << "d.e" << 1)};
+        source->sorts = {BSON("a" << 1 << "d.e" << 1 << "c" << 1)};
         intrusive_ptr<DocumentSource> lookup =
             DocumentSourceLookUp::createFromBson(BSON("$lookup" << BSON("from"
                                                                         << "a"
@@ -3363,14 +3379,39 @@ public:
                                                                         << "foreignField"
                                                                         << "c"
                                                                         << "as"
-                                                                        << "d.e")).firstElement(),
+                                                                        << "d.e"))
+                                                     .firstElement(),
                                                  ctx());
         lookup->setSource(source.get());
 
         BSONObjSet outputSort = lookup->getOutputSorts();
 
         ASSERT_EQUALS(outputSort.count(BSON("a" << 1)), 1U);
-        ASSERT_EQUALS(outputSort.count(BSON("d.e" << 1)), 0U);
+        ASSERT_EQUALS(outputSort.size(), 1U);
+    }
+};
+
+class OutputSortTruncatesOnPrefix : public Mock::Base {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMock> source = DocumentSourceMock::create();
+        source->sorts = {BSON("a" << 1 << "d.e" << 1 << "c" << 1)};
+        intrusive_ptr<DocumentSource> lookup =
+            DocumentSourceLookUp::createFromBson(BSON("$lookup" << BSON("from"
+                                                                        << "a"
+                                                                        << "localField"
+                                                                        << "b"
+                                                                        << "foreignField"
+                                                                        << "c"
+                                                                        << "as"
+                                                                        << "d"))
+                                                     .firstElement(),
+                                                 ctx());
+        lookup->setSource(source.get());
+
+        BSONObjSet outputSort = lookup->getOutputSorts();
+
+        ASSERT_EQUALS(outputSort.count(BSON("a" << 1)), 1U);
         ASSERT_EQUALS(outputSort.size(), 1U);
     }
 };
@@ -3494,7 +3535,8 @@ public:
         add<DocumentSourceGeoNear::LimitCoalesce>();
         add<DocumentSourceGeoNear::OutputSort>();
 
-        add<DocumentSourceLookUp::OutputSort>();
+        add<DocumentSourceLookUp::OutputSortTruncatesOnEquality>();
+        add<DocumentSourceLookUp::OutputSortTruncatesOnPrefix>();
 
         add<DocumentSourceMatch::RedactSafePortion>();
         add<DocumentSourceMatch::Coalesce>();

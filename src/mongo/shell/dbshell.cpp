@@ -586,7 +586,6 @@ int _main(int argc, char* argv[], char** envp) {
     mongo::shell_utils::RecordMyLocation(argv[0]);
 
     shellGlobalParams.url = "test";
-    mongo::enableLatestBSONVersion();  // No need to limit shell, as server will check on ingress.
 
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
 
@@ -748,7 +747,8 @@ int _main(int argc, char* argv[], char** envp) {
                 hasMongoRC = true;
                 if (!scope->execFile(rcLocation, false, true)) {
                     cout << "The \".mongorc.js\" file located in your home folder could not be "
-                            "executed" << endl;
+                            "executed"
+                         << endl;
                     return -5;
                 }
             }

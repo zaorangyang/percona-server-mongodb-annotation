@@ -29,6 +29,7 @@
 #pragma once
 
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -49,6 +50,85 @@ class ShardFactory;
 class Shard;
 class ShardType;
 
+class ShardRegistryData {
+public:
+    ShardRegistryData(OperationContext* txn, ShardFactory* shardFactory);
+    ShardRegistryData() = default;
+    ~ShardRegistryData() = default;
+
+
+    void swap(ShardRegistryData& other);
+
+    /**
+     * Creates a shard based on the specified information and puts it into the lookup maps.
+     */
+    void addShard(const std::shared_ptr<Shard>&);
+
+    /**
+     * Lookup shard by replica set name. Returns nullptr if the name can't be found.
+     */
+    std::shared_ptr<Shard> findByRSName(const std::string& rsName) const;
+
+    /**
+     * Returns a shared pointer to the shard object with the given shard id.
+     */
+    std::shared_ptr<Shard> findByShardId(const ShardId&) const;
+
+    /**
+     * Finds the Shard that the mongod listening at this HostAndPort is a member of.
+     */
+    std::shared_ptr<Shard> findByHostAndPort(const HostAndPort&) const;
+
+    /**
+     * Returns config shard.
+     */
+    std::shared_ptr<Shard> getConfigShard() const;
+
+    /**
+     * Adds config shard.
+     */
+    void addConfigShard(std::shared_ptr<Shard>);
+
+    void getAllShardIds(std::set<ShardId>& result) const;
+    void toBSON(BSONObjBuilder* result) const;
+    /**
+     * If the shard with same replica set name as in the newConnString already exists then replace
+     * it with the shard built for the newConnString.
+     */
+    void rebuildShardIfExists(const ConnectionString& newConnString, ShardFactory* factory);
+
+    /**
+     * Rebuilds config shard. The result is to recreate a ReplicaSetMonitor in the case it does
+     * not exist.
+     */
+    void rebuildConfigShard(ShardFactory* factory);
+
+private:
+    /**
+     * Reads shards docs from the catalog manager and fills in maps.
+     */
+    void _init(OperationContext* txn, ShardFactory* factory);
+
+    void _addShard_inlock(const std::shared_ptr<Shard>&);
+    std::shared_ptr<Shard> _findByShardId_inlock(const ShardId&) const;
+    void _rebuildShard_inlock(const ConnectionString& newConnString, ShardFactory* factory);
+
+    // Protects the lookup maps below.
+    mutable stdx::mutex _mutex;
+    using ShardMap = std::unordered_map<ShardId, std::shared_ptr<Shard>>;
+
+    // Map of both shardName -> Shard and hostName -> Shard
+    ShardMap _lookup;
+
+    // Map from replica set name to shard corresponding to this replica set
+    ShardMap _rsLookup;
+
+    std::unordered_map<HostAndPort, std::shared_ptr<Shard>> _hostLookup;
+
+    // store configShard separately to always have a reference
+    std::shared_ptr<Shard> _configShard;
+};
+
 /**
  * Maintains the set of all shards known to the instance and their connections and exposes
  * functionality to run commands against shards. All commands which this registry executes are
@@ -65,9 +145,15 @@ public:
      * @param shardFactory Makes shards
      * @param configServerCS ConnectionString used for communicating with the config servers
      */
-    ShardRegistry(std::unique_ptr<ShardFactory> shardFactory, ConnectionString configServerCS);
+    ShardRegistry(std::unique_ptr<ShardFactory> shardFactory,
+                  const ConnectionString& configServerCS);
 
-    ~ShardRegistry();
+    ~ShardRegistry() = default;
+
+    /**
+     *  Starts ReplicaSetMonitor by adding a config shard.
+     */
+    void startup();
 
     ConnectionString getConfigServerConnectionString() const;
 
@@ -80,12 +166,6 @@ public:
      * returned false.
      */
     bool reload(OperationContext* txn);
-
-    /**
-     * Invoked when the connection string for the config server changes. Updates the config server
-     * connection string and recreates the config server's shard.
-     */
-    void updateConfigServerConnectionString(ConnectionString configServerCS);
 
     /**
      * Throws out and reconstructs the config shard.  This has the effect that if replica set
@@ -127,7 +207,7 @@ public:
     /**
      * Returns shared pointer to the shard object representing the config servers.
      */
-    std::shared_ptr<Shard> getConfigShard();
+    std::shared_ptr<Shard> getConfigShard() const;
 
     /**
      * Instantiates a new detached shard connection, which does not appear in the list of shards
@@ -146,37 +226,25 @@ public:
      */
     std::shared_ptr<Shard> lookupRSName(const std::string& name) const;
 
-    void remove(const ShardId& id);
-
     void getAllShardIds(std::vector<ShardId>* all) const;
-
-    void toBSON(BSONObjBuilder* result);
+    void toBSON(BSONObjBuilder* result) const;
 
 private:
-    using ShardMap = std::unordered_map<ShardId, std::shared_ptr<Shard>>;
-
     /**
-     * Creates a shard based on the specified information and puts it into the lookup maps.
+     * Factory to create shards.  Never changed after startup so safe to access outside of _mutex.
      */
-    void _addShard_inlock(const ShardId& shardId, const ConnectionString& connString);
-
-    /**
-     * Adds the "config" shard (representing the config server) to the shard registry.
-     */
-    void _addConfigShard_inlock();
-
-    void _updateConfigServerConnectionString_inlock(ConnectionString configServerCS);
-
-    std::shared_ptr<Shard> _findUsingLookUp(const ShardId& shardId);
-    std::shared_ptr<Shard> _findUsingLookUp_inlock(const ShardId& shardId);
-
-    // Factory to create shards.  Never changed after startup so safe
-    // to access outside of _mutex.
     const std::unique_ptr<ShardFactory> _shardFactory;
 
-    // Protects the _reloadState, config server connections string, and the lookup maps below.
-    mutable stdx::mutex _mutex;
+    /**
+     * Specified in the ShardRegistry c-tor. It's used only in startup() to initialize the config
+     * shard
+     */
+    ConnectionString _initConfigServerCS;
 
+    ShardRegistryData _data;
+
+    // Protects the _reloadState and _initConfigServerCS during startup.
+    mutable stdx::mutex _reloadMutex;
     stdx::condition_variable _inReloadCV;
 
     enum class ReloadState {
@@ -186,17 +254,7 @@ private:
     };
 
     ReloadState _reloadState{ReloadState::Idle};
-
-    // Config server connection string
-    ConnectionString _configServerCS;
-
-    // Map of both shardName -> Shard and hostName -> Shard
-    ShardMap _lookup;
-
-    // Map from replica set name to shard corresponding to this replica set
-    ShardMap _rsLookup;
-
-    std::unordered_map<HostAndPort, std::shared_ptr<Shard>> _hostLookup;
 };
+
 
 }  // namespace mongo

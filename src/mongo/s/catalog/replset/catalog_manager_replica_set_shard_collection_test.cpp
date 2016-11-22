@@ -42,7 +42,6 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
-#include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/replset/catalog_manager_replica_set.h"
 #include "mongo/s/catalog/replset/catalog_manager_replica_set_test_fixture.h"
@@ -56,9 +55,9 @@
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/stdx/chrono.h"
 #include "mongo/stdx/future.h"
 #include "mongo/util/log.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
@@ -70,7 +69,6 @@ using executor::TaskExecutor;
 using std::set;
 using std::string;
 using std::vector;
-using stdx::chrono::milliseconds;
 using unittest::assertGet;
 
 const BSONObj kReplMetadata();
@@ -88,6 +86,7 @@ public:
     void setUp() override {
         CatalogManagerReplSetTestFixture::setUp();
         configTargeter()->setFindHostReturnValue(configHost);
+        configTargeter()->setConnectionStringReturnValue(configCS);
         getMessagingPort()->setRemote(clientHost);
     }
 
@@ -99,8 +98,7 @@ public:
             const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
             ASSERT_EQ(DatabaseType::ConfigNS, nss.ns());
 
-            auto query =
-                assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+            auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
             ASSERT_EQ(DatabaseType::ConfigNS, query->ns());
             ASSERT_EQ(BSON(DatabaseType::name(expectedDb.getName())), query->getFilter());
@@ -164,8 +162,7 @@ public:
             const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
             ASSERT_EQ(nss.ns(), ChunkType::ConfigNS);
 
-            auto query =
-                assertGet(LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false));
+            auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
             BSONObj expectedQuery =
                 BSON(ChunkType::ns(ns) << ChunkType::DEPRECATED_lastmod << GTE << Timestamp());
             BSONObj expectedSort = BSON(ChunkType::DEPRECATED_lastmod() << 1);
@@ -218,6 +215,7 @@ public:
 
 protected:
     const HostAndPort configHost{"configHost1"};
+    const ConnectionString configCS{ConnectionString::forReplicaSet("configReplSet", {configHost})};
     const HostAndPort clientHost{"clientHost1"};
 };
 
@@ -225,8 +223,8 @@ TEST_F(ShardCollectionTest, distLockFails) {
     distLock()->expectLock(
         [](StringData name,
            StringData whyMessage,
-           milliseconds waitFor,
-           milliseconds lockTryInterval) {
+           Milliseconds waitFor,
+           Milliseconds lockTryInterval) {
             ASSERT_EQUALS("test.foo", name);
             ASSERT_EQUALS("shardCollection", whyMessage);
         },
@@ -258,8 +256,8 @@ TEST_F(ShardCollectionTest, anotherMongosSharding) {
     distLock()->expectLock(
         [&](StringData name,
             StringData whyMessage,
-            milliseconds waitFor,
-            milliseconds lockTryInterval) {
+            Milliseconds waitFor,
+            Milliseconds lockTryInterval) {
             ASSERT_EQUALS(ns, name);
             ASSERT_EQUALS("shardCollection", whyMessage);
         },
@@ -307,7 +305,6 @@ TEST_F(ShardCollectionTest, noInitialChunksOrData) {
     ShardKeyPattern keyPattern(BSON("_id" << 1));
 
     ChunkType expectedChunk;
-    expectedChunk.setName(ChunkType::genID(ns, keyPattern.getKeyPattern().globalMin()));
     expectedChunk.setNS(ns);
     expectedChunk.setMin(keyPattern.getKeyPattern().globalMin());
     expectedChunk.setMax(keyPattern.getKeyPattern().globalMax());
@@ -317,8 +314,8 @@ TEST_F(ShardCollectionTest, noInitialChunksOrData) {
     distLock()->expectLock(
         [&](StringData name,
             StringData whyMessage,
-            milliseconds waitFor,
-            milliseconds lockTryInterval) {
+            Milliseconds waitFor,
+            Milliseconds lockTryInterval) {
             ASSERT_EQUALS(ns, name);
             ASSERT_EQUALS("shardCollection", whyMessage);
         },
@@ -340,8 +337,11 @@ TEST_F(ShardCollectionTest, noInitialChunksOrData) {
     {
         BSONObj logChangeDetail =
             BSON("shardKey" << keyPattern.toBSON() << "collection" << ns << "primary"
-                            << shard.getName() + ":" + shard.getHost() << "initShards"
-                            << BSONArray() << "numChunks" << 1);
+                            << shard.getName() + ":" + shard.getHost()
+                            << "initShards"
+                            << BSONArray()
+                            << "numChunks"
+                            << 1);
         expectChangeLogCreate(configHost, BSON("ok" << 1));
         expectChangeLogInsert(
             configHost, network()->now(), "shardCollection.start", ns, logChangeDetail);
@@ -442,7 +442,6 @@ TEST_F(ShardCollectionTest, withInitialChunks) {
     expectedChunk0.setShard(shard0.getName());
     expectedChunk0.setMin(keyPattern.getKeyPattern().globalMin());
     expectedChunk0.setMax(splitPoint0);
-    expectedChunk0.setName(ChunkType::genID(ns, expectedChunk0.getMin()));
     expectedChunk0.setVersion(expectedVersion);
     expectedVersion.incMinor();
 
@@ -451,7 +450,6 @@ TEST_F(ShardCollectionTest, withInitialChunks) {
     expectedChunk1.setShard(shard1.getName());
     expectedChunk1.setMin(splitPoint0);
     expectedChunk1.setMax(splitPoint1);
-    expectedChunk1.setName(ChunkType::genID(ns, expectedChunk1.getMin()));
     expectedChunk1.setVersion(expectedVersion);
     expectedVersion.incMinor();
 
@@ -460,7 +458,6 @@ TEST_F(ShardCollectionTest, withInitialChunks) {
     expectedChunk2.setShard(shard2.getName());
     expectedChunk2.setMin(splitPoint1);
     expectedChunk2.setMax(splitPoint2);
-    expectedChunk2.setName(ChunkType::genID(ns, expectedChunk2.getMin()));
     expectedChunk2.setVersion(expectedVersion);
     expectedVersion.incMinor();
 
@@ -469,7 +466,6 @@ TEST_F(ShardCollectionTest, withInitialChunks) {
     expectedChunk3.setShard(shard0.getName());
     expectedChunk3.setMin(splitPoint2);
     expectedChunk3.setMax(splitPoint3);
-    expectedChunk3.setName(ChunkType::genID(ns, expectedChunk3.getMin()));
     expectedChunk3.setVersion(expectedVersion);
     expectedVersion.incMinor();
 
@@ -478,7 +474,6 @@ TEST_F(ShardCollectionTest, withInitialChunks) {
     expectedChunk4.setShard(shard1.getName());
     expectedChunk4.setMin(splitPoint3);
     expectedChunk4.setMax(keyPattern.getKeyPattern().globalMax());
-    expectedChunk4.setName(ChunkType::genID(ns, expectedChunk4.getMin()));
     expectedChunk4.setVersion(expectedVersion);
 
     vector<ChunkType> expectedChunks{
@@ -487,8 +482,8 @@ TEST_F(ShardCollectionTest, withInitialChunks) {
     distLock()->expectLock(
         [&](StringData name,
             StringData whyMessage,
-            milliseconds waitFor,
-            milliseconds lockTryInterval) {
+            Milliseconds waitFor,
+            Milliseconds lockTryInterval) {
             ASSERT_EQUALS(ns, name);
             ASSERT_EQUALS("shardCollection", whyMessage);
         },
@@ -516,9 +511,11 @@ TEST_F(ShardCollectionTest, withInitialChunks) {
     {
         BSONObj logChangeDetail =
             BSON("shardKey" << keyPattern.toBSON() << "collection" << ns << "primary"
-                            << shard0.getName() + ":" + shard0.getHost() << "initShards"
+                            << shard0.getName() + ":" + shard0.getHost()
+                            << "initShards"
                             << BSON_ARRAY(shard0.getName() << shard1.getName() << shard2.getName())
-                            << "numChunks" << (int)expectedChunks.size());
+                            << "numChunks"
+                            << (int)expectedChunks.size());
         expectChangeLogCreate(configHost, BSON("ok" << 1));
         expectChangeLogInsert(
             configHost, network()->now(), "shardCollection.start", ns, logChangeDetail);
@@ -597,7 +594,6 @@ TEST_F(ShardCollectionTest, withInitialData) {
     expectedChunk0.setShard(shard.getName());
     expectedChunk0.setMin(keyPattern.getKeyPattern().globalMin());
     expectedChunk0.setMax(splitPoint0);
-    expectedChunk0.setName(ChunkType::genID(ns, expectedChunk0.getMin()));
     expectedChunk0.setVersion(expectedVersion);
     expectedVersion.incMinor();
 
@@ -606,7 +602,6 @@ TEST_F(ShardCollectionTest, withInitialData) {
     expectedChunk1.setShard(shard.getName());
     expectedChunk1.setMin(splitPoint0);
     expectedChunk1.setMax(splitPoint1);
-    expectedChunk1.setName(ChunkType::genID(ns, expectedChunk1.getMin()));
     expectedChunk1.setVersion(expectedVersion);
     expectedVersion.incMinor();
 
@@ -615,7 +610,6 @@ TEST_F(ShardCollectionTest, withInitialData) {
     expectedChunk2.setShard(shard.getName());
     expectedChunk2.setMin(splitPoint1);
     expectedChunk2.setMax(splitPoint2);
-    expectedChunk2.setName(ChunkType::genID(ns, expectedChunk2.getMin()));
     expectedChunk2.setVersion(expectedVersion);
     expectedVersion.incMinor();
 
@@ -624,7 +618,6 @@ TEST_F(ShardCollectionTest, withInitialData) {
     expectedChunk3.setShard(shard.getName());
     expectedChunk3.setMin(splitPoint2);
     expectedChunk3.setMax(splitPoint3);
-    expectedChunk3.setName(ChunkType::genID(ns, expectedChunk3.getMin()));
     expectedChunk3.setVersion(expectedVersion);
     expectedVersion.incMinor();
 
@@ -633,7 +626,6 @@ TEST_F(ShardCollectionTest, withInitialData) {
     expectedChunk4.setShard(shard.getName());
     expectedChunk4.setMin(splitPoint3);
     expectedChunk4.setMax(keyPattern.getKeyPattern().globalMax());
-    expectedChunk4.setName(ChunkType::genID(ns, expectedChunk4.getMin()));
     expectedChunk4.setVersion(expectedVersion);
 
     vector<ChunkType> expectedChunks{
@@ -642,8 +634,8 @@ TEST_F(ShardCollectionTest, withInitialData) {
     distLock()->expectLock(
         [&](StringData name,
             StringData whyMessage,
-            milliseconds waitFor,
-            milliseconds lockTryInterval) {
+            Milliseconds waitFor,
+            Milliseconds lockTryInterval) {
             ASSERT_EQUALS(ns, name);
             ASSERT_EQUALS("shardCollection", whyMessage);
         },
@@ -665,8 +657,11 @@ TEST_F(ShardCollectionTest, withInitialData) {
     {
         BSONObj logChangeDetail =
             BSON("shardKey" << keyPattern.toBSON() << "collection" << ns << "primary"
-                            << shard.getName() + ":" + shard.getHost() << "initShards"
-                            << BSONArray() << "numChunks" << 1);
+                            << shard.getName() + ":" + shard.getHost()
+                            << "initShards"
+                            << BSONArray()
+                            << "numChunks"
+                            << 1);
         expectChangeLogCreate(configHost, BSON("ok" << 1));
         expectChangeLogInsert(
             configHost, network()->now(), "shardCollection.start", ns, logChangeDetail);
@@ -686,7 +681,7 @@ TEST_F(ShardCollectionTest, withInitialData) {
         ASSERT_EQUALS(keyPattern.toBSON(), request.cmdObj["keyPattern"].Obj());
         ASSERT_EQUALS(keyPattern.getKeyPattern().globalMin(), request.cmdObj["min"].Obj());
         ASSERT_EQUALS(keyPattern.getKeyPattern().globalMax(), request.cmdObj["max"].Obj());
-        ASSERT_EQUALS(ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes,
+        ASSERT_EQUALS(64 * 1024 * 1024ULL,
                       static_cast<uint64_t>(request.cmdObj["maxChunkSizeBytes"].numberLong()));
         ASSERT_EQUALS(0, request.cmdObj["maxSplitPoints"].numberLong());
         ASSERT_EQUALS(0, request.cmdObj["maxChunkObjects"].numberLong());

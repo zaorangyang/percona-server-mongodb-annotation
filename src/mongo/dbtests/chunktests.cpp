@@ -1,5 +1,3 @@
-//@file chunktests.cpp : s/chunk.{h,cpp} tests
-
 /**
  *    Copyright (C) 2012 10gen Inc.
  *
@@ -65,7 +63,7 @@ public:
             _chunkMap[mySplitPoints[i]] = chunk;
         }
 
-        _chunkRangeMap = std::move(_constructRanges(_chunkMap));
+        _chunkRangeMap = _constructRanges(_chunkMap);
     }
 };
 
@@ -129,8 +127,9 @@ class MultiShardBase : public Base {
         return BSON_ARRAY(BSON("a"
                                << "x")
                           << BSON("a"
-                                  << "y") << BSON("a"
-                                                  << "z"));
+                                  << "y")
+                          << BSON("a"
+                                  << "z"));
     }
 };
 

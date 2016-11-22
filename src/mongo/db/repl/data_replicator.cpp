@@ -44,6 +44,7 @@
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/rollback_checker.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -52,6 +53,7 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/destructor_guard.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -427,7 +429,6 @@ DataReplicator::DataReplicator(
       _applierActive(false),
       _applierPaused(false),
       _oplogBuffer(kOplogBufferSize, &getSize) {
-    uassert(ErrorCodes::BadValue, "invalid applier function", _opts.applierFn);
     uassert(ErrorCodes::BadValue, "invalid rollback function", _opts.rollbackFn);
     uassert(ErrorCodes::BadValue,
             "invalid replSetUpdatePosition command object creation function",
@@ -649,6 +650,13 @@ TimestampStatus DataReplicator::initialSync(OperationContext* txn) {
             attemptErrorStatus = _ensureGoodSyncSource_inlock();
         }
 
+        RollbackChecker rollbackChecker(_exec, _syncSource);
+        if (attemptErrorStatus.isOK()) {
+            lk.unlock();
+            attemptErrorStatus = rollbackChecker.reset_sync();
+            lk.lock();
+        }
+
         if (attemptErrorStatus.isOK()) {
             StatusWith<Event> status = _exec->makeEvent();
             if (!status.isOK()) {
@@ -700,6 +708,10 @@ TimestampStatus DataReplicator::initialSync(OperationContext* txn) {
                 _initialSyncState->dbsCloner.start();  // When the cloner is done applier starts.
                 invariant(_initialSyncState->finishEvent.isValid());
                 _exec->waitForEvent(_initialSyncState->finishEvent);
+                if (rollbackChecker.hasHadRollback()) {
+                    _initialSyncState->setStatus(Status(ErrorCodes::UnrecoverableRollbackError,
+                                                        "Rollback occurred during initial sync"));
+                }
                 attemptErrorStatus = _initialSyncState->status;
 
                 // Re-lock DataReplicator Internals
@@ -763,8 +775,8 @@ void DataReplicator::_onDataClonerFinish(const Status& status) {
         return;
     }
 
-    BSONObj query = BSON("find" << _opts.remoteOplogNS.coll() << "sort" << BSON("$natural" << -1)
-                                << "limit" << 1);
+    BSONObj query = BSON(
+        "find" << _opts.remoteOplogNS.coll() << "sort" << BSON("$natural" << -1) << "limit" << 1);
 
     TimestampStatus timestampStatus(ErrorCodes::BadValue, "");
     _tmpFetcher = stdx::make_unique<Fetcher>(
@@ -1146,7 +1158,6 @@ Status DataReplicator::_scheduleApplyBatch_inlock() {
                 return status.getStatus();
             }
         }
-        invariant(_opts.applierFn);
         invariant(!(_applier && _applier->isActive()));
         return _scheduleApplyBatch_inlock(ops);
     }
@@ -1154,6 +1165,27 @@ Status DataReplicator::_scheduleApplyBatch_inlock() {
 }
 
 Status DataReplicator::_scheduleApplyBatch_inlock(const Operations& ops) {
+    MultiApplier::ApplyOperationFn applierFn;
+    if (_state == DataReplicatorState::Steady) {
+        applierFn = stdx::bind(&DataReplicatorExternalState::_multiSyncApply,
+                               _dataReplicatorExternalState.get(),
+                               stdx::placeholders::_1);
+    } else {
+        invariant(_state == DataReplicatorState::InitialSync);
+        // "_syncSource" has to be copied to stdx::bind result.
+        HostAndPort source = _syncSource;
+        applierFn = stdx::bind(&DataReplicatorExternalState::_multiInitialSyncApply,
+                               _dataReplicatorExternalState.get(),
+                               stdx::placeholders::_1,
+                               source);
+    }
+
+    auto multiApplyFn = stdx::bind(&DataReplicatorExternalState::_multiApply,
+                                   _dataReplicatorExternalState.get(),
+                                   stdx::placeholders::_1,
+                                   stdx::placeholders::_2,
+                                   stdx::placeholders::_3);
+
     auto lambda = [this](const TimestampStatus& ts, const Operations& theOps) {
         CBHStatus status = _exec->scheduleWork(stdx::bind(&DataReplicator::_onApplyBatchFinish,
                                                           this,
@@ -1171,7 +1203,7 @@ Status DataReplicator::_scheduleApplyBatch_inlock(const Operations& ops) {
         _exec->wait(status.getValue());
     };
 
-    _applier.reset(new MultiApplier(_exec, ops, _opts.applierFn, _opts.multiApplyFn, lambda));
+    _applier.reset(new MultiApplier(_exec, ops, applierFn, multiApplyFn, lambda));
     return _applier->start();
 }
 

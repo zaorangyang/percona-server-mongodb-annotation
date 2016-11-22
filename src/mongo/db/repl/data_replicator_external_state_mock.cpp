@@ -33,6 +33,11 @@
 namespace mongo {
 namespace repl {
 
+DataReplicatorExternalStateMock::DataReplicatorExternalStateMock()
+    : multiApplyFn([](OperationContext*,
+                      const MultiApplier::Operations& ops,
+                      MultiApplier::ApplyOperationFn) { return ops.back().getOpTime(); }) {}
+
 OpTimeWithTerm DataReplicatorExternalStateMock::getCurrentTermAndLastCommittedOpTime() {
     return {currentTerm, lastCommittedOpTime};
 }
@@ -42,13 +47,24 @@ void DataReplicatorExternalStateMock::processMetadata(const rpc::ReplSetMetadata
 }
 
 bool DataReplicatorExternalStateMock::shouldStopFetching(const HostAndPort& source,
-                                                         const OpTime& sourceOpTime,
-                                                         bool sourceHasSyncSource) {
+                                                         const rpc::ReplSetMetadata& metadata) {
     lastSyncSourceChecked = source;
-    syncSourceLastOpTime = sourceOpTime;
-    syncSourceHasSyncSource = sourceHasSyncSource;
+    syncSourceLastOpTime = metadata.getLastOpVisible();
+    syncSourceHasSyncSource = metadata.getSyncSourceIndex() != -1;
     return shouldStopFetchingResult;
 }
+
+StatusWith<OpTime> DataReplicatorExternalStateMock::_multiApply(
+    OperationContext* txn,
+    const MultiApplier::Operations& ops,
+    MultiApplier::ApplyOperationFn applyOperation) {
+    return multiApplyFn(txn, ops, applyOperation);
+}
+
+void DataReplicatorExternalStateMock::_multiSyncApply(const MultiApplier::Operations& ops) {}
+
+void DataReplicatorExternalStateMock::_multiInitialSyncApply(const MultiApplier::Operations& ops,
+                                                             const HostAndPort& source) {}
 
 }  // namespace repl
 }  // namespace mongo

@@ -45,7 +45,10 @@ class TicketImpl {
 public:
     using SessionId = Session::SessionId;
 
-    virtual ~Ticket() = default;
+    virtual ~TicketImpl() = default;
+
+    TicketImpl(TicketImpl&&) = default;
+    TicketImpl& operator=(TicketImpl&&) = default;
 
     /**
      * Return this ticket's session id.

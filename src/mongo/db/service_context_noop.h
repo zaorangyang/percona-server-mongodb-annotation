@@ -49,27 +49,12 @@ public:
 
     StorageFactoriesIterator* makeStorageFactoriesIterator() override;
 
-    bool killOperation(unsigned int opId) override;
-
-    void killAllUserOperations(const OperationContext* txn, ErrorCodes::Error killCode) override;
-
-    void setKillAllOperations() override;
-
-    void unsetKillAllOperations() override;
-
-    bool getKillAllOperations() override;
-
-    void registerKillOpListener(KillOpListenerInterface* listener) override;
-
     void setOpObserver(std::unique_ptr<OpObserver> opObserver) override;
 
     OpObserver* getOpObserver() override;
 
-protected:
-    AtomicUInt32 _nextOpId{1};
-
 private:
-    std::unique_ptr<OperationContext> _newOpCtx(Client* client) override;
+    std::unique_ptr<OperationContext> _newOpCtx(Client* client, unsigned opId) override;
 };
 
 }  // namespace mongo

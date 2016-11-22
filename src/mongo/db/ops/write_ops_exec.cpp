@@ -209,8 +209,8 @@ bool handleError(OperationContext* txn,
                                    << demangleName(typeid(ex)));
         }
 
-        ShardingState::get(txn)
-            ->onStaleShardVersion(txn, wholeOp.ns, staleConfigException->getVersionReceived());
+        ShardingState::get(txn)->onStaleShardVersion(
+            txn, wholeOp.ns, staleConfigException->getVersionReceived());
         out->staleConfigException =
             stdx::make_unique<SendStaleConfigException>(*staleConfigException);
         return false;
@@ -230,7 +230,8 @@ static WriteResult::SingleResult createIndex(OperationContext* txn,
     uassert(ErrorCodes::TypeMismatch,
             str::stream() << "Expected \"ns\" field of index description to be a "
                              "string, "
-                             "but found a " << typeName(nsElement.type()),
+                             "but found a "
+                          << typeName(nsElement.type()),
             nsElement.type() == String);
     const NamespaceString ns(nsElement.valueStringData());
     uassert(ErrorCodes::InvalidOptions,
@@ -470,8 +471,6 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* txn,
         curOp.setLogicalOp_inlock(LogicalOp::opUpdate);
         curOp.setQuery_inlock(op.query);
         curOp.ensureStarted();
-
-        curOp.debug().query = op.query;
     }
 
     UpdateLifecycleImpl updateLifecycle(ns);
@@ -527,7 +526,7 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* txn,
     if (curOp.shouldDBProfile(curOp.elapsedMillis())) {
         BSONObjBuilder execStatsBob;
         Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-        curOp.debug().execStats.set(execStatsBob.obj());
+        curOp.debug().execStats = execStatsBob.obj();
     }
 
     const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
@@ -581,10 +580,9 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* txn,
         curOp.setLogicalOp_inlock(LogicalOp::opDelete);
         curOp.setQuery_inlock(op.query);
         curOp.ensureStarted();
-
-        curOp.debug().query = op.query;
-        curOp.debug().ndeleted = 0;
     }
+
+    curOp.debug().ndeleted = 0;
 
     txn->checkForInterrupt();
 
@@ -630,7 +628,7 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* txn,
     if (curOp.shouldDBProfile(curOp.elapsedMillis())) {
         BSONObjBuilder execStatsBob;
         Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-        curOp.debug().execStats.set(execStatsBob.obj());
+        curOp.debug().execStats = execStatsBob.obj();
     }
 
     LastError::get(txn->getClient()).recordDelete(n);

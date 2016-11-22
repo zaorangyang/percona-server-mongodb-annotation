@@ -48,16 +48,6 @@ namespace mongo {
  */
 class Decimal128 {
 public:
-/**
- * This boolean is used as a master switch to enable and disable decimal support.
- * TODO(SERVER-23553): Remove once s390 decimal support is working
- */
-#if defined(__s390x__)
-    static const bool enabled = false;
-#else
-    static const bool enabled = true;
-#endif
-
     /**
      * Static constants to get Decimal128 representations of specific numbers
      * kLargestPositive -> 9999999999999999999999999999999999E6111
@@ -187,6 +177,10 @@ public:
      */
     explicit Decimal128(std::string stringValue, RoundingMode roundMode = kRoundTiesToEven);
 
+    Decimal128(std::string stringValue,
+               std::uint32_t* signalingFlag,
+               RoundingMode roundMode = kRoundTiesToEven);
+
     /**
      * This function gets the inner Value struct storing a Decimal128 value.
      */
@@ -314,6 +308,11 @@ public:
     bool isNegative() const;
 
     /**
+     * Return true if and only if a Decimal128 is Zero, Normal, or Subnormal (not Inf or NaN)
+     */
+    bool isFinite() const;
+
+    /**
      * This set of mathematical operation functions implement the corresponding
      * IEEE 754-2008 operations on self and other.
      * The operations are commutative, so a.add(b) is equivalent to b.add(a).
@@ -398,6 +397,9 @@ private:
     static const uint64_t kCombinationInfinity = 0x1e << 12;
     static const uint64_t kCombinationNaN = 0x1f << 12;
     static const uint64_t kCanonicalCoefficientHighFieldMask = (1ull << 49) - 1;
+
+    std::string _convertToScientificNotation(StringData coefficient, int adjustedExponent) const;
+    std::string _convertToStandardDecimalNotation(StringData coefficient, int exponent) const;
 
     uint64_t _getCombinationField() const {
         return (_value.high64 >> kCombinationFieldPos) & kCombinationFieldMask;

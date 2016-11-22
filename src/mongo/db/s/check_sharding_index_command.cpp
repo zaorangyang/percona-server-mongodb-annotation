@@ -33,12 +33,13 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/index_legacy.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_legacy.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/util/log.h"
@@ -47,6 +48,8 @@ namespace mongo {
 
 using std::string;
 using std::unique_ptr;
+
+namespace dps = ::mongo::dotted_path_support;
 
 namespace {
 
@@ -178,7 +181,7 @@ public:
                 for (int x = 0; x <= k; x++)
                     real = j.next();
 
-                real = obj.getFieldDotted(real.fieldName());
+                real = dps::extractElementAtPath(obj, real.fieldName());
 
                 if (real.type())
                     continue;

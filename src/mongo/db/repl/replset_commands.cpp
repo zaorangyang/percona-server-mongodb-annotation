@@ -47,8 +47,8 @@
 #include "mongo/db/repl/initial_sync.h"
 #include "mongo/db/repl/old_update_position_args.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
+#include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -110,13 +110,12 @@ public:
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
-            MemberState expectedState(stateVal);
-            if (expectedState.toString().empty()) {
-                return appendCommandStatus(
-                    result,
-                    Status(ErrorCodes::BadValue,
-                           str::stream() << "Unrecognized numerical state: " << stateVal));
+
+            const auto swMemberState = MemberState::create(stateVal);
+            if (!swMemberState.isOK()) {
+                return appendCommandStatus(result, swMemberState.getStatus());
             }
+            const auto expectedState = swMemberState.getValue();
 
             long long timeoutMillis;
             status = bsonExtractIntegerField(cmdObj, "timeoutMillis", &timeoutMillis);
@@ -355,15 +354,9 @@ public:
         std::string replSetString =
             ReplicationCoordinator::get(txn)->getSettings().getReplSetString();
         if (replSetString.empty()) {
-            if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                return appendCommandStatus(result,
-                                           ReplicationCoordinator::get(txn)
-                                               ->processReplSetInitiate(txn, configObj, &result));
-            }
             return appendCommandStatus(result,
                                        Status(ErrorCodes::NoReplicationEnabled,
-                                              "This node was not started with the replSet "
-                                              "option"));
+                                              "This node was not started with the replSet option"));
         }
 
         if (configObj.isEmpty()) {
@@ -458,7 +451,8 @@ public:
                 txn,
                 BSON("msg"
                      << "Reconfig set"
-                     << "version" << parsedArgs.newConfigObj["version"]));
+                     << "version"
+                     << parsedArgs.newConfigObj["version"]));
         }
         wuow.commit();
 
@@ -664,7 +658,9 @@ public:
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+        auto replCoord = repl::ReplicationCoordinator::get(txn->getClient()->getServiceContext());
+
+        Status status = replCoord->checkReplEnabledForCommand(&result);
         if (!status.isOK())
             return appendCommandStatus(result, status);
 
@@ -672,6 +668,14 @@ public:
         // enable mixed-version operation, since we no longer use the handshakes
         if (cmdObj.hasField("handshake"))
             return true;
+
+        auto metadataResult = rpc::ReplSetMetadata::readFromMetadata(cmdObj);
+        if (metadataResult.isOK()) {
+            // New style update position command has metadata, which may inform the
+            // upstream of a higher term.
+            auto metadata = metadataResult.getValue();
+            replCoord->processReplSetMetadata(metadata);
+        }
 
         // In the case of an update from a member with an invalid replica set config,
         // we return our current config version.
@@ -682,8 +686,7 @@ public:
         status = args.initialize(cmdObj);
         if (status.isOK()) {
             // v3.2.4+ style replSetUpdatePosition command.
-            status = getGlobalReplicationCoordinator()->processReplSetUpdatePosition(
-                args, &configVersion);
+            status = replCoord->processReplSetUpdatePosition(args, &configVersion);
 
             if (status == ErrorCodes::InvalidReplicaSetConfig) {
                 result.append("configVersion", configVersion);
@@ -696,8 +699,7 @@ public:
             if (!status.isOK())
                 return appendCommandStatus(result, status);
 
-            status = getGlobalReplicationCoordinator()->processReplSetUpdatePosition(
-                oldArgs, &configVersion);
+            status = replCoord->processReplSetUpdatePosition(oldArgs, &configVersion);
 
             if (status == ErrorCodes::InvalidReplicaSetConfig) {
                 result.append("configVersion", configVersion);
@@ -774,14 +776,14 @@ public:
         AbstractMessagingPort* mp = txn->getClient()->port();
         unsigned originalTag = 0;
         if (mp) {
-            originalTag = mp->tag;
-            mp->tag |= executor::NetworkInterface::kMessagingPortKeepOpen;
+            originalTag = mp->getTag();
+            mp->setTag(originalTag | executor::NetworkInterface::kMessagingPortKeepOpen);
         }
 
         // Unset the tag on block exit
         ON_BLOCK_EXIT([mp, originalTag]() {
             if (mp) {
-                mp->tag = originalTag;
+                mp->setTag(originalTag);
             }
         });
 
@@ -844,7 +846,8 @@ public:
         BSONElement cfgverElement = cmdObj["cfgver"];
         uassert(28525,
                 str::stream() << "Expected cfgver argument to replSetFresh command to have "
-                                 "numeric type, but found " << typeName(cfgverElement.type()),
+                                 "numeric type, but found "
+                              << typeName(cfgverElement.type()),
                 cfgverElement.isNumber());
         parsedArgs.cfgver = cfgverElement.safeNumberLong();
         parsedArgs.opTime = Timestamp(cmdObj["opTime"].Date());
@@ -878,7 +881,8 @@ private:
         BSONElement cfgverElement = cmdObj["cfgver"];
         uassert(28526,
                 str::stream() << "Expected cfgver argument to replSetElect command to have "
-                                 "numeric type, but found " << typeName(cfgverElement.type()),
+                                 "numeric type, but found "
+                              << typeName(cfgverElement.type()),
                 cfgverElement.isNumber());
         parsedArgs.cfgver = cfgverElement.safeNumberLong();
         parsedArgs.round = cmdObj["round"].OID();

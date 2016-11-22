@@ -34,8 +34,8 @@
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
-#include "mongo/db/storage/mmap_v1/catalog/namespace_index.h"
 #include "mongo/db/storage/mmap_v1/catalog/namespace_details_collection_entry.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_index.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
 
 namespace mongo {
@@ -82,7 +82,7 @@ public:
     virtual bool isOlderThan24(OperationContext* opCtx) const;
     virtual void markIndexSafe24AndUp(OperationContext* opCtx);
 
-    virtual bool currentFilesCompatible(OperationContext* opCtx) const;
+    virtual Status currentFilesCompatible(OperationContext* opCtx) const;
 
     virtual void appendExtraStats(OperationContext* opCtx, BSONObjBuilder* out, double scale) const;
 

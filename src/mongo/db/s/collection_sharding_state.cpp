@@ -43,6 +43,7 @@
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
+#include "mongo/db/server_options.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/stale_exception.h"
 
@@ -131,17 +132,11 @@ void CollectionShardingState::checkShardVersionOrThrow(OperationContext* txn) co
     ChunkVersion received;
     ChunkVersion wanted;
     if (!_checkShardVersionOk(txn, &errmsg, &received, &wanted)) {
-        // Set migration critical section in case we failed because of migration
-        if (_sourceMgr && _sourceMgr->getMigrationCriticalSection()) {
-            OperationShardingState::get(txn)
-                .setMigrationCriticalSection(_sourceMgr->getMigrationCriticalSection());
-        }
-
-        throw SendStaleConfigException(_nss.ns(),
-                                       str::stream() << "[" << _nss.ns()
-                                                     << "] shard version not ok: " << errmsg,
-                                       received,
-                                       wanted);
+        throw SendStaleConfigException(
+            _nss.ns(),
+            str::stream() << "[" << _nss.ns() << "] shard version not ok: " << errmsg,
+            received,
+            wanted);
     }
 }
 
@@ -218,7 +213,7 @@ bool CollectionShardingState::_checkShardVersionOk(OperationContext* txn,
     }
 
     if (!repl::ReplicationCoordinator::get(txn)->canAcceptWritesForDatabase(_nss.db())) {
-        // right now connections to secondaries aren't versioned at all
+        // Right now connections to secondaries aren't versioned at all.
         return true;
     }
 
@@ -244,7 +239,18 @@ bool CollectionShardingState::_checkShardVersionOk(OperationContext* txn,
         return true;
     }
 
+    // Set this for error messaging purposes before potentially returning false.
     *actualShardVersion = (_metadata ? _metadata->getShardVersion() : ChunkVersion::UNSHARDED());
+
+    if (_sourceMgr && _sourceMgr->getMigrationCriticalSection()) {
+        *errmsg = str::stream() << "migration commit in progress for " << _nss.ns();
+
+        // Set migration critical section on operation sharding state: operation will wait for the
+        // migration to finish before returning failure and retrying.
+        OperationShardingState::get(txn).setMigrationCriticalSection(
+            _sourceMgr->getMigrationCriticalSection());
+        return false;
+    }
 
     if (expectedShardVersion->isWriteCompatibleWith(*actualShardVersion)) {
         return true;

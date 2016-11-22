@@ -39,6 +39,7 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/platform/decimal128.h"
 
 namespace mongo {
@@ -51,8 +52,8 @@ using std::unique_ptr;
  */
 class ParsedMatchExpression {
 public:
-    ParsedMatchExpression(const std::string& str) : _obj(fromjson(str)) {
-        const CollatorInterface* collator = nullptr;
+    ParsedMatchExpression(const std::string& str, const CollatorInterface* collator = nullptr)
+        : _obj(fromjson(str)) {
         StatusWithMatchExpression result =
             MatchExpressionParser::parse(_obj, ExtensionsCallbackDisallowExtensions(), collator);
         ASSERT_OK(result.getStatus());
@@ -73,9 +74,10 @@ TEST(ExpressionAlgoIsSubsetOf, NullAndOmittedField) {
     // an Undefined type.
     BSONObj undefined = fromjson("{a: undefined}");
     const CollatorInterface* collator = nullptr;
-    ASSERT_EQUALS(ErrorCodes::BadValue,
-                  MatchExpressionParser::parse(
-                      undefined, ExtensionsCallbackDisallowExtensions(), collator).getStatus());
+    ASSERT_EQUALS(
+        ErrorCodes::BadValue,
+        MatchExpressionParser::parse(undefined, ExtensionsCallbackDisallowExtensions(), collator)
+            .getStatus());
 
     ParsedMatchExpression empty("{}");
     ParsedMatchExpression null("{a: null}");
@@ -132,20 +134,18 @@ TEST(ExpressionAlgoIsSubsetOf, Compare_NaN) {
     ASSERT_FALSE(expression::isSubsetOf(nan.get(), in.get()));
     ASSERT_FALSE(expression::isSubsetOf(in.get(), nan.get()));
 
-    if (Decimal128::enabled) {
-        ParsedMatchExpression decNan("{x : NumberDecimal(\"NaN\") }");
-        ASSERT_TRUE(expression::isSubsetOf(decNan.get(), decNan.get()));
-        ASSERT_TRUE(expression::isSubsetOf(nan.get(), decNan.get()));
-        ASSERT_TRUE(expression::isSubsetOf(decNan.get(), nan.get()));
-        ASSERT_FALSE(expression::isSubsetOf(decNan.get(), lt.get()));
-        ASSERT_FALSE(expression::isSubsetOf(lt.get(), decNan.get()));
-        ASSERT_FALSE(expression::isSubsetOf(decNan.get(), lte.get()));
-        ASSERT_FALSE(expression::isSubsetOf(lte.get(), decNan.get()));
-        ASSERT_FALSE(expression::isSubsetOf(decNan.get(), gte.get()));
-        ASSERT_FALSE(expression::isSubsetOf(gte.get(), decNan.get()));
-        ASSERT_FALSE(expression::isSubsetOf(decNan.get(), gt.get()));
-        ASSERT_FALSE(expression::isSubsetOf(gt.get(), decNan.get()));
-    }
+    ParsedMatchExpression decNan("{x : NumberDecimal(\"NaN\") }");
+    ASSERT_TRUE(expression::isSubsetOf(decNan.get(), decNan.get()));
+    ASSERT_TRUE(expression::isSubsetOf(nan.get(), decNan.get()));
+    ASSERT_TRUE(expression::isSubsetOf(decNan.get(), nan.get()));
+    ASSERT_FALSE(expression::isSubsetOf(decNan.get(), lt.get()));
+    ASSERT_FALSE(expression::isSubsetOf(lt.get(), decNan.get()));
+    ASSERT_FALSE(expression::isSubsetOf(decNan.get(), lte.get()));
+    ASSERT_FALSE(expression::isSubsetOf(lte.get(), decNan.get()));
+    ASSERT_FALSE(expression::isSubsetOf(decNan.get(), gte.get()));
+    ASSERT_FALSE(expression::isSubsetOf(gte.get(), decNan.get()));
+    ASSERT_FALSE(expression::isSubsetOf(decNan.get(), gt.get()));
+    ASSERT_FALSE(expression::isSubsetOf(gt.get(), decNan.get()));
 }
 
 TEST(ExpressionAlgoIsSubsetOf, Compare_EQ) {
@@ -490,9 +490,6 @@ TEST(ExpressionAlgoIsSubsetOf, RegexAndIn) {
     ParsedMatchExpression inRegexAOrEq1("{x: {$in: [/a/, 1]}}");
     ParsedMatchExpression inRegexAOrNull("{x: {$in: [/a/, null]}}");
 
-    ASSERT_TRUE(expression::isSubsetOf(inRegexA.get(), inRegexA.get()));
-    ASSERT_FALSE(expression::isSubsetOf(inRegexAbc.get(), inRegexA.get()));
-    ASSERT_FALSE(expression::isSubsetOf(inRegexA.get(), inRegexAOrEq1.get()));
     ASSERT_FALSE(expression::isSubsetOf(inRegexAOrEq1.get(), eq1.get()));
     ASSERT_FALSE(expression::isSubsetOf(inRegexA.get(), eqA.get()));
     ASSERT_FALSE(expression::isSubsetOf(inRegexAOrNull.get(), eqA.get()));
@@ -651,6 +648,66 @@ TEST(ExpressionAlgoIsSubsetOf, Compare_Exists_NE) {
     ASSERT_FALSE(expression::isSubsetOf(aNotEqual1.get(), aExists.get()));
     ASSERT_FALSE(expression::isSubsetOf(bNotEqual1.get(), aExists.get()));
     ASSERT_TRUE(expression::isSubsetOf(aNotEqualNull.get(), aExists.get()));
+}
+
+TEST(ExpressionAlgoIsSubsetOf, CollationAwareStringComparison) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    ParsedMatchExpression lhs("{a: {$gt: 'abc'}}", &collator);
+    ParsedMatchExpression rhs("{a: {$gt: 'cba'}}", &collator);
+
+    ASSERT_TRUE(expression::isSubsetOf(lhs.get(), rhs.get()));
+
+    ParsedMatchExpression lhsLT("{a: {$lt: 'abc'}}", &collator);
+    ParsedMatchExpression rhsLT("{a: {$lt: 'cba'}}", &collator);
+
+    ASSERT_FALSE(expression::isSubsetOf(lhsLT.get(), rhsLT.get()));
+}
+
+TEST(ExpressionAlgoIsSubsetOf, NonMatchingCollationsStringComparison) {
+    CollatorInterfaceMock collatorAlwaysEqual(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    CollatorInterfaceMock collatorReverseString(CollatorInterfaceMock::MockType::kReverseString);
+    ParsedMatchExpression lhs("{a: {$gt: 'abc'}}", &collatorAlwaysEqual);
+    ParsedMatchExpression rhs("{a: {$gt: 'cba'}}", &collatorReverseString);
+
+    ASSERT_FALSE(expression::isSubsetOf(lhs.get(), rhs.get()));
+
+    ParsedMatchExpression lhsLT("{a: {$lt: 'abc'}}", &collatorAlwaysEqual);
+    ParsedMatchExpression rhsLT("{a: {$lt: 'cba'}}", &collatorReverseString);
+
+    ASSERT_FALSE(expression::isSubsetOf(lhsLT.get(), rhsLT.get()));
+}
+
+TEST(ExpressionAlgoIsSubsetOf, CollationAwareStringComparisonIn) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    ParsedMatchExpression lhsAllGTcba("{a: {$in: ['abc', 'cbc']}}", &collator);
+    ParsedMatchExpression lhsSomeGTcba("{a: {$in: ['abc', 'aba']}}", &collator);
+    ParsedMatchExpression rhs("{a: {$gt: 'cba'}}", &collator);
+
+    ASSERT_TRUE(expression::isSubsetOf(lhsAllGTcba.get(), rhs.get()));
+    ASSERT_FALSE(expression::isSubsetOf(lhsSomeGTcba.get(), rhs.get()));
+
+    ParsedMatchExpression rhsLT("{a: {$lt: 'cba'}}", &collator);
+
+    ASSERT_FALSE(expression::isSubsetOf(lhsAllGTcba.get(), rhsLT.get()));
+    ASSERT_FALSE(expression::isSubsetOf(lhsSomeGTcba.get(), rhsLT.get()));
+}
+
+TEST(ExpressionAlgoIsSubsetOf, NonMatchingCollationsNoStringComparisonLHS) {
+    CollatorInterfaceMock collatorAlwaysEqual(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    CollatorInterfaceMock collatorReverseString(CollatorInterfaceMock::MockType::kReverseString);
+    ParsedMatchExpression lhs("{a: {b: 1}}", &collatorAlwaysEqual);
+    ParsedMatchExpression rhs("{a: {$lt: {b: 'abc'}}}", &collatorReverseString);
+
+    ASSERT_TRUE(expression::isSubsetOf(lhs.get(), rhs.get()));
+}
+
+TEST(ExpressionAlgoIsSubsetOf, NonMatchingCollationsNoStringComparison) {
+    CollatorInterfaceMock collatorAlwaysEqual(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    CollatorInterfaceMock collatorReverseString(CollatorInterfaceMock::MockType::kReverseString);
+    ParsedMatchExpression lhs("{a: 1}", &collatorAlwaysEqual);
+    ParsedMatchExpression rhs("{a: {$gt: 0}}", &collatorReverseString);
+
+    ASSERT_TRUE(expression::isSubsetOf(lhs.get(), rhs.get()));
 }
 
 TEST(IsIndependent, AndIsIndependentOnlyIfChildrenAre) {
@@ -841,11 +898,11 @@ TEST(SplitMatchExpression, ComplexMatchExpressionSplitsCorrectly) {
     splitExpr.second->serialize(&secondBob);
 
     ASSERT_EQUALS(firstBob.obj(), fromjson("{$or: [{'a.b': {$eq: 3}}, {'a.b.c': {$eq: 4}}]}"));
-    ASSERT_EQUALS(secondBob.obj(),
-                  fromjson(
-                      "{$and: [{$nor: [{$and: [{x: {$size: 2}}]}]}, {$nor: [{x: {$gt: 4}}, {$and: "
-                      "[{$nor: [{$and: [{x: "
-                      "{$eq: 1}}]}]}, {y: {$eq: 3}}]}]}]}"));
+    ASSERT_EQUALS(
+        secondBob.obj(),
+        fromjson("{$and: [{$nor: [{$and: [{x: {$size: 2}}]}]}, {$nor: [{x: {$gt: 4}}, {$and: "
+                 "[{$nor: [{$and: [{x: "
+                 "{$eq: 1}}]}]}, {y: {$eq: 3}}]}]}]}"));
 }
 
 TEST(MapOverMatchExpression, DoesMapOverLogicalNodes) {
@@ -911,9 +968,9 @@ TEST(MapOverMatchExpression, DoesMapOverNodesWithMultipleChildren) {
     ASSERT_OK(swMatchExpression.getStatus());
 
     size_t nodeCount = 0;
-    expression::mapOver(swMatchExpression.getValue().get(),
-                        [&nodeCount](MatchExpression* expression, std::string path)
-                            -> void { ++nodeCount; });
+    expression::mapOver(
+        swMatchExpression.getValue().get(),
+        [&nodeCount](MatchExpression* expression, std::string path) -> void { ++nodeCount; });
 
     ASSERT_EQ(nodeCount, 3U);
 }

@@ -120,7 +120,7 @@ private:
     StatusWithMatchExpression _parseRegexDocument(const char* name, const BSONObj& doc);
 
 
-    Status _parseArrayFilterEntries(ArrayFilterEntries* entries, const BSONObj& theArray);
+    Status _parseInExpression(InMatchExpression* entries, const BSONObj& theArray);
 
     StatusWithMatchExpression _parseType(const char* name, const BSONElement& elt);
 
@@ -160,6 +160,7 @@ private:
 };
 
 typedef stdx::function<StatusWithMatchExpression(
-    const char* name, int type, const BSONObj& section)> MatchExpressionParserGeoCallback;
+    const char* name, int type, const BSONObj& section)>
+    MatchExpressionParserGeoCallback;
 extern MatchExpressionParserGeoCallback expressionParserGeoCallback;
 }

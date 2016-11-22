@@ -191,7 +191,7 @@ void ServiceContext::ClientDeleter::operator()(Client* client) const {
 }
 
 ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(Client* client) {
-    auto opCtx = _newOpCtx(client);
+    auto opCtx = _newOpCtx(client, _nextOpId.fetchAndAdd(1));
     auto observer = _clientObservers.begin();
     try {
         for (; observer != _clientObservers.cend(); ++observer) {
@@ -208,27 +208,20 @@ ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(Clie
         }
         throw;
     }
-    // // TODO(schwerin): When callers no longer construct their own OperationContexts directly,
-    // // but only through the ServiceContext, uncomment the following.  Until then, it must
-    // // be done in the operation context destructors, which introduces a potential race.
-    // {
-    //     stdx::lock_guard<Client> lk(*client);
-    //     client->setOperationContext(opCtx.get());
-    // }
+    {
+        stdx::lock_guard<Client> lk(*client);
+        client->setOperationContext(opCtx.get());
+    }
     return UniqueOperationContext(opCtx.release());
 };
 
 void ServiceContext::OperationContextDeleter::operator()(OperationContext* opCtx) const {
     auto client = opCtx->getClient();
-    invariant(client);
     auto service = client->getServiceContext();
-    // // TODO(schwerin): When callers no longer construct their own OperationContexts directly,
-    // // but only through the ServiceContext, uncomment the following.  Until then, it must
-    // // be done in the operation context destructors, which introduces a potential race.
-    // {
-    //     stdx::lock_guard<Client> lk(*client);
-    //     client->resetOperationContext();
-    // }
+    {
+        stdx::lock_guard<Client> lk(*client);
+        client->resetOperationContext();
+    }
     try {
         for (const auto& observer : service->_clientObservers) {
             observer->onDestroyOperationContext(opCtx);
@@ -276,4 +269,70 @@ BSONArray storageEngineList() {
 void appendStorageEngineList(BSONObjBuilder* result) {
     result->append("storageEngines", storageEngineList());
 }
+
+void ServiceContext::setKillAllOperations() {
+    stdx::lock_guard<stdx::mutex> clientLock(_mutex);
+    _globalKill.store(true);
+    for (const auto listener : _killOpListeners) {
+        try {
+            listener->interruptAll();
+        } catch (...) {
+            std::terminate();
+        }
+    }
+}
+
+void ServiceContext::_killOperation_inlock(OperationContext* opCtx, ErrorCodes::Error killCode) {
+    opCtx->markKilled(killCode);
+
+    for (const auto listener : _killOpListeners) {
+        try {
+            listener->interrupt(opCtx->getOpID());
+        } catch (...) {
+            std::terminate();
+        }
+    }
+}
+
+bool ServiceContext::killOperation(unsigned int opId) {
+    for (LockedClientsCursor cursor(this); Client* client = cursor.next();) {
+        stdx::lock_guard<Client> lk(*client);
+
+        OperationContext* opCtx = client->getOperationContext();
+        if (opCtx && opCtx->getOpID() == opId) {
+            _killOperation_inlock(opCtx, ErrorCodes::Interrupted);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void ServiceContext::killAllUserOperations(const OperationContext* txn,
+                                           ErrorCodes::Error killCode) {
+    for (LockedClientsCursor cursor(this); Client* client = cursor.next();) {
+        if (!client->isFromUserConnection()) {
+            // Don't kill system operations.
+            continue;
+        }
+
+        stdx::lock_guard<Client> lk(*client);
+        OperationContext* toKill = client->getOperationContext();
+
+        // Don't kill ourself.
+        if (toKill && toKill->getOpID() != txn->getOpID()) {
+            _killOperation_inlock(toKill, killCode);
+        }
+    }
+}
+
+void ServiceContext::unsetKillAllOperations() {
+    _globalKill.store(false);
+}
+
+void ServiceContext::registerKillOpListener(KillOpListenerInterface* listener) {
+    stdx::lock_guard<stdx::mutex> clientLock(_mutex);
+    _killOpListeners.push_back(listener);
+}
+
 }  // namespace mongo

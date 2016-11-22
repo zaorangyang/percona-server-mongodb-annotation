@@ -32,12 +32,12 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/write_concern_options.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/read_concern_response.h"
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/db/storage/snapshot_name.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -357,8 +357,7 @@ void ReplicationCoordinatorMock::resetLastOpTimesFromOplog(OperationContext* txn
 }
 
 bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& currentSource,
-                                                        const OpTime& syncSourceLastOpTime,
-                                                        bool syncSourceHasSyncSource) {
+                                                        const rpc::ReplSetMetadata& metadata) {
     invariant(false);
 }
 
@@ -378,9 +377,8 @@ Status ReplicationCoordinatorMock::processReplSetRequestVotes(
     return Status::OK();
 }
 
-void ReplicationCoordinatorMock::prepareReplResponseMetadata(const rpc::RequestInterface& request,
-                                                             const OpTime& lastOpTimeFromClient,
-                                                             BSONObjBuilder* builder) {}
+void ReplicationCoordinatorMock::prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+                                                     BSONObjBuilder* builder) const {}
 
 Status ReplicationCoordinatorMock::processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                                       ReplSetHeartbeatResponse* response) {
@@ -415,7 +413,7 @@ void ReplicationCoordinatorMock::onSnapshotCreate(OpTime timeOfSnapshot, Snapsho
 
 void ReplicationCoordinatorMock::dropAllSnapshots() {}
 
-OpTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTime() {
+OpTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTime() const {
     return OpTime();
 }
 
@@ -437,6 +435,19 @@ WriteConcernOptions ReplicationCoordinatorMock::populateUnsetWriteConcernOptions
     }
     return wc;
 }
+
+bool ReplicationCoordinatorMock::getInitialSyncRequestedFlag() const {
+    return false;
+}
+
+void ReplicationCoordinatorMock::setInitialSyncRequestedFlag(bool value) {}
+
+ReplSettings::IndexPrefetchConfig ReplicationCoordinatorMock::getIndexPrefetchConfig() const {
+    return ReplSettings::IndexPrefetchConfig();
+}
+
+void ReplicationCoordinatorMock::setIndexPrefetchConfig(
+    const ReplSettings::IndexPrefetchConfig cfg) {}
 
 }  // namespace repl
 }  // namespace mongo

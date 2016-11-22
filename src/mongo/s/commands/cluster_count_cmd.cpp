@@ -31,8 +31,8 @@
 #include <vector>
 
 #include "mongo/db/commands.h"
-#include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/util/timer.h"
 
@@ -144,7 +144,7 @@ public:
         }
 
         const std::initializer_list<StringData> passthroughFields = {
-            "hint", "$queryOptions", "readConcern", LiteParsedQuery::cmdOptionMaxTimeMS,
+            "hint", "$queryOptions", "readConcern", QueryRequest::cmdOptionMaxTimeMS,
         };
         for (auto name : passthroughFields) {
             if (auto field = cmdObj[name]) {

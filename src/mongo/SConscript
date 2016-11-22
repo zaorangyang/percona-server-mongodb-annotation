@@ -16,7 +16,11 @@ Import("use_system_version_of_library")
 
 # Boost we need everywhere. 's2' is spammed in all over the place by
 # db/geo unfortunately. pcre is also used many places.
-env.InjectThirdPartyIncludePaths(libraries=['boost', 's2', 'pcre'])
+env.InjectThirdPartyIncludePaths(libraries=[
+    'boost',
+    'pcre',
+    's2',
+])
 env.InjectMongoIncludePaths()
 
 # Add needed Percona dependencies
@@ -97,6 +101,7 @@ baseSource=[
     'util/assert_util.cpp',
     'util/base64.cpp',
     'util/concurrency/thread_name.cpp',
+    'util/duration.cpp',
     'util/exception_filter_win32.cpp',
     'util/exit.cpp',
     'util/hex.cpp',
@@ -358,7 +363,7 @@ if not has_option('noshell') and usemozjs:
                     'db/catalog/index_key_validate',
                     'db/index/external_key_generator',
                     'db/query/command_request_response',
-                    'db/query/lite_parsed_query',
+                    'db/query/query_request',
                     'db/server_options_core',
                     'linenoise_utf8',
                     'rpc/protocol',
@@ -368,6 +373,9 @@ if not has_option('noshell') and usemozjs:
                     'util/options_parser/options_parser_init',
                     'util/processinfo',
                     'util/signal_handlers',
+                    'executor/thread_pool_task_executor',
+                    'executor/network_interface_thread_pool',
+                    'executor/network_interface_factory'
                 ],
     )
 

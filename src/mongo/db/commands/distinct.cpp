@@ -37,6 +37,7 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
@@ -60,6 +61,8 @@ namespace mongo {
 using std::unique_ptr;
 using std::string;
 using std::stringstream;
+
+namespace dps = ::mongo::dotted_path_support;
 
 namespace {
 
@@ -127,8 +130,10 @@ public:
                 return Status(ErrorCodes::TypeMismatch,
                               str::stream() << "\"" << kQueryField
                                             << "\" had the wrong type. Expected "
-                                            << typeName(BSONType::Object) << " or "
-                                            << typeName(BSONType::jstNULL) << ", found "
+                                            << typeName(BSONType::Object)
+                                            << " or "
+                                            << typeName(BSONType::jstNULL)
+                                            << ", found "
                                             << typeName(queryElt.type()));
             }
         }
@@ -142,7 +147,8 @@ public:
                 return Status(ErrorCodes::TypeMismatch,
                               str::stream() << "\"" << kCollationField
                                             << "\" had the wrong type. Expected "
-                                            << typeName(BSONType::Object) << ", found "
+                                            << typeName(BSONType::Object)
+                                            << ", found "
                                             << typeName(collationElt.type()));
             }
             collation = collationElt.embeddedObject();
@@ -198,8 +204,8 @@ public:
 
         {
             stdx::lock_guard<Client>(*txn->getClient());
-            CurOp::get(txn)
-                ->setPlanSummary_inlock(Explain::getPlanSummary(executor.getValue().get()));
+            CurOp::get(txn)->setPlanSummary_inlock(
+                Explain::getPlanSummary(executor.getValue().get()));
         }
 
         string key = cmdObj[kKeyField].valuestrsafe();
@@ -220,7 +226,7 @@ public:
             // available to us without this.  If a collection scan is providing the data, we may
             // have to expand an array.
             BSONElementSet elts;
-            obj.getFieldsDotted(key, elts);
+            dps::extractAllElementsAlongPath(obj, key, elts);
 
             for (BSONElementSet::iterator it = elts.begin(); it != elts.end(); ++it) {
                 BSONElement elt = *it;
@@ -266,7 +272,7 @@ public:
         if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
             BSONObjBuilder execStatsBob;
             Explain::getWinningPlanStats(executor.getValue().get(), &execStatsBob);
-            curOp->debug().execStats.set(execStatsBob.obj());
+            curOp->debug().execStats = execStatsBob.obj();
         }
 
         verify(start == bb.buf());

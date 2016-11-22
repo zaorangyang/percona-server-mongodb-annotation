@@ -679,9 +679,8 @@ public:
     /**
      * Prepares a metadata object describing the current term, primary, and lastOp information.
      */
-    virtual void prepareReplResponseMetadata(const rpc::RequestInterface& request,
-                                             const OpTime& lastOpTimeFromClient,
-                                             BSONObjBuilder* builder) = 0;
+    virtual void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+                                     BSONObjBuilder* builder) const = 0;
 
     /**
      * Returns true if the V1 election protocol is being used and false otherwise.
@@ -759,7 +758,7 @@ public:
     /**
      * Gets the latest OpTime of the currentCommittedSnapshot.
      */
-    virtual OpTime getCurrentCommittedSnapshotOpTime() = 0;
+    virtual OpTime getCurrentCommittedSnapshotOpTime() const = 0;
 
     /**
      * Appends connection information to the provided BSONObjBuilder.
@@ -779,6 +778,12 @@ public:
      */
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) = 0;
+
+    virtual bool getInitialSyncRequestedFlag() const = 0;
+    virtual void setInitialSyncRequestedFlag(bool value) = 0;
+
+    virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const = 0;
+    virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) = 0;
 
 protected:
     ReplicationCoordinator();

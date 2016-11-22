@@ -40,7 +40,6 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/pipeline_proxy.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
@@ -52,6 +51,7 @@
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/memory.h"
 
@@ -127,13 +127,15 @@ static bool handleCursorCommand(OperationContext* txn,
         msgasserted(
             17391,
             str::stream() << "Aggregation has more results than fit in initial batch, but can't "
-                          << "create cursor since collection " << ns << " doesn't exist");
+                          << "create cursor since collection "
+                          << ns
+                          << " doesn't exist");
     }
 
     if (cursor) {
         // If a time limit was set on the pipeline, remaining time is "rolled over" to the
         // cursor (for use by future getmore ops).
-        cursor->setLeftoverMaxTimeMicros(CurOp::get(txn)->getRemainingMaxTimeMicros());
+        cursor->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
 
         CurOp::get(txn)->debug().cursorid = cursor->cursorid();
 
@@ -256,7 +258,7 @@ public:
                 if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
                     BSONObjBuilder execStatsBob;
                     Explain::getWinningPlanStats(input.get(), &execStatsBob);
-                    curOp->debug().execStats.set(execStatsBob.obj());
+                    curOp->debug().execStats = execStatsBob.obj();
                 }
             }
 

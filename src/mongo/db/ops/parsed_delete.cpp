@@ -35,8 +35,8 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/exec/delete.h"
-#include "mongo/db/ops/delete_request.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/ops/delete_request.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner_common.h"
@@ -77,10 +77,11 @@ Status ParsedDelete::parseQueryToCQ() {
 
     // The projection needs to be applied after the delete operation, so we do not specify a
     // projection during canonicalization.
-    auto lpq = stdx::make_unique<LiteParsedQuery>(_request->getNamespaceString());
-    lpq->setFilter(_request->getQuery());
-    lpq->setSort(_request->getSort());
-    lpq->setExplain(_request->isExplain());
+    auto qr = stdx::make_unique<QueryRequest>(_request->getNamespaceString());
+    qr->setFilter(_request->getQuery());
+    qr->setSort(_request->getSort());
+    qr->setCollation(_request->getCollation());
+    qr->setExplain(_request->isExplain());
 
     // Limit should only used for the findAndModify command when a sort is specified. If a sort
     // is requested, we want to use a top-k sort for efficiency reasons, so should pass the
@@ -88,12 +89,11 @@ Status ParsedDelete::parseQueryToCQ() {
     // deleted out from under it, but a limit could inhibit that and give an EOF when the delete
     // has not actually deleted a document. This behavior is fine for findAndModify, but should
     // not apply to deletes in general.
-    // TODO SERVER-23473: Pass the collation to canonicalize().
     if (!_request->isMulti() && !_request->getSort().isEmpty()) {
-        lpq->setLimit(1);
+        qr->setLimit(1);
     }
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(_txn, std::move(lpq), extensionsCallback);
+    auto statusWithCQ = CanonicalQuery::canonicalize(_txn, std::move(qr), extensionsCallback);
 
     if (statusWithCQ.isOK()) {
         _canonicalQuery = std::move(statusWithCQ.getValue());
@@ -118,7 +118,7 @@ PlanExecutor::YieldPolicy ParsedDelete::yieldPolicy() const {
 
 bool ParsedDelete::isIsolated() const {
     return _canonicalQuery.get() ? _canonicalQuery->isIsolated()
-                                 : LiteParsedQuery::isQueryIsolated(_request->getQuery());
+                                 : QueryRequest::isQueryIsolated(_request->getQuery());
 }
 
 bool ParsedDelete::hasParsedQuery() const {

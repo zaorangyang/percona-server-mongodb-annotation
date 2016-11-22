@@ -37,22 +37,22 @@
 #include <set>
 
 #include "mongo/base/checked_cast.h"
-#include "mongo/db/json.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/json.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/hex.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -60,7 +60,7 @@
 
 #if TRACING_ENABLED
 #define TRACE_CURSOR log() << "WT index (" << (const void*)&_idx << ") "
-#define TRACE_INDEX log() << "WT index (" << (const void*) this << ") "
+#define TRACE_INDEX log() << "WT index (" << (const void*)this << ") "
 #else
 #define TRACE_CURSOR \
     if (0)           \
@@ -82,14 +82,10 @@ static const int TempKeyMaxSize = 1024;  // this goes away with SERVER-3372
 
 static const WiredTigerItem emptyItem(NULL, 0);
 
+static const int kKeyStringV0Version = 6;
 static const int kKeyStringV1Version = 7;
-static const int kMinimumIndexVersion = 6;
-static const int kCurrentIndexVersion = kKeyStringV1Version;  // New indexes use this by default.
+static const int kMinimumIndexVersion = kKeyStringV0Version;
 static const int kMaximumIndexVersion = kKeyStringV1Version;
-static_assert(kCurrentIndexVersion >= kMinimumIndexVersion,
-              "kCurrentIndexVersion >= kMinimumIndexVersion");
-static_assert(kCurrentIndexVersion <= kMaximumIndexVersion,
-              "kCurrentIndexVersion <= kMaximumIndexVersion");
 
 bool hasFieldNames(const BSONObj& obj) {
     BSONForEach(e, obj) {
@@ -145,7 +141,8 @@ StatusWith<std::string> WiredTigerIndex::parseIndexOptions(const BSONObj& option
             // Return error on first unrecognized field.
             return StatusWith<std::string>(ErrorCodes::InvalidOptions,
                                            str::stream() << '\'' << elem.fieldNameStringData()
-                                                         << '\'' << " is not a supported option.");
+                                                         << '\''
+                                                         << " is not a supported option.");
         }
     }
     return StatusWith<std::string>(ss.str());
@@ -198,7 +195,7 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
 
     // Index metadata
     ss << ",app_metadata=("
-       << "formatVersion=" << (enableBSON1_1 ? kKeyStringV1Version : kCurrentIndexVersion) << ','
+       << "formatVersion=" << (enableBSON1_1 ? kKeyStringV1Version : kKeyStringV0Version) << ','
        << "infoObj=" << desc.infoObj().jsonString() << "),";
 
     LOG(3) << "index create string: " << ss.ss.str();
@@ -228,7 +225,14 @@ WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
     Status versionStatus = WiredTigerUtil::checkApplicationMetadataFormatVersion(
         ctx, uri, kMinimumIndexVersion, kMaximumIndexVersion);
     if (!versionStatus.isOK()) {
-        fassertFailedWithStatusNoTrace(28579, versionStatus);
+        str::stream ss;
+        ss << versionStatus.reason() << " Index: {name: " << desc->indexName()
+           << ", ns: " << desc->parentNS() << "} - version too new for this mongod."
+           << " See http://dochub.mongodb.org/core/3.4-index-downgrade for detailed"
+           << " instructions on how to handle this error.";
+        Status indexVersionStatus(
+            ErrorCodes::UnsupportedFormat, ss.ss.str(), versionStatus.location());
+        fassertFailedWithStatusNoTrace(28579, indexVersionStatus);
     }
 }
 

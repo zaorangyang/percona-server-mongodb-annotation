@@ -71,7 +71,6 @@ protected:
         chunkType.setMin(BSON("a" << MINKEY));
         chunkType.setMax(BSON("a" << MAXKEY));
         chunkType.setVersion(ChunkVersion(1, 0, epoch));
-        chunkType.setName(OID::gen().toString());
         ASSERT_OK(chunkType.validate());
         std::vector<BSONObj> chunksToSend{chunkType.toBSON()};
 
@@ -117,7 +116,8 @@ TEST_F(NoChunkFixture, IsKeyValid) {
     ASSERT_TRUE(getCollMetadata().isValidKey(BSON("a" << 3)));
     ASSERT_FALSE(getCollMetadata().isValidKey(BSON("a"
                                                    << "abcde"
-                                                   << "b" << 1)));
+                                                   << "b"
+                                                   << 1)));
     ASSERT_FALSE(getCollMetadata().isValidKey(BSON("c"
                                                    << "abcde")));
 }
@@ -125,6 +125,11 @@ TEST_F(NoChunkFixture, IsKeyValid) {
 TEST_F(NoChunkFixture, getNextFromEmpty) {
     ChunkType nextChunk;
     ASSERT(!getCollMetadata().getNextChunk(getCollMetadata().getMinKey(), &nextChunk));
+}
+
+TEST_F(NoChunkFixture, getDifferentFromEmpty) {
+    ChunkType differentChunk;
+    ASSERT(!getCollMetadata().getDifferentChunk(getCollMetadata().getMinKey(), &differentChunk));
 }
 
 TEST_F(NoChunkFixture, FirstChunkClonePlus) {
@@ -329,10 +334,12 @@ protected:
 
         BSONObj fooSingle = BSON(
             ChunkType::name("test.foo-a_10")
-            << ChunkType::ns("test.foo") << ChunkType::min(BSON("a" << 10))
+            << ChunkType::ns("test.foo")
+            << ChunkType::min(BSON("a" << 10))
             << ChunkType::max(BSON("a" << 20))
             << ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(chunkVersion.toLong()))
-            << ChunkType::DEPRECATED_epoch(epoch) << ChunkType::shard("shard0000"));
+            << ChunkType::DEPRECATED_epoch(epoch)
+            << ChunkType::shard("shard0000"));
         std::vector<BSONObj> chunksToSend{fooSingle};
 
         auto future = launchAsync([this] {
@@ -390,6 +397,11 @@ TEST_F(SingleChunkFixture, getNextFromEmpty) {
 TEST_F(SingleChunkFixture, GetLastChunkIsFalse) {
     ChunkType nextChunk;
     ASSERT(!getCollMetadata().getNextChunk(getCollMetadata().getMaxKey(), &nextChunk));
+}
+
+TEST_F(SingleChunkFixture, getDifferentFromOneIsFalse) {
+    ChunkType differentChunk;
+    ASSERT(!getCollMetadata().getDifferentChunk(BSON("a" << 10), &differentChunk));
 }
 
 TEST_F(SingleChunkFixture, DonateLastChunk) {
@@ -578,10 +590,12 @@ protected:
 
         BSONObj fooSingle = BSON(
             ChunkType::name("test.foo-a_MinKey")
-            << ChunkType::ns("test.foo") << ChunkType::min(BSON("a" << MINKEY << "b" << MINKEY))
+            << ChunkType::ns("test.foo")
+            << ChunkType::min(BSON("a" << MINKEY << "b" << MINKEY))
             << ChunkType::max(BSON("a" << MAXKEY << "b" << MAXKEY))
             << ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(chunkVersion.toLong()))
-            << ChunkType::DEPRECATED_epoch(epoch) << ChunkType::shard("shard0000"));
+            << ChunkType::DEPRECATED_epoch(epoch)
+            << ChunkType::shard("shard0000"));
         std::vector<BSONObj> chunksToSend{fooSingle};
 
         auto future = launchAsync([this] {
@@ -645,16 +659,20 @@ protected:
         std::vector<BSONObj> chunksToSend;
         chunksToSend.push_back(BSON(
             ChunkType::name("test.foo-a_10")
-            << ChunkType::ns("test.foo") << ChunkType::min(BSON("a" << 10 << "b" << 0))
+            << ChunkType::ns("test.foo")
+            << ChunkType::min(BSON("a" << 10 << "b" << 0))
             << ChunkType::max(BSON("a" << 20 << "b" << 0))
             << ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(chunkVersion.toLong()))
-            << ChunkType::DEPRECATED_epoch(epoch) << ChunkType::shard("shard0000")));
+            << ChunkType::DEPRECATED_epoch(epoch)
+            << ChunkType::shard("shard0000")));
         chunksToSend.push_back(BSON(
             ChunkType::name("test.foo-a_10")
-            << ChunkType::ns("test.foo") << ChunkType::min(BSON("a" << 30 << "b" << 0))
+            << ChunkType::ns("test.foo")
+            << ChunkType::min(BSON("a" << 30 << "b" << 0))
             << ChunkType::max(BSON("a" << 40 << "b" << 0))
             << ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(chunkVersion.toLong()))
-            << ChunkType::DEPRECATED_epoch(epoch) << ChunkType::shard("shard0000")));
+            << ChunkType::DEPRECATED_epoch(epoch)
+            << ChunkType::shard("shard0000")));
 
         auto future = launchAsync([this] {
             MetadataLoader loader;
@@ -838,30 +856,36 @@ protected:
             ChunkVersion version(1, 1, epoch);
             chunksToSend.push_back(BSON(
                 ChunkType::name("x.y-a_MinKey")
-                << ChunkType::ns("x.y") << ChunkType::min(BSON("a" << MINKEY))
+                << ChunkType::ns("x.y")
+                << ChunkType::min(BSON("a" << MINKEY))
                 << ChunkType::max(BSON("a" << 10))
                 << ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(version.toLong()))
-                << ChunkType::DEPRECATED_epoch(version.epoch()) << ChunkType::shard("shard0000")));
+                << ChunkType::DEPRECATED_epoch(version.epoch())
+                << ChunkType::shard("shard0000")));
         }
 
         {
             ChunkVersion version(1, 3, epoch);
             chunksToSend.push_back(BSON(
                 ChunkType::name("x.y-a_10")
-                << ChunkType::ns("x.y") << ChunkType::min(BSON("a" << 10))
+                << ChunkType::ns("x.y")
+                << ChunkType::min(BSON("a" << 10))
                 << ChunkType::max(BSON("a" << 20))
                 << ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(version.toLong()))
-                << ChunkType::DEPRECATED_epoch(version.epoch()) << ChunkType::shard("shard0000")));
+                << ChunkType::DEPRECATED_epoch(version.epoch())
+                << ChunkType::shard("shard0000")));
         }
 
         {
             ChunkVersion version(1, 2, epoch);
             chunksToSend.push_back(BSON(
                 ChunkType::name("x.y-a_30")
-                << ChunkType::ns("x.y") << ChunkType::min(BSON("a" << 30))
+                << ChunkType::ns("x.y")
+                << ChunkType::min(BSON("a" << 30))
                 << ChunkType::max(BSON("a" << MAXKEY))
                 << ChunkType::DEPRECATED_lastmod(Date_t::fromMillisSinceEpoch(version.toLong()))
-                << ChunkType::DEPRECATED_epoch(version.epoch()) << ChunkType::shard("shard0000")));
+                << ChunkType::DEPRECATED_epoch(version.epoch())
+                << ChunkType::shard("shard0000")));
         }
 
         auto future = launchAsync([this] {
@@ -919,6 +943,29 @@ TEST_F(ThreeChunkWithRangeGapFixture, GetNextFromMiddle) {
 TEST_F(ThreeChunkWithRangeGapFixture, GetNextFromLast) {
     ChunkType nextChunk;
     ASSERT(getCollMetadata().getNextChunk(BSON("a" << 30), &nextChunk));
+    ASSERT_EQUALS(0, nextChunk.getMin().woCompare(BSON("a" << 30)));
+    ASSERT_EQUALS(0, nextChunk.getMax().woCompare(BSON("a" << MAXKEY)));
+}
+
+TEST_F(ThreeChunkWithRangeGapFixture, GetDifferentFromBeginning) {
+    ChunkType differentChunk;
+    ASSERT(getCollMetadata().getDifferentChunk(getCollMetadata().getMinKey(), &differentChunk));
+    ASSERT_EQUALS(0, differentChunk.getMin().woCompare(BSON("a" << 10)));
+    ASSERT_EQUALS(0, differentChunk.getMax().woCompare(BSON("a" << 20)));
+}
+
+TEST_F(ThreeChunkWithRangeGapFixture, GetDifferentFromMiddle) {
+    ChunkType differentChunk;
+    ASSERT(getCollMetadata().getDifferentChunk(BSON("a" << 10), &differentChunk));
+    ASSERT_EQUALS(0, differentChunk.getMin().woCompare(BSON("a" << MINKEY)));
+    ASSERT_EQUALS(0, differentChunk.getMax().woCompare(BSON("a" << 10)));
+}
+
+TEST_F(ThreeChunkWithRangeGapFixture, GetDifferentFromLast) {
+    ChunkType differentChunk;
+    ASSERT(getCollMetadata().getDifferentChunk(BSON("a" << 30), &differentChunk));
+    ASSERT_EQUALS(0, differentChunk.getMin().woCompare(BSON("a" << MINKEY)));
+    ASSERT_EQUALS(0, differentChunk.getMax().woCompare(BSON("a" << 10)));
 }
 
 TEST_F(ThreeChunkWithRangeGapFixture, MergeChunkHoleInRange) {

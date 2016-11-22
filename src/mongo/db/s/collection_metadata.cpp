@@ -270,7 +270,8 @@ StatusWith<std::unique_ptr<CollectionMetadata>> CollectionMetadata::cloneMerge(
     if (!validStartEnd || !validNoHoles) {
         return {ErrorCodes::IllegalOperation,
                 stream() << "cannot merge range " << rangeToString(minKey, maxKey)
-                         << ", overlapping chunks " << overlapToString(overlap)
+                         << ", overlapping chunks "
+                         << overlapToString(overlap)
                          << (!validStartEnd ? " do not have the same min and max key"
                                             : " are not all adjacent")};
     }
@@ -365,6 +366,23 @@ bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey, ChunkType* chunk
         chunk->setMin(upperChunkIt->first);
         chunk->setMax(upperChunkIt->second);
         return true;
+    }
+
+    return false;
+}
+
+bool CollectionMetadata::getDifferentChunk(const BSONObj& chunkMinKey,
+                                           ChunkType* differentChunk) const {
+    RangeMap::const_iterator upperChunkIt = _chunksMap.end();
+    RangeMap::const_iterator lowerChunkIt = _chunksMap.begin();
+
+    while (lowerChunkIt != upperChunkIt) {
+        if (lowerChunkIt->first.woCompare(chunkMinKey) != 0) {
+            differentChunk->setMin(lowerChunkIt->first);
+            differentChunk->setMax(lowerChunkIt->second);
+            return true;
+        }
+        ++lowerChunkIt;
     }
 
     return false;

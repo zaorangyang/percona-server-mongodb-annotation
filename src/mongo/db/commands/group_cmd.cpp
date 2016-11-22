@@ -94,8 +94,8 @@ private:
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         std::string ns = parseNs(dbname, cmdObj);
-        if (!AuthorizationSession::get(client)
-                 ->isAuthorizedForActionsOnNamespace(NamespaceString(ns), ActionType::find)) {
+        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnNamespace(
+                NamespaceString(ns), ActionType::find)) {
             return Status(ErrorCodes::Unauthorized, "unauthorized");
         }
         return Status::OK();
@@ -198,7 +198,7 @@ private:
         if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
             BSONObjBuilder execStatsBob;
             Explain::getWinningPlanStats(planExecutor.get(), &execStatsBob);
-            curOp->debug().execStats.set(execStatsBob.obj());
+            curOp->debug().execStats = execStatsBob.obj();
         }
 
         invariant(STAGE_GROUP == planExecutor->getRootStage()->stageType());

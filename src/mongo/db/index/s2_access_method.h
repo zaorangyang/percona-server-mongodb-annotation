@@ -29,6 +29,7 @@
 #pragma once
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/s2_common.h"
@@ -44,9 +45,11 @@ public:
      * Takes an index spec object for this index and returns a copy tweaked to conform to the
      * expected format.  When an index build is initiated, this function is called on the spec
      * object the user provides, and the return value of this function is the final spec object
-     * that gets saved in the index catalog.  Throws a UserException if 'specObj' is invalid.
+     * that gets saved in the index catalog.
+     *
+     * Returns a non-OK status if 'specObj' is invalid.
      */
-    static BSONObj fixSpec(const BSONObj& specObj);
+    static StatusWith<BSONObj> fixSpec(const BSONObj& specObj);
 
 private:
     /**
@@ -55,8 +58,10 @@ private:
      * This function ignores the 'multikeyPaths' pointer because text indexes don't support tracking
      * path-level multikey information.
      *
-     * TODO SERVER-23114: Return prefixes of the indexed fields that cause the index to be multikey
-     * as a result of inserting 'keys'.
+     * If the 'multikeyPaths' pointer is non-null, then it must point to an empty vector. This
+     * function resizes 'multikeyPaths' to have the same number of elements as the index key pattern
+     * and fills each element with the prefixes of the indexed field that would cause this index to
+     * be multikey as a result of inserting 'keys'.
      */
     void getKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const final;
 

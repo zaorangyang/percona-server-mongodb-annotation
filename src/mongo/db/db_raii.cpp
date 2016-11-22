@@ -30,9 +30,9 @@
 
 #include "mongo/db/db_raii.h"
 
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -141,8 +141,10 @@ void AutoGetCollectionForRead::_ensureMajorityCommittedSnapshotIsValid(const Nam
 
         uassertStatusOK(_txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
 
-        stdx::lock_guard<Client> lk(*_txn->getClient());
-        CurOp::get(_txn)->yielded();
+        {
+            stdx::lock_guard<Client> lk(*_txn->getClient());
+            CurOp::get(_txn)->yielded();
+        }
 
         // Relock.
         _autoColl.emplace(_txn, nss, MODE_IS);

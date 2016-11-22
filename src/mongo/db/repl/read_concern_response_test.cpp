@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/read_concern_response.h"
 #include "mongo/unittest/unittest.h"
@@ -61,8 +63,7 @@ TEST(ReadAfterResponse, WithStatus) {
 }
 
 TEST(ReadAfterResponse, WaitedWithDuration) {
-    ReadConcernResponse response(Status(ErrorCodes::InternalError, "test"),
-                                 stdx::chrono::milliseconds(7));
+    ReadConcernResponse response(Status(ErrorCodes::InternalError, "test"), Milliseconds(7));
 
     ASSERT_TRUE(response.didWait());
     ASSERT_EQUALS(Milliseconds(7), response.getDuration());

@@ -37,6 +37,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/map_util.h"
@@ -132,7 +133,8 @@ void BackgroundOperation::assertNoBgOpInProgForDb(StringData db) {
     uassert(ErrorCodes::BackgroundOperationInProgressForDatabase,
             mongoutils::str::stream()
                 << "cannot perform operation: a background operation is currently running for "
-                   "database " << db,
+                   "database "
+                << db,
             !inProgForDb(db));
 }
 
@@ -140,7 +142,8 @@ void BackgroundOperation::assertNoBgOpInProgForNs(StringData ns) {
     uassert(ErrorCodes::BackgroundOperationInProgressForNamespace,
             mongoutils::str::stream()
                 << "cannot perform operation: a background operation is currently running for "
-                   "collection " << ns,
+                   "collection "
+                << ns,
             !inProgForNs(ns));
 }
 

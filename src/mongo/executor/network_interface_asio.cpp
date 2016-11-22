@@ -155,7 +155,8 @@ void NetworkInterfaceASIO::startup() {
                 _io_service.run();
             } catch (...) {
                 severe() << "Uncaught exception in NetworkInterfaceASIO IO "
-                            "worker thread of type: " << exceptionToStatus();
+                            "worker thread of type: "
+                         << exceptionToStatus();
                 fassertFailed(28820);
             }
         });
@@ -189,7 +190,7 @@ void NetworkInterfaceASIO::waitForWorkUntil(Date_t when) {
         if (waitTime <= Milliseconds(0)) {
             break;
         }
-        _isExecutorRunnableCondition.wait_for(lk, waitTime);
+        _isExecutorRunnableCondition.wait_for(lk, waitTime.toSystemDuration());
     }
     _isExecutorRunnable = false;
 }

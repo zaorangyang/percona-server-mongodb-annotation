@@ -75,7 +75,9 @@
  *         specify options that are common all replica members.
  *       useHostname {boolean}: if true, use hostname of machine,
  *         otherwise use localhost
- *       numReplicas {number}
+ *       numReplicas {number},
+ *       waitForCSRSSecondaries {boolean}: if false, will not wait for the read committed view
+ *         of the secondaries to catch up with the primary. Defaults to true.
  *     }
  *   }
  *
@@ -408,12 +410,10 @@ var ShardingTest = function(params) {
         }
 
         var s = "";
-        this.config.chunks.find(q)
-            .sort({ns: 1, min: 1})
-            .forEach(function(z) {
-                s += "  " + z._id + "\t" + z.lastmod.t + "|" + z.lastmod.i + "\t" + tojson(z.min) +
-                    " -> " + tojson(z.max) + " " + z.shard + "  " + z.ns + "\n";
-            });
+        this.config.chunks.find(q).sort({ns: 1, min: 1}).forEach(function(z) {
+            s += "  " + z._id + "\t" + z.lastmod.t + "|" + z.lastmod.i + "\t" + tojson(z.min) +
+                " -> " + tojson(z.max) + " " + z.shard + "  " + z.ns + "\n";
+        });
 
         return s;
     };
@@ -492,13 +492,12 @@ var ShardingTest = function(params) {
             x[z._id] = 0;
         });
 
-        this.config.chunks.find({ns: dbName + "." + collName})
-            .forEach(function(z) {
-                if (x[z.shard])
-                    x[z.shard]++;
-                else
-                    x[z.shard] = 1;
-            });
+        this.config.chunks.find({ns: dbName + "." + collName}).forEach(function(z) {
+            if (x[z.shard])
+                x[z.shard]++;
+            else
+                x[z.shard] = 1;
+        });
 
         return x;
     };
@@ -536,11 +535,9 @@ var ShardingTest = function(params) {
 
     this.getShardNames = function() {
         var shards = [];
-        this.s.getCollection("config.shards")
-            .find()
-            .forEach(function(shardDoc) {
-                shards.push(shardDoc._id);
-            });
+        this.s.getCollection("config.shards").find().forEach(function(shardDoc) {
+            shards.push(shardDoc._id);
+        });
         return shards;
     };
 
@@ -786,15 +783,13 @@ var ShardingTest = function(params) {
             var bridgeOptions =
                 (opts !== mongos) ? opts.bridgeOptions : mongos.fullOptions.bridgeOptions;
             bridgeOptions = Object.merge(otherParams.bridgeOptions, bridgeOptions || {});
-            bridgeOptions = Object.merge(
-                bridgeOptions,
-                {
-                  hostName: otherParams.useHostname ? hostName : "localhost",
-                  port: this._mongos[n].port,
-                  // The mongos processes identify themselves to mongobridge as host:port, where the
-                  // host is the actual hostname of the machine and not localhost.
-                  dest: hostName + ":" + opts.port,
-                });
+            bridgeOptions = Object.merge(bridgeOptions, {
+                hostName: otherParams.useHostname ? hostName : "localhost",
+                port: this._mongos[n].port,
+                // The mongos processes identify themselves to mongobridge as host:port, where the
+                // host is the actual hostname of the machine and not localhost.
+                dest: hostName + ":" + opts.port,
+            });
 
             this._mongos[n] = new MongoBridge(bridgeOptions);
         }
@@ -848,15 +843,13 @@ var ShardingTest = function(params) {
             var bridgeOptions =
                 (opts !== mongod) ? opts.bridgeOptions : mongod.fullOptions.bridgeOptions;
             bridgeOptions = Object.merge(otherParams.bridgeOptions, bridgeOptions || {});
-            bridgeOptions = Object.merge(
-                bridgeOptions,
-                {
-                  hostName: otherParams.useHostname ? hostName : "localhost",
-                  port: this._connections[n].port,
-                  // The mongod processes identify themselves to mongobridge as host:port, where the
-                  // host is the actual hostname of the machine and not localhost.
-                  dest: hostName + ":" + opts.port,
-                });
+            bridgeOptions = Object.merge(bridgeOptions, {
+                hostName: otherParams.useHostname ? hostName : "localhost",
+                port: this._connections[n].port,
+                // The mongod processes identify themselves to mongobridge as host:port, where the
+                // host is the actual hostname of the machine and not localhost.
+                dest: hostName + ":" + opts.port,
+            });
 
             this._connections[n] = new MongoBridge(bridgeOptions);
         }
@@ -909,15 +902,13 @@ var ShardingTest = function(params) {
         if (otherParams.useBridge) {
             var bridgeOptions =
                 Object.merge(otherParams.bridgeOptions, mongod.fullOptions.bridgeOptions || {});
-            bridgeOptions = Object.merge(
-                bridgeOptions,
-                {
-                  hostName: otherParams.useHostname ? hostName : "localhost",
-                  port: this._configServers[n].port,
-                  // The mongod processes identify themselves to mongobridge as host:port, where the
-                  // host is the actual hostname of the machine and not localhost.
-                  dest: hostName + ":" + mongod.port,
-                });
+            bridgeOptions = Object.merge(bridgeOptions, {
+                hostName: otherParams.useHostname ? hostName : "localhost",
+                port: this._configServers[n].port,
+                // The mongod processes identify themselves to mongobridge as host:port, where the
+                // host is the actual hostname of the machine and not localhost.
+                dest: hostName + ":" + mongod.port,
+            });
 
             this._configServers[n] = new MongoBridge(bridgeOptions);
         }
@@ -960,6 +951,9 @@ var ShardingTest = function(params) {
     var verboseLevel = otherParams.hasOwnProperty('verbose') ? otherParams.verbose : 1;
     var numMongos = otherParams.hasOwnProperty('mongos') ? otherParams.mongos : 1;
     var numConfigs = otherParams.hasOwnProperty('config') ? otherParams.config : 3;
+    var waitForCSRSSecondaries = otherParams.hasOwnProperty('waitForCSRSSecondaries')
+        ? otherParams.waitForCSRSSecondaries
+        : true;
 
     // Allow specifying mixed-type options like this:
     // { mongos : [ { noprealloc : "" } ],
@@ -1018,19 +1012,13 @@ var ShardingTest = function(params) {
     otherParams.useBridge = otherParams.useBridge || false;
     otherParams.bridgeOptions = otherParams.bridgeOptions || {};
 
-    if (otherParams.chunkSize && numMongos === 0) {
-        throw Error('Cannot set chunk size without any running mongos instances');
-    }
-
     var keyFile = otherParams.keyFile || otherParams.extraOptions.keyFile;
     var hostName = getHostName();
 
     this._testName = testName;
     this._otherParams = otherParams;
 
-    var pathOpts = {
-        testName: testName
-    };
+    var pathOpts = {testName: testName};
 
     for (var k in otherParams) {
         if (k.startsWith("rs") && otherParams[k] != undefined) {
@@ -1087,12 +1075,8 @@ var ShardingTest = function(params) {
                 settings: rsSettings
             });
 
-            this._rs[i] = {
-                setName: setName,
-                test: rs,
-                nodes: rs.startSet(rsDefaults),
-                url: rs.getURL()
-            };
+            this._rs[i] =
+                {setName: setName, test: rs, nodes: rs.startSet(rsDefaults), url: rs.getURL()};
 
             rs.initiate(null, null, initiateTimeout);
 
@@ -1128,14 +1112,12 @@ var ShardingTest = function(params) {
             if (otherParams.useBridge) {
                 var bridgeOptions =
                     Object.merge(otherParams.bridgeOptions, options.bridgeOptions || {});
-                bridgeOptions = Object.merge(
-                    bridgeOptions,
-                    {
-                      hostName: otherParams.useHostname ? hostName : "localhost",
-                      // The mongod processes identify themselves to mongobridge as host:port, where
-                      // the host is the actual hostname of the machine and not localhost.
-                      dest: hostName + ":" + options.port,
-                    });
+                bridgeOptions = Object.merge(bridgeOptions, {
+                    hostName: otherParams.useHostname ? hostName : "localhost",
+                    // The mongod processes identify themselves to mongobridge as host:port, where
+                    // the host is the actual hostname of the machine and not localhost.
+                    dest: hostName + ":" + options.port,
+                });
 
                 var bridge = new MongoBridge(bridgeOptions);
             }
@@ -1172,11 +1154,9 @@ var ShardingTest = function(params) {
         rs.getPrimary().getDB("admin").foo.save({x: 1});
 
         if (keyFile) {
-            authutil.asCluster(rs.nodes,
-                               keyFile,
-                               function() {
-                                   rs.awaitReplication();
-                               });
+            authutil.asCluster(rs.nodes, keyFile, function() {
+                rs.awaitReplication();
+            });
         }
 
         rs.awaitSecondaryNodes();
@@ -1225,7 +1205,7 @@ var ShardingTest = function(params) {
 
     rstOptions.nodes = nodeOptions;
 
-    // Start the config server
+    // Start the config server's replica set
     this.configRS = new ReplSetTest(rstOptions);
     this.configRS.startSet(startOptions);
 
@@ -1236,7 +1216,23 @@ var ShardingTest = function(params) {
     this.configRS.initiate(config, null, initiateTimeout);
 
     // Wait for master to be elected before starting mongos
-    this.configRS.getPrimary();
+    var csrsPrimary = this.configRS.getPrimary();
+
+    // If chunkSize has been requested for this test, write the configuration
+    if (otherParams.chunkSize) {
+        function setChunkSize() {
+            assert.writeOK(csrsPrimary.getDB('config').settings.update(
+                {_id: 'chunksize'},
+                {$set: {value: otherParams.chunkSize}},
+                {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
+        }
+
+        if (keyFile) {
+            authutil.asCluster(csrsPrimary, keyFile, setChunkSize);
+        } else {
+            setChunkSize();
+        }
+    }
 
     this._configDB = this.configRS.getURL();
     this._configServers = this.configRS.nodes;
@@ -1246,7 +1242,7 @@ var ShardingTest = function(params) {
         this["c" + i] = conn;
     }
 
-    printjson("config servers: " + this._configDB);
+    printjson('Config servers: ' + this._configDB);
 
     var configConnection = _connectWithRetry(this._configDB);
 
@@ -1265,10 +1261,6 @@ var ShardingTest = function(params) {
             keyFile: keyFile,
         };
 
-        if (otherParams.chunkSize) {
-            options.chunkSize = otherParams.chunkSize;
-        }
-
         if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion) {
             otherParams.mongosOptions.binVersion =
                 MongoRunner.versionIterator(otherParams.mongosOptions.binVersion);
@@ -1283,14 +1275,12 @@ var ShardingTest = function(params) {
         if (otherParams.useBridge) {
             var bridgeOptions =
                 Object.merge(otherParams.bridgeOptions, options.bridgeOptions || {});
-            bridgeOptions = Object.merge(
-                bridgeOptions,
-                {
-                  hostName: otherParams.useHostname ? hostName : "localhost",
-                  // The mongos processes identify themselves to mongobridge as host:port, where the
-                  // host is the actual hostname of the machine and not localhost.
-                  dest: hostName + ":" + options.port,
-                });
+            bridgeOptions = Object.merge(bridgeOptions, {
+                hostName: otherParams.useHostname ? hostName : "localhost",
+                // The mongos processes identify themselves to mongobridge as host:port, where the
+                // host is the actual hostname of the machine and not localhost.
+                dest: hostName + ":" + options.port,
+            });
 
             var bridge = new MongoBridge(bridgeOptions);
         }
@@ -1319,27 +1309,18 @@ var ShardingTest = function(params) {
 
     // If auth is enabled for the test, login the mongos connections as system in order to
     // configure the instances and then log them out again.
-    if (keyFile) {
-        authutil.assertAuthenticate(this._mongos,
-                                    'admin',
-                                    {
-                                      user: '__system',
-                                      mechanism: 'MONGODB-CR',
-                                      pwd: cat(keyFile).replace(/[\011-\015\040]/g, '')
-                                    });
-    }
 
-    try {
+    function configureCluster() {
         // Disable the balancer unless it is explicitly turned on
         if (!otherParams.enableBalancer) {
-            this.stopBalancer();
+            self.stopBalancer();
         }
 
         // Lower the mongos replica set monitor's threshold for deeming RS shard hosts as
         // inaccessible in order to speed up tests, which shutdown entire shards and check for
         // errors. This attempt is best-effort and failure should not have effect on the actual
         // test execution, just the execution time.
-        this._mongos.forEach(function(mongos) {
+        self._mongos.forEach(function(mongos) {
             var res = mongos.adminCommand({setParameter: 1, replMonitorMaxFailedChecks: 2});
 
             // For tests, which use x509 certificate for authentication, the command above will not
@@ -1348,10 +1329,12 @@ var ShardingTest = function(params) {
                 assert.commandWorked(res);
             }
         });
-    } finally {
-        if (keyFile) {
-            authutil.logout(this._mongos, 'admin');
-        }
+    }
+
+    if (keyFile) {
+        authutil.asCluster(this._mongos, keyFile, configureCluster);
+    } else {
+        configureCluster();
     }
 
     try {
@@ -1379,6 +1362,15 @@ var ShardingTest = function(params) {
         print("Failed to add shards, stopping cluster.");
         this.stop();
         throw e;
+    }
+
+    if (waitForCSRSSecondaries) {
+        // Ensure that all CSRS nodes are up to date. This is strictly needed for tests that use
+        // multiple mongoses. In those cases, the first mongos initializes the contents of the
+        // 'config' database, but without waiting for those writes to replicate to all the
+        // config servers then the secondary mongoses risk reading from a stale config server
+        // and seeing an empty config database.
+        this.configRS.awaitLastOpCommitted();
     }
 
     if (jsTestOptions().keyFile) {

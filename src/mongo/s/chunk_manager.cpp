@@ -421,18 +421,17 @@ Status ChunkManager::createFirstChunks(OperationContext* txn,
             i < splitPoints.size() ? splitPoints[i] : _keyPattern.getKeyPattern().globalMax();
 
         ChunkType chunk;
-        chunk.setName(ChunkType::genID(_ns, min));
         chunk.setNS(_ns);
         chunk.setMin(min);
         chunk.setMax(max);
         chunk.setShard(shardIds[i % shardIds.size()]);
         chunk.setVersion(version);
 
-        Status status = grid.catalogManager(txn)
-                            ->insertConfigDocument(txn, ChunkType::ConfigNS, chunk.toBSON());
+        Status status = grid.catalogManager(txn)->insertConfigDocument(
+            txn, ChunkType::ConfigNS, chunk.toBSON());
         if (!status.isOK()) {
-            const string errMsg = str::stream()
-                << "Creating first chunks failed: " << status.reason();
+            const string errMsg = str::stream() << "Creating first chunks failed: "
+                                                << status.reason();
             error() << errMsg;
             return Status(status.code(), errMsg);
         }
@@ -473,18 +472,21 @@ shared_ptr<Chunk> ChunkManager::findIntersectingChunk(OperationContext* txn,
     }
 
     msgasserted(8070,
-                str::stream() << "couldn't find a chunk intersecting: " << shardKey
-                              << " for ns: " << _ns << " at version: " << _version.toString()
-                              << ", number of chunks: " << _chunkMap.size());
+                str::stream() << "couldn't find a chunk intersecting: " << shardKey << " for ns: "
+                              << _ns
+                              << " at version: "
+                              << _version.toString()
+                              << ", number of chunks: "
+                              << _chunkMap.size());
 }
 
 void ChunkManager::getShardIdsForQuery(OperationContext* txn,
                                        const BSONObj& query,
                                        set<ShardId>* shardIds) const {
-    auto lpq = stdx::make_unique<LiteParsedQuery>(NamespaceString(_ns));
-    lpq->setFilter(query);
+    auto qr = stdx::make_unique<QueryRequest>(NamespaceString(_ns));
+    qr->setFilter(query);
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), ExtensionsCallbackNoop());
+    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), ExtensionsCallbackNoop());
 
     uassertStatusOK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
@@ -590,7 +592,8 @@ IndexBounds ChunkManager::getIndexBoundsForQuery(const BSONObj& key,
                           false /* unique */,
                           "shardkey",
                           NULL /* filterExpr */,
-                          BSONObj());
+                          BSONObj(),
+                          NULL /* collator */);
     plannerParams.indices.push_back(indexEntry);
 
     OwnedPointerVector<QuerySolution> solutions;
@@ -714,12 +717,10 @@ ChunkManager::ChunkRangeMap ChunkManager::_constructRanges(const ChunkMap& chunk
 
     while (current != chunkMap.cend()) {
         const auto rangeFirst = current;
-        current = std::find_if(current,
-                               chunkMap.cend(),
-                               [&rangeFirst](const ChunkMap::value_type& chunkMapEntry) {
-                                   return chunkMapEntry.second->getShardId() !=
-                                       rangeFirst->second->getShardId();
-                               });
+        current = std::find_if(
+            current, chunkMap.cend(), [&rangeFirst](const ChunkMap::value_type& chunkMapEntry) {
+                return chunkMapEntry.second->getShardId() != rangeFirst->second->getShardId();
+            });
         const auto rangeLast = std::prev(current);
 
         const BSONObj rangeMin = rangeFirst->second->getMin();

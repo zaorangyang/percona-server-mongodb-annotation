@@ -31,6 +31,7 @@
 #include "document_source.h"
 
 #include "mongo/base/init.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
@@ -42,6 +43,8 @@ namespace mongo {
 
 using boost::intrusive_ptr;
 using std::unique_ptr;
+
+namespace dps = ::mongo::dotted_path_support;
 
 REGISTER_DOCUMENT_SOURCE(graphLookup, DocumentSourceGraphLookUp::createFromBson);
 
@@ -220,7 +223,7 @@ bool DocumentSourceGraphLookUp::addToVisitedAndFrontier(BSONObj result, long lon
     // array, we treat it as connecting to multiple values, so we must add each element to
     // '_frontier'.
     BSONElementSet recurseOnValues;
-    result.getFieldsDotted(_connectFromField.getPath(false), recurseOnValues);
+    dps::extractAllElementsAlongPath(result, _connectFromField.getPath(false), recurseOnValues);
 
     for (auto&& elem : recurseOnValues) {
         Value recurseOn = Value(elem);
@@ -243,7 +246,7 @@ bool DocumentSourceGraphLookUp::addToVisitedAndFrontier(BSONObj result, long lon
 void DocumentSourceGraphLookUp::addToCache(const BSONObj& result,
                                            const unordered_set<Value, Value::Hash>& queried) {
     BSONElementSet cacheByValues;
-    result.getFieldsDotted(_connectToField.getPath(false), cacheByValues);
+    dps::extractAllElementsAlongPath(result, _connectToField.getPath(false), cacheByValues);
 
     for (auto&& elem : cacheByValues) {
         Value cacheBy(elem);
@@ -358,9 +361,12 @@ void DocumentSourceGraphLookUp::checkMemoryUsage() {
 void DocumentSourceGraphLookUp::serializeToArray(std::vector<Value>& array, bool explain) const {
     // Serialize default options.
     MutableDocument spec(DOC("from" << _from.coll() << "as" << _as.getPath(false)
-                                    << "connectToField" << _connectToField.getPath(false)
-                                    << "connectFromField" << _connectFromField.getPath(false)
-                                    << "startWith" << _startWith->serialize(false)));
+                                    << "connectToField"
+                                    << _connectToField.getPath(false)
+                                    << "connectFromField"
+                                    << _connectFromField.getPath(false)
+                                    << "startWith"
+                                    << _startWith->serialize(false)));
 
     // depthField is optional; serialize it if it was specified.
     if (_depthField) {
@@ -376,7 +382,8 @@ void DocumentSourceGraphLookUp::serializeToArray(std::vector<Value>& array, bool
         const boost::optional<FieldPath> indexPath = (*_unwind)->indexPath();
         spec["unwinding"] =
             Value(DOC("preserveNullAndEmptyArrays"
-                      << (*_unwind)->preserveNullAndEmptyArrays() << "includeArrayIndex"
+                      << (*_unwind)->preserveNullAndEmptyArrays()
+                      << "includeArrayIndex"
                       << (indexPath ? Value((*indexPath).getPath(false)) : Value())));
     }
 
@@ -432,14 +439,14 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
                                   << typeName(argument.type()),
                     argument.isNumber());
             maxDepth = argument.safeNumberLong();
-            uassert(
-                40101,
-                str::stream() << "maxDepth requires a nonnegative argument, found: " << *maxDepth,
-                *maxDepth >= 0);
-            uassert(
-                40102,
-                str::stream() << "maxDepth could not be represented as a long long: " << *maxDepth,
-                *maxDepth == argument.number());
+            uassert(40101,
+                    str::stream() << "maxDepth requires a nonnegative argument, found: "
+                                  << *maxDepth,
+                    *maxDepth >= 0);
+            uassert(40102,
+                    str::stream() << "maxDepth could not be represented as a long long: "
+                                  << *maxDepth,
+                    *maxDepth == argument.number());
             continue;
         }
 
@@ -447,8 +454,8 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
             argName == "depthField" || argName == "connectToField") {
             // All remaining arguments to $graphLookup are expected to be strings.
             uassert(40103,
-                    str::stream() << "expected string as argument for " << argName
-                                  << ", found: " << argument.toString(false, false),
+                    str::stream() << "expected string as argument for " << argName << ", found: "
+                                  << argument.toString(false, false),
                     argument.type() == String);
         }
 
@@ -464,8 +471,8 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
             depthField = boost::optional<FieldPath>(FieldPath(argument.String()));
         } else {
             uasserted(40104,
-                      str::stream()
-                          << "Unknown argument to $graphLookup: " << argument.fieldName());
+                      str::stream() << "Unknown argument to $graphLookup: "
+                                    << argument.fieldName());
         }
     }
 

@@ -78,8 +78,10 @@ bool shouldStartService() {
     return _startService;
 }
 
-static DWORD WINAPI
-serviceCtrl(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext);
+static DWORD WINAPI serviceCtrl(DWORD dwControl,
+                                DWORD dwEventType,
+                                LPVOID lpEventData,
+                                LPVOID lpContext);
 
 void configureService(ServiceCallback serviceCallback,
                       const moe::Environment& params,
@@ -544,10 +546,10 @@ static void serviceStop() {
     // so it doesn't even need a name.
     stdx::thread(std::move(exitCleanlyTask)).detach();
 
-    const auto timeout = stdx::chrono::milliseconds(kStopWaitHintMillis / 2);
+    const auto timeout = Milliseconds(kStopWaitHintMillis / 2);
 
     // We periodically check if we are done exiting by polling at half of each wait interval
-    while (exitedCleanly.wait_for(timeout) != stdx::future_status::ready) {
+    while (exitedCleanly.wait_for(timeout.toSystemDuration()) != stdx::future_status::ready) {
         reportStatus(SERVICE_STOP_PENDING, kStopWaitHintMillis);
         log() << "Service Stop is waiting for storage engine to finish shutdown";
     }
@@ -586,8 +588,10 @@ static void serviceShutdown(const char* controlCodeName) {
     // Note: we will report exit status in initService
 }
 
-static DWORD WINAPI
-serviceCtrl(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext) {
+static DWORD WINAPI serviceCtrl(DWORD dwControl,
+                                DWORD dwEventType,
+                                LPVOID lpEventData,
+                                LPVOID lpContext) {
     switch (dwControl) {
         case SERVICE_CONTROL_INTERROGATE:
             // Return NO_ERROR per MSDN even though we do nothing for this control code.

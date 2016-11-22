@@ -128,7 +128,8 @@ Status ReplicaSetConfig::_initialize(const BSONObj& cfg,
         if (memberElement.type() != Object) {
             return Status(ErrorCodes::TypeMismatch,
                           str::stream() << "Expected type of " << kMembersFieldName << "."
-                                        << memberElement.fieldName() << " to be Object, but found "
+                                        << memberElement.fieldName()
+                                        << " to be Object, but found "
                                         << typeName(memberElement.type()));
         }
         _members.resize(_members.size() + 1);
@@ -200,7 +201,8 @@ Status ReplicaSetConfig::_initialize(const BSONObj& cfg,
                           str::stream() << "replica set configuration cannot contain '"
                                         << kReplicaSetIdFieldName
                                         << "' "
-                                           "field when called from replSetInitiate: " << cfg);
+                                           "field when called from replSetInitiate: "
+                                        << cfg);
         }
         _replicaSetId = OID::gen();
     } else if (!_replicaSetId.isSet()) {
@@ -209,6 +211,7 @@ Status ReplicaSetConfig::_initialize(const BSONObj& cfg,
 
     _calculateMajorities();
     _addInternalWriteConcernModes();
+    _initializeConnectionString();
     _isInitialized = true;
     return Status::OK();
 }
@@ -311,8 +314,10 @@ Status ReplicaSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
         if (modeElement.type() != Object) {
             return Status(ErrorCodes::TypeMismatch,
                           str::stream() << "Expected " << kSettingsFieldName << '.'
-                                        << kGetLastErrorModesFieldName << '.'
-                                        << modeElement.fieldName() << " to be an Object, not "
+                                        << kGetLastErrorModesFieldName
+                                        << '.'
+                                        << modeElement.fieldName()
+                                        << " to be an Object, not "
                                         << typeName(modeElement.type()));
         }
         ReplicaSetTagPattern pattern = _tagConfig.makePattern();
@@ -320,20 +325,26 @@ Status ReplicaSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
             const BSONElement constraintElement = constraintIter.next();
             if (!constraintElement.isNumber()) {
                 return Status(ErrorCodes::TypeMismatch,
-                              str::stream()
-                                  << "Expected " << kSettingsFieldName << '.'
-                                  << kGetLastErrorModesFieldName << '.' << modeElement.fieldName()
-                                  << '.' << constraintElement.fieldName() << " to be a number, not "
-                                  << typeName(constraintElement.type()));
+                              str::stream() << "Expected " << kSettingsFieldName << '.'
+                                            << kGetLastErrorModesFieldName
+                                            << '.'
+                                            << modeElement.fieldName()
+                                            << '.'
+                                            << constraintElement.fieldName()
+                                            << " to be a number, not "
+                                            << typeName(constraintElement.type()));
             }
             const int minCount = constraintElement.numberInt();
             if (minCount <= 0) {
                 return Status(ErrorCodes::BadValue,
                               str::stream() << "Value of " << kSettingsFieldName << '.'
-                                            << kGetLastErrorModesFieldName << '.'
-                                            << modeElement.fieldName() << '.'
+                                            << kGetLastErrorModesFieldName
+                                            << '.'
+                                            << modeElement.fieldName()
+                                            << '.'
                                             << constraintElement.fieldName()
-                                            << " must be positive, but found " << minCount);
+                                            << " must be positive, but found "
+                                            << minCount);
             }
             status = _tagConfig.addTagCountConstraintToPattern(
                 &pattern, constraintElement.fieldNameStringData(), minCount);
@@ -369,7 +380,8 @@ Status ReplicaSetConfig::validate() const {
     if (_replSetName.empty()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Replica set configuration must have non-empty "
-                                    << kIdFieldName << " field");
+                                    << kIdFieldName
+                                    << " field");
     }
     if (_heartbeatInterval < Milliseconds(0)) {
         return Status(ErrorCodes::BadValue,
@@ -412,22 +424,41 @@ Status ReplicaSetConfig::validate() const {
             const MemberConfig& memberJ = _members[j];
             if (memberI.getId() == memberJ.getId()) {
                 return Status(ErrorCodes::BadValue,
-                              str::stream()
-                                  << "Found two member configurations with same "
-                                  << MemberConfig::kIdFieldName << " field, " << kMembersFieldName
-                                  << "." << i << "." << MemberConfig::kIdFieldName
-                                  << " == " << kMembersFieldName << "." << j << "."
-                                  << MemberConfig::kIdFieldName << " == " << memberI.getId());
+                              str::stream() << "Found two member configurations with same "
+                                            << MemberConfig::kIdFieldName
+                                            << " field, "
+                                            << kMembersFieldName
+                                            << "."
+                                            << i
+                                            << "."
+                                            << MemberConfig::kIdFieldName
+                                            << " == "
+                                            << kMembersFieldName
+                                            << "."
+                                            << j
+                                            << "."
+                                            << MemberConfig::kIdFieldName
+                                            << " == "
+                                            << memberI.getId());
             }
             if (memberI.getHostAndPort() == memberJ.getHostAndPort()) {
                 return Status(ErrorCodes::BadValue,
                               str::stream() << "Found two member configurations with same "
-                                            << MemberConfig::kHostFieldName << " field, "
-                                            << kMembersFieldName << "." << i << "."
                                             << MemberConfig::kHostFieldName
-                                            << " == " << kMembersFieldName << "." << j << "."
+                                            << " field, "
+                                            << kMembersFieldName
+                                            << "."
+                                            << i
+                                            << "."
                                             << MemberConfig::kHostFieldName
-                                            << " == " << memberI.getHostAndPort().toString());
+                                            << " == "
+                                            << kMembersFieldName
+                                            << "."
+                                            << j
+                                            << "."
+                                            << MemberConfig::kHostFieldName
+                                            << " == "
+                                            << memberI.getHostAndPort().toString());
             }
         }
     }
@@ -437,7 +468,9 @@ Status ReplicaSetConfig::validate() const {
             ErrorCodes::BadValue,
             str::stream()
                 << "Either all host names in a replica set configuration must be localhost "
-                   "references, or none must be; found " << localhostCount << " out of "
+                   "references, or none must be; found "
+                << localhostCount
+                << " out of "
                 << _members.size());
     }
 
@@ -473,7 +506,8 @@ Status ReplicaSetConfig::validate() const {
     if (_protocolVersion != 0 && _protocolVersion != 1) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << kProtocolVersionFieldName << " field value of "
-                                    << _protocolVersion << " is not 1 or 0");
+                                    << _protocolVersion
+                                    << " is not 1 or 0");
     }
 
     if (_configServer) {
@@ -514,6 +548,11 @@ Status ReplicaSetConfig::validate() const {
                       "their config");
     }
 
+    if (!_connectionString.isValid()) {
+        return Status(ErrorCodes::BadValue,
+                      "ReplicaSetConfig represented an invalid replica set ConnectionString");
+    }
+
     return Status::OK();
 }
 
@@ -540,7 +579,8 @@ Status ReplicaSetConfig::checkIfWriteConcernCanBeSatisfied(
         // write concern mode.
         return Status(ErrorCodes::CannotSatisfyWriteConcern,
                       str::stream() << "Not enough nodes match write concern mode \""
-                                    << writeConcern.wMode << "\"");
+                                    << writeConcern.wMode
+                                    << "\"");
     } else {
         int nodesRemaining = writeConcern.wNumNodes;
         for (size_t j = 0; j < _members.size(); ++j) {
@@ -602,6 +642,12 @@ Milliseconds ReplicaSetConfig::getHeartbeatInterval() const {
     return _heartbeatInterval;
 }
 
+bool ReplicaSetConfig::isLocalHostAllowed() const {
+    // It is sufficient to check any one member's hostname, since in ReplicaSetConfig::validate,
+    // it's ensured that either all members have hostname localhost or none do.
+    return _members.begin()->getHostAndPort().isLocalHost();
+}
+
 ReplicaSetTag ReplicaSetConfig::findTag(StringData key, StringData value) const {
     return _tagConfig.findTag(key, value);
 }
@@ -658,6 +704,23 @@ void ReplicaSetConfig::_addInternalWriteConcernModes() {
         // NoSuchKey means we have no $electable-tagged nodes in this config;
         // other errors are unexpected
         fassert(28694, status);
+    }
+}
+
+void ReplicaSetConfig::_initializeConnectionString() {
+    std::vector<HostAndPort> visibleMembers;
+    for (const auto& member : _members) {
+        if (!member.isHidden() && !member.isArbiter()) {
+            visibleMembers.push_back(member.getHostAndPort());
+        }
+    }
+
+    try {
+        _connectionString = ConnectionString::forReplicaSet(_replSetName, visibleMembers);
+    } catch (const DBException& e) {
+        invariant(e.getCode() == ErrorCodes::FailedToParse);
+        // Failure to construct the ConnectionString means either an invalid replica set name
+        // or members array, which should be caught in validate()
     }
 }
 

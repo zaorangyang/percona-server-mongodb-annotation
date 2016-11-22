@@ -43,15 +43,17 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/journal_listener.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
@@ -60,11 +62,10 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/db/storage/storage_options.h"
-#include "mongo/util/log.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
@@ -77,6 +78,8 @@ namespace mongo {
 
 using std::set;
 using std::string;
+
+namespace dps = ::mongo::dotted_path_support;
 
 class WiredTigerKVEngine::WiredTigerJournalFlusher : public BackgroundJob {
 public:
@@ -560,8 +563,9 @@ Status WiredTigerKVEngine::createSortedDataInterface(OperationContext* opCtx,
 
         if (!collOptions.indexOptionDefaults["storageEngine"].eoo()) {
             BSONObj storageEngineOptions = collOptions.indexOptionDefaults["storageEngine"].Obj();
-            collIndexOptions = storageEngineOptions.getFieldDotted(_canonicalName + ".configString")
-                                   .valuestrsafe();
+            collIndexOptions =
+                dps::extractElementAtPath(storageEngineOptions, _canonicalName + ".configString")
+                    .valuestrsafe();
         }
     }
 
@@ -596,8 +600,8 @@ bool WiredTigerKVEngine::_drop(StringData ident) {
 
     WiredTigerSession session(_conn);
 
-    int ret =
-        session.getSession()->drop(session.getSession(), uri.c_str(), "force,lock_wait=false");
+    int ret = session.getSession()->drop(
+        session.getSession(), uri.c_str(), "force,checkpoint_wait=false");
     LOG(1) << "WT drop of  " << uri << " res " << ret;
 
     if (ret == 0) {
@@ -609,7 +613,7 @@ bool WiredTigerKVEngine::_drop(StringData ident) {
         // this is expected, queue it up
         {
             stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
-            _identToDrop.insert(uri);
+            _identToDrop.push(uri);
         }
         _sessionCache->closeAll();
         return false;
@@ -629,7 +633,7 @@ bool WiredTigerKVEngine::haveDropsQueued() const {
     }
 
     // We only want to check the queue max once per second or we'll thrash
-    // This is done in haveDropsQueued, not dropAllQueued so we skip the mutex
+    // This is done in haveDropsQueued, not dropSomeQueuedIdents so we skip the mutex
     if (delta < Milliseconds(1000))
         return false;
 
@@ -638,41 +642,40 @@ bool WiredTigerKVEngine::haveDropsQueued() const {
     return !_identToDrop.empty();
 }
 
-void WiredTigerKVEngine::dropAllQueued() {
-    set<string> mine;
+void WiredTigerKVEngine::dropSomeQueuedIdents() {
+    int numInQueue;
+
+    WiredTigerSession session(_conn);
+
     {
         stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
-        mine = _identToDrop;
+        numInQueue = _identToDrop.size();
     }
 
-    set<string> deleted;
+    int numToDelete = 10;
+    int tenPercentQueue = numInQueue * 0.1;
+    if (tenPercentQueue > 10)
+        numToDelete = tenPercentQueue;
 
-    {
-        WiredTigerSession session(_conn);
-        for (set<string>::const_iterator it = mine.begin(); it != mine.end(); ++it) {
-            string uri = *it;
-            int ret = session.getSession()->drop(
-                session.getSession(), uri.c_str(), "force,lock_wait=false");
-            LOG(1) << "WT queued drop of  " << uri << " res " << ret;
-
-            if (ret == 0) {
-                deleted.insert(uri);
-                continue;
-            }
-
-            if (ret == EBUSY) {
-                // leave in qeuue
-                continue;
-            }
-
-            invariantWTOK(ret);
+    LOG(1) << "WT Queue is: " << numInQueue << " attempting to drop: " << numToDelete << " tables";
+    for (int i = 0; i < numToDelete; i++) {
+        string uri;
+        {
+            stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
+            if (_identToDrop.empty())
+                break;
+            uri = _identToDrop.front();
+            _identToDrop.pop();
         }
-    }
+        int ret = session.getSession()->drop(
+            session.getSession(), uri.c_str(), "force,checkpoint_wait=false");
+        LOG(1) << "WT queued drop of  " << uri << " res " << ret;
 
-    {
-        stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
-        for (set<string>::const_iterator it = deleted.begin(); it != deleted.end(); ++it) {
-            _identToDrop.erase(*it);
+        if (ret == EBUSY) {
+            stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
+            _identToDrop.push(uri);
+        } else {
+            invariantWTOK(ret);
         }
     }
 }

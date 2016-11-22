@@ -35,15 +35,16 @@
 #include <vector>
 
 #include "mongo/client/dbclientinterface.h"  // For QueryOption_foobar
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_text.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/plan_enumerator.h"
 #include "mongo/db/query/planner_access.h"
 #include "mongo/db/query/planner_analysis.h"
 #include "mongo/db/query/planner_ixselect.h"
-#include "mongo/db/query/plan_enumerator.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/util/log.h"
@@ -52,6 +53,8 @@ namespace mongo {
 
 using std::unique_ptr;
 using std::numeric_limits;
+
+namespace dps = ::mongo::dotted_path_support;
 
 // Copied verbatim from db/index.h
 static bool isIdIndex(const BSONObj& pattern) {
@@ -229,7 +232,7 @@ QuerySolution* buildWholeIXSoln(const IndexEntry& index,
 }
 
 bool providesSort(const CanonicalQuery& query, const BSONObj& kp) {
-    return query.getParsed().getSort().isPrefixOf(kp);
+    return query.getQueryRequest().getSort().isPrefixOf(kp);
 }
 
 // static
@@ -398,8 +401,7 @@ Status QueryPlanner::planFromCache(const CanonicalQuery& query,
     // The planner requires a defined sort order.
     sortUsingTags(clone.get());
 
-    LOG(5) << "Tagged tree:" << endl
-           << clone->toString();
+    LOG(5) << "Tagged tree:" << endl << clone->toString();
 
     // Use the cached index assignments to build solnRoot.
     QuerySolutionNode* solnRoot = QueryPlannerAccess::buildIndexedDataAccess(
@@ -415,8 +417,8 @@ Status QueryPlanner::planFromCache(const CanonicalQuery& query,
     QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
     if (!soln) {
         return Status(ErrorCodes::BadValue,
-                      str::stream()
-                          << "Failed to analyze plan from cache. Query: " << query.toStringShort());
+                      str::stream() << "Failed to analyze plan from cache. Query: "
+                                    << query.toStringShort());
     }
 
     LOG(5) << "Planner: solution constructed from the cache:\n" << soln->toString();
@@ -439,7 +441,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     }
 
     const bool canTableScan = !(params.options & QueryPlannerParams::NO_TABLE_SCAN);
-    const bool isTailable = query.getParsed().isTailable();
+    const bool isTailable = query.getQueryRequest().isTailable();
 
     // If the query requests a tailable cursor, the only solution is a collscan + filter with
     // tailable set on the collscan.  TODO: This is a policy departure.  Previously I think you
@@ -458,19 +460,20 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     // The hint or sort can be $natural: 1.  If this happens, output a collscan. If both
     // a $natural hint and a $natural sort are specified, then the direction of the collscan
     // is determined by the sign of the sort (not the sign of the hint).
-    if (!query.getParsed().getHint().isEmpty() || !query.getParsed().getSort().isEmpty()) {
-        BSONObj hintObj = query.getParsed().getHint();
-        BSONObj sortObj = query.getParsed().getSort();
-        BSONElement naturalHint = hintObj.getFieldDotted("$natural");
-        BSONElement naturalSort = sortObj.getFieldDotted("$natural");
+    if (!query.getQueryRequest().getHint().isEmpty() ||
+        !query.getQueryRequest().getSort().isEmpty()) {
+        BSONObj hintObj = query.getQueryRequest().getHint();
+        BSONObj sortObj = query.getQueryRequest().getSort();
+        BSONElement naturalHint = dps::extractElementAtPath(hintObj, "$natural");
+        BSONElement naturalSort = dps::extractElementAtPath(sortObj, "$natural");
 
         // A hint overrides a $natural sort. This means that we don't force a table
         // scan if there is a $natural sort with a non-$natural hint.
         if (!naturalHint.eoo() || (!naturalSort.eoo() && hintObj.isEmpty())) {
             LOG(5) << "Forcing a table scan due to hinted $natural\n";
             // min/max are incompatible with $natural.
-            if (canTableScan && query.getParsed().getMin().isEmpty() &&
-                query.getParsed().getMax().isEmpty()) {
+            if (canTableScan && query.getQueryRequest().getMin().isEmpty() &&
+                query.getQueryRequest().getMax().isEmpty()) {
                 QuerySolution* soln = buildCollscanSoln(query, isTailable, params);
                 if (NULL != soln) {
                     out->push_back(soln);
@@ -497,7 +500,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     // requested in the query.
     BSONObj hintIndex;
     if (!params.indexFiltersApplied) {
-        hintIndex = query.getParsed().getHint();
+        hintIndex = query.getQueryRequest().getHint();
     }
 
     // If snapshot is set, default to collscanning. If the query param SNAPSHOT_USE_ID is set,
@@ -506,7 +509,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     //
     // Don't do this if the query is a geonear or text as as text search queries must be answered
     // using full text indices and geoNear queries must be answered using geospatial indices.
-    if (query.getParsed().isSnapshot() &&
+    if (query.getQueryRequest().isSnapshot() &&
         !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) &&
         !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)) {
         const bool useIXScan = params.options & QueryPlannerParams::SNAPSHOT_USE_ID;
@@ -568,9 +571,10 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
 
     // Deal with the .min() and .max() query options.  If either exist we can only use an index
     // that matches the object inside.
-    if (!query.getParsed().getMin().isEmpty() || !query.getParsed().getMax().isEmpty()) {
-        BSONObj minObj = query.getParsed().getMin();
-        BSONObj maxObj = query.getParsed().getMax();
+    if (!query.getQueryRequest().getMin().isEmpty() ||
+        !query.getQueryRequest().getMax().isEmpty()) {
+        BSONObj minObj = query.getQueryRequest().getMin();
+        BSONObj maxObj = query.getQueryRequest().getMax();
 
         // The unfinished siblings of these objects may not be proper index keys because they
         // may be empty objects or have field names. When an index is picked to use for the
@@ -659,7 +663,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     }
 
     // Figure out how useful each index is to each predicate.
-    QueryPlannerIXSelect::rateIndices(query.root(), "", relevantIndices, params.collator);
+    QueryPlannerIXSelect::rateIndices(query.root(), "", relevantIndices, query.getCollator());
     QueryPlannerIXSelect::stripInvalidAssignments(query.root(), relevantIndices);
 
     // Unless we have GEO_NEAR, TEXT, or a projection, we may be able to apply an optimization
@@ -670,15 +674,14 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     //
     // TEXT and GEO_NEAR are special because they require the use of a text/geo index in order
     // to be evaluated correctly. Stripping these "mandatory assignments" is therefore invalid.
-    if (query.getParsed().getProj().isEmpty() &&
+    if (query.getQueryRequest().getProj().isEmpty() &&
         !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) &&
         !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)) {
         QueryPlannerIXSelect::stripUnneededAssignments(query.root(), relevantIndices);
     }
 
     // query.root() is now annotated with RelevantTag(s).
-    LOG(5) << "Rated tree:" << endl
-           << query.root()->toString();
+    LOG(5) << "Rated tree:" << endl << query.root()->toString();
 
     // If there is a GEO_NEAR it must have an index it can use directly.
     const MatchExpression* gnNode = NULL;
@@ -744,8 +747,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
 
         MatchExpression* rawTree;
         while (isp.getNext(&rawTree) && (out->size() < params.maxIndexedSolutions)) {
-            LOG(5) << "About to build solntree from tagged tree:" << endl
-                   << rawTree->toString();
+            LOG(5) << "About to build solntree from tagged tree:" << endl << rawTree->toString();
 
             // The tagged tree produced by the plan enumerator is not guaranteed
             // to be canonically sorted. In order to be compatible with the cached
@@ -771,8 +773,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
 
             QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
             if (NULL != soln) {
-                LOG(5) << "Planner: adding solution:" << endl
-                       << soln->toString();
+                LOG(5) << "Planner: adding solution:" << endl << soln->toString();
                 if (indexTreeStatus.isOK()) {
                     SolutionCacheData* scd = new SolutionCacheData();
                     scd->tree.reset(autoData.release());
@@ -817,7 +818,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     // If a sort order is requested, there may be an index that provides it, even if that
     // index is not over any predicates in the query.
     //
-    if (!query.getParsed().getSort().isEmpty() &&
+    if (!query.getQueryRequest().getSort().isEmpty() &&
         !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) &&
         !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)) {
         // See if we have a sort provided from an index already.
@@ -852,6 +853,12 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
                     continue;
                 }
                 if (index.sparse) {
+                    continue;
+                }
+
+                // If the index collation differs from the query collation, the index should not be
+                // used to provide a sort, because strings will be ordered incorrectly.
+                if (!CollatorInterface::collatorsMatch(index.collator, query.getCollator())) {
                     continue;
                 }
 
@@ -918,8 +925,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
             scd->solnType = SolutionCacheData::COLLSCAN_SOLN;
             collscan->cacheData.reset(scd);
             out->push_back(collscan);
-            LOG(5) << "Planner: outputting a collscan:" << endl
-                   << collscan->toString();
+            LOG(5) << "Planner: outputting a collscan:" << endl << collscan->toString();
         }
     }
 

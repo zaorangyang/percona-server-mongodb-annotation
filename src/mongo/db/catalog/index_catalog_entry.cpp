@@ -72,7 +72,8 @@ private:
     IndexCatalogEntry* _catalogEntry;
 };
 
-IndexCatalogEntry::IndexCatalogEntry(StringData ns,
+IndexCatalogEntry::IndexCatalogEntry(OperationContext* txn,
+                                     StringData ns,
                                      CollectionCatalogEntry* collection,
                                      IndexDescriptor* descriptor,
                                      CollectionInfoCache* infoCache)
@@ -80,24 +81,10 @@ IndexCatalogEntry::IndexCatalogEntry(StringData ns,
       _collection(collection),
       _descriptor(descriptor),
       _infoCache(infoCache),
-      _accessMethod(NULL),
       _headManager(new HeadManagerImpl(this)),
       _ordering(Ordering::make(descriptor->keyPattern())),
       _isReady(false) {
     _descriptor->_cachedEntry = this;
-}
-
-IndexCatalogEntry::~IndexCatalogEntry() {
-    _descriptor->_cachedEntry = NULL;  // defensive
-
-    delete _headManager;
-    delete _accessMethod;
-    delete _descriptor;
-}
-
-void IndexCatalogEntry::init(OperationContext* txn, IndexAccessMethod* accessMethod) {
-    verify(_accessMethod == NULL);
-    _accessMethod = accessMethod;
 
     _isReady = _catalogIsReady(txn);
     _head = _catalogHead(txn);
@@ -108,19 +95,6 @@ void IndexCatalogEntry::init(OperationContext* txn, IndexAccessMethod* accessMet
         _indexTracksPathLevelMultikeyInfo = !_indexMultikeyPaths.empty();
     }
 
-    if (BSONElement filterElement = _descriptor->getInfoElement("partialFilterExpression")) {
-        invariant(filterElement.isABSONObj());
-        BSONObj filter = filterElement.Obj();
-        // TODO SERVER-23618: pass the appropriate CollatorInterface* instead of nullptr.
-        StatusWithMatchExpression statusWithMatcher =
-            MatchExpressionParser::parse(filter, ExtensionsCallbackDisallowExtensions(), nullptr);
-        // this should be checked in create, so can blow up here
-        invariantOK(statusWithMatcher.getStatus());
-        _filterExpression = std::move(statusWithMatcher.getValue());
-        LOG(2) << "have filter expression for " << _ns << " " << _descriptor->indexName() << " "
-               << filter;
-    }
-
     if (BSONElement collationElement = _descriptor->getInfoElement("collation")) {
         invariant(collationElement.isABSONObj());
         BSONObj collation = collationElement.Obj();
@@ -129,6 +103,30 @@ void IndexCatalogEntry::init(OperationContext* txn, IndexAccessMethod* accessMet
         invariantOK(statusWithCollator.getStatus());
         _collator = std::move(statusWithCollator.getValue());
     }
+
+    if (BSONElement filterElement = _descriptor->getInfoElement("partialFilterExpression")) {
+        invariant(filterElement.isABSONObj());
+        BSONObj filter = filterElement.Obj();
+        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
+            filter, ExtensionsCallbackDisallowExtensions(), _collator.get());
+        // this should be checked in create, so can blow up here
+        invariantOK(statusWithMatcher.getStatus());
+        _filterExpression = std::move(statusWithMatcher.getValue());
+        LOG(2) << "have filter expression for " << _ns << " " << _descriptor->indexName() << " "
+               << filter;
+    }
+}
+
+IndexCatalogEntry::~IndexCatalogEntry() {
+    _descriptor->_cachedEntry = NULL;  // defensive
+
+    delete _headManager;
+    delete _descriptor;
+}
+
+void IndexCatalogEntry::init(std::unique_ptr<IndexAccessMethod> accessMethod) {
+    invariant(!_accessMethod);
+    _accessMethod = std::move(accessMethod);
 }
 
 const RecordId& IndexCatalogEntry::head(OperationContext* txn) const {

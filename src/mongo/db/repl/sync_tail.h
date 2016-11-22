@@ -29,6 +29,7 @@
 #pragma once
 
 #include <deque>
+#include <memory>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
@@ -44,7 +45,7 @@ class Database;
 class OperationContext;
 
 namespace repl {
-class BackgroundSyncInterface;
+class BackgroundSync;
 class ReplicationCoordinator;
 class OpTime;
 
@@ -53,7 +54,8 @@ class OpTime;
  */
 class SyncTail {
 public:
-    using MultiSyncApplyFunc = stdx::function<void(const std::vector<OplogEntry>& ops)>;
+    using MultiSyncApplyFunc =
+        stdx::function<void(const std::vector<OplogEntry>& ops, SyncTail* st)>;
 
     /**
      * Type of function to increment "repl.apply.ops" server status metric.
@@ -82,8 +84,14 @@ public:
      */
     using ApplyCommandInLockFn = stdx::function<Status(OperationContext*, const BSONObj&)>;
 
-    SyncTail(BackgroundSyncInterface* q, MultiSyncApplyFunc func);
+    SyncTail(BackgroundSync* q, MultiSyncApplyFunc func);
+    SyncTail(BackgroundSync* q, MultiSyncApplyFunc func, std::unique_ptr<OldThreadPool> writerPool);
     virtual ~SyncTail();
+
+    /**
+     * Creates thread pool for writer tasks.
+     */
+    static std::unique_ptr<OldThreadPool> makeWriterPool();
 
     /**
      * Applies the operation that is in param o.
@@ -145,11 +153,10 @@ public:
     void setHostname(const std::string& hostname);
 
     /**
-     * This variable determines the number of writer threads SyncTail will have. It has a default
-     * value, which varies based on architecture and can be overridden using the
-     * "replWriterThreadCount" server parameter.
+     * Returns writer thread pool.
+     * Used by ReplicationCoordinatorExternalStateImpl only.
      */
-    static int replWriterThreadCount;
+    OldThreadPool* getWriterPool();
 
 protected:
     // Cap the batches using the limit on journal commits.
@@ -167,19 +174,17 @@ private:
 
     std::string _hostname;
 
-    BackgroundSyncInterface* _networkQueue;
+    BackgroundSync* _networkQueue;
 
     // Function to use during applyOps
     MultiSyncApplyFunc _applyFunc;
 
     // persistent pool of worker threads for writing ops to the databases
-    OldThreadPool _writerPool;
-    // persistent pool of worker threads for prefetching
-    OldThreadPool _prefetcherPool;
+    std::unique_ptr<OldThreadPool> _writerPool;
 };
 
 /**
- * Applies the opeartions described in the oplog entries contained in "ops" using the
+ * Applies the operations described in the oplog entries contained in "ops" using the
  * "applyOperation" function.
  *
  * Returns ErrorCode::InterruptedAtShutdown if the node enters shutdown while applying ops,
@@ -189,12 +194,32 @@ private:
  * Shared between here and MultiApplier.
  */
 StatusWith<OpTime> multiApply(OperationContext* txn,
+                              OldThreadPool* workerPool,
                               const MultiApplier::Operations& ops,
                               MultiApplier::ApplyOperationFn applyOperation);
 
 // These free functions are used by the thread pool workers to write ops to the db.
-void multiSyncApply(const std::vector<OplogEntry>& ops);
-void multiInitialSyncApply(const std::vector<OplogEntry>& ops);
+void multiSyncApply(const std::vector<OplogEntry>& ops, SyncTail* st);
+void multiInitialSyncApply(const std::vector<OplogEntry>& ops, SyncTail* st);
+
+/**
+ * Testing-only version of multiSyncApply that returns an error instead of aborting.
+ * Accepts an external operation context and a function with the same argument list as
+ * SyncTail::syncApply.
+ */
+using SyncApplyFn =
+    stdx::function<Status(OperationContext* txn, const BSONObj& o, bool convertUpdateToUpsert)>;
+Status multiSyncApply_noAbort(OperationContext* txn,
+                              const std::vector<OplogEntry>& ops,
+                              SyncApplyFn syncApply);
+
+/**
+ * Testing-only version of multiInitialSyncApply that accepts an external operation context and
+ * returns an error instead of aborting.
+ */
+Status multiInitialSyncApply_noAbort(OperationContext* txn,
+                                     const std::vector<OplogEntry>& ops,
+                                     SyncTail* st);
 
 }  // namespace repl
 }  // namespace mongo

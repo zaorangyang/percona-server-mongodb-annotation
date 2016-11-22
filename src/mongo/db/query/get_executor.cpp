@@ -51,8 +51,8 @@
 #include "mongo/db/exec/sort_key_generator.h"
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/exec/update.h"
-#include "mongo/db/index_names.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -71,14 +71,14 @@
 #include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/server_parameters.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/oplog_hack.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -142,7 +142,8 @@ void fillOutPlannerParams(OperationContext* txn,
                                                     desc->unique(),
                                                     desc->indexName(),
                                                     ice->getFilterExpression(),
-                                                    desc->infoObj()));
+                                                    desc->infoObj(),
+                                                    ice->getCollator()));
     }
 
     // If query supports index filters, filter params.indices by indices in query settings.
@@ -269,17 +270,18 @@ Status prepareExecution(OperationContext* opCtx,
         // document, so we don't support covered projections. However, we might use the
         // simple inclusion fast path.
         if (NULL != canonicalQuery->getProj()) {
-            // TODO SERVER-23613: pass the appropriate collator to ProjectionStageParams.
             ProjectionStageParams params(ExtensionsCallbackReal(opCtx, &collection->ns()));
             params.projObj = canonicalQuery->getProj()->getProjObj();
+            params.collator = canonicalQuery->getCollator();
 
             // Add a SortKeyGeneratorStage if there is a $meta sortKey projection.
             if (canonicalQuery->getProj()->wantSortKey()) {
                 *rootOut = new SortKeyGeneratorStage(opCtx,
                                                      *rootOut,
                                                      ws,
-                                                     canonicalQuery->getParsed().getSort(),
-                                                     canonicalQuery->getParsed().getFilter());
+                                                     canonicalQuery->getQueryRequest().getSort(),
+                                                     canonicalQuery->getQueryRequest().getFilter(),
+                                                     canonicalQuery->getCollator());
             }
 
             // Stuff the right data into the params depending on what proj impl we use.
@@ -299,7 +301,7 @@ Status prepareExecution(OperationContext* opCtx,
     }
 
     // Tailable: If the query requests tailable the collection must be capped.
-    if (canonicalQuery->getParsed().isTailable()) {
+    if (canonicalQuery->getQueryRequest().isTailable()) {
         if (!collection->isCapped()) {
             return Status(ErrorCodes::BadValue,
                           "error processing query: " + canonicalQuery->toString() +
@@ -558,7 +560,7 @@ StatusWith<unique_ptr<PlanExecutor>> getOplogStartHack(OperationContext* txn,
     params.collection = collection;
     params.start = *startLoc;
     params.direction = CollectionScanParams::FORWARD;
-    params.tailable = cq->getParsed().isTailable();
+    params.tailable = cq->getQueryRequest().isTailable();
 
     unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
     unique_ptr<CollectionScan> cs = make_unique<CollectionScan>(txn, params, ws.get(), cq->root());
@@ -574,7 +576,7 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorFind(OperationContext* txn,
                                                      const NamespaceString& nss,
                                                      unique_ptr<CanonicalQuery> canonicalQuery,
                                                      PlanExecutor::YieldPolicy yieldPolicy) {
-    if (NULL != collection && canonicalQuery->getParsed().isOplogReplay()) {
+    if (NULL != collection && canonicalQuery->getQueryRequest().isOplogReplay()) {
         return getOplogStartHack(txn, collection, std::move(canonicalQuery));
     }
 
@@ -626,9 +628,9 @@ StatusWith<unique_ptr<PlanStage>> applyProjection(OperationContext* txn,
                 "Cannot use a $meta sortKey projection in findAndModify commands."};
     }
 
-    // TODO SERVER-23613: pass the appropriate collator to ProjectionStageParams.
     ProjectionStageParams params(ExtensionsCallbackReal(txn, &nsString));
     params.projObj = proj;
+    params.collator = cq->getCollator();
     params.fullExpression = cq->root();
     return {make_unique<ProjectionStage>(txn, params, ws, root.release())};
 }
@@ -773,7 +775,8 @@ inline void validateUpdate(const char* ns, const BSONObj& updateobj, const BSONO
            has pointers into it */
         uassert(10156,
                 str::stream() << "cannot update system collection: " << ns << " q: " << patternOrig
-                              << " u: " << updateobj,
+                              << " u: "
+                              << updateobj,
                 legalClientSystemNS(ns, true));
     }
 }
@@ -800,7 +803,9 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorUpdate(OperationContext* txn,
     }
 
     // TODO: This seems a bit circuitious.
-    opDebug->updateobj = request->getUpdates();
+    if (opDebug) {
+        opDebug->updateobj = request->getUpdates();
+    }
 
     // If this is a user-issued update, then we want to return an error: you cannot perform
     // writes on a secondary. If this is an update to a secondary from the replication system,
@@ -935,13 +940,14 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorGroup(OperationContext* txn,
     }
 
     const NamespaceString nss(request.ns);
-    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-    lpq->setFilter(request.query);
-    lpq->setExplain(request.explain);
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(request.query);
+    qr->setCollation(request.collation);
+    qr->setExplain(request.explain);
 
     const ExtensionsCallbackReal extensionsCallback(txn, &nss);
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
+    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -1158,14 +1164,15 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorCount(OperationContext* txn,
                                                       PlanExecutor::YieldPolicy yieldPolicy) {
     unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
 
-    auto lpq = stdx::make_unique<LiteParsedQuery>(request.getNs());
-    lpq->setFilter(request.getQuery());
-    lpq->setHint(request.getHint());
-    lpq->setExplain(explain);
+    auto qr = stdx::make_unique<QueryRequest>(request.getNs());
+    qr->setFilter(request.getQuery());
+    qr->setCollation(request.getCollation());
+    qr->setHint(request.getHint());
+    qr->setExplain(explain);
 
     auto cq = CanonicalQuery::canonicalize(
         txn,
-        std::move(lpq),
+        std::move(qr),
         collection
             ? static_cast<const ExtensionsCallback&>(ExtensionsCallbackReal(txn, &collection->ns()))
             : static_cast<const ExtensionsCallback&>(ExtensionsCallbackNoop()));
@@ -1322,7 +1329,8 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDistinct(OperationContext* txn,
                                                        desc->unique(),
                                                        desc->indexName(),
                                                        ice->getFilterExpression(),
-                                                       desc->infoObj()));
+                                                       desc->infoObj(),
+                                                       ice->getCollator()));
         }
     }
 
@@ -1331,11 +1339,11 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDistinct(OperationContext* txn,
     // If there are no suitable indices for the distinct hack bail out now into regular planning
     // with no projection.
     if (plannerParams.indices.empty()) {
-        auto lpq = stdx::make_unique<LiteParsedQuery>(collection->ns());
-        lpq->setFilter(query);
-        lpq->setExplain(isExplain);
+        auto qr = stdx::make_unique<QueryRequest>(collection->ns());
+        qr->setFilter(query);
+        qr->setExplain(isExplain);
 
-        auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
+        auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
         if (!statusWithCQ.isOK()) {
             return statusWithCQ.getStatus();
         }
@@ -1352,12 +1360,12 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDistinct(OperationContext* txn,
     // (ie _id:1 being implied by default).
     BSONObj projection = getDistinctProjection(field);
 
-    auto lpq = stdx::make_unique<LiteParsedQuery>(collection->ns());
-    lpq->setFilter(query);
-    lpq->setExplain(isExplain);
-    lpq->setProj(projection);
+    auto qr = stdx::make_unique<QueryRequest>(collection->ns());
+    qr->setFilter(query);
+    qr->setExplain(isExplain);
+    qr->setProj(projection);
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(lpq), extensionsCallback);
+    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -1443,12 +1451,11 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDistinct(OperationContext* txn,
     }
 
     // We drop the projection from the 'cq'.  Unfortunately this is not trivial.
-    auto lpqNoProjection = stdx::make_unique<LiteParsedQuery>(collection->ns());
-    lpqNoProjection->setFilter(query);
-    lpqNoProjection->setExplain(isExplain);
+    auto qrNoProjection = stdx::make_unique<QueryRequest>(collection->ns());
+    qrNoProjection->setFilter(query);
+    qrNoProjection->setExplain(isExplain);
 
-    statusWithCQ =
-        CanonicalQuery::canonicalize(txn, std::move(lpqNoProjection), extensionsCallback);
+    statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qrNoProjection), extensionsCallback);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }

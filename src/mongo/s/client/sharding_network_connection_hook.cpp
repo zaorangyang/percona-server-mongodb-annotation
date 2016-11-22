@@ -36,8 +36,8 @@
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/set_shard_version_request.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
@@ -103,12 +103,6 @@ Status ShardingNetworkConnectionHook::validateHostImpl(
 
 StatusWith<boost::optional<executor::RemoteCommandRequest>>
 ShardingNetworkConnectionHook::makeRequest(const HostAndPort& remoteHost) {
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        // TODO: SERVER-23973 Temporary crutch until we decide where to get the config server
-        // connection string.
-        return {boost::none};
-    }
-
     auto shard = grid.shardRegistry()->getShardForHostNoReload(remoteHost);
     if (!shard) {
         return {ErrorCodes::ShardNotFound,
@@ -126,7 +120,7 @@ ShardingNetworkConnectionHook::makeRequest(const HostAndPort& remoteHost) {
     executor::RemoteCommandRequest request;
     request.dbname = "admin";
     request.target = remoteHost;
-    request.timeout = stdx::chrono::seconds{30};
+    request.timeout = Seconds{30};
     request.cmdObj = ssv.toBSON();
 
     return {request};

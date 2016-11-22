@@ -43,9 +43,9 @@
 #include <io.h>
 #define SIGKILL 9
 #else
-#include <sys/socket.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #endif
@@ -55,6 +55,7 @@
 #include "mongo/shell/shell_utils.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/destructor_guard.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
@@ -296,10 +297,12 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
 // we explicitly override them.
 #ifdef _WIN32
     wchar_t* processEnv = GetEnvironmentStringsW();
-    ON_BLOCK_EXIT([](wchar_t* toFree) {
-        if (toFree)
-            FreeEnvironmentStringsW(toFree);
-    }, processEnv);
+    ON_BLOCK_EXIT(
+        [](wchar_t* toFree) {
+            if (toFree)
+                FreeEnvironmentStringsW(toFree);
+        },
+        processEnv);
 
     // Windows' GetEnvironmentStringsW returns a NULL terminated array of NULL separated
     // <key>=<value> pairs.
@@ -396,7 +399,7 @@ void ProgramRunner::operator()() {
                 programOutputLogger.appendLine(
                     _port, _pid, "WARNING: mongod wrote null bytes to output");
             char* last = buf;
-            for (char* i = strchr(buf, '\n'); i; last = i + 1, i = strchr(last, '\n')) {
+            for (char *i = strchr(buf, '\n'); i; last = i + 1, i = strchr(last, '\n')) {
                 *i = '\0';
                 programOutputLogger.appendLine(_port, _pid, last);
             }
@@ -588,10 +591,9 @@ void ProgramRunner::launchProcess(int child_stdout) {
     std::string execErrMsg = str::stream() << "Unable to start program " << _argv[0];
     auto constCharStorageMaker = [](const std::vector<std::string>& in) {
         std::vector<const char*> out;
-        std::transform(in.begin(),
-                       in.end(),
-                       std::back_inserter(out),
-                       [](const std::string& x) { return x.c_str(); });
+        std::transform(in.begin(), in.end(), std::back_inserter(out), [](const std::string& x) {
+            return x.c_str();
+        });
         out.push_back(nullptr);
         return out;
     };

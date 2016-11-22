@@ -120,6 +120,7 @@
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostname_canonicalization_worker.h"
+#include "mongo/util/net/listen.h"
 #include "mongo/util/net/message_server.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
@@ -321,6 +322,9 @@ static unsigned long long checkIfReplMissingFromCommandLine(OperationContext* tx
  * these versions.
  */
 static bool isSubjectToSERVER23299(OperationContext* txn) {
+    if (storageGlobalParams.readOnly) {
+        return false;
+    }
     dbHolder().openDb(txn, startupLogCollectionName.db());
     AutoGetCollectionForRead autoColl(txn, startupLogCollectionName);
     // No startup log or an empty one means either that the user was not running an affected
@@ -426,10 +430,21 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
 
         // First thing after opening the database is to check for file compatibility,
         // otherwise we might crash if this is a deprecated format.
-        if (!db->getDatabaseCatalogEntry()->currentFilesCompatible(txn)) {
-            log() << "****";
-            log() << "cannot do this upgrade without an upgrade in the middle";
-            log() << "please do a --repair with 2.6 and then start this version";
+        auto status = db->getDatabaseCatalogEntry()->currentFilesCompatible(txn);
+        if (!status.isOK()) {
+            if (status.code() == ErrorCodes::CanRepairToDowngrade) {
+                // Convert CanRepairToDowngrade statuses to MustUpgrade statuses to avoid logging a
+                // potentially confusing and inaccurate message.
+                //
+                // TODO SERVER-24097: Log a message informing the user that they can start the
+                // current version of mongod with --repair and then proceed with normal startup.
+                status = {ErrorCodes::MustUpgrade, status.reason()};
+            }
+            severe() << "Unable to start mongod due to an incompatibility with the data files and"
+                        " this version of mongod: "
+                     << status;
+            severe() << "Please consult our documentation when trying to downgrade to a previous"
+                        " major release";
             quickExit(EXIT_NEED_UPGRADE);
             return;
         }
@@ -482,6 +497,9 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
         if (replSettings.usingReplSets()) {
             // We only care about the _id index if we are in a replset
             checkForIdIndexes(txn, db);
+            // Ensure oplog is capped (mmap does not guarantee order of inserts on noncapped
+            // collections)
+            repl::checkForCappedOplog(txn);
         }
 
         if (shouldDoCleanupForSERVER23299) {
@@ -818,9 +836,8 @@ int main(int argc, char* argv[], char** envp) {
 }
 #endif
 
-MONGO_INITIALIZER_GENERAL(ForkServer,
-                          ("EndStartupOptionHandling"),
-                          ("default"))(InitializerContext* context) {
+MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
+(InitializerContext* context) {
     mongo::forkServerOrDie();
     return Status::OK();
 }
@@ -932,9 +949,8 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
 }
 
 #ifdef MONGO_CONFIG_SSL
-MONGO_INITIALIZER_GENERAL(setSSLManagerType,
-                          MONGO_NO_PREREQUISITES,
-                          ("SSLManager"))(InitializerContext* context) {
+MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManager"))
+(InitializerContext* context) {
     isSSLServer = true;
     return Status::OK();
 }

@@ -36,10 +36,11 @@
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/constants.h"
-#include "mongo/client/dbclientcursor.h"
 #include "mongo/client/dbclient_rs.h"
+#include "mongo/client/dbclientcursor.h"
 #include "mongo/client/replica_set_monitor.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
@@ -58,6 +59,8 @@ using std::set;
 using std::string;
 using std::stringstream;
 using std::vector;
+
+namespace dps = ::mongo::dotted_path_support;
 
 LabeledLevel pc("pcursor", 2);
 
@@ -169,7 +172,7 @@ void ParallelSortClusteredCursor::_finishCons() {
     BSONObjIterator sortKeyIt(_sortKey);
     while (sortKeyIt.more()) {
         BSONElement e = sortKeyIt.next();
-        if (LiteParsedQuery::isTextScoreMeta(e)) {
+        if (QueryRequest::isTextScoreMeta(e)) {
             textMetaSortKeyFields.insert(e.fieldName());
             transformedSortKeyBuilder.append(e.fieldName(), -1);
         } else {
@@ -193,7 +196,7 @@ void ParallelSortClusteredCursor::_finishCons() {
 
                 string fieldName = e.fieldName();
 
-                if (LiteParsedQuery::isTextScoreMeta(e)) {
+                if (QueryRequest::isTextScoreMeta(e)) {
                     textMetaSortKeyFields.erase(fieldName);
                 } else {
                     // exact field
@@ -316,7 +319,12 @@ BSONObj ParallelConnectionState::toBSON() const {
 
 BSONObj ParallelConnectionMetadata::toBSON() const {
     return BSON("state" << (pcState ? pcState->toBSON() : BSONObj()) << "retryNext" << retryNext
-                        << "init" << initialized << "finish" << finished << "errored" << errored);
+                        << "init"
+                        << initialized
+                        << "finish"
+                        << finished
+                        << "errored"
+                        << errored);
 }
 
 void ParallelSortClusteredCursor::fullInit(OperationContext* txn) {
@@ -1040,13 +1048,14 @@ void ParallelSortClusteredCursor::_oldInit() {
                 conns[i]->done();
 
                 // Version is zero b/c this is deprecated codepath
-                staleConfigExs.push_back(
-                    str::stream() << "stale config detected for "
-                                  << RecvStaleConfigException(_ns,
-                                                              "ParallelCursor::_init",
-                                                              ChunkVersion(0, 0, OID()),
-                                                              ChunkVersion(0, 0, OID())).what()
-                                  << errLoc);
+                staleConfigExs.push_back(str::stream()
+                                         << "stale config detected for "
+                                         << RecvStaleConfigException(_ns,
+                                                                     "ParallelCursor::_init",
+                                                                     ChunkVersion(0, 0, OID()),
+                                                                     ChunkVersion(0, 0, OID()))
+                                                .what()
+                                         << errLoc);
                 break;
             }
 
@@ -1107,8 +1116,8 @@ void ParallelSortClusteredCursor::_oldInit() {
                     _cursors[i].reset(NULL, NULL);
 
                     if (!retry) {
-                        socketExs.push_back(str::stream()
-                                            << "error querying server: " << servers[i]);
+                        socketExs.push_back(str::stream() << "error querying server: "
+                                                          << servers[i]);
                         conns[i]->done();
                     } else {
                         retryQueries.insert(i);
@@ -1282,7 +1291,7 @@ BSONObj ParallelSortClusteredCursor::next() {
         }
 
         // Otherwise compare the result to the current best result
-        int comp = best.woSortOrder(me, _sortKey, true);
+        int comp = dps::compareObjectsAccordingToSort(best, me, _sortKey, true);
         if (comp < 0)
             continue;
 

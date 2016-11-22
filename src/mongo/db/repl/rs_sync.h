@@ -32,16 +32,18 @@
 #include <vector>
 
 #include "mongo/db/client.h"
-#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/initial_sync.h"
 #include "mongo/db/repl/sync_tail.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/util/concurrency/old_thread_pool.h"
 
 namespace mongo {
 namespace repl {
+class BackgroundSync;
+
 // Body of the thread that will do the background sync.
-void runSyncThread();
+void runSyncThread(BackgroundSync* bgsync);
 
 }  // namespace repl
 }  // namespace mongo

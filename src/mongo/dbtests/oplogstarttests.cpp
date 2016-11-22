@@ -75,10 +75,10 @@ protected:
     }
 
     void setupFromQuery(const BSONObj& query) {
-        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-        lpq->setFilter(query);
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(query);
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            &_txn, std::move(lpq), ExtensionsCallbackDisallowExtensions());
+            &_txn, std::move(qr), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         _cq = std::move(statusWithCQ.getValue());
         _oplogws.reset(new WorkingSet());
@@ -223,8 +223,10 @@ protected:
     void buildCollection() {
         BSONObj info;
         // Create a collection with specified extent sizes
-        BSONObj command = BSON("create" << nss.coll() << "capped" << true << "$nExtents"
-                                        << extentSizes() << "autoIndexId" << false);
+        BSONObj command =
+            BSON("create" << nss.coll() << "capped" << true << "$nExtents" << extentSizes()
+                          << "autoIndexId"
+                          << false);
         ASSERT(client()->runCommand(nss.db().toString(), command, info));
 
         // Populate documents.

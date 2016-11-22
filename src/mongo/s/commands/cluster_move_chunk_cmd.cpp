@@ -141,7 +141,8 @@ public:
         const auto to = grid.shardRegistry()->getShard(txn, toString);
         if (!to) {
             string msg(str::stream() << "Could not move chunk in '" << nss.ns() << "' to shard '"
-                                     << toString << "' because that shard does not exist");
+                                     << toString
+                                     << "' because that shard does not exist");
             log() << msg;
             return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
         }
@@ -222,7 +223,6 @@ public:
         {
             ChunkType chunkType;
             chunkType.setNS(nss.ns());
-            chunkType.setName(ChunkType::genID(nss.ns(), chunk->getMin()));
             chunkType.setMin(chunk->getMin());
             chunkType.setMax(chunk->getMax());
             chunkType.setShard(chunk->getShardId());

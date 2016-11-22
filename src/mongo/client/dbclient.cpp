@@ -31,6 +31,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "mongo/base/status.h"
@@ -63,10 +64,15 @@
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/asio_message_port.h"
+#include "mongo/util/net/message_port.h"
+#include "mongo/util/net/message_port_startup_param.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/password_digest.h"
+#include "mongo/util/represent_as.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -101,130 +107,6 @@ SSLManagerInterface* sslManager() {
 }  // namespace
 
 AtomicInt64 DBClientBase::ConnectionIdSequence;
-
-const BSONField<BSONObj> Query::ReadPrefField("$readPreference");
-const BSONField<string> Query::ReadPrefModeField("mode");
-const BSONField<BSONArray> Query::ReadPrefTagsField("tags");
-
-Query::Query(const string& json) : obj(fromjson(json)) {}
-
-Query::Query(const char* json) : obj(fromjson(json)) {}
-
-Query& Query::hint(const string& jsonKeyPatt) {
-    return hint(fromjson(jsonKeyPatt));
-}
-
-Query& Query::where(const string& jscode, BSONObj scope) {
-    /* use where() before sort() and hint() and explain(), else this will assert. */
-    verify(!isComplex());
-    BSONObjBuilder b;
-    b.appendElements(obj);
-    b.appendWhere(jscode, scope);
-    obj = b.obj();
-    return *this;
-}
-
-void Query::makeComplex() {
-    if (isComplex())
-        return;
-    BSONObjBuilder b;
-    b.append("query", obj);
-    obj = b.obj();
-}
-
-Query& Query::sort(const BSONObj& s) {
-    appendComplex("orderby", s);
-    return *this;
-}
-
-Query& Query::hint(BSONObj keyPattern) {
-    appendComplex("$hint", keyPattern);
-    return *this;
-}
-
-Query& Query::explain() {
-    appendComplex("$explain", true);
-    return *this;
-}
-
-Query& Query::snapshot() {
-    appendComplex("$snapshot", true);
-    return *this;
-}
-
-Query& Query::minKey(const BSONObj& val) {
-    appendComplex("$min", val);
-    return *this;
-}
-
-Query& Query::maxKey(const BSONObj& val) {
-    appendComplex("$max", val);
-    return *this;
-}
-
-bool Query::isComplex(const BSONObj& obj, bool* hasDollar) {
-    if (obj.hasElement("query")) {
-        if (hasDollar)
-            *hasDollar = false;
-        return true;
-    }
-
-    if (obj.hasElement("$query")) {
-        if (hasDollar)
-            *hasDollar = true;
-        return true;
-    }
-
-    return false;
-}
-
-Query& Query::readPref(ReadPreference pref, const BSONArray& tags) {
-    appendComplex(ReadPrefField.name().c_str(), ReadPreferenceSetting(pref, TagSet(tags)).toBSON());
-    return *this;
-}
-
-bool Query::isComplex(bool* hasDollar) const {
-    return isComplex(obj, hasDollar);
-}
-
-bool Query::hasReadPreference(const BSONObj& queryObj) {
-    const bool hasReadPrefOption = queryObj["$queryOptions"].isABSONObj() &&
-        queryObj["$queryOptions"].Obj().hasField(ReadPrefField.name());
-
-    bool canHaveReadPrefField = Query::isComplex(queryObj) ||
-        // The find command has a '$readPreference' option.
-        queryObj.firstElementFieldName() == StringData("find");
-
-    return (canHaveReadPrefField && queryObj.hasField(ReadPrefField.name())) || hasReadPrefOption;
-}
-
-BSONObj Query::getFilter() const {
-    bool hasDollar;
-    if (!isComplex(&hasDollar))
-        return obj;
-
-    return obj.getObjectField(hasDollar ? "$query" : "query");
-}
-BSONObj Query::getSort() const {
-    if (!isComplex())
-        return BSONObj();
-    BSONObj ret = obj.getObjectField("orderby");
-    if (ret.isEmpty())
-        ret = obj.getObjectField("$orderby");
-    return ret;
-}
-BSONObj Query::getHint() const {
-    if (!isComplex())
-        return BSONObj();
-    return obj.getObjectField("$hint");
-}
-bool Query::isExplain() const {
-    return isComplex() && obj.getBoolField("$explain");
-}
-
-string Query::toString() const {
-    return obj.toString();
-}
 
 /* --- dbclientcommands --- */
 
@@ -318,16 +200,23 @@ rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData databas
     // more helpful error message. Note that call() can itself throw a socket exception.
     uassert(ErrorCodes::HostUnreachable,
             str::stream() << "network error while attempting to run "
-                          << "command '" << command << "' "
-                          << "on host '" << host << "' ",
+                          << "command '"
+                          << command
+                          << "' "
+                          << "on host '"
+                          << host
+                          << "' ",
             call(requestMsg, replyMsg, false, &host));
 
     auto commandReply = rpc::makeReply(&replyMsg);
 
     uassert(ErrorCodes::RPCProtocolNegotiationFailed,
             str::stream() << "Mismatched RPC protocols - request was '"
-                          << networkOpToString(requestMsg.operation()) << "' '"
-                          << " but reply was '" << networkOpToString(replyMsg.operation()) << "' ",
+                          << networkOpToString(requestMsg.operation())
+                          << "' '"
+                          << " but reply was '"
+                          << networkOpToString(replyMsg.operation())
+                          << "' ",
             requestBuilder->getProtocol() == commandReply->getProtocol());
 
     if (ErrorCodes::SendStaleConfig ==
@@ -399,7 +288,8 @@ bool DBClientWithCommands::runPseudoCommand(StringData db,
         if (status == ErrorCodes::CommandResultSchemaViolation) {
             msgasserted(28624,
                         str::stream() << "Received bad " << realCommandName
-                                      << " response from server: " << info);
+                                      << " response from server: "
+                                      << info);
         } else if (status == ErrorCodes::CommandNotFound) {
             NamespaceString pseudoCommandNss(db, pseudoCommandCol);
             // if this throws we just let it escape as that's how runCommand works.
@@ -807,7 +697,10 @@ void DBClientInterface::findN(vector<BSONObj>& out,
 
     uassert(10276,
             str::stream() << "DBClientBase::findN: transport error: " << getServerAddress()
-                          << " ns: " << ns << " query: " << query.toString(),
+                          << " ns: "
+                          << ns
+                          << " query: "
+                          << query.toString(),
             c.get());
 
     if (c->hasResultFlag(ResultFlag_ShardConfigStale)) {
@@ -948,6 +841,10 @@ Status DBClientConnection::connect(const HostAndPort& serverAddress) {
     return Status::OK();
 }
 
+namespace {
+const auto kMaxMillisCount = Milliseconds::max().count();
+}  // namespace
+
 Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
     _serverAddress = serverAddress;
     _failed = true;
@@ -958,10 +855,18 @@ Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
     if (!osAddr.isValid()) {
         return Status(ErrorCodes::InvalidOptions,
                       str::stream() << "couldn't initialize connection to host "
-                                    << serverAddress.host() << ", address is invalid");
+                                    << serverAddress.host()
+                                    << ", address is invalid");
     }
 
-    _port.reset(new MessagingPort(_so_timeout, _logLevel));
+    if (isMessagePortImplASIO()) {
+        // `_so_timeout` is in seconds.
+        auto ms = representAs<int64_t>(std::floor(_so_timeout * 1000)).value_or(kMaxMillisCount);
+        _port.reset(new ASIOMessagingPort(
+            ms > kMaxMillisCount ? Milliseconds::max() : Milliseconds(ms), _logLevel));
+    } else {
+        _port.reset(new MessagingPort(_so_timeout, _logLevel));
+    }
 
     if (serverAddress.host().empty()) {
         return Status(ErrorCodes::InvalidOptions,
@@ -1058,7 +963,9 @@ void DBClientConnection::_checkConnection() {
 void DBClientConnection::setSoTimeout(double timeout) {
     _so_timeout = timeout;
     if (_port) {
-        _port->setSocketTimeout(timeout);
+        // `timeout` is in seconds.
+        auto ms = representAs<int64_t>(std::floor(timeout * 1000)).value_or(kMaxMillisCount);
+        _port->setTimeout(ms > kMaxMillisCount ? Milliseconds::max() : Milliseconds(ms));
     }
 }
 
@@ -1414,29 +1321,6 @@ void DBClientWithCommands::ensureIndex(const string& ns,
 }
 
 /* -- DBClientCursor ---------------------------------------------- */
-void assembleQueryRequest(const string& ns,
-                          BSONObj query,
-                          int nToReturn,
-                          int nToSkip,
-                          const BSONObj* fieldsToReturn,
-                          int queryOptions,
-                          Message& toSend) {
-    if (kDebugBuild) {
-        massert(10337, (string) "object not valid assembleRequest query", query.isValid());
-    }
-
-    // see query.h for the protocol we are using here.
-    BufBuilder b;
-    int opts = queryOptions;
-    b.appendNum(opts);
-    b.appendStr(ns);
-    b.appendNum(nToSkip);
-    b.appendNum(nToReturn);
-    query.appendSelfToBufBuilder(b);
-    if (fieldsToReturn)
-        fieldsToReturn->appendSelfToBufBuilder(b);
-    toSend.setData(dbQuery, b.buf(), b.len());
-}
 
 DBClientConnection::DBClientConnection(bool _autoReconnect,
                                        double so_timeout,

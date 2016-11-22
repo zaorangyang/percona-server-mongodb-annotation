@@ -47,11 +47,9 @@
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/clock_source_mock.h"
 
 namespace QueryStageCachedPlan {
 
-const std::unique_ptr<ClockSource> clockSource = stdx::make_unique<ClockSourceMock>();
 static const NamespaceString nss("unittests.QueryStageCachedPlan");
 
 class QueryStageCachedPlanBase {
@@ -122,10 +120,10 @@ public:
         ASSERT(collection);
 
         // Query can be answered by either index on "a" or index on "b".
-        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-        lpq->setFilter(fromjson("{a: {$gte: 8}, b: 1}"));
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(fromjson("{a: {$gte: 8}, b: 1}"));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
+            txn(), std::move(qr), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -149,7 +147,8 @@ public:
             &_txn, collection, &_ws, cq.get(), plannerParams, decisionWorks, mockChild.release());
 
         // This should succeed after triggering a replan.
-        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL, clockSource.get());
+        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL,
+                                    _txn.getServiceContext()->getFastClockSource());
         ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
 
         // Make sure that we get 2 legit results back.
@@ -189,10 +188,10 @@ public:
         ASSERT(collection);
 
         // Query can be answered by either index on "a" or index on "b".
-        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-        lpq->setFilter(fromjson("{a: {$gte: 8}, b: 1}"));
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(fromjson("{a: {$gte: 8}, b: 1}"));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            txn(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
+            txn(), std::move(qr), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -220,7 +219,8 @@ public:
             &_txn, collection, &_ws, cq.get(), plannerParams, decisionWorks, mockChild.release());
 
         // This should succeed after triggering a replan.
-        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL, clockSource.get());
+        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL,
+                                    _txn.getServiceContext()->getFastClockSource());
         ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
 
         // Make sure that we get 2 legit results back.

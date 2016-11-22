@@ -32,8 +32,8 @@
 #include <cfloat>
 #include <sstream>
 #include <stdio.h>
-#include <string>
 #include <string.h>
+#include <string>
 
 
 #include "mongo/base/data_type_endian.h"
@@ -218,7 +218,8 @@ public:
     }
 
     void appendBuf(const void* src, size_t len) {
-        memcpy(grow((int)len), src, len);
+        if (len)
+            memcpy(grow((int)len), src, len);
     }
 
     template <class T>

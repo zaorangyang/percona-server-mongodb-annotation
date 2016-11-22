@@ -30,8 +30,6 @@
 
 #include "mongo/db/repl/storage_interface_mock.h"
 
-#include "mongo/db/repl/operation_context_repl_mock.h"
-
 namespace mongo {
 namespace repl {
 
@@ -65,6 +63,21 @@ void StorageInterfaceMock::setMinValid(OperationContext* txn,
 void StorageInterfaceMock::setMinValid(OperationContext* txn, const BatchBoundaries& boundaries) {
     stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
     _minValidBoundaries = boundaries;
+}
+
+StatusWith<OpTime> StorageInterfaceMock::writeOpsToOplog(
+    OperationContext* txn, const NamespaceString& nss, const MultiApplier::Operations& operations) {
+    invariant(!operations.empty());
+    stdx::lock_guard<stdx::mutex> lock(_operationsWrittenToOplogMutex);
+    for (const auto& oplogEntry : operations) {
+        _operationsWrittenToOplog.push_back(oplogEntry.getOwned());
+    }
+    return operations.back().getOpTime();
+}
+
+MultiApplier::Operations StorageInterfaceMock::getOperationsWrittenToOplog() const {
+    stdx::lock_guard<stdx::mutex> lock(_operationsWrittenToOplogMutex);
+    return _operationsWrittenToOplog;
 }
 
 }  // namespace repl

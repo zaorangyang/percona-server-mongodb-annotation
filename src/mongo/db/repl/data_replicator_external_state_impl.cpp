@@ -33,14 +33,17 @@
 #include "mongo/db/repl/data_replicator_external_state_impl.h"
 
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
 
 DataReplicatorExternalStateImpl::DataReplicatorExternalStateImpl(
-    ReplicationCoordinator* replicationCoordinator)
-    : _replicationCoordinator(replicationCoordinator) {}
+    ReplicationCoordinator* replicationCoordinator,
+    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState)
+    : _replicationCoordinator(replicationCoordinator),
+      _replicationCoordinatorExternalState(replicationCoordinatorExternalState) {}
 
 OpTimeWithTerm DataReplicatorExternalStateImpl::getCurrentTermAndLastCommittedOpTime() {
     if (!_replicationCoordinator->isV1ElectionProtocol()) {
@@ -57,21 +60,40 @@ void DataReplicatorExternalStateImpl::processMetadata(const rpc::ReplSetMetadata
 }
 
 bool DataReplicatorExternalStateImpl::shouldStopFetching(const HostAndPort& source,
-                                                         const OpTime& sourceOpTime,
-                                                         bool sourceHasSyncSource) {
+                                                         const rpc::ReplSetMetadata& metadata) {
     // Re-evaluate quality of sync target.
-    if (_replicationCoordinator->shouldChangeSyncSource(
-            source, sourceOpTime, sourceHasSyncSource)) {
+    if (_replicationCoordinator->shouldChangeSyncSource(source, metadata)) {
         LOG(1) << "Canceling oplog query because we have to choose a sync source. Current source: "
-               << source << ", OpTime " << sourceOpTime
-               << ", hasSyncSource:" << sourceHasSyncSource;
+               << source << ", OpTime " << metadata.getLastOpVisible()
+               << ", its sync source index:" << metadata.getSyncSourceIndex();
         return true;
     }
     return false;
 }
 
+StatusWith<OpTime> DataReplicatorExternalStateImpl::_multiApply(
+    OperationContext* txn,
+    const MultiApplier::Operations& ops,
+    MultiApplier::ApplyOperationFn applyOperation) {
+    return _replicationCoordinatorExternalState->multiApply(txn, ops, applyOperation);
+}
+
+void DataReplicatorExternalStateImpl::_multiSyncApply(const MultiApplier::Operations& ops) {
+    _replicationCoordinatorExternalState->multiSyncApply(ops);
+}
+
+void DataReplicatorExternalStateImpl::_multiInitialSyncApply(const MultiApplier::Operations& ops,
+                                                             const HostAndPort& source) {
+    _replicationCoordinatorExternalState->multiInitialSyncApply(ops, source);
+}
+
 ReplicationCoordinator* DataReplicatorExternalStateImpl::getReplicationCoordinator() const {
     return _replicationCoordinator;
+}
+
+ReplicationCoordinatorExternalState*
+DataReplicatorExternalStateImpl::getReplicationCoordinatorExternalState() const {
+    return _replicationCoordinatorExternalState;
 }
 
 }  // namespace repl

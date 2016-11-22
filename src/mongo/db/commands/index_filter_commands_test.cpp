@@ -119,12 +119,12 @@ void addQueryShapeToPlanCache(OperationContext* txn,
                               const char* sortStr,
                               const char* projectionStr) {
     // Create canonical query.
-    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-    lpq->setFilter(fromjson(queryStr));
-    lpq->setSort(fromjson(sortStr));
-    lpq->setProj(fromjson(projectionStr));
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(fromjson(queryStr));
+    qr->setSort(fromjson(sortStr));
+    qr->setProj(fromjson(projectionStr));
     auto statusWithCQ =
-        CanonicalQuery::canonicalize(txn, std::move(lpq), ExtensionsCallbackDisallowExtensions());
+        CanonicalQuery::canonicalize(txn, std::move(qr), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -147,12 +147,12 @@ bool planCacheContains(const PlanCache& planCache,
     auto txn = serviceContext.makeOperationContext();
 
     // Create canonical query.
-    auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-    lpq->setFilter(fromjson(queryStr));
-    lpq->setSort(fromjson(sortStr));
-    lpq->setProj(fromjson(projectionStr));
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(fromjson(queryStr));
+    qr->setSort(fromjson(sortStr));
+    qr->setProj(fromjson(projectionStr));
     auto statusWithInputQuery = CanonicalQuery::canonicalize(
-        txn.get(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithInputQuery.getStatus());
     unique_ptr<CanonicalQuery> inputQuery = std::move(statusWithInputQuery.getValue());
 
@@ -167,12 +167,12 @@ bool planCacheContains(const PlanCache& planCache,
         // Canonicalizing query shape in cache entry to get cache key.
         // Alternatively, we could add key to PlanCacheEntry but that would be used in one place
         // only.
-        auto lpq = stdx::make_unique<LiteParsedQuery>(nss);
-        lpq->setFilter(entry->query);
-        lpq->setSort(entry->sort);
-        lpq->setProj(entry->projection);
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(entry->query);
+        qr->setSort(entry->sort);
+        qr->setProj(entry->projection);
         auto statusWithCurrentQuery = CanonicalQuery::canonicalize(
-            txn.get(), std::move(lpq), ExtensionsCallbackDisallowExtensions());
+            txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCurrentQuery.getStatus());
         unique_ptr<CanonicalQuery> currentQuery = std::move(statusWithCurrentQuery.getValue());
 
@@ -308,13 +308,13 @@ TEST(IndexFilterCommandsTest, SetAndClearFilters) {
     addQueryShapeToPlanCache(txn.get(), &planCache, "{a: 1, b: 1}", "{a: -1}", "{_id: 0, a: 1}");
     ASSERT_TRUE(planCacheContains(planCache, "{a: 1, b: 1}", "{a: -1}", "{_id: 0, a: 1}"));
 
-    ASSERT_OK(SetFilter::set(txn.get(),
-                             &querySettings,
-                             &planCache,
-                             nss.ns(),
-                             fromjson(
-                                 "{query: {a: 1, b: 1}, sort: {a: -1}, projection: {_id: 0, a: 1}, "
-                                 "indexes: [{a: 1}]}")));
+    ASSERT_OK(
+        SetFilter::set(txn.get(),
+                       &querySettings,
+                       &planCache,
+                       nss.ns(),
+                       fromjson("{query: {a: 1, b: 1}, sort: {a: -1}, projection: {_id: 0, a: 1}, "
+                                "indexes: [{a: 1}]}")));
     vector<BSONObj> filters = getFilters(querySettings);
     ASSERT_EQUALS(filters.size(), 1U);
 
@@ -328,13 +328,13 @@ TEST(IndexFilterCommandsTest, SetAndClearFilters) {
 
     // Replacing the hint for the same query shape ({a: 1, b: 1} and {b: 2, a: 3}
     // share same shape) should not change the query settings size.
-    ASSERT_OK(SetFilter::set(txn.get(),
-                             &querySettings,
-                             &planCache,
-                             nss.ns(),
-                             fromjson(
-                                 "{query: {b: 2, a: 3}, sort: {a: -1}, projection: {_id: 0, a: 1}, "
-                                 "indexes: [{a: 1, b: 1}]}")));
+    ASSERT_OK(
+        SetFilter::set(txn.get(),
+                       &querySettings,
+                       &planCache,
+                       nss.ns(),
+                       fromjson("{query: {b: 2, a: 3}, sort: {a: -1}, projection: {_id: 0, a: 1}, "
+                                "indexes: [{a: 1, b: 1}]}")));
     filters = getFilters(querySettings);
     ASSERT_EQUALS(filters.size(), 1U);
 

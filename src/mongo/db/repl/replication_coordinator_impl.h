@@ -28,9 +28,9 @@
 
 #pragma once
 
-#include <vector>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
@@ -275,8 +275,7 @@ public:
     virtual void resetLastOpTimesFromOplog(OperationContext* txn) override;
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
-                                        const OpTime& syncSourceLastOpTime,
-                                        bool syncSourceHasSyncSource) override;
+                                        const rpc::ReplSetMetadata& metadata) override;
 
     virtual SyncSourceResolverResponse selectSyncSource(OperationContext* txn,
                                                         const OpTime& lastOpTimeFetched) override;
@@ -287,9 +286,8 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response) override;
 
-    void prepareReplResponseMetadata(const rpc::RequestInterface&,
-                                     const OpTime& lastOpTimeFromClient,
-                                     BSONObjBuilder* builder) override;
+    void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+                             BSONObjBuilder* builder) const override;
 
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response) override;
@@ -314,7 +312,7 @@ public:
 
     virtual void onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name) override;
 
-    virtual OpTime getCurrentCommittedSnapshotOpTime() override;
+    virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
 
     virtual void waitUntilSnapshotCommitted(OperationContext* txn,
                                             const SnapshotName& untilSnapshot) override;
@@ -325,6 +323,14 @@ public:
 
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) override;
+
+
+    virtual bool getInitialSyncRequestedFlag() const override;
+    virtual void setInitialSyncRequestedFlag(bool value) override;
+
+    virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
+    virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) override;
+
 
     // ================== Test support API ===================
 
@@ -1320,6 +1326,16 @@ private:
 
     // Lambda indicating durability of storageEngine.
     stdx::function<bool()> _isDurableStorageEngine;  // (R)
+
+    // bool for indicating resync need on this node and the mutex that protects it
+    // The resync command sets this flag; the Applier thread observes and clears it.
+    mutable stdx::mutex _initialSyncMutex;
+    bool _initialSyncRequestedFlag = false;  // (I)
+
+    // This setting affects the Applier prefetcher behavior.
+    mutable stdx::mutex _indexPrefetchMutex;
+    ReplSettings::IndexPrefetchConfig _indexPrefetchConfig =
+        ReplSettings::IndexPrefetchConfig::PREFETCH_ALL;  // (I)
 };
 
 }  // namespace repl

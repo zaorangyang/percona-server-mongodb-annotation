@@ -130,7 +130,8 @@ void UserCacheInvalidator::initialize(OperationContext* txn) {
                      "running an outdated version of mongod on the config servers";
     } else {
         warning() << "An error occurred while fetching initial user cache generation from "
-                     "config servers: " << currentGeneration.getStatus();
+                     "config servers: "
+                  << currentGeneration.getStatus();
     }
     _previousCacheGeneration = OID();
 }
@@ -141,11 +142,12 @@ void UserCacheInvalidator::run() {
 
     while (true) {
         stdx::unique_lock<stdx::mutex> lock(invalidationIntervalMutex);
-        Date_t sleepUntil = lastInvalidationTime + Seconds(userCacheInvalidationIntervalSecs);
+        Date_t sleepUntil =
+            lastInvalidationTime + Seconds(userCacheInvalidationIntervalSecs.load());
         Date_t now = Date_t::now();
         while (now < sleepUntil) {
-            invalidationIntervalChangedCondition.wait_for(lock, sleepUntil - now);
-            sleepUntil = lastInvalidationTime + Seconds(userCacheInvalidationIntervalSecs);
+            invalidationIntervalChangedCondition.wait_until(lock, sleepUntil.toSystemTimePoint());
+            sleepUntil = lastInvalidationTime + Seconds(userCacheInvalidationIntervalSecs.load());
             now = Date_t::now();
         }
         lastInvalidationTime = now;
@@ -161,7 +163,8 @@ void UserCacheInvalidator::run() {
             if (currentGeneration.getStatus().code() == ErrorCodes::CommandNotFound) {
                 warning() << "_getUserCacheGeneration command not found on config server(s), "
                              "this most likely means you are running an outdated version of mongod "
-                             "on the config servers" << std::endl;
+                             "on the config servers"
+                          << std::endl;
             } else {
                 warning() << "An error occurred while fetching current user cache generation "
                              "to check if user cache needs invalidation: "

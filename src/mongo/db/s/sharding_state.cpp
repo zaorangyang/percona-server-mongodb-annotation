@@ -54,18 +54,18 @@
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
-#include <iostream>
-#include <iomanip>
-#include <ctime>
 #include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <iostream>
 
 namespace mongo {
 
@@ -120,20 +120,6 @@ VersionChoice chooseNewestVersion(ChunkVersion prevLocalVersion,
     // We're now sure we're installing a new epoch and the epoch didn't change during reload
     dassert(prevEpoch == localEpoch && localEpoch != remoteEpoch);
     return VersionChoice::Remote;
-}
-
-Date_t getDeadlineFromMaxTimeMS(OperationContext* txn) {
-    auto remainingTime = txn->getRemainingMaxTimeMicros();
-    if (remainingTime == 0) {
-        return Date_t::max();
-    }
-
-    if (remainingTime == 1) {
-        // 1 means maxTimeMS has exceeded.
-        return Date_t::now();
-    }
-
-    return Date_t::now() + Microseconds(remainingTime);
 }
 
 /**
@@ -401,7 +387,7 @@ void ShardingState::initializeFromConfigConnString(OperationContext* txn, const 
         }
     }
 
-    uassertStatusOK(_waitForInitialization(getDeadlineFromMaxTimeMS(txn)));
+    uassertStatusOK(_waitForInitialization(txn->getDeadline()));
     uassertStatusOK(reloadShardRegistryUntilSuccess(txn));
     updateConfigServerOpTimeFromMetadata(txn);
 }
@@ -432,8 +418,7 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* txn) {
         return parseStatus.getStatus();
     }
 
-    auto status =
-        initializeFromShardIdentity(parseStatus.getValue(), getDeadlineFromMaxTimeMS(txn));
+    auto status = initializeFromShardIdentity(parseStatus.getValue(), txn->getDeadline());
     if (!status.isOK()) {
         return status;
     }
@@ -477,14 +462,15 @@ Status ShardingState::initializeFromShardIdentity(const ShardIdentityType& shard
         if (_shardName != shardIdentity.getShardName()) {
             return {ErrorCodes::InconsistentShardIdentity,
                     str::stream() << "shard name previously set as " << _shardName
-                                  << " is different from stored: " << shardIdentity.getShardName()};
+                                  << " is different from stored: "
+                                  << shardIdentity.getShardName()};
         }
 
         auto prevConfigsvrConnStr = grid.shardRegistry()->getConfigServerConnectionString();
         if (prevConfigsvrConnStr.type() != ConnectionString::SET) {
             return {ErrorCodes::UnsupportedFormat,
-                    str::stream() << "config server connection string was previosly initialized as "
-                                     "something that is not a replica sets: "
+                    str::stream() << "config server connection string was previously initialized as"
+                                     " something that is not a replica set: "
                                   << prevConfigsvrConnStr.toString()};
         }
 
@@ -492,7 +478,8 @@ Status ShardingState::initializeFromShardIdentity(const ShardIdentityType& shard
             return {ErrorCodes::InconsistentShardIdentity,
                     str::stream() << "config server connection string previously set as "
                                   << prevConfigsvrConnStr.toString()
-                                  << " is different from stored: " << configSvrConnStr.toString()};
+                                  << " is different from stored: "
+                                  << configSvrConnStr.toString()};
         }
 
         // clusterId will only be unset if sharding state was initialized via the sharding
@@ -502,7 +489,8 @@ Status ShardingState::initializeFromShardIdentity(const ShardIdentityType& shard
         } else if (_clusterId != shardIdentity.getClusterId()) {
             return {ErrorCodes::InconsistentShardIdentity,
                     str::stream() << "cluster id previously set as " << _clusterId
-                                  << " is different from stored: " << shardIdentity.getClusterId()};
+                                  << " is different from stored: "
+                                  << shardIdentity.getClusterId()};
         }
 
         return Status::OK();
@@ -636,7 +624,7 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
                                        ChunkVersion* latestShardVersion) {
     invariant(!txn->lockState()->isLocked());
 
-    Status status = _waitForInitialization(getDeadlineFromMaxTimeMS(txn));
+    Status status = _waitForInitialization(txn->getDeadline());
     if (!status.isOK())
         return status;
 
@@ -790,7 +778,9 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
         choice = chooseNewestVersion(beforeCollVersion, afterCollVersion, remoteCollVersion);
 
         if (choice == VersionChoice::Remote) {
-            dassert(!remoteCollVersion.epoch().isSet() || remoteShardVersion >= beforeShardVersion);
+            dassert(
+                !remoteCollVersion.epoch().isSet() || remoteShardVersion >= beforeShardVersion ||
+                (remoteShardVersion.minorVersion() == 0 && remoteShardVersion.majorVersion() == 0));
 
             if (!afterCollVersion.epoch().isSet()) {
                 // First metadata load
@@ -974,12 +964,10 @@ Status ShardingState::updateShardIdentityConfigString(OperationContext* txn,
     UpdateLifecycleImpl updateLifecycle(NamespaceString::kConfigCollectionNamespace);
     updateReq.setLifecycle(&updateLifecycle);
 
-    OpDebug opDebug;
-
     try {
         AutoGetOrCreateDb autoDb(txn, NamespaceString::kConfigCollectionNamespace.db(), MODE_X);
 
-        auto result = update(txn, autoDb.getDb(), updateReq, &opDebug);
+        auto result = update(txn, autoDb.getDb(), updateReq);
         if (result.numMatched == 0) {
             warning() << "failed to update config string of shard identity document because "
                       << "it does not exist. This shard could have been removed from the cluster";

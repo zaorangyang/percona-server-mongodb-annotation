@@ -35,10 +35,11 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/bson/ordering.h"
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/ops/log_builder.h"
@@ -64,6 +65,8 @@ using mongo::mutablebson::Document;
 using mongo::mutablebson::Element;
 using std::sort;
 using std::vector;
+
+namespace dps = ::mongo::dotted_path_support;
 
 void combineVec(const vector<int>& origVec,
                 const vector<int>& modVec,
@@ -113,8 +116,8 @@ struct ProjectKeyCmp {
         if (useWholeValue) {
             ret = left.woCompare(right, Ordering::make(sortPattern), false);
         } else {
-            BSONObj lhsKey = left.extractFields(sortPattern, true);
-            BSONObj rhsKey = right.extractFields(sortPattern, true);
+            BSONObj lhsKey = dps::extractElementsBasedOnTemplate(left, sortPattern, true);
+            BSONObj rhsKey = dps::extractElementsBasedOnTemplate(right, sortPattern, true);
             ret = lhsKey.woCompare(rhsKey, sortPattern);
         }
         return ret < 0;
@@ -659,13 +662,13 @@ TEST(SimpleObjMod, PrepareApplyNormal) {
 }
 
 TEST(SimpleObjMod, PrepareApplyDotted) {
-    Document doc(fromjson(
-        "{ _id : 1 , "
-        "  question : 'a', "
-        "  choices : { "
-        "            first : { choice : 'b' }, "
-        "            second : { choice : 'c' } }"
-        "}"));
+    Document doc(
+        fromjson("{ _id : 1 , "
+                 "  question : 'a', "
+                 "  choices : { "
+                 "            first : { choice : 'b' }, "
+                 "            second : { choice : 'c' } }"
+                 "}"));
     Mod pushMod(fromjson("{$push: {'choices.first.votes': 1}}"));
 
     ModifierInterface::ExecInfo execInfo;
@@ -676,13 +679,12 @@ TEST(SimpleObjMod, PrepareApplyDotted) {
 
     ASSERT_OK(pushMod.apply());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson(
-                      "{ _id : 1 , "
-                      "  question : 'a', "
-                      "  choices : { "
-                      "            first : { choice : 'b', votes: [1]}, "
-                      "            second : { choice : 'c' } }"
-                      "}"),
+    ASSERT_EQUALS(fromjson("{ _id : 1 , "
+                           "  question : 'a', "
+                           "  choices : { "
+                           "            first : { choice : 'b', votes: [1]}, "
+                           "            second : { choice : 'c' } }"
+                           "}"),
                   doc);
 
     Document logDoc;
@@ -1059,8 +1061,9 @@ public:
             arrBuilder.append(*it);
         }
 
-        _modObj = BSON("$push" << BSON("a" << BSON("$each" << arrBuilder.arr() << "$slice" << slice
-                                                           << "$sort" << sort)));
+        _modObj = BSON(
+            "$push" << BSON(
+                "a" << BSON("$each" << arrBuilder.arr() << "$slice" << slice << "$sort" << sort)));
 
         ASSERT_OK(_mod.init(_modObj["$push"].embeddedObject().firstElement(),
                             ModifierInterface::Options::normal()));

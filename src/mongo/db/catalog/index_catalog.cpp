@@ -38,8 +38,8 @@
 
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/catalog/index_key_validate.h"
@@ -47,7 +47,6 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_legacy.h"
@@ -56,11 +55,13 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete.h"
+#include "mongo/db/query/collation/collation_serializer.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -140,13 +141,14 @@ IndexCatalogEntry* IndexCatalog::_setupInMemoryStructures(OperationContext* txn,
         fassertFailedNoTrace(28782);
     }
 
-    unique_ptr<IndexCatalogEntry> entry(new IndexCatalogEntry(_collection->ns().ns(),
-                                                              _collection->getCatalogEntry(),
-                                                              descriptorCleanup.release(),
-                                                              _collection->infoCache()));
-
-    entry->init(txn,
-                _collection->_dbce->getIndex(txn, _collection->getCatalogEntry(), entry.get()));
+    auto entry = stdx::make_unique<IndexCatalogEntry>(txn,
+                                                      _collection->ns().ns(),
+                                                      _collection->getCatalogEntry(),
+                                                      descriptorCleanup.release(),
+                                                      _collection->infoCache());
+    std::unique_ptr<IndexAccessMethod> accessMethod(
+        _collection->_dbce->getIndex(txn, _collection->getCatalogEntry(), entry.get()));
+    entry->init(std::move(accessMethod));
 
     IndexCatalogEntry* save = entry.get();
     _entries.add(entry.release());
@@ -184,7 +186,8 @@ Status IndexCatalog::checkUnfinished() const {
 
     return Status(ErrorCodes::InternalError,
                   str::stream() << "IndexCatalog has left over indexes that must be cleared"
-                                << " ns: " << _collection->ns().ns());
+                                << " ns: "
+                                << _collection->ns().ns());
 }
 
 bool IndexCatalog::_shouldOverridePlugin(OperationContext* txn, const BSONObj& keyPattern) const {
@@ -197,7 +200,8 @@ bool IndexCatalog::_shouldOverridePlugin(OperationContext* txn, const BSONObj& k
         // supports an index plugin unsupported by this version.
         uassert(17197,
                 str::stream() << "Invalid index type '" << pluginName << "' "
-                              << "in index " << keyPattern,
+                              << "in index "
+                              << keyPattern,
                 known);
         return false;
     }
@@ -275,18 +279,21 @@ StatusWith<BSONObj> IndexCatalog::prepareSpecForCreate(OperationContext* txn,
     if (!status.isOK())
         return StatusWith<BSONObj>(status);
 
-    BSONObj fixed = _fixIndexSpec(original);
+    auto fixed = _fixIndexSpec(txn, _collection, original);
+    if (!fixed.isOK()) {
+        return fixed;
+    }
 
     // we double check with new index spec
-    status = _isSpecOk(txn, fixed);
+    status = _isSpecOk(txn, fixed.getValue());
     if (!status.isOK())
         return StatusWith<BSONObj>(status);
 
-    status = _doesSpecConflictWithExisting(txn, fixed);
+    status = _doesSpecConflictWithExisting(txn, fixed.getValue());
     if (!status.isOK())
         return StatusWith<BSONObj>(status);
 
-    return StatusWith<BSONObj>(fixed);
+    return fixed;
 }
 
 Status IndexCatalog::createIndexOnEmptyCollection(OperationContext* txn, BSONObj spec) {
@@ -478,7 +485,8 @@ Status IndexCatalog::_isSpecOk(OperationContext* txn, const BSONObj& spec) const
         if (v != 0 && v != 1) {
             return Status(ErrorCodes::CannotCreateIndex,
                           str::stream() << "this version of mongod cannot build new indexes "
-                                        << "of version number " << v);
+                                        << "of version number "
+                                        << v);
         }
     }
 
@@ -503,7 +511,9 @@ Status IndexCatalog::_isSpecOk(OperationContext* txn, const BSONObj& spec) const
         return Status(ErrorCodes::CannotCreateIndex,
                       str::stream() << "the \"ns\" field of the index spec '"
                                     << specNamespace.valueStringData()
-                                    << "' does not match the collection name '" << nss.ns() << "'");
+                                    << "' does not match the collection name '"
+                                    << nss.ns()
+                                    << "'");
 
     // logical name of the index
     const BSONElement nameElem = spec["name"];
@@ -521,7 +531,8 @@ Status IndexCatalog::_isSpecOk(OperationContext* txn, const BSONObj& spec) const
     if (indexNamespace.length() > NamespaceString::MaxNsLen)
         return Status(ErrorCodes::CannotCreateIndex,
                       str::stream() << "namespace name generated from index name \""
-                                    << indexNamespace << "\" is too long (127 byte max)");
+                                    << indexNamespace
+                                    << "\" is too long (127 byte max)");
 
     const BSONObj key = spec.getObjectField("key");
     const Status keyStatus = validateKeyPattern(key);
@@ -531,34 +542,7 @@ Status IndexCatalog::_isSpecOk(OperationContext* txn, const BSONObj& spec) const
                                     << keyStatus.reason());
     }
 
-    const bool isSparse = spec["sparse"].trueValue();
-
-    // Ensure if there is a filter, its valid.
-    BSONElement filterElement = spec.getField("partialFilterExpression");
-    if (filterElement) {
-        if (isSparse) {
-            return Status(ErrorCodes::CannotCreateIndex,
-                          "cannot mix \"partialFilterExpression\" and \"sparse\" options");
-        }
-
-        if (filterElement.type() != Object) {
-            return Status(ErrorCodes::CannotCreateIndex,
-                          "\"partialFilterExpression\" for an index must be a document");
-        }
-        // TODO SERVER-23618: pass the appropriate CollatorInterface* instead of nullptr.
-        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-            filterElement.Obj(), ExtensionsCallbackDisallowExtensions(), nullptr);
-        if (!statusWithMatcher.isOK()) {
-            return statusWithMatcher.getStatus();
-        }
-        const std::unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
-
-        Status status = _checkValidFilterExpressions(filterExpr.get());
-        if (!status.isOK()) {
-            return status;
-        }
-    }
-
+    std::unique_ptr<CollatorInterface> collator;
     BSONElement collationElement = spec.getField("collation");
     if (collationElement) {
         string pluginName = IndexNames::findPluginName(key);
@@ -576,6 +560,36 @@ Status IndexCatalog::_isSpecOk(OperationContext* txn, const BSONObj& spec) const
                                       ->makeFromBSON(collationElement.Obj());
         if (!statusWithCollator.isOK()) {
             return statusWithCollator.getStatus();
+        }
+        collator = std::move(statusWithCollator.getValue());
+    }
+
+    const bool isSparse = spec["sparse"].trueValue();
+
+    // Ensure if there is a filter, its valid.
+    BSONElement filterElement = spec.getField("partialFilterExpression");
+    if (filterElement) {
+        if (isSparse) {
+            return Status(ErrorCodes::CannotCreateIndex,
+                          "cannot mix \"partialFilterExpression\" and \"sparse\" options");
+        }
+
+        if (filterElement.type() != Object) {
+            return Status(ErrorCodes::CannotCreateIndex,
+                          "\"partialFilterExpression\" for an index must be a document");
+        }
+
+        // The collator must outlive the constructed MatchExpression.
+        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
+            filterElement.Obj(), ExtensionsCallbackDisallowExtensions(), collator.get());
+        if (!statusWithMatcher.isOK()) {
+            return statusWithMatcher.getStatus();
+        }
+        const std::unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
+
+        Status status = _checkValidFilterExpressions(filterExpr.get());
+        if (!status.isOK()) {
+            return status;
         }
     }
 
@@ -645,9 +659,12 @@ Status IndexCatalog::_doesSpecConflictWithExisting(OperationContext* txn,
             if (!desc->keyPattern().equal(key))
                 return Status(ErrorCodes::IndexKeySpecsConflict,
                               str::stream() << "Trying to create an index "
-                                            << "with same name " << name
-                                            << " with different key spec " << key
-                                            << " vs existing spec " << desc->keyPattern());
+                                            << "with same name "
+                                            << name
+                                            << " with different key spec "
+                                            << key
+                                            << " vs existing spec "
+                                            << desc->keyPattern());
 
             IndexDescriptor temp(_collection, _getAccessMethodName(txn, key), spec);
             if (!desc->areIndexOptionsEquivalent(&temp))
@@ -697,7 +714,8 @@ Status IndexCatalog::_doesSpecConflictWithExisting(OperationContext* txn,
             return Status(ErrorCodes::CannotCreateIndex,
                           str::stream() << "only one text index per collection allowed, "
                                         << "found existing text index \""
-                                        << textIndexes[0]->indexName() << "\"");
+                                        << textIndexes[0]->indexName()
+                                        << "\"");
         }
     }
     return Status::OK();
@@ -907,6 +925,11 @@ bool IndexCatalog::isMultikey(OperationContext* txn, const IndexDescriptor* idx)
     return entry->isMultikey();
 }
 
+MultikeyPaths IndexCatalog::getMultikeyPaths(OperationContext* txn, const IndexDescriptor* idx) {
+    IndexCatalogEntry* entry = _entries.find(idx);
+    invariant(entry);
+    return entry->getMultikeyPaths(txn);
+}
 
 // ---------------------------
 
@@ -1251,8 +1274,14 @@ BSONObj IndexCatalog::fixIndexKey(const BSONObj& key) {
     return key;
 }
 
-BSONObj IndexCatalog::_fixIndexSpec(const BSONObj& spec) {
-    BSONObj o = IndexLegacy::adjustIndexSpecObject(spec);
+StatusWith<BSONObj> IndexCatalog::_fixIndexSpec(OperationContext* txn,
+                                                Collection* collection,
+                                                const BSONObj& spec) {
+    auto statusWithSpec = IndexLegacy::adjustIndexSpecObject(spec);
+    if (!statusWithSpec.isOK()) {
+        return statusWithSpec;
+    }
+    BSONObj o = statusWithSpec.getValue();
 
     BSONObjBuilder b;
 
@@ -1276,6 +1305,34 @@ BSONObj IndexCatalog::_fixIndexSpec(const BSONObj& spec) {
     }
     b.append("name", name);
 
+    if (auto collationElt = spec["collation"]) {
+        // This should already have been verified by _isSpecOk().
+        invariant(collationElt.type() == BSONType::Object);
+
+        auto collator = CollatorFactoryInterface::get(txn->getServiceContext())
+                            ->makeFromBSON(collationElt.Obj());
+        if (!collator.isOK()) {
+            return collator.getStatus();
+        }
+
+        // If the collator factory returned a non-null collator, set the collation option to the
+        // result of serializing the collator's spec back into BSON. We do this in order to fill in
+        // all options that the user omitted.
+        //
+        // If the collator factory returned a null collator (representing the "simple" collation),
+        // we can't use the collation serializer. In this case, we simply set the collation option
+        // to the original user BSON.
+        b.append("collation",
+                 collator.getValue()
+                     ? CollationSerializer::specToBSON(collator.getValue()->getSpec())
+                     : collationElt.Obj());
+    } else if (collection->getDefaultCollator()) {
+        // The user did not specify an explicit collation for this index and the collection has a
+        // default collator. In this case, the index inherits the collection default.
+        b.append("collation",
+                 CollationSerializer::specToBSON(collection->getDefaultCollator()->getSpec()));
+    }
+
     {
         BSONObjIterator i(o);
         while (i.more()) {
@@ -1286,7 +1343,7 @@ BSONObj IndexCatalog::_fixIndexSpec(const BSONObj& spec) {
                 // skip
             } else if (s == "dropDups") {
                 // dropDups is silently ignored and removed from the spec as of SERVER-14710.
-            } else if (s == "v" || s == "unique" || s == "key" || s == "name") {
+            } else if (s == "v" || s == "unique" || s == "key" || s == "name" || s == "collation") {
                 // covered above
             } else {
                 b.append(e);

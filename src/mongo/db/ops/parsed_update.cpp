@@ -33,6 +33,7 @@
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/query_planner_common.h"
 
 namespace mongo {
@@ -48,6 +49,15 @@ Status ParsedUpdate::parseRequest() {
     // It is invalid to request that a ProjectionStage be applied to the UpdateStage if the
     // UpdateStage would not return any document.
     invariant(_request->getProj().isEmpty() || _request->shouldReturnAnyDocs());
+
+    if (!_request->getCollation().isEmpty()) {
+        auto collator = CollatorFactoryInterface::get(_txn->getServiceContext())
+                            ->makeFromBSON(_request->getCollation());
+        if (!collator.isOK()) {
+            return collator.getStatus();
+        }
+        _collator = std::move(collator.getValue());
+    }
 
     // We parse the update portion before the query portion because the dispostion of the update
     // may determine whether or not we need to produce a CanonicalQuery at all.  For example, if
@@ -82,10 +92,11 @@ Status ParsedUpdate::parseQueryToCQ() {
 
     // The projection needs to be applied after the update operation, so we do not specify a
     // projection during canonicalization.
-    auto lpq = stdx::make_unique<LiteParsedQuery>(_request->getNamespaceString());
-    lpq->setFilter(_request->getQuery());
-    lpq->setSort(_request->getSort());
-    lpq->setExplain(_request->isExplain());
+    auto qr = stdx::make_unique<QueryRequest>(_request->getNamespaceString());
+    qr->setFilter(_request->getQuery());
+    qr->setSort(_request->getSort());
+    qr->setCollation(_request->getCollation());
+    qr->setExplain(_request->isExplain());
 
     // Limit should only used for the findAndModify command when a sort is specified. If a sort
     // is requested, we want to use a top-k sort for efficiency reasons, so should pass the
@@ -95,10 +106,10 @@ Status ParsedUpdate::parseQueryToCQ() {
     // not apply to update in general.
     // TODO SERVER-23473: Pass the collation to canonicalize().
     if (!_request->isMulti() && !_request->getSort().isEmpty()) {
-        lpq->setLimit(1);
+        qr->setLimit(1);
     }
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(_txn, std::move(lpq), extensionsCallback);
+    auto statusWithCQ = CanonicalQuery::canonicalize(_txn, std::move(qr), extensionsCallback);
     if (statusWithCQ.isOK()) {
         _canonicalQuery = std::move(statusWithCQ.getValue());
     }
@@ -117,9 +128,8 @@ Status ParsedUpdate::parseUpdate() {
         !(!_txn->writesAreReplicated() || ns.isConfigDB() || _request->isFromMigration());
 
     _driver.setLogOp(true);
-    // TODO SERVER-23610: pass down the CollatorInterface as an option to ModifierInterface.
     _driver.setModOptions(
-        ModifierInterface::Options(!_txn->writesAreReplicated(), shouldValidate, nullptr));
+        ModifierInterface::Options(!_txn->writesAreReplicated(), shouldValidate, _collator.get()));
 
     return _driver.parse(_request->getUpdates(), _request->isMulti());
 }
@@ -136,7 +146,7 @@ PlanExecutor::YieldPolicy ParsedUpdate::yieldPolicy() const {
 
 bool ParsedUpdate::isIsolated() const {
     return _canonicalQuery.get() ? _canonicalQuery->isIsolated()
-                                 : LiteParsedQuery::isQueryIsolated(_request->getQuery());
+                                 : QueryRequest::isQueryIsolated(_request->getQuery());
 }
 
 bool ParsedUpdate::hasParsedQuery() const {

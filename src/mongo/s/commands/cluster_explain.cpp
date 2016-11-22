@@ -29,7 +29,6 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_explain.h"
@@ -150,14 +149,16 @@ Status ClusterExplain::validateShardResults(const vector<Strategy::CommandResult
             return Status(error,
                           str::stream() << "Explain command on shard "
                                         << shardResults[i].target.toString()
-                                        << " failed, caused by: " << shardResults[i].result);
+                                        << " failed, caused by: "
+                                        << shardResults[i].result);
         }
 
         if (Object != shardResults[i].result["queryPlanner"].type()) {
             return Status(ErrorCodes::OperationFailed,
                           str::stream() << "Explain command on shard "
                                         << shardResults[i].target.toString()
-                                        << " failed, caused by: " << shardResults[i].result);
+                                        << " failed, caused by: "
+                                        << shardResults[i].result);
         }
 
         if (shardResults[i].result.hasField("executionStats")) {

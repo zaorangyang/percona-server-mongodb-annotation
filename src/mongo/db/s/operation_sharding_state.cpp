@@ -40,7 +40,7 @@ const OperationContext::Decoration<OperationShardingState> shardingMetadataDecor
     OperationContext::declareDecoration<OperationShardingState>();
 
 // Max time to wait for the migration critical section to complete
-const Minutes kMaxWaitForMigrationCriticalSection(5);
+const Microseconds kMaxWaitForMigrationCriticalSection = Minutes(5);
 
 }  // namespace mongo
 
@@ -101,10 +101,9 @@ bool OperationShardingState::waitForMigrationCriticalSection(OperationContext* t
     invariant(!txn->lockState()->isLocked());
 
     if (_migrationCriticalSection) {
-        const Microseconds operationRemainingTime(Microseconds(txn->getRemainingMaxTimeMicros()));
         _migrationCriticalSection->waitUntilOutOfCriticalSection(
-            durationCount<Microseconds>(operationRemainingTime)
-                ? operationRemainingTime
+            txn->hasDeadline()
+                ? std::min(txn->getRemainingMaxTimeMicros(), kMaxWaitForMigrationCriticalSection)
                 : kMaxWaitForMigrationCriticalSection);
         _migrationCriticalSection = nullptr;
         return true;

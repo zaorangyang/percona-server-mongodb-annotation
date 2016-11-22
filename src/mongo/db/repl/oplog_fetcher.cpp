@@ -53,8 +53,10 @@ Milliseconds calculateAwaitDataTimeout(const ReplicaSetConfig& config) {
     // Under protocol version 1, make the awaitData timeout (maxTimeMS) dependent on the election
     // timeout. This enables the sync source to communicate liveness of the primary to secondaries.
     // Under protocol version 0, use a default timeout of 2 seconds for awaitData.
-    return config.getProtocolVersion() == 1LL ? config.getElectionTimeoutPeriod() / 2
-                                              : OplogFetcher::kDefaultProtocolZeroAwaitDataTimeout;
+    if (config.getProtocolVersion() == 1LL) {
+        return config.getElectionTimeoutPeriod() / 2;
+    }
+    return OplogFetcher::kDefaultProtocolZeroAwaitDataTimeout;
 }
 
 /**
@@ -125,17 +127,26 @@ Status checkRemoteOplogStart(const Fetcher::Documents& documents, OpTimeWithHash
     if (!opTimeResult.isOK()) {
         return Status(ErrorCodes::OplogStartMissing,
                       str::stream() << "our last op time fetched: " << lastFetched.opTime.toString()
-                                    << " (hash: " << lastFetched.value << ")"
+                                    << " (hash: "
+                                    << lastFetched.value
+                                    << ")"
                                     << ". failed to parse optime from first oplog on source: "
-                                    << o.toString() << ": " << opTimeResult.getStatus().toString());
+                                    << o.toString()
+                                    << ": "
+                                    << opTimeResult.getStatus().toString());
     }
     auto opTime = opTimeResult.getValue();
     long long hash = o["h"].numberLong();
     if (opTime != lastFetched.opTime || hash != lastFetched.value) {
         return Status(ErrorCodes::OplogStartMissing,
                       str::stream() << "our last op time fetched: " << lastFetched.opTime.toString()
-                                    << ". source's GTE: " << opTime.toString() << " hashes: ("
-                                    << lastFetched.value << "/" << hash << ")");
+                                    << ". source's GTE: "
+                                    << opTime.toString()
+                                    << " hashes: ("
+                                    << lastFetched.value
+                                    << "/"
+                                    << hash
+                                    << ")");
     }
     return Status::OK();
 }
@@ -147,7 +158,8 @@ StatusWith<OplogFetcher::DocumentsInfo> OplogFetcher::validateDocuments(
     if (first && documents.empty()) {
         return Status(ErrorCodes::OplogStartMissing,
                       str::stream() << "The first batch of oplog entries is empty, but expected at "
-                                       "least 1 document matching ts: " << lastTS.toString());
+                                       "least 1 document matching ts: "
+                                    << lastTS.toString());
     }
 
     DocumentsInfo info;
@@ -176,8 +188,11 @@ StatusWith<OplogFetcher::DocumentsInfo> OplogFetcher::validateDocuments(
         if (lastTS >= docTS) {
             return Status(ErrorCodes::OplogOutOfOrder,
                           str::stream() << "Out of order entries in oplog. lastTS: "
-                                        << lastTS.toString() << " outOfOrderTS:" << docTS.toString()
-                                        << " at count:" << info.networkDocumentCount);
+                                        << lastTS.toString()
+                                        << " outOfOrderTS:"
+                                        << docTS.toString()
+                                        << " at count:"
+                                        << info.networkDocumentCount);
         }
         lastTS = docTS;
     }
@@ -279,8 +294,7 @@ void OplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
     }
 
     const auto& queryResponse = result.getValue();
-    OpTime sourcesLastOpTime;
-    bool syncSourceHasSyncSource = false;
+    rpc::ReplSetMetadata metadata;
 
     // Forward metadata (containing liveness information) to data replicator external state.
     bool receivedMetadata =
@@ -294,10 +308,8 @@ void OplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
             _onShutdown(metadataResult.getStatus());
             return;
         }
-        auto metadata = metadataResult.getValue();
+        metadata = metadataResult.getValue();
         _dataReplicatorExternalState->processMetadata(metadata);
-        sourcesLastOpTime = metadata.getLastOpVisible();
-        syncSourceHasSyncSource = metadata.getSyncSourceIndex() != -1;
     }
 
     const auto& documents = queryResponse.documents;
@@ -347,12 +359,15 @@ void OplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
         _lastFetched = opTimeWithHash;
     }
 
-    if (_dataReplicatorExternalState->shouldStopFetching(
-            _fetcher.getSource(), sourcesLastOpTime, syncSourceHasSyncSource)) {
+    if (_dataReplicatorExternalState->shouldStopFetching(_fetcher.getSource(), metadata)) {
         _onShutdown(Status(ErrorCodes::InvalidSyncSource,
                            str::stream() << "sync source " << _fetcher.getSource().toString()
-                                         << " (last optime: " << sourcesLastOpTime.toString()
-                                         << "; has sync source: " << syncSourceHasSyncSource
+                                         << " (last optime: "
+                                         << metadata.getLastOpVisible().toString()
+                                         << "; sync source index: "
+                                         << metadata.getSyncSourceIndex()
+                                         << "; primary index: "
+                                         << metadata.getPrimaryIndex()
                                          << ") is no longer valid"),
                     opTimeWithHash);
         return;

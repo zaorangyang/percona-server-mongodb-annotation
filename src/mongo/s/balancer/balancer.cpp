@@ -41,7 +41,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/s/balancer/balancer_chunk_selection_policy_impl.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/balancer/cluster_statistics_impl.h"
@@ -58,6 +58,7 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
+#include "mongo/util/represent_as.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/version.h"
 
@@ -147,6 +148,25 @@ void warnOnMultiVersion(const vector<ClusterStatistics::ShardStatistics>& cluste
     warning() << sb.str();
 }
 
+void appendOperationDeadlineIfSet(OperationContext* txn, BSONObjBuilder* cmdBuilder) {
+    if (!txn->hasDeadline()) {
+        return;
+    }
+    // Treat a remaining max time less than 1ms as 1ms, since any smaller is treated as infinity
+    // or an error on the receiving node.
+    const auto remainingMicros = std::max(txn->getRemainingMaxTimeMicros(), Microseconds{1000});
+    const auto maxTimeMsArg = representAs<int32_t>(durationCount<Milliseconds>(remainingMicros));
+
+    // We know that remainingMicros > 1000us, so if maxTimeMsArg is not engaged, it is because
+    // remainingMicros was too big to represent as a 32-bit signed integer number of
+    // milliseconds. In that case, we omit a maxTimeMs argument on the command, implying "no max
+    // time".
+    if (!maxTimeMsArg) {
+        return;
+    }
+    cmdBuilder->append(QueryRequest::cmdOptionMaxTimeMS, *maxTimeMsArg);
+}
+
 /**
  * Blocking method, which requests a single chunk migration to run.
  */
@@ -178,8 +198,7 @@ Status executeSingleMigration(OperationContext* txn,
         maxChunkSizeBytes,
         secondaryThrottle,
         waitForDelete);
-    builder.append(LiteParsedQuery::cmdOptionMaxTimeMS,
-                   durationCount<Milliseconds>(Microseconds(txn->getRemainingMaxTimeMicros())));
+    appendOperationDeadlineIfSet(txn, &builder);
 
     BSONObj cmdObj = builder.obj();
 
@@ -223,7 +242,6 @@ Status executeSingleMigration(OperationContext* txn,
 }
 
 MONGO_FP_DECLARE(skipBalanceRound);
-MONGO_FP_DECLARE(balancerRoundIntervalSetting);
 
 }  // namespace
 
@@ -318,11 +336,6 @@ void Balancer::_mainThread() {
             // know that there is an active balancer
             _stardingUptimeReporter.reportStatus(txn.get(), true);
 
-            MONGO_FAIL_POINT_BLOCK(balancerRoundIntervalSetting, scopedBalancerRoundInterval) {
-                const BSONObj& data = scopedBalancerRoundInterval.getData();
-                balanceRoundInterval = Seconds(data["sleepSecs"].numberInt());
-            }
-
             // Use fresh shard state and balancer settings
             shardingContext->shardRegistry()->reload(txn.get());
 
@@ -347,11 +360,11 @@ void Balancer::_mainThread() {
             uassert(13258, "oids broken after resetting!", _checkOIDs(txn.get()));
 
             {
-                auto scopedDistLock = shardingContext->catalogManager(txn.get())
-                                          ->distLock(txn.get(),
-                                                     "balancer",
-                                                     "doing balance round",
-                                                     DistLockManager::kSingleLockAttemptTimeout);
+                auto scopedDistLock = shardingContext->catalogManager(txn.get())->distLock(
+                    txn.get(),
+                    "balancer",
+                    "doing balance round",
+                    DistLockManager::kSingleLockAttemptTimeout);
 
                 if (!scopedDistLock.isOK()) {
                     LOG(1) << "skipping balancing round" << causedBy(scopedDistLock.getStatus());
@@ -393,8 +406,8 @@ void Balancer::_mainThread() {
                     roundDetails.setSucceeded(static_cast<int>(candidateChunks.size()),
                                               _balancedLastTime);
 
-                    shardingContext->catalogManager(txn.get())
-                        ->logAction(txn.get(), "balancer.round", "", roundDetails.toBSON());
+                    shardingContext->catalogManager(txn.get())->logAction(
+                        txn.get(), "balancer.round", "", roundDetails.toBSON());
                 }
 
                 LOG(1) << "*** End of balancing round";
@@ -413,8 +426,8 @@ void Balancer::_mainThread() {
             // This round failed, tell the world!
             roundDetails.setFailed(e.what());
 
-            shardingContext->catalogManager(txn.get())
-                ->logAction(txn.get(), "balancer.round", "", roundDetails.toBSON());
+            shardingContext->catalogManager(txn.get())->logAction(
+                txn.get(), "balancer.round", "", roundDetails.toBSON());
 
             // Sleep a fair amount before retrying because of the error
             sleepFor(balanceRoundInterval);
@@ -445,7 +458,8 @@ bool Balancer::_init(OperationContext* txn) {
         return true;
     } catch (const std::exception& e) {
         warning() << "could not initialize balancer, please check that all shards and config "
-                     "servers are up: " << e.what();
+                     "servers are up: "
+                  << e.what();
         return false;
     }
 }

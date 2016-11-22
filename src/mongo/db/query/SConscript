@@ -29,13 +29,14 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/bson/dotted_path_support",
         "$BUILD_DIR/mongo/db/index/expression_params",
         "$BUILD_DIR/mongo/db/index_names",
         "$BUILD_DIR/mongo/db/matcher/expression_algo",
         "$BUILD_DIR/mongo/db/matcher/expressions",
         "$BUILD_DIR/mongo/db/server_parameters",
         "collation/collation_serializer",
-        "collation/collator_interface",
+        "collation/collator_factory_interface",
         "command_request_response",
         "index_bounds",
     ],
@@ -44,7 +45,6 @@ env.Library(
 env.Library(
     target='query',
     source=[
-        "collation/collator_factory_mock_decoration.cpp",
         "explain.cpp",
         "get_executor.cpp",
         "find.cpp",
@@ -55,7 +55,6 @@ env.Library(
         "stage_builder.cpp",
     ],
     LIBDEPS=[
-        "collation/collator_factory_mock",
         "internal_plans",
         "query_common",
         "query_planner",
@@ -75,13 +74,15 @@ env.Library(
 env.Library(
     target="query_common",
     source=[
+        "collation/collator_factory_icu_decoration.cpp",
         "find_common.cpp",
         "explain_common.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/util/fail_point",
-        "lite_parsed_query",
+        "collation/collator_icu",
+        "query_request",
     ],
 )
 
@@ -117,7 +118,6 @@ env.Library(
         "$BUILD_DIR/mongo/db/mongohasher",
         "$BUILD_DIR/mongo/db/server_parameters",
         "collation/collation_index_key",
-        "collation/collator_interface",
     ],
 )
 
@@ -138,7 +138,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/repl/optime',
         '$BUILD_DIR/mongo/rpc/command_status',
-        'lite_parsed_query',
+        'query_request',
     ]
 )
 
@@ -174,9 +174,9 @@ env.Library(
 )
 
 env.Library(
-    target="lite_parsed_query",
+    target="query_request",
     source=[
-        "lite_parsed_query.cpp"
+        "query_request.cpp"
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
@@ -213,6 +213,7 @@ env.Library(
         "query_planner_test_lib.cpp",
     ],
     LIBDEPS=[
+        "collation/collator_factory_mock",
         "query_planner",
     ],
 )
@@ -261,12 +262,12 @@ env.CppUnitTest(
 )
 
 env.CppUnitTest(
-    target="lite_parsed_query_test",
+    target="query_request_test",
     source=[
-        "lite_parsed_query_test.cpp"
+        "query_request_test.cpp"
     ],
     LIBDEPS=[
-        "lite_parsed_query",
+        "query_request",
     ],
 )
 

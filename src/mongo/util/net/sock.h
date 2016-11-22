@@ -33,10 +33,10 @@
 
 #ifndef _WIN32
 
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
-#include <errno.h>
 
 #ifdef __OpenBSD__
 #include <sys/uio.h>
@@ -45,6 +45,7 @@
 #endif  // not _WIN32
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -175,6 +176,17 @@ public:
     }
     int rawFD() const {
         return _fd;
+    }
+
+    /**
+     * This sets the Sock's socket descriptor to be invalid and returns the old descriptor. This
+     * only gets called in listen.cpp in Listener::_accepted(). This gets called on the listener
+     * thread immediately after the thread creates the Sock, so it doesn't need to be thread-safe.
+     */
+    int stealSD() {
+        int tmp = _fd;
+        _fd = -1;
+        return tmp;
     }
 
     void setTimeout(double secs);

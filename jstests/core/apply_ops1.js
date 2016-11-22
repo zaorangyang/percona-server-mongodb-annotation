@@ -39,20 +39,23 @@
     assert.commandWorked(db.adminCommand({applyOps: [{op: 'n', ns: ''}]}),
                          'applyOps should work on no op operation with empty "ns" field value');
 
+    // Missing dbname in 'ns' field.
+    assert.commandFailed(db.adminCommand({applyOps: [{op: 'd', ns: t.getName(), o: {_id: 1}}]}));
+
     // Missing 'o' field value in an operation of type 'c' (command).
-    assert.commandFailed(db.adminCommand({applyOps: [{op: 'c', ns: 'foo'}]}),
+    assert.commandFailed(db.adminCommand({applyOps: [{op: 'c', ns: t.getFullName()}]}),
                          'applyOps should fail on command operation without "o" field');
 
     // Non-object 'o' field value in an operation of type 'c' (command).
-    assert.commandFailed(db.adminCommand({applyOps: [{op: 'c', ns: 'foo', o: 'bar'}]}),
+    assert.commandFailed(db.adminCommand({applyOps: [{op: 'c', ns: t.getFullName(), o: 'bar'}]}),
                          'applyOps should fail on command operation with non-object "o" field');
 
     // Empty object 'o' field value in an operation of type 'c' (command).
-    assert.commandFailed(db.adminCommand({applyOps: [{op: 'c', ns: 'foo', o: {}}]}),
+    assert.commandFailed(db.adminCommand({applyOps: [{op: 'c', ns: t.getFullName(), o: {}}]}),
                          'applyOps should fail on command operation with empty object "o" field');
 
     // Unknown key in 'o' field value in an operation of type 'c' (command).
-    assert.commandFailed(db.adminCommand({applyOps: [{op: 'c', ns: 'foo', o: {a: 1}}]}),
+    assert.commandFailed(db.adminCommand({applyOps: [{op: 'c', ns: t.getFullName(), o: {a: 1}}]}),
                          'applyOps should fail on command operation on unknown key in "o" field');
 
     // Empty 'ns' field value in operation type other than 'n'.
@@ -156,10 +159,7 @@
     assert.eq(1, t.find().count(), "Duplicate insert failed");
     assert.eq(true, a.results[0], "Bad result value for duplicate insert");
 
-    var o = {
-        _id: 5,
-        x: 17
-    };
+    var o = {_id: 5, x: 17};
     assert.eq(o, t.findOne(), "Mismatching document inserted.");
 
     var res = db.runCommand({
@@ -243,8 +243,9 @@
     res = t.getIndexes();
     assert.eq(1,
               res.filter(function(element, index, array) {
-                  return element.name == 'a_1';
-              }).length,
+                     return element.name == 'a_1';
+                 })
+                  .length,
               'Foreground index not found in listIndexes result: ' + tojson(res));
 
     // Background indexes are created in the foreground when processed by applyOps.
@@ -265,7 +266,8 @@
     res = t.getIndexes();
     assert.eq(1,
               res.filter(function(element, index, array) {
-                  return element.name == 'b_1';
-              }).length,
+                     return element.name == 'b_1';
+                 })
+                  .length,
               'Background index not found in listIndexes result: ' + tojson(res));
 })();

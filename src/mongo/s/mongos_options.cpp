@@ -99,14 +99,15 @@ Status addMongosOptions(moe::OptionSection* options) {
     sharding_options.addOptionChaining(
         "sharding.chunkSize", "chunkSize", moe::Int, "maximum amount of data per chunk");
 
-    sharding_options.addOptionChaining("net.http.JSONPEnabled",
-                                       "jsonp",
-                                       moe::Switch,
-                                       "allow JSONP access via http (has security implications)")
+    sharding_options
+        .addOptionChaining("net.http.JSONPEnabled",
+                           "jsonp",
+                           moe::Switch,
+                           "allow JSONP access via http (has security implications)")
         .setSources(moe::SourceAllLegacy);
 
-    sharding_options.addOptionChaining(
-                         "noscripting", "noscripting", moe::Switch, "disable scripting engine")
+    sharding_options
+        .addOptionChaining("noscripting", "noscripting", moe::Switch, "disable scripting engine")
         .setSources(moe::SourceAllLegacy);
 
 
@@ -122,15 +123,14 @@ Status addMongosOptions(moe::OptionSection* options) {
     options->addSection(ssl_options);
 #endif
 
-    options->addOptionChaining("noAutoSplit",
-                               "noAutoSplit",
-                               moe::Switch,
-                               "do not send split commands with writes")
+    options
+        ->addOptionChaining(
+            "noAutoSplit", "noAutoSplit", moe::Switch, "do not send split commands with writes")
         .hidden()
         .setSources(moe::SourceAllLegacy);
 
-    options->addOptionChaining(
-                 "sharding.autoSplit", "", moe::Bool, "send split commands with writes")
+    options
+        ->addOptionChaining("sharding.autoSplit", "", moe::Bool, "send split commands with writes")
         .setSources(moe::SourceYAMLConfig);
 
 
@@ -204,21 +204,6 @@ Status storeMongosOptions(const moe::Environment& params, const std::vector<std:
     Status ret = storeServerOptions(params, args);
     if (!ret.isOK()) {
         return ret;
-    }
-
-    if (params.count("sharding.chunkSize")) {
-        const int maxChunkSizeMB = params["sharding.chunkSize"].as<int>();
-        if (maxChunkSizeMB <= 0) {
-            return Status(ErrorCodes::BadValue, "error: need a positive chunksize");
-        }
-
-        const uint64_t maxChunkSizeBytes = maxChunkSizeMB * 1024 * 1024;
-
-        if (!ChunkSizeSettingsType::checkMaxChunkSizeValid(maxChunkSizeBytes)) {
-            return Status(ErrorCodes::BadValue, "MaxChunkSize invalid");
-        }
-
-        mongosGlobalParams.maxChunkSizeBytes = maxChunkSizeBytes;
     }
 
     if (params.count("net.port")) {

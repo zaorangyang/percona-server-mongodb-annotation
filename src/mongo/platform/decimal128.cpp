@@ -25,8 +25,8 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/platform/basic.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -250,11 +250,17 @@ Decimal128::Decimal128(double doubleValue,
 
 Decimal128::Decimal128(std::string stringValue, RoundingMode roundMode) {
     std::uint32_t throwAwayFlag = 0;
+    *this = Decimal128(stringValue, &throwAwayFlag, roundMode);
+}
+
+Decimal128::Decimal128(std::string stringValue,
+                       std::uint32_t* signalingFlags,
+                       RoundingMode roundMode) {
     std::unique_ptr<char[]> charInput(new char[stringValue.size() + 1]);
     std::copy(stringValue.begin(), stringValue.end(), charInput.get());
     charInput[stringValue.size()] = '\0';
     BID_UINT128 dec128;
-    dec128 = bid128_from_string(charInput.get(), roundMode, &throwAwayFlag);
+    dec128 = bid128_from_string(charInput.get(), roundMode, signalingFlags);
     _value = libraryTypeToValue(dec128);
 }
 
@@ -371,6 +377,17 @@ double Decimal128::toDouble(std::uint32_t* signalingFlags, RoundingMode roundMod
 }
 
 std::string Decimal128::toString() const {
+    // If the decimal is a variant of NaN (i.e. sNaN, -NaN, +NaN, etc...) or a variant of
+    // Inf (i.e. +Inf, Inf, -Inf), return either NaN, Infinity, or -Infinity
+    if (!isFinite()) {
+        if (this->isEqual(kPositiveInfinity)) {
+            return "Infinity";
+        } else if (this->isEqual(kNegativeInfinity)) {
+            return "-Infinity";
+        }
+        invariant(isNaN());
+        return "NaN";
+    }
     BID_UINT128 dec128 = decimal128ToLibraryType(_value);
     char decimalCharRepresentation[1 /* mantissa sign */ + 34 /* mantissa */ +
                                    1 /* scientific E */ + 1 /* exponent sign */ + 4 /* exponent */ +
@@ -387,34 +404,24 @@ std::string Decimal128::toString() const {
      */
     bid128_to_string(decimalCharRepresentation, dec128, &idec_signaling_flags);
 
-    std::string dec128String(decimalCharRepresentation);
+    StringData dec128String(decimalCharRepresentation);
 
-    // If the string is NaN or Infinity, return either NaN, +Inf, or -Inf
-    std::string::size_type ePos = dec128String.find("E");
-    if (ePos == std::string::npos) {
-        if (dec128String == "-NaN" || dec128String == "+NaN")
-            return "NaN";
-        if (dec128String[0] == '+')
-            return "Inf";
-        invariant(dec128String == "-Inf");
-        return dec128String;
-    }
+    int ePos = dec128String.find("E");
 
     // Calculate the precision and exponent of the number and output it in a readable manner
     int precision = 0;
     int exponent = 0;
-    int stringReadPosition = 0;
 
-    std::string exponentString = dec128String.substr(ePos);
+    StringData exponentString = dec128String.substr(ePos);
 
     // Get the value of the exponent, start at 2 to ignore the E and the sign
-    for (std::string::size_type i = 2; i < exponentString.size(); ++i) {
+    for (size_t i = 2; i < exponentString.size(); ++i) {
         exponent = exponent * 10 + (exponentString[i] - '0');
     }
     if (exponentString[1] == '-') {
         exponent *= -1;
     }
-    // Get the total precision of the number
+    // Get the total precision of the number, i.e. the length of the coefficient
     precision = dec128String.size() - exponentString.size() - 1 /* mantissa sign */;
 
     std::string result;
@@ -422,53 +429,67 @@ std::string Decimal128::toString() const {
     // For formatting, leave off the sign if it is positive
     if (dec128String[0] == '-')
         result = "-";
-    stringReadPosition++;
 
-    int scientificExponent = precision - 1 + exponent;
+    StringData coefficient = dec128String.substr(1, precision);
+    int adjustedExponent = exponent + precision - 1;
 
-    // If the number is significantly large, small, or the user has specified an exponent
-    // such that converting to string would need to append trailing zeros, display the
-    // number in scientific notation
-    if (scientificExponent >= 12 || scientificExponent <= -4 || exponent > 0) {
-        // Output in scientific format
-        result += dec128String.substr(stringReadPosition, 1);
-        stringReadPosition++;
-        precision--;
-        if (precision)
-            result += ".";
-        result += dec128String.substr(stringReadPosition, precision);
-        // Add the exponent
-        result += "E";
-        if (scientificExponent > 0)
-            result += "+";
-        result += std::to_string(scientificExponent);
+    if (exponent > 0 || adjustedExponent < -6) {
+        result += _convertToScientificNotation(coefficient, adjustedExponent);
     } else {
-        // Regular format with no decimal place
-        if (exponent >= 0) {
-            result += dec128String.substr(stringReadPosition, precision);
-            stringReadPosition += precision;
-        } else {
-            int radixPosition = precision + exponent;
-            if (radixPosition > 0) {
-                // Non-zero digits before radix point
-                result += dec128String.substr(stringReadPosition, radixPosition);
-                stringReadPosition += radixPosition;
-            } else {
-                // Leading zero before radix point
-                result += "0";
-            }
-
-            result += ".";
-            // Leading zeros after radix point
-            while (radixPosition++ < 0)
-                result += "0";
-
-            result +=
-                dec128String.substr(stringReadPosition, precision - std::max(radixPosition - 1, 0));
-        }
+        result += _convertToStandardDecimalNotation(coefficient, exponent);
     }
 
     return result;
+}
+
+std::string Decimal128::_convertToScientificNotation(StringData coefficient,
+                                                     int adjustedExponent) const {
+    int cLength = coefficient.size();
+    std::string result;
+    for (int i = 0; i < cLength; i++) {
+        result += coefficient[i];
+        if (i == 0 && cLength > 1) {
+            result += '.';
+        }
+    }
+    result += 'E';
+    if (adjustedExponent > 0) {
+        result += '+';
+    }
+    result += std::to_string(adjustedExponent);
+    return result;
+}
+
+std::string Decimal128::_convertToStandardDecimalNotation(StringData coefficient,
+                                                          int exponent) const {
+    if (exponent == 0) {
+        return coefficient.toString();
+    } else {
+        invariant(exponent < 0);
+        std::string result;
+        int precision = coefficient.size();
+        // Absolute value of the exponent
+        int significantDecimalDigits = -exponent;
+        bool decimalAppended = false;
+
+        // Pre-pend 0's before the coefficient as necessary
+        for (int i = precision; i <= significantDecimalDigits; i++) {
+            result += '0';
+            if (i == precision) {
+                result += '.';
+                decimalAppended = true;
+            }
+        }
+
+        // Copy over the digits in the coefficient
+        for (int i = 0; i < precision; i++) {
+            if (precision - i == significantDecimalDigits && !decimalAppended) {
+                result += '.';
+            }
+            result += coefficient[i];
+        }
+        return result;
+    }
 }
 
 bool Decimal128::isZero() const {
@@ -481,6 +502,10 @@ bool Decimal128::isNaN() const {
 
 bool Decimal128::isInfinite() const {
     return bid128_isInf(decimal128ToLibraryType(_value));
+}
+
+bool Decimal128::isFinite() const {
+    return bid128_isFinite(decimal128ToLibraryType(_value));
 }
 
 bool Decimal128::isNegative() const {

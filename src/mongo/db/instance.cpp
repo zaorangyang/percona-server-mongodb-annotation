@@ -40,8 +40,8 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authz_manager_external_state_d.h"
-#include "mongo/db/client.h"
 #include "mongo/db/catalog/cursor_manager.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -194,7 +194,6 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
  */
 void beginCommandOp(OperationContext* txn, const NamespaceString& nss, const BSONObj& queryObj) {
     auto curop = CurOp::get(txn);
-    curop->debug().query = queryObj;
     stdx::lock_guard<Client> lk(*txn->getClient());
     curop->setQuery_inlock(queryObj);
     curop->setNS_inlock(nss.ns());
@@ -221,7 +220,9 @@ void receivedCommand(OperationContext* txn,
         rpc::LegacyRequest request{&message};
         // Auth checking for Commands happens later.
         int nToReturn = queryMessage.ntoreturn;
-        beginCommandOp(txn, nss, queryMessage.query);
+
+        beginCommandOp(txn, nss, request.getCommandArgs());
+
         {
             stdx::lock_guard<Client> lk(*txn->getClient());
             op->markCommand_inlock();
@@ -235,8 +236,6 @@ void receivedCommand(OperationContext* txn,
         runCommands(txn, request, &builder);
 
         op->debug().iscommand = true;
-        // TODO: Does this get overwritten/do we really need to set this twice?
-        op->debug().query = request.getCommandArgs();
     } catch (const DBException& exception) {
         Command::generateErrorResponse(txn, &builder, exception);
     }
@@ -274,7 +273,6 @@ void receivedRpc(OperationContext* txn, Client& client, DbResponse& dbResponse, 
         runCommands(txn, request, &replyBuilder);
 
         curOp->debug().iscommand = true;
-        curOp->debug().query = request.getCommandArgs();
 
     } catch (const DBException& exception) {
         Command::generateErrorResponse(txn, &replyBuilder, exception);
@@ -372,8 +370,8 @@ void receivedQuery(OperationContext* txn,
         // If we got a stale config, wait in case the operation is stuck in a critical section
         if (e.getCode() == ErrorCodes::SendStaleConfig) {
             auto& sce = static_cast<const StaleConfigException&>(e);
-            ShardingState::get(txn)
-                ->onStaleShardVersion(txn, NamespaceString(sce.getns()), sce.getVersionReceived());
+            ShardingState::get(txn)->onStaleShardVersion(
+                txn, NamespaceString(sce.getns()), sce.getVersionReceived());
         }
 
         dbResponse.response.reset();
@@ -653,9 +651,12 @@ void assembleResponse(OperationContext* txn,
                     const ShardedConnectionInfo* connInfo = ShardedConnectionInfo::get(&c, false);
                     uassert(18663,
                             str::stream() << "legacy writeOps not longer supported for "
-                                          << "versioned connections, ns: " << nsString.ns()
-                                          << ", op: " << networkOpToString(op)
-                                          << ", remote: " << remote.toString(),
+                                          << "versioned connections, ns: "
+                                          << nsString.ns()
+                                          << ", op: "
+                                          << networkOpToString(op)
+                                          << ", remote: "
+                                          << remote.toString(),
                             connInfo == NULL);
                 }
 
