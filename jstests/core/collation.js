@@ -4,7 +4,7 @@
 
     load("jstests/libs/analyze_plan.js");
 
-    var coll = db.collation_shell_helpers;
+    var coll = db.collation;
     coll.drop();
 
     var explainRes;
@@ -29,30 +29,25 @@
     //
 
     // Attempting to create a collection with an invalid collation should fail.
+    assert.commandFailed(db.createCollection("collation", {collation: "not an object"}));
+    assert.commandFailed(db.createCollection("collation", {collation: {}}));
+    assert.commandFailed(db.createCollection("collation", {collation: {blah: 1}}));
+    assert.commandFailed(db.createCollection("collation", {collation: {locale: "en", blah: 1}}));
+    assert.commandFailed(db.createCollection("collation", {collation: {locale: "xx"}}));
     assert.commandFailed(
-        db.createCollection("collation_shell_helpers", {collation: "not an object"}));
-    assert.commandFailed(db.createCollection("collation_shell_helpers", {collation: {}}));
-    assert.commandFailed(db.createCollection("collation_shell_helpers", {collation: {blah: 1}}));
-    assert.commandFailed(
-        db.createCollection("collation_shell_helpers", {collation: {locale: "en", blah: 1}}));
-    assert.commandFailed(
-        db.createCollection("collation_shell_helpers", {collation: {locale: "xx"}}));
-    assert.commandFailed(
-        db.createCollection("collation_shell_helpers", {collation: {locale: "en", strength: 99}}));
+        db.createCollection("collation", {collation: {locale: "en", strength: 99}}));
 
     // Ensure we can create a collection with the "simple" collation as the collection default.
-    assert.commandWorked(
-        db.createCollection("collation_shell_helpers", {collation: {locale: "simple"}}));
-    var collectionInfos = db.getCollectionInfos({name: "collation_shell_helpers"});
+    assert.commandWorked(db.createCollection("collation", {collation: {locale: "simple"}}));
+    var collectionInfos = db.getCollectionInfos({name: "collation"});
     assert.eq(collectionInfos.length, 1);
     assert.eq(collectionInfos[0].options.collation, {locale: "simple"});
     coll.drop();
 
     // Ensure that we populate all collation-related fields when we create a collection with a valid
     // collation.
-    assert.commandWorked(
-        db.createCollection("collation_shell_helpers", {collation: {locale: "fr_CA"}}));
-    var collectionInfos = db.getCollectionInfos({name: "collation_shell_helpers"});
+    assert.commandWorked(db.createCollection("collation", {collation: {locale: "fr_CA"}}));
+    var collectionInfos = db.getCollectionInfos({name: "collation"});
     assert.eq(collectionInfos.length, 1);
     assert.eq(collectionInfos[0].options.collation, {
         locale: "fr_CA",
@@ -242,10 +237,31 @@
     assert.eq(1, planStage.advanced);
 
     // Distinct.
-    assert.eq(["foo", "bar"], coll.distinct("str", {}, {collation: {locale: "fr"}}));
+    coll.drop();
+    assert.writeOK(coll.insert({_id: 1, str: "foo"}));
+    assert.writeOK(coll.insert({_id: 2, str: "FOO"}));
+
+    // Without an index.
+    var res = coll.distinct("str", {}, {collation: {locale: "en_US", strength: 2}});
+    assert.eq(1, res.length);
+    assert.eq("foo", res[0].toLowerCase());
+    assert.eq(2, coll.distinct("str", {}, {collation: {locale: "en_US", strength: 3}}).length);
+    assert.eq(
+        2, coll.distinct("_id", {str: "foo"}, {collation: {locale: "en_US", strength: 2}}).length);
+
+    // With an index.
+    coll.createIndex({str: 1}, {collation: {locale: "en_US", strength: 2}});
+    res = coll.distinct("str", {}, {collation: {locale: "en_US", strength: 2}});
+    assert.eq(1, res.length);
+    assert.eq("foo", res[0].toLowerCase());
+    assert.eq(2, coll.distinct("str", {}, {collation: {locale: "en_US", strength: 3}}).length);
+
     assert.commandWorked(coll.explain().distinct("str", {}, {collation: {locale: "fr"}}));
 
     // Find command.
+    coll.drop();
+    assert.writeOK(coll.insert({_id: 1, str: "foo"}));
+    assert.writeOK(coll.insert({_id: 2, str: "bar"}));
     if (db.getMongo().useReadCommands()) {
         // On _id field.
         assert.writeOK(coll.insert({_id: "foo"}));
