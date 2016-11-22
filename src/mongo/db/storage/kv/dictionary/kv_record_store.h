@@ -174,6 +174,8 @@ namespace mongo {
 
         void undoUpdateStats(long long nrDelta, long long dsDelta);
 
+        virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* txn) const {}
+
         virtual void updateStatsAfterRepair(OperationContext* txn,
                                             long long numRecords,
                                             long long dataSize);
