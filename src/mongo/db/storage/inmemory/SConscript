@@ -29,9 +29,7 @@ if inmemory:
                 ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/serveronly',
-            '$BUILD_DIR/mongo/util/ntservice_mock',
             ],
-        NO_CRUTCH=True,
         )
 
     imEnv.CppUnitTest(
