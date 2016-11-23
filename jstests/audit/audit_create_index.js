@@ -18,11 +18,12 @@ auditTest(
 
         assert.commandWorked(testDB.coll.createIndex({ b: 1 }, { name: 'hot', background: true }));
 
+        beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m);
 
         assert.eq(1, auditColl.count({
             atype: "createIndex",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.ns': testDBName + '.coll',
             'params.indexSpec.key': { a: 1 },
             'params.indexName': 'cold',
@@ -31,7 +32,7 @@ auditTest(
 
         assert.eq(1, auditColl.count({
             atype: "createIndex",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.ns': testDBName + '.coll' ,
             'params.indexSpec.key': { b: 1 },
             'params.indexName': 'hot',

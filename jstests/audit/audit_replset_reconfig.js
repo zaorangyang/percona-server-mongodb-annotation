@@ -29,7 +29,7 @@ auditTestRepl(
         sleep(5000);
 
         // Ensure that the reconfig audit event got logged on every member.
-        withinTheLast20Seconds = withinTheLastFewSeconds(20);
+        withinTheLast20Seconds = withinFewSecondsBefore(Date.now(), 20);
         replTest.nodes.forEach(function(m) { 
             print('audit check looking for old, new: ' +tojson(oldConfig)+', '+tojson(newConfig));
             // We need to import the audit events collection into the master node.

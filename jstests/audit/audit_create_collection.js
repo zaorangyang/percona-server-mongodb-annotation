@@ -14,10 +14,11 @@ auditTest(
         testDB = m.getDB(testDBName);
         assert.commandWorked(testDB.createCollection('foo'));
 
+        beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({
             atype: "createCollection",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.ns': testDBName + '.' + 'foo',
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
