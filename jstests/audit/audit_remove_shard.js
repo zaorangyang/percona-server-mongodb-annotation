@@ -21,10 +21,11 @@ auditTestShard(
             assert.commandWorked(removeRet);
         } while (removeRet.state != 'completed');
 
+        beforeLoad = Date.now();
         auditColl = loadAuditEventsIntoCollection(st.s0, getDBPath() + '/auditLog-s0.json', jsTestName(), 'auditEvents');
         assert.eq(1, auditColl.count({
             atype: "removeShard",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.shard': 'removable',
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));

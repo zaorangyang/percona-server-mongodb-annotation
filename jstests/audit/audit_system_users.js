@@ -20,10 +20,11 @@ auditTest(
         var userObj = { user: 'john', pwd: 'john', roles: [ { role:'userAdmin', db:testDBName} ] };
         testDB.createUser(userObj);
 
+        beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({
             atype: "createUser",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.db': testDBName,
             'params.user': userObj.user,
             //'params.roles': userObj.roles,
@@ -35,10 +36,11 @@ auditTest(
         testDB.updateUser(userObj.user, updateObj);
         assert.eq(1, adminDB.system.users.count({ user: userObj.user, roles: updateObj.roles }),
                      "system.users update did not update role for user: " + userObj.user);
+        beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({
             atype: "updateUser",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.db': testDBName,
             'params.user': userObj.user,
             //'params.roles': updateObj.roles,
@@ -50,10 +52,11 @@ auditTest(
         testDB.removeUser(userObj.user);
         assert.eq(0, testDB.system.users.count({ user: userObj.user }),
                      "removeUser did not remove user:" + userObj.user);
+        beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({
             atype: "dropUser",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.db': testDBName,
             'params.user': userObj.user,
             result: 0,

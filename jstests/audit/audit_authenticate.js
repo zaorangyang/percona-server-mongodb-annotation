@@ -25,10 +25,11 @@ auditTest(
 
         assert(testDB.auth('john', 'john'), "could not auth as john (pwd john)");
 
+        beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m, undefined, true);
         assert.eq(1, auditColl.count({
             atype: 'authenticate',
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.user': 'john',
             'params.mechanism': 'SCRAM-SHA-1',
             'params.db': testDBName,
@@ -40,10 +41,11 @@ auditTest(
         // ErrorCodes::AuthenticationFailed in src/mongo/base/error_codes.err
         var authenticationFailureCode = 18;
 
+        beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m, undefined, true);
         assert.eq(1, auditColl.count({
             atype: 'authenticate',
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.user': 'john',
             'params.mechanism': 'SCRAM-SHA-1',
             'params.db': testDBName,

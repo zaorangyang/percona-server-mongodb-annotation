@@ -52,10 +52,11 @@ auditTest(
         testDB.logout();
 
         // Verify that audit event was inserted.
+        beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m, undefined, true);
         assert.eq(1, auditColl.count({
             atype: "authCheck",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             users: { $elemMatch: { user:'tom', db:testDBName} },
             'params.ns': testDBName + '.' + 'foo',
             'params.command': 'getMore',

@@ -12,11 +12,12 @@ auditTest(
         m.getDB('admin').shutdownServer();
         m = restartServer();
 
+        beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({
             atype: "shutdown",
             // Give 10 seconds of slack in case shutdown / restart was particularly slow
-            ts: withinTheLastFewSeconds(10),
+            ts: withinFewSecondsBefore(beforeLoad, 10),
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },
