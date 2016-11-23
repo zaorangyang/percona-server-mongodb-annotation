@@ -34,6 +34,7 @@
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/global_conn_pool.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/reply_builder_interface.h"
@@ -66,10 +67,6 @@ using std::vector;
 class Client;
 class OperationContext;
 
-DBClientBase* createDirectClient(OperationContext* txn) {
-    return NULL;
-}
-
 namespace {
 
 const string TARGET_HOST = "localhost:27017";
@@ -87,7 +84,7 @@ public:
 
         // We need to handle the isMaster received during connection.
         if (request->getCommandName() == "isMaster") {
-            commandResponse.append("maxWireVersion", WireVersion::FIND_COMMAND);
+            commandResponse.append("maxWireVersion", WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN);
             commandResponse.append("minWireVersion", WireVersion::RELEASE_2_4_AND_BEFORE);
         }
 
@@ -141,7 +138,7 @@ public:
         MessageServer::Options options;
         options.port = _port;
 
-        _server.reset(createServer(options, std::move(messsageHandler)));
+        _server.reset(createServer(options, std::move(messsageHandler), getGlobalServiceContext()));
         _serverThread = stdx::thread(runServer, _server.get());
     }
 

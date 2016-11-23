@@ -34,6 +34,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
+#include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/sync_source_resolver.h"
@@ -41,8 +42,8 @@
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/util/net/hostandport.h"
-#include "mongo/util/queue.h"
 
 namespace mongo {
 
@@ -62,23 +63,35 @@ class ReplicationCoordinatorExternalState;
  */
 class BackgroundSync {
 public:
-    BackgroundSync();
+    BackgroundSync(ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
+                   std::unique_ptr<OplogBuffer> oplogBuffer);
     MONGO_DISALLOW_COPYING(BackgroundSync);
 
     // stop syncing (when this node becomes a primary, e.g.)
     void stop();
 
-    void shutdown();
+    /**
+     * Starts oplog buffer, task executor and producer thread, in that order.
+     */
+    void startup(OperationContext* txn);
+
+    /**
+     * Signals producer thread to stop.
+     */
+    void shutdown(OperationContext* txn);
+
+    /**
+     * Waits for producer thread to stop before shutting down the task executor and oplog buffer.
+     */
+    void join(OperationContext* txn);
+
+    /**
+     * Returns true if shutdown() has been called.
+     */
+    bool inShutdown() const;
 
     bool isStopped() const;
 
-    /**
-     * Starts the producer thread which runs until shutdown. Upon resolving the current sync source
-     * the producer thread uses the OplogFetcher (which requires the replication coordinator
-     * external state at construction) to fetch oplog entries from the source's oplog via a long
-     * running find query.
-     */
-    void producerThread(ReplicationCoordinatorExternalState* replicationCoordinatorExternalState);
     // starts the sync target notifying thread
     void notifierThread();
 
@@ -86,16 +99,16 @@ public:
 
     // Interface implementation
 
-    bool peek(BSONObj* op);
-    void consume();
+    bool peek(OperationContext* txn, BSONObj* op);
+    void consume(OperationContext* txn);
     void clearSyncTarget();
-    void waitForMore();
+    void waitForMore(OperationContext* txn);
 
     // For monitoring
     BSONObj getCounters();
 
     // Clears any fetched and buffered oplog entries.
-    void clearBuffer();
+    void clearBuffer(OperationContext* txn);
 
     /**
      * Cancel existing find/getMore commands on the sync source's oplog collection.
@@ -112,13 +125,21 @@ public:
     bool shouldStopFetching() const;
 
     // Testing related stuff
-    void pushTestOpToBuffer(const BSONObj& op);
+    void pushTestOpToBuffer(OperationContext* txn, const BSONObj& op);
 
 private:
-    // Production thread
-    void _producerThread(ReplicationCoordinatorExternalState* replicationCoordinatorExternalState);
-    void _produce(OperationContext* txn,
-                  ReplicationCoordinatorExternalState* replicationCoordinatorExternalState);
+    bool _inShutdown_inlock() const;
+
+    /**
+     * Starts the producer thread which runs until shutdown. Upon resolving the current sync source
+     * the producer thread uses the OplogFetcher (which requires the replication coordinator
+     * external state at construction) to fetch oplog entries from the source's oplog via a long
+     * running find query.
+     */
+    void _run();
+    // Production thread inner loop.
+    void _runProducer();
+    void _produce(OperationContext* txn);
 
     /**
      * Signals to the applier that we have no new data,
@@ -126,7 +147,7 @@ private:
      *
      * NOTE: Used after rollback and during draining to transition to Primary role;
      */
-    void _signalNoNewDataForApplier();
+    void _signalNoNewDataForApplier(OperationContext* txn);
 
     /**
      * Record metrics.
@@ -156,13 +177,16 @@ private:
     long long _readLastAppliedHash(OperationContext* txn);
 
     // Production thread
-    BlockingQueue<BSONObj> _buffer;
+    std::unique_ptr<OplogBuffer> _oplogBuffer;
 
     // Task executor used to run find/getMore commands on sync source.
     executor::ThreadPoolTaskExecutor _threadPoolTaskExecutor;
 
     // A pointer to the replication coordinator running the show.
     ReplicationCoordinator* _replCoord;
+
+    // A pointer to the replication coordinator external state.
+    ReplicationCoordinatorExternalState* _replicationCoordinatorExternalState;
 
     // Used to determine sync source.
     // TODO(dannenberg) move into DataReplicator.
@@ -176,6 +200,12 @@ private:
     // lastFetchedHash is used to match ops to determine if we need to rollback, when
     // a secondary.
     long long _lastFetchedHash = 0LL;
+
+    // Thread running producerThread().
+    std::unique_ptr<stdx::thread> _producerThread;
+
+    // Set to true if shutdown() has been called.
+    bool _inShutdown = false;
 
     // if producer thread should not be running
     bool _stopped = true;

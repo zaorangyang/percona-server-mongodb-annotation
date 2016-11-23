@@ -38,6 +38,7 @@
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/near.h"
+#include "mongo/db/exec/pipeline_proxy.h"
 #include "mongo/db/exec/text.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/get_executor.h"
@@ -326,6 +327,13 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         bob->appendBool("isSparse", spec->isSparse);
         bob->appendBool("isPartial", spec->isPartial);
         bob->append("indexVersion", spec->indexVersion);
+
+        BSONObjBuilder indexBoundsBob;
+        indexBoundsBob.append("startKey", spec->startKey);
+        indexBoundsBob.append("startKeyInclusive", spec->startKeyInclusive);
+        indexBoundsBob.append("endKey", spec->endKey);
+        indexBoundsBob.append("endKeyInclusive", spec->endKeyInclusive);
+        bob->append("indexBounds", indexBoundsBob.obj());
     } else if (STAGE_DELETE == stats.stageType) {
         DeleteStats* spec = static_cast<DeleteStats*>(stats.specific.get());
 
@@ -562,6 +570,7 @@ void Explain::getWinningPlanStats(const PlanExecutor* exec, BSONObjBuilder* bob)
 
 // static
 void Explain::generatePlannerInfo(PlanExecutor* exec,
+                                  const Collection* collection,
                                   PlanStageStats* winnerStats,
                                   const vector<unique_ptr<PlanStageStats>>& rejectedStats,
                                   BSONObjBuilder* out) {
@@ -576,8 +585,8 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
     // Find whether there is an index filter set for the query shape. The 'indexFilterSet'
     // field will always be false in the case of EOF or idhack plans.
     bool indexFilterSet = false;
-    if (exec->collection() && exec->getCanonicalQuery()) {
-        const CollectionInfoCache* infoCache = exec->collection()->infoCache();
+    if (collection && exec->getCanonicalQuery()) {
+        const CollectionInfoCache* infoCache = collection->infoCache();
         const QuerySettings* querySettings = infoCache->getQuerySettings();
         PlanCacheKey planCacheKey =
             infoCache->getPlanCache()->computeKey(*exec->getCanonicalQuery());
@@ -664,6 +673,7 @@ void Explain::generateServerInfo(BSONObjBuilder* out) {
 
 // static
 void Explain::explainStages(PlanExecutor* exec,
+                            const Collection* collection,
                             ExplainCommon::Verbosity verbosity,
                             BSONObjBuilder* out) {
     //
@@ -713,7 +723,7 @@ void Explain::explainStages(PlanExecutor* exec,
     //
 
     if (verbosity >= ExplainCommon::QUERY_PLANNER) {
-        generatePlannerInfo(exec, winningStats.get(), allPlansStats, out);
+        generatePlannerInfo(exec, collection, winningStats.get(), allPlansStats, out);
     }
 
     if (verbosity >= ExplainCommon::EXEC_STATS) {
@@ -766,6 +776,11 @@ std::string Explain::getPlanSummary(const PlanExecutor* exec) {
 
 // static
 std::string Explain::getPlanSummary(const PlanStage* root) {
+    if (root->stageType() == STAGE_PIPELINE_PROXY) {
+        auto pipelineProxy = static_cast<const PipelineProxyStage*>(root);
+        return pipelineProxy->getPlanSummaryStr();
+    }
+
     std::vector<const PlanStage*> stages;
     flattenExecTree(root, &stages);
 
@@ -794,6 +809,12 @@ void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsO
     invariant(NULL != statsOut);
 
     PlanStage* root = exec.getRootStage();
+
+    if (root->stageType() == STAGE_PIPELINE_PROXY) {
+        auto pipelineProxy = static_cast<PipelineProxyStage*>(root);
+        pipelineProxy->getPlanSummaryStats(statsOut);
+        return;
+    }
 
     // We can get some of the fields we need from the common stats stored in the
     // root stage of the plan tree.

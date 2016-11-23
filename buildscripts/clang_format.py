@@ -11,6 +11,7 @@ from __future__ import print_function, absolute_import
 
 import Queue
 import difflib
+import glob
 import itertools
 import os
 import re
@@ -218,10 +219,18 @@ class ClangFormat(object):
                         break
 
         # If Windows, try to grab it from Program Files
+        # Check both native Program Files and WOW64 version
         if sys.platform == "win32":
-            win32bin = os.path.join(os.environ["ProgramFiles(x86)"], "LLVM\\bin\\clang-format.exe")
-            if os.path.exists(win32bin):
-                self.path = win32bin
+            programfiles = [
+                os.environ["ProgramFiles"],
+                os.environ["ProgramFiles(x86)"],
+                ]
+
+            for programfile in programfiles:
+                win32bin = os.path.join(programfile, "LLVM\\bin\\clang-format.exe")
+                if os.path.exists(win32bin):
+                    self.path = win32bin
+                    break
 
         # Have not found it yet, download it from the web
         if self.path is None:
@@ -301,7 +310,16 @@ class ClangFormat(object):
             return True
 
         # Update the file with clang-format
-        return not subprocess.call([self.path, "--style=file", "-i", file_name])
+        formatted = not subprocess.call([self.path, "--style=file", "-i", file_name])
+
+        # Version 3.8 generates files like foo.cpp~RF83372177.TMP when it formats foo.cpp
+        # on Windows, we must clean these up
+        if sys.platform == "win32":
+            glob_pattern = file_name + "*.TMP"
+            for fglob in glob.glob(glob_pattern):
+                os.unlink(fglob)
+
+        return formatted
 
 
 def parallel_process(items, func):

@@ -32,6 +32,8 @@
 
 #include "mongo/s/server.h"
 
+#include <boost/optional.hpp>
+
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
@@ -62,7 +64,8 @@
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balancer/balancer.h"
 #include "mongo/s/balancer/balancer_configuration.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_lockpings.h"
 #include "mongo/s/catalog/type_locks.h"
@@ -82,6 +85,7 @@
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/sharding_egress_metadata_hook_for_mongos.h"
 #include "mongo/s/sharding_initialization.h"
+#include "mongo/s/sharding_uptime_reporter.h"
 #include "mongo/s/version_mongos.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
@@ -117,6 +121,12 @@ using std::vector;
 
 using logger::LogComponent;
 
+namespace {
+
+boost::optional<ShardingUptimeReporter> shardingUptimeReporter;
+
+}  // namespace
+
 #if defined(_WIN32)
 ntservice::NtServiceDefaultStrings defaultServiceStrings = {
     L"MongoS", L"MongoDB Router", L"MongoDB Sharding Router"};
@@ -128,6 +138,7 @@ static ExitCode initService();
 // prior execution of mongo initializers or the existence of threads.
 static void cleanupTask() {
     {
+        Client::initThreadIfNotAlready();
         Client& client = cc();
         ServiceContext::UniqueOperationContext uniqueTxn;
         OperationContext* txn = client.getOperationContext();
@@ -139,7 +150,7 @@ static void cleanupTask() {
         auto cursorManager = grid.getCursorManager();
         cursorManager->shutdown();
         grid.getExecutorPool()->shutdownAndJoin();
-        grid.catalogManager(txn)->shutDown(txn);
+        grid.catalogClient(txn)->shutDown(txn);
     }
 
     audit::logShutdown(ClientBasic::getCurrent());
@@ -206,11 +217,6 @@ public:
         Client::destroy();
     }
 };
-
-DBClientBase* createDirectClient(OperationContext* txn) {
-    uassert(10197, "createDirectClient not implemented for sharding yet", 0);
-    return nullptr;
-}
 
 }  // namespace mongo
 
@@ -300,9 +306,12 @@ static Status initializeSharding(OperationContext* txn) {
     auto shardFactory =
         stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
-    Status status =
-        initializeGlobalShardingState(mongosGlobalParams.configdbs, std::move(shardFactory), []() {
-            return stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>();
+    Status status = initializeGlobalShardingState(
+        mongosGlobalParams.configdbs,
+        std::move(shardFactory),
+        []() { return stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>(); },
+        [](ShardingCatalogClient* catalogClient, std::unique_ptr<executor::TaskExecutor> executor) {
+            return nullptr;  // Only config servers get a real ShardingCatalogManager.
         });
 
     if (!status.isOK()) {
@@ -314,8 +323,8 @@ static Status initializeSharding(OperationContext* txn) {
         return status;
     }
 
-    auto catalogManager = grid.catalogManager(txn);
-    status = catalogManager->initConfigVersion(txn);
+    auto catalogClient = grid.catalogClient(txn);
+    status = catalogClient->initConfigVersion(txn);
     if (!status.isOK()) {
         return status;
     }
@@ -327,10 +336,10 @@ static void _initWireSpec() {
     WireSpec& spec = WireSpec::instance();
     // accept from any version
     spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionIncoming = FIND_COMMAND;
-    // connect to version supporting Find Command only
-    spec.minWireVersionOutgoing = FIND_COMMAND;
-    spec.maxWireVersionOutgoing = FIND_COMMAND;
+    spec.maxWireVersionIncoming = COMMANDS_ACCEPT_WRITE_CONCERN;
+    // connect to version supporting Write Concern only
+    spec.minWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
+    spec.maxWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
 }
 
 static ExitCode runMongosServer() {
@@ -378,8 +387,10 @@ static ExitCode runMongosServer() {
 #endif
 
     if (serverGlobalParams.isHttpInterfaceEnabled) {
-        std::shared_ptr<DbWebServer> dbWebServer(new DbWebServer(
-            serverGlobalParams.bind_ip, serverGlobalParams.port + 1000, new NoAdminAccess()));
+        std::shared_ptr<DbWebServer> dbWebServer(new DbWebServer(serverGlobalParams.bind_ip,
+                                                                 serverGlobalParams.port + 1000,
+                                                                 getGlobalServiceContext(),
+                                                                 new NoAdminAccess()));
         dbWebServer->setupSockets();
 
         stdx::thread web(stdx::bind(&webServerListenThread, dbWebServer));
@@ -394,7 +405,13 @@ static ExitCode runMongosServer() {
         return EXIT_SHARDING_ERROR;
     }
 
-    Balancer::get(opCtx.get())->start(opCtx.get());
+    // Construct the sharding uptime reporter after the startup parameters have been parsed in order
+    // to ensure that it picks up the server port instead of reporting the default value.
+    shardingUptimeReporter.emplace();
+    shardingUptimeReporter->startPeriodicThread();
+
+    Balancer::create(getGlobalServiceContext());
+
     clusterCursorCleanupJob.go();
 
     UserCacheInvalidator cacheInvalidatorThread(getGlobalAuthorizationManager());
@@ -410,8 +427,7 @@ static ExitCode runMongosServer() {
     opts.ipList = serverGlobalParams.bind_ip;
 
     auto handler = std::make_shared<ShardedMessageHandler>();
-    MessageServer* server = createServer(opts, std::move(handler));
-    server->setAsTimeTracker();
+    MessageServer* server = createServer(opts, std::move(handler), getGlobalServiceContext());
     if (!server->setupSockets()) {
         return EXIT_NET_ERROR;
     }

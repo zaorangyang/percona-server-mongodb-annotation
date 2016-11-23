@@ -114,13 +114,13 @@ public:
         init(bsonData);
     }
 
-    explicit BSONObj(SharedBuffer ownedBuffer)
+    explicit BSONObj(ConstSharedBuffer ownedBuffer)
         : _objdata(ownedBuffer.get() ? ownedBuffer.get() : BSONObj().objdata()),
           _ownedBuffer(std::move(ownedBuffer)) {}
 
     /** Move construct a BSONObj */
-    BSONObj(BSONObj&& other)
-        : _objdata(std::move(other._objdata)), _ownedBuffer(std::move(other._ownedBuffer)) {
+    BSONObj(BSONObj&& other) noexcept : _objdata(std::move(other._objdata)),
+                                        _ownedBuffer(std::move(other._ownedBuffer)) {
         other._objdata = BSONObj()._objdata;  // To return to an empty state.
         dassert(!other.isOwned());
     }
@@ -134,13 +134,13 @@ public:
     /** Provide assignment semantics. We use the value taking form so that we can use copy
      *  and swap, and consume both lvalue and rvalue references.
      */
-    BSONObj& operator=(BSONObj otherCopy) {
+    BSONObj& operator=(BSONObj otherCopy) noexcept {
         this->swap(otherCopy);
         return *this;
     }
 
     /** Swap this BSONObj with 'other' */
-    void swap(BSONObj& other) {
+    void swap(BSONObj& other) noexcept {
         using std::swap;
         swap(_objdata, other._objdata);
         swap(_ownedBuffer, other._ownedBuffer);
@@ -175,7 +175,27 @@ public:
        @return true if this is in owned mode
     */
     bool isOwned() const {
-        return _ownedBuffer.get() != 0;
+        return bool(_ownedBuffer);
+    }
+
+    /**
+     * Share ownership with another object.
+     *
+     * It is the callers responsibility to ensure that the other object is owned and contains the
+     * data this BSONObj is viewing. This can happen if this is a subobject or sibling object
+     * contained in a larger buffer.
+     */
+    void shareOwnershipWith(ConstSharedBuffer buffer) {
+        invariant(buffer);
+        _ownedBuffer = buffer;
+    }
+    void shareOwnershipWith(const BSONObj& other) {
+        shareOwnershipWith(other.sharedBuffer());
+    }
+
+    ConstSharedBuffer sharedBuffer() const {
+        invariant(isOwned());
+        return _ownedBuffer;
     }
 
     /** If the data buffer is under the control of this BSONObj, return it.
@@ -540,19 +560,6 @@ public:
     template <typename T>
     bool coerceVector(std::vector<T>* out) const;
 
-    typedef SharedBuffer::Holder Holder;
-
-    /** Given a pointer to a region of un-owned memory containing BSON data, prefixed by
-     *  sufficient space for a BSONObj::Holder object, return a BSONObj that owns the
-     *  memory.
-     *
-     * This class will call free(holderPrefixedData), so it must have been allocated in a way
-     * that makes that valid.
-     */
-    static BSONObj takeOwnership(char* holderPrefixedData) {
-        return BSONObj(SharedBuffer::takeOwnership(holderPrefixedData));
-    }
-
     /// members for Sorter
     struct SorterDeserializeSettings {};  // unused
     void serializeForSorter(BufBuilder& buf) const {
@@ -586,7 +593,7 @@ private:
     Status _okForStorage(bool root, bool deep) const;
 
     const char* _objdata;
-    SharedBuffer _ownedBuffer;
+    ConstSharedBuffer _ownedBuffer;
 };
 
 std::ostream& operator<<(std::ostream& s, const BSONObj& o);
@@ -595,7 +602,7 @@ std::ostream& operator<<(std::ostream& s, const BSONElement& e);
 StringBuilder& operator<<(StringBuilder& s, const BSONObj& o);
 StringBuilder& operator<<(StringBuilder& s, const BSONElement& e);
 
-inline void swap(BSONObj& l, BSONObj& r) {
+inline void swap(BSONObj& l, BSONObj& r) noexcept {
     l.swap(r);
 }
 

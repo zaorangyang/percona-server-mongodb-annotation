@@ -1,6 +1,9 @@
 /**
- * Starts up a sharded cluster with the given specifications. The cluster
- * will be fully operational after the execution of this constructor function.
+ * Starts up a sharded cluster with the given specifications. The cluster will be fully operational
+ * after the execution of this constructor function.
+ *
+ * In addition to its own methods, ShardingTest inherits all the functions from the 'sh' utility
+ * with the db set as the first mongos instance in the test (i.e. s0).
  *
  * @param {Object} params Contains the key-value pairs for the cluster
  *   configuration. Accepted keys are:
@@ -8,7 +11,6 @@
  *   {
  *     name {string}: name for this test
  *     verbose {number}: the verbosity for the mongos
- *     keyFile {string}: the location of the keyFile
  *     chunkSize {number}: the chunk size to use as configuration for the cluster
  *     nopreallocj {boolean|number}:
  *
@@ -54,6 +56,7 @@
  *       nopreallocj: same as above
  *       rs: same as above
  *       chunkSize: same as above
+ *       keyFile {string}: the location of the keyFile
  *
  *       shardOptions {Object}: same as the shards property above.
  *          Can be used to specify options that are common all shards.
@@ -164,6 +167,62 @@ var ShardingTest = function(params) {
         }
     }
 
+    /**
+     * Extends the ShardingTest class with the methods exposed by the sh utility class.
+     */
+    function _extendWithShMethods() {
+        Object.keys(sh).forEach(function(fn) {
+            if (typeof sh[fn] !== 'function') {
+                return;
+            }
+
+            assert.eq(undefined,
+                      self[fn],
+                      'ShardingTest contains a method ' + fn +
+                          ' which duplicates a method with the same name on sh. ' +
+                          'Please select a different function name.');
+
+            self[fn] = function() {
+                if (typeof db == "undefined") {
+                    db = undefined;
+                }
+
+                var oldDb = db;
+                db = self.getDB('test');
+
+                try {
+                    sh[fn].apply(sh, arguments);
+                } finally {
+                    db = oldDb;
+                }
+            };
+        });
+    }
+
+    /**
+     * Configures the cluster based on the specified parameters (balancer state, etc).
+     */
+    function _configureCluster() {
+        // Disable the balancer unless it is explicitly turned on
+        if (!otherParams.enableBalancer) {
+            self.stopBalancer();
+        }
+
+        // Lower the mongos replica set monitor's threshold for deeming RS shard hosts as
+        // inaccessible in order to speed up tests, which shutdown entire shards and check for
+        // errors. This attempt is best-effort and failure should not have effect on the actual
+        // test execution, just the execution time.
+        self._mongos.forEach(function(mongos) {
+            var res = mongos.adminCommand({setParameter: 1, replMonitorMaxFailedChecks: 2});
+
+            // For tests, which use x509 certificate for authentication, the command above will not
+            // work due to authorization error.
+            if (res.code != ErrorCodes.Unauthorized) {
+                assert.commandWorked(res);
+            }
+        });
+    }
+
     function connectionURLTheSame(a, b) {
         if (a == b)
             return true;
@@ -212,18 +271,11 @@ var ShardingTest = function(params) {
 
     // ShardingTest API
 
-    this.getRSEntry = function(setName) {
-        for (var i = 0; i < this._rs.length; i++)
-            if (this._rs[i].setName == setName)
-                return this._rs[i];
-        throw Error("can't find rs: " + setName);
-    };
-
     this.getDB = function(name) {
         return this.s.getDB(name);
     };
 
-    /*
+    /**
      * Finds the _id of the primary shard for database 'dbname', e.g., 'test-rs0'
      */
     this.getPrimaryShardIdForDatabase = function(dbname) {
@@ -260,7 +312,7 @@ var ShardingTest = function(params) {
         return names;
     };
 
-    /*
+    /**
      * Find the connection to the primary shard for database 'dbname'.
      */
     this.getPrimaryShard = function(dbname) {
@@ -290,7 +342,7 @@ var ShardingTest = function(params) {
         return x;
     };
 
-    /*
+    /**
      * Find a different shard connection than the one given.
      */
     this.getOther = function(one) {
@@ -324,16 +376,6 @@ var ShardingTest = function(params) {
             if (this._connections[i] == one)
                 return this._connections[(i + 1) % this._connections.length];
         }
-    };
-
-    this.getFirstOther = function(one) {
-        for (var i = 0; i < this._connections.length; i++) {
-            if (this._connections[i] != one) {
-                return this._connections[i];
-            }
-        }
-
-        throw Error("impossible");
     };
 
     this.stop = function(opts) {
@@ -519,9 +561,44 @@ var ShardingTest = function(params) {
     };
 
     /**
-     * Waits up to one minute for the difference in chunks between the most loaded shard and least
-     * loaded shard to be 0 or 1, indicating that the collection is well balanced. This should only
-     * be called after creating a big enough chunk difference to trigger balancing.
+     * Waits up to the specified timeout (with a default of 60s) for the balancer to execute one
+     * round.
+     */
+    this.awaitBalancerRound = function(timeoutMs) {
+        timeoutMs = timeoutMs || 60000;
+
+        // Get the balancer section from the server status of the config server primary
+        function getBalancerStatus() {
+            var csrsPrimary = self.configRS.getPrimary();
+            var serverStatus = csrsPrimary.adminCommand({serverStatus: 1, sharding: 1});
+            if (!serverStatus) {
+                throw Error('Unable to run serverStatus on "' + csrsPrimary + '"');
+            }
+
+            var balancerStatus = serverStatus.sharding.balancer;
+            if (!balancerStatus) {
+                throw Error('Host "' + csrsPrimary + '" does not have the balancer component');
+            }
+
+            if (balancerStatus.state !== 'running') {
+                throw Error('Balancer is stopped');
+            }
+
+            return balancerStatus;
+        }
+
+        var initialStatus = getBalancerStatus();
+        var currentStatus;
+        assert.soon(function() {
+            currentStatus = getBalancerStatus();
+            return (currentStatus.numBalancerRounds - initialStatus.numBalancerRounds) != 0;
+        }, 'Latest balancer status' + currentStatus, timeoutMs);
+    };
+
+    /**
+     * Waits up to one minute for the difference in chunks between the most loaded shard and
+     * least loaded shard to be 0 or 1, indicating that the collection is well balanced. This should
+     * only be called after creating a big enough chunk difference to trigger balancing.
      */
     this.awaitBalance = function(collName, dbName, timeToWait) {
         timeToWait = timeToWait || 60000;
@@ -531,14 +608,6 @@ var ShardingTest = function(params) {
             print("chunk diff: " + x);
             return x < 2;
         }, "no balance happened", timeToWait);
-    };
-
-    this.getShardNames = function() {
-        var shards = [];
-        this.s.getCollection("config.shards").find().forEach(function(shardDoc) {
-            shards.push(shardDoc._id);
-        });
-        return shards;
     };
 
     this.getShard = function(coll, query, includeEmpty) {
@@ -638,41 +707,7 @@ var ShardingTest = function(params) {
         assert(result.ok);
     };
 
-    this.stopBalancer = function(timeout, interval) {
-        if (typeof db == "undefined") {
-            db = undefined;
-        }
-
-        var oldDB = db;
-        db = this.config;
-        timeout = timeout || 60000;
-
-        try {
-            assert.writeOK(sh.setBalancerState(false));
-            sh.waitForBalancer(false, timeout, interval);
-        } finally {
-            db = oldDB;
-        }
-    };
-
-    this.startBalancer = function(timeout, interval) {
-        if (typeof db == "undefined") {
-            db = undefined;
-        }
-
-        var oldDB = db;
-        db = this.config;
-        timeout = timeout || 60000;
-
-        try {
-            assert.writeOK(sh.setBalancerState(true));
-            sh.waitForBalancer(true, timeout, interval);
-        } finally {
-            db = oldDB;
-        }
-    };
-
-    /*
+    /**
      * Returns true after the balancer has completed a balancing round.
      *
      * Checks that three pings were sent to config.mongos. The balancer writes a ping
@@ -707,18 +742,6 @@ var ShardingTest = function(params) {
             db = oldDB;
             return false;
         }
-    };
-
-    this.isAnyBalanceInFlight = function() {
-        if (this.config.locks.find({_id: {$ne: "balancer"}, state: 2}).count() > 0)
-            return true;
-
-        var allCurrent = this.s.getDB("admin").currentOp().inprog;
-        for (var i = 0; i < allCurrent.length; i++) {
-            if (allCurrent[i].desc && allCurrent[i].desc.indexOf("cleanupOldData") == 0)
-                return true;
-        }
-        return false;
     };
 
     /**
@@ -1007,12 +1030,11 @@ var ShardingTest = function(params) {
         numConfigs = tempCount;
     }
 
-    otherParams.extraOptions = otherParams.extraOptions || {};
     otherParams.useHostname = otherParams.useHostname == undefined ? true : otherParams.useHostname;
     otherParams.useBridge = otherParams.useBridge || false;
     otherParams.bridgeOptions = otherParams.bridgeOptions || {};
 
-    var keyFile = otherParams.keyFile || otherParams.extraOptions.keyFile;
+    var keyFile = otherParams.keyFile;
     var hostName = getHostName();
 
     this._testName = testName;
@@ -1267,7 +1289,6 @@ var ShardingTest = function(params) {
         }
 
         options = Object.merge(options, otherParams.mongosOptions);
-        options = Object.merge(options, otherParams.extraOptions);
         options = Object.merge(options, otherParams["s" + i]);
 
         options.port = options.port || allocatePort();
@@ -1307,34 +1328,14 @@ var ShardingTest = function(params) {
         this["s" + i] = this._mongos[i];
     }
 
-    // If auth is enabled for the test, login the mongos connections as system in order to
-    // configure the instances and then log them out again.
+    _extendWithShMethods();
 
-    function configureCluster() {
-        // Disable the balancer unless it is explicitly turned on
-        if (!otherParams.enableBalancer) {
-            self.stopBalancer();
-        }
-
-        // Lower the mongos replica set monitor's threshold for deeming RS shard hosts as
-        // inaccessible in order to speed up tests, which shutdown entire shards and check for
-        // errors. This attempt is best-effort and failure should not have effect on the actual
-        // test execution, just the execution time.
-        self._mongos.forEach(function(mongos) {
-            var res = mongos.adminCommand({setParameter: 1, replMonitorMaxFailedChecks: 2});
-
-            // For tests, which use x509 certificate for authentication, the command above will not
-            // work due to authorization error.
-            if (res.code != ErrorCodes.Unauthorized) {
-                assert.commandWorked(res);
-            }
-        });
-    }
-
+    // If auth is enabled for the test, login the mongos connections as system in order to configure
+    // the instances and then log them out again.
     if (keyFile) {
-        authutil.asCluster(this._mongos, keyFile, configureCluster);
+        authutil.asCluster(this._mongos, keyFile, _configureCluster);
     } else {
-        configureCluster();
+        _configureCluster();
     }
 
     try {

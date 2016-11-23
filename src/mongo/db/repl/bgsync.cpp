@@ -56,11 +56,9 @@
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/thread_pool.h"
-#include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -113,6 +111,9 @@ bool DataReplicatorExternalStateBackgroundSync::shouldStopFetching(
 std::unique_ptr<ThreadPool> makeThreadPool() {
     ThreadPool::Options threadPoolOptions;
     threadPoolOptions.poolName = "rsBackgroundSync";
+    threadPoolOptions.onCreateThread = [](const std::string& threadName) {
+        Client::initThread(threadName.c_str());
+    };
     return stdx::make_unique<ThreadPool>(threadPoolOptions);
 }
 
@@ -143,48 +144,74 @@ static ServerStatusMetricField<Counter64> displayBufferCount("repl.buffer.count"
 static Counter64 bufferSizeGauge;
 static ServerStatusMetricField<Counter64> displayBufferSize("repl.buffer.sizeBytes",
                                                             &bufferSizeGauge);
-// The max size (bytes) of the buffer
-static int bufferMaxSizeGauge = 256 * 1024 * 1024;
-static ServerStatusMetricField<int> displayBufferMaxSize("repl.buffer.maxSizeBytes",
-                                                         &bufferMaxSizeGauge);
+// The max size (bytes) of the buffer. If the buffer does not have a size constraint, this is
+// set to 0.
+static Counter64 bufferMaxSizeGauge;
+static ServerStatusMetricField<Counter64> displayBufferMaxSize("repl.buffer.maxSizeBytes",
+                                                               &bufferMaxSizeGauge);
 
 
-BackgroundSync::BackgroundSync()
-    : _buffer(bufferMaxSizeGauge, &getSize),
+BackgroundSync::BackgroundSync(
+    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
+    std::unique_ptr<OplogBuffer> oplogBuffer)
+    : _oplogBuffer(std::move(oplogBuffer)),
       _threadPoolTaskExecutor(makeThreadPool(),
                               executor::makeNetworkInterface("NetworkInterfaceASIO-BGSync")),
       _replCoord(getGlobalReplicationCoordinator()),
+      _replicationCoordinatorExternalState(replicationCoordinatorExternalState),
       _syncSourceResolver(_replCoord),
       _lastOpTimeFetched(Timestamp(std::numeric_limits<int>::max(), 0),
-                         std::numeric_limits<long long>::max()) {}
+                         std::numeric_limits<long long>::max()) {
+    // Update "repl.buffer.maxSizeBytes" server status metric to reflect the current oplog buffer's
+    // max size.
+    bufferMaxSizeGauge.increment(_oplogBuffer->getMaxSize() - bufferMaxSizeGauge.get());
+}
 
-void BackgroundSync::shutdown() {
+void BackgroundSync::startup(OperationContext* txn) {
+    _oplogBuffer->startup(txn);
+    _threadPoolTaskExecutor.startup();
+
+    invariant(!_producerThread);
+    _producerThread.reset(new stdx::thread(stdx::bind(&BackgroundSync::_run, this)));
+}
+
+void BackgroundSync::shutdown(OperationContext* txn) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
     // Clear the buffer in case the producerThread is waiting in push() due to a full queue.
-    invariant(inShutdown());
-    clearBuffer();
+    clearBuffer(txn);
     _stopped = true;
 
     if (_oplogFetcher) {
         _oplogFetcher->shutdown();
     }
+
+    _inShutdown = true;
 }
 
-void BackgroundSync::producerThread(
-    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState) {
+void BackgroundSync::join(OperationContext* txn) {
+    _producerThread->join();
+    _threadPoolTaskExecutor.shutdown();
+    _threadPoolTaskExecutor.join();
+    _oplogBuffer->shutdown(txn);
+}
+
+bool BackgroundSync::inShutdown() const {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _inShutdown_inlock();
+}
+
+bool BackgroundSync::_inShutdown_inlock() const {
+    return _inShutdown;
+}
+
+void BackgroundSync::_run() {
     Client::initThread("rsBackgroundSync");
     AuthorizationSession::get(cc())->grantInternalAuthorization();
 
-    _threadPoolTaskExecutor.startup();
-    ON_BLOCK_EXIT([this]() {
-        _threadPoolTaskExecutor.shutdown();
-        _threadPoolTaskExecutor.join();
-    });
-
     while (!inShutdown()) {
         try {
-            _producerThread(replicationCoordinatorExternalState);
+            _runProducer();
         } catch (const DBException& e) {
             std::string msg(str::stream() << "sync producer problem: " << e.toString());
             error() << msg;
@@ -198,20 +225,19 @@ void BackgroundSync::producerThread(
     stop();
 }
 
-void BackgroundSync::_signalNoNewDataForApplier() {
+void BackgroundSync::_signalNoNewDataForApplier(OperationContext* txn) {
     // Signal to consumers that we have entered the stopped state
     // if the signal isn't already in the queue.
-    const boost::optional<BSONObj> lastObjectPushed = _buffer.lastObjectPushed();
+    const boost::optional<BSONObj> lastObjectPushed = _oplogBuffer->lastObjectPushed(txn);
     if (!lastObjectPushed || !lastObjectPushed->isEmpty()) {
         const BSONObj sentinelDoc;
-        _buffer.pushEvenIfFull(sentinelDoc);
+        _oplogBuffer->pushEvenIfFull(txn, sentinelDoc);
         bufferCountGauge.increment();
         bufferSizeGauge.increment(sentinelDoc.objsize());
     }
 }
 
-void BackgroundSync::_producerThread(
-    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState) {
+void BackgroundSync::_runProducer() {
     const MemberState state = _replCoord->getMemberState();
     // Stop when the state changes to primary.
     if (_replCoord->isWaitingForApplierToDrain() || state.primary()) {
@@ -219,7 +245,8 @@ void BackgroundSync::_producerThread(
             stop();
         }
         if (_replCoord->isWaitingForApplierToDrain()) {
-            _signalNoNewDataForApplier();
+            auto txn = cc().makeOperationContext();
+            _signalNoNewDataForApplier(txn.get());
         }
         sleepsecs(1);
         return;
@@ -239,18 +266,15 @@ void BackgroundSync::_producerThread(
     }
     // we want to start when we're no longer primary
     // start() also loads _lastOpTimeFetched, which we know is set from the "if"
-    const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-    OperationContext& txn = *txnPtr;
+    auto txn = cc().makeOperationContext();
     if (isStopped()) {
-        start(&txn);
+        start(txn.get());
     }
 
-    _produce(&txn, replicationCoordinatorExternalState);
+    _produce(txn.get());
 }
 
-void BackgroundSync::_produce(
-    OperationContext* txn,
-    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState) {
+void BackgroundSync::_produce(OperationContext* txn) {
     // this oplog reader does not do a handshake because we don't want the server it's syncing
     // from to track how far it has synced
     {
@@ -264,7 +288,7 @@ void BackgroundSync::_produce(
         }
 
         if (_replCoord->isWaitingForApplierToDrain() || _replCoord->getMemberState().primary() ||
-            inShutdownStrict()) {
+            _inShutdown_inlock()) {
             return;
         }
     }
@@ -331,7 +355,7 @@ void BackgroundSync::_produce(
     // "lastFetched" not used. Already set in _enqueueDocuments.
     Status fetcherReturnStatus = Status::OK();
     DataReplicatorExternalStateBackgroundSync dataReplicatorExternalState(
-        _replCoord, replicationCoordinatorExternalState, this);
+        _replCoord, _replicationCoordinatorExternalState, this);
     OplogFetcher* oplogFetcher;
     try {
         auto config = _replCoord->getConfig();
@@ -477,6 +501,8 @@ void BackgroundSync::_enqueueDocuments(Fetcher::Documents::const_iterator begin,
                                        Fetcher::Documents::const_iterator end,
                                        const OplogFetcher::DocumentsInfo& info,
                                        Milliseconds getMoreElapsed) {
+    auto txn = cc().makeOperationContext();
+
     // If this is the first batch of operations returned from the query, "toApplyDocumentCount" will
     // be one fewer than "networkDocumentCount" because the first document (which was applied
     // previously) is skipped.
@@ -486,14 +512,14 @@ void BackgroundSync::_enqueueDocuments(Fetcher::Documents::const_iterator begin,
     }
 
     // Wait for enough space.
-    _buffer.waitForSpace(info.toApplyDocumentBytes);
+    _oplogBuffer->waitForSpace(txn.get(), info.toApplyDocumentBytes);
 
     OCCASIONALLY {
-        LOG(2) << "bgsync buffer has " << _buffer.size() << " bytes";
+        LOG(2) << "bgsync buffer has " << _oplogBuffer->getSize() << " bytes";
     }
 
     // Buffer docs for later application.
-    _buffer.pushAllNonBlocking(begin, end);
+    _oplogBuffer->pushAllNonBlocking(txn.get(), begin, end);
 
     // Update last fetched info.
     {
@@ -506,21 +532,21 @@ void BackgroundSync::_enqueueDocuments(Fetcher::Documents::const_iterator begin,
     _recordStats(info, getMoreElapsed);
 }
 
-bool BackgroundSync::peek(BSONObj* op) {
-    return _buffer.peek(*op);
+bool BackgroundSync::peek(OperationContext* txn, BSONObj* op) {
+    return _oplogBuffer->peek(txn, op);
 }
 
-void BackgroundSync::waitForMore() {
+void BackgroundSync::waitForMore(OperationContext* txn) {
     BSONObj op;
     // Block for one second before timing out.
     // Ignore the value of the op we peeked at.
-    _buffer.blockingPeek(op, 1);
+    _oplogBuffer->blockingPeek(txn, &op, Seconds(1));
 }
 
-void BackgroundSync::consume() {
+void BackgroundSync::consume(OperationContext* txn) {
     // this is just to get the op off the queue, it's been peeked at
     // and queued for application already
-    BSONObj op = _buffer.blockingPop();
+    BSONObj op = _oplogBuffer->blockingPop(txn);
     bufferCountGauge.decrement(1);
     bufferSizeGauge.decrement(getSize(op));
 }
@@ -536,11 +562,11 @@ void BackgroundSync::_rollback(OperationContext* txn,
                                _replCoord);
     if (status.isOK()) {
         // When the syncTail thread sees there is no new data by adding something to the buffer.
-        _signalNoNewDataForApplier();
+        _signalNoNewDataForApplier(txn);
         // Wait until the buffer is empty.
         // This is an indication that syncTail has removed the sentinal marker from the buffer
         // and reset its local lastAppliedOpTime via the replCoord.
-        while (!_buffer.empty()) {
+        while (!_oplogBuffer->isEmpty()) {
             sleepmillis(10);
             if (inShutdown()) {
                 return;
@@ -596,7 +622,7 @@ void BackgroundSync::stop() {
 }
 
 void BackgroundSync::start(OperationContext* txn) {
-    massert(16235, "going to start syncing, but buffer is not empty", _buffer.empty());
+    massert(16235, "going to start syncing, but buffer is not empty", _oplogBuffer->isEmpty());
 
     long long lastFetchedHash = _readLastAppliedHash(txn);
     stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -614,8 +640,8 @@ bool BackgroundSync::isStopped() const {
     return _stopped;
 }
 
-void BackgroundSync::clearBuffer() {
-    _buffer.clear();
+void BackgroundSync::clearBuffer(OperationContext* txn) {
+    _oplogBuffer->clear(txn);
     const auto count = bufferCountGauge.get();
     bufferCountGauge.decrement(count);
     const auto size = bufferSizeGauge.get();
@@ -683,8 +709,8 @@ bool BackgroundSync::shouldStopFetching() const {
     return false;
 }
 
-void BackgroundSync::pushTestOpToBuffer(const BSONObj& op) {
-    _buffer.push(op);
+void BackgroundSync::pushTestOpToBuffer(OperationContext* txn, const BSONObj& op) {
+    _oplogBuffer->push(txn, op);
     bufferCountGauge.increment();
     bufferSizeGauge.increment(op.objsize());
 }

@@ -24,8 +24,7 @@ env.Library(
     ],
     LIBDEPS_TAGS=[
         # Circular with both coreshard and coredb! Also relies on some
-        # symbols like usingAShardConnection that are not uniquely
-        # defined.
+        # symbols that are not uniquely defined.
         'incomplete',
     ],
 )
@@ -79,6 +78,8 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/s/shard_id',
+        '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
     ]
 )
 
@@ -108,5 +109,4 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
     ],
-    NO_CRUTCH = True,
 )

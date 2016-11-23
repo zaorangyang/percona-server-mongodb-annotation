@@ -57,6 +57,7 @@ DEFAULTS = {
     "shellWriteMode": None,
     "shuffle": False,
     "storageEngine": None,
+    "storageEngineCacheSizeGB": None,
     "wiredTigerCollectionConfigString": None,
     "wiredTigerEngineConfigString": None,
     "wiredTigerIndexConfigString": None
@@ -153,6 +154,10 @@ SHUFFLE = None
 STORAGE_ENGINE = None
 
 # If set, then all mongod's started by resmoke.py and by the mongo shell will use the specified
+# storage engine cache size.
+STORAGE_ENGINE_CACHE_SIZE = None
+
+# If set, then all mongod's started by resmoke.py and by the mongo shell will use the specified
 # WiredTiger collection configuration settings.
 WT_COLL_CONFIG = None
 
@@ -180,3 +185,7 @@ DEFAULT_INTEGRATION_TEST_LIST = "build/integration_tests.txt"
 EXTERNAL_SUITE_SELECTORS = [DEFAULT_UNIT_TEST_LIST,
                             DEFAULT_INTEGRATION_TEST_LIST,
                             DEFAULT_DBTEST_EXECUTABLE]
+
+# This is used internally to store the executor name that is passed on the command line.
+# Specifically it's used to record in the logs which executor a test is being run under.
+INTERNAL_EXECUTOR_NAME = None

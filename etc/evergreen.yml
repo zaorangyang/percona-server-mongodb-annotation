@@ -22,6 +22,21 @@
 stepback: true
 command_type: system
 
+# Files that match an ignore-list pattern will not trigger a build, if they're the only modified
+# files in the patch.
+ignore:
+  - ".*"
+  - "!.clang-format"
+  - "!.eslintrc.yml"
+  - "*.md"
+  - "*.rst"
+  - "*.txt"
+  - "/distsrc/**"
+  - "/docs/**"
+  - "/etc/*.yml"
+  - "!/etc/evergreen.yml"
+  - "README"
+
 ## Some variables for convenience:
 variables:
 
@@ -39,6 +54,8 @@ variables:
       max_jobs: 0  # If set in combination with run_multiple_jobs, will cap the number of jobs used.
 
 - &jepsen_config_vars
+  hang_analyzer_processes: "java"
+  jepsen_key_time_limit: --key-time-limit 15
   jepsen_protocol_version: --protocol-version 1
   jepsen_read_concern: ""
   jepsen_read_with_find_and_modify: ""
@@ -85,7 +102,6 @@ variables:
 - &debug_symbol_variants
   - enterprise-linux-64-amazon-ami
   - enterprise-osx-107
-  - enterprise-rhel-57-64-bit
   - enterprise-rhel-62-64-bit
   - enterprise-rhel-70-64-bit
   - enterprise-rhel-71-ppc64le
@@ -99,7 +115,6 @@ variables:
   - enterprise-debian81-64
   - linux-64
   - amazon
-  - rhel55
   - rhel62
   - rhel70
   - suse11
@@ -119,7 +134,6 @@ variables:
 
 - &packaging_variants
   - enterprise-linux-64-amazon-ami
-  - enterprise-rhel-57-64-bit
   - enterprise-rhel-62-64-bit
   - enterprise-rhel-70-64-bit
   - enterprise-rhel-71-ppc64le
@@ -131,7 +145,6 @@ variables:
   - enterprise-ubuntu1604-64
   - enterprise-debian71-64
   - enterprise-debian81-64
-  - rhel55
   - rhel62
   - rhel70
   - suse11
@@ -255,29 +268,20 @@ functions:
   "build new tools" :
     command: shell.exec
     params:
-      working_dir: src
+      working_dir: src/mongo-tools
       script: |
         set -o verbose
         set -o errexit
-
-        # create the target directory for the binaries
-        mkdir -p src/mongo-tools
-
-        # clone into a different path so the binaries and package directory
-        # names do not conflict
-        ${gitvars} git clone https://github.com/mongodb/mongo-tools.git src/mongo-tools-repo
-        cd src/mongo-tools-repo
 
         # make sure newlines in the scripts are handled correctly by windows
         if [ "Windows_NT" = "$OS" ]; then
             set -o igncr
         fi;
 
-        git checkout v3.3
         . ./${set_tools_gopath|set_gopath.sh}
 
         for i in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog; do
-             ${gorootvars} go build -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec $(git rev-parse HEAD) -X github.com/mongodb/mongo-tools/common/options.VersionStr $(git --git-dir ../../.git describe)" ${tooltags|} -o "../mongo-tools/$i${exe|}" $i/main/$i.go
+             ${gorootvars} go build -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec $(git rev-parse HEAD) -X github.com/mongodb/mongo-tools/common/options.VersionStr $(git --git-dir ../.git describe)" ${tooltags|} -o "../src/mongo-tools/$i${exe|}" $i/main/$i.go
              echo $i;
         done
 
@@ -337,7 +341,14 @@ functions:
           extra_args="$extra_args --continueOnFailure"
         fi
 
-        ${path_prefix} ${san_symbolizer} ${san_options} ${rlp_environment} ${python|python} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json
+        # Default storageEngineCacheSizeGB to 1. Override on individual test config if needed.
+        # resmoke will assign to the appropriate parameter on storage engines that support it.
+        if [[ "${resmoke_args}" != *storageEngineCacheSizeGB* ]]; then
+          extra_args="$extra_args --storageEngineCacheSizeGB=1"
+        fi
+
+        ${resmoke_wrapper} ${path_prefix} ${san_symbolizer} ${san_options} ${rlp_environment} ${python|python} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json
+
 
   "do jepsen setup" :
     - command: shell.exec
@@ -353,15 +364,24 @@ functions:
       params:
         working_dir: src
         script: |
-          set -o errexit
           # On each LXC host do the following:
           #   Copy the mongodb tarball to /root
           numVms=5
+          exit_failure_code=0
+          ${set_sudo}
           for i in $(seq 1 $numVms)
           do
             hostn=n$i
-            sudo cp -f mongo-binaries.tgz /var/lib/lxc/$hostn/rootfs/root/
+            scp mongo-binaries.tgz root@$hostn:
+            exit_code=$?
+            # If the copy fails, then tail the LXC host log.
+            if [ $exit_code -ne 0 ]; then
+              exit_failure_code=$exit_code
+              echo "Copy to host $hostn failed!"
+              $sudo tail /var/log/lxc/$hostn.log
+            fi
           done
+          exit $exit_failure_code
 
   "run jepsen test" :
     - command: shell.exec
@@ -370,9 +390,9 @@ functions:
         script: |
           set -o verbose
           set -o errexit
-          # Increase JVM heap space to 75% of total free memory
-          heap_space=$(awk '/MemFree:/{printf "%0dm\n",$2*0.75/1024}' /proc/meminfo)
-          sed -i -e "s/\"-Xmx.*\"/\"-Xmx$heap_space\"/" project.clj
+          # Set/modify JVM heap space settings.
+          jvm_settings="\"-Xmx16g\"\n             \"-Xms16g\"\n             \"-Xmn4g\""
+          sed -i -e "s/\"-Xmx.*\"/$jvm_settings/" project.clj
     - command: shell.exec
       type: test
       timeout_secs: 2700 # Timeout test if there is no output for more than 45 minutes.
@@ -381,7 +401,7 @@ functions:
         script: |
           set -o verbose
           start_time=$(date +%s)
-          lein run --tarball "file:///root/mongo-binaries.tgz" ${jepsen_protocol_version} ${jepsen_read_concern} ${jepsen_read_with_find_and_modify} ${jepsen_storage_engine} ${jepsen_time_limit} ${jepsen_write_concern}
+          lein run --tarball "file:///root/mongo-binaries.tgz" ${jepsen_key_time_limit} ${jepsen_protocol_version} ${jepsen_read_concern} ${jepsen_read_with_find_and_modify} ${jepsen_storage_engine} ${jepsen_time_limit} ${jepsen_write_concern}
           exit_code=$?
           # Create exit_code file, so we can signal an error, after the archive/put steps have run.
           echo $exit_code > ../../jepsen-exit_code-${task_id}-${execution}.txt
@@ -396,6 +416,29 @@ functions:
           fi
           # Create report.json
           echo "{\"failures\": $failures, \"results\": [{\"status\": $status, \"exit_code\": $exit_code, \"test_file\": \"${task_name}\", \"start\": $start_time, \"end\": $end_time, \"elapsed\": $elapsed_secs}]}" > ../../report.json
+    - command: shell.exec
+      params:
+        working_dir: src/jepsen/mongodb
+        script: |
+          # Copy mongod.log from each LXC host for archive purposes
+          numVms=5
+          for i in $(seq 1 $numVms)
+          do
+            hostn=n$i
+            if [ ! -d store/latest ]; then
+              echo "Creating the store/latest directory, which was not created by Jepsen"
+              mkdir -p store/latest
+            fi
+            mongod_log=store/latest/mongod-$hostn.log
+            scp root@$hostn:mongod.log $mongod_log
+            if [ -f $mongod_log ]; then
+              echo "Copied mongod.log from $hostn to $mongod_log"
+            else
+              echo "Failed to copy mongod.log from $hostn to $mongod_log"
+            fi
+          done
+          # Always exit without an error so the archive steps will run.
+          exit 0
     - command: archive.targz_pack
       params:
         target: "src/jepsen-results.tgz"
@@ -429,11 +472,6 @@ functions:
 
           git clone git@github.com:10gen/jstestfuzz.git
 
-          if [ "Windows_NT" != "$OS" ]; then
-            ${python|python} jstestfuzz/etc/download_nodejs.py
-            ${decompress} node.tar.gz > /dev/null
-          fi
-
           cp mongodb*/bin/mongod .
     - command: shell.exec
       params:
@@ -459,8 +497,7 @@ functions:
             export APPDATA=${workdir}/npm-app-data
             export PATH="$PATH:/cygdrive/c/Program Files (x86)/nodejs" # Windows location
           else
-            export PATH="$PATH:/opt/node/bin" # OS X location
-            export PATH="$PATH:${workdir}/src/node-v0.12.7-linux-x64/bin" # Linux location
+            export PATH="$PATH:/opt/node/bin"
           fi
 
           npm start -- --jsTestsDir ../jstests
@@ -500,7 +537,7 @@ functions:
     params:
       silent: true
       script: |
-        process_kill_list="(mongo|bsondump|python|lldb|_test$|^cl\.exe$|_test\.exe$)"
+        process_kill_list="(^cl\.exe$|bsondump|java|lein|lldb|mongo|python|_test$|_test\.exe$)"
         # Exclude Evergreen agent processes
         process_exclude_list="(main)"
 
@@ -558,6 +595,25 @@ functions:
 pre:
   - command: shell.track
   - func: "kill processes"
+  - command: expansions.update
+    params:
+       updates:
+       - key: set_sudo
+         value: |
+          set -o | grep errexit | grep on
+          errexit_on=$?
+          # Set errexit "off".
+          set +o errexit
+          sudo=
+          # Use sudo, if it is supported.
+          sudo date > /dev/null 2>&1
+          if [ $? -eq 0 ]; then
+            sudo=sudo
+          fi
+          # Set errexit "on", if previously enabled.
+          if [ $errexit_on -eq 0 ]; then
+            set -o errexit
+          fi
   - command: shell.exec
     params:
       script: |
@@ -565,6 +621,22 @@ pre:
         set -o verbose
 
         rm -rf src /data/db/* mongo-coredumps.tgz
+  - command: shell.exec
+    params:
+      system_log: true
+      script: |
+        set -o errexit
+        set -o verbose
+
+        ulimit -a
+        # Clear the dmesg ring buffer. The "post" phase will check dmesg for OOM messages.
+        ${set_sudo}
+        $sudo dmesg --clear > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+          echo "Cleared the dmesg ring buffer"
+        else
+          echo "Could not clear the dmesg ring buffer"
+        fi
 
 post:
   - command: attach.results
@@ -577,6 +649,15 @@ post:
       source_dir: "./"
       include:
         - "./**.mdmp"
+  # Using shell and tar to recurse properly to all possible diagnostic.data subdirectories.  The
+  # archive.targz_pack command is not being used here because the command's glob support did not
+  # allow us to gather all directories.
+  - command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        set -o verbose
+        ${tar|tar} cvzf diagnostic-data.tgz $(find /data/db -type d -name diagnostic.data)
   - command: s3.put
     params:
       aws_key: ${aws_key}
@@ -588,6 +669,41 @@ post:
       content_type: ${content_type|application/x-gzip}
       display_name: Core Dumps - Execution ${execution}
       optional: true
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/diagnostic-data.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/ftdc/mongo-diagnostic-data-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: FTDC Diagnostic Data - Execution ${execution}
+      optional: true
+  - command: shell.exec
+    params:
+      system_log: true
+      working_dir: src # Temporary files created in src will be cleaned up in "pre".
+      script: |
+        ${set_sudo}
+        # Use dmesg -T option, if supported, to display timestamps.
+        dmesg=dmesg
+        dmesg -T > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+          dmesg="dmesg -T"
+        fi
+        $sudo $dmesg 2> /dev/null > dmesg.txt
+        if [ $? -ne 0 ]; then
+          echo "Cannot check for OOM (Out of memory) killed processes on this platform"
+          exit 0
+        fi
+        egrep -i '(Out of memory|OOM[- ]killer|Killed process)' dmesg.txt > oom.txt
+        if [ -s oom.txt ]; then
+          echo "OOM (Out of memory) killed processes detected"
+          cat oom.txt
+        else
+          echo "No OOM (Out of memory) killed processes detected"
+        fi
   - command: shell.cleanup
 
 timeout:
@@ -595,8 +711,10 @@ timeout:
     params:
       working_dir: src
       script: |
-        echo "Calling the hang analyzer..."
-        PATH=/opt/mongodbtoolchain/bin:$PATH python buildscripts/hang_analyzer.py
+        set -o verbose
+        hang_analyzer_option="-p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test}"
+        echo "Calling the hang analyzer: python buildscripts/hang_analyzer.py $hang_analyzer_option"
+        PATH=/opt/mongodbtoolchain/bin:$PATH python buildscripts/hang_analyzer.py $hang_analyzer_option
 
 #######################################
 #               Tasks                 #
@@ -614,6 +732,7 @@ tasks:
         directory: src
         revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
           enterprise: ${enterprise_rev}
+          mongo-tools: ${mongo-tools_rev}
           rocksdb: ${rocksdb_rev}
     - command: git.apply_patch
       params:
@@ -669,6 +788,9 @@ tasks:
             ${strip_command|/usr/bin/strip} dbtest
             ${strip_command|/usr/bin/strip} mongobridge
           fi
+
+          # Capture a list of new and modified tests.
+          ${python|python} buildscripts/burn_in_tests.py --reportFile=jstests/new_tests.json --noExec
 
           # On windows we need to make sure the paths in unittests.txt are compatible with cygwin tar
           sed 's|\\|/|g' build/unittests.txt > build/unittests-tarlist.txt
@@ -767,6 +889,7 @@ tasks:
         directory: src
         revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
           enterprise: ${enterprise_rev}
+          mongo-tools: ${mongo-tools_rev}
           rocksdb: ${rocksdb_rev}
     - command: git.apply_patch
       params:
@@ -780,6 +903,22 @@ tasks:
           set -o verbose
           ${scons|scons} ${compile_flags|} lint
 
+- <<: *task_template
+  name: burn_in_tests_WT
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      burn_msg: This task is currently only configured for patch builds.
+      burn_patch_check: if [ "${is_patch}" != "true" ]; then echo ${burn_msg}; exit 0; fi;
+      path_prefix: PATH=$PATH:/data/multiversion
+      resmoke_wrapper: ${burn_patch_check} ${python|python} buildscripts/burn_in_tests.py --testListFile=jstests/new_tests.json
+      resmoke_args: --repeat=2
+      run_multiple_jobs: true
+
 ## jepsen WT ##
 - <<: *run_jepsen_template
   name: jepsen_findAndModify_WT
@@ -789,6 +928,7 @@ tasks:
   - func: "run jepsen test"
     vars:
       <<: *jepsen_config_vars
+      hang_analyzer_processes: "java"
       jepsen_read_with_find_and_modify: --read-with-find-and-modify
       jepsen_storage_engine: --storage-engine wiredTiger
 
@@ -800,6 +940,7 @@ tasks:
   - func: "run jepsen test"
     vars:
       <<: *jepsen_config_vars
+      hang_analyzer_processes: "java"
       jepsen_read_with_find_and_modify: --read-with-find-and-modify
       jepsen_storage_engine: --storage-engine wiredTiger
       jepsen_time_limit: --time-limit 150
@@ -812,6 +953,7 @@ tasks:
   - func: "run jepsen test"
     vars:
       <<: *jepsen_config_vars
+      hang_analyzer_processes: "java"
       jepsen_read_with_find_and_modify: --read-with-find-and-modify
       jepsen_storage_engine: --storage-engine wiredTiger
       jepsen_time_limit: --time-limit 600
@@ -1198,6 +1340,15 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=integration_tests_replset
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: external_auth_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=external_auth --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -2476,6 +2627,11 @@ modules:
   prefix: src/mongo/db/modules
   branch: master
 
+- name: mongo-tools
+  repo: git@github.com:mongodb/mongo-tools.git
+  prefix: .
+  branch: v3.3
+
 - name: rocksdb
   repo: git@github.com:mongodb-partners/mongo-rocks.git
   prefix: src/mongo/db/modules
@@ -2493,24 +2649,23 @@ buildvariants:
 
 - name: linux-64
   display_name: Linux
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
-  - rhel55
-  - rhel55-test
+  - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --release
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
@@ -2614,20 +2769,20 @@ buildvariants:
 - name: linux-64-repeated-execution
   stepback: false
   display_name: ~ Linux Repeated Execution
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
-  - rhel55-test
+  - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --release
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --repeat=10 --shuffle
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel62-large
   - name: dbtest
   - name: dbtest_WT
   - name: integration_tests_standalone
@@ -2645,24 +2800,23 @@ buildvariants:
 
 - name: linux-64-debug
   display_name: Linux DEBUG
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
-  - rhel55
-  - rhel55-test
+  - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux-debug
     push_arch: x86_64
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
@@ -2702,28 +2856,28 @@ buildvariants:
     # Some concurrency workloads require a lot of memory, so we use machines
     # with more RAM for these suites.
     distros:
-    - rhel55
+    - rhel62-large
   - name: concurrency_WT
     distros:
-    - rhel55
+    - rhel62-large
   - name: concurrency_replication
     distros:
-    - rhel55
+    - rhel62-large
   - name: concurrency_replication_WT
     distros:
-    - rhel55
+    - rhel62-large
   - name: concurrency_sharded
     distros:
-    - rhel55
+    - rhel62-large
   - name: concurrency_sharded_WT
     distros:
-    - rhel55
+    - rhel62-large
   - name: concurrency_simultaneous
     distros:
-    - rhel55
+    - rhel62-large
   - name: concurrency_simultaneous_WT
     distros:
-    - rhel55
+    - rhel62-large
   - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
@@ -2750,25 +2904,24 @@ buildvariants:
 
 - name: linux-64-duroff
   display_name: Linux (No Journal)
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
-  - rhel55
-  - rhel55-test
+  - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux-duroff
     push_arch: x86_64
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --nojournal --excludeWithAnyTags=requires_journaling
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
@@ -2817,20 +2970,20 @@ buildvariants:
 - name: linux-64-lsm
   stepback: false
   display_name: Linux LSM
+  modules:
+  - mongo-tools
   run_on:
-  - rhel55
-  - rhel55-test
+  - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --release
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --wiredTigerCollectionConfig=type=lsm --wiredTigerIndexConfig=type=lsm
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel62-large
   - name: aggregation_WT
   - name: auth_WT
   - name: dbtest_WT
@@ -2869,7 +3022,8 @@ buildvariants:
 
 - name: ubuntu1204
   display_name: SSL Ubuntu 12.04
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - ubuntu1204-test
   batchtime: 1440 # 1 day
@@ -2879,7 +3033,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-ubuntu1204
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1204 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1204 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -2978,7 +3132,8 @@ buildvariants:
 
 - name: ubuntu1404
   display_name: SSL Ubuntu 14.04
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - ubuntu1404-test
   batchtime: 1440 # 1 day
@@ -2988,7 +3143,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-ubuntu1404
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -3091,7 +3246,8 @@ buildvariants:
 
 - name: ubuntu1604
   display_name: SSL Ubuntu 16.04
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - ubuntu1604-test
   batchtime: 1440 # 1 day
@@ -3101,7 +3257,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-ubuntu1604
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -3203,6 +3359,7 @@ buildvariants:
   display_name: "* Enterprise Amazon Linux"
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - linux-64-amzn-test
   expansions:
@@ -3211,7 +3368,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: x86_64-enterprise-amzn64
-    compile_flags: --ssl MONGO_DISTMOD=amzn64 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=amzn64 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -3278,7 +3435,8 @@ buildvariants:
 
 - name: amazon
   display_name: SSL Amazon Linux
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - linux-64-amzn-test
   batchtime: 1440 # 1 day
@@ -3288,7 +3446,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-amazon
-    compile_flags: --ssl MONGO_DISTMOD=amazon -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=amazon -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -3394,9 +3552,10 @@ buildvariants:
 
 - name: windows-64
   display_name: Windows Vista
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
-  - windows-64-vs2015-test
+  - windows-64-vs2015-small
   batchtime: 1440 # 1 day
   expansions:
     platform_decompress: unzip
@@ -3413,7 +3572,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: aggregation
   - name: aggregation_WT
   - name: auth
@@ -3495,9 +3654,10 @@ buildvariants:
 
 - name: windows-64-2k8
   display_name: Windows 2008R2
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
-  - windows-64-vs2015-test
+  - windows-64-vs2015-small
   batchtime: 1440 # 1 day
   expansions:
     platform_decompress: unzip
@@ -3515,7 +3675,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_read_concern_majority_passthrough_WT
@@ -3601,9 +3761,10 @@ buildvariants:
 
 - name: windows-64-2k8-debug
   display_name: "* Windows 2008R2 DEBUG"
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
-  - windows-64-vs2015-test
+  - windows-64-vs2015-small
   expansions:
     platform_decompress: unzip
     exe: ".exe"
@@ -3618,7 +3779,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_read_concern_majority_passthrough_WT
@@ -3639,7 +3800,11 @@ buildvariants:
   - name: jsCore_small_oplog
   - name: jsCore_small_oplog_WT
   - name: jsCore_small_oplog_rs
+    distros:
+    - windows-64-vs2015-large
   - name: jsCore_small_oplog_rs_WT
+    distros:
+    - windows-64-vs2015-large
   - name: mmap
   - name: mongosTest
   - name: noPassthrough
@@ -3656,39 +3821,49 @@ buildvariants:
     # Some concurrency workloads require a lot of memory, so we use machines
     # with more RAM for these suites.
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: concurrency_WT
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: concurrency_replication
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: concurrency_replication_WT
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: concurrency_sharded
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: concurrency_sharded_WT
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: concurrency_simultaneous
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: concurrency_simultaneous_WT
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: read_concern_majority_passthrough_WT
+    distros:
+    - windows-64-vs2015-large
   - name: read_only
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
   - name: replicasets
+    distros:
+    - windows-64-vs2015-large
   - name: replicasets_WT
+    distros:
+    - windows-64-vs2015-large
   - name: replication
   - name: replication_WT
   - name: sharding
+    distros:
+    - windows-64-vs2015-large
   - name: sharding_WT
+    distros:
+    - windows-64-vs2015-large
   - name: tool
   - name: tool_WT
   - name: unittests
@@ -3697,8 +3872,9 @@ buildvariants:
   display_name: "* Enterprise Windows"
   modules:
   - enterprise
+  - mongo-tools
   run_on:
-  - windows-64-vs2015-test
+  - windows-64-vs2015-small
   expansions:
     platform_decompress: unzip
     tooltags: "-tags 'ssl sasl'"
@@ -3716,7 +3892,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: audit
   - name: audit_WT
   - name: auth_audit
@@ -3724,6 +3900,7 @@ buildvariants:
   - name: dbtest
   - name: dbtest_WT
   - name: ese_WT
+  - name: external_auth_WT
   - name: jsCore
   - name: jsCore_WT
   - name: jsCore_WT_ese
@@ -3754,8 +3931,9 @@ buildvariants:
   display_name: Enterprise Windows (inMemory)
   modules:
   - enterprise
+  - mongo-tools
   run_on:
-  - windows-64-vs2015-test
+  - windows-64-vs2015-small
   batchtime: 1440 # 1 day
   expansions:
     platform_decompress: unzip
@@ -3775,14 +3953,14 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: audit
   - name: audit_WT
   - name: auth_audit
   - name: dbtest
   - name: concurrency
     distros:
-    - windows-64-vs2015-compile  # Some workloads require a lot of memory, use a bigger machine for this suite.
+    - windows-64-vs2015-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
   - name: concurrency_sharded
   - name: concurrency_simultaneous
@@ -3804,9 +3982,10 @@ buildvariants:
 
 - name: windows-64-2k8-ssl
   display_name: SSL Windows 2008R2
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
-  - windows-64-vs2015-test
+  - windows-64-vs2015-small
   batchtime: 1440 # 1 day
   expansions:
     platform_decompress: unzip
@@ -3825,7 +4004,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - windows-64-vs2015-compile
+    - windows-64-vs2015-large
   - name: aggregation
   - name: aggregation_WT
   - name: auth
@@ -3901,7 +4080,8 @@ buildvariants:
 
 - name: osx-107
   display_name: OS X 10.7
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - osx-1010
   batchtime: 1440 # 1 day
@@ -3994,7 +4174,8 @@ buildvariants:
 
 - name: osx-107-ssl
   display_name: SSL OS X 10.7
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - osx-1010
   batchtime: 1440 # 1 day
@@ -4088,7 +4269,8 @@ buildvariants:
 
 - name: osx-107-debug
   display_name: "* OS X 10.7 DEBUG"
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - osx-1010
   expansions:
@@ -4129,6 +4311,7 @@ buildvariants:
   display_name: Enterprise OS X 10.7
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - osx-1010
   batchtime: 1440 # 1 day
@@ -4173,63 +4356,13 @@ buildvariants:
 #          Redhat buildvariants           #
 ###########################################
 
-- name: enterprise-rhel-57-64-bit
-  display_name: Enterprise RHEL 5.7
-  modules:
-  - enterprise
-  run_on:
-  - rhel55-test
-  batchtime: 1440 # 1 day
-  expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl) -L/usr/lib64/sasl2" -tags 'sasl ssl'
-    push_path: linux
-    push_bucket: downloads.10gen.com
-    push_name: linux
-    push_arch: x86_64-enterprise-rhel57
-    compile_flags: --ssl MONGO_DISTMOD=rhel57 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    has_packages: true
-    packager_script: packager-enterprise.py
-    packager_arch: x86_64
-    packager_distro: rhel57
-  tasks:
-  - name: compile
-    distros:
-    - rhel55
-  - name: audit
-  - name: audit_WT
-  - name: dbtest
-  - name: dbtest_WT
-  - name: ese_WT
-  - name: jsCore
-  - name: jsCore_auth
-  - name: jstestfuzz
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_WT
-  - name: mmap
-  - name: replicasets_auth
-  - name: sasl
-  - name: sharding_auth
-  - name: snmp
-  - name: snmp_WT
-  - name: ssl
-  - name: sslSpecial
-  - name: unittests
-  - name: push
-    distros:
-    - rhel55-test
-
 - name: enterprise-rhel-62-64-bit
   display_name: "* Enterprise RHEL 6.2"
   modules:
   - enterprise
+  - mongo-tools
   run_on:
-  - rhel62-test
+  - rhel62-small
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
@@ -4238,7 +4371,7 @@ buildvariants:
     push_name: linux
     push_arch: x86_64-enterprise-rhel62
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
-    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
+    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -4246,9 +4379,12 @@ buildvariants:
     packager_distro: rhel62
   tasks:
   - name: compile
+    requires:
+    - name: burn_in_tests_WT
     distros:
-    - rhel62-build
+    - rhel62-large
   - name: lint
+  - name: burn_in_tests_WT
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -4303,7 +4439,11 @@ buildvariants:
   - name: jsCore_small_oplog
   - name: jsCore_small_oplog_WT
   - name: jsCore_small_oplog_rs
+    distros:
+    - rhel62-large
   - name: jsCore_small_oplog_rs_WT
+    distros:
+    - rhel62-large
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_replication
@@ -4322,15 +4462,27 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
+    distros:
+    - rhel62-large
   - name: read_only
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
   - name: replicasets
+    distros:
+    - rhel62-large
   - name: replicasets_WT
+    distros:
+    - rhel62-large
   - name: replicasets_WT_ese
+    distros:
+    - rhel62-large
   - name: replicasets_auth
+    distros:
+    - rhel62-large
   - name: replicasets_legacy
+    distros:
+    - rhel62-large
   - name: replication
   - name: replication_WT
   - name: replication_auth
@@ -4340,10 +4492,20 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding
+    distros:
+    - rhel62-large
   - name: sharding_WT
+    distros:
+    - rhel62-large
   - name: sharding_WT_ese
+    distros:
+    - rhel62-large
   - name: sharding_auth
+    distros:
+    - rhel62-large
   - name: sharding_auth_audit_WT
+    distros:
+    - rhel62-large
   - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd
@@ -4352,8 +4514,14 @@ buildvariants:
   - name: sharding_jscore_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_last_stable_mongos
+    distros:
+    - rhel62-large
   - name: sharding_op_query_WT
+    distros:
+    - rhel62-large
   - name: sharding_csrs_continuous_config_stepdown_WT
+    distros:
+    - rhel62-large
   - name: slow1
   - name: slow1_WT
   - name: serial_run
@@ -4373,6 +4541,7 @@ buildvariants:
   display_name: Enterprise RHEL 7.0
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - rhel70
   batchtime: 1440 # 1 day
@@ -4383,7 +4552,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: x86_64-enterprise-rhel70
-    compile_flags: --ssl MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -4404,6 +4573,7 @@ buildvariants:
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
+  - name: external_auth_WT
   - name: mmap
   - name: replicasets_auth
   - name: sasl
@@ -4417,123 +4587,12 @@ buildvariants:
     distros:
     - rhel55-test
 
-- name: rhel55
-  display_name: SSL RHEL 5.5
-  modules: ~
-  run_on:
-  - rhel55
-  - rhel55-test
-  batchtime: 1440 # 1 day
-  expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl)" -tags 'ssl'
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: x86_64-rhel55
-    compile_flags: --ssl MONGO_DISTMOD=rhel55 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: x86_64
-    packager_distro: rhel55
-  tasks:
-  - name: compile
-    distros:
-    - rhel55
-  - name: aggregation
-  - name: aggregation_WT
-  - name: aggregation_auth
-  - name: auth
-  - name: auth_WT
-  - name: dbtest
-  - name: dbtest_WT
-  - name: disk
-  - name: durability
-  - name: dur_jscore_passthrough
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth
-  - name: gle_auth_WT
-  - name: gle_auth_write_cmd
-  - name: gle_auth_write_cmd_WT
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_WT
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: jsCore
-  - name: jsCore_WT
-  - name: jsCore_auth
-  - name: jsCore_compatibility
-  - name: jsCore_compatibility_WT
-  - name: jsCore_decimal
-  - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
-  - name: jstestfuzz
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_WT
-  - name: mmap
-  - name: mongosTest
-  - name: multiversion
-  - name: noPassthrough
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
-  - name: parallel
-  - name: parallel_WT
-  - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
-  - name: sharding
-  - name: sharding_WT
-  - name: sharding_auth
-  - name: slow1
-  - name: slow1_WT
-  - name: serial_run
-  - name: serial_run_WT
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_passthrough_WT
-  - name: sharding_last_stable_mongos
-  - name: ssl
-  - name: sslSpecial
-  - name: tool
-  - name: tool_WT
-  - name: unittests
-  - name: push
-    distros:
-    - rhel55-test
-
 - name: rhel62
   display_name: SSL RHEL 6.2
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
-  - rhel62-test
+  - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
@@ -4542,7 +4601,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-rhel62
-    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -4551,7 +4610,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - rhel62-build
+    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
@@ -4641,7 +4700,8 @@ buildvariants:
 
 - name: rhel70
   display_name: SSL RHEL 7.0
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - rhel70
   batchtime: 1440 # 1 day
@@ -4652,7 +4712,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-rhel70
-    compile_flags: --ssl MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -4753,6 +4813,7 @@ buildvariants:
   display_name: Enterprise RHEL 7.1 PPC64LE
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - rhel71-power8-build
   - rhel71-power8-test
@@ -4762,7 +4823,7 @@ buildvariants:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
     # We need to compensate for SMT8 setting the cpu count very high and lower the amount of parallelism down
-    compile_flags: --ssl MONGO_DISTMOD=rhel71 --release -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=rhel71 --release -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(echo "$(grep -c processor /proc/cpuinfo)/4" | bc)
     test_flags: --continueOnFailure --excludeWithAnyTags=requires_mmapv1
     has_packages: true
@@ -4886,6 +4947,7 @@ buildvariants:
   display_name: Enterprise RHEL 7.2 s390x
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - rhel72-zseries-build
   - rhel72-zseries-test
@@ -4894,7 +4956,7 @@ buildvariants:
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
-    compile_flags: --ssl MONGO_DISTMOD=rhel72 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=rhel72 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: 2
     test_flags: --continueOnFailure --excludeWithAnyTags=requires_mmapv1
     has_packages: true
@@ -5022,6 +5084,7 @@ buildvariants:
   display_name: Enterprise Ubuntu 12.04
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - ubuntu1204-test
   batchtime: 1440 # 1 day
@@ -5032,7 +5095,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: x86_64-enterprise-ubuntu1204
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1204 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1204 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -5072,6 +5135,7 @@ buildvariants:
   display_name: Enterprise Ubuntu 14.04
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - ubuntu1404-test
   batchtime: 1440 # 1 day
@@ -5082,7 +5146,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: x86_64-enterprise-ubuntu1404
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -5125,6 +5189,7 @@ buildvariants:
   display_name: Enterprise Ubuntu 16.04
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - ubuntu1604-test
   batchtime: 1440 # 1 day
@@ -5135,7 +5200,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: x86_64-enterprise-ubuntu1604
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -5171,7 +5236,22 @@ buildvariants:
     distros:
     - rhel55-test
 
-
+- name: enterprise-ubuntu1404-clang-3.4-libc
+  display_name: "~Enterprise Ubuntu 14.04 (Clang 3.4/libc++)"
+  modules:
+  - enterprise
+  - mongo-tools
+  run_on:
+  - ubuntu1404-test
+  batchtime: 1440 # 1 day
+  expansions:
+    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
+    tooltags: "-tags 'ssl sasl'"
+    compile_flags: --ssl CC=/usr/bin/clang CXX=/usr/bin/clang++ --libc++ -j$(grep -c ^processor /proc/cpuinfo)
+  tasks:
+  - name: compile
+    distros:
+    - ubuntu1404-build
 
 ###########################################
 #          SUSE buildvariants             #
@@ -5181,6 +5261,7 @@ buildvariants:
   display_name: Enterprise SLES 12
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - suse12-test
   batchtime: 1440 # 1 day
@@ -5191,7 +5272,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: x86_64-enterprise-suse12
-    compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -5229,7 +5310,8 @@ buildvariants:
 
 - name: suse12
   display_name: SSL SUSE 12
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - suse12-test
   batchtime: 1440 # 1 day
@@ -5240,7 +5322,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-suse12
-    compile_flags: --ssl MONGO_DISTMOD=suse12 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=suse12 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -5339,6 +5421,7 @@ buildvariants:
   display_name: Enterprise SLES 11
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - suse11-test
   batchtime: 1440 # 1 day
@@ -5349,7 +5432,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: x86_64-enterprise-suse11
-    compile_flags: --ssl MONGO_DISTMOD=suse11 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=suse11 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -5387,7 +5470,8 @@ buildvariants:
 
 - name: suse11
   display_name: SSL SUSE 11
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - suse11-test
   batchtime: 1440 # 1 day
@@ -5398,7 +5482,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-suse11
-    compile_flags: --ssl MONGO_DISTMOD=suse11 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=suse11 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -5499,7 +5583,8 @@ buildvariants:
 
 - name: solaris-64-bit
   display_name: "* Solaris"
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - solaris
   expansions:
@@ -5509,7 +5594,7 @@ buildvariants:
     push_arch: x86_64
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "-lsocket -lnsl"
-    compile_flags: CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ -j$(kstat cpu | sort -u | grep -c "^module") --release CCFLAGS="-m64" LINKFLAGS="-m64 -static-libstdc++ -static-libgcc" OBJCOPY=/opt/mongodbtoolchain/bin/objcopy
+    compile_flags: CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy -j$(kstat cpu | sort -u | grep -c "^module") --release CCFLAGS="-m64" LINKFLAGS="-m64 -static-libstdc++ -static-libgcc" OBJCOPY=/opt/mongodbtoolchain/bin/objcopy
     num_jobs_available: $(kstat cpu | sort -u | grep -c "^module")
   tasks:
   - name: compile
@@ -5581,6 +5666,7 @@ buildvariants:
   display_name: Enterprise Debian 7.1
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - debian71-test
   batchtime: 1440 # 1 day
@@ -5591,7 +5677,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: x86_64-enterprise-debian71
-    compile_flags: --ssl MONGO_DISTMOD=debian71 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=debian71 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -5631,6 +5717,7 @@ buildvariants:
   display_name: Enterprise Debian 8.1
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - debian81-test
   batchtime: 1440 # 1 day
@@ -5641,7 +5728,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: x86_64-enterprise-debian81
-    compile_flags: --ssl MONGO_DISTMOD=debian81 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=debian81 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -5680,7 +5767,8 @@ buildvariants:
 
 - name: debian71
   display_name: SSL Debian 7.1
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - debian71-test
   batchtime: 1440 # 1 day
@@ -5691,7 +5779,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-debian71
-    compile_flags: --ssl MONGO_DISTMOD=debian71 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=debian71 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -5792,7 +5880,8 @@ buildvariants:
 
 - name: debian81
   display_name: SSL Debian 8.1
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
   - debian81-test
   batchtime: 1440 # 1 day
@@ -5803,7 +5892,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-debian81
-    compile_flags: --ssl MONGO_DISTMOD=debian81 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --ssl MONGO_DISTMOD=debian81 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -5910,15 +5999,16 @@ buildvariants:
   display_name: Enterprise RHEL 6.2 (inMemory)
   modules:
   - enterprise
+  - mongo-tools
   run_on:
-  - rhel62-test
+  - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling
-    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
+    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -5927,7 +6017,7 @@ buildvariants:
   tasks:
   - name: compile
     distros:
-    - rhel62-build
+    - rhel62-large
   - name: aggregation_WT
   - name: aggregation_auth
   - name: aggregation_read_concern_majority_passthrough_WT
@@ -5937,7 +6027,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
     distros:
-    - rhel62-build  # Some workloads require a lot of memory, use a bigger machine for this suite.
+    - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
   - name: concurrency_sharded
   - name: concurrency_simultaneous
@@ -5992,28 +6082,27 @@ buildvariants:
 
 - name: linux-64-ephemeralForTest
   display_name: Linux (ephemeralForTest)
-  modules: ~
+  modules:
+  - mongo-tools
   run_on:
-  - rhel55
-  - rhel55-test
+  - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    gitvars: LD_LIBRARY_PATH=/opt/openssl/lib64 #needed to workaround the old openSSL on rhel55 builders.
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
   tasks:
   - name: compile
     distros:
-    - rhel55
+    - rhel62-large
   - name: aggregation_WT
   - name: aggregation_auth
   - name: auth
   # Disabled due to SERVER-21965
   # - name: concurrency
   #   distros:
-  #   - rhel62-build  # Some workloads require a lot of memory, use a bigger machine for this suite.
+  #   - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   # - name: concurrency_replication
   # - name: concurrency_sharded
   # - name: concurrency_simultaneous
@@ -6068,6 +6157,7 @@ buildvariants:
   display_name: Enterprise RHEL 7.1 PPC64LE (inMemory) DEBUG
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - rhel71-power8-build
   - rhel71-power8-test
@@ -6077,7 +6167,7 @@ buildvariants:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
     # We need to compensate for SMT8 setting the cpu count very high and lower the amount of parallelism down
-    compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel71 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel71 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(echo "$(grep -c processor /proc/cpuinfo)/4" | bc)
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_mmapv1,requires_journaling
   tasks:
@@ -6144,6 +6234,7 @@ buildvariants:
   display_name: Enterprise RHEL 7.2 s390x (inMemory) DEBUG
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - rhel72-zseries-build
   - rhel72-zseries-test
@@ -6152,7 +6243,7 @@ buildvariants:
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
-    compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: 2
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_mmapv1,requires_journaling
   tasks:
@@ -6227,12 +6318,13 @@ buildvariants:
   display_name: Ubuntu 14.04 (RocksDB)
   modules:
   - rocksdb
+  - mongo-tools
   run_on:
   - ubuntu1404-test
   batchtime: 1440 # 1 day
   expansions:
     build_rocksdb: true
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CPPPATH=$(readlink -f ../rocksdb/include/) LIBPATH=$(readlink -f ../rocksdb/) LIBS=rocksdb CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ VARIANT_DIR=release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CPPPATH=$(readlink -f ../rocksdb/include/) LIBPATH=$(readlink -f ../rocksdb/) LIBS=rocksdb CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy VARIANT_DIR=release --runtime-hardening=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --storageEngine=rocksdb
   tasks:
@@ -6292,6 +6384,7 @@ buildvariants:
   display_name: ~ ASAN Enterprise SSL Ubuntu 14.10 DEBUG
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - ubuntu1410-build
   stepback: true
@@ -6414,6 +6507,8 @@ buildvariants:
 
 - name: ubuntu1410-asan
   display_name: ~ ASAN SSL Ubuntu 14.10
+  modules:
+  - mongo-tools
   run_on:
   - ubuntu1410-build
   stepback: true
@@ -6439,6 +6534,7 @@ buildvariants:
   display_name: ~ UBSAN Enterprise Debian 8.1 DEBUG
   modules:
   - enterprise
+  - mongo-tools
   run_on:
   - debian81-test
   stepback: true
@@ -6564,6 +6660,8 @@ buildvariants:
 
 - name: ubuntu1410-fast-clang
   display_name: ~ Clang/libc++ SSL Ubuntu 14.10
+  modules:
+  - mongo-tools
   run_on:
   - ubuntu1410-test
   stepback: false
@@ -6672,10 +6770,11 @@ buildvariants:
   display_name: "* Shared Library Enterprise Ubuntu 16.04"
   modules:
   - enterprise
+  - mongo-tools
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ --link-model=dynamic
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --link-model=dynamic
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
   tasks:
   - name: compile
@@ -6686,19 +6785,20 @@ buildvariants:
   display_name: ~ Enterprise RHEL 6.2 C++14 DEBUG
   modules:
   - enterprise
+  - mongo-tools
   run_on:
-  - rhel62-test
+  - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
-    compile_flags: --allocator=system --ssl -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on --cxx-std=14
+    compile_flags: --allocator=system --ssl -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on --cxx-std=14
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
   tasks:
   - name: compile
     distros:
-    - rhel62-build
+    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -6816,10 +6916,12 @@ buildvariants:
 
 - name: ubuntu1404-jepsen
   display_name: ~ Jepsen Ubuntu 14.04
+  modules:
+  - mongo-tools
   run_on:
   - ubuntu1404-jepsen
   expansions:
-    compile_flags: MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
+    compile_flags: MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
   tasks:
   - name: compile

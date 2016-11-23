@@ -84,7 +84,7 @@ using mongo::DocumentSourceCursor;
 
 class Base : public CollectionBase {
 public:
-    Base() : _ctx(new ExpressionContext(&_opCtx, nss)) {
+    Base() : _ctx(new ExpressionContext(&_opCtx, AggregationRequest(nss, {}))) {
         _ctx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     }
 
@@ -107,7 +107,7 @@ protected:
             getExecutor(&_opCtx, ctx.getCollection(), std::move(cq), PlanExecutor::YIELD_MANUAL));
 
         _exec->saveState();
-        _exec->registerExec();
+        _exec->registerExec(ctx.getCollection());
 
         _source = DocumentSourceCursor::create(nss.ns(), _exec, _ctx);
     }

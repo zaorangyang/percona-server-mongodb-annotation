@@ -41,8 +41,8 @@
 #include "mongo/db/commands/mr.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
@@ -93,8 +93,9 @@ BSONObj fixForShards(const BSONObj& orig,
 
         if (fn == bypassDocumentValidationCommandOption() || fn == "map" || fn == "mapreduce" ||
             fn == "mapReduce" || fn == "mapparams" || fn == "reduce" || fn == "query" ||
-            fn == "sort" || fn == "scope" || fn == "verbose" || fn == "$queryOptions" ||
-            fn == "readConcern" || fn == QueryRequest::cmdOptionMaxTimeMS) {
+            fn == "sort" || fn == "collation" || fn == "scope" || fn == "verbose" ||
+            fn == "$queryOptions" || fn == "readConcern" ||
+            fn == QueryRequest::cmdOptionMaxTimeMS) {
             b.append(e);
         } else if (fn == "out" || fn == "finalize" || fn == "writeConcern") {
             // We don't want to copy these
@@ -195,6 +196,7 @@ public:
         bool shardedOutput = false;
         NamespaceString outputCollNss;
         bool customOutDB = false;
+        bool inlineOutput = false;
 
         string outDB = dbname;
 
@@ -205,6 +207,7 @@ public:
             shardedOutput = customOut.getBoolField("sharded");
 
             if (customOut.hasField("inline")) {
+                inlineOutput = true;
                 uassert(ErrorCodes::InvalidOptions,
                         "cannot specify inline and sharded output at the same time",
                         !shardedOutput);
@@ -241,6 +244,14 @@ public:
             confOut = scopedDb.getSharedDbReference();
         } else {
             confOut = confIn;
+        }
+
+        if (confOut->getPrimaryId() == "config" && !inlineOutput) {
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::CommandNotSupported,
+                       str::stream() << "Can not execute mapReduce with output database " << outDB
+                                     << " which lives on config servers"));
         }
 
         const bool shardedInput =
@@ -469,7 +480,7 @@ public:
 
                 BSONObj sortKey = BSON("_id" << 1);
                 ShardKeyPattern sortKeyPattern(sortKey);
-                Status status = grid.catalogManager(txn)->shardCollection(
+                Status status = grid.catalogClient(txn)->shardCollection(
                     txn, outputCollNss.ns(), sortKeyPattern, true, sortedSplitPts, outShardIds);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
@@ -484,7 +495,7 @@ public:
             map<BSONObj, int> chunkSizes;
             {
                 // Take distributed lock to prevent split / migration.
-                auto scopedDistLock = grid.catalogManager(txn)->distLock(
+                auto scopedDistLock = grid.catalogClient(txn)->distLock(
                     txn, outputCollNss.ns(), "mr-post-process", kNoDistLockTimeout);
 
                 if (!scopedDistLock.isOK()) {

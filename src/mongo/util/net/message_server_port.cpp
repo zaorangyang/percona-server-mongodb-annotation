@@ -42,7 +42,6 @@
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/debug_util.h"
@@ -55,6 +54,7 @@
 #include "mongo/util/net/message_server.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/thread_idle_callback.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 
@@ -85,8 +85,10 @@ public:
      * @param opts
      * @param handler the handler to use.
      */
-    PortMessageServer(const MessageServer::Options& opts, std::shared_ptr<MessageHandler> handler)
-        : Listener("", opts.ipList, opts.port), _handler(std::move(handler)) {}
+    PortMessageServer(const MessageServer::Options& opts,
+                      std::shared_ptr<MessageHandler> handler,
+                      ServiceContext* ctx)
+        : Listener("", opts.ipList, opts.port, ctx, true), _handler(std::move(handler)) {}
 
     virtual void accepted(AbstractMessagingPort* mp) {
         ScopeGuard sleepAfterClosingPort = MakeGuard(sleepmillis, 2);
@@ -145,10 +147,6 @@ public:
             Listener::globalTicketHolder.release();
             log() << "failed to create thread after accepting new connection, closing connection";
         }
-    }
-
-    virtual void setAsTimeTracker() {
-        Listener::setAsTimeTracker();
     }
 
     virtual bool setupSockets() {
@@ -238,8 +236,9 @@ private:
 
 
 MessageServer* createServer(const MessageServer::Options& opts,
-                            std::shared_ptr<MessageHandler> handler) {
-    return new PortMessageServer(opts, std::move(handler));
+                            std::shared_ptr<MessageHandler> handler,
+                            ServiceContext* ctx) {
+    return new PortMessageServer(opts, std::move(handler), ctx);
 }
 
 }  // namespace mongo

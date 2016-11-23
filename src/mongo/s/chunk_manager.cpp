@@ -47,7 +47,7 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/chunk_diff.h"
@@ -97,8 +97,8 @@ public:
         return make_pair(chunk.getMax(), c);
     }
 
-    string shardFor(OperationContext* txn, const string& hostName) const final {
-        const auto shard = grid.shardRegistry()->getShard(txn, hostName);
+    ShardId shardFor(OperationContext* txn, const ShardId& shardId) const final {
+        const auto shard = grid.shardRegistry()->getShard(txn, shardId);
         return shard->getId();
     }
 
@@ -262,7 +262,7 @@ bool ChunkManager::_load(OperationContext* txn,
 
     repl::OpTime opTime;
     std::vector<ChunkType> chunks;
-    uassertStatusOK(grid.catalogManager(txn)->getChunks(
+    uassertStatusOK(grid.catalogClient(txn)->getChunks(
         txn, diffQuery.query, diffQuery.sort, boost::none, &chunks, &opTime));
 
     invariant(opTime >= _configOpTime);
@@ -427,8 +427,8 @@ Status ChunkManager::createFirstChunks(OperationContext* txn,
         chunk.setShard(shardIds[i % shardIds.size()]);
         chunk.setVersion(version);
 
-        Status status = grid.catalogManager(txn)->insertConfigDocument(
-            txn, ChunkType::ConfigNS, chunk.toBSON());
+        Status status = grid.catalogClient(txn)->insertConfigDocument(
+            txn, ChunkType::ConfigNS, chunk.toBSON(), ShardingCatalogClient::kMajorityWriteConcern);
         if (!status.isOK()) {
             const string errMsg = str::stream() << "Creating first chunks failed: "
                                                 << status.reason();
@@ -674,13 +674,13 @@ IndexBounds ChunkManager::collapseQuerySolution(const QuerySolutionNode* node) {
     return bounds;
 }
 
-bool ChunkManager::compatibleWith(const ChunkManager& other, const string& shardName) const {
+bool ChunkManager::compatibleWith(const ChunkManager& other, const ShardId& shardName) const {
     // Return true if the shard version is the same in the two chunk managers
     // TODO: This doesn't need to be so strong, just major vs
     return other.getVersion(shardName).equals(getVersion(shardName));
 }
 
-ChunkVersion ChunkManager::getVersion(const std::string& shardName) const {
+ChunkVersion ChunkManager::getVersion(const ShardId& shardName) const {
     ShardVersionMap::const_iterator i = _shardVersions.find(shardName);
     if (i == _shardVersions.end()) {
         // Shards without explicitly tracked shard versions (meaning they have

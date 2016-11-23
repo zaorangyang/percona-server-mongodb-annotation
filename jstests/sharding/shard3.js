@@ -1,5 +1,4 @@
 (function() {
-
     // Include helpers for analyzing explain output.
     load("jstests/libs/analyze_plan.js");
 
@@ -11,17 +10,19 @@
     s.adminCommand({enablesharding: "test"});
     s.ensurePrimaryShard('test', 'shard0001');
     s.adminCommand({shardcollection: "test.foo", key: {num: 1}});
-    if (s.configRS) {
-        // Ensure that the second mongos will see the movePrimary
-        s.configRS.awaitLastOpCommitted();
-    }
+
+    // Ensure that the second mongos will see the movePrimary
+    s.configRS.awaitLastOpCommitted();
 
     assert(sh.getBalancerState(), "A1");
-    sh.setBalancerState(false);
+
+    s.stopBalancer();
     assert(!sh.getBalancerState(), "A2");
-    sh.setBalancerState(true);
+
+    s.startBalancer();
     assert(sh.getBalancerState(), "A3");
-    sh.setBalancerState(false);
+
+    s.stopBalancer();
     assert(!sh.getBalancerState(), "A4");
 
     s.config.databases.find().forEach(printjson);

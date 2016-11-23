@@ -71,18 +71,28 @@ bool DataReplicatorExternalStateImpl::shouldStopFetching(const HostAndPort& sour
     return false;
 }
 
-StatusWith<OpTime> DataReplicatorExternalStateImpl::_multiApply(
-    OperationContext* txn,
-    const MultiApplier::Operations& ops,
-    MultiApplier::ApplyOperationFn applyOperation) {
-    return _replicationCoordinatorExternalState->multiApply(txn, ops, applyOperation);
+std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeInitialSyncOplogBuffer(
+    OperationContext* txn) const {
+    return _replicationCoordinatorExternalState->makeInitialSyncOplogBuffer(txn);
 }
 
-void DataReplicatorExternalStateImpl::_multiSyncApply(const MultiApplier::Operations& ops) {
+std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeSteadyStateOplogBuffer(
+    OperationContext* txn) const {
+    return _replicationCoordinatorExternalState->makeSteadyStateOplogBuffer(txn);
+}
+
+StatusWith<OpTime> DataReplicatorExternalStateImpl::_multiApply(
+    OperationContext* txn,
+    MultiApplier::Operations ops,
+    MultiApplier::ApplyOperationFn applyOperation) {
+    return _replicationCoordinatorExternalState->multiApply(txn, std::move(ops), applyOperation);
+}
+
+void DataReplicatorExternalStateImpl::_multiSyncApply(MultiApplier::OperationPtrs* ops) {
     _replicationCoordinatorExternalState->multiSyncApply(ops);
 }
 
-void DataReplicatorExternalStateImpl::_multiInitialSyncApply(const MultiApplier::Operations& ops,
+void DataReplicatorExternalStateImpl::_multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
                                                              const HostAndPort& source) {
     _replicationCoordinatorExternalState->multiInitialSyncApply(ops, source);
 }

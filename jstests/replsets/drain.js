@@ -75,12 +75,7 @@
               "find failed with unexpected error code: " + tojson(res));
     // Nor should it be readable with the slaveOk bit.
     secondary.slaveOk = true;
-    res = secondary.getDB("foo").runCommand({find: "foo"});
-    assert.commandFailed(res);
-    assert.eq(ErrorCodes.NotMasterOrSecondary,
-              res.code,
-              "find failed with unexpected error code: " + tojson(res));
-    secondary.slaveOk = false;
+    assert.commandWorked(secondary.getDB("foo").runCommand({find: "foo"}));
 
     assert.commandFailedWithCode(
         secondary.adminCommand({

@@ -39,8 +39,10 @@ namespace mongo {
 
 class BSONObj;
 class CatalogCache;
-class CatalogManager;
-class CatalogManagerReplicaSet;
+class ShardingCatalogClient;
+class ShardingCatalogClientImpl;
+class ShardingCatalogManager;
+class ShardingCatalogManagerImpl;
 struct ChunkVersion;
 class CollectionType;
 class DistLockManagerMock;
@@ -59,7 +61,8 @@ class TaskExecutor;
 }  // namespace executor
 
 /**
- * Sets up the mocked out objects for testing the replica-set backed catalog manager.
+ * Sets up the mocked out objects for testing the replica-set backed catalog manager and catalog
+ * client.
  */
 class ShardingTestFixture : public mongo::unittest::Test {
 public:
@@ -75,12 +78,14 @@ protected:
         return _networkTestEnv->launchAsync(std::forward<Lambda>(func));
     }
 
-    CatalogManager* catalogManager() const;
+    ShardingCatalogClient* catalogClient() const;
+
+    ShardingCatalogManager* catalogManager() const;
 
     /**
-     * Prefer catalogManager() method over this as much as possible.
+     * Prefer catalogClient() method over this as much as possible.
      */
-    CatalogManagerReplicaSet* getCatalogManagerReplicaSet() const;
+    ShardingCatalogClientImpl* getCatalogClient() const;
 
     ShardRegistry* shardRegistry() const;
 
@@ -213,7 +218,8 @@ private:
     std::unique_ptr<executor::NetworkTestEnv> _networkTestEnv;
     std::unique_ptr<executor::NetworkTestEnv> _addShardNetworkTestEnv;
     DistLockManagerMock* _distLockManager = nullptr;
-    CatalogManagerReplicaSet* _catalogManagerRS = nullptr;
+    ShardingCatalogClientImpl* _catalogClient = nullptr;
+    ShardingCatalogManagerImpl* _catalogManager = nullptr;
 };
 
 }  // namespace mongo

@@ -673,7 +673,7 @@ public:
 
             unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
             // Process notifications when the lock is released/reacquired in the loop below
-            exec->registerExec();
+            exec->registerExec(coll);
 
             BSONObj obj;
             PlanExecutor::ExecState state;
@@ -1257,7 +1257,7 @@ void appendOpTimeMetadata(OperationContext* txn,
         // TODO: refactor out of here as part of SERVER-18236
         if (isShardingAware || isConfig) {
             rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
-                .writeToMetadata(metadataBob, request.getProtocol());
+                .writeToMetadata(metadataBob);
         }
     }
 
@@ -1341,9 +1341,20 @@ void Command::execCommand(OperationContext* txn,
                 replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet &&
                 !replCoord->canAcceptWritesForDatabase(dbname) &&
                 !replCoord->getMemberState().secondary()) {
-                uasserted(ErrorCodes::NotMasterOrSecondary, "node is recovering");
+
+                uassert(ErrorCodes::NotMasterOrSecondary,
+                        "node is recovering",
+                        !replCoord->getMemberState().recovering());
+                uassert(ErrorCodes::NotMasterOrSecondary,
+                        "node is not in primary or recovering state",
+                        replCoord->getMemberState().primary());
+                // Check ticket SERVER-21432, slaveOk commands are allowed in drain mode
+                uassert(ErrorCodes::NotMasterOrSecondary,
+                        "node is in drain mode",
+                        commandIsOverriddenToRunOnSecondary || commandCanRunOnSecondary);
             }
         }
+
 
         if (command->adminOnly()) {
             LOG(2) << "command: " << request.getCommandName();

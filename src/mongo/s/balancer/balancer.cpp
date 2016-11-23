@@ -35,9 +35,9 @@
 #include <string>
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/client.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -45,8 +45,7 @@
 #include "mongo/s/balancer/balancer_chunk_selection_policy_impl.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/balancer/cluster_statistics_impl.h"
-#include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
@@ -55,7 +54,6 @@
 #include "mongo/s/shard_util.h"
 #include "mongo/s/sharding_raii.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/represent_as.h"
@@ -75,7 +73,7 @@ const Seconds kShortBalanceRoundInterval(1);
 
 const char kChunkTooBig[] = "chunkTooBig";
 
-const auto getBalancer = ServiceContext::declareDecoration<Balancer>();
+const auto getBalancer = ServiceContext::declareDecoration<std::unique_ptr<Balancer>>();
 
 /**
  * Utility class to generate timing and statistics for a single balancer round.
@@ -197,7 +195,9 @@ Status executeSingleMigration(OperationContext* txn,
         ChunkRange(c->getMin(), c->getMax()),
         maxChunkSizeBytes,
         secondaryThrottle,
-        waitForDelete);
+        waitForDelete,
+        true);  // takeDistLock flag.
+
     appendOperationDeadlineIfSet(txn, &builder);
 
     BSONObj cmdObj = builder.obj();
@@ -209,11 +209,13 @@ Status executeSingleMigration(OperationContext* txn,
         status = {ErrorCodes::ShardNotFound,
                   str::stream() << "shard " << migrateInfo.from << " not found"};
     } else {
-        auto cmdStatus = shard->runCommand(txn,
-                                           ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                           "admin",
-                                           cmdObj,
-                                           Shard::RetryPolicy::kNotIdempotent);
+        StatusWith<Shard::CommandResponse> cmdStatus =
+            shard->runCommand(txn,
+                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                              "admin",
+                              cmdObj,
+                              Shard::RetryPolicy::kNotIdempotent);
+
         if (!cmdStatus.isOK()) {
             status = std::move(cmdStatus.getStatus());
         } else {
@@ -245,21 +247,80 @@ MONGO_FP_DECLARE(skipBalanceRound);
 
 }  // namespace
 
+const char* Balancer::kStateNames[kStateCount] = {"stopped", "running", "stopping"};
+
 Balancer::Balancer()
     : _balancedLastTime(0),
       _chunkSelectionPolicy(stdx::make_unique<BalancerChunkSelectionPolicyImpl>(
           stdx::make_unique<ClusterStatisticsImpl>())),
-      _clusterStats(stdx::make_unique<ClusterStatisticsImpl>()) {}
+      _clusterStats(stdx::make_unique<ClusterStatisticsImpl>()) {
 
-Balancer::~Balancer() = default;
-
-Balancer* Balancer::get(OperationContext* operationContext) {
-    return &getBalancer(operationContext->getServiceContext());
+    static_assert((sizeof(kStateNames) / sizeof(kStateNames[0])) == kStateCount,
+                  "(sizeof(kStateNames) / sizeof(kStateNames[0])) == kStateCount");
 }
 
-void Balancer::start(OperationContext* txn) {
-    invariant(!_thread.joinable());
-    _thread = stdx::thread([this] { _mainThread(); });
+Balancer::~Balancer() {
+    // The balancer thread must have been stopped
+    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    invariant(_state == kStopped);
+}
+
+void Balancer::create(ServiceContext* serviceContext) {
+    invariant(!getBalancer(serviceContext));
+    getBalancer(serviceContext) = stdx::make_unique<Balancer>();
+}
+
+Balancer* Balancer::get(ServiceContext* serviceContext) {
+    return getBalancer(serviceContext).get();
+}
+
+Balancer* Balancer::get(OperationContext* operationContext) {
+    return get(operationContext->getServiceContext());
+}
+
+Status Balancer::startThread(OperationContext* txn) {
+    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    switch (_state) {
+        case kStopping:
+            return {ErrorCodes::ConflictingOperationInProgress,
+                    "Sharding balancer is in currently being shut down"};
+        case kStopped:
+            invariant(!_thread.joinable());
+            _state = kRunning;
+            _thread = stdx::thread([this] { _mainThread(); });
+        // Intentional fall through
+        case kRunning:
+            return Status::OK();
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+void Balancer::stopThread() {
+    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    if (_state == kRunning) {
+        _state = kStopping;
+        _condVar.notify_all();
+    }
+}
+
+void Balancer::joinThread() {
+    {
+        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+        if (_state == kStopped) {
+            return;
+        }
+
+        invariant(_state == kStopping);
+    }
+
+    if (_thread.joinable()) {
+        _thread.join();
+
+        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+        _state = kStopped;
+        _thread = {};
+    }
 }
 
 Status Balancer::rebalanceSingleChunk(OperationContext* txn, const ChunkType& chunk) {
@@ -280,12 +341,11 @@ Status Balancer::rebalanceSingleChunk(OperationContext* txn, const ChunkType& ch
         return refreshStatus;
     }
 
-    _moveChunks(txn,
-                {*migrateInfo},
-                balancerConfig->getSecondaryThrottle(),
-                balancerConfig->waitForDelete());
-
-    return Status::OK();
+    return executeSingleMigration(txn,
+                                  *migrateInfo,
+                                  balancerConfig->getMaxChunkSizeBytes(),
+                                  balancerConfig->getSecondaryThrottle(),
+                                  balancerConfig->waitForDelete());
 }
 
 Status Balancer::moveSingleChunk(OperationContext* txn,
@@ -306,76 +366,77 @@ Status Balancer::moveSingleChunk(OperationContext* txn,
                                   waitForDelete);
 }
 
+void Balancer::report(BSONObjBuilder* builder) {
+    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    builder->append("state", kStateNames[_state]);
+    builder->append("inBalancerRound", _inBalancerRound);
+    builder->append("numBalancerRounds", _numBalancerRounds);
+}
+
 void Balancer::_mainThread() {
     Client::initThread("Balancer");
 
-    // This is the body of a BackgroundJob so if we throw here we're basically ending the balancer
-    // thread prematurely.
-    while (!inShutdown()) {
-        auto txn = cc().makeOperationContext();
-        if (!_init(txn.get())) {
-            log() << "will retry to initialize balancer in one minute";
-            sleepsecs(60);
+    // TODO (SERVER-24754): Balancer thread should only keep the operation context alive while it is
+    // doing balancing
+    const auto txn = cc().makeOperationContext();
+
+    log() << "CSRS balancer is starting";
+
+    // TODO (SERVER-23096): Use the actual cluster id
+    const OID csrsBalancerLockSessionID{OID()};
+    const Seconds kInitBackoffInterval(60);
+
+    // The balancer thread is holding the balancer during its entire lifetime
+    boost::optional<DistLockManager::ScopedDistLock> scopedBalancerLock;
+
+    // Take the balancer distributed lock
+    while (!_stopRequested() && !scopedBalancerLock) {
+        auto shardingContext = Grid::get(txn.get());
+        auto scopedDistLock =
+            shardingContext->catalogClient(txn.get())->getDistLockManager()->lockWithSessionID(
+                txn.get(),
+                "balancer",
+                "CSRS balancer starting",
+                csrsBalancerLockSessionID,
+                DistLockManager::kSingleLockAttemptTimeout);
+        if (!scopedDistLock.isOK()) {
+            warning() << "Balancer distributed lock could not be acquired and will be retried in "
+                         "one minute"
+                      << causedBy(scopedDistLock.getStatus());
+            _sleepFor(txn.get(), kInitBackoffInterval);
             continue;
         }
 
-        break;
+        // Initialization and distributed lock acquisition succeeded
+        scopedBalancerLock = std::move(scopedDistLock.getValue());
     }
 
-    Seconds balanceRoundInterval(kBalanceRoundDefaultInterval);
+    log() << "CSRS balancer started with instance id " << csrsBalancerLockSessionID;
 
-    while (!inShutdown()) {
-        auto txn = cc().makeOperationContext();
+    // Main balancer loop
+    while (!_stopRequested()) {
         auto shardingContext = Grid::get(txn.get());
         auto balancerConfig = shardingContext->getBalancerConfiguration();
 
         BalanceRoundDetails roundDetails;
 
         try {
-            // Reporting the balancer as active must be first call so the balancer control scripts
-            // know that there is an active balancer
-            _stardingUptimeReporter.reportStatus(txn.get(), true);
-
-            // Use fresh shard state and balancer settings
-            shardingContext->shardRegistry()->reload(txn.get());
+            _beginRound(txn.get());
 
             Status refreshStatus = balancerConfig->refreshAndCheck(txn.get());
             if (!refreshStatus.isOK()) {
                 warning() << "Skipping balancing round" << causedBy(refreshStatus);
-                sleepFor(balanceRoundInterval);
+                _endRound(txn.get(), kBalanceRoundDefaultInterval);
                 continue;
             }
 
-            // now make sure we should even be running
             if (!balancerConfig->isBalancerActive() || MONGO_FAIL_POINT(skipBalanceRound)) {
-                LOG(1) << "skipping balancing round because balancing is disabled";
-
-                // Tell scripts that the balancer is not active anymore
-                _stardingUptimeReporter.reportStatus(txn.get(), false);
-
-                sleepFor(balanceRoundInterval);
+                LOG(1) << "Skipping balancing round because balancing is disabled";
+                _endRound(txn.get(), kBalanceRoundDefaultInterval);
                 continue;
             }
-
-            uassert(13258, "oids broken after resetting!", _checkOIDs(txn.get()));
 
             {
-                auto scopedDistLock = shardingContext->catalogManager(txn.get())->distLock(
-                    txn.get(),
-                    "balancer",
-                    "doing balance round",
-                    DistLockManager::kSingleLockAttemptTimeout);
-
-                if (!scopedDistLock.isOK()) {
-                    LOG(1) << "skipping balancing round" << causedBy(scopedDistLock.getStatus());
-
-                    // Tell scripts that the balancer is not active anymore
-                    _stardingUptimeReporter.reportStatus(txn.get(), false);
-
-                    sleepFor(balanceRoundInterval);  // no need to wake up soon
-                    continue;
-                }
-
                 LOG(1) << "*** start balancing round. "
                        << "waitForDelete: " << balancerConfig->waitForDelete()
                        << ", secondaryThrottle: "
@@ -406,17 +467,16 @@ void Balancer::_mainThread() {
                     roundDetails.setSucceeded(static_cast<int>(candidateChunks.size()),
                                               _balancedLastTime);
 
-                    shardingContext->catalogManager(txn.get())->logAction(
+                    shardingContext->catalogClient(txn.get())->logAction(
                         txn.get(), "balancer.round", "", roundDetails.toBSON());
                 }
 
                 LOG(1) << "*** End of balancing round";
             }
 
-            // Tell scripts that the balancer is not active anymore
-            _stardingUptimeReporter.reportStatus(txn.get(), false);
-
-            sleepFor(_balancedLastTime ? kShortBalanceRoundInterval : balanceRoundInterval);
+            _endRound(txn.get(),
+                      _balancedLastTime ? kShortBalanceRoundInterval
+                                        : kBalanceRoundDefaultInterval);
         } catch (const std::exception& e) {
             log() << "caught exception while doing balance: " << e.what();
 
@@ -426,41 +486,44 @@ void Balancer::_mainThread() {
             // This round failed, tell the world!
             roundDetails.setFailed(e.what());
 
-            shardingContext->catalogManager(txn.get())->logAction(
+            shardingContext->catalogClient(txn.get())->logAction(
                 txn.get(), "balancer.round", "", roundDetails.toBSON());
 
             // Sleep a fair amount before retrying because of the error
-            sleepFor(balanceRoundInterval);
+            _endRound(txn.get(), kBalanceRoundDefaultInterval);
         }
     }
+
+    log() << "CSRS balancer is stopped";
 }
 
-bool Balancer::_init(OperationContext* txn) {
-    log() << "about to contact config servers and shards";
+bool Balancer::_stopRequested() {
+    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    return (_state != kRunning);
+}
 
-    try {
-        // Contact the config server and refresh shard information. Checks that each shard is indeed
-        // a different process (no hostname mixup).
-        //
-        // These checks are redundant in that they're redone at every new round but we want to do
-        // them initially here so to catch any problem soon.
-        Grid::get(txn)->shardRegistry()->reload(txn);
+void Balancer::_beginRound(OperationContext* txn) {
+    Grid::get(txn)->shardRegistry()->reload(txn);
+    uassert(13258, "oids broken after resetting!", _checkOIDs(txn));
 
-        if (!_checkOIDs(txn)) {
-            return false;
-        }
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    _inBalancerRound = true;
+}
 
-        log() << "config servers and shards contacted successfully";
-        _stardingUptimeReporter.reportStatus(txn, false);
+void Balancer::_endRound(OperationContext* txn, Seconds waitTimeout) {
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        _inBalancerRound = false;
+        _numBalancerRounds++;
+    }
 
-        log() << "balancer id: " << _stardingUptimeReporter.getInstanceId() << " started";
+    _sleepFor(txn, waitTimeout);
+}
 
-        return true;
-    } catch (const std::exception& e) {
-        warning() << "could not initialize balancer, please check that all shards and config "
-                     "servers are up: "
-                  << e.what();
-        return false;
+void Balancer::_sleepFor(OperationContext* txn, Seconds waitTimeout) {
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    if (_state == kRunning) {
+        _condVar.wait_for(lock, waitTimeout.toSystemDuration());
     }
 }
 
@@ -471,9 +534,13 @@ bool Balancer::_checkOIDs(OperationContext* txn) {
     shardingContext->shardRegistry()->getAllShardIds(&all);
 
     // map of OID machine ID => shardId
-    map<int, string> oids;
+    map<int, ShardId> oids;
 
     for (const ShardId& shardId : all) {
+        if (_stopRequested()) {
+            return false;
+        }
+
         const auto s = shardingContext->shardRegistry()->getShard(txn, shardId);
         if (!s) {
             continue;
@@ -567,7 +634,7 @@ int Balancer::_moveChunks(OperationContext* txn,
         auto balancerConfig = Grid::get(txn)->getBalancerConfiguration();
 
         // If the balancer was disabled since we started this round, don't start new chunk moves
-        if (!balancerConfig->isBalancerActive()) {
+        if (_stopRequested() || !balancerConfig->isBalancerActive()) {
             LOG(1) << "Stopping balancing round early as balancing was disabled";
             return movedCount;
         }

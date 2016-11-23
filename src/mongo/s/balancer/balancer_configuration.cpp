@@ -36,7 +36,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -48,6 +48,8 @@ const char kValue[] = "value";
 const char kStopped[] = "stopped";
 const char kActiveWindow[] = "activeWindow";
 const char kWaitForDelete[] = "_waitForDelete";
+
+const NamespaceString kSettingsNamespace("config", "settings");
 
 }  // namespace
 
@@ -61,6 +63,29 @@ BalancerConfiguration::BalancerConfiguration()
       _maxChunkSizeBytes(ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes) {}
 
 BalancerConfiguration::~BalancerConfiguration() = default;
+
+Status BalancerConfiguration::setBalancerActive(OperationContext* txn, bool active) {
+    auto updateStatus = Grid::get(txn)->catalogClient(txn)->updateConfigDocument(
+        txn,
+        kSettingsNamespace.ns(),
+        BSON("_id" << BalancerSettingsType::kKey),
+        BSON("$set" << BSON(kStopped << !active)),
+        true,
+        ShardingCatalogClient::kMajorityWriteConcern);
+
+    Status refreshStatus = refreshAndCheck(txn);
+    if (!refreshStatus.isOK()) {
+        return refreshStatus;
+    }
+
+    if (!updateStatus.isOK() && (isBalancerActive() != active)) {
+        return {updateStatus.getStatus().code(),
+                str::stream() << "Failed to update balancer configuration due to "
+                              << updateStatus.getStatus().reason()};
+    }
+
+    return Status::OK();
+}
 
 bool BalancerConfiguration::isBalancerActive() const {
     stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
@@ -105,7 +130,7 @@ Status BalancerConfiguration::_refreshBalancerSettings(OperationContext* txn) {
     BalancerSettingsType settings = BalancerSettingsType::createDefault();
 
     auto settingsObjStatus =
-        Grid::get(txn)->catalogManager(txn)->getGlobalSettings(txn, BalancerSettingsType::kKey);
+        Grid::get(txn)->catalogClient(txn)->getGlobalSettings(txn, BalancerSettingsType::kKey);
     if (settingsObjStatus.isOK()) {
         auto settingsStatus = BalancerSettingsType::fromBSON(settingsObjStatus.getValue());
         if (!settingsStatus.isOK()) {
@@ -127,7 +152,7 @@ Status BalancerConfiguration::_refreshChunkSizeSettings(OperationContext* txn) {
     ChunkSizeSettingsType settings = ChunkSizeSettingsType::createDefault();
 
     auto settingsObjStatus =
-        grid.catalogManager(txn)->getGlobalSettings(txn, ChunkSizeSettingsType::kKey);
+        grid.catalogClient(txn)->getGlobalSettings(txn, ChunkSizeSettingsType::kKey);
     if (settingsObjStatus.isOK()) {
         auto settingsStatus = ChunkSizeSettingsType::fromBSON(settingsObjStatus.getValue());
         if (!settingsStatus.isOK()) {

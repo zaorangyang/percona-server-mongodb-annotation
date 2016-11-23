@@ -38,7 +38,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/replica_set_monitor.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_connection.h"
@@ -59,14 +59,21 @@ using std::string;
 using std::unique_ptr;
 using std::vector;
 
+// TODO SERVER-23096: Initializing an empty _clusterId is a temporary hack. The _clusterId should
+// be queried from the config servers on sharding initialization and passed to the ShardRegistry
+// constructor.
 ShardRegistry::ShardRegistry(std::unique_ptr<ShardFactory> shardFactory,
                              const ConnectionString& configServerCS)
-    : _shardFactory(std::move(shardFactory)), _data() {
+    : _shardFactory(std::move(shardFactory)), _clusterId(), _data() {
     _initConfigServerCS = configServerCS;
 }
 
 ConnectionString ShardRegistry::getConfigServerConnectionString() const {
     return getConfigShard()->getConnString();
+}
+
+const OID& ShardRegistry::getClusterId() const {
+    return _clusterId;
 }
 
 void ShardRegistry::rebuildConfigShard() {
@@ -112,7 +119,7 @@ shared_ptr<Shard> ShardRegistry::getConfigShard() const {
 }
 
 unique_ptr<Shard> ShardRegistry::createConnection(const ConnectionString& connStr) const {
-    return _shardFactory->createUniqueShard("<unnamed>", connStr);
+    return _shardFactory->createUniqueShard(ShardId("<unnamed>"), connStr);
 }
 
 shared_ptr<Shard> ShardRegistry::lookupRSName(const string& name) const {
@@ -120,7 +127,7 @@ shared_ptr<Shard> ShardRegistry::lookupRSName(const string& name) const {
 }
 
 void ShardRegistry::getAllShardIds(vector<ShardId>* all) const {
-    std::set<string> seen;
+    std::set<ShardId> seen;
     _data.getAllShardIds(seen);
     all->assign(seen.begin(), seen.end());
 }
@@ -139,7 +146,7 @@ void ShardRegistry::updateReplSetHosts(const ConnectionString& newConnString) {
 void ShardRegistry::startup() {
     stdx::unique_lock<stdx::mutex> reloadLock(_reloadMutex);
     invariant(_initConfigServerCS.isValid());
-    auto configShard = _shardFactory->createShard("config", _initConfigServerCS);
+    auto configShard = _shardFactory->createShard(ShardId("config"), _initConfigServerCS);
     _data.addConfigShard(configShard);
     // set to invalid so it cant be started more than once.
     _initConfigServerCS = ConnectionString();
@@ -192,7 +199,7 @@ ShardRegistryData::ShardRegistryData(OperationContext* txn, ShardFactory* shardF
 }
 
 void ShardRegistryData::_init(OperationContext* txn, ShardFactory* shardFactory) {
-    auto shardsStatus = grid.catalogManager(txn)->getAllShards(txn);
+    auto shardsStatus = grid.catalogClient(txn)->getAllShards(txn);
 
     if (!shardsStatus.isOK()) {
         uasserted(shardsStatus.getStatus().code(),
@@ -295,11 +302,11 @@ void ShardRegistryData::toBSON(BSONObjBuilder* result) const {
     }
 }
 
-void ShardRegistryData::getAllShardIds(std::set<string>& seen) const {
+void ShardRegistryData::getAllShardIds(std::set<ShardId>& seen) const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     for (auto i = _lookup.begin(); i != _lookup.end(); ++i) {
         const auto& s = i->second;
-        if (s->getId() == "config") {
+        if (s->getId().toString() == "config") {
             continue;
         }
         seen.insert(s->getId());
@@ -370,8 +377,8 @@ void ShardRegistryData::_addShard_inlock(const std::shared_ptr<Shard>& shard) {
         // CUSTOM connection strings (ie "$dummy:10000) become DBDirectClient connections which
         // always return "localhost" as their response to getServerAddress().  This is just for
         // making dbtest work.
-        _lookup["localhost"] = shard;
-        _hostLookup[HostAndPort{"localhost"}] = shard;
+        _lookup[ShardId("localhost")] = shard;
+        _hostLookup[HostAndPort("localhost")] = shard;
     }
 
     // TODO: The only reason to have the shard host names in the lookup table is for the

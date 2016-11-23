@@ -43,6 +43,9 @@
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
+
+class ServiceContext;
+
 namespace repl {
 
 class ReplicationCoordinatorExternalStateMock : public ReplicationCoordinatorExternalState {
@@ -55,14 +58,17 @@ public:
     virtual ~ReplicationCoordinatorExternalStateMock();
     virtual void startThreads(const ReplSettings& settings) override;
     virtual void startInitialSync(OnInitialSyncFinishedFn finished) override;
-    virtual void startSteadyStateReplication() override;
+    virtual void startSteadyStateReplication(OperationContext* txn) override;
+    virtual void runOnInitialSyncThread(stdx::function<void(OperationContext* txn)> run) override;
+    virtual bool isInitialSyncFlagSet(OperationContext* txn) override;
+
     virtual void startMasterSlave(OperationContext*);
-    virtual void shutdown();
+    virtual void shutdown(OperationContext* txn);
     virtual Status initializeReplSetStorage(OperationContext* txn, const BSONObj& config);
     virtual void logTransitionToPrimaryToOplog(OperationContext* txn);
     virtual void forwardSlaveProgress();
     virtual OID ensureMe(OperationContext*);
-    virtual bool isSelf(const HostAndPort& host);
+    virtual bool isSelf(const HostAndPort& host, ServiceContext* ctx);
     virtual HostAndPort getClientHostAndPort(const OperationContext* txn);
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* txn);
     virtual Status storeLocalConfigDocument(OperationContext* txn, const BSONObj& config);
@@ -73,9 +79,8 @@ public:
     virtual void cleanUpLastApplyBatch(OperationContext* txn);
     virtual void closeConnections();
     virtual void killAllUserOperations(OperationContext* txn);
-    virtual void clearShardingState();
-    virtual void recoverShardingState(OperationContext* txn);
-    virtual void updateShardIdentityConfigString(OperationContext* txn) override;
+    virtual void shardingOnStepDownHook();
+    virtual void shardingOnDrainingStateHook(OperationContext* txn);
     virtual void signalApplierToChooseNewSyncSource();
     virtual void signalApplierToCancelFetcher();
     virtual void dropAllTempCollections(OperationContext* txn);
@@ -87,11 +92,16 @@ public:
     virtual double getElectionTimeoutOffsetLimitFraction() const;
     virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* txn) const;
     virtual StatusWith<OpTime> multiApply(OperationContext* txn,
-                                          const MultiApplier::Operations& ops,
+                                          MultiApplier::Operations ops,
                                           MultiApplier::ApplyOperationFn applyOperation) override;
-    virtual void multiSyncApply(const MultiApplier::Operations& ops) override;
-    virtual void multiInitialSyncApply(const MultiApplier::Operations& ops,
+    virtual void multiSyncApply(MultiApplier::OperationPtrs* ops) override;
+    virtual void multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
                                        const HostAndPort& source) override;
+    virtual std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(
+        OperationContext* txn) const override;
+    virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(
+        OperationContext* txn) const override;
+    virtual bool shouldUseDataReplicatorInitialSync() const override;
 
     /**
      * Adds "host" to the list of hosts that this mock will match when responding to "isSelf"

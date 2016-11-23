@@ -720,6 +720,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
     MongoRunner.StopError.prototype.constructor = MongoRunner.StopError;
 
     // Constants for exit codes of MongoDB processes
+    MongoRunner.EXIT_ABORT = -6;
     MongoRunner.EXIT_CLEAN = 0;
     MongoRunner.EXIT_BADOPTIONS = 2;
     MongoRunner.EXIT_REPLICATION_ERROR = 3;
@@ -792,10 +793,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
 
         if (!Array.contains(allowedExitCodes, returnCode)) {
             throw new MongoRunner.StopError(
-                // clang-format off
-            `MongoDB process on port ${port} exited with error code ${returnCode}`,
-                // clang-format on
-                returnCode);
+                `MongoDB process on port ${port} exited with error code ${returnCode}`, returnCode);
         }
 
         return returnCode;
@@ -806,15 +804,18 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
     /**
      * Starts an instance of the specified mongo tool
      *
-     * @param {String} binaryName The name of the tool to run
-     * @param {Object} opts options to pass to the tool
-     *    {
-     *      binVersion {string}: version of tool to run
-     *    }
+     * @param {String} binaryName - The name of the tool to run.
+     * @param {Object} [opts={}] - Options of the form --flag or --key=value to pass to the tool.
+     * @param {string} [opts.binVersion] - The version of the tool to run.
+     *
+     * @param {...string} positionalArgs - Positional arguments to pass to the tool after all
+     * options have been specified. For example,
+     * MongoRunner.runMongoTool("executable", {key: value}, arg1, arg2) would invoke
+     * ./executable --key value arg1 arg2.
      *
      * @see MongoRunner.arrOptions
      */
-    MongoRunner.runMongoTool = function(binaryName, opts) {
+    MongoRunner.runMongoTool = function(binaryName, opts, ...positionalArgs) {
 
         var opts = opts || {};
         // Normalize and get the binary version to use
@@ -829,7 +830,11 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
             opts['dialTimeout'] = '30';
         }
 
+        // Convert 'opts' into an array of arguments.
         var argsArray = MongoRunner.arrOptions(binaryName, opts);
+
+        // Append any positional arguments that were specified.
+        argsArray.push(...positionalArgs);
 
         return runMongoProgram.apply(null, argsArray);
 
@@ -938,6 +943,16 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                 if (jsTest.options().storageEngine) {
                     if (argArray.indexOf("--storageEngine") < 0) {
                         argArray.push(...['--storageEngine', jsTest.options().storageEngine]);
+                    }
+                }
+                if (jsTest.options().storageEngineCacheSizeGB) {
+                    if (jsTest.options().storageEngine === "rocksdb") {
+                        argArray.push(
+                            ...['--rocksdbCacheSizeGB', jsTest.options().storageEngineCacheSizeGB]);
+                    } else if (jsTest.options().storageEngine === "wiredTiger" ||
+                               !jsTest.options().storageEngine) {
+                        argArray.push(...['--wiredTigerCacheSizeGB',
+                                          jsTest.options().storageEngineCacheSizeGB]);
                     }
                 }
                 if (jsTest.options().wiredTigerEngineConfigString) {

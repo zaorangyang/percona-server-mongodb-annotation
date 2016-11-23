@@ -45,7 +45,7 @@
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
@@ -447,7 +447,7 @@ public:
         bool isValid = true;
         bool errored = false;
         for (const auto& cmdResult : results) {
-            const string& shardName = cmdResult.shardTargetId;
+            const ShardId& shardName = cmdResult.shardTargetId;
             BSONObj result = cmdResult.result;
             const BSONElement valid = result["valid"];
             if (!valid.trueValue()) {
@@ -459,7 +459,7 @@ public:
                 errmsg = result["errmsg"].toString();
                 errored = true;
             }
-            rawResBuilder.append(shardName, result);
+            rawResBuilder.append(shardName.toString(), result);
         }
         rawResBuilder.done();
 
@@ -561,7 +561,7 @@ public:
             return passthrough(txn, db.get(), cmdObj, result);
         }
 
-        uassertStatusOK(grid.catalogManager(txn)->dropCollection(txn, fullns));
+        uassertStatusOK(grid.catalogClient(txn)->dropCollection(txn, fullns));
 
         // Force a full reload next time the just dropped namespace is accessed
         db->invalidateNs(fullns.ns());
@@ -701,7 +701,7 @@ public:
         auto conf = uassertStatusOK(grid.catalogCache()->getDatabase(txn, dbName));
         if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
             result.appendBool("sharded", false);
-            result.append("primary", conf->getPrimaryId());
+            result.append("primary", conf->getPrimaryId().toString());
 
             return passthrough(txn, conf.get(), cmdObj, result);
         }
@@ -811,7 +811,7 @@ public:
                     warning() << "mongos collstats doesn't know about: " << e.fieldName();
                 }
             }
-            shardStats.append(shardId, res);
+            shardStats.append(shardId.toString(), res);
         }
 
         result.append("ns", fullns);
@@ -1288,7 +1288,7 @@ public:
                 } catch (DBException& e) {
                     // This is handled below and logged
                     Strategy::CommandResult errResult;
-                    errResult.shardTargetId = "";
+                    errResult.shardTargetId = ShardId();
                     errResult.result = BSON("errmsg" << e.what() << "ok" << 0);
                     results.push_back(errResult);
                 }
@@ -1400,7 +1400,7 @@ public:
 
             futures.push_back(
                 Future::spawnCommand(shard->getConnString().toString(), dbName, cmdObj, options));
-            shardArray.append(shardId);
+            shardArray.append(shardId.toString());
         }
 
         multimap<double, BSONObj> results;  // TODO: maybe use merge-sort instead

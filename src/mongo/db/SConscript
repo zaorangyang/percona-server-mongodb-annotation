@@ -127,6 +127,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/net/network',
     ]
 )
 
@@ -373,7 +374,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/util/concurrency/synchronization',
         'range_arithmetic',
     ],
 )
@@ -704,9 +704,11 @@ serveronlyLibdeps = [
     "$BUILD_DIR/mongo/client/parallel",
     "$BUILD_DIR/mongo/db/bson/dotted_path_support",
     "$BUILD_DIR/mongo/executor/network_interface_factory",
-    "$BUILD_DIR/mongo/s/catalog/replset/catalog_manager_replica_set",
+    "$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_client_impl",
+    "$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_manager_impl",
     "$BUILD_DIR/mongo/s/client/sharding_connection_hook",
     "$BUILD_DIR/mongo/s/coreshard",
+    "$BUILD_DIR/mongo/s/shard_id",
     "$BUILD_DIR/mongo/s/serveronly",
     "$BUILD_DIR/mongo/scripting/scripting_server",
     "$BUILD_DIR/mongo/util/clock_sources",
@@ -732,11 +734,12 @@ serveronlyLibdeps = [
     "matcher/expressions_mongod_only",
     "ops/update_driver",
     "ops/write_ops_parsers",
-    "pipeline/document_source",
-    "pipeline/pipeline",
+    "pipeline/aggregation",
     "query/query",
     "range_deleter",
     "repl/bgsync",
+    "repl/oplog_buffer_collection",
+    "repl/oplog_buffer_blocking_queue",
     "repl/repl_coordinator_global",
     "repl/repl_coordinator_impl",
     "repl/repl_settings",
@@ -788,7 +791,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/serveronly',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/unittest/unittest',
-        '$BUILD_DIR/mongo/util/ntservice_mock',
     ],
 )
 

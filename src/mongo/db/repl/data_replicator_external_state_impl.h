@@ -53,14 +53,18 @@ public:
     bool shouldStopFetching(const HostAndPort& source,
                             const rpc::ReplSetMetadata& metadata) override;
 
+    std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(OperationContext* txn) const override;
+
+    std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(OperationContext* txn) const override;
+
 private:
     StatusWith<OpTime> _multiApply(OperationContext* txn,
-                                   const MultiApplier::Operations& ops,
+                                   MultiApplier::Operations ops,
                                    MultiApplier::ApplyOperationFn applyOperation) override;
 
-    void _multiSyncApply(const MultiApplier::Operations& ops) override;
+    void _multiSyncApply(MultiApplier::OperationPtrs* ops) override;
 
-    void _multiInitialSyncApply(const MultiApplier::Operations& ops,
+    void _multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
                                 const HostAndPort& source) override;
 
 protected:

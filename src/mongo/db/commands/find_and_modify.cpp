@@ -64,7 +64,6 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/s/d_state.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -216,16 +215,23 @@ public:
     }
 
     CmdFindAndModify() : Command("findAndModify", false, "findandmodify") {}
+
     bool slaveOk() const override {
         return false;
     }
+
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
+
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
                                std::vector<Privilege>* out) override {
         find_and_modify::addPrivilegesRequiredForFindAndModify(this, dbname, cmdObj, out);
+    }
+
+    ReadWriteType getReadWriteType() const {
+        return ReadWriteType::kWrite;
     }
 
     Status explain(OperationContext* txn,
@@ -279,7 +285,7 @@ public:
                 return statusWithPlanExecutor.getStatus();
             }
             const std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
-            Explain::explainStages(exec.get(), verbosity, out);
+            Explain::explainStages(exec.get(), collection, verbosity, out);
         } else {
             UpdateRequest request(nsString);
             UpdateLifecycleImpl updateLifecycle(nsString);
@@ -310,7 +316,7 @@ public:
                 return statusWithPlanExecutor.getStatus();
             }
             const std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
-            Explain::explainStages(exec.get(), verbosity, out);
+            Explain::explainStages(exec.get(), collection, verbosity, out);
         }
 
         return Status::OK();

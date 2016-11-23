@@ -52,7 +52,7 @@
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
@@ -211,7 +211,7 @@ void ShardingState::shutDown(OperationContext* txn) {
 
     if (_getInitializationState() == InitializationState::kInitialized) {
         grid.getExecutorPool()->shutdownAndJoin();
-        grid.catalogManager(txn)->shutDown(txn);
+        grid.catalogClient(txn)->shutDown(txn);
     }
 }
 
@@ -310,7 +310,7 @@ Status ShardingState::onStaleShardVersion(OperationContext* txn,
 
     // Ensure any ongoing migrations have completed
     auto& oss = OperationShardingState::get(txn);
-    oss.waitForMigrationCriticalSection(txn);
+    oss.waitForMigrationCriticalSectionSignal(txn);
 
     ChunkVersion collectionShardVersion;
 
@@ -698,7 +698,7 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
 
     {
         Status status = mdLoader.makeCollectionMetadata(txn,
-                                                        grid.catalogManager(txn),
+                                                        grid.catalogClient(txn),
                                                         ns,
                                                         getShardName(),
                                                         fullReload ? nullptr : beforeMetadata.get(),
@@ -868,9 +868,12 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
     return Status::OK();
 }
 
+StatusWith<ScopedRegisterMigration> ShardingState::registerMigration(const MoveChunkRequest& args) {
+    return _activeMigrationsRegistry.registerMigration(args);
+}
+
 boost::optional<NamespaceString> ShardingState::getActiveMigrationNss() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _activeMigrationNss;
+    return _activeMigrationsRegistry.getActiveMigrationNss();
 }
 
 void ShardingState::appendInfo(OperationContext* txn, BSONObjBuilder& builder) {
@@ -917,41 +920,8 @@ shared_ptr<CollectionMetadata> ShardingState::getCollectionMetadata(const string
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     CollectionShardingStateMap::const_iterator it = _collections.find(ns);
-    if (it == _collections.end()) {
-        return shared_ptr<CollectionMetadata>();
-    } else {
-        return it->second->getMetadata();
-    }
-}
-
-Status ShardingState::_registerMigration(NamespaceString nss) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    if (_activeMigrationNss) {
-        return {
-            ErrorCodes::ConflictingOperationInProgress,
-            str::stream()
-                << "Unable start new migration, because there is already an active migration for "
-                << _activeMigrationNss->ns()};
-    }
-
-    _activeMigrationNss = std::move(nss);
-    return Status::OK();
-}
-
-void ShardingState::_clearMigration() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    invariant(_activeMigrationNss);
-    _activeMigrationNss.reset();
-}
-
-ShardingState::ScopedRegisterMigration::ScopedRegisterMigration(OperationContext* txn,
-                                                                NamespaceString nss)
-    : _txn(txn) {
-    uassertStatusOK(ShardingState::get(_txn)->_registerMigration(std::move(nss)));
-}
-
-ShardingState::ScopedRegisterMigration::~ScopedRegisterMigration() {
-    ShardingState::get(_txn)->_clearMigration();
+    invariant(it != _collections.end());
+    return it->second->getMetadata();
 }
 
 Status ShardingState::updateShardIdentityConfigString(OperationContext* txn,

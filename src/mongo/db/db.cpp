@@ -107,8 +107,11 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/s/balancer/balancer.h"
 #include "mongo/s/sharding_initialization.h"
+#include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
@@ -199,7 +202,7 @@ public:
                         string ns = dbresponse.exhaustNS;  // before reset() free's it...
                         m.reset();
                         BufBuilder b(512);
-                        b.appendNum((int)0 /*size set later in appendData()*/);
+                        b.appendNum((int)0 /*size set later*/);
                         b.appendNum(header.getId());
                         b.appendNum(header.getResponseToMsgId());
                         b.appendNum((int)dbGetMore);
@@ -207,8 +210,10 @@ public:
                         b.appendStr(ns);
                         b.appendNum((int)0);  // ntoreturn
                         b.appendNum(cursorid);
-                        m.appendData(b.buf(), b.len());
-                        b.decouple();
+
+                        MsgData::View header = b.buf();
+                        header.setLen(b.len());
+                        m.setData(b.release());
                         DEV log() << "exhaust=true sending more";
                         continue;  // this goes back to top loop
                     }
@@ -518,10 +523,10 @@ static void _initWireSpec() {
     WireSpec& spec = WireSpec::instance();
     // accept from any version
     spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionIncoming = FIND_COMMAND;
+    spec.maxWireVersionIncoming = COMMANDS_ACCEPT_WRITE_CONCERN;
     // connect to any version
     spec.minWireVersionOutgoing = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionOutgoing = FIND_COMMAND;
+    spec.maxWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
 }
 
 
@@ -529,8 +534,15 @@ static void _initAndListen(int listenPort) {
     Client::initThread("initandlisten");
 
     _initWireSpec();
-    getGlobalServiceContext()->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
-    getGlobalServiceContext()->setOpObserver(stdx::make_unique<OpObserver>());
+    auto globalServiceContext = getGlobalServiceContext();
+
+    globalServiceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
+    globalServiceContext->setOpObserver(stdx::make_unique<OpObserver>());
+
+    DBDirectClientFactory::get(globalServiceContext)
+        .registerImplementation([](OperationContext* txn) {
+            return std::unique_ptr<DBClientBase>(new DBDirectClient(txn));
+        });
 
     const repl::ReplSettings& replSettings = repl::getGlobalReplicationCoordinator()->getSettings();
 
@@ -565,8 +577,7 @@ static void _initAndListen(int listenPort) {
     options.ipList = serverGlobalParams.bind_ip;
 
     auto handler = std::make_shared<MyMessageHandler>();
-    MessageServer* server = createServer(options, std::move(handler));
-    server->setAsTimeTracker();
+    MessageServer* server = createServer(options, std::move(handler), getGlobalServiceContext());
 
     // This is what actually creates the sockets, but does not yet listen on them because we
     // do not want connections to just hang if recovery takes a very long time.
@@ -577,8 +588,10 @@ static void _initAndListen(int listenPort) {
 
     std::shared_ptr<DbWebServer> dbWebServer;
     if (serverGlobalParams.isHttpInterfaceEnabled) {
-        dbWebServer.reset(new DbWebServer(
-            serverGlobalParams.bind_ip, serverGlobalParams.port + 1000, new RestAdminAccess()));
+        dbWebServer.reset(new DbWebServer(serverGlobalParams.bind_ip,
+                                          serverGlobalParams.port + 1000,
+                                          getGlobalServiceContext(),
+                                          new RestAdminAccess()));
         if (!dbWebServer->setupSockets()) {
             error() << "Failed to set up sockets for HTTP interface during startup.";
             return;
@@ -767,6 +780,7 @@ static void _initAndListen(int listenPort) {
             }
         } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             uassertStatusOK(initializeGlobalShardingStateForMongod(ConnectionString::forLocal()));
+            Balancer::create(startupOpCtx->getServiceContext());
         }
 
         logStartup(startupOpCtx.get());
@@ -972,46 +986,86 @@ static void reportEventToSystemImpl(const char* msg) {
 }  // namespace mongo
 #endif  // if defined(_WIN32)
 
-static void shutdownServer() {
+#if !defined(__has_feature)
+#define __has_feature(x) 0
+#endif
+
+// NOTE: This function may be called at any time after
+// registerShutdownTask is called below. It must not depend on the
+// prior execution of mongo initializers or the existence of threads.
+static void shutdownTask() {
+
+    auto serviceContext = getGlobalServiceContext();
+
+    Client::initThreadIfNotAlready();
+    Client& client = cc();
+
+    ServiceContext::UniqueOperationContext uniqueTxn;
+    OperationContext* txn = client.getOperationContext();
+    if (!txn && serviceContext->getGlobalStorageEngine()) {
+        uniqueTxn = client.makeOperationContext();
+        txn = uniqueTxn.get();
+    }
+
     log(LogComponent::kNetwork) << "shutdown: going to close listening sockets..." << endl;
     ListeningSockets::get()->closeAll();
 
     log(LogComponent::kNetwork) << "shutdown: going to flush diaglog..." << endl;
     _diaglog.flush();
 
-    // We drop the scope cache because leak sanitizer can't see across the
-    // thread we use for proxying MozJS requests. Dropping the cache cleans up
-    // the memory and makes leak sanitizer happy.
-    ScriptEngine::dropScopeCache();
+    if (serviceContext)
+        serviceContext->setKillAllOperations();
 
-    getGlobalServiceContext()->shutdownGlobalStorageEngineCleanly();
-}
+#if __has_feature(address_sanitizer)
 
-// NOTE: This function may be called at any time after
-// registerShutdownTask is called below. It must not depend on the
-// prior execution of mongo initializers or the existence of threads.
-static void shutdownTask() {
-    // Global storage engine may not be started in all cases before we exit
-    if (getGlobalServiceContext()->getGlobalStorageEngine() == NULL) {
-        return;
+    // When running under address sanitizer, we get false positive leaks due to disorder around the
+    // lifecycle of a connection and request. When we are running under ASAN, we try a lot harder to
+    // dry up the server from active connections before going on to really shut down.
+
+    log(LogComponent::kNetwork) << "shutdown: going to close all sockets because ASAN is active...";
+
+    // Close all sockets in a detached thread, and then wait for the number of active connections to
+    // reach zero. Give the detached background thread a 10 second deadline. If we haven't closed
+    // drained all active operations within that deadline, just keep going with shutdown: the OS
+    // will do it for us when the process terminates.
+
+    stdx::packaged_task<void()> dryOutTask([] {
+
+        // Walk all open sockets and close them. This should unblock any that are sitting in
+        // recv. Other sockets on which there are active operations should see the inShutdown flag
+        // as true when they complete the operation.
+        Listener::closeMessagingPorts(0);
+
+        // There isn't currently a way to wait on the TicketHolder to have all its tickets back,
+        // unfortunately. So, busy wait in this detached thread.
+        while (true) {
+            const auto connected = Listener::globalTicketHolder.used();
+            if (connected == 0) {
+                log(LogComponent::kNetwork) << "shutdown: no active connections found...";
+                break;
+            }
+            log(LogComponent::kNetwork) << "shutdown: still waiting on " << connected
+                                        << " active connections to drain... ";
+            mongo::sleepFor(Milliseconds(250));
+        }
+    });
+
+    auto dryNotification = dryOutTask.get_future();
+    stdx::thread(std::move(dryOutTask)).detach();
+    if (dryNotification.wait_for(Seconds(10).toSystemDuration()) != stdx::future_status::ready) {
+        log(LogComponent::kNetwork) << "shutdown: exhausted grace period for"
+                                    << " active connections to drain; continuing with shutdown... ";
     }
+
+#endif
 
     // Shutdown Full-Time Data Capture
     stopFTDC();
 
-    getGlobalServiceContext()->setKillAllOperations();
-
-    repl::getGlobalReplicationCoordinator()->shutdown();
-
-    Client& client = cc();
-    ServiceContext::UniqueOperationContext uniqueTxn;
-    OperationContext* txn = client.getOperationContext();
-    if (!txn) {
-        uniqueTxn = client.makeOperationContext();
-        txn = uniqueTxn.get();
+    if (txn) {
+        repl::ReplicationCoordinator::get(txn)->shutdown(txn);
+        ShardingState::get(txn)->shutDown(txn);
     }
-
-    ShardingState::get(txn)->shutDown(txn);
 
     // We should always be able to acquire the global lock at shutdown.
     //
@@ -1031,22 +1085,18 @@ static void shutdownTask() {
 
     invariant(LOCK_OK == result);
 
-    log(LogComponent::kControl) << "now exiting" << endl;
+    // Global storage engine may not be started in all cases before we exit
 
-    // Execute the graceful shutdown tasks, such as flushing the outstanding journal
-    // and data files, close sockets, etc.
-    try {
-        shutdownServer();
-    } catch (const DBException& ex) {
-        severe() << "shutdown failed with DBException " << ex;
-        std::terminate();
-    } catch (const std::exception& ex) {
-        severe() << "shutdown failed with std::exception: " << ex.what();
-        std::terminate();
-    } catch (...) {
-        severe() << "shutdown failed with exception";
-        std::terminate();
+    if (serviceContext && serviceContext->getGlobalStorageEngine()) {
+        serviceContext->shutdownGlobalStorageEngineCleanly();
     }
+
+    // We drop the scope cache because leak sanitizer can't see across the
+    // thread we use for proxying MozJS requests. Dropping the cache cleans up
+    // the memory and makes leak sanitizer happy.
+    ScriptEngine::dropScopeCache();
+
+    log(LogComponent::kControl) << "now exiting" << endl;
 
     audit::logShutdown(&cc());
 }

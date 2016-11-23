@@ -30,6 +30,9 @@
 
 #include "mongo/db/repl/data_replicator_external_state_mock.h"
 
+#include "mongo/db/repl/oplog_buffer_blocking_queue.h"
+#include "mongo/stdx/memory.h"
+
 namespace mongo {
 namespace repl {
 
@@ -54,16 +57,26 @@ bool DataReplicatorExternalStateMock::shouldStopFetching(const HostAndPort& sour
     return shouldStopFetchingResult;
 }
 
-StatusWith<OpTime> DataReplicatorExternalStateMock::_multiApply(
-    OperationContext* txn,
-    const MultiApplier::Operations& ops,
-    MultiApplier::ApplyOperationFn applyOperation) {
-    return multiApplyFn(txn, ops, applyOperation);
+std::unique_ptr<OplogBuffer> DataReplicatorExternalStateMock::makeInitialSyncOplogBuffer(
+    OperationContext* txn) const {
+    return stdx::make_unique<OplogBufferBlockingQueue>();
 }
 
-void DataReplicatorExternalStateMock::_multiSyncApply(const MultiApplier::Operations& ops) {}
+std::unique_ptr<OplogBuffer> DataReplicatorExternalStateMock::makeSteadyStateOplogBuffer(
+    OperationContext* txn) const {
+    return stdx::make_unique<OplogBufferBlockingQueue>();
+}
 
-void DataReplicatorExternalStateMock::_multiInitialSyncApply(const MultiApplier::Operations& ops,
+StatusWith<OpTime> DataReplicatorExternalStateMock::_multiApply(
+    OperationContext* txn,
+    MultiApplier::Operations ops,
+    MultiApplier::ApplyOperationFn applyOperation) {
+    return multiApplyFn(txn, std::move(ops), applyOperation);
+}
+
+void DataReplicatorExternalStateMock::_multiSyncApply(MultiApplier::OperationPtrs* ops) {}
+
+void DataReplicatorExternalStateMock::_multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
                                                              const HostAndPort& source) {}
 
 }  // namespace repl

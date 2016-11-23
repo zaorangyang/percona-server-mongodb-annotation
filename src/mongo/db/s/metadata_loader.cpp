@@ -35,7 +35,7 @@
 #include <vector>
 
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/chunk_diff.h"
@@ -60,7 +60,7 @@ namespace {
  */
 class SCMConfigDiffTracker : public ConfigDiffTracker<BSONObj> {
 public:
-    SCMConfigDiffTracker(const string& currShard) : _currShard(currShard) {}
+    SCMConfigDiffTracker(const ShardId& currShard) : _currShard(currShard) {}
 
     virtual bool isTracked(const ChunkType& chunk) const {
         return chunk.getShard() == _currShard;
@@ -70,7 +70,7 @@ public:
         return make_pair(chunk.getMin(), chunk.getMax());
     }
 
-    virtual string shardFor(OperationContext* txn, const string& name) const {
+    virtual ShardId shardFor(OperationContext* txn, const ShardId& name) const {
         return name;
     }
 
@@ -79,7 +79,7 @@ public:
     }
 
 private:
-    const string _currShard;
+    const ShardId _currShard;
 };
 
 }  // namespace
@@ -93,25 +93,25 @@ MetadataLoader::MetadataLoader() = default;
 MetadataLoader::~MetadataLoader() = default;
 
 Status MetadataLoader::makeCollectionMetadata(OperationContext* txn,
-                                              CatalogManager* catalogManager,
+                                              ShardingCatalogClient* catalogClient,
                                               const string& ns,
                                               const string& shard,
                                               const CollectionMetadata* oldMetadata,
                                               CollectionMetadata* metadata) const {
-    Status status = _initCollection(txn, catalogManager, ns, shard, metadata);
+    Status status = _initCollection(txn, catalogClient, ns, shard, metadata);
     if (!status.isOK() || metadata->getKeyPattern().isEmpty()) {
         return status;
     }
 
-    return initChunks(txn, catalogManager, ns, shard, oldMetadata, metadata);
+    return initChunks(txn, catalogClient, ns, shard, oldMetadata, metadata);
 }
 
 Status MetadataLoader::_initCollection(OperationContext* txn,
-                                       CatalogManager* catalogManager,
+                                       ShardingCatalogClient* catalogClient,
                                        const string& ns,
                                        const string& shard,
                                        CollectionMetadata* metadata) const {
-    auto coll = catalogManager->getCollection(txn, ns);
+    auto coll = catalogClient->getCollection(txn, ns);
     if (!coll.isOK()) {
         return coll.getStatus();
     }
@@ -132,12 +132,12 @@ Status MetadataLoader::_initCollection(OperationContext* txn,
 }
 
 Status MetadataLoader::initChunks(OperationContext* txn,
-                                  CatalogManager* catalogManager,
+                                  ShardingCatalogClient* catalogClient,
                                   const string& ns,
                                   const string& shard,
                                   const CollectionMetadata* oldMetadata,
                                   CollectionMetadata* metadata) const {
-    map<string, ChunkVersion> versionMap;
+    map<ShardId, ChunkVersion> versionMap;  // TODO: use .h defined type
 
     // Preserve the epoch
     versionMap[shard] = metadata->_shardVersion;
@@ -179,7 +179,7 @@ Status MetadataLoader::initChunks(OperationContext* txn,
     try {
         std::vector<ChunkType> chunks;
         const auto diffQuery = differ.configDiffQuery();
-        Status status = catalogManager->getChunks(
+        Status status = catalogClient->getChunks(
             txn, diffQuery.query, diffQuery.sort, boost::none, &chunks, nullptr);
         if (!status.isOK()) {
             if (status == ErrorCodes::HostUnreachable) {

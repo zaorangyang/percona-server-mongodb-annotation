@@ -55,7 +55,7 @@ using std::vector;
 namespace {
 
 BSONArray buildOpPrecond(const string& ns,
-                         const string& shardName,
+                         const ShardId& shardName,
                          const ChunkVersion& shardVersion) {
     BSONArrayBuilder preCond;
     BSONObjBuilder condB;
@@ -144,7 +144,7 @@ Status runApplyOpsCmd(OperationContext* txn,
 
     BSONArray preCond = buildOpPrecond(firstChunk.getNS(), firstChunk.getShard(), currShardVersion);
 
-    return grid.catalogManager(txn)->applyChunkOpsDeprecated(
+    return grid.catalogClient(txn)->applyChunkOpsDeprecated(
         txn, updatesB.arr(), preCond, firstChunk.getNS(), newMergedVersion);
 }
 
@@ -157,7 +157,7 @@ bool mergeChunks(OperationContext* txn,
     // Get the distributed lock
     const string whyMessage = stream() << "merging chunks in " << nss.ns() << " from " << minKey
                                        << " to " << maxKey;
-    auto scopedDistLock = grid.catalogManager(txn)->distLock(
+    auto scopedDistLock = grid.catalogClient(txn)->distLock(
         txn, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
 
     if (!scopedDistLock.isOK()) {
@@ -196,14 +196,18 @@ bool mergeChunks(OperationContext* txn,
         return false;
     }
 
-    shared_ptr<CollectionMetadata> metadata = gss->getCollectionMetadata(nss.ns());
+    std::shared_ptr<CollectionMetadata> metadata;
+    {
+        AutoGetCollection autoColl(txn, nss, MODE_IS);
 
-    if (!metadata || metadata->getKeyPattern().isEmpty()) {
-        *errMsg = stream() << "could not merge chunks, collection " << nss.ns()
-                           << " is not sharded";
+        metadata = CollectionShardingState::get(txn, nss.ns())->getMetadata();
+        if (!metadata || metadata->getKeyPattern().isEmpty()) {
+            *errMsg = stream() << "could not merge chunks, collection " << nss.ns()
+                               << " is not sharded";
 
-        warning() << *errMsg;
-        return false;
+            warning() << *errMsg;
+            return false;
+        }
     }
 
     dassert(metadata->getShardVersion().equals(shardVersion));
@@ -217,6 +221,7 @@ bool mergeChunks(OperationContext* txn,
         warning() << *errMsg;
         return false;
     }
+
 
     //
     // Get merged chunk information
@@ -234,6 +239,7 @@ bool mergeChunks(OperationContext* txn,
            metadata->getNextChunk(itChunk.getMax(), &itChunk)) {
         chunksToMerge.push_back(itChunk);
     }
+
 
     if (chunksToMerge.empty()) {
         *errMsg = stream() << "could not merge chunks, collection " << nss.ns()
@@ -344,7 +350,7 @@ bool mergeChunks(OperationContext* txn,
 
     BSONObj mergeLogEntry = buildMergeLogEntry(chunksToMerge, shardVersion, mergeVersion);
 
-    grid.catalogManager(txn)->logChange(txn, "merge", nss.ns(), mergeLogEntry);
+    grid.catalogClient(txn)->logChange(txn, "merge", nss.ns(), mergeLogEntry);
 
     return true;
 }

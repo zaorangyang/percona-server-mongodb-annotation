@@ -41,6 +41,7 @@
 #include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/database_cloner.h"
 #include "mongo/db/repl/multiapplier.h"
+#include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_executor.h"
@@ -168,13 +169,13 @@ public:
 
     virtual ~DataReplicator();
 
-    Status start();
-    Status shutdown();
+    Status start(OperationContext* txn);
+    Status shutdown(OperationContext* txn);
 
     /**
      * Cancels outstanding work and begins shutting down.
      */
-    Status scheduleShutdown();
+    Status scheduleShutdown(OperationContext* txn);
 
     /**
      * Waits for data replicator to finish shutting down.
@@ -220,7 +221,7 @@ public:
 
     // For testing only
 
-    void _resetState_inlock(Timestamp lastAppliedOpTime);
+    void _resetState_inlock(OperationContext* txn, Timestamp lastAppliedOpTime);
     void _setInitialSyncStorageInterface(CollectionCloner::StorageInterface* si);
 
 private:
@@ -280,7 +281,7 @@ private:
     void _waitOnAll_inlock();
     bool _anyActiveHandles_inlock() const;
 
-    Status _shutdown();
+    Status _shutdown(OperationContext* txn);
     void _changeStateIfNeeded();
 
     // Set during construction
@@ -325,10 +326,10 @@ private:
     bool _applierPaused;                     // (X)
     std::unique_ptr<MultiApplier> _applier;  // (M)
 
-    HostAndPort _syncSource;              // (M)
-    Timestamp _lastTimestampFetched;      // (MX)
-    Timestamp _lastTimestampApplied;      // (MX)
-    BlockingQueue<BSONObj> _oplogBuffer;  // (M)
+    HostAndPort _syncSource;                    // (M)
+    Timestamp _lastTimestampFetched;            // (MX)
+    Timestamp _lastTimestampApplied;            // (MX)
+    std::unique_ptr<OplogBuffer> _oplogBuffer;  // (M)
 
     // Shutdown
     Event _onShutdown;  // (M)

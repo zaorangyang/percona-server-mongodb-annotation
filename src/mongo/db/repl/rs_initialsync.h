@@ -28,9 +28,13 @@
 
 #pragma once
 
-namespace mongo {
-namespace repl {
+#include "mongo/base/status.h"
 
+namespace mongo {
+class OperationContext;
+class Database;
+
+namespace repl {
 class BackgroundSync;
 
 /**
@@ -38,6 +42,11 @@ class BackgroundSync;
  * and runs the cloner from that sync source.  The node's state is not changed.
  */
 void syncDoInitialSync(BackgroundSync* bgsync);
+
+/**
+ * Checks that the "admin" database contains a supported version of the auth data schema.
+ */
+Status checkAdminDatabase(OperationContext* txn, Database* adminDb);
 
 }  // namespace repl
 }  // namespace mongo
