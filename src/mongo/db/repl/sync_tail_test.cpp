@@ -543,13 +543,13 @@ TEST_F(SyncTailTest,
 }
 
 TEST_F(SyncTailTest, MultiApplyAssignsOperationsToWriterThreadsBasedOnNamespaceHash) {
+    // This test relies on implementation details of how multiApply uses hashing to distribute ops
+    // to threads. It is possible for this test to fail, even if the implementation of multiApply is
+    // correct. If it fails, consider adjusting the namespace names (to adjust the hash values) or
+    // the number of threads in the pool.
     NamespaceString nss1("test.t0");
     NamespaceString nss2("test.t1");
-    OldThreadPool writerPool(2);
-
-    // Ensure that namespaces are hashed to different threads in pool.
-    ASSERT_EQUALS(0U, StringMapTraits::hash(nss1.ns()) % writerPool.getNumThreads());
-    ASSERT_EQUALS(1U, StringMapTraits::hash(nss2.ns()) % writerPool.getNumThreads());
+    OldThreadPool writerPool(3);
 
     stdx::mutex mutex;
     std::vector<MultiApplier::Operations> operationsApplied;
@@ -583,7 +583,7 @@ TEST_F(SyncTailTest, MultiApplyAssignsOperationsToWriterThreadsBasedOnNamespaceH
     std::vector<OpTime> seen;
     {
         stdx::lock_guard<stdx::mutex> lock(mutex);
-        ASSERT_EQUALS(writerPool.getNumThreads(), operationsApplied.size());
+        ASSERT_EQUALS(operationsApplied.size(), 2U);
         for (auto&& operationsAppliedByThread : operationsApplied) {
             ASSERT_EQUALS(1U, operationsAppliedByThread.size());
             const auto& oplogEntry = operationsAppliedByThread.front();
@@ -868,6 +868,28 @@ TEST_F(SyncTailTest,
     // Since the missing document is not found on the sync source, the collection referenced by
     // the failed operation should not be automatically created.
     ASSERT_FALSE(AutoGetCollectionForRead(_txn.get(), nss).getCollection());
+}
+
+TEST_F(SyncTailTest, MultiInitialSyncApplySkipsDocumentOnNamespaceNotFound) {
+    BSONObj emptyDoc;
+    SyncTailWithLocalDocumentFetcher syncTail(emptyDoc);
+    NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
+    NamespaceString badNss("local." + _agent.getSuiteName() + "_" + _agent.getTestName() + "bad");
+    auto doc1 = BSON("_id" << 1);
+    auto doc2 = BSON("_id" << 2);
+    auto doc3 = BSON("_id" << 3);
+    auto op0 = makeCreateCollectionOplogEntry({Timestamp(Seconds(1), 0), 1LL}, nss);
+    auto op1 = makeInsertDocumentOplogEntry({Timestamp(Seconds(2), 0), 1LL}, nss, doc1);
+    auto op2 = makeInsertDocumentOplogEntry({Timestamp(Seconds(3), 0), 1LL}, badNss, doc2);
+    auto op3 = makeInsertDocumentOplogEntry({Timestamp(Seconds(4), 0), 1LL}, nss, doc3);
+    MultiApplier::OperationPtrs ops = {&op0, &op1, &op2, &op3};
+    ASSERT_OK(multiInitialSyncApply_noAbort(_txn.get(), &ops, &syncTail));
+
+    OplogInterfaceLocal collectionReader(_txn.get(), nss.ns());
+    auto iter = collectionReader.makeIterator();
+    ASSERT_EQUALS(doc3, unittest::assertGet(iter->next()).first);
+    ASSERT_EQUALS(doc1, unittest::assertGet(iter->next()).first);
+    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
 }
 
 TEST_F(SyncTailTest, MultiInitialSyncApplyRetriesFailedUpdateIfDocumentIsAvailableFromSyncSource) {

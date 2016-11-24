@@ -40,12 +40,16 @@
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
+#include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/replset/sharding_catalog_test_fixture.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_changelog.h"
+#include "mongo/s/catalog/type_config_version.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_identity_loader.h"
+#include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/batched_insert_request.h"
 #include "mongo/s/write_ops/batched_update_document.h"
@@ -75,18 +79,27 @@ protected:
      */
     void setUp() override {
         ShardingCatalogTestFixture::setUp();
-
-        getMessagingPort()->setRemote(HostAndPort("FakeRemoteClient:34567"));
+        setRemote(HostAndPort("FakeRemoteClient:34567"));
 
         configTargeter()->setConnectionStringReturnValue(_configConnStr);
 
         _configHost = _configConnStr.getServers().front();
         configTargeter()->setFindHostReturnValue(_configHost);
 
-        // TODO SERVER-23096: Change this to OID::gen() once clusterId is loaded from the config
-        // servers into the ShardRegistry instead of created by the ShardRegistry within each
-        // process.
-        _clusterId = OID();
+        _clusterId = OID::gen();
+
+        // Ensure the cluster ID has been loaded and cached so that future requests for the cluster
+        // ID will not require any network traffic.
+        // TODO: use kLocalReadConcern once this test is switched to using the
+        // ConfigServerTestFixture.
+        auto future = launchAsync([&] {
+            ASSERT_OK(ClusterIdentityLoader::get(operationContext())
+                          ->loadClusterId(operationContext(),
+                                          repl::ReadConcernLevel::kMajorityReadConcern));
+        });
+        expectGetConfigVersion();
+        future.timed_get(kFutureTimeout);
+        ASSERT_EQUALS(_clusterId, ClusterIdentityLoader::get(operationContext())->getClusterId());
     }
 
     /**
@@ -138,22 +151,53 @@ protected:
     }
 
     /**
+     * Intercepts a query on config.version and returns a basic config.version document containing
+     * _clusterId
+     */
+    void expectGetConfigVersion() {
+        VersionType version;
+        version.setCurrentVersion(CURRENT_CONFIG_VERSION);
+        version.setMinCompatibleVersion(MIN_COMPATIBLE_CONFIG_VERSION);
+        version.setClusterId(_clusterId);
+
+        onFindCommand([this, &version](const RemoteCommandRequest& request) {
+            const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
+            ASSERT_EQ(nss.toString(), VersionType::ConfigNS);
+
+            auto queryResult = QueryRequest::makeFromFindCommand(nss, request.cmdObj, false);
+            ASSERT_OK(queryResult.getStatus());
+
+            const auto& query = queryResult.getValue();
+            ASSERT_EQ(query->ns(), VersionType::ConfigNS);
+
+            ASSERT_EQ(query->getFilter(), BSONObj());
+            ASSERT_EQ(query->getSort(), BSONObj());
+            ASSERT_FALSE(query->getLimit().is_initialized());
+
+            checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
+
+            return std::vector<BSONObj>{version.toBSON()};
+        });
+    }
+
+    /**
      * Waits for a request for the shardIdentity document to be upserted into a shard from the
      * config server on addShard.
      */
     void expectShardIdentityUpsert(const HostAndPort& expectedHost,
                                    const std::string& expectedShardName) {
+        // Create the expected upsert shardIdentity command for this shardType.
+        auto upsertCmdObj = catalogManager()->createShardIdentityUpsertForAddShard(
+            operationContext(), expectedShardName);
 
-        ShardIdentityType expectedShardIdentity;
-        expectedShardIdentity.setShardName(expectedShardName);
-        expectedShardIdentity.setClusterId(_clusterId);
-        expectedShardIdentity.setConfigsvrConnString(_configConnStr);
-        invariant(expectedShardIdentity.validate().isOK());
+        // Get the BatchedUpdateRequest from the upsert command.
+        BatchedCommandRequest request(BatchedCommandRequest::BatchType::BatchType_Update);
+        std::string errMsg;
+        invariant(request.parseBSON("admin", upsertCmdObj, &errMsg) || !request.isValid(&errMsg));
 
-        auto updateRequest = expectedShardIdentity.createUpsertForAddShard();
         expectUpdates(expectedHost,
                       NamespaceString(NamespaceString::kConfigCollectionNamespace),
-                      updateRequest.get());
+                      request.getUpdateRequest());
     }
 
     /**
@@ -338,6 +382,7 @@ TEST_F(AddShardTest, Standalone) {
     expectedShard.setName(expectedShardName);
     expectedShard.setHost("StandaloneHost:12345");
     expectedShard.setMaxSizeMB(100);
+    expectedShard.setState(ShardType::ShardState::kShardAware);
 
     expectInserts(NamespaceString(ShardType::ConfigNS), {expectedShard.toBSON()});
 
@@ -438,6 +483,7 @@ TEST_F(AddShardTest, StandaloneGenerateName) {
     expectedShard.setName(expectedShardName);
     expectedShard.setHost(shardTarget.toString());
     expectedShard.setMaxSizeMB(100);
+    expectedShard.setState(ShardType::ShardState::kShardAware);
 
     expectInserts(NamespaceString(ShardType::ConfigNS), {expectedShard.toBSON()});
 
@@ -878,6 +924,7 @@ TEST_F(AddShardTest, ReAddExistingShard) {
     newShard.setName(expectedShardName);
     newShard.setMaxSizeMB(100);
     newShard.setHost(connString.toString());
+    newShard.setState(ShardType::ShardState::kShardAware);
 
     // When a shard with the same name already exists, the insert into config.shards will fail
     // with a duplicate key error on the shard name.
@@ -947,6 +994,7 @@ TEST_F(AddShardTest, SuccessfullyAddReplicaSet) {
     newShard.setName(expectedShardName);
     newShard.setMaxSizeMB(100);
     newShard.setHost(connString.toString());
+    newShard.setState(ShardType::ShardState::kShardAware);
 
     expectInserts(NamespaceString(ShardType::ConfigNS), {newShard.toBSON()});
 
@@ -1008,6 +1056,7 @@ TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
     newShard.setName(expectedShardName);
     newShard.setMaxSizeMB(100);
     newShard.setHost(connString.toString());
+    newShard.setState(ShardType::ShardState::kShardAware);
 
     expectInserts(NamespaceString(ShardType::ConfigNS), {newShard.toBSON()});
 
@@ -1089,6 +1138,7 @@ TEST_F(AddShardTest, ReplicaSetExtraHostsDiscovered) {
     newShard.setName(expectedShardName);
     newShard.setMaxSizeMB(100);
     newShard.setHost(fullConnString.toString());
+    newShard.setState(ShardType::ShardState::kShardAware);
 
     expectInserts(NamespaceString(ShardType::ConfigNS), {newShard.toBSON()});
 
@@ -1097,6 +1147,34 @@ TEST_F(AddShardTest, ReplicaSetExtraHostsDiscovered) {
     expectGetShards({newShard});
 
     future.timed_get(kFutureTimeout);
+}
+
+TEST_F(AddShardTest, CreateShardIdentityUpsertForAddShard) {
+    std::string shardName = "shardName";
+
+    BSONObj expectedBSON = BSON("update"
+                                << "system.version"
+                                << "updates"
+                                << BSON_ARRAY(BSON(
+                                       "q" << BSON("_id"
+                                                   << "shardIdentity"
+                                                   << "shardName"
+                                                   << shardName
+                                                   << "clusterId"
+                                                   << _clusterId)
+                                           << "u"
+                                           << BSON("$set" << BSON("configsvrConnectionString"
+                                                                  << _configConnStr.toString()))
+                                           << "upsert"
+                                           << true))
+                                << "writeConcern"
+                                << BSON("w"
+                                        << "majority"
+                                        << "wtimeout"
+                                        << 15000));
+    ASSERT_EQUALS(
+        expectedBSON,
+        catalogManager()->createShardIdentityUpsertForAddShard(operationContext(), shardName));
 }
 
 }  // namespace

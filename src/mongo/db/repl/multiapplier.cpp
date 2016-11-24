@@ -26,23 +26,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/multiapplier.h"
 
-#include <algorithm>
-
+#include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/replication_executor.h"
 #include "mongo/util/destructor_guard.h"
 
 namespace mongo {
 namespace repl {
 
-MultiApplier::MultiApplier(ReplicationExecutor* executor,
+MultiApplier::MultiApplier(executor::TaskExecutor* executor,
                            const Operations& operations,
                            const ApplyOperationFn& applyOperation,
                            const MultiApplyFn& multiApply,
@@ -62,6 +58,7 @@ MultiApplier::MultiApplier(ReplicationExecutor* executor,
             str::stream() << "'ts' in last operation not a timestamp: " << operations.back().raw,
             BSONType::bsonTimestamp == operations.back().raw.getField("ts").type());
     uassert(ErrorCodes::BadValue, "apply operation function cannot be null", applyOperation);
+    uassert(ErrorCodes::BadValue, "multi apply function cannot be null", multiApply);
     uassert(ErrorCodes::BadValue, "callback function cannot be null", onCompletion);
 }
 
@@ -73,8 +70,10 @@ std::string MultiApplier::getDiagnosticString() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     str::stream output;
     output << "MultiApplier";
-    output << " executor: " << _executor->getDiagnosticString();
     output << " active: " << _active;
+    output << ", ops: " << _operations.front().ts.timestamp().toString();
+    output << " - " << _operations.back().ts.timestamp().toString();
+    output << ", executor: " << _executor->getDiagnosticString();
     return output;
 }
 
@@ -90,8 +89,8 @@ Status MultiApplier::start() {
         return Status(ErrorCodes::IllegalOperation, "applier already started");
     }
 
-    auto scheduleResult = _executor->scheduleDBWork(
-        stdx::bind(&MultiApplier::_callback, this, stdx::placeholders::_1));
+    auto scheduleResult =
+        _executor->scheduleWork(stdx::bind(&MultiApplier::_callback, this, stdx::placeholders::_1));
     if (!scheduleResult.isOK()) {
         return scheduleResult.getStatus();
     }
@@ -103,7 +102,7 @@ Status MultiApplier::start() {
 }
 
 void MultiApplier::cancel() {
-    ReplicationExecutor::CallbackHandle dbWorkCallbackHandle;
+    executor::TaskExecutor::CallbackHandle dbWorkCallbackHandle;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
 
@@ -127,28 +126,25 @@ void MultiApplier::wait() {
     }
 }
 
-// TODO change the passed in function to be multiapply instead of apply inlock
-void MultiApplier::_callback(const ReplicationExecutor::CallbackArgs& cbd) {
+void MultiApplier::_callback(const executor::TaskExecutor::CallbackArgs& cbd) {
     if (!cbd.status.isOK()) {
         _finishCallback(cbd.status, _operations);
         return;
     }
 
-    invariant(cbd.txn);
-
-    // Refer to multiSyncApply() and multiInitialSyncApply() in sync_tail.cpp.
-    cbd.txn->setReplicatedWrites(false);
-
-    // allow us to get through the magic barrier
-    cbd.txn->lockState()->setIsBatchWriter(true);
+    invariant(!_operations.empty());
 
     StatusWith<OpTime> applyStatus(ErrorCodes::InternalError, "not mutated");
-
-    invariant(!_operations.empty());
     try {
-        // TODO restructure to support moving _operations into this call. Can't do it today since
-        // _finishCallback gets _operations on failure.
-        applyStatus = _multiApply(cbd.txn, _operations, _applyOperation);
+        auto txn = cc().makeOperationContext();
+
+        // Refer to multiSyncApply() and multiInitialSyncApply() in sync_tail.cpp.
+        txn->setReplicatedWrites(false);
+
+        // allow us to get through the magic barrier
+        txn->lockState()->setIsBatchWriter(true);
+
+        applyStatus = _multiApply(txn.get(), _operations, _applyOperation);
     } catch (...) {
         applyStatus = exceptionToStatus();
     }
@@ -156,15 +152,19 @@ void MultiApplier::_callback(const ReplicationExecutor::CallbackArgs& cbd) {
         _finishCallback(applyStatus.getStatus(), _operations);
         return;
     }
-    _finishCallback(applyStatus.getValue().getTimestamp(), Operations());
+    _finishCallback(applyStatus.getValue().getTimestamp(), _operations);
 }
 
 void MultiApplier::_finishCallback(const StatusWith<Timestamp>& result,
                                    const Operations& operations) {
-    _onCompletion(result, operations);
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     _active = false;
     _condition.notify_all();
+    auto finish = _onCompletion;
+    lk.unlock();
+
+    // This instance may be destroyed during the "finish" call.
+    finish(result, operations);
 }
 
 namespace {
@@ -182,7 +182,7 @@ void pauseBeforeCompletion(const StatusWith<Timestamp>& result,
 }  // namespace
 
 StatusWith<std::pair<std::unique_ptr<MultiApplier>, MultiApplier::Operations>> applyUntilAndPause(
-    ReplicationExecutor* executor,
+    executor::TaskExecutor* executor,
     const MultiApplier::Operations& operations,
     const MultiApplier::ApplyOperationFn& applyOperation,
     const MultiApplier::MultiApplyFn& multiApply,

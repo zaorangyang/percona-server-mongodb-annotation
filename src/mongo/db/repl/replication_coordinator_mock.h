@@ -30,6 +30,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/platform/atomic_word.h"
 
@@ -116,8 +117,8 @@ public:
     virtual OpTime getMyLastAppliedOpTime() const;
     virtual OpTime getMyLastDurableOpTime() const;
 
-    virtual ReadConcernResponse waitUntilOpTime(OperationContext* txn,
-                                                const ReadConcernArgs& settings) override;
+    virtual Status waitUntilOpTimeForRead(OperationContext* txn,
+                                          const ReadConcernArgs& settings) override;
 
     virtual OID getElectionId();
 
@@ -256,12 +257,20 @@ public:
     virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
     virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) override;
 
+    virtual Status stepUpIfEligible() override;
+
+    /**
+     * Sets the return value for calls to getConfig.
+     */
+    void setGetConfigReturnValue(ReplicaSetConfig returnValue);
+
 private:
     AtomicUInt64 _snapshotNameGenerator;
     const ReplSettings _settings;
     MemberState _memberState;
     OpTime _myLastDurableOpTime;
     OpTime _myLastAppliedOpTime;
+    ReplicaSetConfig _getConfigReturnValue;
 };
 
 }  // namespace repl

@@ -223,55 +223,13 @@ Status CanonicalQuery::init(std::unique_ptr<QueryRequest> qr,
     return Status::OK();
 }
 
-namespace {
-
-bool isComparisonMatchExpression(const MatchExpression* expr) {
-    switch (expr->matchType()) {
-        case MatchExpression::LT:
-        case MatchExpression::LTE:
-        case MatchExpression::EQ:
-        case MatchExpression::GTE:
-        case MatchExpression::GT:
-            return true;
-        default:
-            return false;
-    }
-}
-
-/**
- * Recursively set the collator on the MatchExpression 'root'. Currently, only
- * ComparisonMatchExpression and InMatchExpression are collation-aware, so we ignore other leaf
- * nodes.
- *
- * TODO: consider converting to a virtual MatchExpression::setCollator() method, especially if
- * adding new match expressions that can do string comparisons.
- */
-void setCollatorOnMatchExpression(MatchExpression* root, const CollatorInterface* collator) {
-    if (isComparisonMatchExpression(root)) {
-        auto compExpr = static_cast<ComparisonMatchExpression*>(root);
-        compExpr->setCollator(collator);
-    } else if (root->matchType() == MatchExpression::MATCH_IN) {
-        auto inExpr = static_cast<InMatchExpression*>(root);
-        inExpr->setCollator(collator);
-    }
-
-    if (!root->getChildVector()) {
-        return;
-    }
-    for (auto child : *root->getChildVector()) {
-        setCollatorOnMatchExpression(child, collator);
-    }
-}
-
-}  // namespace
-
 void CanonicalQuery::setCollator(std::unique_ptr<CollatorInterface> collator) {
     _collator = std::move(collator);
 
     // The collator associated with the match expression tree is now invalid, since we have reset
     // the object owned by '_collator'. We must associate the match expression tree with the new
     // value of '_collator'.
-    setCollatorOnMatchExpression(_root.get(), _collator.get());
+    _root->setCollator(_collator.get());
 }
 
 // static
@@ -310,11 +268,8 @@ bool CanonicalQuery::isSimpleIdQuery(const BSONObj& query) {
 
 // static
 MatchExpression* CanonicalQuery::normalizeTree(MatchExpression* root) {
-    // root->isLogical() is true now.  We care about AND, OR, and NOT. NOR currently scares us.
     if (MatchExpression::AND == root->matchType() || MatchExpression::OR == root->matchType()) {
-        // We could have AND of AND of AND.  Make sure we clean up our children before merging
-        // them.
-        // UNITTEST 11738048
+        // We could have AND of AND of AND.  Make sure we clean up our children before merging them.
         for (size_t i = 0; i < root->getChildVector()->size(); ++i) {
             (*root->getChildVector())[i] = normalizeTree(root->getChild(i));
         }
@@ -350,6 +305,27 @@ MatchExpression* CanonicalQuery::normalizeTree(MatchExpression* root) {
             root->getChildVector()->clear();
             delete root;
             return ret;
+        }
+    } else if (MatchExpression::NOR == root->matchType()) {
+        // First clean up children.
+        for (size_t i = 0; i < root->getChildVector()->size(); ++i) {
+            (*root->getChildVector())[i] = normalizeTree(root->getChild(i));
+        }
+
+        // NOR of one thing is NOT of the thing.
+        if (1 == root->numChildren()) {
+            // Detach the child and assume ownership.
+            std::unique_ptr<MatchExpression> child(root->getChild(0));
+            root->getChildVector()->clear();
+
+            // Delete the root when this goes out of scope.
+            std::unique_ptr<NorMatchExpression> ownedRoot(static_cast<NorMatchExpression*>(root));
+
+            // Make a NOT to be the new root and transfer ownership of the child to it.
+            auto newRoot = stdx::make_unique<NotMatchExpression>();
+            newRoot->init(child.release());
+
+            return newRoot.release();
         }
     } else if (MatchExpression::NOT == root->matchType()) {
         // Normalize the rest of the tree hanging off this NOT node.
@@ -558,6 +534,9 @@ std::string CanonicalQuery::toString() const {
     ss << "Tree: " << _root->toString();
     ss << "Sort: " << _qr->getSort().toString() << '\n';
     ss << "Proj: " << _qr->getProj().toString() << '\n';
+    if (!_qr->getCollation().isEmpty()) {
+        ss << "Collation: " << _qr->getCollation().toString() << '\n';
+    }
     return ss;
 }
 
@@ -565,6 +544,10 @@ std::string CanonicalQuery::toStringShort() const {
     str::stream ss;
     ss << "query: " << _qr->getFilter().toString() << " sort: " << _qr->getSort().toString()
        << " projection: " << _qr->getProj().toString();
+
+    if (!_qr->getCollation().isEmpty()) {
+        ss << " collation: " << _qr->getCollation().toString();
+    }
 
     if (_qr->getBatchSize()) {
         ss << " batchSize: " << *_qr->getBatchSize();

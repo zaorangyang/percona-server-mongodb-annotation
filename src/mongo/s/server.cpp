@@ -66,29 +66,25 @@
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
-#include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog/type_lockpings.h"
-#include "mongo/s/catalog/type_locks.h"
-#include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/shard_remote.h"
 #include "mongo/s/client/sharding_connection_hook_for_mongos.h"
-#include "mongo/s/cluster_write.h"
 #include "mongo/s/commands/request.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/service_entry_point_mongos.h"
 #include "mongo/s/sharding_egress_metadata_hook_for_mongos.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/s/sharding_uptime_reporter.h"
 #include "mongo/s/version_mongos.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/transport/transport_layer_legacy.h"
 #include "mongo/util/admin_access.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
 #include "mongo/util/concurrency/thread_name.h"
@@ -98,7 +94,6 @@
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/net/message.h"
-#include "mongo/util/net/message_server.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
@@ -166,121 +161,9 @@ static BSONObj buildErrReply(const DBException& ex) {
     return errB.obj();
 }
 
-class ShardedMessageHandler : public MessageHandler {
-public:
-    virtual ~ShardedMessageHandler() {}
-
-    virtual void connected(AbstractMessagingPort* p) {
-        Client::initThread("conn", getGlobalServiceContext(), p);
-    }
-
-    virtual void process(Message& m, AbstractMessagingPort* p) {
-        verify(p);
-        Request r(m, p);
-        auto txn = cc().makeOperationContext();
-
-        try {
-            r.init(txn.get());
-            r.process(txn.get());
-        } catch (const AssertionException& ex) {
-            LOG(ex.isUserAssertion() ? 1 : 0) << "Assertion failed"
-                                              << " while processing "
-                                              << networkOpToString(m.operation()) << " op"
-                                              << " for " << r.getnsIfPresent() << causedBy(ex);
-
-            if (r.expectResponse()) {
-                m.header().setId(r.id());
-                replyToQuery(ResultFlag_ErrSet, p, m, buildErrReply(ex));
-            }
-
-            // We *always* populate the last error for now
-            LastError::get(cc()).setLastError(ex.getCode(), ex.what());
-        } catch (const DBException& ex) {
-            log() << "Exception thrown"
-                  << " while processing " << networkOpToString(m.operation()) << " op"
-                  << " for " << r.getnsIfPresent() << causedBy(ex);
-
-            if (r.expectResponse()) {
-                m.header().setId(r.id());
-                replyToQuery(ResultFlag_ErrSet, p, m, buildErrReply(ex));
-            }
-
-            // We *always* populate the last error for now
-            LastError::get(cc()).setLastError(ex.getCode(), ex.what());
-        }
-
-        // Release connections back to pool, if any still cached
-        ShardConnection::releaseMyConnections();
-    }
-
-    virtual void close() {
-        Client::destroy();
-    }
-};
-
 }  // namespace mongo
 
 using namespace mongo;
-
-static void reloadSettings(OperationContext* txn) {
-    Grid::get(txn)->getBalancerConfiguration()->refreshAndCheck(txn);
-
-    // Create the config data indexes
-    const bool unique = true;
-
-    Status result = clusterCreateIndex(
-        txn, ChunkType::ConfigNS, BSON(ChunkType::ns() << 1 << ChunkType::min() << 1), unique);
-    if (!result.isOK()) {
-        warning() << "couldn't create ns_1_min_1 index on config db" << causedBy(result);
-    }
-
-    result = clusterCreateIndex(
-        txn,
-        ChunkType::ConfigNS,
-        BSON(ChunkType::ns() << 1 << ChunkType::shard() << 1 << ChunkType::min() << 1),
-        unique);
-    if (!result.isOK()) {
-        warning() << "couldn't create ns_1_shard_1_min_1 index on config db" << causedBy(result);
-    }
-
-    result = clusterCreateIndex(txn,
-                                ChunkType::ConfigNS,
-                                BSON(ChunkType::ns() << 1 << ChunkType::DEPRECATED_lastmod() << 1),
-                                unique);
-    if (!result.isOK()) {
-        warning() << "couldn't create ns_1_lastmod_1 index on config db" << causedBy(result);
-    }
-
-    result = clusterCreateIndex(txn, ShardType::ConfigNS, BSON(ShardType::host() << 1), unique);
-    if (!result.isOK()) {
-        warning() << "couldn't create host_1 index on config db" << causedBy(result);
-    }
-
-    result = clusterCreateIndex(txn, LocksType::ConfigNS, BSON(LocksType::lockID() << 1), !unique);
-    if (!result.isOK()) {
-        warning() << "couldn't create lock id index on config db" << causedBy(result);
-    }
-
-    result = clusterCreateIndex(txn,
-                                LocksType::ConfigNS,
-                                BSON(LocksType::state() << 1 << LocksType::process() << 1),
-                                !unique);
-    if (!result.isOK()) {
-        warning() << "couldn't create state and process id index on config db" << causedBy(result);
-    }
-
-    result =
-        clusterCreateIndex(txn, LockpingsType::ConfigNS, BSON(LockpingsType::ping() << 1), !unique);
-    if (!result.isOK()) {
-        warning() << "couldn't create lockping ping time index on config db" << causedBy(result);
-    }
-
-    result = clusterCreateIndex(
-        txn, TagsType::ConfigNS, BSON(TagsType::ns() << 1 << TagsType::min() << 1), unique);
-    if (!result.isOK()) {
-        warning() << "could not create index ns_1_min_1: " << causedBy(result);
-    }
-}
 
 static Status initializeSharding(OperationContext* txn) {
     auto targeterFactory = stdx::make_unique<RemoteCommandTargeterFactoryImpl>();
@@ -307,7 +190,9 @@ static Status initializeSharding(OperationContext* txn) {
         stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
     Status status = initializeGlobalShardingState(
+        txn,
         mongosGlobalParams.configdbs,
+        generateDistLockProcessId(txn),
         std::move(shardFactory),
         []() { return stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>(); },
         [](ShardingCatalogClient* catalogClient, std::unique_ptr<executor::TaskExecutor> executor) {
@@ -319,12 +204,6 @@ static Status initializeSharding(OperationContext* txn) {
     }
 
     status = reloadShardRegistryUntilSuccess(txn);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    auto catalogClient = grid.catalogClient(txn);
-    status = catalogClient->initConfigVersion(txn);
     if (!status.isOK()) {
         return status;
     }
@@ -347,6 +226,19 @@ static ExitCode runMongosServer() {
     printShardingVersionInfo(false);
 
     _initWireSpec();
+
+    transport::TransportLayerLegacy::Options opts;
+    opts.port = serverGlobalParams.port;
+    opts.ipList = serverGlobalParams.bind_ip;
+
+    auto sep =
+        std::make_shared<ServiceEntryPointMongos>(getGlobalServiceContext()->getTransportLayer());
+
+    auto transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(opts, sep);
+    auto res = transportLayer->setup();
+    if (!res.isOK()) {
+        return EXIT_NET_ERROR;
+    }
 
     // Add sharding hooks to both connection pools - ShardingConnectionHook includes auth hooks
     globalConnPool.addHook(new ShardingConnectionHookForMongos(false));
@@ -379,7 +271,7 @@ static ExitCode runMongosServer() {
             return EXIT_SHARDING_ERROR;
         }
 
-        reloadSettings(opCtx.get());
+        Grid::get(opCtx.get())->getBalancerConfiguration()->refreshAndCheck(opCtx.get());
     }
 
 #if !defined(_WIN32)
@@ -422,19 +314,13 @@ static ExitCode runMongosServer() {
 
     PeriodicTask::startRunningPeriodicTasks();
 
-    MessageServer::Options opts;
-    opts.port = serverGlobalParams.port;
-    opts.ipList = serverGlobalParams.bind_ip;
-
-    auto handler = std::make_shared<ShardedMessageHandler>();
-    MessageServer* server = createServer(opts, std::move(handler), getGlobalServiceContext());
-    if (!server->setupSockets()) {
+    auto start = getGlobalServiceContext()->addAndStartTransportLayer(std::move(transportLayer));
+    if (!start.isOK()) {
         return EXIT_NET_ERROR;
     }
-    server->run();
 
-    // MessageServer::run will return when exit code closes its socket
-    return inShutdown() ? EXIT_CLEAN : EXIT_NET_ERROR;
+    // Block until shutdown.
+    return waitForShutdown();
 }
 
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))

@@ -76,8 +76,15 @@ public:
      */
     boost::intrusive_ptr<DocumentSource> optimize() final;
 
-    // TODO SERVER-24640: implement getDependencies() to take a union of all dependencies of
-    // sub-pipelines.
+    /**
+     * Injects the expression context into inner pipelines.
+     */
+    void doInjectExpressionContext() final;
+
+    /**
+     * Takes a union of all sub-pipelines, and adds them to 'deps'.
+     */
+    GetDepsReturn getDependencies(DepsTracker* deps) const final;
 
     const char* getSourceName() const final {
         return "$facet";

@@ -151,6 +151,9 @@ public:
 
     StatusWith<BSONObj> getGlobalSettings(OperationContext* txn, StringData key) override;
 
+    StatusWith<VersionType> getConfigVersion(OperationContext* txn,
+                                             repl::ReadConcernLevel readConcern) override;
+
     void writeConfigServerDirect(OperationContext* txn,
                                  const BatchedCommandRequest& request,
                                  BatchedCommandResponse* response) override;
@@ -173,8 +176,6 @@ public:
                                  const WriteConcernOptions& writeConcern) override;
 
     DistLockManager* getDistLockManager() override;
-
-    Status initConfigVersion(OperationContext* txn) override;
 
     Status appendInfoForConfigServerDatabases(OperationContext* txn,
                                               BSONArrayBuilder* builder) override;
@@ -215,15 +216,6 @@ private:
                                          int cappedSize);
 
     /**
-     * Executes the specified batch write command on the current config server's primary and retries
-     * on the specified set of errors using the default retry policy.
-     */
-    void _runBatchWriteCommand(OperationContext* txn,
-                               const BatchedCommandRequest& request,
-                               BatchedCommandResponse* response,
-                               Shard::RetryPolicy retryPolicy);
-
-    /**
      * Helper method for running a count command against the config server with appropriate
      * error handling.
      */
@@ -243,11 +235,6 @@ private:
      * Appends a read committed read concern to the request object.
      */
     void _appendReadConcern(BSONObjBuilder* builder);
-
-    /**
-     * Returns the current cluster schema/protocol version.
-     */
-    StatusWith<VersionType> _getConfigVersion(OperationContext* txn);
 
     /**
      * Queries the config servers for the database metadata for the given database, using the

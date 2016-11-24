@@ -43,11 +43,14 @@ AtomicUInt64 sessionIdCounter(0);
 }  // namespace
 
 Session::Session(HostAndPort remote, HostAndPort local, TransportLayer* tl)
-    : _id(sessionIdCounter.addAndFetch(1)), _remote(remote), _local(local), _tl(tl) {}
+    : _id(sessionIdCounter.addAndFetch(1)),
+      _remote(std::move(remote)),
+      _local(std::move(local)),
+      _tags(kEmptyTagMask),
+      _tl(tl) {}
 
 Session::~Session() {
     if (_tl != nullptr) {
-        invariant(_tl);
         _tl->end(*this);
     }
 }
@@ -62,25 +65,34 @@ Session::Session(Session&& other)
 }
 
 Session& Session::operator=(Session&& other) {
+    if (&other == this) {
+        return *this;
+    }
+
     _id = other._id;
     _remote = std::move(other._remote);
     _local = std::move(other._local);
     _tl = other._tl;
-    _tl = nullptr;
+    other._tl = nullptr;
 
     return *this;
 }
 
-Session::SessionId Session::id() const {
-    return _id;
+void Session::replaceTags(TagMask tags) {
+    _tags = tags;
+    _tl->registerTags(*this);
 }
 
-const HostAndPort& Session::remote() const {
-    return _remote;
+Ticket Session::sourceMessage(Message* message, Date_t expiration) {
+    return _tl->sourceMessage(*this, message, expiration);
 }
 
-const HostAndPort& Session::local() const {
-    return _local;
+Ticket Session::sinkMessage(const Message& message, Date_t expiration) {
+    return _tl->sinkMessage(*this, message, expiration);
+}
+
+std::string Session::getX509SubjectName() const {
+    return _tl->getX509SubjectName(*this);
 }
 
 }  // namespace transport

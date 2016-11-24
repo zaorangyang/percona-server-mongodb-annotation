@@ -45,7 +45,7 @@ ExpressionContext::ExpressionContext(OperationContext* opCtx, const AggregationR
         auto statusWithCollator =
             CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation);
         uassertStatusOK(statusWithCollator.getStatus());
-        collator = std::move(statusWithCollator.getValue());
+        setCollator(std::move(statusWithCollator.getValue()));
     }
 }
 
@@ -56,4 +56,13 @@ void ExpressionContext::checkForInterrupt() {
         interruptCounter = kInterruptCheckPeriod;
     }
 }
+
+void ExpressionContext::setCollator(std::unique_ptr<CollatorInterface> coll) {
+    _collator = std::move(coll);
+
+    // Document/Value comparisons must be aware of the collation.
+    _documentComparator = DocumentComparator(_collator.get());
+    _valueComparator = ValueComparator(_collator.get());
+}
+
 }  // namespace mongo

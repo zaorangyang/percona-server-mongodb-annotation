@@ -28,7 +28,10 @@
 
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/s/type_shard_identity.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/s/catalog/type_shard.h"
 
 namespace mongo {
 
@@ -53,8 +56,18 @@ public:
                           const std::string& shardName,
                           const std::string& zoneName) override;
 
+    Status removeShardFromZone(OperationContext* txn,
+                               const std::string& shardName,
+                               const std::string& zoneName) override;
 
     void appendConnectionStats(executor::ConnectionPoolStats* stats) override;
+
+    Status initializeConfigDatabaseIfNeeded(OperationContext* txn) override;
+
+    Status upsertShardIdentityOnShard(OperationContext* txn, ShardType shardType) override;
+
+    BSONObj createShardIdentityUpsertForAddShard(OperationContext* txn,
+                                                 const std::string& shardName) override;
 };
 
 }  // namespace mongo

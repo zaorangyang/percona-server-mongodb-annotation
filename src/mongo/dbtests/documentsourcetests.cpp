@@ -39,6 +39,7 @@
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
@@ -152,7 +153,7 @@ public:
         // The cursor will produce the expected result.
         boost::optional<Document> next = source()->getNext();
         ASSERT(bool(next));
-        ASSERT_EQUALS(Value(1), next->getField("a"));
+        ASSERT_VALUE_EQ(Value(1), next->getField("a"));
         // There are no more results.
         ASSERT(!source()->getNext());
         // Exhausting the source releases the read lock.
@@ -186,11 +187,11 @@ public:
         // The result is as expected.
         boost::optional<Document> next = source()->getNext();
         ASSERT(bool(next));
-        ASSERT_EQUALS(Value(1), next->getField("a"));
+        ASSERT_VALUE_EQ(Value(1), next->getField("a"));
         // The next result is as expected.
         next = source()->getNext();
         ASSERT(bool(next));
-        ASSERT_EQUALS(Value(2), next->getField("a"));
+        ASSERT_VALUE_EQ(Value(2), next->getField("a"));
         // The DocumentSourceCursor doesn't hold a read lock.
         ASSERT(!_opCtx.lockState()->isReadLocked());
         source()->dispose();
@@ -278,7 +279,7 @@ public:
 class IndexScanProvidesSortOnKeys : public Base {
 public:
     void run() {
-        client.ensureIndex(nss.ns(), BSON("a" << 1));
+        client.createIndex(nss.ns(), BSON("a" << 1));
         createSource(BSON("a" << 1));
 
         ASSERT_EQ(source()->getOutputSorts().size(), 1U);
@@ -289,7 +290,7 @@ public:
 class ReverseIndexScanProvidesSort : public Base {
 public:
     void run() {
-        client.ensureIndex(nss.ns(), BSON("a" << -1));
+        client.createIndex(nss.ns(), BSON("a" << -1));
         createSource(BSON("a" << -1));
 
         ASSERT_EQ(source()->getOutputSorts().size(), 1U);
@@ -300,7 +301,7 @@ public:
 class CompoundIndexScanProvidesMultipleSorts : public Base {
 public:
     void run() {
-        client.ensureIndex(nss.ns(), BSON("a" << 1 << "b" << -1));
+        client.createIndex(nss.ns(), BSON("a" << 1 << "b" << -1));
         createSource(BSON("a" << 1 << "b" << -1));
 
         ASSERT_EQ(source()->getOutputSorts().size(), 2U);

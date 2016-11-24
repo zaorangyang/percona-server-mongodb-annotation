@@ -34,6 +34,7 @@
 #include <boost/intrusive_ptr.hpp>
 
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
@@ -43,7 +44,6 @@ class BSONObj;
 class BSONObjBuilder;
 class ClientBasic;
 class CollatorInterface;
-struct DepsTracker;
 class DocumentSource;
 struct ExpressionContext;
 class OperationContext;
@@ -107,15 +107,6 @@ public:
     void reattachToOperationContext(OperationContext* opCtx);
 
     /**
-     * Sets the collator on this Pipeline. parseCommand() will return a Pipeline with its collator
-     * already set from the parsed request (if applicable), but this setter method can be used to
-     * later override the Pipeline's original collator.
-     *
-     * The Pipeline's collator can be retrieved with getContext()->collator.
-     */
-    void setCollator(std::unique_ptr<CollatorInterface> collator);
-
-    /**
       Split the current Pipeline into a Pipeline for each shard, and
       a Pipeline that combines the results within mongos.
 
@@ -140,6 +131,12 @@ public:
      * Modifies the pipeline, optimizing it by combining and swapping stages.
      */
     void optimizePipeline();
+
+    /**
+     * Propagates a reference to the ExpressionContext to all of the pipeline's contained stages and
+     * expressions.
+     */
+    void injectExpressionContext(const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
      * Returns any other collections involved in the pipeline in addition to the collection the
@@ -175,12 +172,10 @@ public:
     std::vector<Value> writeExplainOps() const;
 
     /**
-     * Returns the dependencies needed by this pipeline.
-     *
-     * initialQuery is used as a fallback for metadata dependency detection. The assumption is
-     * that any metadata produced by the query is needed unless we can prove it isn't.
+     * Returns the dependencies needed by this pipeline. 'metadataAvailable' should reflect what
+     * metadata is present on documents that are input to the front of the pipeline.
      */
-    DepsTracker getDependencies(const BSONObj& initialQuery) const;
+    DepsTracker getDependencies(DepsTracker::MetadataAvailable metadataAvailable) const;
 
     const SourceContainer& getSources() {
         return _sources;

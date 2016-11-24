@@ -29,15 +29,24 @@
 #pragma once
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/base/status_with.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/optime_with.h"
+#include "mongo/db/repl/replica_set_config.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
+class OldThreadPool;
+
+namespace executor {
+class TaskExecutor;
+}  // namespace executor
+
 namespace repl {
 
 class DataReplicator;
@@ -60,6 +69,16 @@ public:
     DataReplicatorExternalState() = default;
 
     virtual ~DataReplicatorExternalState() = default;
+
+    /**
+     * Returns task executor for scheduling tasks to be run asynchronously.
+     */
+    virtual executor::TaskExecutor* getTaskExecutor() const = 0;
+
+    /**
+     * Returns shared db worker thread pool for collection cloning.
+     */
+    virtual OldThreadPool* getDbWorkThreadPool() const = 0;
 
     /**
      * Returns the current term and last committed optime.
@@ -91,6 +110,11 @@ public:
      */
     virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(
         OperationContext* txn) const = 0;
+
+    /**
+     * Returns the current replica set config if there is one, or an error why there isn't.
+     */
+    virtual StatusWith<ReplicaSetConfig> getCurrentConfig() const = 0;
 
 private:
     /**

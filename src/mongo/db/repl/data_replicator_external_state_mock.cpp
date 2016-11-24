@@ -41,6 +41,14 @@ DataReplicatorExternalStateMock::DataReplicatorExternalStateMock()
                       const MultiApplier::Operations& ops,
                       MultiApplier::ApplyOperationFn) { return ops.back().getOpTime(); }) {}
 
+executor::TaskExecutor* DataReplicatorExternalStateMock::getTaskExecutor() const {
+    return taskExecutor;
+}
+
+OldThreadPool* DataReplicatorExternalStateMock::getDbWorkThreadPool() const {
+    return dbWorkThreadPool;
+}
+
 OpTimeWithTerm DataReplicatorExternalStateMock::getCurrentTermAndLastCommittedOpTime() {
     return {currentTerm, lastCommittedOpTime};
 }
@@ -65,6 +73,10 @@ std::unique_ptr<OplogBuffer> DataReplicatorExternalStateMock::makeInitialSyncOpl
 std::unique_ptr<OplogBuffer> DataReplicatorExternalStateMock::makeSteadyStateOplogBuffer(
     OperationContext* txn) const {
     return stdx::make_unique<OplogBufferBlockingQueue>();
+}
+
+StatusWith<ReplicaSetConfig> DataReplicatorExternalStateMock::getCurrentConfig() const {
+    return replSetConfig;
 }
 
 StatusWith<OpTime> DataReplicatorExternalStateMock::_multiApply(

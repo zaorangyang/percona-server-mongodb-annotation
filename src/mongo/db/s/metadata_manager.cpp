@@ -36,19 +36,28 @@ namespace mongo {
 
 MetadataManager::MetadataManager() = default;
 
+MetadataManager::~MetadataManager() {
+    stdx::lock_guard<stdx::mutex> scopedLock(_managerLock);
+    invariant(!_activeMetadataTracker || _activeMetadataTracker->usageCounter == 0);
+}
+
 ScopedCollectionMetadata MetadataManager::getActiveMetadata() {
-    invariant(_activeMetadataTracker);
+    stdx::lock_guard<stdx::mutex> scopedLock(_managerLock);
+    if (!_activeMetadataTracker) {
+        return ScopedCollectionMetadata();
+    }
     return ScopedCollectionMetadata(this, _activeMetadataTracker.get());
 }
 
 void MetadataManager::setActiveMetadata(std::unique_ptr<CollectionMetadata> newMetadata) {
+    stdx::lock_guard<stdx::mutex> scopedLock(_managerLock);
     if (_activeMetadataTracker && _activeMetadataTracker->usageCounter > 0) {
         _metadataInUse.push_front(std::move(_activeMetadataTracker));
     }
     _activeMetadataTracker = stdx::make_unique<CollectionMetadataTracker>(std::move(newMetadata));
 }
 
-void MetadataManager::_removeMetadata(CollectionMetadataTracker* metadataTracker) {
+void MetadataManager::_removeMetadata_inlock(CollectionMetadataTracker* metadataTracker) {
     invariant(metadataTracker->usageCounter == 0);
     auto i = _metadataInUse.begin();
     auto e = _metadataInUse.end();
@@ -65,6 +74,9 @@ MetadataManager::CollectionMetadataTracker::CollectionMetadataTracker(
     std::unique_ptr<CollectionMetadata> m)
     : metadata(std::move(m)), usageCounter(0){};
 
+ScopedCollectionMetadata::ScopedCollectionMetadata() = default;
+
+// called in lock
 ScopedCollectionMetadata::ScopedCollectionMetadata(
     MetadataManager* manager, MetadataManager::CollectionMetadataTracker* tracker)
     : _manager(manager), _tracker(tracker) {
@@ -72,9 +84,13 @@ ScopedCollectionMetadata::ScopedCollectionMetadata(
 }
 
 ScopedCollectionMetadata::~ScopedCollectionMetadata() {
+    if (!_tracker)
+        return;
+
+    stdx::lock_guard<stdx::mutex> scopedLock(_manager->_managerLock);
     invariant(_tracker->usageCounter > 0);
     if (--_tracker->usageCounter == 0) {
-        _manager->_removeMetadata(_tracker);
+        _manager->_removeMetadata_inlock(_tracker);
     }
 }
 
@@ -101,11 +117,21 @@ ScopedCollectionMetadata& ScopedCollectionMetadata::operator=(ScopedCollectionMe
     return *this;
 }
 
+ScopedCollectionMetadata::operator bool() const {
+    return _tracker && _tracker->metadata.get();
+}
+
 std::map<BSONObj, ChunkRange> MetadataManager::getCopyOfRanges() {
+    stdx::lock_guard<stdx::mutex> scopedLock(_managerLock);
     return _rangesToClean;
 }
 
 void MetadataManager::addRangeToClean(const ChunkRange& range) {
+    stdx::lock_guard<stdx::mutex> scopedLock(_managerLock);
+    _addRangeToClean_inlock(range);
+}
+
+void MetadataManager::_addRangeToClean_inlock(const ChunkRange& range) {
     auto itLow = _rangesToClean.upper_bound(range.getMin());
     if (itLow != _rangesToClean.begin()) {
         --itLow;
@@ -134,6 +160,11 @@ void MetadataManager::addRangeToClean(const ChunkRange& range) {
 }
 
 void MetadataManager::removeRangeToClean(const ChunkRange& range) {
+    stdx::lock_guard<stdx::mutex> scopedLock(_managerLock);
+    _removeRangeToClean_inlock(range);
+}
+
+void MetadataManager::_removeRangeToClean_inlock(const ChunkRange& range) {
     auto it = _rangesToClean.upper_bound(range.getMin());
     // We want our iterator to point at the greatest value
     // that is still less than or equal to range.
@@ -152,17 +183,18 @@ void MetadataManager::removeRangeToClean(const ChunkRange& range) {
         _rangesToClean.erase(it++);
         if (oldChunk.getMin() < range.getMin()) {
             ChunkRange newChunk = ChunkRange(oldChunk.getMin(), range.getMin());
-            addRangeToClean(newChunk);
+            _addRangeToClean_inlock(newChunk);
         }
         if (oldChunk.getMax() > range.getMax()) {
             ChunkRange newChunk = ChunkRange(range.getMax(), oldChunk.getMax());
-            addRangeToClean(newChunk);
+            _addRangeToClean_inlock(newChunk);
         }
     }
 }
 
 void MetadataManager::append(BSONObjBuilder* builder) {
     BSONArrayBuilder arr(builder->subarrayStart("rangesToClean"));
+    stdx::lock_guard<stdx::mutex> scopedLock(_managerLock);
     for (const auto& entry : _rangesToClean) {
         BSONObjBuilder obj;
         entry.second.append(&obj);

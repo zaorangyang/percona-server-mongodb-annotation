@@ -33,8 +33,6 @@
 #include "mongo/base/status.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/repl/read_concern_response.h"
-#include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/db/storage/snapshot_name.h"
 #include "mongo/db/write_concern_options.h"
@@ -47,6 +45,7 @@ using std::vector;
 
 ReplicationCoordinatorMock::ReplicationCoordinatorMock(const ReplSettings& settings)
     : _settings(settings) {}
+
 ReplicationCoordinatorMock::~ReplicationCoordinatorMock() {}
 
 void ReplicationCoordinatorMock::startup(OperationContext* txn) {
@@ -181,9 +180,9 @@ OpTime ReplicationCoordinatorMock::getMyLastDurableOpTime() const {
     return _myLastDurableOpTime;
 }
 
-ReadConcernResponse ReplicationCoordinatorMock::waitUntilOpTime(OperationContext* txn,
-                                                                const ReadConcernArgs& settings) {
-    return ReadConcernResponse();
+Status ReplicationCoordinatorMock::waitUntilOpTimeForRead(OperationContext* txn,
+                                                          const ReadConcernArgs& settings) {
+    return Status::OK();
 }
 
 
@@ -226,7 +225,11 @@ StatusWith<BSONObj> ReplicationCoordinatorMock::prepareReplSetUpdatePositionComm
 }
 
 ReplicaSetConfig ReplicationCoordinatorMock::getConfig() const {
-    return ReplicaSetConfig();
+    return _getConfigReturnValue;
+}
+
+void ReplicationCoordinatorMock::setGetConfigReturnValue(ReplicaSetConfig returnValue) {
+    _getConfigReturnValue = std::move(returnValue);
 }
 
 void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result) {
@@ -448,6 +451,10 @@ ReplSettings::IndexPrefetchConfig ReplicationCoordinatorMock::getIndexPrefetchCo
 
 void ReplicationCoordinatorMock::setIndexPrefetchConfig(
     const ReplSettings::IndexPrefetchConfig cfg) {}
+
+Status ReplicationCoordinatorMock::stepUpIfEligible() {
+    return Status::OK();
+}
 
 }  // namespace repl
 }  // namespace mongo

@@ -141,9 +141,10 @@ var server11675 = function() {
                ]).toArray();
     assert.eq(res[0].score, score);
 
-    // Make sure the metadata is 'missing()' when it doesn't exist because it was never created
-    var res = t.aggregate([{$project: {_id: 1, score: {$meta: 'textScore'}}}]).toArray();
-    assert(!("score" in res[0]));
+    // Make sure the pipeline fails if it tries to reference the text score and it doesn't exist.
+    var res = t.runCommand(
+        {aggregate: t.getName(), pipeline: [{$project: {_id: 1, score: {$meta: 'textScore'}}}]});
+    assert.commandFailed(res);
 
     // Make sure the metadata is 'missing()' when it doesn't exist because the document changed
     var res = t.aggregate([
@@ -168,7 +169,9 @@ var server11675 = function() {
     assertErrorCode(t, [{$sort: {text: 1}}, {$match: {$text: {$search: 'apple banana'}}}], 17313);
 
     // wrong $stage, but correct position
-    assertErrorCode(t, [{$project: {searchValue: {$text: {$search: 'apple banana'}}}}], 15999);
+    assertErrorCode(t,
+                    [{$project: {searchValue: {$text: {$search: 'apple banana'}}}}],
+                    ErrorCodes.InvalidPipelineOperator);
     assertErrorCode(t, [{$sort: {$text: {$search: 'apple banana'}}}], 17312);
 };
 server11675();

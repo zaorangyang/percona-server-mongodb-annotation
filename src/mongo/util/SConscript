@@ -162,6 +162,16 @@ env.Library(
 )
 
 env.CppUnitTest(
+    target='clock_source_mock_test',
+    source=[
+        'clock_source_mock_test.cpp',
+    ],
+    LIBDEPS=[
+        'clock_source_mock',
+    ],
+)
+
+env.CppUnitTest(
     target='text_test',
     source=[
         'text_test.cpp'
@@ -509,3 +519,34 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
     ])
+
+env.CppUnitTest(
+    target='assert_util_test',
+    source=[
+        'assert_util_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
+)
+
+if env.TargetOSIs('linux'):
+    env.Library(
+        target='procparser',
+        source=[
+            "procparser.cpp",
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base',
+        ],
+    )
+
+    env.CppUnitTest(
+        target='procparser_test',
+        source=[
+            'procparser_test.cpp',
+        ],
+        LIBDEPS=[
+            'procparser',
+        ],
+    )

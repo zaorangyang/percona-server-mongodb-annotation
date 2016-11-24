@@ -43,6 +43,10 @@ class DataReplicatorExternalStateMock : public DataReplicatorExternalState {
 public:
     DataReplicatorExternalStateMock();
 
+    executor::TaskExecutor* getTaskExecutor() const override;
+
+    OldThreadPool* getDbWorkThreadPool() const override;
+
     OpTimeWithTerm getCurrentTermAndLastCommittedOpTime() override;
 
     void processMetadata(const rpc::ReplSetMetadata& metadata) override;
@@ -53,6 +57,14 @@ public:
     std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(OperationContext* txn) const override;
 
     std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(OperationContext* txn) const override;
+
+    StatusWith<ReplicaSetConfig> getCurrentConfig() const override;
+
+    // Task executor. Not owned by us.
+    executor::TaskExecutor* taskExecutor = nullptr;
+
+    // DB worker thread pool. Not owned by us.
+    OldThreadPool* dbWorkThreadPool = nullptr;
 
     // Returned by getCurrentTermAndLastCommittedOpTime.
     long long currentTerm = OpTime::kUninitializedTerm;
@@ -71,6 +83,8 @@ public:
 
     // Override to change multiApply behavior.
     MultiApplier::MultiApplyFn multiApplyFn;
+
+    ReplicaSetConfig replSetConfig;
 
 private:
     StatusWith<OpTime> _multiApply(OperationContext* txn,

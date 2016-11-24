@@ -66,13 +66,20 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/s/balancer/balancer.h"
+#include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -99,7 +106,7 @@ const char kBlockingQueueOplogBufferName[] = "inMemoryBlockingQueue";
 // repl::SnapshotThread introduces.
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(enableReplSnapshotThread, bool, false);
 
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(useDataReplicatorInitialSync, bool, false);
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(use3dot2InitialSync, bool, false);
 
 // Set this to specify whether to use a collection to buffer the oplog on the destination server
 // during initial sync to prevent rolling over the oplog.
@@ -113,45 +120,45 @@ MONGO_INITIALIZER(initialSyncOplogBuffer)(InitializerContext*) {
         return Status(ErrorCodes::BadValue,
                       "unsupported initial sync oplog buffer option: " + initialSyncOplogBuffer);
     }
-    if (!useDataReplicatorInitialSync && (initialSyncOplogBuffer == kCollectionOplogBufferName)) {
+    if (use3dot2InitialSync && (initialSyncOplogBuffer == kCollectionOplogBufferName)) {
         return Status(ErrorCodes::BadValue,
                       "cannot use collection oplog buffer without --setParameter "
-                      "useDataReplicatorInitialSync=true");
+                      "use3dot2InitialSync=false");
     }
 
     return Status::OK();
 }
 
+/**
+ * Returns new thread pool for thread pool task executor.
+ */
+std::unique_ptr<ThreadPool> makeThreadPool() {
+    ThreadPool::Options threadPoolOptions;
+    threadPoolOptions.poolName = "replication";
+    threadPoolOptions.onCreateThread = [](const std::string& threadName) {
+        Client::initThread(threadName.c_str());
+    };
+    return stdx::make_unique<ThreadPool>(threadPoolOptions);
+}
+
 }  // namespace
 
-ReplicationCoordinatorExternalStateImpl::ReplicationCoordinatorExternalStateImpl()
-    : _startedThreads(false), _nextThreadId(0) {}
+ReplicationCoordinatorExternalStateImpl::ReplicationCoordinatorExternalStateImpl(
+    StorageInterface* storageInterface)
+    : _storageInterface(storageInterface) {
+    uassert(ErrorCodes::BadValue, "A StorageInterface is required.", _storageInterface);
+}
 ReplicationCoordinatorExternalStateImpl::~ReplicationCoordinatorExternalStateImpl() {}
 
 bool ReplicationCoordinatorExternalStateImpl::isInitialSyncFlagSet(OperationContext* txn) {
-    const auto si = repl::StorageInterface::get(txn);
-    return (si && si->getInitialSyncFlag(txn));
+    return _storageInterface->getInitialSyncFlag(txn);
 }
 
 void ReplicationCoordinatorExternalStateImpl::startInitialSync(OnInitialSyncFinishedFn finished) {
     _initialSyncThread.reset(new stdx::thread{[finished, this]() {
         Client::initThreadIfNotAlready("initial sync");
-
-        // "_bgSync" should not be initialized before this.
-        invariant(!_bgSync);
-        {
-            auto txn = cc().makeOperationContext();
-            invariant(txn);
-            invariant(txn->getClient());
-            log() << "Starting replication fetcher thread";
-
-            // Start bgsync.
-            _bgSync.reset(new BackgroundSync(this, makeSteadyStateOplogBuffer(txn.get())));
-            _bgSync->startup(txn.get());
-        }
-
         // Do initial sync.
-        syncDoInitialSync(_bgSync.get());
+        syncDoInitialSync(this);
         finished();
     }});
 }
@@ -168,18 +175,18 @@ void ReplicationCoordinatorExternalStateImpl::runOnInitialSyncThread(
 }
 
 void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(OperationContext* txn) {
-    if (!_bgSync) {
-        log() << "Starting replication fetcher thread";
-        _bgSync.reset(new BackgroundSync(this, makeSteadyStateOplogBuffer(txn)));
-        _bgSync->startup(txn);
-    }
+    invariant(!_bgSync);
+    log() << "Starting replication fetcher thread";
+    _bgSync = stdx::make_unique<BackgroundSync>(this, makeSteadyStateOplogBuffer(txn));
+    _bgSync->startup(txn);
+
     log() << "Starting replication applier threads";
     invariant(!_applierThread);
     _applierThread.reset(new stdx::thread(stdx::bind(&runSyncThread, _bgSync.get())));
     log() << "Starting replication reporter thread";
     invariant(!_syncSourceFeedbackThread);
-    _syncSourceFeedbackThread.reset(new stdx::thread(
-        stdx::bind(&SyncSourceFeedback::run, &_syncSourceFeedback, _bgSync.get())));
+    _syncSourceFeedbackThread.reset(new stdx::thread(stdx::bind(
+        &SyncSourceFeedback::run, &_syncSourceFeedback, _taskExecutor.get(), _bgSync.get())));
 }
 
 void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& settings) {
@@ -193,7 +200,13 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
     }
     getGlobalServiceContext()->getGlobalStorageEngine()->setJournalListener(this);
 
+    _taskExecutor = stdx::make_unique<executor::ThreadPoolTaskExecutor>(
+        makeThreadPool(), executor::makeNetworkInterface("NetworkInterfaceASIO-RS"));
+    _taskExecutor->startup();
+
     _writerPool = SyncTail::makeWriterPool();
+
+    _storageInterface->startup();
 
     _startedThreads = true;
 }
@@ -220,7 +233,19 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* txn) {
         }
         if (_snapshotThread)
             _snapshotThread->shutdown();
+
+        _taskExecutor->shutdown();
+        _taskExecutor->join();
+        _storageInterface->shutdown();
     }
+}
+
+executor::TaskExecutor* ReplicationCoordinatorExternalStateImpl::getTaskExecutor() const {
+    return _taskExecutor.get();
+}
+
+OldThreadPool* ReplicationCoordinatorExternalStateImpl::getDbWorkThreadPool() const {
+    return _writerPool.get();
 }
 
 Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(OperationContext* txn,
@@ -372,7 +397,10 @@ void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(const Timestamp
 }
 
 void ReplicationCoordinatorExternalStateImpl::cleanUpLastApplyBatch(OperationContext* txn) {
-    auto mv = StorageInterface::get(txn)->getMinValid(txn);
+    if (_storageInterface->getInitialSyncFlag(txn)) {
+        return;  // Initial Sync will take over so no cleanup is needed.
+    }
+    auto mv = _storageInterface->getMinValid(txn);
 
     if (!mv.start.isNull()) {
         // If we are in the middle of a batch, and recoveringm then we need to truncate the oplog.
@@ -385,8 +413,7 @@ StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(Opera
     // TODO: handle WriteConflictExceptions below
     try {
         // If we are doing an initial sync do not read from the oplog.
-        const auto si = repl::StorageInterface::get(txn);
-        if (si && si->getInitialSyncFlag(txn)) {
+        if (_storageInterface->getInitialSyncFlag(txn)) {
             return {ErrorCodes::InitialSyncFailure, "In the middle of an initial sync."};
         }
 
@@ -428,7 +455,7 @@ HostAndPort ReplicationCoordinatorExternalStateImpl::getClientHostAndPort(
 }
 
 void ReplicationCoordinatorExternalStateImpl::closeConnections() {
-    Listener::closeMessagingPorts(executor::NetworkInterface::kMessagingPortKeepOpen);
+    getGlobalServiceContext()->getTransportLayer()->endAllSessions(transport::Session::kKeepOpen);
 }
 
 void ReplicationCoordinatorExternalStateImpl::killAllUserOperations(OperationContext* txn) {
@@ -447,7 +474,7 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
 void ReplicationCoordinatorExternalStateImpl::shardingOnDrainingStateHook(OperationContext* txn) {
     auto status = ShardingStateRecovery::recover(txn);
 
-    if (status == ErrorCodes::ShutdownInProgress) {
+    if (ErrorCodes::isShutdownError(status.code())) {
         // Note: callers of this method don't expect exceptions, so throw only unexpected fatal
         // errors.
         return;
@@ -458,6 +485,44 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnDrainingStateHook(Operat
     }
 
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        status = Grid::get(txn)->catalogManager()->initializeConfigDatabaseIfNeeded(txn);
+        if (!status.isOK() && status != ErrorCodes::AlreadyInitialized) {
+            if (ErrorCodes::isShutdownError(status.code())) {
+                // Don't fassert if we're mid-shutdown, let the shutdown happen gracefully.
+                return;
+            }
+
+            fassertFailedWithStatus(40184,
+                                    Status(status.code(),
+                                           str::stream()
+                                               << "Failed to initialize config database on config "
+                                                  "server's first transition to primary"
+                                               << causedBy(status)));
+        }
+
+        if (status != ErrorCodes::AlreadyInitialized) {
+            // Load the clusterId into memory. Use local readConcern, since we can't use majority
+            // readConcern in drain mode because the global lock prevents replication. This is
+            // safe, since if the clusterId write is rolled back, any writes that depend on it will
+            // also be rolled back.
+            // Since we *just* wrote the cluster ID to the config.version document (via
+            // ShardingCatalogManager::initializeConfigDatabaseIfNeeded), this should always
+            // succeed.
+            status = ClusterIdentityLoader::get(txn)->loadClusterId(
+                txn, repl::ReadConcernLevel::kLocalReadConcern);
+
+            if (ErrorCodes::isShutdownError(status.code())) {
+                // Don't fassert if we're mid-shutdown, let the shutdown happen gracefully.
+                return;
+            }
+
+            fassertStatusOK(40217, status);
+        }
+
+        // Free any leftover locks from previous instantiations
+        auto distLockManager = Grid::get(txn)->catalogClient(txn)->getDistLockManager();
+        distLockManager->unlockAll(txn, distLockManager->getProcessID());
+
         // If this is a config server node becoming a primary, start the balancer
         auto balancer = Balancer::get(txn);
 
@@ -587,7 +652,7 @@ std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateImpl::makeSteady
 }
 
 bool ReplicationCoordinatorExternalStateImpl::shouldUseDataReplicatorInitialSync() const {
-    return useDataReplicatorInitialSync;
+    return !use3dot2InitialSync;
 }
 
 JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken() {

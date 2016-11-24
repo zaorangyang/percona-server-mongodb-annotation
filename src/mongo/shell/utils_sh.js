@@ -44,7 +44,7 @@ sh._pchunk = function(chunk) {
 
 /**
  * Internal method to write the balancer state to the config.settings collection. Should not be used
- * directly, instead go through the start/stopBalancer calls and the controlBalancer command.
+ * directly, instead go through the start/stopBalancer calls and the balancerStart/Stop commands.
  */
 sh._writeBalancerStateDeprecated = function(onOrNot) {
     return assert.writeOK(
@@ -79,6 +79,9 @@ sh.help = function() {
     print("\tsh.status()                               prints a general overview of the cluster");
     print(
         "\tsh.stopBalancer()                         stops the balancer so chunks are not balanced automatically");
+    print("\tsh.disableAutoSplit()                   disable autoSplit on one collection");
+    print("\tsh.enableAutoSplit()                    re-eable autoSplit on one colleciton");
+    print("\tsh.getShouldAutoSplit()                 returns whether autosplit is enabled");
 };
 
 sh.status = function(verbose, configDB) {
@@ -165,7 +168,7 @@ sh.getBalancerHost = function(configDB) {
 sh.stopBalancer = function(timeoutMs, interval) {
     timeoutMs = timeoutMs || 60000;
 
-    var result = db.adminCommand({controlBalancer: 'stop', maxTimeMS: timeoutMs});
+    var result = db.adminCommand({balancerStop: 1, maxTimeMS: timeoutMs});
     if (result.code === ErrorCodes.CommandNotFound) {
         // For backwards compatibility, use the legacy balancer stop method
         result = sh._writeBalancerStateDeprecated(false);
@@ -177,7 +180,7 @@ sh.stopBalancer = function(timeoutMs, interval) {
 };
 
 sh.startBalancer = function(timeoutMs, interval) {
-    var result = db.adminCommand({controlBalancer: 'start', maxTimeMS: timeoutMs});
+    var result = db.adminCommand({balancerStart: 1, maxTimeMS: timeoutMs});
     if (result.code === ErrorCodes.CommandNotFound) {
         // For backwards compatibility, use the legacy balancer start method
         result = sh._writeBalancerStateDeprecated(true);
@@ -186,6 +189,36 @@ sh.startBalancer = function(timeoutMs, interval) {
     }
 
     return assert.commandWorked(result);
+};
+
+sh.enableAutoSplit = function(configDB) {
+    if (configDB === undefined)
+        configDB = sh._getConfigDB();
+    return assert.writeOK(
+        configDB.settings.update({_id: 'autosplit'},
+                                 {$set: {enabled: true}},
+                                 {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
+};
+
+sh.disableAutoSplit = function(configDB) {
+    if (configDB === undefined)
+        configDB = sh._getConfigDB();
+    return assert.writeOK(
+        configDB.settings.update({_id: 'autosplit'},
+                                 {$set: {enabled: false}},
+                                 {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
+};
+
+sh.getShouldAutoSplit = function(configDB) {
+    if (configDB === undefined)
+        configDB = sh._getConfigDB();
+    var autosplit = configDB.settings.findOne({_id: 'autosplit'});
+    if (autosplit == null) {
+        print(
+            "No autosplit document found in config.settings collection. Be sure you are connected to a mongos");
+        return true;
+    }
+    return autosplit.enabled;
 };
 
 sh._waitForDLock = function(lockId, onOrNot, timeout, interval) {
@@ -314,7 +347,9 @@ sh.disableBalancing = function(coll) {
     }
 
     return assert.writeOK(dbase.getSisterDB("config").collections.update(
-        {_id: coll + ""}, {$set: {"noBalance": true}}, {writeConcern: {w: 'majority'}}));
+        {_id: coll + ""},
+        {$set: {"noBalance": true}},
+        {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.enableBalancing = function(coll) {
@@ -329,7 +364,9 @@ sh.enableBalancing = function(coll) {
     }
 
     return assert.writeOK(dbase.getSisterDB("config").collections.update(
-        {_id: coll + ""}, {$set: {"noBalance": false}}, {writeConcern: {w: 'majority'}}));
+        {_id: coll + ""},
+        {$set: {"noBalance": false}},
+        {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 /*
@@ -385,7 +422,7 @@ sh.addShardTag = function(shard, tag) {
         throw Error("can't find a shard with name: " + shard);
     }
     return assert.writeOK(config.shards.update(
-        {_id: shard}, {$addToSet: {tags: tag}}, {writeConcern: {w: 'majority'}}));
+        {_id: shard}, {$addToSet: {tags: tag}}, {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.removeShardTag = function(shard, tag) {
@@ -393,8 +430,8 @@ sh.removeShardTag = function(shard, tag) {
     if (config.shards.findOne({_id: shard}) == null) {
         throw Error("can't find a shard with name: " + shard);
     }
-    return assert.writeOK(
-        config.shards.update({_id: shard}, {$pull: {tags: tag}}, {writeConcern: {w: 'majority'}}));
+    return assert.writeOK(config.shards.update(
+        {_id: shard}, {$pull: {tags: tag}}, {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.addTagRange = function(ns, min, max, tag) {
@@ -406,7 +443,7 @@ sh.addTagRange = function(ns, min, max, tag) {
     return assert.writeOK(
         config.tags.update({_id: {ns: ns, min: min}},
                            {_id: {ns: ns, min: min}, ns: ns, min: min, max: max, tag: tag},
-                           {upsert: true, writeConcern: {w: 'majority'}}));
+                           {upsert: true, writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.removeTagRange = function(ns, min, max, tag) {
@@ -422,7 +459,7 @@ sh.removeTagRange = function(ns, min, max, tag) {
     // max and tag criteria not really needed, but including them avoids potentially unexpected
     // behavior.
     return assert.writeOK(config.tags.remove({_id: {ns: ns, min: min}, max: max, tag: tag},
-                                             {writeConcern: {w: 'majority'}}));
+                                             {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.getBalancerLockDetails = function(configDB) {
@@ -611,6 +648,11 @@ function printShardingStatus(configDB, verbose) {
                 });
         }
     }
+
+    output(" autosplit:");
+
+    // Is autosplit currently enabled
+    output("\tCurrently enabled: " + (sh.getShouldAutoSplit(configDB) ? "yes" : "no"));
 
     output("  balancer:");
 
