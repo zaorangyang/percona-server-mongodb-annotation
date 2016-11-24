@@ -9,12 +9,24 @@ env.SConscript(
 )
 
 env.Library(
-    target='catalog_manager_mock',
+    target='sharding_catalog_client',
     source=[
-        'catalog_manager_mock.cpp',
+        'sharding_catalog_client.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/write_concern_options',
+    ]
+)
+
+env.Library(
+    target='sharding_catalog_mock',
+    source=[
+        'sharding_catalog_client_mock.cpp',
+        'sharding_catalog_manager_mock.cpp',
     ],
     LIBDEPS=[
         'dist_lock_manager_mock',
+        'sharding_catalog_client',
     ]
 )
 

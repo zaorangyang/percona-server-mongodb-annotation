@@ -37,6 +37,8 @@
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/client/sasl_client_session.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/mozjs/cursor.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
@@ -61,6 +63,8 @@ const JSFunctionSpec MongoBase::methods[] = {
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
         getServerRPCProtocols, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(insert, MongoLocalInfo, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
+        isReplicaSetConnection, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(logout, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(remove, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(runCommand, MongoLocalInfo, MongoExternalInfo),
@@ -591,15 +595,24 @@ void MongoBase::Functions::getServerRPCProtocols::call(JSContext* cx, JS::CallAr
     ValueReader(cx, args.rval()).fromStringData(protoStr);
 }
 
+void MongoBase::Functions::isReplicaSetConnection::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+
+    if (args.length() != 0) {
+        uasserted(ErrorCodes::BadValue, "isReplicaSetConnection takes no args");
+    }
+
+    args.rval().setBoolean(conn->type() == ConnectionString::ConnectionType::SET);
+}
+
 void MongoLocalInfo::construct(JSContext* cx, JS::CallArgs args) {
     auto scope = getScope(cx);
 
     if (args.length() != 0)
         uasserted(ErrorCodes::BadValue, "local Mongo constructor takes no args");
 
-    std::unique_ptr<DBClientBase> conn;
-
-    conn.reset(createDirectClient(scope->getOpContext()));
+    auto txn = scope->getOpContext();
+    auto conn = DBDirectClientFactory::get(txn).create(txn);
 
     JS::RootedObject thisv(cx);
     scope->getProto<MongoLocalInfo>().newObject(&thisv);

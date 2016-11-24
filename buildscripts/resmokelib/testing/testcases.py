@@ -100,7 +100,14 @@ class TestCase(unittest.TestCase):
         Runs the specified process.
         """
 
-        self.logger.info("Starting %s...\n%s", self.shortDescription(), process.as_command())
+        if config.INTERNAL_EXECUTOR_NAME is not None:
+            self.logger.info("Starting %s under executor %s...\n%s",
+                    self.shortDescription(),
+                    config.INTERNAL_EXECUTOR_NAME,
+                    process.as_command())
+        else:
+            self.logger.info("Starting %s...\n%s", self.shortDescription(), process.as_command())
+
         process.start()
         self.logger.info("%s started with pid %s.", self.shortDescription(), process.pid)
 
@@ -312,6 +319,9 @@ class JSTestCase(TestCase):
         test_data = global_vars.get("TestData", {}).copy()
         test_data["minPort"] = core.network.PortAllocator.min_test_port(fixture.job_num)
         test_data["maxPort"] = core.network.PortAllocator.max_test_port(fixture.job_num)
+        # Marks the main test when multiple test clients are run concurrently, to notify the test
+        # of any code that should only be run once.
+        test_data["isMainTest"] = True
 
         global_vars["TestData"] = test_data
         self.shell_options["global_vars"] = global_vars

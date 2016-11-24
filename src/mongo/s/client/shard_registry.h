@@ -105,7 +105,7 @@ public:
 
 private:
     /**
-     * Reads shards docs from the catalog manager and fills in maps.
+     * Reads shards docs from the catalog client and fills in maps.
      */
     void _init(OperationContext* txn, ShardFactory* factory);
 
@@ -115,7 +115,7 @@ private:
 
     // Protects the lookup maps below.
     mutable stdx::mutex _mutex;
-    using ShardMap = std::unordered_map<ShardId, std::shared_ptr<Shard>>;
+    using ShardMap = std::unordered_map<ShardId, std::shared_ptr<Shard>, ShardId::Hasher>;
 
     // Map of both shardName -> Shard and hostName -> Shard
     ShardMap _lookup;
@@ -156,6 +156,11 @@ public:
     void startup();
 
     ConnectionString getConfigServerConnectionString() const;
+
+    /**
+     * Returns the cluster id from the config shard.
+     */
+    const OID& getClusterId() const;
 
     /**
      * Reloads the ShardRegistry based on the contents of the config server's config.shards
@@ -240,6 +245,12 @@ private:
      * shard
      */
     ConnectionString _initConfigServerCS;
+
+    /**
+     * The id for the cluster, obtained from the config servers on sharding initialization. The
+     * config servers are the authority on the clusterId.
+     */
+    const OID _clusterId;
 
     ShardRegistryData _data;
 

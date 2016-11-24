@@ -82,6 +82,10 @@ private:
         return true;
     }
 
+    ReadWriteType getReadWriteType() const {
+        return ReadWriteType::kRead;
+    }
+
     std::size_t reserveBytesForReply() const override {
         return FindCommon::kInitReplyBufferSize;
     }
@@ -132,7 +136,7 @@ private:
 
         unique_ptr<PlanExecutor> planExecutor = std::move(statusWithPlanExecutor.getValue());
 
-        Explain::explainStages(planExecutor.get(), verbosity, out);
+        Explain::explainStages(planExecutor.get(), coll, verbosity, out);
         return Status::OK();
     }
 

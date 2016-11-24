@@ -30,11 +30,12 @@
 
 #include <string>
 
+#include "mongo/bson/bsonobj.h"
+
 namespace mongo {
 
 /**
- * A CollationSpec is a parsed representation of a user-provided collation BSONObj. Can be
- * re-serialized to BSON using CollationSerializer.
+ * A CollationSpec is a parsed representation of a user-provided collation BSONObj.
  */
 struct CollationSpec {
     // Controls whether uppercase sorts before lowercase or vice versa.
@@ -100,6 +101,7 @@ struct CollationSpec {
     static const char* kMaxVariableField;
     static const char* kNormalizationField;
     static const char* kBackwardsField;
+    static const char* kVersionField;
 
     // Field value constants.
     static const char* kSimpleBinaryComparison;
@@ -120,7 +122,13 @@ struct CollationSpec {
      * Constructs a CollationSpec for the given locale, where all other fields have their default
      * values.
      */
-    CollationSpec(std::string locale) : localeID(std::move(locale)) {}
+    CollationSpec(std::string locale, std::string version)
+        : localeID(std::move(locale)), version(std::move(version)) {}
+
+    /**
+     * Serializes this CollationSpec to its BSON format.
+     */
+    BSONObj toBSON() const;
 
     // A string such as "en_US", identifying the language, country, or other attributes of the
     // locale for this collation.
@@ -149,6 +157,11 @@ struct CollationSpec {
     // Causes accent differences to be considered in reverse order, as it is done in the French
     // language.
     bool backwards = false;
+
+    // Indicates the version of the collator. It is used to ensure that we do not mix versions by,
+    // for example, constructing an index with one version of ICU and then attempting to use this
+    // index with a server that is built against a newer ICU version.
+    std::string version;
 };
 
 /**
@@ -159,7 +172,8 @@ inline bool operator==(const CollationSpec& left, const CollationSpec& right) {
             (left.caseFirst == right.caseFirst) && (left.strength == right.strength) &&
             (left.numericOrdering == right.numericOrdering) &&
             (left.alternate == right.alternate) && (left.maxVariable == right.maxVariable) &&
-            (left.normalization == right.normalization) && (left.backwards == right.backwards));
+            (left.normalization == right.normalization) && (left.backwards == right.backwards) &&
+            (left.version == right.version));
 }
 
 inline bool operator!=(const CollationSpec& left, const CollationSpec& right) {

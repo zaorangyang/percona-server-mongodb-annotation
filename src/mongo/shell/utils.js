@@ -170,6 +170,7 @@ jsTestOptions = function() {
             setParameters: TestData.setParameters,
             setParametersMongos: TestData.setParametersMongos,
             storageEngine: TestData.storageEngine,
+            storageEngineCacheSizeGB: TestData.storageEngineCacheSizeGB,
             wiredTigerEngineConfigString: TestData.wiredTigerEngineConfigString,
             wiredTigerCollectionConfigString: TestData.wiredTigerCollectionConfigString,
             wiredTigerIndexConfigString: TestData.wiredTigerIndexConfigString,
@@ -244,7 +245,7 @@ jsTest.authenticate = function(conn) {
 };
 
 jsTest.authenticateNodes = function(nodes) {
-    assert.soon(function() {
+    assert.soonNoExcept(function() {
         for (var i = 0; i < nodes.length; i++) {
             // Don't try to authenticate to arbiters
             res = nodes[i].getDB("admin").runCommand({replSetGetStatus: 1});

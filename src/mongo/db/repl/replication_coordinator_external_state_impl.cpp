@@ -32,9 +32,9 @@
 
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 
-#include <sstream>
 #include <string>
 
+#include "mongo/base/init.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/catalog/database.h"
@@ -51,6 +51,8 @@
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_buffer_blocking_queue.h"
+#include "mongo/db/repl/oplog_buffer_collection.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/rs_initialsync.h"
@@ -64,6 +66,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/s/balancer/balancer.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/functional.h"
@@ -88,10 +91,36 @@ const char meCollectionName[] = "local.me";
 const char meDatabaseName[] = "local";
 const char tsFieldName[] = "ts";
 
+const char kCollectionOplogBufferName[] = "collection";
+const char kBlockingQueueOplogBufferName[] = "inMemoryBlockingQueue";
+
 // Set this to true to force background creation of snapshots even if --enableMajorityReadConcern
 // isn't specified. This can be used for A-B benchmarking to find how much overhead
 // repl::SnapshotThread introduces.
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(enableReplSnapshotThread, bool, false);
+
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(useDataReplicatorInitialSync, bool, false);
+
+// Set this to specify whether to use a collection to buffer the oplog on the destination server
+// during initial sync to prevent rolling over the oplog.
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(initialSyncOplogBuffer,
+                                      std::string,
+                                      kBlockingQueueOplogBufferName);
+
+MONGO_INITIALIZER(initialSyncOplogBuffer)(InitializerContext*) {
+    if ((initialSyncOplogBuffer != kCollectionOplogBufferName) &&
+        (initialSyncOplogBuffer != kBlockingQueueOplogBufferName)) {
+        return Status(ErrorCodes::BadValue,
+                      "unsupported initial sync oplog buffer option: " + initialSyncOplogBuffer);
+    }
+    if (!useDataReplicatorInitialSync && (initialSyncOplogBuffer == kCollectionOplogBufferName)) {
+        return Status(ErrorCodes::BadValue,
+                      "cannot use collection oplog buffer without --setParameter "
+                      "useDataReplicatorInitialSync=true");
+    }
+
+    return Status::OK();
+}
 
 }  // namespace
 
@@ -99,28 +128,50 @@ ReplicationCoordinatorExternalStateImpl::ReplicationCoordinatorExternalStateImpl
     : _startedThreads(false), _nextThreadId(0) {}
 ReplicationCoordinatorExternalStateImpl::~ReplicationCoordinatorExternalStateImpl() {}
 
+bool ReplicationCoordinatorExternalStateImpl::isInitialSyncFlagSet(OperationContext* txn) {
+    const auto si = repl::StorageInterface::get(txn);
+    return (si && si->getInitialSyncFlag(txn));
+}
+
 void ReplicationCoordinatorExternalStateImpl::startInitialSync(OnInitialSyncFinishedFn finished) {
     _initialSyncThread.reset(new stdx::thread{[finished, this]() {
         Client::initThreadIfNotAlready("initial sync");
-        log() << "Starting replication fetcher thread";
 
-        // Start bgsync.
-        _bgSync.reset(new BackgroundSync());
-        invariant(!_producerThread);  // The producer thread should not be init'd before this.
-        _producerThread.reset(
-            new stdx::thread(stdx::bind(&BackgroundSync::producerThread, _bgSync.get(), this)));
+        // "_bgSync" should not be initialized before this.
+        invariant(!_bgSync);
+        {
+            auto txn = cc().makeOperationContext();
+            invariant(txn);
+            invariant(txn->getClient());
+            log() << "Starting replication fetcher thread";
+
+            // Start bgsync.
+            _bgSync.reset(new BackgroundSync(this, makeSteadyStateOplogBuffer(txn.get())));
+            _bgSync->startup(txn.get());
+        }
+
         // Do initial sync.
         syncDoInitialSync(_bgSync.get());
         finished();
     }});
 }
 
-void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication() {
-    if (!_producerThread) {
+void ReplicationCoordinatorExternalStateImpl::runOnInitialSyncThread(
+    stdx::function<void(OperationContext* txn)> run) {
+    _initialSyncThread.reset(new stdx::thread{[run, this]() {
+        Client::initThreadIfNotAlready("initial sync");
+        auto txn = cc().makeOperationContext();
+        invariant(txn);
+        invariant(txn->getClient());
+        run(txn.get());
+    }});
+}
+
+void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(OperationContext* txn) {
+    if (!_bgSync) {
         log() << "Starting replication fetcher thread";
-        _bgSync.reset(new BackgroundSync());
-        _producerThread.reset(
-            new stdx::thread(stdx::bind(&BackgroundSync::producerThread, _bgSync.get(), this)));
+        _bgSync.reset(new BackgroundSync(this, makeSteadyStateOplogBuffer(txn)));
+        _bgSync->startup(txn);
     }
     log() << "Starting replication applier threads";
     invariant(!_applierThread);
@@ -151,7 +202,7 @@ void ReplicationCoordinatorExternalStateImpl::startMasterSlave(OperationContext*
     repl::startMasterSlave(txn);
 }
 
-void ReplicationCoordinatorExternalStateImpl::shutdown() {
+void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* txn) {
     stdx::lock_guard<stdx::mutex> lk(_threadMutex);
     if (_startedThreads) {
         log() << "Stopping replication applier threads";
@@ -163,9 +214,9 @@ void ReplicationCoordinatorExternalStateImpl::shutdown() {
             _applierThread->join();
         }
 
-        if (_producerThread) {
-            _bgSync->shutdown();
-            _producerThread->join();
+        if (_bgSync) {
+            _bgSync->shutdown(txn);
+            _bgSync->join(txn);
         }
         if (_snapshotThread)
             _snapshotThread->shutdown();
@@ -333,6 +384,12 @@ void ReplicationCoordinatorExternalStateImpl::cleanUpLastApplyBatch(OperationCon
 StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(OperationContext* txn) {
     // TODO: handle WriteConflictExceptions below
     try {
+        // If we are doing an initial sync do not read from the oplog.
+        const auto si = repl::StorageInterface::get(txn);
+        if (si && si->getInitialSyncFlag(txn)) {
+            return {ErrorCodes::InitialSyncFailure, "In the middle of an initial sync."};
+        }
+
         BSONObj oplogEntry;
         if (!Helpers::getLast(txn, rsOplogName.c_str(), oplogEntry)) {
             return StatusWith<OpTime>(ErrorCodes::NoMatchingDocument,
@@ -361,8 +418,8 @@ StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(Opera
     }
 }
 
-bool ReplicationCoordinatorExternalStateImpl::isSelf(const HostAndPort& host) {
-    return repl::isSelf(host);
+bool ReplicationCoordinatorExternalStateImpl::isSelf(const HostAndPort& host, ServiceContext* ctx) {
+    return repl::isSelf(host, ctx);
 }
 
 HostAndPort ReplicationCoordinatorExternalStateImpl::getClientHostAndPort(
@@ -379,11 +436,15 @@ void ReplicationCoordinatorExternalStateImpl::killAllUserOperations(OperationCon
     environment->killAllUserOperations(txn, ErrorCodes::InterruptedDueToReplStateChange);
 }
 
-void ReplicationCoordinatorExternalStateImpl::clearShardingState() {
+void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        Balancer::get(getGlobalServiceContext())->stopThread();
+    }
+
     ShardingState::get(getGlobalServiceContext())->clearCollectionMetadata();
 }
 
-void ReplicationCoordinatorExternalStateImpl::recoverShardingState(OperationContext* txn) {
+void ReplicationCoordinatorExternalStateImpl::shardingOnDrainingStateHook(OperationContext* txn) {
     auto status = ShardingStateRecovery::recover(txn);
 
     if (status == ErrorCodes::ShutdownInProgress) {
@@ -396,14 +457,15 @@ void ReplicationCoordinatorExternalStateImpl::recoverShardingState(OperationCont
         fassertFailedWithStatus(40107, status);
     }
 
-    // There is a slight chance that some stale metadata might have been loaded before the latest
-    // optime has been recovered, so throw out everything that we have up to now
-    ShardingState::get(txn)->clearCollectionMetadata();
-}
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        // If this is a config server node becoming a primary, start the balancer
+        auto balancer = Balancer::get(txn);
 
-void ReplicationCoordinatorExternalStateImpl::updateShardIdentityConfigString(
-    OperationContext* txn) {
-    if (ShardingState::get(txn)->enabled()) {
+        // We need to join the balancer here, because it might have been running at a previous time
+        // when this node was a primary.
+        balancer->joinThread();
+        balancer->startThread(txn);
+    } else if (ShardingState::get(txn)->enabled()) {
         const auto configsvrConnStr =
             Grid::get(txn)->shardRegistry()->getConfigShard()->getConnString();
         auto status = ShardingState::get(txn)->updateShardIdentityConfigString(
@@ -413,6 +475,10 @@ void ReplicationCoordinatorExternalStateImpl::updateShardIdentityConfigString(
                       << configsvrConnStr << causedBy(status);
         }
     }
+
+    // There is a slight chance that some stale metadata might have been loaded before the latest
+    // optime has been recovered, so throw out everything that we have up to now
+    ShardingState::get(txn)->clearCollectionMetadata();
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
@@ -484,18 +550,18 @@ bool ReplicationCoordinatorExternalStateImpl::isReadCommittedSupportedByStorageE
 
 StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::multiApply(
     OperationContext* txn,
-    const MultiApplier::Operations& ops,
+    MultiApplier::Operations ops,
     MultiApplier::ApplyOperationFn applyOperation) {
-    return repl::multiApply(txn, _writerPool.get(), ops, applyOperation);
+    return repl::multiApply(txn, _writerPool.get(), std::move(ops), applyOperation);
 }
 
-void ReplicationCoordinatorExternalStateImpl::multiSyncApply(const MultiApplier::Operations& ops) {
+void ReplicationCoordinatorExternalStateImpl::multiSyncApply(MultiApplier::OperationPtrs* ops) {
     // SyncTail* argument is not used by repl::multiSyncApply().
     repl::multiSyncApply(ops, nullptr);
 }
 
 void ReplicationCoordinatorExternalStateImpl::multiInitialSyncApply(
-    const MultiApplier::Operations& ops, const HostAndPort& source) {
+    MultiApplier::OperationPtrs* ops, const HostAndPort& source) {
 
     // repl::multiInitialSyncApply uses SyncTail::shouldRetry() (and implicitly getMissingDoc())
     // to fetch missing documents during initial sync. Therefore, it is fine to construct SyncTail
@@ -506,6 +572,23 @@ void ReplicationCoordinatorExternalStateImpl::multiInitialSyncApply(
     repl::multiInitialSyncApply(ops, &syncTail);
 }
 
+std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateImpl::makeInitialSyncOplogBuffer(
+    OperationContext* txn) const {
+    if (initialSyncOplogBuffer == kCollectionOplogBufferName) {
+        return stdx::make_unique<OplogBufferCollection>(StorageInterface::get(txn));
+    } else {
+        return stdx::make_unique<OplogBufferBlockingQueue>();
+    }
+}
+
+std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateImpl::makeSteadyStateOplogBuffer(
+    OperationContext* txn) const {
+    return stdx::make_unique<OplogBufferBlockingQueue>();
+}
+
+bool ReplicationCoordinatorExternalStateImpl::shouldUseDataReplicatorInitialSync() const {
+    return useDataReplicatorInitialSync;
+}
 
 JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken() {
     return repl::getGlobalReplicationCoordinator()->getMyLastAppliedOpTime();

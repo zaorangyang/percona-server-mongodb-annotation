@@ -46,6 +46,7 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/migration_secondary_throttle_options.h"
 #include "mongo/s/move_chunk_request.h"
+#include "mongo/util/concurrency/notification.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
@@ -56,65 +57,28 @@ using std::string;
 namespace {
 
 /**
- * RAII object, which will register an active migration with the global sharding state so that no
- * subsequent migrations may start until the previous one has completed.
+ * Acquires a distributed lock for the specified collection or throws if lock cannot be acquired.
  */
-class ScopedSetInMigration {
-    MONGO_DISALLOW_COPYING(ScopedSetInMigration);
-
-public:
-    /**
-     * Registers a new migration with the global sharding state and acquires distributed lock on the
-     * collection so other shards cannot do migrations. If a migration is already active it will
-     * throw a user assertion with a ConflictingOperationInProgress code. Otherwise it may throw any
-     * other error due to distributed lock acquisition failure.
-     */
-    ScopedSetInMigration(OperationContext* txn, MoveChunkRequest args)
-        : _scopedRegisterMigration(txn, args.getNss()),
-          _collectionDistLock(_acquireDistLock(txn, args)) {}
-
-    ~ScopedSetInMigration() = default;
-
-    /**
-     * Blocking call, which polls the state of the distributed lock and ensures that it is still
-     * held.
-     */
-    Status checkDistLock() {
-        return _collectionDistLock.checkStatus();
+DistLockManager::ScopedDistLock acquireCollectionDistLock(OperationContext* txn,
+                                                          const MoveChunkRequest& args) {
+    const string whyMessage(str::stream()
+                            << "migrating chunk "
+                            << ChunkRange(args.getMinKey(), args.getMaxKey()).toString()
+                            << " in "
+                            << args.getNss().ns());
+    auto distLockStatus =
+        Grid::get(txn)->catalogClient(txn)->distLock(txn, args.getNss().ns(), whyMessage);
+    if (!distLockStatus.isOK()) {
+        const string msg = str::stream()
+            << "Could not acquire collection lock for " << args.getNss().ns()
+            << " to migrate chunk [" << args.getMinKey() << "," << args.getMaxKey() << ") due to "
+            << distLockStatus.getStatus().toString();
+        warning() << msg;
+        uasserted(distLockStatus.getStatus().code(), msg);
     }
 
-private:
-    /**
-     * Acquires a distributed lock for the specified colleciton or throws if lock cannot be
-     * acquired.
-     */
-    DistLockManager::ScopedDistLock _acquireDistLock(OperationContext* txn,
-                                                     const MoveChunkRequest& args) {
-        const std::string whyMessage(
-            str::stream() << "migrating chunk [" << args.getMinKey() << ", " << args.getMaxKey()
-                          << ") in "
-                          << args.getNss().ns());
-        auto distLockStatus =
-            grid.catalogManager(txn)->distLock(txn, args.getNss().ns(), whyMessage);
-        if (!distLockStatus.isOK()) {
-            const std::string msg = str::stream()
-                << "Could not acquire collection lock for " << args.getNss().ns()
-                << " to migrate chunk [" << args.getMinKey() << "," << args.getMaxKey()
-                << ") due to " << distLockStatus.getStatus().toString();
-            warning() << msg;
-            uasserted(distLockStatus.getStatus().code(), msg);
-        }
-
-        return std::move(distLockStatus.getValue());
-    }
-
-    // The scoped migration registration
-    ShardingState::ScopedRegisterMigration _scopedRegisterMigration;
-
-    // Handle for the the distributed lock, which protects other migrations from happening on the
-    // same collection
-    DistLockManager::ScopedDistLock _collectionDistLock;
-};
+    return std::move(distLockStatus.getValue());
+}
 
 /**
  * If the specified status is not OK logs a warning and throws a DBException corresponding to the
@@ -151,12 +115,12 @@ public:
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
     Status checkAuthForCommand(ClientBasic* client,
-                               const std::string& dbname,
+                               const string& dbname,
                                const BSONObj& cmdObj) override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
@@ -165,7 +129,7 @@ public:
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+    string parseNs(const string& dbname, const BSONObj& cmdObj) const override {
         return parseNsFullyQualified(dbname, cmdObj);
     }
 
@@ -173,13 +137,10 @@ public:
              const string& dbname,
              BSONObj& cmdObj,
              int options,
-             std::string& errmsg,
+             string& errmsg,
              BSONObjBuilder& result) override {
-        const NamespaceString nss = NamespaceString(parseNs(dbname, cmdObj));
-        uassert(ErrorCodes::InvalidNamespace, "need to specify a valid namespace", nss.isValid());
-
-        MoveChunkRequest moveChunkRequest =
-            uassertStatusOK(MoveChunkRequest::createFromCommand(nss, cmdObj));
+        const MoveChunkRequest moveChunkRequest = uassertStatusOK(
+            MoveChunkRequest::createFromCommand(NamespaceString(parseNs(dbname, cmdObj)), cmdObj));
 
         ShardingState* const shardingState = ShardingState::get(txn);
 
@@ -188,34 +149,79 @@ public:
                 txn, moveChunkRequest.getConfigServerCS().toString());
         }
 
-        shardingState->setShardName(moveChunkRequest.getFromShardId());
-
-        const auto writeConcernForRangeDeleter =
-            uassertStatusOK(ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(
-                txn, moveChunkRequest.getSecondaryThrottle()));
+        shardingState->setShardName(moveChunkRequest.getFromShardId().toString());
 
         // Make sure we're as up-to-date as possible with shard information. This catches the case
         // where we might have changed a shard's host by removing/adding a shard with the same name.
         grid.shardRegistry()->reload(txn);
 
+        auto scopedRegisterMigration =
+            uassertStatusOK(shardingState->registerMigration(moveChunkRequest));
+
+        Status status = {ErrorCodes::InternalError, "Uninitialized value"};
+
+        // Check if there is an existing migration running and if so, join it
+        if (scopedRegisterMigration.mustExecute()) {
+            try {
+                _runImpl(txn, moveChunkRequest);
+                status = Status::OK();
+            } catch (const DBException& e) {
+                status = e.toStatus();
+            } catch (const std::exception& e) {
+                scopedRegisterMigration.complete(
+                    {ErrorCodes::InternalError,
+                     str::stream() << "Severe error occurred while running moveChunk command: "
+                                   << e.what()});
+                throw;
+            }
+
+            scopedRegisterMigration.complete(status);
+        } else {
+            status = scopedRegisterMigration.waitForCompletion(txn);
+        }
+
+        if (status == ErrorCodes::ChunkTooBig) {
+            // This code is for compatibility with pre-3.2 balancer, which does not recognize the
+            // ChunkTooBig error code and instead uses the "chunkTooBig" field in the response.
+            // TODO: Remove after 3.4 is released.
+            errmsg = status.reason();
+            result.appendBool("chunkTooBig", true);
+            return false;
+        }
+
+        uassertStatusOK(status);
+        return true;
+    }
+
+private:
+    static void _runImpl(OperationContext* txn, const MoveChunkRequest& moveChunkRequest) {
+        const auto writeConcernForRangeDeleter =
+            uassertStatusOK(ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(
+                txn, moveChunkRequest.getSecondaryThrottle()));
+
+        string unusedErrMsg;
         MoveTimingHelper moveTimingHelper(txn,
                                           "from",
-                                          nss.ns(),
+                                          moveChunkRequest.getNss().ns(),
                                           moveChunkRequest.getMinKey(),
                                           moveChunkRequest.getMaxKey(),
                                           6,  // Total number of steps
-                                          &errmsg,
+                                          &unusedErrMsg,
                                           moveChunkRequest.getToShardId(),
                                           moveChunkRequest.getFromShardId());
 
         moveTimingHelper.done(1);
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep1);
 
-        ScopedSetInMigration scopedInMigration(txn, moveChunkRequest);
-
         BSONObj shardKeyPattern;
 
         {
+            // Acquire the collection distributed lock if necessary
+            boost::optional<DistLockManager::ScopedDistLock> scopedCollectionDistLock;
+            if (moveChunkRequest.getTakeDistLock()) {
+                scopedCollectionDistLock = acquireCollectionDistLock(txn, moveChunkRequest);
+            }
+
             MigrationSourceManager migrationSourceManager(txn, moveChunkRequest);
 
             shardKeyPattern =
@@ -224,17 +230,7 @@ public:
             moveTimingHelper.done(2);
             MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep2);
 
-            Status startCloneStatus = migrationSourceManager.startClone(txn);
-            if (startCloneStatus == ErrorCodes::ChunkTooBig) {
-                // TODO: This is for compatibility with pre-3.2 balancer, which does not recognize
-                // the ChunkTooBig error code and instead uses the "chunkTooBig" field in the
-                // response. Remove after 3.4 is released.
-                errmsg = startCloneStatus.reason();
-                result.appendBool("chunkTooBig", true);
-                return false;
-            }
-
-            uassertStatusOKWithWarning(startCloneStatus);
+            uassertStatusOKWithWarning(migrationSourceManager.startClone(txn));
             moveTimingHelper.done(3);
             MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep3);
 
@@ -242,15 +238,17 @@ public:
             moveTimingHelper.done(4);
             MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep4);
 
-            // Ensure distributed lock is still held
-            Status checkDistLockStatus = scopedInMigration.checkDistLock();
-            if (!checkDistLockStatus.isOK()) {
-                const string msg = str::stream() << "not entering migrate critical section due to "
-                                                 << checkDistLockStatus.toString();
-                warning() << msg;
-                migrationSourceManager.cleanupOnError(txn);
+            // Ensure the distributed lock is still held if this shard owns it.
+            if (moveChunkRequest.getTakeDistLock()) {
+                Status checkDistLockStatus = scopedCollectionDistLock->checkStatus();
+                if (!checkDistLockStatus.isOK()) {
+                    migrationSourceManager.cleanupOnError(txn);
 
-                uasserted(checkDistLockStatus.code(), msg);
+                    uassertStatusOKWithWarning(
+                        {checkDistLockStatus.code(),
+                         str::stream() << "not entering migrate critical section due to "
+                                       << checkDistLockStatus.toString()});
+                }
             }
 
             uassertStatusOKWithWarning(migrationSourceManager.enterCriticalSection(txn));
@@ -294,8 +292,6 @@ public:
 
         moveTimingHelper.done(6);
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep6);
-
-        return true;
     }
 
 } moveChunkCmd;

@@ -408,8 +408,8 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
 
     LockGuard topoLock(_topoMutex);
 
-    StatusWith<int> myIndex =
-        validateConfigForStartUp(_externalState.get(), _rsConfig, localConfig);
+    StatusWith<int> myIndex = validateConfigForStartUp(
+        _externalState.get(), _rsConfig, localConfig, getGlobalServiceContext());
     if (!myIndex.isOK()) {
         if (myIndex.getStatus() == ErrorCodes::NodeNotFound ||
             myIndex.getStatus() == ErrorCodes::DuplicateKey) {
@@ -480,29 +480,42 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     }
 }
 
-void ReplicationCoordinatorImpl::_stopDataReplication() {}
+void ReplicationCoordinatorImpl::_stopDataReplication() {
+    // TODO: Stop replication threads (bgsync, synctail, reporter)
+}
+
 void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* txn) {
-    // When initial sync is done, callback.
-    OnInitialSyncFinishedFn callback{[this]() {
+    // Check to see if we need to do an initial sync.
+    const auto lastOpTime = getMyLastAppliedOpTime();
+    const auto needsInitialSync = lastOpTime.isNull() || _externalState->isInitialSyncFlagSet(txn);
+    if (!needsInitialSync) {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         if (!_inShutdown) {
-            log() << "Initial sync done, starting steady state replication.";
-            _externalState->startSteadyStateReplication();
+            // Start steady replication, since we already have data.
+            _externalState->startSteadyStateReplication(txn);
         }
-    }};
-
-    const auto lastApplied = getMyLastAppliedOpTime();
-    if (!lastApplied.isNull()) {
-        callback();
         return;
     }
 
     // Do initial sync.
-    if (false) {
-        // TODO: make this async with callback.
-        _dr.initialSync(txn);
+    if (_externalState->shouldUseDataReplicatorInitialSync()) {
+        _externalState->runOnInitialSyncThread([this](OperationContext* txn) {
+            const auto status = _dr.initialSync(txn);
+            fassertStatusOK(40088, status);
+            _setMyLastAppliedOpTime_inlock({status.getValue(), -1}, false);
+            _externalState->startSteadyStateReplication(txn);
+
+        });
     } else {
-        _externalState->startInitialSync(callback);
+        _externalState->startInitialSync([this]() {
+            auto txn = cc().makeOperationContext();
+            invariant(txn);
+            invariant(txn->getClient());
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            if (!_inShutdown) {
+                _externalState->startSteadyStateReplication(txn.get());
+            }
+        });
     }
 }
 
@@ -545,7 +558,7 @@ void ReplicationCoordinatorImpl::startup(OperationContext* txn) {
     }
 }
 
-void ReplicationCoordinatorImpl::shutdown() {
+void ReplicationCoordinatorImpl::shutdown(OperationContext* txn) {
     // Shutdown must:
     // * prevent new threads from blocking in awaitReplication
     // * wake up all existing threads blocking in awaitReplication
@@ -578,7 +591,7 @@ void ReplicationCoordinatorImpl::shutdown() {
     // joining the replication executor is blocking so it must be run outside of the mutex
     _replExecutor.shutdown();
     _replExecutor.join();
-    _externalState->shutdown();
+    _externalState->shutdown(txn);
 }
 
 const ReplSettings& ReplicationCoordinatorImpl::getSettings() const {
@@ -740,8 +753,6 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* txn) {
     }
     lk.unlock();
 
-    _externalState->recoverShardingState(txn);
-
     ScopedTransaction transaction(txn, MODE_X);
     Lock::GlobalWrite globalWriteLock(txn->lockState());
 
@@ -754,7 +765,7 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* txn) {
     _drainFinishedCond.notify_all();
     lk.unlock();
 
-    _externalState->updateShardIdentityConfigString(txn);
+    _externalState->shardingOnDrainingStateHook(txn);
     _externalState->dropAllTempCollections(txn);
 
     // This is done for compatibility with PV0 replicas wrt how "n" ops are processed.
@@ -2225,8 +2236,8 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* txn,
         return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
     }
 
-    StatusWith<int> myIndex =
-        validateConfigForReconfig(_externalState.get(), oldConfig, newConfig, args.force);
+    StatusWith<int> myIndex = validateConfigForReconfig(
+        _externalState.get(), oldConfig, newConfig, txn->getServiceContext(), args.force);
     if (!myIndex.isOK()) {
         error() << "replSetReconfig got " << myIndex.getStatus() << " while validating "
                 << newConfigObj;
@@ -2365,7 +2376,8 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* txn,
         return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
     }
 
-    StatusWith<int> myIndex = validateConfigForInitiate(_externalState.get(), newConfig);
+    StatusWith<int> myIndex =
+        validateConfigForInitiate(_externalState.get(), newConfig, txn->getServiceContext());
     if (!myIndex.isOK()) {
         error() << "replSet initiate got " << myIndex.getStatus() << " while validating "
                 << configObj;
@@ -2540,7 +2552,7 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
             break;
         case kActionCloseAllConnections:
             _externalState->closeConnections();
-            _externalState->clearShardingState();
+            _externalState->shardingOnStepDownHook();
             break;
         case kActionWinElection: {
             stdx::unique_lock<stdx::mutex> lk(_mutex);

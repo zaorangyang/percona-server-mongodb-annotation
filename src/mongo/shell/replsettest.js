@@ -108,11 +108,16 @@ var ReplSetTest = function(opts) {
     function _callIsMaster() {
         _clearLiveNodes();
 
+        var twoPrimaries = false;
         self.nodes.forEach(function(node) {
             try {
                 var n = node.getDB('admin').runCommand({ismaster: 1});
                 if (n.ismaster == true) {
-                    self.liveNodes.master = node;
+                    if (self.liveNodes.master) {
+                        twoPrimaries = true;
+                    } else {
+                        self.liveNodes.master = node;
+                    }
                 } else {
                     node.setSlaveOk();
                     self.liveNodes.slaves.push(node);
@@ -121,6 +126,9 @@ var ReplSetTest = function(opts) {
                 print("ReplSetTest Could not call ismaster on node " + node + ": " + tojson(err));
             }
         });
+        if (twoPrimaries) {
+            return false;
+        }
 
         return self.liveNodes.master || false;
     }
@@ -251,29 +259,6 @@ var ReplSetTest = function(opts) {
     }
 
     /**
-     * Surrounds a function call by a try...catch to convert any exception to a print statement
-     * and return false.
-     */
-    function _convertExceptionToReturnStatus(func, msg) {
-        try {
-            return func();
-        } catch (e) {
-            if (msg) {
-                print(msg);
-            }
-            print("ReplSetTest caught exception " + e);
-            return false;
-        }
-    }
-
-    /**
-     * Wraps assert.soon to try...catch any function passed in.
-     */
-    function _assertSoonNoExcept(func, msg, timeout) {
-        assert.soon((() => _convertExceptionToReturnStatus(func)), msg, timeout);
-    }
-
-    /**
      * Returns the optime for the specified host by issuing replSetGetStatus.
      */
     function _getLastOpTime(conn) {
@@ -321,6 +306,13 @@ var ReplSetTest = function(opts) {
             {ts: Timestamp(0, 0), t: NumberLong(0)};
     }
 
+    function _isEarlierTimestamp(ts1, ts2) {
+        if (ts1.getTime() == ts2.getTime()) {
+            return ts1.getInc() < ts2.getInc();
+        }
+        return ts1.getTime() < ts2.getTime();
+    }
+
     function _isEarlierOpTime(ot1, ot2) {
         // Make sure both optimes have a timestamp and a term.
         ot1 = ot1.t ? ot1 : {ts: ot1, t: NumberLong(-1)};
@@ -334,7 +326,7 @@ var ReplSetTest = function(opts) {
         }
 
         // Otherwise, choose the optime with the lower timestamp.
-        return ot1.ts < ot2.ts;
+        return _isEarlierTimestamp(ot1.ts, ot2.ts);
     }
 
     /**
@@ -464,7 +456,7 @@ var ReplSetTest = function(opts) {
     this.awaitSecondaryNodes = function(timeout) {
         timeout = timeout || 60000;
 
-        _assertSoonNoExcept(function() {
+        assert.soonNoExcept(function() {
             // Reload who the current slaves are
             self.getPrimary(timeout);
 
@@ -488,7 +480,7 @@ var ReplSetTest = function(opts) {
     this.awaitNodesAgreeOnPrimary = function(timeout) {
         timeout = timeout || 60000;
 
-        _assertSoonNoExcept(function() {
+        assert.soonNoExcept(function() {
             var primary = -1;
 
             for (var i = 0; i < self.nodes.length; i++) {
@@ -529,7 +521,7 @@ var ReplSetTest = function(opts) {
         timeout = timeout || 60000;
         var primary = null;
 
-        _assertSoonNoExcept(function() {
+        assert.soonNoExcept(function() {
             primary = _callIsMaster();
             return primary;
         }, "Finding primary", timeout);
@@ -541,7 +533,7 @@ var ReplSetTest = function(opts) {
         msg = msg || "Timed out waiting for there to be no primary in replset: " + this.name;
         timeout = timeout || 30000;
 
-        _assertSoonNoExcept(function() {
+        assert.soonNoExcept(function() {
             return _callIsMaster() == false;
         }, msg, timeout);
     };
@@ -678,7 +670,7 @@ var ReplSetTest = function(opts) {
         print("Waiting for op with OpTime " + tojson(masterOpTime) +
               " to be committed on all secondaries");
 
-        _assertSoonNoExcept(function() {
+        assert.soonNoExcept(function() {
             for (var i = 0; i < rst.nodes.length; i++) {
                 var node = rst.nodes[i];
 
@@ -710,7 +702,7 @@ var ReplSetTest = function(opts) {
         // Blocking call, which will wait for the last optime written on the master to be available
         var awaitLastOpTimeWrittenFn = function() {
             var master = self.getPrimary();
-            _assertSoonNoExcept(function() {
+            assert.soonNoExcept(function() {
                 try {
                     masterLatestOpTime = _getLastOpTimeTimestamp(master);
                 } catch (e) {
@@ -747,7 +739,7 @@ var ReplSetTest = function(opts) {
               ", is " + tojson(masterLatestOpTime) + ", last oplog entry is " +
               tojsononeline(masterOpTime));
 
-        _assertSoonNoExcept(function() {
+        assert.soonNoExcept(function() {
             try {
                 print("ReplSetTest awaitReplication: checking secondaries against timestamp " +
                       tojson(masterLatestOpTime));
@@ -834,8 +826,12 @@ var ReplSetTest = function(opts) {
         this.getPrimary();
         var res = {};
         res.master = this.liveNodes.master.getDB(db).runCommand("dbhash");
-        res.slaves = this.liveNodes.slaves.map(function(z) {
-            return z.getDB(db).runCommand("dbhash");
+        res.slaves = [];
+        this.liveNodes.slaves.forEach(function(node) {
+            var isArbiter = node.getDB('admin').isMaster('admin').arbiterOnly;
+            if (!isArbiter) {
+                res.slaves.push(node.getDB(db).runCommand("dbhash"));
+            }
         });
         return res;
     };
@@ -982,10 +978,10 @@ var ReplSetTest = function(opts) {
             if (started.length) {
                 // if n was an array of conns, start will return an array of connections
                 for (var i = 0; i < started.length; i++) {
-                    jsTest.authenticate(started[i]);
+                    assert(jsTest.authenticate(started[i]), "Failed authentication during restart");
                 }
             } else {
-                jsTest.authenticate(started);
+                assert(jsTest.authenticate(started), "Failed authentication during restart");
             }
         }
         return started;
@@ -1165,7 +1161,7 @@ var ReplSetTest = function(opts) {
      */
     this.waitForMaster = function(timeout) {
         var master;
-        _assertSoonNoExcept(function() {
+        assert.soonNoExcept(function() {
             return (master = self.getPrimary());
         }, "waiting for master", timeout);
 

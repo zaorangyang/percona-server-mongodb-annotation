@@ -66,12 +66,13 @@ public:
                                 const NamespaceString& nss,
                                 const ChunkVersion& shardVersion,
                                 const ConnectionString& configServerConnectionString,
-                                const std::string& fromShardId,
-                                const std::string& toShardId,
+                                const ShardId& fromShardId,
+                                const ShardId& toShardId,
                                 const ChunkRange& range,
                                 int64_t maxChunkSizeBytes,
                                 const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                                bool waitForDelete);
+                                bool waitForDelete,
+                                bool takeDistLock);
 
     const NamespaceString& getNss() const {
         return _nss;
@@ -81,11 +82,11 @@ public:
         return _configServerCS;
     }
 
-    const std::string& getFromShardId() const {
+    const ShardId& getFromShardId() const {
         return _fromShardId;
     }
 
-    const std::string& getToShardId() const {
+    const ShardId& getToShardId() const {
         return _toShardId;
     }
 
@@ -109,6 +110,17 @@ public:
         return _waitForDelete;
     }
 
+    bool getTakeDistLock() const {
+        return _takeDistLock;
+    }
+
+    /**
+     * Returns true if the requests match exactly in terms of the field values and the order of
+     * elements within the BSON-typed fields.
+     */
+    bool operator==(const MoveChunkRequest& other) const;
+    bool operator!=(const MoveChunkRequest& other) const;
+
 private:
     MoveChunkRequest(NamespaceString nss,
                      ChunkRange range,
@@ -123,10 +135,10 @@ private:
     ConnectionString _configServerCS;
 
     // The source shard id
-    std::string _fromShardId;
+    ShardId _fromShardId;
 
     // The recipient shard id
-    std::string _toShardId;
+    ShardId _toShardId;
 
     // Range of chunk chunk being moved
     ChunkRange _range;
@@ -141,6 +153,9 @@ private:
     // Whether to block and wait for the range deleter to cleanup the orphaned documents at the end
     // of move.
     bool _waitForDelete;
+
+    // Whether to take the distributed lock for the collection or not.
+    bool _takeDistLock;
 };
 
 }  // namespace mongo

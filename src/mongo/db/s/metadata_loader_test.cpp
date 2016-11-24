@@ -32,7 +32,7 @@
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/metadata_loader.h"
-#include "mongo/s/catalog/replset/catalog_manager_replica_set_test_fixture.h"
+#include "mongo/s/catalog/replset/sharding_catalog_test_fixture.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 
@@ -43,14 +43,14 @@ using std::string;
 using std::unique_ptr;
 using std::vector;
 
-class MetadataLoaderFixture : public CatalogManagerReplSetTestFixture {
+class MetadataLoaderFixture : public ShardingCatalogTestFixture {
 public:
     MetadataLoaderFixture() = default;
     ~MetadataLoaderFixture() = default;
 
 protected:
     void setUp() override {
-        CatalogManagerReplSetTestFixture::setUp();
+        ShardingCatalogTestFixture::setUp();
         getMessagingPort()->setRemote(HostAndPort("FakeRemoteClient:34567"));
         configTargeter()->setFindHostReturnValue(configHost);
         _maxCollVersion = ChunkVersion(1, 0, OID::gen());
@@ -88,7 +88,7 @@ protected:
         // Infer namespace, shard, epoch, keypattern from first chunk
         const ChunkType* firstChunk = *(chunks.vector().begin());
         const string ns = firstChunk->getNS();
-        const string shardName = firstChunk->getShard();
+        const string shardName = firstChunk->getShard().toString();
         const OID epoch = firstChunk->getVersion().epoch();
 
         CollectionType coll;
@@ -115,7 +115,7 @@ protected:
 
         auto future = launchAsync([this, ns, shardName, metadata] {
             auto status = loader().makeCollectionMetadata(operationContext(),
-                                                          catalogManager(),
+                                                          catalogClient(),
                                                           ns,
                                                           shardName,
                                                           NULL, /* no old metadata */
@@ -160,7 +160,7 @@ TEST_F(MetadataLoaderFixture, DroppedColl) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -176,7 +176,7 @@ TEST_F(MetadataLoaderFixture, EmptyColl) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -193,7 +193,7 @@ TEST_F(MetadataLoaderFixture, BadColl) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -221,7 +221,7 @@ TEST_F(MetadataLoaderFixture, BadChunk) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -248,7 +248,7 @@ TEST_F(MetadataLoaderFixture, NoChunksIsDropped) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -276,7 +276,7 @@ TEST_F(MetadataLoaderFixture, CheckNumChunk) {
     // can't load metadata
     ChunkType chunkType;
     chunkType.setNS("test.foo");
-    chunkType.setShard("shard0001");
+    chunkType.setShard(ShardId("shard0001"));
     chunkType.setMin(BSON("a" << MINKEY));
     chunkType.setMax(BSON("a" << MAXKEY));
     chunkType.setVersion(ChunkVersion(1, 0, epoch));
@@ -286,7 +286,7 @@ TEST_F(MetadataLoaderFixture, CheckNumChunk) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -311,7 +311,7 @@ TEST_F(MetadataLoaderFixture, SingleChunkCheckNumChunk) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -331,7 +331,7 @@ TEST_F(MetadataLoaderFixture, SingleChunkGetNext) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -351,7 +351,7 @@ TEST_F(MetadataLoaderFixture, SingleChunkGetShardKey) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -371,7 +371,7 @@ TEST_F(MetadataLoaderFixture, SingleChunkGetMaxCollVersion) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -389,7 +389,7 @@ TEST_F(MetadataLoaderFixture, SingleChunkGetMaxShardVersion) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -407,7 +407,7 @@ TEST_F(MetadataLoaderFixture, NoChunks) {
         MetadataLoader loader;
         CollectionMetadata metadata;
         auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogManager(),
+                                                    catalogClient(),
                                                     "test.foo",
                                                     "shard0000",
                                                     NULL, /* no old metadata */
@@ -424,7 +424,7 @@ TEST_F(MetadataLoaderFixture, NoChunks) {
 TEST_F(MetadataLoaderFixture, PromotePendingNA) {
     unique_ptr<ChunkType> chunk(new ChunkType());
     chunk->setNS("foo.bar");
-    chunk->setShard("shard0000");
+    chunk->setShard(ShardId("shard0000"));
     chunk->setMin(BSON("x" << MINKEY));
     chunk->setMax(BSON("x" << 0));
     chunk->setVersion(ChunkVersion(1, 0, OID::gen()));
@@ -459,7 +459,7 @@ TEST_F(MetadataLoaderFixture, PromotePendingNAVersion) {
 
     unique_ptr<ChunkType> chunk(new ChunkType());
     chunk->setNS("foo.bar");
-    chunk->setShard("shard0000");
+    chunk->setShard(ShardId("shard0000"));
     chunk->setMin(BSON("x" << MINKEY));
     chunk->setMax(BSON("x" << 0));
     chunk->setVersion(ChunkVersion(1, 1, epoch));
@@ -500,7 +500,7 @@ TEST_F(MetadataLoaderFixture, PromotePendingGoodOverlap) {
 
     unique_ptr<ChunkType> chunk(new ChunkType());
     chunk->setNS("foo.bar");
-    chunk->setShard("shard0000");
+    chunk->setShard(ShardId("shard0000"));
     chunk->setMin(BSON("x" << MINKEY));
     chunk->setMax(BSON("x" << 0));
     chunk->setVersion(ChunkVersion(1, 0, epoch));
@@ -508,14 +508,14 @@ TEST_F(MetadataLoaderFixture, PromotePendingGoodOverlap) {
 
     chunk.reset(new ChunkType());
     chunk->setNS("foo.bar");
-    chunk->setShard("shard0000");
+    chunk->setShard(ShardId("shard0000"));
     chunk->setMin(BSON("x" << 10));
     chunk->setMax(BSON("x" << 20));
     chunks.mutableVector().push_back(chunk.release());
 
     chunk.reset(new ChunkType());
     chunk->setNS("foo.bar");
-    chunk->setShard("shard0000");
+    chunk->setShard(ShardId("shard0000"));
     chunk->setMin(BSON("x" << 30));
     chunk->setMax(BSON("x" << MAXKEY));
     chunks.mutableVector().push_back(chunk.release());
@@ -531,7 +531,7 @@ TEST_F(MetadataLoaderFixture, PromotePendingGoodOverlap) {
 
     chunk.reset(new ChunkType());
     chunk->setNS("foo.bar");
-    chunk->setShard("shard0000");
+    chunk->setShard(ShardId("shard0000"));
     chunk->setMin(BSON("x" << 0));
     chunk->setMax(BSON("x" << 10));
     chunk->setVersion(ChunkVersion(1, 0, epoch));
@@ -580,7 +580,7 @@ TEST_F(MetadataLoaderFixture, PromotePendingBadOverlap) {
 
     unique_ptr<ChunkType> chunk(new ChunkType());
     chunk->setNS("foo.bar");
-    chunk->setShard("shard0000");
+    chunk->setShard(ShardId("shard0000"));
     chunk->setMin(BSON("x" << MINKEY));
     chunk->setMax(BSON("x" << 0));
     chunk->setVersion(ChunkVersion(1, 0, epoch));
@@ -598,7 +598,7 @@ TEST_F(MetadataLoaderFixture, PromotePendingBadOverlap) {
 
     chunk.reset(new ChunkType());
     chunk->setNS("foo.bar");
-    chunk->setShard("shard0000");
+    chunk->setShard(ShardId("shard0000"));
     chunk->setMin(BSON("x" << 15));
     chunk->setMax(BSON("x" << MAXKEY));
     chunk->setVersion(ChunkVersion(1, 0, epoch));

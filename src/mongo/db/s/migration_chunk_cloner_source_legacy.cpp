@@ -170,7 +170,8 @@ MigrationChunkClonerSourceLegacy::MigrationChunkClonerSourceLegacy(MoveChunkRequ
                                                                    const BSONObj& shardKeyPattern)
     : _args(std::move(request)),
       _shardKeyPattern(shardKeyPattern),
-      _sessionId(MigrationSessionId::generate(_args.getFromShardId(), _args.getToShardId())) {}
+      _sessionId(MigrationSessionId::generate(_args.getFromShardId().toString(),
+                                              _args.getToShardId().toString())) {}
 
 MigrationChunkClonerSourceLegacy::~MigrationChunkClonerSourceLegacy() {
     invariant(!_deleteNotifyExec);
@@ -534,7 +535,7 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* txn
         invariant(statusWithPlanExecutor.isOK());
 
         _deleteNotifyExec = std::move(statusWithPlanExecutor.getValue());
-        _deleteNotifyExec->registerExec();
+        _deleteNotifyExec->registerExec(collection);
     }
 
     // Assume both min and max non-empty, append MinKey's to make them fit chosen index
@@ -553,7 +554,7 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* txn
 
     // We can afford to yield here because any change to the base data that we might miss is already
     // being queued and will migrate in the 'transferMods' stage.
-    exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
+    exec->setYieldPolicy(PlanExecutor::YIELD_AUTO, collection);
 
     // Use the average object size to estimate how many objects a full chunk would carry do that
     // while traversing the chunk's range using the sharding index, below there's a fair amount of

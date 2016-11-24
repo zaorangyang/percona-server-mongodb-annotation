@@ -144,7 +144,6 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/platform/platform',
-        '$BUILD_DIR/mongo/util/concurrency/synchronization',
         '$BUILD_DIR/third_party/shim_allocator',
         '$BUILD_DIR/third_party/shim_boost',
         '$BUILD_DIR/third_party/shim_tz',
@@ -256,7 +255,6 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "background_job",
-        "concurrency/synchronization",
     ],
 )
 
@@ -309,6 +307,7 @@ env.Library(
     ],
     LIBDEPS=[
         'foundation',
+        'signal_handlers',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
     ],
 )
@@ -348,15 +347,7 @@ if env.TargetOSIs('windows'):
             'shell32',
             env['LIBS']
         ],
-        NO_CRUTCH=True,
     )
-
-env.Library(
-    target='ntservice_mock',
-    source=[
-        'ntservice_mock.cpp',
-    ],
-)
 
 env.Library(
     target='elapsed_tracker',

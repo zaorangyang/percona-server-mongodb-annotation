@@ -31,7 +31,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/s/catalog/replset/catalog_manager_replica_set_test_fixture.h"
+#include "mongo/s/catalog/replset/sharding_catalog_test_fixture.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -64,10 +64,10 @@ static int rand(int max = -1) {
     return max > 0 ? r % max : r;
 }
 
-class ChunkManagerFixture : public CatalogManagerReplSetTestFixture {
+class ChunkManagerFixture : public ShardingCatalogTestFixture {
 public:
     void setUp() override {
-        CatalogManagerReplSetTestFixture::setUp();
+        ShardingCatalogTestFixture::setUp();
         getMessagingPort()->setRemote(HostAndPort("FakeRemoteClient:34567"));
         configTargeter()->setFindHostReturnValue(configHost);
     }
@@ -138,7 +138,7 @@ protected:
             ASSERT(version.epoch() == epoch);
 
             // Check chunk's shard id.
-            ASSERT(chunk[ChunkType::shard()].String() == _shardId);
+            ASSERT(chunk[ChunkType::shard()].String() == _shardId.toString());
 
             return RemoteCommandResponse(BSON("ok" << 1), BSONObj(), Milliseconds(1));
         });
@@ -163,7 +163,7 @@ TEST_F(ChunkManagerTests, Basic) {
 
     std::vector<BSONObj> shards{
         BSON(ShardType::name() << _shardId << ShardType::host()
-                               << ConnectionString(HostAndPort("$hostFooBar:27017")).toString())};
+                               << ConnectionString(HostAndPort("hostFooBar:27017")).toString())};
 
     // Generate and save a set of chunks with metadata using a temporary ChunkManager.
 

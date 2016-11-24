@@ -58,10 +58,10 @@ void initWireSpecMongoD() {
     WireSpec& spec = WireSpec::instance();
     // accept from any version
     spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionIncoming = FIND_COMMAND;
+    spec.maxWireVersionIncoming = COMMANDS_ACCEPT_WRITE_CONCERN;
     // connect to any version
     spec.minWireVersionOutgoing = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionOutgoing = FIND_COMMAND;
+    spec.maxWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
 }
 
 // Utility function to use with mock streams
@@ -469,8 +469,8 @@ public:
             // Get the appropriate message id
             WriteEvent write{stream};
             std::vector<uint8_t> messageData = stream->popWrite();
-            Message msg(messageData.data(), false);
-            messageId = msg.header().getId();
+            messageId =
+                MsgData::ConstView(reinterpret_cast<const char*>(messageData.data())).getId();
         }
 
         // Build a mock reply message
@@ -575,6 +575,50 @@ public:
         _net->startup();
     }
 };
+
+TEST_F(NetworkInterfaceASIOConnectionHookTest, InvalidIsMaster) {
+    auto validationFailedStatus =
+        Status(ErrorCodes::InterruptedDueToReplStateChange, "operation was interrupted");
+
+    start(makeTestHook(
+        [&](const HostAndPort& remoteHost, const RemoteCommandResponse& isMasterReply) {
+            return Status(ErrorCodes::UnknownError, "unused");
+        },
+        [&](const HostAndPort& remoteHost) -> StatusWith<boost::optional<RemoteCommandRequest>> {
+            return {boost::none};
+        },
+        [&](const HostAndPort& remoteHost, RemoteCommandResponse&& response) {
+            return Status::OK();
+        }));
+
+    auto deferred = startCommand(makeCallbackHandle(),
+                                 {testHost,
+                                  "blah",
+                                  BSON("foo"
+                                       << "bar")});
+
+    auto stream = streamFactory().blockUntilStreamExists(testHost);
+
+    ConnectEvent{stream}.skip();
+
+    // simulate isMaster reply.
+    stream->simulateServer(rpc::Protocol::kOpQuery,
+                           [](RemoteCommandRequest request) -> RemoteCommandResponse {
+                               RemoteCommandResponse response;
+                               response.data = BSON("ok" << 0.0 << "errmsg"
+                                                         << "operation was interrupted"
+                                                         << "code"
+                                                         << 11602);
+                               return response;
+                           });
+
+    // we should stop here.
+    auto& res = deferred.get();
+
+    ASSERT(res == validationFailedStatus);
+
+    assertNumOps(0u, 0u, 1u, 0u);
+}
 
 TEST_F(NetworkInterfaceASIOConnectionHookTest, ValidateHostInvalid) {
     bool validateCalled = false;

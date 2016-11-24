@@ -37,7 +37,8 @@
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
@@ -57,13 +58,15 @@ Grid* Grid::get(OperationContext* operationContext) {
     return &grid;
 }
 
-void Grid::init(std::unique_ptr<CatalogManager> catalogManager,
+void Grid::init(std::unique_ptr<ShardingCatalogClient> catalogClient,
+                std::unique_ptr<ShardingCatalogManager> catalogManager,
                 std::unique_ptr<CatalogCache> catalogCache,
                 std::unique_ptr<ShardRegistry> shardRegistry,
                 std::unique_ptr<ClusterCursorManager> cursorManager,
                 std::unique_ptr<BalancerConfiguration> balancerConfig,
                 std::unique_ptr<executor::TaskExecutorPool> executorPool,
                 executor::NetworkInterface* network) {
+    invariant(!_catalogClient);
     invariant(!_catalogManager);
     invariant(!_catalogCache);
     invariant(!_shardRegistry);
@@ -72,6 +75,7 @@ void Grid::init(std::unique_ptr<CatalogManager> catalogManager,
     invariant(!_executorPool);
     invariant(!_network);
 
+    _catalogClient = std::move(catalogClient);
     _catalogManager = std::move(catalogManager);
     _catalogCache = std::move(catalogCache);
     _shardRegistry = std::move(shardRegistry);
@@ -109,6 +113,7 @@ void Grid::advanceConfigOpTime(repl::OpTime opTime) {
 
 void Grid::clearForUnitTests() {
     _catalogManager.reset();
+    _catalogClient.reset();
     _catalogCache.reset();
     _shardRegistry.reset();
     _cursorManager.reset();

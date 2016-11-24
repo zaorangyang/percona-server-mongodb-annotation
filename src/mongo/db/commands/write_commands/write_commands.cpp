@@ -203,6 +203,10 @@ public:
         return true;
     }
 
+    ReadWriteType getReadWriteType() const {
+        return ReadWriteType::kWrite;
+    }
+
     bool run(OperationContext* txn,
              const std::string& dbname,
              BSONObj& cmdObj,
@@ -325,7 +329,7 @@ public:
 
         auto exec = uassertStatusOK(getExecutorUpdate(
             txn, &CurOp::get(txn)->debug(), collection.getCollection(), &parsedUpdate));
-        Explain::explainStages(exec.get(), verbosity, out);
+        Explain::explainStages(exec.get(), collection.getCollection(), verbosity, out);
         return Status::OK();
     }
 } cmdUpdate;
@@ -394,7 +398,7 @@ public:
         // Explain the plan tree.
         auto exec = uassertStatusOK(getExecutorDelete(
             txn, &CurOp::get(txn)->debug(), collection.getCollection(), &parsedDelete));
-        Explain::explainStages(exec.get(), verbosity, out);
+        Explain::explainStages(exec.get(), collection.getCollection(), verbosity, out);
         return Status::OK();
     }
 } cmdDelete;

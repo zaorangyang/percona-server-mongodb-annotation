@@ -46,11 +46,6 @@ namespace mongo {
 using std::unique_ptr;
 using std::string;
 
-// Called from scripting/engine.cpp and scripting/v8_db.cpp.
-DBClientBase* createDirectClient(OperationContext* txn) {
-    return new DBDirectClient(txn);
-}
-
 namespace {
 
 class DirectClientScope {
@@ -131,9 +126,6 @@ bool DBDirectClient::call(Message& toSend, Message& response, bool assertOk, str
     CurOp curOp(_txn);
     assembleResponse(_txn, toSend, dbResponse, dummyHost);
     verify(!dbResponse.response.empty());
-
-    // can get rid of this if we make response handling smarter
-    dbResponse.response.concat();
     response = std::move(dbResponse.response);
 
     return true;

@@ -504,7 +504,7 @@ add_option('modules',
 
 add_option('runtime-hardening',
     choices=["on", "off"],
-    default="off",
+    default="on",
     help="Enable runtime hardening features (e.g. stack smash protection)",
     type='choice',
 )
@@ -749,10 +749,6 @@ env_vars.Add('VERBOSE',
     default='auto',
 )
 
-# don't run configure if user calls --help
-if GetOption('help'):
-    Return()
-
 # -- Validate user provided options --
 
 # A dummy environment that should *only* have the variables we have set. In practice it has
@@ -768,6 +764,19 @@ variables_only_env = Environment(
     # Use the Variables specified above.
     variables=env_vars,
 )
+
+# don't run configure if user calls --help
+if GetOption('help'):
+    try:
+        Help('\nThe following variables may also be set like scons VARIABLE=value\n', append=True)
+        Help(env_vars.GenerateHelpText(variables_only_env), append=True)
+    except TypeError:
+        # The append=true kwarg is only supported in scons>=2.4. Without it, calls to Help() clobber
+        # the automatically generated options help, which we don't want. Users on older scons
+        # versions will need to use --variables-help to learn about which variables we support.
+        pass
+
+    Return()
 
 if ('CC' in variables_only_env) != ('CXX' in variables_only_env):
     print('Cannot customize C compiler without customizing C++ compiler, and vice versa')
@@ -1167,6 +1176,9 @@ if env.TargetOSIs('windows') and link_model != 'object':
 # modes operate in library mode, enabled by setting _LIBDEPS to $_LIBDEPS_LIBS.
 env['_LIBDEPS'] = '$_LIBDEPS_OBJS' if link_model == "object" else '$_LIBDEPS_LIBS'
 
+env['BUILDERS']['ProgramObject'] = env['BUILDERS']['StaticObject']
+env['BUILDERS']['LibraryObject'] = env['BUILDERS']['StaticObject']
+
 if link_model.startswith("dynamic"):
 
     # Add in the abi linking tool if the user requested and it is
@@ -1179,8 +1191,7 @@ if link_model.startswith("dynamic"):
     # Redirect the 'Library' target, which we always use instead of 'StaticLibrary' for things
     # that can be built in either mode, to point to SharedLibrary.
     env['BUILDERS']['Library'] = env['BUILDERS']['SharedLibrary']
-    # Do the same for SharedObject
-    env['BUILDERS']['Object'] = env['BUILDERS']['SharedObject']
+    env['BUILDERS']['LibraryObject'] = env['BUILDERS']['SharedObject']
 
     # TODO: Ideally, the conditions below should be based on a
     # detection of what linker we are using, not the local OS, but I
@@ -1268,6 +1279,16 @@ if get_option('build-fast-and-loose') == "on" and \
     # See http://www.scons.org/wiki/GoFastButton for details
     env.Decider('MD5-timestamp')
     env.SetOption('max_drift', 1)
+
+# On non-windows platforms, we may need to differentiate between flags being used to target an
+# executable (like -fPIE), vs those being used to target a (shared) library (like -fPIC). To do so,
+# we inject a new family of SCons variables PROG*FLAGS, by reaching into the various COMs.
+if not env.TargetOSIs('windows'):
+    env["CCCOM"] = env["CCCOM"].replace("$CFLAGS", "$CFLAGS $PROGCFLAGS")
+    env["CXXCOM"] = env["CXXCOM"].replace("$CXXFLAGS", "$CXXFLAGS $PROGCXXFLAGS")
+    env["CCCOM"] = env["CCCOM"].replace("$CCFLAGS", "$CCFLAGS $PROGCCFLAGS")
+    env["CXXCOM"] = env["CXXCOM"].replace("$CCFLAGS", "$CCFLAGS $PROGCCFLAGS")
+    env["LINKCOM"] = env["LINKCOM"].replace("$LINKFLAGS", "$LINKFLAGS $PROGLINKFLAGS")
 
 if not env.Verbose():
     env.Append( CCCOMSTR = "Compiling $TARGET" )
@@ -1480,12 +1501,20 @@ elif env.TargetOSIs('windows'):
 if env.ToolchainIs('msvc'):
     env['PDB'] = '${TARGET.base}.pdb'
 
-env['STATIC_AND_SHARED_OBJECTS_ARE_THE_SAME'] = 1
 if env.TargetOSIs('posix'):
+
+    # Everything on OS X is position independent by default. Solaris doesn't support PIE.
+    if not env.TargetOSIs('osx', 'solaris'):
+        if get_option('runtime-hardening') == "on":
+            # If runtime hardening is requested, then build anything
+            # destined for an executable with the necessary flags for PIE.
+            env.AppendUnique(
+                PROGCCFLAGS=['-fPIE'],
+                PROGLINKFLAGS=['-pie'],
+            )
 
     # -Winvalid-pch Warn if a precompiled header (see Precompiled Headers) is found in the search path but can't be used.
     env.Append( CCFLAGS=["-fno-omit-frame-pointer",
-                         "-fPIC",
                          "-fno-strict-aliasing",
                          "-ggdb",
                          "-pthread",
@@ -1498,8 +1527,8 @@ if env.TargetOSIs('posix'):
         if not has_option("disable-warnings-as-errors"):
             env.Append( CCFLAGS=["-Werror"] )
 
-    env.Append( CXXFLAGS=["-Wnon-virtual-dtor", "-Woverloaded-virtual"] )
-    env.Append( LINKFLAGS=["-fPIC", "-pthread"] )
+    env.Append( CXXFLAGS=["-Woverloaded-virtual"] )
+    env.Append( LINKFLAGS=["-pthread"] )
 
     # SERVER-9761: Ensure early detection of missing symbols in dependent libraries at program
     # startup.
@@ -1845,6 +1874,40 @@ def doConfigure(myenv):
         # TODO: re-evaluate when we move to GCC 5.3
         # see: http://stackoverflow.com/questions/21755206/how-to-get-around-gcc-void-b-4-may-be-used-uninitialized-in-this-funct
         AddToCXXFLAGSIfSupported(myenv, "-Wno-maybe-uninitialized")
+
+        # Check if we can set "-Wnon-virtual-dtor" when "-Werror" is set. The only time we can't set it is on
+        # clang 3.4, where a class with virtual function(s) and a non-virtual destructor throws a warning when
+        # it shouldn't.
+        def CheckNonVirtualDtor(context):
+
+            test_body = """
+            class Base {
+            public:
+                virtual void foo() const = 0;
+            protected:
+                ~Base() {};
+            };
+
+            class Derived : public Base {
+            public:
+                virtual void foo() const {}
+            };
+            """
+
+            context.Message('Checking -Wnon-virtual-dtor for false positives... ')
+            ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
+            context.Result(ret)
+            return ret
+
+        myenvClone = myenv.Clone()
+        myenvClone.Append( CCFLAGS=['-Werror'] )
+        myenvClone.Append( CXXFLAGS=["-Wnon-virtual-dtor"] )
+        conf = Configure(myenvClone, help=False, custom_tests = {
+            'CheckNonVirtualDtor' : CheckNonVirtualDtor,
+        })
+        if conf.CheckNonVirtualDtor():
+            myenv.Append( CXXFLAGS=["-Wnon-virtual-dtor"] )
+        conf.Finish()
 
     if get_option('runtime-hardening') == "on":
         # Clang honors these flags, but doesn't actually do anything with them for compatibility, so we

@@ -46,8 +46,8 @@ MoveTimingHelper::MoveTimingHelper(OperationContext* txn,
                                    const BSONObj& max,
                                    int totalNumSteps,
                                    std::string* cmdErrmsg,
-                                   const std::string& toShard,
-                                   const std::string& fromShard)
+                                   const ShardId& toShard,
+                                   const ShardId& fromShard)
     : _txn(txn),
       _where(where),
       _ns(ns),
@@ -64,12 +64,12 @@ MoveTimingHelper::~MoveTimingHelper() {
     // even if logChange doesn't throw, bson does
     // sigh
     try {
-        if (!_to.empty()) {
-            _b.append("to", _to);
+        if (_to.isValid()) {
+            _b.append("to", _to.toString());
         }
 
-        if (!_from.empty()) {
-            _b.append("from", _from);
+        if (_from.isValid()) {
+            _b.append("from", _from.toString());
         }
 
         if (_nextStep != _totalNumSteps) {
@@ -82,7 +82,7 @@ MoveTimingHelper::~MoveTimingHelper() {
             _b.append("errmsg", *_cmdErrmsg);
         }
 
-        grid.catalogManager(_txn)->logChange(
+        grid.catalogClient(_txn)->logChange(
             _txn, str::stream() << "moveChunk." << _where, _ns, _b.obj());
     } catch (const std::exception& e) {
         warning() << "couldn't record timing for moveChunk '" << _where << "': " << e.what();

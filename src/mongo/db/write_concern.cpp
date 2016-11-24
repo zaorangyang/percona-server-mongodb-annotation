@@ -121,8 +121,13 @@ Status validateWriteConcern(OperationContext* txn,
                     << writeConcern.toBSON().toString());
         }
 
-        if (replMode == repl::ReplicationCoordinator::modeReplSet && !isLocalDb &&
-            writeConcern.wMode.empty()) {
+        if (replMode == repl::ReplicationCoordinator::modeReplSet &&
+            // Allow writes performed within the server to have a write concern of { w: 1 }.
+            // This is so commands have the option to skip waiting for replication if they are
+            // holding locks (ex. addShardToZone). This also allows commands that perform
+            // multiple writes to batch the wait at the end.
+            !txn->getClient()->isInDirectClient() &&
+            !isLocalDb && writeConcern.wMode.empty()) {
             invariant(writeConcern.wNumNodes == 1);
             return Status(
                 ErrorCodes::BadValue,
@@ -192,7 +197,8 @@ void WriteConcernResult::appendTo(const WriteConcernOptions& writeConcern,
             result->appendNumber("waited", syncMillis);
         }
 
-        dassert(result->asTempObj()["fsyncFiles"].numberInt() > 0 ||
+        // For ephemeral storage engines, 0 files may be fsynced.
+        dassert(result->asTempObj()["fsyncFiles"].numberLong() >= 0 ||
                 !result->asTempObj()["waited"].eoo());
     }
 }

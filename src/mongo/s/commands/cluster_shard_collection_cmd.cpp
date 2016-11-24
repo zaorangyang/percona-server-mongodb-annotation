@@ -47,7 +47,7 @@
 #include "mongo/s/balancer/balancer.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_write.h"
@@ -404,8 +404,8 @@ public:
         audit::logShardCollection(
             ClientBasic::getCurrent(), nss.ns(), proposedKey, careAboutUnique);
 
-        Status status = grid.catalogManager(txn)->shardCollection(
-            txn, nss.ns(), proposedShardKey, careAboutUnique, initSplits, {});
+        Status status = grid.catalogClient(txn)->shardCollection(
+            txn, nss.ns(), proposedShardKey, careAboutUnique, initSplits, std::set<ShardId>{});
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }

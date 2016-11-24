@@ -33,7 +33,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/metadata_loader.h"
-#include "mongo/s/catalog/replset/catalog_manager_replica_set_test_fixture.h"
+#include "mongo/s/catalog/replset/sharding_catalog_test_fixture.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/chunk_version.h"
@@ -46,10 +46,10 @@ using std::unique_ptr;
 using std::vector;
 using unittest::assertGet;
 
-class NoChunkFixture : public CatalogManagerReplSetTestFixture {
+class NoChunkFixture : public ShardingCatalogTestFixture {
 protected:
     void setUp() {
-        CatalogManagerReplSetTestFixture::setUp();
+        ShardingCatalogTestFixture::setUp();
         getMessagingPort()->setRemote(HostAndPort("FakeRemoteClient:34567"));
         configTargeter()->setFindHostReturnValue(configHost);
 
@@ -67,7 +67,7 @@ protected:
         // can't load metadata
         ChunkType chunkType;
         chunkType.setNS(NamespaceString{"test.foo"}.ns());
-        chunkType.setShard("shard0001");
+        chunkType.setShard(ShardId("shard0001"));
         chunkType.setMin(BSON("a" << MINKEY));
         chunkType.setMax(BSON("a" << MAXKEY));
         chunkType.setVersion(ChunkVersion(1, 0, epoch));
@@ -77,7 +77,7 @@ protected:
         auto future = launchAsync([this] {
             MetadataLoader loader;
             auto status = loader.makeCollectionMetadata(operationContext(),
-                                                        catalogManager(),
+                                                        catalogClient(),
                                                         "test.foo",
                                                         "shard0000",
                                                         NULL, /* no old metadata */
@@ -314,10 +314,10 @@ TEST_F(NoChunkFixture, PendingOrphanedDataRanges) {
  * Fixture with single chunk containing:
  * [10->20)
  */
-class SingleChunkFixture : public CatalogManagerReplSetTestFixture {
+class SingleChunkFixture : public ShardingCatalogTestFixture {
 protected:
     void setUp() {
-        CatalogManagerReplSetTestFixture::setUp();
+        ShardingCatalogTestFixture::setUp();
         getMessagingPort()->setRemote(HostAndPort("FakeRemoteClient:34567"));
         configTargeter()->setFindHostReturnValue(configHost);
 
@@ -345,7 +345,7 @@ protected:
         auto future = launchAsync([this] {
             MetadataLoader loader;
             auto status = loader.makeCollectionMetadata(operationContext(),
-                                                        catalogManager(),
+                                                        catalogClient(),
                                                         "test.foo",
                                                         "shard0000",
                                                         NULL, /* no old metadata */
@@ -570,10 +570,10 @@ TEST_F(SingleChunkFixture, ChunkOrphanedDataRanges) {
  * Fixture with single chunk containing:
  * [(min, min)->(max, max))
  */
-class SingleChunkMinMaxCompoundKeyFixture : public CatalogManagerReplSetTestFixture {
+class SingleChunkMinMaxCompoundKeyFixture : public ShardingCatalogTestFixture {
 protected:
     void setUp() {
-        CatalogManagerReplSetTestFixture::setUp();
+        ShardingCatalogTestFixture::setUp();
         getMessagingPort()->setRemote(HostAndPort("FakeRemoteClient:34567"));
         configTargeter()->setFindHostReturnValue(configHost);
 
@@ -601,7 +601,7 @@ protected:
         auto future = launchAsync([this] {
             MetadataLoader loader;
             auto status = loader.makeCollectionMetadata(operationContext(),
-                                                        catalogManager(),
+                                                        catalogClient(),
                                                         "test.foo",
                                                         "shard0000",
                                                         NULL, /* no old metadata */
@@ -638,10 +638,10 @@ TEST_F(SingleChunkMinMaxCompoundKeyFixture, CompoudKeyBelongsToMe) {
  * Fixture with chunks:
  * [(10, 0)->(20, 0)), [(30, 0)->(40, 0))
  */
-class TwoChunksWithGapCompoundKeyFixture : public CatalogManagerReplSetTestFixture {
+class TwoChunksWithGapCompoundKeyFixture : public ShardingCatalogTestFixture {
 protected:
     void setUp() {
-        CatalogManagerReplSetTestFixture::setUp();
+        ShardingCatalogTestFixture::setUp();
         getMessagingPort()->setRemote(HostAndPort("FakeRemoteClient:34567"));
         configTargeter()->setFindHostReturnValue(configHost);
 
@@ -677,7 +677,7 @@ protected:
         auto future = launchAsync([this] {
             MetadataLoader loader;
             auto status = loader.makeCollectionMetadata(operationContext(),
-                                                        catalogManager(),
+                                                        catalogClient(),
                                                         "test.foo",
                                                         "shard0000",
                                                         NULL, /* no old metadata */
@@ -835,10 +835,10 @@ TEST_F(TwoChunksWithGapCompoundKeyFixture, ChunkGapAndPendingOrphanedDataRanges)
  * Fixture with chunk containing:
  * [min->10) , [10->20) , <gap> , [30->max)
  */
-class ThreeChunkWithRangeGapFixture : public CatalogManagerReplSetTestFixture {
+class ThreeChunkWithRangeGapFixture : public ShardingCatalogTestFixture {
 protected:
     void setUp() {
-        CatalogManagerReplSetTestFixture::setUp();
+        ShardingCatalogTestFixture::setUp();
         getMessagingPort()->setRemote(HostAndPort("FakeRemoteClient:34567"));
         configTargeter()->setFindHostReturnValue(configHost);
 
@@ -891,7 +891,7 @@ protected:
         auto future = launchAsync([this] {
             MetadataLoader loader;
             auto status = loader.makeCollectionMetadata(operationContext(),
-                                                        catalogManager(),
+                                                        catalogClient(),
                                                         "test.foo",
                                                         "shard0000",
                                                         NULL, /* no old metadata */

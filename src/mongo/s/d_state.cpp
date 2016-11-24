@@ -30,8 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/s/d_state.h"
-
+#include "mongo/base/init.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -46,6 +45,8 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/local_sharding_info.h"
 #include "mongo/util/log.h"
 #include "mongo/util/stringutils.h"
 
@@ -55,7 +56,7 @@ using std::shared_ptr;
 using std::string;
 using std::stringstream;
 
-namespace {}  // namespace
+namespace {
 
 bool haveLocalShardingInfo(OperationContext* txn, const string& ns) {
     if (!ShardingState::get(txn)->enabled()) {
@@ -74,6 +75,14 @@ bool haveLocalShardingInfo(OperationContext* txn, const string& ns) {
 
     return false;
 }
+
+MONGO_INITIALIZER_WITH_PREREQUISITES(MongoDLocalShardingInfo, ("SetGlobalEnvironment"))
+(InitializerContext* context) {
+    enableLocalShardingInfo(getGlobalServiceContext(), &haveLocalShardingInfo);
+    return Status::OK();
+}
+
+}  // namespace
 
 void usingAShardConnection(const string& addr) {}
 

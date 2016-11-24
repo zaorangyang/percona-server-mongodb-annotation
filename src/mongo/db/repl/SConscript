@@ -56,7 +56,6 @@ env.Library(
         'storage_interface.cpp',
     ],
     LIBDEPS=[
-        'oplog_entry',
         'optime',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/util/decorable',
@@ -67,9 +66,12 @@ env.Library(
     target='storage_interface_impl',
     source=[
         'storage_interface_impl.cpp',
+        'collection_bulk_loader_impl.cpp',
     ],
     LIBDEPS=[
         'storage_interface',
+        '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/query/internal_plans',
         '$BUILD_DIR/mongo/db/serveronly', # For OperationContextImpl
     ],
 )
@@ -85,7 +87,6 @@ env.CppUnitTest(
         'storage_interface_impl',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
     ],
-    NO_CRUTCH = True,
 )
 
 env.Library(
@@ -130,6 +131,44 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
         '$BUILD_DIR/mongo/unittest/concurrency',
     ],
+)
+
+env.Library(
+    target='oplog_buffer_blocking_queue',
+    source=[
+        'oplog_buffer_blocking_queue.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Library(
+    target='oplog_buffer_collection',
+    source=[
+        'oplog_buffer_collection.cpp',
+    ],
+    LIBDEPS=[
+        'storage_interface',
+        '$BUILD_DIR/mongo/db/catalog/collection_options',
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+)
+
+env.CppUnitTest(
+    target='oplog_buffer_collection_test',
+    source=[
+        'oplog_buffer_collection_test.cpp',
+    ],
+    LIBDEPS=[
+        'oplog_buffer_collection',
+        'oplog_interface_local',
+        'replmocks',
+        'storage_interface_impl',
+        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+        '$BUILD_DIR/mongo/unittest/concurrency',
+    ],
+    NO_CRUTCH = True,
 )
 
 env.Library(
@@ -210,7 +249,6 @@ env.CppUnitTest(
         'rs_rollback',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
     ],
-    NO_CRUTCH = True,
 )
 
 env.Library(
@@ -277,7 +315,6 @@ env.CppUnitTest(
         'sync_tail',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
     ],
-    NO_CRUTCH = True,
 )
 
 env.Library('topology_coordinator',
@@ -531,6 +568,7 @@ env.Library(
         'storage_interface_mock.cpp',
     ],
     LIBDEPS=[
+        'oplog_buffer_blocking_queue',
         'repl_coordinator_interface',
         'repl_settings',
         'replica_set_messages',
@@ -608,9 +646,8 @@ env.CppUnitTest('isself_test',
                 ],
                 LIBDEPS=[
                     '$BUILD_DIR/mongo/db/serveronly',
-                    "$BUILD_DIR/mongo/util/ntservice_mock",
                 ],
-                NO_CRUTCH = True)
+                )
 
 env.Library(
     target='replset_commands',
@@ -885,6 +922,7 @@ env.Library(
         'data_replicator_external_state_mock.cpp',
     ],
     LIBDEPS=[
+        'oplog_buffer_blocking_queue',
         'oplog_entry',
         'optime',
         '$BUILD_DIR/mongo/util/net/hostandport',
@@ -901,6 +939,7 @@ env.Library(
         'collection_cloner',
         'database_cloner',
         'multiapplier',
+        'oplog_buffer_blocking_queue',
         'oplog_fetcher',
         'optime',
         'reporter',

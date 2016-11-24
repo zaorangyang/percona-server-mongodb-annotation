@@ -22,7 +22,7 @@ env.Library(
         '$BUILD_DIR/mongo/executor/network_interface_factory',
         '$BUILD_DIR/mongo/executor/network_interface_thread_pool',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
-        '$BUILD_DIR/mongo/s/catalog/replset/catalog_manager_replica_set',
+        '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_client_impl',
         '$BUILD_DIR/mongo/s/catalog/replset/dist_lock_catalog_impl',
         '$BUILD_DIR/mongo/s/catalog/replset/replset_dist_lock_manager',
         'client/sharding_connection_hook',
@@ -32,6 +32,16 @@ env.Library(
 )
 
 # Functionality shared between mongod and mongos
+env.Library(
+    target='shard_id',
+    source=[
+        'shard_id.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
+)
+
 env.Library(
     target='common',
     source=[
@@ -46,6 +56,12 @@ env.Library(
         'catalog/type_mongos.cpp',
         'catalog/type_shard.cpp',
         'catalog/type_tags.cpp',
+        'request_types/add_shard_request_type.cpp',
+        'request_types/add_shard_to_zone_request_type.cpp',
+        'request_types/assign_key_range_to_zone_request_type.cpp',
+        'request_types/balance_chunk_request_type.cpp',
+        'request_types/control_balancer_request_type.cpp',
+        'request_types/remove_shard_from_zone_request_type.cpp',
         'chunk_diff.cpp',
         'chunk_version.cpp',
         'migration_secondary_throttle_options.cpp',
@@ -54,6 +70,7 @@ env.Library(
         'shard_key_pattern.cpp',
     ],
     LIBDEPS=[
+        'shard_id',
         '$BUILD_DIR/mongo/client/connection_string',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/matcher/expressions',
@@ -79,9 +96,36 @@ env.Library(
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
         '$BUILD_DIR/mongo/rpc/metadata',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
-        '$BUILD_DIR/mongo/s/catalog/replset/catalog_manager_replica_set',
+        '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_client_impl',
+        '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_manager_impl',
         '$BUILD_DIR/mongo/s/coreshard',
-        '$BUILD_DIR/mongo/s/mongoscore',
+        '$BUILD_DIR/mongo/util/clock_source_mock',
+        '$BUILD_DIR/mongo/util/net/message_port_mock',
+        'mongoscore',
+    ],
+    LIBDEPS_TAGS=[
+        # Depends on coreshard, but that would be circular
+        'incomplete',
+    ],
+)
+
+env.Library(
+    target='config_server_test_fixture',
+    source=[
+        'config_server_test_fixture.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+        '$BUILD_DIR/mongo/client/remote_command_targeter_mock',
+        '$BUILD_DIR/mongo/executor/network_test_env',
+        '$BUILD_DIR/mongo/executor/task_executor_pool',
+        '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
+        '$BUILD_DIR/mongo/rpc/metadata',
+        '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
+        '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_client_impl',
+        '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_manager_impl',
+        '$BUILD_DIR/mongo/s/coreshard',
+        '$BUILD_DIR/mongo/s/serveronly',
         '$BUILD_DIR/mongo/util/clock_source_mock',
         '$BUILD_DIR/mongo/util/net/message_port_mock',
     ],
@@ -89,6 +133,16 @@ env.Library(
         # Depends on coreshard, but that would be circular
         'incomplete',
     ],
+)
+
+env.CppUnitTest(
+    target='shard_id_test',
+    source=[
+        'shard_id_test.cpp',
+    ],
+    LIBDEPS=[
+        'common',
+    ]
 )
 
 env.CppUnitTest(
@@ -104,15 +158,26 @@ env.CppUnitTest(
         'catalog/type_mongos_test.cpp',
         'catalog/type_shard_test.cpp',
         'catalog/type_tags_test.cpp',
-        'chunk_diff_test.cpp',
         'chunk_version_test.cpp',
         'migration_secondary_throttle_options_test.cpp',
         'move_chunk_request_test.cpp',
         'set_shard_version_request_test.cpp',
         'shard_key_pattern_test.cpp',
+#        'shard_id_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
+        'common',
+    ]
+)
+
+# This test is very slow in debug mode, so it is put in a separate binary by itself
+env.CppUnitTest(
+    target='chunk_diff_test',
+    source=[
+        'chunk_diff_test.cpp',
+    ],
+    LIBDEPS=[
         'common',
     ]
 )
@@ -161,31 +226,22 @@ env.CppUnitTest(
         'chunk_manager_tests.cpp'
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/s/catalog/replset/catalog_manager_replica_set_test_fixture',
+        '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_test_fixture',
         'coreshard',
     ]
-)
-
-env.Library(
-    target='request_types',
-    source=[
-        'request_types/add_shard_request_type.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/bson/util/bson_extract',
-        '$BUILD_DIR/mongo/client/connection_string',
-        '$BUILD_DIR/mongo/db/server_options_core',
-        '$BUILD_DIR/mongo/db/service_context',
-    ],
 )
 
 env.CppUnitTest('request_types_test',
     source=[
         'request_types/add_shard_request_test.cpp',
+        'request_types/add_shard_to_zone_request_test.cpp',
+        'request_types/assign_key_range_to_zone_request_test.cpp',
+        'request_types/balance_chunk_request_test.cpp',
+        'request_types/control_balancer_request_test.cpp',
+        'request_types/remove_shard_from_zone_request_test.cpp',
     ],
     LIBDEPS=[
-        'request_types',
+        'common',
     ],
 )
 
@@ -194,7 +250,6 @@ env.CppUnitTest('request_types_test',
 env.Library(
     target='coreshard',
     source=[
-        # This is only here temporarily for auto-split logic in chunk.cpp.
         'balancer/balancer.cpp',
         'balancer/balancer_chunk_selection_policy.cpp',
         'balancer/balancer_chunk_selection_policy_impl.cpp',
@@ -206,6 +261,7 @@ env.Library(
         'chunk.cpp',
         'chunk_manager.cpp',
         'config.cpp',
+        'config_server_client.cpp',
         'grid.cpp',
         'shard_util.cpp',
         'sharding_egress_metadata_hook.cpp',
@@ -215,10 +271,9 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/executor/task_executor_pool',
         '$BUILD_DIR/mongo/s/query/cluster_cursor_manager',
-        'catalog/replset/catalog_manager_replica_set',
+        'catalog/replset/sharding_catalog_client_impl',
         'client/sharding_client',
         'common',
-        'request_types',
     ],
     LIBDEPS_TAGS=[
         'incomplete',
@@ -273,17 +328,26 @@ env.CppUnitTest(
         'balancer/cluster_statistics_test.cpp',
     ],
     LIBDEPS=[
-        'coreshard',
-        'sharding_test_fixture',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
+        'coreshard',
+        'sharding_test_fixture',
     ]
+)
+
+env.Library(
+    target='local_sharding_info',
+    source=[
+        'local_sharding_info.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
 )
 
 env.Library(
     target='serveronly',
     source=[
-        'd_sharding_server_status.cpp',
         'd_state.cpp',
         'sharding_egress_metadata_hook_for_mongod.cpp',
     ],
