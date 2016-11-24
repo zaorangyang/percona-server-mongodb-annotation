@@ -20,11 +20,12 @@ auditTest(
         assert.commandWorked(testDB.createCollection(oldName));
         assert.commandWorked(testDB.getCollection(oldName).renameCollection(newName));
 
+        beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m);
         var checkAuditLogForSingleRename = function() {
             assert.eq(1, auditColl.count({
                 atype: "renameCollection",
-                ts: withinTheLastFewSeconds(),
+                ts: withinFewSecondsBefore(beforeLoad),
                 'params.old': testDBName + '.' + oldName,
                 'params.new': testDBName + '.' + newName,
                 result: 0,

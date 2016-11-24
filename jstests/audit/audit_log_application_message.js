@@ -12,10 +12,11 @@ auditTest(
         var msg = "it's a trap!"
         assert.commandWorked(m.getDB('admin').runCommand({ logApplicationMessage: msg }));
 
+        beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({
             atype: "applicationMessage",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.msg': msg,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
