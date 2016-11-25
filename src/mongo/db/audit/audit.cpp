@@ -45,7 +45,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
@@ -419,7 +419,7 @@ namespace audit {
 
     static void appendCommonInfo(BSONObjBuilder &builder,
                                  StringData atype,
-                                 ClientBasic* client) {
+                                 Client* client) {
         builder << AuditFields::type(atype);
         builder << AuditFields::timestamp(BSON("$date" << static_cast<long long>(jsTime().toMillisSinceEpoch())));
         builder << AuditFields::local(BSON("host" << getHostNameCached() << "port" << serverGlobalParams.port));
@@ -467,7 +467,7 @@ namespace audit {
     }
 
 
-    static void _auditEvent(ClientBasic* client,
+    static void _auditEvent(Client* client,
                             StringData atype,
                             const BSONObj& params,
                             ErrorCodes::Error result = ErrorCodes::OK) {
@@ -478,7 +478,7 @@ namespace audit {
         _auditLog->append(builder.done());
     }
 
-    static void _auditAuthzFailure(ClientBasic* client,
+    static void _auditAuthzFailure(Client* client,
                                  StringData ns,
                                  StringData command,
                                  const BSONObj& args,
@@ -489,7 +489,7 @@ namespace audit {
         _auditEvent(client, "authCheck", params, result);
     }
 
-    void logAuthentication(ClientBasic* client,
+    void logAuthentication(Client* client,
                            StringData mechanism,
                            const UserName& user,
                            ErrorCodes::Error result) {
@@ -503,7 +503,7 @@ namespace audit {
         _auditEvent(client, "authenticate", params, result);
     }
 
-    void logCommandAuthzCheck(ClientBasic* client,
+    void logCommandAuthzCheck(Client* client,
                               const std::string& dbname,
                               const BSONObj& cmdObj,
                               Command* command,
@@ -519,7 +519,7 @@ namespace audit {
 
 
     void logDeleteAuthzCheck(
-            ClientBasic* client,
+            Client* client,
             const NamespaceString& ns,
             const BSONObj& pattern,
             ErrorCodes::Error result) {
@@ -535,7 +535,7 @@ namespace audit {
     }
 
     void logGetMoreAuthzCheck(
-            ClientBasic* client,
+            Client* client,
             const NamespaceString& ns,
             long long cursorId,
             ErrorCodes::Error result) {
@@ -549,7 +549,7 @@ namespace audit {
     }
 
     void logInsertAuthzCheck(
-            ClientBasic* client,
+            Client* client,
             const NamespaceString& ns,
             const BSONObj& insertedObj,
             ErrorCodes::Error result) {
@@ -565,7 +565,7 @@ namespace audit {
     }
 
     void logKillCursorsAuthzCheck(
-            ClientBasic* client,
+            Client* client,
             const NamespaceString& ns,
             long long cursorId,
             ErrorCodes::Error result) {
@@ -579,7 +579,7 @@ namespace audit {
     }
 
     void logQueryAuthzCheck(
-            ClientBasic* client,
+            Client* client,
             const NamespaceString& ns,
             const BSONObj& query,
             ErrorCodes::Error result) {
@@ -593,7 +593,7 @@ namespace audit {
     }
 
     void logUpdateAuthzCheck(
-            ClientBasic* client,
+            Client* client,
             const NamespaceString& ns,
             const BSONObj& query,
             const BSONObj& updateObj,
@@ -620,7 +620,7 @@ namespace audit {
         }
     }
 
-    void logReplSetReconfig(ClientBasic* client,
+    void logReplSetReconfig(Client* client,
                             const BSONObj* oldConfig,
                             const BSONObj* newConfig) {
         if (!_auditLog) {
@@ -631,7 +631,7 @@ namespace audit {
         _auditEvent(client, "replSetReconfig", params);
     }
 
-    void logApplicationMessage(ClientBasic* client,
+    void logApplicationMessage(Client* client,
                                StringData msg) {
         if (!_auditLog) {
             return;
@@ -641,7 +641,7 @@ namespace audit {
         _auditEvent(client, "applicationMessage", params);
     }
 
-    void logShutdown(ClientBasic* client) {
+    void logShutdown(Client* client) {
         if (!_auditLog) {
             return;
         }
@@ -650,7 +650,7 @@ namespace audit {
         _auditEvent(client, "shutdown", params);
     }
 
-    void logCreateIndex(ClientBasic* client,
+    void logCreateIndex(Client* client,
                         const BSONObj* indexSpec,
                         StringData indexname,
                         StringData nsname) {
@@ -664,7 +664,7 @@ namespace audit {
         _auditEvent(client, "createIndex", params);
     }
 
-    void logCreateCollection(ClientBasic* client,
+    void logCreateCollection(Client* client,
                              StringData nsname) { 
         if (!_auditLog) {
             return;
@@ -674,7 +674,7 @@ namespace audit {
         _auditEvent(client, "createCollection", params);
     }
 
-    void logCreateDatabase(ClientBasic* client,
+    void logCreateDatabase(Client* client,
                            StringData nsname) {
         if (!_auditLog) {
             return;
@@ -684,7 +684,7 @@ namespace audit {
         _auditEvent(client, "createDatabase", params);
     }
 
-    void logDropIndex(ClientBasic* client,
+    void logDropIndex(Client* client,
                       StringData indexname,
                       StringData nsname) {
         if (!_auditLog) {
@@ -695,7 +695,7 @@ namespace audit {
         _auditEvent(client, "dropIndex", params);
     }
 
-    void logDropCollection(ClientBasic* client,
+    void logDropCollection(Client* client,
                            StringData nsname) { 
         if (!_auditLog) {
             return;
@@ -705,7 +705,7 @@ namespace audit {
         _auditEvent(client, "dropCollection", params);
     }
 
-    void logDropDatabase(ClientBasic* client,
+    void logDropDatabase(Client* client,
                          StringData nsname) {
         if (!_auditLog) {
             return;
@@ -715,7 +715,7 @@ namespace audit {
         _auditEvent(client, "dropDatabase", params);
     }
 
-    void logRenameCollection(ClientBasic* client,
+    void logRenameCollection(Client* client,
                              StringData source,
                              StringData target) {
         if (!_auditLog) {
@@ -726,7 +726,7 @@ namespace audit {
         _auditEvent(client, "renameCollection", params);
     }
 
-    void logEnableSharding(ClientBasic* client,
+    void logEnableSharding(Client* client,
                            StringData nsname) {
         if (!_auditLog) {
             return;
@@ -736,7 +736,7 @@ namespace audit {
         _auditEvent(client, "enableSharding", params);
     }
 
-    void logAddShard(ClientBasic* client,
+    void logAddShard(Client* client,
                      StringData name,
                      const std::string& servers,
                      long long maxsize) {
@@ -750,7 +750,7 @@ namespace audit {
         _auditEvent(client, "addShard", params);
     }
 
-    void logRemoveShard(ClientBasic* client,
+    void logRemoveShard(Client* client,
                         StringData shardname) {
         if (!_auditLog) {
             return;
@@ -760,7 +760,7 @@ namespace audit {
         _auditEvent(client, "removeShard", params);
     }
 
-    void logShardCollection(ClientBasic* client,
+    void logShardCollection(Client* client,
                             StringData ns,
                             const BSONObj& keyPattern,
                             bool unique) {
@@ -774,7 +774,7 @@ namespace audit {
         _auditEvent(client, "shardCollection", params);
     }
 
-    void logCreateUser(ClientBasic* client,
+    void logCreateUser(Client* client,
                        const UserName& username,
                        bool password,
                        const BSONObj* customData,
@@ -792,7 +792,7 @@ namespace audit {
         _auditEvent(client, "createUser", params.done());
     }
 
-    void logDropUser(ClientBasic* client,
+    void logDropUser(Client* client,
                      const UserName& username) {
         if (!_auditLog) {
             return;
@@ -803,7 +803,7 @@ namespace audit {
         _auditEvent(client, "dropUser", params);
     }
 
-    void logDropAllUsersFromDatabase(ClientBasic* client,
+    void logDropAllUsersFromDatabase(Client* client,
                                      StringData dbname) {
         if (!_auditLog) {
             return;
@@ -812,7 +812,7 @@ namespace audit {
         _auditEvent(client, "dropAllUsers", BSON("db" << dbname));
     }
 
-    void logUpdateUser(ClientBasic* client,
+    void logUpdateUser(Client* client,
                        const UserName& username,
                        bool password,
                        const BSONObj* customData,
@@ -833,7 +833,7 @@ namespace audit {
         _auditEvent(client, "updateUser", params.done());
     }
 
-    void logGrantRolesToUser(ClientBasic* client,
+    void logGrantRolesToUser(Client* client,
                              const UserName& username,
                              const std::vector<RoleName>& roles) {
         if (!_auditLog) {
@@ -847,7 +847,7 @@ namespace audit {
         _auditEvent(client, "grantRolesToUser", params.done());
     }
 
-    void logRevokeRolesFromUser(ClientBasic* client,
+    void logRevokeRolesFromUser(Client* client,
                                 const UserName& username,
                                 const std::vector<RoleName>& roles) {
         if (!_auditLog) {
@@ -861,7 +861,7 @@ namespace audit {
         _auditEvent(client, "revokeRolesFromUser", params.done());
     }
 
-    void logCreateRole(ClientBasic* client,
+    void logCreateRole(Client* client,
                        const RoleName& role,
                        const std::vector<RoleName>& roles,
                        const PrivilegeVector& privileges) {
@@ -877,7 +877,7 @@ namespace audit {
         _auditEvent(client, "createRole", params.done());
     }
 
-    void logUpdateRole(ClientBasic* client,
+    void logUpdateRole(Client* client,
                        const RoleName& role,
                        const std::vector<RoleName>* roles,
                        const PrivilegeVector* privileges) {
@@ -897,7 +897,7 @@ namespace audit {
         _auditEvent(client, "updateRole", params.done());
     }
 
-    void logDropRole(ClientBasic* client,
+    void logDropRole(Client* client,
                      const RoleName& role) {
         if (!_auditLog) {
             return;
@@ -908,7 +908,7 @@ namespace audit {
         _auditEvent(client, "dropRole", params);
     }
 
-    void logDropAllRolesFromDatabase(ClientBasic* client,
+    void logDropAllRolesFromDatabase(Client* client,
                                      StringData dbname) {
         if (!_auditLog) {
             return;
@@ -917,7 +917,7 @@ namespace audit {
         _auditEvent(client, "dropAllRoles", BSON("db" << dbname));
     }
 
-    void logGrantRolesToRole(ClientBasic* client,
+    void logGrantRolesToRole(Client* client,
                              const RoleName& role,
                              const std::vector<RoleName>& roles) {
         if (!_auditLog) {
@@ -931,7 +931,7 @@ namespace audit {
         _auditEvent(client, "grantRolesToRole", params.done());
     }
 
-    void logRevokeRolesFromRole(ClientBasic* client,
+    void logRevokeRolesFromRole(Client* client,
                                 const RoleName& role,
                                 const std::vector<RoleName>& roles) {
         if (!_auditLog) {
@@ -945,7 +945,7 @@ namespace audit {
         _auditEvent(client, "revokeRolesFromRole", params.done());
     }
 
-    void logGrantPrivilegesToRole(ClientBasic* client,
+    void logGrantPrivilegesToRole(Client* client,
                                   const RoleName& role,
                                   const PrivilegeVector& privileges) {
         if (!_auditLog) {
@@ -959,7 +959,7 @@ namespace audit {
         _auditEvent(client, "grantPrivilegesToRole", params.done());
     }
 
-    void logRevokePrivilegesFromRole(ClientBasic* client,
+    void logRevokePrivilegesFromRole(Client* client,
                                      const RoleName& role,
                                      const PrivilegeVector& privileges) {
         if (!_auditLog) {

@@ -44,7 +44,7 @@ public:
              << std::endl
              << "{ createBackup: 1, backupDir: <destination directory> }";
     }
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
         return AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
