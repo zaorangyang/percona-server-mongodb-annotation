@@ -973,7 +973,8 @@ namespace audit {
         _auditEvent(client, "revokePrivilegesFromRole", params.done());
     }
 
-    void writeImpersonatedUsersToMetadata(BSONObjBuilder* metadata) PERCONA_AUDIT_STUB
+    void writeImpersonatedUsersToMetadata(OperationContext* txn,
+                                          BSONObjBuilder* metadata) PERCONA_AUDIT_STUB
 
     void parseAndRemoveImpersonatedUsersField(
             BSONObj cmdObj,
