@@ -45,8 +45,6 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
-#include "mongo/logger/console_appender.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -455,7 +453,8 @@ Status addMongodOptions(moe::OptionSection* options) {
                            "declare this is a config db of a cluster; default port 27019; "
                            "default dir /data/configdb")
         .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("shardsvr");
+        .incompatibleWith("shardsvr")
+        .incompatibleWith("nojournal");
 
     sharding_options
         .addOptionChaining("shardsvr",
@@ -463,7 +462,9 @@ Status addMongodOptions(moe::OptionSection* options) {
                            moe::Switch,
                            "declare this is a shard db of a cluster; default port 27018")
         .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("configsvr");
+        .incompatibleWith("configsvr")
+        .incompatibleWith("master")
+        .incompatibleWith("slave");
 
     sharding_options
         .addOptionChaining(
@@ -597,14 +598,6 @@ void sysRuntimeInfo() {
 #endif
 }
 }  // namespace
-
-void setPlainConsoleLogger() {
-    logger::LogManager* manager = logger::globalLogManager();
-    manager->getGlobalDomain()->clearAppenders();
-    manager->getGlobalDomain()->attachAppender(logger::MessageLogDomain::AppenderAutoPtr(
-        new logger::ConsoleAppender<logger::MessageEventEphemeral>(
-            new logger::MessageEventUnadornedEncoder)));
-}
 
 bool handlePreValidationMongodOptions(const moe::Environment& params,
                                       const std::vector<std::string>& args) {
@@ -1271,12 +1264,6 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
     if (params.count("sharding.clusterRole")) {
         auto clusterRoleParam = params["sharding.clusterRole"].as<std::string>();
         if (clusterRoleParam == "configsvr") {
-            bool journal = true;
-            params.get("storage.journal.enabled", &journal);
-            if (!journal) {
-                return Status(ErrorCodes::BadValue,
-                              "journaling cannot be turned off when configsvr is specified");
-            }
             serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
             replSettings.setMajorityReadConcernEnabled(true);
 
@@ -1284,6 +1271,11 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
             // the config server role
             if (!params.count("storage.journal.enabled")) {
                 storageGlobalParams.dur = true;
+            }
+
+            if (!storageGlobalParams.dur) {
+                return Status(ErrorCodes::BadValue,
+                              "journaling cannot be turned off when configsvr is specified");
             }
 
             if (!params.count("storage.dbPath")) {

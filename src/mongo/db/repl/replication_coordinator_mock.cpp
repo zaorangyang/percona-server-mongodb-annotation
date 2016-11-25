@@ -32,6 +32,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/db/storage/snapshot_name.h"
@@ -208,6 +209,10 @@ bool ReplicationCoordinatorMock::isWaitingForApplierToDrain() {
     return false;
 }
 
+bool ReplicationCoordinatorMock::isCatchingUp() {
+    return false;
+}
+
 void ReplicationCoordinatorMock::signalDrainComplete(OperationContext*) {}
 
 Status ReplicationCoordinatorMock::waitForDrainFinish(Milliseconds timeout) {
@@ -216,6 +221,10 @@ Status ReplicationCoordinatorMock::waitForDrainFinish(Milliseconds timeout) {
 }
 
 void ReplicationCoordinatorMock::signalUpstreamUpdater() {}
+
+Status ReplicationCoordinatorMock::resyncData(OperationContext* txn, bool waitUntilCompleted) {
+    return Status::OK();
+}
 
 StatusWith<BSONObj> ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand(
     ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle) const {
@@ -244,7 +253,13 @@ Status ReplicationCoordinatorMock::processReplSetGetStatus(BSONObjBuilder* resul
     return Status::OK();
 }
 
-void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result) {}
+void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result) {
+    result->setReplSetVersion(_getConfigReturnValue.getConfigVersion());
+    result->setIsMaster(true);
+    result->setIsSecondary(false);
+    result->setMe(_getConfigReturnValue.getMemberAt(0).getHostAndPort());
+    result->setElectionId(OID::gen());
+}
 
 void ReplicationCoordinatorMock::appendSlaveInfoData(BSONObjBuilder* result) {}
 
@@ -438,12 +453,6 @@ WriteConcernOptions ReplicationCoordinatorMock::populateUnsetWriteConcernOptions
     }
     return wc;
 }
-
-bool ReplicationCoordinatorMock::getInitialSyncRequestedFlag() const {
-    return false;
-}
-
-void ReplicationCoordinatorMock::setInitialSyncRequestedFlag(bool value) {}
 
 ReplSettings::IndexPrefetchConfig ReplicationCoordinatorMock::getIndexPrefetchConfig() const {
     return ReplSettings::IndexPrefetchConfig();

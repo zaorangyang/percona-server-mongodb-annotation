@@ -41,6 +41,9 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collation_index_key.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
@@ -159,19 +162,33 @@ bool isChunkMapValid(const ChunkMap& chunkMap) {
 
 AtomicUInt32 ChunkManager::NextSequenceNumber(1U);
 
-ChunkManager::ChunkManager(const string& ns, const ShardKeyPattern& pattern, bool unique)
+ChunkManager::ChunkManager(const string& ns,
+                           const ShardKeyPattern& pattern,
+                           std::unique_ptr<CollatorInterface> defaultCollator,
+                           bool unique)
     : _ns(ns),
       _keyPattern(pattern.getKeyPattern()),
+      _defaultCollator(std::move(defaultCollator)),
       _unique(unique),
       _sequenceNumber(NextSequenceNumber.addAndFetch(1)) {}
 
-ChunkManager::ChunkManager(const CollectionType& coll)
+ChunkManager::ChunkManager(OperationContext* txn, const CollectionType& coll)
     : _ns(coll.getNs().ns()),
       _keyPattern(coll.getKeyPattern()),
       _unique(coll.getUnique()),
       _sequenceNumber(NextSequenceNumber.addAndFetch(1)) {
     // coll does not have correct version. Use same initial version as _load and createFirstChunks.
     _version = ChunkVersion(0, 0, coll.getEpoch());
+
+    if (!coll.getDefaultCollation().isEmpty()) {
+        auto statusWithCollator = CollatorFactoryInterface::get(txn->getServiceContext())
+                                      ->makeFromBSON(coll.getDefaultCollation());
+
+        // The collation was validated upon collection creation.
+        invariantOK(statusWithCollator.getStatus());
+
+        _defaultCollator = std::move(statusWithCollator.getValue());
+    }
 }
 
 void ChunkManager::loadExistingRanges(OperationContext* txn, const ChunkManager* oldManager) {
@@ -333,7 +350,7 @@ shared_ptr<ChunkManager> ChunkManager::reload(OperationContext* txn, bool force)
 
 void ChunkManager::_printChunks() const {
     for (ChunkMap::const_iterator it = _chunkMap.begin(), end = _chunkMap.end(); it != end; ++it) {
-        log() << *it->second;
+        log() << redact((*it->second).toString());
     }
 }
 
@@ -431,7 +448,7 @@ Status ChunkManager::createFirstChunks(OperationContext* txn,
             txn, ChunkType::ConfigNS, chunk.toBSON(), ShardingCatalogClient::kMajorityWriteConcern);
         if (!status.isOK()) {
             const string errMsg = str::stream() << "Creating first chunks failed: "
-                                                << status.reason();
+                                                << redact(status.reason());
             error() << errMsg;
             return Status(status.code(), errMsg);
         }
@@ -445,8 +462,18 @@ Status ChunkManager::createFirstChunks(OperationContext* txn,
 }
 
 shared_ptr<Chunk> ChunkManager::findIntersectingChunk(OperationContext* txn,
-                                                      const BSONObj& shardKey) const {
+                                                      const BSONObj& shardKey,
+                                                      const CollatorInterface* collator) const {
     {
+        if (collator) {
+            for (BSONElement elt : shardKey) {
+                if (CollationIndexKey::isCollatableType(elt.type())) {
+                    msgasserted(ErrorCodes::ShardKeyNotFound,
+                                "cannot target single shard due to collation");
+                }
+            }
+        }
+
         BSONObj chunkMin;
         shared_ptr<Chunk> chunk;
         {
@@ -462,9 +489,9 @@ shared_ptr<Chunk> ChunkManager::findIntersectingChunk(OperationContext* txn,
                 return chunk;
             }
 
-            log() << chunkMin;
-            log() << *chunk;
-            log() << shardKey;
+            log() << redact(chunkMin.toString());
+            log() << redact((*chunk).toString());
+            log() << redact(shardKey);
 
             reload(txn);
             msgasserted(13141, "Chunk map pointed to incorrect chunk");
@@ -480,11 +507,24 @@ shared_ptr<Chunk> ChunkManager::findIntersectingChunk(OperationContext* txn,
                               << _chunkMap.size());
 }
 
+shared_ptr<Chunk> ChunkManager::findIntersectingChunkWithSimpleCollation(
+    OperationContext* txn, const BSONObj& shardKey) const {
+    const CollatorInterface* collator = nullptr;
+    return findIntersectingChunk(txn, shardKey, collator);
+}
+
 void ChunkManager::getShardIdsForQuery(OperationContext* txn,
                                        const BSONObj& query,
+                                       const BSONObj& collation,
                                        set<ShardId>* shardIds) const {
     auto qr = stdx::make_unique<QueryRequest>(NamespaceString(_ns));
     qr->setFilter(query);
+
+    if (!collation.isEmpty()) {
+        qr->setCollation(collation);
+    } else if (_defaultCollator) {
+        qr->setCollation(_defaultCollator->getSpec().toBSON());
+    }
 
     auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), ExtensionsCallbackNoop());
 
@@ -499,9 +539,18 @@ void ChunkManager::getShardIdsForQuery(OperationContext* txn,
     // Fast path for targeting equalities on the shard key.
     auto shardKeyToFind = _keyPattern.extractShardKeyFromQuery(*cq);
     if (shardKeyToFind.isOK() && !shardKeyToFind.getValue().isEmpty()) {
-        auto chunk = findIntersectingChunk(txn, shardKeyToFind.getValue());
-        shardIds->insert(chunk->getShardId());
-        return;
+        try {
+            auto chunk = findIntersectingChunk(txn, shardKeyToFind.getValue(), cq->getCollator());
+            shardIds->insert(chunk->getShardId());
+            return;
+        } catch (const MsgAssertionException& msg) {
+
+            // If we failed to find the intersecting chunk for a reason other than the inability to
+            // target a single shard, throw.
+            if (msg.getCode() != ErrorCodes::ShardKeyNotFound) {
+                throw msg;
+            }
+        }
     }
 
     // Transforms query into bounds for each field in the shard key
@@ -633,7 +682,8 @@ IndexBounds ChunkManager::collapseQuerySolution(const QuerySolutionNode* node) {
     // children.size() > 1, assert it's OR / SORT_MERGE.
     if (node->getType() != STAGE_OR && node->getType() != STAGE_SORT_MERGE) {
         // Unexpected node. We should never reach here.
-        error() << "could not generate index bounds on query solution tree: " << node->toString();
+        error() << "could not generate index bounds on query solution tree: "
+                << redact(node->toString());
         dassert(false);  // We'd like to know this error in testing.
 
         // Bail out with all shards in production, since this isn't a fatal error.

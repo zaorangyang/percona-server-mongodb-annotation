@@ -32,8 +32,12 @@
 #include <memory>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/util/concurrency/notification.h"
+
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -44,7 +48,7 @@ class MetadataManager {
     MONGO_DISALLOW_COPYING(MetadataManager);
 
 public:
-    MetadataManager();
+    MetadataManager(ServiceContext* sc, NamespaceString nss);
     ~MetadataManager();
 
     /**
@@ -57,31 +61,74 @@ public:
     ScopedCollectionMetadata getActiveMetadata();
 
     /**
-     * Changes the active metadata and if there are current users of the current metadata,
-     * puts it in the _metadataInUse set.
+     * Uses the contents of the specified metadata as a way to purge any pending chunks.
      */
-    void setActiveMetadata(std::unique_ptr<CollectionMetadata> newMetadata);
+    void refreshActiveMetadata(std::unique_ptr<CollectionMetadata> newMetadata);
+
+    /**
+     * Puts the specified range on the list of chunks, which are being received so that the range
+     * deleter process will not clean the partially migrated data.
+     */
+    void beginReceive(const ChunkRange& range);
+
+    /**
+     * Removes a range from the list of chunks, which are being received. Used externally to
+     * indicate that a chunk migration failed.
+     */
+    void forgetReceive(const ChunkRange& range);
+
+    /**
+     * Gets copy of the set of chunk ranges which are being received for this collection. This
+     * method is intended for testing purposes only and should not be used in any production code.
+     */
+    RangeMap getCopyOfReceivingChunks();
 
     /**
     * Adds a new range to be cleaned up.
     * The newly introduced range must not overlap with the existing ranges.
     */
-    void addRangeToClean(const ChunkRange& range);
+    std::shared_ptr<Notification<Status>> addRangeToClean(const ChunkRange& range);
+
+    /**
+     * Calls removeRangeToClean with Status::OK.
+     */
+    void removeRangeToClean(const ChunkRange& range) {
+        removeRangeToClean(range, Status::OK());
+    }
 
     /**
      * Removes the specified range from the ranges to be cleaned up.
+     * The specified deletionStatus will be returned to callers waiting
+     * on whether the deletion succeeded or failed.
      */
-    void removeRangeToClean(const ChunkRange& range);
+    void removeRangeToClean(const ChunkRange& range, Status deletionStatus);
 
     /**
-     * Gets copy of _rangesToClean map (see below).
+     * Gets copy of the set of chunk ranges which are scheduled for cleanup.
+     * Converts RangeToCleanMap to RangeMap.
      */
-    std::map<BSONObj, ChunkRange> getCopyOfRanges();
+    RangeMap getCopyOfRangesToClean();
 
-    /*
+    /**
      * Appends information on all the chunk ranges in rangesToClean to builder.
      */
     void append(BSONObjBuilder* builder);
+
+    /**
+     * Returns true if _rangesToClean is not empty.
+     */
+    bool hasRangesToClean();
+
+    /**
+     * Returns true if the exact range is in _rangesToClean.
+     */
+    bool isInRangesToClean(const ChunkRange& range);
+
+    /**
+     * Gets and returns, but does not remove, a single ChunkRange from _rangesToClean.
+     * Should not be called if _rangesToClean is empty: it will hit an invariant.
+     */
+    ChunkRange getNextRangeToClean();
 
 private:
     friend class ScopedCollectionMetadata;
@@ -94,7 +141,49 @@ private:
         CollectionMetadataTracker(std::unique_ptr<CollectionMetadata> m);
 
         std::unique_ptr<CollectionMetadata> metadata;
+
         uint32_t usageCounter{0};
+    };
+
+    // Class for the value of the _rangesToClean map. Used because callers of addRangeToClean
+    // sometimes need to wait until a range is deleted. Thus, complete(Status) is called
+    // when the range is deleted from _rangesToClean in removeRangeToClean(), letting callers
+    // of addRangeToClean know if the deletion succeeded or failed.
+    class RangeToCleanDescriptor {
+    public:
+        /**
+         * Initializes a RangeToCleanDescriptor with an empty notification.
+         */
+        RangeToCleanDescriptor(BSONObj max)
+            : _max(max.getOwned()), _notification(std::make_shared<Notification<Status>>()) {}
+
+        /**
+         * Gets the maximum value of the range to be deleted.
+         */
+        const BSONObj& getMax() const {
+            return _max;
+        }
+
+        // See comment on _notification.
+        std::shared_ptr<Notification<Status>> getNotification() {
+            return _notification;
+        }
+
+        /**
+         * Sets the status on _notification. This will tell threads
+         * waiting on the value of status that the deletion succeeded or failed.
+         */
+        void complete(Status status) {
+            _notification->set(status);
+        }
+
+    private:
+        // The maximum value of the range to be deleted.
+        BSONObj _max;
+
+        // This _notification will be set with a value indicating whether the deletion
+        // succeeded or failed.
+        std::shared_ptr<Notification<Status>> _notification;
     };
 
     /**
@@ -103,19 +192,36 @@ private:
      */
     void _removeMetadata_inlock(CollectionMetadataTracker* metadataTracker);
 
-    void _addRangeToClean_inlock(const ChunkRange& range);
-    void _removeRangeToClean_inlock(const ChunkRange& range);
+    std::shared_ptr<Notification<Status>> _addRangeToClean_inlock(const ChunkRange& range);
 
+    void _removeRangeToClean_inlock(const ChunkRange& range, Status deletionStatus);
+
+    RangeMap _getCopyOfRangesToClean_inlock();
+
+    void _setActiveMetadata_inlock(std::unique_ptr<CollectionMetadata> newMetadata);
+
+    const NamespaceString _nss;
+
+    // ServiceContext from which to obtain instances of global support objects.
+    ServiceContext* _serviceContext;
+
+    // Mutex to protect the state below
+    stdx::mutex _managerLock;
+
+    // Holds the collection metadata, which is currently active
     std::unique_ptr<CollectionMetadataTracker> _activeMetadataTracker;
 
+    // Holds collection metadata instances, which have previously been active, but are still in use
+    // by still active server operations or cursors
     std::list<std::unique_ptr<CollectionMetadataTracker>> _metadataInUse;
 
-    // Contains the information of which ranges of sharding keys need to
-    // be deleted from the shard. The map is from the minimum value of the
-    // range to be deleted (e.g. BSON("key" << 0)) to the entire chunk range.
-    std::map<BSONObj, ChunkRange> _rangesToClean;
+    // Chunk ranges which are currently assumed to be transferred to the shard. Indexed by the min
+    // key of the range.
+    RangeMap _receivingChunks;
 
-    stdx::mutex _managerLock;
+    // Set of ranges to be deleted. Indexed by the min key of the range.
+    typedef std::map<BSONObj, RangeToCleanDescriptor, BSONObjCmp> RangeToCleanMap;
+    RangeToCleanMap _rangesToClean;
 };
 
 class ScopedCollectionMetadata {
@@ -143,7 +249,9 @@ public:
     CollectionMetadata* operator->();
     CollectionMetadata* getMetadata();
 
-    /** True if the ScopedCollectionMetadata stores a metadata (is not empty) */
+    /**
+     * True if the ScopedCollectionMetadata stores a metadata (is not empty)
+     */
     operator bool() const;
 
 private:

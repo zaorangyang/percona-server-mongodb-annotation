@@ -52,6 +52,8 @@
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/views/resolved_view.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/bson_serializable.h"
 #include "mongo/s/catalog/catalog_cache.h"
@@ -106,7 +108,45 @@ void runAgainstRegistered(OperationContext* txn,
         return;
     }
 
-    Command::execCommandClientBasic(txn, c, cc(), queryOptions, ns, jsobj, anObjBuilder);
+    Command::execCommandClient(txn, c, queryOptions, ns, jsobj, anObjBuilder);
+}
+
+/**
+ * This code handles the $cmd.sys.inprog queries.
+ */
+bool handleSpecialNamespaces(OperationContext* txn, Request& request, const QueryMessage& q) {
+    const char* ns = strstr(request.getns(), ".$cmd.sys.");
+    if (!ns)
+        return false;
+
+    ns += 10;
+
+    BSONObjBuilder reply;
+
+    const auto upgradeToRealCommand = [txn, &q, &reply](StringData commandName) {
+        BSONObjBuilder cmdBob;
+        cmdBob.append(commandName, 1);
+        cmdBob.appendElements(q.query);  // fields are validated by Commands
+        auto interposedCmd = cmdBob.done();
+
+        // Rewrite upgraded pseudoCommands to run on the 'admin' database.
+        const NamespaceString interposedNss("admin", "$cmd");
+        runAgainstRegistered(txn, interposedNss.ns().c_str(), interposedCmd, reply, q.queryOptions);
+    };
+
+    if (strcmp(ns, "inprog") == 0) {
+        upgradeToRealCommand("currentOp");
+    } else if (strcmp(ns, "killop") == 0) {
+        upgradeToRealCommand("killOp");
+    } else if (strcmp(ns, "unlock") == 0) {
+        reply.append("err", "can't do unlock through mongos");
+    } else {
+        warning() << "unknown sys command [" << ns << "]";
+        return false;
+    }
+
+    replyToQuery(0, request.session(), request.m(), reply.done());
+    return true;
 }
 
 }  // namespace
@@ -119,13 +159,13 @@ void Strategy::queryOp(OperationContext* txn, Request& request) {
     QueryMessage q(request.d());
 
     NamespaceString ns(q.ns);
-    ClientBasic* client = txn->getClient();
+    Client* client = txn->getClient();
     AuthorizationSession* authSession = AuthorizationSession::get(client);
     Status status = authSession->checkAuthForFind(ns, false);
     audit::logQueryAuthzCheck(client, ns, q.query, status.code());
     uassertStatusOK(status);
 
-    LOG(3) << "query: " << q.ns << " " << q.query << " ntoreturn: " << q.ntoreturn
+    LOG(3) << "query: " << q.ns << " " << redact(q.query) << " ntoreturn: " << q.ntoreturn
            << " options: " << q.queryOptions;
 
     if (q.ntoreturn == 1 && strstr(q.ns, ".$cmd"))
@@ -192,7 +232,18 @@ void Strategy::queryOp(OperationContext* txn, Request& request) {
 
     // 0 means the cursor is exhausted. Otherwise we assume that a cursor with the returned id can
     // be retrieved via the ClusterCursorManager.
-    auto cursorId = ClusterFind::runQuery(txn, *canonicalQuery.getValue(), readPreference, &batch);
+    auto cursorId =
+        ClusterFind::runQuery(txn,
+                              *canonicalQuery.getValue(),
+                              readPreference,
+                              &batch,
+                              nullptr /*Argument is for views which OP_QUERY doesn't support*/);
+
+    if (!cursorId.isOK() &&
+        cursorId.getStatus() == ErrorCodes::CommandOnShardedViewNotSupportedOnMongod) {
+        uasserted(40247, "OP_QUERY not supported on views");
+    }
+
     uassertStatusOK(cursorId.getStatus());
 
     // Fill out the response buffer.
@@ -211,9 +262,9 @@ void Strategy::queryOp(OperationContext* txn, Request& request) {
 }
 
 void Strategy::clientCommandOp(OperationContext* txn, Request& request) {
-    QueryMessage q(request.d());
+    const QueryMessage q(request.d());
 
-    LOG(3) << "command: " << q.ns << " " << q.query << " ntoreturn: " << q.ntoreturn
+    LOG(3) << "command: " << q.ns << " " << redact(q.query) << " ntoreturn: " << q.ntoreturn
            << " options: " << q.queryOptions;
 
     if (q.queryOptions & QueryOption_Exhaust) {
@@ -222,44 +273,51 @@ void Strategy::clientCommandOp(OperationContext* txn, Request& request) {
                       " " + q.query.toString());
     }
 
-    NamespaceString nss(request.getns());
-    // Regular queries are handled in strategy_shard.cpp
-    verify(nss.isCommand() || nss.isSpecialCommand());
+    const NamespaceString nss(request.getns());
+    invariant(nss.isCommand() || nss.isSpecialCommand());
 
     if (handleSpecialNamespaces(txn, request, q))
         return;
+
+    BSONObj cmdObj = q.query;
+
+    {
+        BSONElement e = cmdObj.firstElement();
+        if (e.type() == Object && (e.fieldName()[0] == '$' ? str::equals("query", e.fieldName() + 1)
+                                                           : str::equals("query", e.fieldName()))) {
+            // Extract the embedded query object.
+            if (cmdObj.hasField(Query::ReadPrefField.name())) {
+                // The command has a read preference setting. We don't want to lose this information
+                // so we copy this to a new field called $queryOptions.$readPreference
+                BSONObjBuilder finalCmdObjBuilder;
+                finalCmdObjBuilder.appendElements(e.embeddedObject());
+
+                BSONObjBuilder queryOptionsBuilder(finalCmdObjBuilder.subobjStart("$queryOptions"));
+                queryOptionsBuilder.append(cmdObj[Query::ReadPrefField.name()]);
+                queryOptionsBuilder.done();
+
+                cmdObj = finalCmdObjBuilder.obj();
+            } else {
+                cmdObj = e.embeddedObject();
+            }
+        }
+    }
+
+    // Handle command option maxTimeMS.
+    uassert(ErrorCodes::InvalidOptions,
+            "no such command option $maxTimeMs; use maxTimeMS instead",
+            cmdObj[QueryRequest::queryOptionMaxTimeMS].eoo());
+
+    const int maxTimeMS =
+        uassertStatusOK(QueryRequest::parseMaxTimeMS(cmdObj[QueryRequest::cmdOptionMaxTimeMS]));
+    if (maxTimeMS > 0) {
+        txn->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
+    }
 
     int loops = 5;
 
     while (true) {
         try {
-            BSONObj cmdObj = q.query;
-            {
-                BSONElement e = cmdObj.firstElement();
-                if (e.type() == Object &&
-                    (e.fieldName()[0] == '$' ? str::equals("query", e.fieldName() + 1)
-                                             : str::equals("query", e.fieldName()))) {
-                    // Extract the embedded query object.
-
-                    if (cmdObj.hasField(Query::ReadPrefField.name())) {
-                        // The command has a read preference setting. We don't want
-                        // to lose this information so we copy this to a new field
-                        // called $queryOptions.$readPreference
-                        BSONObjBuilder finalCmdObjBuilder;
-                        finalCmdObjBuilder.appendElements(e.embeddedObject());
-
-                        BSONObjBuilder queryOptionsBuilder(
-                            finalCmdObjBuilder.subobjStart("$queryOptions"));
-                        queryOptionsBuilder.append(cmdObj[Query::ReadPrefField.name()]);
-                        queryOptionsBuilder.done();
-
-                        cmdObj = finalCmdObjBuilder.obj();
-                    } else {
-                        cmdObj = e.embeddedObject();
-                    }
-                }
-            }
-
             OpQueryReplyBuilder reply;
             {
                 BSONObjBuilder builder(reply.bufBuilderForResults());
@@ -272,7 +330,8 @@ void Strategy::clientCommandOp(OperationContext* txn, Request& request) {
                 throw e;
 
             loops--;
-            log() << "retrying command: " << q.query;
+
+            log() << "Retrying command " << redact(q.query) << causedBy(e);
 
             // For legacy reasons, ns may not actually be set in the exception :-(
             string staleNS = e.getns();
@@ -294,51 +353,18 @@ void Strategy::clientCommandOp(OperationContext* txn, Request& request) {
     }
 }
 
-// TODO: remove after MongoDB 3.2
-bool Strategy::handleSpecialNamespaces(OperationContext* txn, Request& request, QueryMessage& q) {
-    const char* ns = strstr(request.getns(), ".$cmd.sys.");
-    if (!ns)
-        return false;
-    ns += 10;
-
-    BSONObjBuilder reply;
-
-    const auto upgradeToRealCommand = [txn, &q, &reply](StringData commandName) {
-        BSONObjBuilder cmdBob;
-        cmdBob.append(commandName, 1);
-        cmdBob.appendElements(q.query);  // fields are validated by Commands
-        auto interposedCmd = cmdBob.done();
-        // Rewrite upgraded pseudoCommands to run on the 'admin' database.
-        NamespaceString interposedNss("admin", "$cmd");
-        runAgainstRegistered(txn, interposedNss.ns().c_str(), interposedCmd, reply, q.queryOptions);
-    };
-
-    if (strcmp(ns, "inprog") == 0) {
-        upgradeToRealCommand("currentOp");
-    } else if (strcmp(ns, "killop") == 0) {
-        upgradeToRealCommand("killOp");
-    } else if (strcmp(ns, "unlock") == 0) {
-        reply.append("err", "can't do unlock through mongos");
-    } else {
-        warning() << "unknown sys command [" << ns << "]";
-        return false;
-    }
-
-    BSONObj x = reply.done();
-    replyToQuery(0, request.session(), request.m(), x);
-    return true;
-}
-
 void Strategy::commandOp(OperationContext* txn,
                          const string& db,
                          const BSONObj& command,
                          int options,
                          const string& versionedNS,
                          const BSONObj& targetingQuery,
+                         const BSONObj& targetingCollation,
                          vector<CommandResult>* results) {
     QuerySpec qSpec(db + ".$cmd", command, BSONObj(), 0, 1, options);
 
-    ParallelSortClusteredCursor cursor(qSpec, CommandInfo(versionedNS, targetingQuery));
+    ParallelSortClusteredCursor cursor(
+        qSpec, CommandInfo(versionedNS, targetingQuery, targetingCollation));
 
     // Initialize the cursor
     cursor.init(txn);
@@ -526,9 +552,16 @@ Status Strategy::explainFind(OperationContext* txn,
                         options,
                         qr.nss().toString(),
                         qr.getFilter(),
+                        qr.getCollation(),
                         &shardResults);
 
     long long millisElapsed = timer.millis();
+
+    if (shardResults.size() == 1 &&
+        ResolvedView::isResolvedViewErrorResponse(shardResults[0].result)) {
+        out->append("resolvedView", shardResults[0].result.getObjectField("resolvedView"));
+        return getStatusFromCommandResult(shardResults[0].result);
+    }
 
     const char* mongosStageName = ClusterExplain::getStageNameForReadOp(shardResults, findCommand);
 

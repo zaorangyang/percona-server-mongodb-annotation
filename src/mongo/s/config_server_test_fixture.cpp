@@ -38,9 +38,12 @@
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/query_request.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -71,6 +74,7 @@
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
@@ -98,14 +102,15 @@ const Seconds ConfigServerTestFixture::kFutureTimeout{5};
 
 void ConfigServerTestFixture::setUp() {
     ServiceContextMongoDTest::setUp();
+    auto serviceContext = getServiceContext();
 
-    auto serviceContext = getGlobalServiceContext();
     _messagePort = stdx::make_unique<MessagingPortMock>();
-    Client::initThreadIfNotAlready("ConfigServerTestFixture");
     _opCtx = cc().makeOperationContext();
 
     repl::ReplSettings replSettings;
+    replSettings.setReplSetString("mySet/node1:12345,node2:54321,node3:12543");
     auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(replSettings);
+
     repl::ReplicaSetConfig config;
     config.initialize(BSON("_id"
                            << "mySet"
@@ -115,11 +120,15 @@ void ConfigServerTestFixture::setUp() {
                            << 3
                            << "members"
                            << BSON_ARRAY(BSON("host"
-                                              << "node2:12345"
+                                              << "node1:12345"
                                               << "_id"
                                               << 1))));
     replCoord->setGetConfigReturnValue(config);
     repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
+
+    serviceContext->setOpObserver(stdx::make_unique<OpObserver>());
+    repl::setOplogCollectionName();
+    repl::createOplog(_opCtx.get());
 
     serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
 
@@ -142,9 +151,10 @@ void ConfigServerTestFixture::setUp() {
 
     // Set up executor used for a few special operations during addShard.
     auto specialNet(stdx::make_unique<executor::NetworkInterfaceMock>());
-    auto specialMockNet = specialNet.get();
+    _mockNetworkForAddShard = specialNet.get();
     auto specialExec = makeThreadPoolTestExecutor(std::move(specialNet));
-    _addShardNetworkTestEnv = stdx::make_unique<NetworkTestEnv>(specialExec.get(), specialMockNet);
+    _addShardNetworkTestEnv =
+        stdx::make_unique<NetworkTestEnv>(specialExec.get(), _mockNetworkForAddShard);
     _executorForAddShard = specialExec.get();
 
     auto targeterFactory(stdx::make_unique<RemoteCommandTargeterFactoryMock>());
@@ -211,6 +221,11 @@ void ConfigServerTestFixture::setUp() {
 
     _catalogClient->startup();
     _catalogManager->startup();
+
+    // Needed if serverStatus gets called.
+    if (!HostnameCanonicalizationWorker::get(getGlobalServiceContext())) {
+        HostnameCanonicalizationWorker::start(getGlobalServiceContext());
+    }
 }
 
 void ConfigServerTestFixture::tearDown() {
@@ -269,10 +284,22 @@ executor::NetworkInterfaceMock* ConfigServerTestFixture::network() const {
     return _mockNetwork;
 }
 
+executor::NetworkInterfaceMock* ConfigServerTestFixture::networkForAddShard() const {
+    invariant(_mockNetworkForAddShard);
+
+    return _mockNetworkForAddShard;
+}
+
 executor::TaskExecutor* ConfigServerTestFixture::executor() const {
     invariant(_executor);
 
     return _executor;
+}
+
+executor::TaskExecutor* ConfigServerTestFixture::executorForAddShard() const {
+    invariant(_executorForAddShard);
+
+    return _executorForAddShard;
 }
 
 MessagingPortMock* ConfigServerTestFixture::getMessagingPort() const {
@@ -324,8 +351,12 @@ Status ConfigServerTestFixture::insertToConfigCollection(OperationContext* txn,
     auto config = getConfigShard();
     invariant(config);
 
-    auto insertResponse = config->runCommand(
-        txn, kReadPref, ns.db().toString(), request.toBSON(), Shard::RetryPolicy::kNoRetry);
+    auto insertResponse = config->runCommand(txn,
+                                             kReadPref,
+                                             ns.db().toString(),
+                                             request.toBSON(),
+                                             Shard::kDefaultConfigCommandTimeout,
+                                             Shard::RetryPolicy::kNoRetry);
 
     BatchedCommandResponse batchResponse;
     auto status = Shard::CommandResponse::processBatchWriteResponse(insertResponse, &batchResponse);
@@ -378,6 +409,28 @@ StatusWith<ShardType> ConfigServerTestFixture::getShardDoc(OperationContext* txn
     }
 
     return ShardType::fromBSON(doc.getValue());
+}
+
+Status ConfigServerTestFixture::setupChunks(const std::vector<ChunkType>& chunks) {
+    const NamespaceString chunkNS(ChunkType::ConfigNS);
+    for (const auto& chunk : chunks) {
+        auto insertStatus = insertToConfigCollection(operationContext(), chunkNS, chunk.toBSON());
+        if (!insertStatus.isOK()) {
+            return insertStatus;
+        }
+    }
+
+    return Status::OK();
+}
+
+StatusWith<ChunkType> ConfigServerTestFixture::getChunkDoc(OperationContext* txn,
+                                                           const BSONObj& minKey) {
+    auto doc = findOneOnConfigCollection(
+        txn, NamespaceString(ChunkType::ConfigNS), BSON(ChunkType::min() << minKey));
+    if (!doc.isOK())
+        return doc.getStatus();
+
+    return ChunkType::fromBSON(doc.getValue());
 }
 
 StatusWith<std::vector<BSONObj>> ConfigServerTestFixture::getIndexes(OperationContext* txn,

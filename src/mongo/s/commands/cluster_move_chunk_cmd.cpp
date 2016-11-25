@@ -35,18 +35,18 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/balancer/balancer.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
+#include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/sharding_raii.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
@@ -82,7 +82,7 @@ public:
              << " , to : 'shard001' }\n";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -159,8 +159,10 @@ public:
             return false;
         }
 
-        // This refreshes the chunk metadata if stale.
-        shared_ptr<ChunkManager> info = config->getChunkManager(txn, nss.ns(), true);
+        // This refreshes the chunk metadata if stale
+        auto scopedCM = uassertStatusOK(ScopedChunkManager::getExisting(txn, nss));
+        ChunkManager* const info = scopedCM.cm();
+
         shared_ptr<Chunk> chunk;
 
         if (!find.isEmpty()) {
@@ -178,7 +180,7 @@ public:
                 return false;
             }
 
-            chunk = info->findIntersectingChunk(txn, shardKey);
+            chunk = info->findIntersectingChunkWithSimpleCollation(txn, shardKey);
         } else {
             // Bounds
             if (!info->getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
@@ -193,7 +195,7 @@ public:
             BSONObj minKey = info->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
             BSONObj maxKey = info->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
 
-            chunk = info->findIntersectingChunk(txn, minKey);
+            chunk = info->findIntersectingChunkWithSimpleCollation(txn, minKey);
 
             if (chunk->getMin().woCompare(minKey) != 0 || chunk->getMax().woCompare(maxKey) != 0) {
                 errmsg = str::stream() << "no chunk found with the shard key bounds "
@@ -202,26 +204,25 @@ public:
             }
         }
 
-        const auto from = grid.shardRegistry()->getShard(txn, chunk->getShardId());
-        if (from->getId() != to->getId()) {
-            const auto secondaryThrottle =
-                uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
+        const auto secondaryThrottle =
+            uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
 
-            ChunkType chunkType;
-            chunkType.setNS(nss.ns());
-            chunkType.setMin(chunk->getMin());
-            chunkType.setMax(chunk->getMax());
-            chunkType.setShard(chunk->getShardId());
-            chunkType.setVersion(info->getVersion());
+        ChunkType chunkType;
+        chunkType.setNS(nss.ns());
+        chunkType.setMin(chunk->getMin());
+        chunkType.setMax(chunk->getMax());
+        chunkType.setShard(chunk->getShardId());
+        chunkType.setVersion(info->getVersion());
 
-            uassertStatusOK(
-                Balancer::get(txn)->moveSingleChunk(txn,
+        uassertStatusOK(configsvr_client::moveChunk(txn,
                                                     chunkType,
                                                     to->getId(),
                                                     maxChunkSizeBytes,
                                                     secondaryThrottle,
                                                     cmdObj["_waitForDelete"].trueValue()));
-        }
+
+        // Make sure the chunk manager is updated with the migrated chunk
+        info->reload(txn);
 
         result.append("millis", t.millis());
         return true;

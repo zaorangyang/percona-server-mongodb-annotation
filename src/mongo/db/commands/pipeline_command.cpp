@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <deque>
 #include <vector>
 
 #include "mongo/base/init.h"
@@ -59,8 +60,10 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/db/views/view_sharding_check.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -161,6 +164,72 @@ bool handleCursorCommand(OperationContext* txn,
     return static_cast<bool>(cursor);
 }
 
+StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNamespaces(
+    OperationContext* txn,
+    const boost::intrusive_ptr<Pipeline>& pipeline,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    // We intentionally do not drop and reacquire our DB lock after resolving the view definition in
+    // order to prevent the definition for any view namespaces we've already resolved from changing.
+    // This is necessary to prevent a cycle from being formed among the view definitions cached in
+    // 'resolvedNamespaces' because we won't re-resolve a view namespace we've already encountered.
+    AutoGetDb autoDb(txn, expCtx->ns.db(), MODE_IS);
+    ViewCatalog* viewCatalog = autoDb.getDb() ? autoDb.getDb()->getViewCatalog() : nullptr;
+
+    const auto& pipelineInvolvedNamespaces = pipeline->getInvolvedCollections();
+    std::deque<NamespaceString> involvedNamespacesQueue(pipelineInvolvedNamespaces.begin(),
+                                                        pipelineInvolvedNamespaces.end());
+    StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
+
+    while (!involvedNamespacesQueue.empty()) {
+        auto involvedNs = std::move(involvedNamespacesQueue.front());
+        involvedNamespacesQueue.pop_front();
+
+        if (resolvedNamespaces.find(involvedNs.coll()) != resolvedNamespaces.end()) {
+            continue;
+        }
+
+        if (viewCatalog && viewCatalog->lookup(txn, involvedNs.ns())) {
+            // If the database exists and 'involvedNs' refers to a view namespace, then we resolve
+            // its definition.
+            auto resolvedView = viewCatalog->resolveView(txn, involvedNs);
+            if (!resolvedView.isOK()) {
+                return {ErrorCodes::FailedToParse,
+                        str::stream() << "Failed to resolve view '" << involvedNs.ns() << "': "
+                                      << resolvedView.getStatus().toString()};
+            }
+
+            resolvedNamespaces[involvedNs.coll()] = {resolvedView.getValue().getNamespace(),
+                                                     resolvedView.getValue().getPipeline()};
+
+            // We parse the pipeline corresponding to the resolved view in case we must resolve
+            // other view namespaces that are also involved.
+            auto resolvedViewPipeline =
+                Pipeline::parse(resolvedView.getValue().getPipeline(), expCtx);
+            if (!resolvedViewPipeline.isOK()) {
+                return {ErrorCodes::FailedToParse,
+                        str::stream() << "Failed to parse definition for view '" << involvedNs.ns()
+                                      << "': "
+                                      << resolvedViewPipeline.getStatus().toString()};
+            }
+
+            const auto& resolvedViewInvolvedNamespaces =
+                resolvedViewPipeline.getValue()->getInvolvedCollections();
+            involvedNamespacesQueue.insert(involvedNamespacesQueue.end(),
+                                           resolvedViewInvolvedNamespaces.begin(),
+                                           resolvedViewInvolvedNamespaces.end());
+        } else {
+            // If the database exists and 'involvedNs' refers to a collection namespace, then we
+            // resolve it as an empty pipeline in order to read directly from the underlying
+            // collection. If the database doesn't exist, then we still resolve it as an empty
+            // pipeline because 'involvedNs' doesn't refer to a view namespace in our consistent
+            // snapshot of the view catalog.
+            resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
+        }
+    }
+
+    return resolvedNamespaces;
+}
+
 /**
  * Round trips the pipeline through serialization by calling serialize(), then Pipeline::parse().
  * fasserts if it fails to parse after being serialized.
@@ -228,7 +297,7 @@ public:
              << "See http://dochub.mongodb.org/core/aggregation for more details.";
     }
 
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) final {
         return Pipeline::checkAuthForCommand(client, dbname, cmdObj);
@@ -264,6 +333,12 @@ public:
         }
         auto pipeline = std::move(statusWithPipeline.getValue());
 
+        auto resolvedNamespaces = resolveInvolvedNamespaces(txn, pipeline, expCtx);
+        if (!resolvedNamespaces.isOK()) {
+            return appendCommandStatus(result, resolvedNamespaces.getStatus());
+        }
+        expCtx->resolvedNamespaces = std::move(resolvedNamespaces.getValue());
+
         unique_ptr<ClientCursorPin> pin;  // either this OR the exec will be non-null
         unique_ptr<PlanExecutor> exec;
         auto curOp = CurOp::get(txn);
@@ -278,12 +353,32 @@ public:
             AutoGetCollectionOrViewForRead ctx(txn, nss);
             Collection* collection = ctx.getCollection();
 
+            // If running $collStats on a view, we do not resolve the view since we want stats
+            // on this view namespace.
+            auto startsWithCollStats = [&pipeline]() {
+                const Pipeline::SourceContainer& sources = pipeline->getSources();
+                return !sources.empty() &&
+                    dynamic_cast<DocumentSourceCollStats*>(sources.front().get());
+            };
+
             // If this is a view, resolve it by finding the underlying collection and stitching view
             // pipelines and this request's pipeline together. We then release our locks before
             // recursively calling run, which will re-acquire locks on the underlying collection.
             // (The lock must be released because recursively acquiring locks on the database will
             // prohibit yielding.)
-            if (ctx.getView()) {
+            auto view = ctx.getView();
+            if (view && !startsWithCollStats()) {
+                auto viewDefinition =
+                    ViewShardingCheck::getResolvedViewIfSharded(txn, ctx.getDb(), view);
+                if (!viewDefinition.isOK()) {
+                    return appendCommandStatus(result, viewDefinition.getStatus());
+                }
+
+                if (!viewDefinition.getValue().isEmpty()) {
+                    ViewShardingCheck::appendShardedViewStatus(viewDefinition.getValue(), &result);
+                    return false;
+                }
+
                 auto resolvedView = ctx.getDb()->getViewCatalog()->resolveView(txn, nss);
                 if (!resolvedView.isOK()) {
                     return appendCommandStatus(result, resolvedView.getStatus());
@@ -293,10 +388,20 @@ public:
                 ctx.releaseLocksForView();
 
                 // Parse the resolved view into a new aggregation request.
-                BSONObj viewCmd =
+                auto viewCmd =
                     resolvedView.getValue().asExpandedViewAggregation(request.getValue());
+                if (!viewCmd.isOK()) {
+                    return appendCommandStatus(result, viewCmd.getStatus());
+                }
 
-                return this->run(txn, db, viewCmd, options, errmsg, result);
+                bool status = this->run(txn, db, viewCmd.getValue(), options, errmsg, result);
+                {
+                    // Set the namespace of the curop back to the view namespace so ctx records
+                    // stats on this view namespace on destruction.
+                    stdx::lock_guard<Client>(*txn->getClient());
+                    curOp->setNS_inlock(nss.ns());
+                }
+                return status;
             }
 
             // If the pipeline does not have a user-specified collation, set it from the collection
@@ -327,14 +432,13 @@ public:
 
             // This does mongod-specific stuff like creating the input PlanExecutor and adding
             // it to the front of the pipeline if needed.
-            std::shared_ptr<PlanExecutor> input =
-                PipelineD::prepareCursorSource(txn, collection, nss, pipeline, expCtx);
+            PipelineD::prepareCursorSource(collection, pipeline);
 
             // Create the PlanExecutor which returns results from the pipeline. The WorkingSet
             // ('ws') and the PipelineProxyStage ('proxy') will be owned by the created
             // PlanExecutor.
             auto ws = make_unique<WorkingSet>();
-            auto proxy = make_unique<PipelineProxyStage>(txn, pipeline, input, ws.get());
+            auto proxy = make_unique<PipelineProxyStage>(txn, pipeline, ws.get());
 
             auto statusWithPlanExecutor = (NULL == collection)
                 ? PlanExecutor::make(
@@ -444,7 +548,7 @@ public:
         }
         // Any code that needs the cursor pinned must be inside the try block, above.
 
-        return true;
+        return appendCommandStatus(result, Status::OK());
     }
 };
 

@@ -81,7 +81,7 @@ public:
              << " NOTE: this does not move the chunks, it just creates a logical separation.";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -195,7 +195,7 @@ public:
                 return false;
             }
 
-            chunk = info->findIntersectingChunk(txn, shardKey);
+            chunk = info->findIntersectingChunkWithSimpleCollation(txn, shardKey);
         } else if (!bounds.isEmpty()) {
             if (!info->getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
                 !info->getShardKeyPattern().isShardKey(bounds[1].Obj())) {
@@ -209,7 +209,7 @@ public:
             BSONObj minKey = info->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
             BSONObj maxKey = info->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
 
-            chunk = info->findIntersectingChunk(txn, minKey);
+            chunk = info->findIntersectingChunkWithSimpleCollation(txn, minKey);
             invariant(chunk.get());
 
             if (chunk->getMin().woCompare(minKey) != 0 || chunk->getMax().woCompare(maxKey) != 0) {
@@ -234,7 +234,7 @@ public:
                 return appendCommandStatus(result, status);
             }
 
-            chunk = info->findIntersectingChunk(txn, middle);
+            chunk = info->findIntersectingChunkWithSimpleCollation(txn, middle);
             invariant(chunk.get());
 
             if (chunk->getMin().woCompare(middle) == 0 || chunk->getMax().woCompare(middle) == 0) {
@@ -247,7 +247,8 @@ public:
 
         invariant(chunk.get());
 
-        log() << "splitting chunk [" << chunk->getMin() << "," << chunk->getMax() << ")"
+        log() << "splitting chunk [" << redact(chunk->getMin().toString()) << ","
+              << redact(chunk->getMax().toString()) << ")"
               << " in collection " << nss.ns() << " on shard " << chunk->getShardId();
 
         BSONObj res;

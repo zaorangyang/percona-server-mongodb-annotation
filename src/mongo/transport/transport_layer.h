@@ -57,6 +57,10 @@ class TransportLayer {
     MONGO_DISALLOW_COPYING(TransportLayer);
 
 public:
+    static const Status SessionUnknownStatus;
+    static const Status ShutdownStatus;
+    static const Status TicketSessionUnknownStatus;
+
     /**
      * Stats for sessions open in the Transport Layer.
      */
@@ -94,7 +98,7 @@ public:
      * TransportLayer is unable to source a Message, this will be a failed status,
      * and the passed-in Message buffer may be left in an invalid state.
      */
-    virtual Ticket sourceMessage(const Session& session,
+    virtual Ticket sourceMessage(Session& session,
                                  Message* message,
                                  Date_t expiration = Ticket::kNoExpirationDate) = 0;
 
@@ -113,7 +117,7 @@ public:
      * This method does NOT take ownership of the sunk Message, which must be cleaned
      * up by the caller.
      */
-    virtual Ticket sinkMessage(const Session& session,
+    virtual Ticket sinkMessage(Session& session,
                                const Message& message,
                                Date_t expiration = Ticket::kNoExpirationDate) = 0;
 
@@ -150,10 +154,10 @@ public:
     virtual void registerTags(const Session& session) = 0;
 
     /**
-     * Return the stored X509 subject name for this session. If the session does not
-     * exist in this TransportLayer, returns "".
+     * Return the stored X509 peer information for this session. If the session does not
+     * exist in this TransportLayer, returns a default constructed object.
      */
-    virtual std::string getX509SubjectName(const Session& session) = 0;
+    virtual SSLPeerInfo getX509PeerInfo(const Session& session) const = 0;
 
     /**
      * Returns the number of sessions currently open in the transport layer.
@@ -171,7 +175,7 @@ public:
      *
      * This method is idempotent and synchronous.
      */
-    virtual void end(const Session& session) = 0;
+    virtual void end(Session& session) = 0;
 
     /**
      * End all active sessions in the TransportLayer. Tickets that have already been started via

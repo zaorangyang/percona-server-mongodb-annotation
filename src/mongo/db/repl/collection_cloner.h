@@ -103,11 +103,11 @@ public:
 
     bool isActive() const override;
 
-    Status start() override;
+    Status startup() override;
 
-    void cancel() override;
+    void shutdown() override;
 
-    void wait() override;
+    void join() override;
 
     CollectionCloner::Stats getStats() const;
 
@@ -128,7 +128,7 @@ public:
      *
      * For testing only.
      */
-    void setScheduleDbWorkFn(const ScheduleDbWorkFn& scheduleDbWorkFn);
+    void setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& scheduleDbWorkFn);
 
 private:
     /**

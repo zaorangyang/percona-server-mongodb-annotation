@@ -35,6 +35,7 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/value_comparator.h"
 
 namespace mongo {
 
@@ -156,7 +157,7 @@ boost::optional<Document> DocumentSourceGroup::getNextStreaming() {
 
 void DocumentSourceGroup::dispose() {
     // Free our resources.
-    GroupsMap().swap(*_groups);
+    _groups = pExpCtx->getValueComparator().makeUnorderedValueMap<Accumulators>();
     _sorterIterator.reset();
 
     // Make us look done.
@@ -305,49 +306,13 @@ intrusive_ptr<DocumentSource> DocumentSourceGroup::createFromBson(
               Treat as a projection field with the additional ability to
               add aggregation operators.
             */
-            uassert(
-                16414,
-                str::stream() << "the group aggregate field name '" << pFieldName
-                              << "' cannot be used because $group's field names cannot contain '.'",
-                !str::contains(pFieldName, '.'));
+            auto parsedAccumulator = Accumulator::parseAccumulator(groupField, vps);
+            auto fieldName = parsedAccumulator.first.toString();
+            auto accExpression = parsedAccumulator.second;
+            auto factory =
+                Accumulator::getFactory(groupField.embeddedObject().firstElementFieldName());
 
-            uassert(15950,
-                    str::stream() << "the group aggregate field name '" << pFieldName
-                                  << "' cannot be an operator name",
-                    pFieldName[0] != '$');
-
-            uassert(15951,
-                    str::stream() << "the group aggregate field '" << pFieldName
-                                  << "' must be defined as an expression inside an object",
-                    groupField.type() == Object);
-
-            BSONObj subField(groupField.Obj());
-            BSONObjIterator subIterator(subField);
-            size_t subCount = 0;
-            for (; subIterator.more(); ++subCount) {
-                BSONElement subElement(subIterator.next());
-
-                auto name = subElement.fieldNameStringData();
-                Accumulator::Factory factory = Accumulator::getFactory(name);
-                intrusive_ptr<Expression> pGroupExpr;
-                BSONType elementType = subElement.type();
-                if (elementType == Object) {
-                    pGroupExpr = Expression::parseObject(subElement.Obj(), vps);
-                } else if (elementType == Array) {
-                    uasserted(15953,
-                              str::stream() << "aggregating group operators are unary (" << name
-                                            << ")");
-                } else { /* assume its an atomic single operand */
-                    pGroupExpr = Expression::parseOperand(subElement, vps);
-                }
-
-                pGroup->addAccumulator(pFieldName, factory, pGroupExpr);
-            }
-
-            uassert(15954,
-                    str::stream() << "the computed aggregate '" << pFieldName
-                                  << "' must specify exactly one operator",
-                    subCount == 1);
+            pGroup->addAccumulator(fieldName, factory, accExpression);
         }
     }
 
@@ -365,16 +330,27 @@ using GroupsMap = DocumentSourceGroup::GroupsMap;
 class SorterComparator {
 public:
     typedef pair<Value, Value> Data;
+
+    SorterComparator(ValueComparator valueComparator) : _valueComparator(valueComparator) {}
+
     int operator()(const Data& lhs, const Data& rhs) const {
-        return Value::compare(lhs.first, rhs.first);
+        return _valueComparator.compare(lhs.first, rhs.first);
     }
+
+private:
+    ValueComparator _valueComparator;
 };
 
 class SpillSTLComparator {
 public:
+    SpillSTLComparator(ValueComparator valueComparator) : _valueComparator(valueComparator) {}
+
     bool operator()(const GroupsMap::value_type* lhs, const GroupsMap::value_type* rhs) const {
-        return Value::compare(lhs->first, rhs->first) < 0;
+        return _valueComparator.evaluate(lhs->first < rhs->first);
     }
+
+private:
+    ValueComparator _valueComparator;
 };
 
 bool containsOnlyFieldPathsAndConstants(ExpressionObject* expressionObj) {
@@ -550,10 +526,10 @@ void DocumentSourceGroup::initialize() {
         }
 
         // We won't be using groups again so free its memory.
-        GroupsMap().swap(*_groups);
+        _groups = pExpCtx->getValueComparator().makeUnorderedValueMap<Accumulators>();
 
-        _sorterIterator.reset(
-            Sorter<Value, Value>::Iterator::merge(sortedFiles, SortOptions(), SorterComparator()));
+        _sorterIterator.reset(Sorter<Value, Value>::Iterator::merge(
+            sortedFiles, SortOptions(), SorterComparator(pExpCtx->getValueComparator())));
 
         // prepare current to accumulate data
         _currentAccumulators.reserve(numAccumulators);
@@ -577,7 +553,7 @@ shared_ptr<Sorter<Value, Value>::Iterator> DocumentSourceGroup::spill() {
         ptrs.push_back(&*it);
     }
 
-    stable_sort(ptrs.begin(), ptrs.end(), SpillSTLComparator());
+    stable_sort(ptrs.begin(), ptrs.end(), SpillSTLComparator(pExpCtx->getValueComparator()));
 
     SortedFileWriter<Value, Value> writer(SortOptions().TempDir(pExpCtx->tempDir));
     switch (vpAccumulatorFactory.size()) {  // same as ptrs[i]->second.size() for all i.

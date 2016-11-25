@@ -174,17 +174,11 @@ private:
     Status _enforceTagRanges(OperationContext* txn);
 
     /**
-     * Issues chunk migration request, one at a time.
-     *
-     * @param candidateChunks possible chunks to move
-     * @param writeConcern detailed write concern. NULL means the default write concern.
-     * @param waitForDelete wait for deletes to complete after each chunk move
-     * @return number of chunks effectively moved
+     * Schedules migrations for the specified set of chunks and returns how many chunks were
+     * successfully processed.
      */
     int _moveChunks(OperationContext* txn,
-                    const BalancerChunkSelectionPolicy::MigrateInfoVector& candidateChunks,
-                    const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                    bool waitForDelete);
+                    const BalancerChunkSelectionPolicy::MigrateInfoVector& candidateChunks);
 
     /**
      * Performs a split on the chunk with min value "minKey". If the split fails, it is marked as
@@ -216,11 +210,12 @@ private:
     // Number of moved chunks in last round
     int _balancedLastTime;
 
-    // Balancer policy
-    std::unique_ptr<BalancerChunkSelectionPolicy> _chunkSelectionPolicy;
-
     // Source for cluster statistics
     std::unique_ptr<ClusterStatistics> _clusterStats;
+
+    // Balancer policy. Depends on the cluster statistics instance above so it should be created
+    // after it and destroyed before it.
+    std::unique_ptr<BalancerChunkSelectionPolicy> _chunkSelectionPolicy;
 };
 
 }  // namespace mongo

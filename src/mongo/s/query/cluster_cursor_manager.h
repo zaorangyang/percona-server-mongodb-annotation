@@ -42,6 +42,7 @@
 namespace mongo {
 
 class ClockSource;
+class OperationContext;
 template <typename T>
 class StatusWith;
 
@@ -153,7 +154,7 @@ public:
          *
          * Can block.
          */
-        StatusWith<boost::optional<BSONObj>> next();
+        StatusWith<ClusterQueryResult> next();
 
         /**
          * Returns whether or not the underlying cursor is tailing a capped collection.  Cannot be
@@ -184,7 +185,7 @@ public:
         /**
          * Stashes 'obj' to be returned later by this cursor. A cursor must be owned.
          */
-        void queueResult(const BSONObj& obj);
+        void queueResult(const ClusterQueryResult& result);
 
         /**
          * Returns whether or not all the remote cursors underlying this cursor have been
@@ -200,6 +201,14 @@ public:
          * if the cursor is not tailable + awaitData).
          */
         Status setAwaitDataTimeout(Milliseconds awaitDataTimeout);
+
+
+        /**
+         * Update the operation context for remote requests.
+         *
+         * Network requests depend on having a valid operation context for user initiated actions.
+         */
+        void setOperationContext(OperationContext* txn);
 
     private:
         // ClusterCursorManager is a friend so that its methods can call the PinnedCursor
@@ -278,7 +287,9 @@ public:
      *
      * Does not block.
      */
-    StatusWith<PinnedCursor> checkOutCursor(const NamespaceString& nss, CursorId cursorId);
+    StatusWith<PinnedCursor> checkOutCursor(const NamespaceString& nss,
+                                            CursorId cursorId,
+                                            OperationContext* txn);
 
     /**
      * Informs the manager that the given cursor should be killed.  The cursor need not necessarily

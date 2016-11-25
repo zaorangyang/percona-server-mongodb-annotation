@@ -111,7 +111,7 @@ class EnterpriseDistro(packager.Distro):
         """
         if arch == "ppc64le":
             if self.n == 'ubuntu':
-                return [ "ubuntu1504" ]
+                return [ "ubuntu1604" ]
             if self.n == 'redhat':
                 return [ "rhel71" ]
             else:
@@ -120,7 +120,9 @@ class EnterpriseDistro(packager.Distro):
             if self.n == 'redhat':
                 return [ "rhel72" ]
             if self.n == 'suse':
-                return [ "suse12" ]
+                return [ "suse11", "suse12" ]
+            if self.n == 'ubuntu':
+                return [ "ubuntu1604" ]
             else:
                 return []
         if arch == "arm64":

@@ -68,7 +68,7 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) final {
         bool isAuthorized = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -100,7 +100,7 @@ public:
                     (opSepPos != (opToKill.size() - 1)));  // can't be NN:
 
         auto shardIdent = opToKill.substr(0, opSepPos);
-        log() << "want to kill op: " << opToKill;
+        log() << "want to kill op: " << redact(opToKill);
 
         // Will throw if shard id is not found
         auto shard = grid.shardRegistry()->getShard(txn, shardIdent);
@@ -111,7 +111,8 @@ public:
                        str::stream() << "shard " << shardIdent << " does not exist"));
         }
 
-        auto opId = std::stoi(opToKill.substr(opSepPos + 1));
+        int opId;
+        uassertStatusOK(parseNumberFromStringWithBase(opToKill.substr(opSepPos + 1), 10, &opId));
 
         // shardid is actually the opid - keeping for backwards compatibility.
         result.append("shard", shardIdent);

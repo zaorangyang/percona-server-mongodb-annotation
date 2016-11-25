@@ -69,6 +69,7 @@ baseSource=[
     'base/initializer_dependency_graph.cpp',
     'base/make_string_vector.cpp',
     'base/parse_number.cpp',
+    'base/simple_string_data_comparator.cpp',
     'base/status.cpp',
     'base/string_data.cpp',
     'base/validate_locale.cpp',
@@ -232,6 +233,7 @@ config_header_substs = (
     ('@mongo_config_have_strnlen@', 'MONGO_CONFIG_HAVE_STRNLEN'),
     ('@mongo_config_optimized_build@', 'MONGO_CONFIG_OPTIMIZED_BUILD'),
     ('@mongo_config_ssl@', 'MONGO_CONFIG_SSL'),
+    ('@mongo_config_ssl_has_asn1_any_definitions@', 'MONGO_CONFIG_HAVE_ASN1_ANY_DEFINITIONS'),
     ('@mongo_config_wiredtiger_enabled@', 'MONGO_CONFIG_WIREDTIGER_ENABLED'),
 )
 
@@ -255,6 +257,7 @@ mongodLibDeps = [
     "db/mongodandmongos",
     "db/mongodwebserver",
     "db/serveronly",
+    "db/repl/replset_commands",
     "db/repl/storage_interface_impl",
     "executor/network_interface_factory",
     's/commands/shared_cluster_commands',
@@ -374,6 +377,7 @@ if not has_option('noshell') and usemozjs:
                     'rpc/protocol',
                     'scripting/scripting',
                     'shell/mongojs',
+                    'transport/message_compressor',
                     'util/net/network',
                     'util/options_parser/options_parser_init',
                     'util/processinfo',

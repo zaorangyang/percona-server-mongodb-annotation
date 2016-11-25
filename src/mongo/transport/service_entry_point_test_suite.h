@@ -39,6 +39,7 @@
 namespace mongo {
 
 class ServiceEntryPoint;
+struct SSLPeerInfo;
 
 /**
  * Test class. Uses a mock TransportLayer to test that the ServiceEntryPoint
@@ -120,19 +121,19 @@ private:
         MockTLHarness();
 
         transport::Ticket sourceMessage(
-            const transport::Session& session,
+            transport::Session& session,
             Message* message,
             Date_t expiration = transport::Ticket::kNoExpirationDate) override;
         transport::Ticket sinkMessage(
-            const transport::Session& session,
+            transport::Session& session,
             const Message& message,
             Date_t expiration = transport::Ticket::kNoExpirationDate) override;
         Status wait(transport::Ticket&& ticket) override;
         void asyncWait(transport::Ticket&& ticket, TicketCallback callback) override;
-        std::string getX509SubjectName(const transport::Session& session) override;
+        SSLPeerInfo getX509PeerInfo(const transport::Session& session) const override;
         void registerTags(const transport::Session& session) override;
         Stats sessionStats() override;
-        void end(const transport::Session& session) override;
+        void end(transport::Session& session) override;
         void endAllSessions(
             transport::Session::TagMask tags = transport::Session::kEmptyTagMask) override;
         Status start() override;
@@ -141,10 +142,8 @@ private:
         ServiceEntryPointTestSuite::MockTicket* getMockTicket(const transport::Ticket& ticket);
 
         // Mocked method hooks
-        stdx::function<transport::Ticket(const transport::Session&, Message*, Date_t)>
-            _sourceMessage;
-        stdx::function<transport::Ticket(const transport::Session&, const Message&, Date_t)>
-            _sinkMessage;
+        stdx::function<transport::Ticket(transport::Session&, Message*, Date_t)> _sourceMessage;
+        stdx::function<transport::Ticket(transport::Session&, const Message&, Date_t)> _sinkMessage;
         stdx::function<Status(transport::Ticket)> _wait;
         stdx::function<void(transport::Ticket, TicketCallback)> _asyncWait;
         stdx::function<void(const transport::Session&)> _end;
@@ -154,11 +153,9 @@ private:
         stdx::function<void(void)> _shutdown = [] {};
 
         // Pre-set hook methods
-        transport::Ticket _defaultSource(const transport::Session& s, Message* m, Date_t d);
-        transport::Ticket _defaultSink(const transport::Session& s, const Message&, Date_t d);
-        transport::Ticket _sinkThenErrorOnWait(const transport::Session& s,
-                                               const Message& m,
-                                               Date_t d);
+        transport::Ticket _defaultSource(transport::Session& s, Message* m, Date_t d);
+        transport::Ticket _defaultSink(transport::Session& s, const Message&, Date_t d);
+        transport::Ticket _sinkThenErrorOnWait(transport::Session& s, const Message& m, Date_t d);
 
         Status _defaultWait(transport::Ticket ticket);
         Status _waitError(transport::Ticket ticket);

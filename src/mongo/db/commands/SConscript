@@ -70,11 +70,13 @@ env.Library(
         '$BUILD_DIR/mongo/db/startup_warnings_common',
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/stats/timer_stats',
+        '$BUILD_DIR/mongo/db/views/views',
         '$BUILD_DIR/mongo/logger/parse_log_component_settings',
         '$BUILD_DIR/mongo/s/client/sharding_client',
         '$BUILD_DIR/mongo/s/coreshard',
         '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
         '$BUILD_DIR/mongo/scripting/scripting_common',
+        '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/transport/transport_layer_common',
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
         '$BUILD_DIR/mongo/util/foundation',
@@ -170,6 +172,16 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
         '$BUILD_DIR/mongo/db/query/command_request_response',
+    ],
+)
+
+env.Library(
+    target="list_collections_filter",
+    source=[
+        'list_collections_filter.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
 )
 

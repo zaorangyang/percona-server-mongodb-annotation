@@ -125,7 +125,7 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -432,9 +432,9 @@ public:
             // TODO: Revisit this interface, it's a bit clunky
             newShardVersion.incMinor();
 
-            std::unique_ptr<CollectionMetadata> cloned(uassertStatusOK(
-                css->getMetadata()->cloneSplit(min, max, splitKeys, newShardVersion)));
-            css->setMetadata(std::move(cloned));
+            std::unique_ptr<CollectionMetadata> cloned(fassertStatusOK(
+                40221, css->getMetadata()->cloneSplit(min, max, splitKeys, newShardVersion)));
+            css->refreshMetadata(txn, std::move(cloned));
         }
 
         //

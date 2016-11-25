@@ -69,6 +69,7 @@
 #include "mongo/rpc/command_request_builder.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -77,6 +78,10 @@ namespace mongo {
 // Convention in this file: generic helpers go in the anonymous namespace. Helpers that are for a
 // single type of operation are static functions defined above their caller.
 namespace {
+
+MONGO_FP_DECLARE(failAllInserts);
+MONGO_FP_DECLARE(failAllUpdates);
+MONGO_FP_DECLARE(failAllRemoves);
 
 void finishCurOp(OperationContext* txn, CurOp* curOp) {
     try {
@@ -107,7 +112,7 @@ void finishCurOp(OperationContext* txn, CurOp* curOp) {
         if (logAll || logSlow) {
             Locker::LockerInfo lockerInfo;
             txn->lockState()->getLockerInfo(&lockerInfo);
-            log() << curOp->debug().report(*curOp, lockerInfo.stats);
+            log() << curOp->debug().report(txn->getClient(), *curOp, lockerInfo.stats);
         }
 
         if (curOp->shouldDBProfile(executionTimeMs)) {
@@ -322,6 +327,11 @@ static bool insertBatchAndHandleErrors(OperationContext* txn,
     auto acquireCollection = [&] {
         while (true) {
             txn->checkForInterrupt();
+
+            if (MONGO_FAIL_POINT(failAllInserts)) {
+                uasserted(ErrorCodes::InternalError, "failAllInserts failpoint active!");
+            }
+
             collection.emplace(txn, wholeOp.ns, MODE_IX);
             if (collection->getCollection())
                 break;
@@ -474,6 +484,7 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* txn,
         curOp.setNetworkOp_inlock(dbUpdate);
         curOp.setLogicalOp_inlock(LogicalOp::opUpdate);
         curOp.setQuery_inlock(op.query);
+        curOp.setCollation_inlock(op.collation);
         curOp.ensureStarted();
     }
 
@@ -494,6 +505,10 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* txn,
     boost::optional<AutoGetCollection> collection;
     while (true) {
         txn->checkForInterrupt();
+        if (MONGO_FAIL_POINT(failAllUpdates)) {
+            uasserted(ErrorCodes::InternalError, "failAllUpdates failpoint active!");
+        }
+
         collection.emplace(txn,
                            ns,
                            MODE_IX,  // DB is always IX, even if collection is X.
@@ -590,12 +605,11 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* txn,
         curOp.setNetworkOp_inlock(dbDelete);
         curOp.setLogicalOp_inlock(LogicalOp::opDelete);
         curOp.setQuery_inlock(op.query);
+        curOp.setCollation_inlock(op.collation);
         curOp.ensureStarted();
     }
 
     curOp.debug().ndeleted = 0;
-
-    txn->checkForInterrupt();
 
     DeleteRequest request(ns);
     request.setQuery(op.query);
@@ -605,6 +619,12 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* txn,
 
     ParsedDelete parsedDelete(txn, &request);
     uassertStatusOK(parsedDelete.parseRequest());
+
+    txn->checkForInterrupt();
+
+    if (MONGO_FAIL_POINT(failAllRemoves)) {
+        uasserted(ErrorCodes::InternalError, "failAllRemoves failpoint active!");
+    }
 
     ScopedTransaction scopedXact(txn, MODE_IX);
     AutoGetCollection collection(txn,

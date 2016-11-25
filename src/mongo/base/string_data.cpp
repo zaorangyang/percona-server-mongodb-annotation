@@ -28,40 +28,11 @@
 #include "mongo/base/string_data.h"
 
 #include <ostream>
-#include <third_party/murmurhash3/MurmurHash3.h>
-
-#include "mongo/base/data_type_endian.h"
-#include "mongo/base/data_view.h"
 
 namespace mongo {
 
-namespace {
-
-template <int SizeofSizeT>
-size_t murmur3(StringData str);
-
-template <>
-size_t murmur3<4>(StringData str) {
-    char hash[4];
-    MurmurHash3_x86_32(str.rawData(), str.size(), 0, &hash);
-    return ConstDataView(hash).read<LittleEndian<std::uint32_t>>();
-}
-
-template <>
-size_t murmur3<8>(StringData str) {
-    char hash[16];
-    MurmurHash3_x64_128(str.rawData(), str.size(), 0, hash);
-    return static_cast<size_t>(ConstDataView(hash).read<LittleEndian<std::uint64_t>>());
-}
-
-}  // namespace
-
 std::ostream& operator<<(std::ostream& stream, StringData value) {
     return stream.write(value.rawData(), value.size());
-}
-
-size_t StringData::Hasher::operator()(StringData str) const {
-    return murmur3<sizeof(size_t)>(str);
 }
 
 }  // namespace mongo

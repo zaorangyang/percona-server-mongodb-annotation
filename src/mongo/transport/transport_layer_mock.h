@@ -28,12 +28,15 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include "mongo/base/status.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/ticket.h"
 #include "mongo/transport/ticket_impl.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/net/message.h"
+#include "mongo/util/net/ssl_types.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -46,44 +49,67 @@ class TransportLayerMock : public TransportLayer {
     MONGO_DISALLOW_COPYING(TransportLayerMock);
 
 public:
-    TransportLayerMock() = default;
+    class TicketMock : public TicketImpl {
+    public:
+        // Source constructor
+        TicketMock(const Session* session,
+                   Message* message,
+                   Date_t expiration = Ticket::kNoExpirationDate);
 
-    Ticket sourceMessage(const Session& session,
+        // Sink constructor
+        TicketMock(const Session* session, Date_t expiration = Ticket::kNoExpirationDate);
+
+        TicketMock(TicketMock&&) = default;
+        TicketMock& operator=(TicketMock&&) = default;
+
+        SessionId sessionId() const override;
+
+        Date_t expiration() const override;
+
+        boost::optional<Message*> msg() const;
+
+    private:
+        const Session* _session;
+        boost::optional<Message*> _message;
+        Date_t _expiration;
+    };
+
+    TransportLayerMock();
+    ~TransportLayerMock();
+
+    Ticket sourceMessage(Session& session,
                          Message* message,
                          Date_t expiration = Ticket::kNoExpirationDate) override;
-    Ticket sinkMessage(const Session& session,
+    Ticket sinkMessage(Session& session,
                        const Message& message,
                        Date_t expiration = Ticket::kNoExpirationDate) override;
 
     Status wait(Ticket&& ticket) override;
     void asyncWait(Ticket&& ticket, TicketCallback callback) override;
 
-    std::string getX509SubjectName(const Session& session) override;
+    SSLPeerInfo getX509PeerInfo(const Session& session) const override;
+    void setX509PeerInfo(const Session& session, SSLPeerInfo peerInfo);
     void registerTags(const Session& session) override;
 
     Stats sessionStats() override;
 
-    void end(const Session& session) override;
+    Session* createSession();
+    Session* get(Session::Id id);
+    bool owns(Session::Id id);
+    void end(Session& session) override;
     void endAllSessions(Session::TagMask tags = Session::kEmptyTagMask) override;
 
     Status start() override;
     void shutdown() override;
+    bool inShutdown() const;
 
 private:
-    /**
-     * A class for Tickets issued from the TransportLayerMock. These will
-     * route to the appropriate TransportLayer when run with wait() or
-     * asyncWait().
-     */
-    class MockTicket : public TicketImpl {
-        MONGO_DISALLOW_COPYING(MockTicket);
-
-    public:
-        MockTicket() = default;
-
-        Session::Id sessionId() const override;
-        Date_t expiration() const override;
+    struct Connection {
+        std::unique_ptr<Session> session;
+        SSLPeerInfo peerInfo;
     };
+    std::unordered_map<Session::Id, Connection> _sessions;
+    bool _shutdown;
 };
 
 }  // namespace transport

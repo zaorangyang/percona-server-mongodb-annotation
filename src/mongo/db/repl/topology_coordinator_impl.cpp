@@ -35,7 +35,7 @@
 #include <limits>
 
 #include "mongo/db/audit.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/heartbeat_response_action.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -150,11 +150,6 @@ HostAndPort TopologyCoordinatorImpl::getSyncSourceAddress() const {
 
 HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
                                                          const Timestamp& lastTimestampApplied) {
-    // If we are primary, then we aren't syncing from anyone (else).
-    if (_iAmPrimary()) {
-        return HostAndPort();
-    }
-
     // If we are not a member of the current replica set configuration, no sync source is valid.
     if (_selfIndex == -1) {
         LOG(2) << "Cannot sync from any members because we are not in the replica set config";

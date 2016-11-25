@@ -42,6 +42,16 @@ env.Library(
     ],
 )
 
+env.CppUnitTest(
+    target="query_settings_test",
+    source=[
+        "query_settings_test.cpp",
+    ],
+    LIBDEPS=[
+        "query_planner"
+    ]
+)
+
 env.Library(
     target='query',
     source=[
@@ -131,6 +141,7 @@ env.Library(
         'getmore_request.cpp',
         'killcursors_request.cpp',
         'killcursors_response.cpp',
+        'view_response_formatter.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',

@@ -38,6 +38,7 @@
 
 #include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/functional.h"
@@ -94,7 +95,10 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
       _dbWorkThreadPool(dbWorkThreadPool),
       _source(source),
       _dbname(dbname),
-      _listCollectionsFilter(listCollectionsFilter),
+      _listCollectionsFilter(
+          listCollectionsFilter.isEmpty()
+              ? ListCollectionsFilter::makeTypeCollectionFilter()
+              : ListCollectionsFilter::addTypeCollectionFilter(listCollectionsFilter)),
       _listCollectionsPredicate(listCollectionsPred ? listCollectionsPred : acceptAllPred),
       _storageInterface(si),
       _collectionWork(collWork),
@@ -114,10 +118,7 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
                                   numListCollectionsRetries,
                                   executor::RemoteCommandRequest::kNoTimeout,
                                   RemoteCommandRetryScheduler::kAllRetriableErrors)),
-      _scheduleDbWorkFn([this](const executor::TaskExecutor::CallbackFn& work) {
-          return _executor->scheduleWork(work);
-      }),
-      _startCollectionCloner([](CollectionCloner& cloner) { return cloner.start(); }) {
+      _startCollectionCloner([](CollectionCloner& cloner) { return cloner.startup(); }) {
     // Fetcher throws an exception on null executor.
     invariant(executor);
     uassert(ErrorCodes::BadValue, "db worker thread pool cannot be null", dbWorkThreadPool);
@@ -128,10 +129,10 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
 }
 
 DatabaseCloner::~DatabaseCloner() {
-    DESTRUCTOR_GUARD(cancel(); wait(););
+    DESTRUCTOR_GUARD(shutdown(); join(););
 }
 
-const std::vector<BSONObj>& DatabaseCloner::getCollectionInfos() const {
+const std::vector<BSONObj>& DatabaseCloner::getCollectionInfos_forTest() const {
     LockGuard lk(_mutex);
     return _collectionInfos;
 }
@@ -159,7 +160,7 @@ bool DatabaseCloner::isActive() const {
     return _active;
 }
 
-Status DatabaseCloner::start() {
+Status DatabaseCloner::startup() {
     LockGuard lk(_mutex);
 
     if (_active) {
@@ -180,7 +181,7 @@ Status DatabaseCloner::start() {
     return Status::OK();
 }
 
-void DatabaseCloner::cancel() {
+void DatabaseCloner::shutdown() {
     {
         LockGuard lk(_mutex);
 
@@ -189,7 +190,7 @@ void DatabaseCloner::cancel() {
         }
     }
 
-    _listCollectionsFetcher.cancel();
+    _listCollectionsFetcher.shutdown();
 }
 
 DatabaseCloner::Stats DatabaseCloner::getStats() const {
@@ -197,12 +198,12 @@ DatabaseCloner::Stats DatabaseCloner::getStats() const {
     return _stats;
 }
 
-void DatabaseCloner::wait() {
+void DatabaseCloner::join() {
     UniqueLock lk(_mutex);
     _condition.wait(lk, [this]() { return !_active; });
 }
 
-void DatabaseCloner::setScheduleDbWorkFn(const CollectionCloner::ScheduleDbWorkFn& work) {
+void DatabaseCloner::setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& work) {
     LockGuard lk(_mutex);
 
     _scheduleDbWorkFn = work;
@@ -332,8 +333,10 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
         }
     }
 
-    for (auto&& collectionCloner : _collectionCloners) {
-        collectionCloner.setScheduleDbWorkFn(_scheduleDbWorkFn);
+    if (_scheduleDbWorkFn) {
+        for (auto&& collectionCloner : _collectionCloners) {
+            collectionCloner.setScheduleDbWorkFn_forTest(_scheduleDbWorkFn);
+        }
     }
 
     // Start first collection cloner.

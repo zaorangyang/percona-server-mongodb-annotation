@@ -32,6 +32,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/s/commands/strategy.h"
 
 namespace mongo {
@@ -77,9 +78,7 @@ public:
         ss << _helpText;
     }
 
-    Status checkAuthForCommand(ClientBasic* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) {
+    Status checkAuthForCommand(Client* client, const std::string& dbname, const BSONObj& cmdObj) {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
         ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
@@ -107,7 +106,10 @@ public:
         // Targeted shard commands are generally data-dependent but index filter
         // commands are tied to query shape (data has no effect on query shape).
         vector<Strategy::CommandResult> results;
-        Strategy::commandOp(txn, dbname, cmdObj, options, nss.ns(), BSONObj(), &results);
+        const BSONObj query;
+        const BSONObj collation =
+            BSON(CollationSpec::kLocaleField << CollationSpec::kSimpleBinaryComparison);
+        Strategy::commandOp(txn, dbname, cmdObj, options, nss.ns(), query, collation, &results);
 
         // Set value of first shard result's "ok" field.
         bool clusterCmdResult = true;

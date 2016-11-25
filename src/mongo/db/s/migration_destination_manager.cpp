@@ -411,11 +411,8 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
                                                  const OID& epoch,
                                                  const WriteConcernOptions& writeConcern) {
     invariant(isActive());
-    invariant(getState() == READY);
     invariant(!min.isEmpty());
     invariant(!max.isEmpty());
-
-    DisableDocumentValidation validationDisabler(txn);
 
     log() << "starting receiving-end of migration of chunk " << min << " -> " << max
           << " for collection " << ns << " from " << fromShard << " at epoch " << epoch.toString();
@@ -423,12 +420,24 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
     string errmsg;
     MoveTimingHelper timing(txn, "to", ns, min, max, 6 /* steps */, &errmsg, ShardId(), ShardId());
 
+    const auto initialState = getState();
+
+    if (initialState == ABORT) {
+        errmsg = "Migration abort requested before it started";
+        error() << errmsg << migrateLog;
+        return;
+    }
+
+    invariant(initialState == READY);
+
     ScopedDbConnection conn(fromShard);
 
     // Just tests the connection
     conn->getLastError();
 
     const NamespaceString nss(ns);
+
+    DisableDocumentValidation validationDisabler(txn);
 
     {
         // 0. copy system.namespaces entry if collection doesn't already exist
@@ -512,7 +521,23 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
                 return;
             }
 
-            Status status = indexer.init(indexSpecs);
+            // Attach simple collation if the index does not specify a collation. Otherwise, this
+            // will be back-filled with the collection default collation.
+            std::vector<BSONObj> indexSpecsWithCollation;
+            for (const BSONObj& spec : indexSpecs) {
+                if (spec["collation"]) {
+                    indexSpecsWithCollation.push_back(spec.getOwned());
+                } else {
+                    indexSpecsWithCollation.emplace_back(BSONObjBuilder()
+                                                             .appendElements(spec)
+                                                             .append("collation",
+                                                                     BSON("locale"
+                                                                          << "simple"))
+                                                             .obj());
+                }
+            }
+
+            Status status = indexer.init(indexSpecsWithCollation);
             if (!status.isOK()) {
                 errmsg = str::stream() << "failed to create index before migrating data. "
                                        << " error: " << status.toString();
@@ -533,10 +558,13 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
             WriteUnitOfWork wunit(txn);
             indexer.commit();
 
-            for (size_t i = 0; i < indexSpecs.size(); i++) {
+            for (size_t i = 0; i < indexSpecsWithCollation.size(); i++) {
                 // make sure to create index on secondaries as well
                 getGlobalServiceContext()->getOpObserver()->onCreateIndex(
-                    txn, db->getSystemIndexesName(), indexSpecs[i], true /* fromMigrate */);
+                    txn,
+                    db->getSystemIndexesName(),
+                    indexSpecsWithCollation[i],
+                    true /* fromMigrate */);
             }
 
             wunit.commit();
@@ -561,17 +589,14 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
         deleterOptions.onlyRemoveOrphanedDocs = true;
         deleterOptions.removeSaverReason = "preCleanup";
 
-        string errMsg;
-
-        if (!getDeleter()->deleteNow(txn, deleterOptions, &errMsg)) {
-            warning() << "Failed to queue delete for migrate abort: " << errMsg;
+        if (!getDeleter()->deleteNow(txn, deleterOptions, &errmsg)) {
+            warning() << "Failed to queue delete for migrate abort: " << errmsg;
             setState(FAIL);
             return;
         }
 
         Status status = _notePending(txn, NamespaceString(ns), min, max, epoch);
         if (!status.isOK()) {
-            warning() << errmsg;
             setState(FAIL);
             return;
         }
@@ -625,8 +650,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
                 txn->checkForInterrupt();
 
                 if (getState() == ABORT) {
-                    errmsg = str::stream() << "Migration abort requested while "
-                                           << "copying documents";
+                    errmsg = "Migration aborted while copying documents";
                     error() << errmsg << migrateLog;
                     return;
                 }
@@ -716,10 +740,8 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
                 txn->checkForInterrupt();
 
                 if (getState() == ABORT) {
-                    errmsg = str::stream() << "Migration abort requested while waiting "
-                                           << "for replication at catch up stage";
+                    errmsg = "Migration aborted while waiting for replication at catch up stage";
                     error() << errmsg << migrateLog;
-
                     return;
                 }
 
@@ -756,7 +778,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
             txn->checkForInterrupt();
 
             if (getState() == ABORT) {
-                errmsg = "Migration abort requested while waiting for replication";
+                errmsg = "Migration aborted while waiting for replication";
                 error() << errmsg << migrateLog;
                 return;
             }
@@ -809,6 +831,8 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
             }
 
             if (getState() == ABORT) {
+                errmsg = "Migration aborted while transferring mods";
+                error() << errmsg << migrateLog;
                 return;
             }
 
@@ -998,11 +1022,7 @@ Status MigrationDestinationManager::_notePending(OperationContext* txn,
                                            : ChunkVersion::UNSHARDED().epoch())};
     }
 
-    ChunkType chunk;
-    chunk.setMin(min);
-    chunk.setMax(max);
-
-    css->setMetadata(metadata->clonePlusPending(chunk));
+    css->beginReceive(ChunkRange(min, max));
 
     stdx::lock_guard<stdx::mutex> sl(_mutex);
     invariant(!_chunkMarkedPending);
@@ -1050,11 +1070,8 @@ Status MigrationDestinationManager::_forgetPending(OperationContext* txn,
                                            : ChunkVersion::UNSHARDED().epoch())};
     }
 
-    ChunkType chunk;
-    chunk.setMin(min);
-    chunk.setMax(max);
+    css->forgetReceive(ChunkRange(min, max));
 
-    css->setMetadata(metadata->cloneMinusPending(chunk));
     return Status::OK();
 }
 

@@ -103,6 +103,7 @@ std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
                                                 "admin",
                                                 hbRequest,
                                                 BSON(rpc::kReplSetMetadataFieldName << 1),
+                                                nullptr,
                                                 _rsConfig->getHeartbeatTimeoutPeriodMillis()));
     }
 
@@ -180,12 +181,12 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
     ++_numResponses;
     if (!response.isOK()) {
         warning() << "Failed to complete heartbeat request to " << request.target << "; "
-                  << response.getStatus();
-        _badResponses.push_back(std::make_pair(request.target, response.getStatus()));
+                  << response.status;
+        _badResponses.push_back(std::make_pair(request.target, response.status));
         return;
     }
 
-    BSONObj resBSON = response.getValue().data;
+    BSONObj resBSON = response.data;
     ReplSetHeartbeatResponse hbResp;
     Status hbStatus = hbResp.initialize(resBSON, 0);
 
@@ -218,7 +219,7 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
 
     if (_rsConfig->hasReplicaSetId()) {
         StatusWith<rpc::ReplSetMetadata> replMetadata =
-            rpc::ReplSetMetadata::readFromMetadata(response.getValue().metadata);
+            rpc::ReplSetMetadata::readFromMetadata(response.metadata);
         if (replMetadata.isOK() && replMetadata.getValue().getReplicaSetId().isSet() &&
             _rsConfig->getReplicaSetId() != replMetadata.getValue().getReplicaSetId()) {
             std::string message = str::stream()

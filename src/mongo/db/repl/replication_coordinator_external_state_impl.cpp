@@ -70,6 +70,7 @@
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/s/balancer/balancer.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
@@ -90,6 +91,9 @@ namespace mongo {
 namespace repl {
 
 namespace {
+using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using LockGuard = stdx::lock_guard<stdx::mutex>;
+
 const char configCollectionName[] = "local.system.replset";
 const char configDatabaseName[] = "local";
 const char lastVoteCollectionName[] = "local.replset.election";
@@ -112,7 +116,7 @@ MONGO_EXPORT_STARTUP_SERVER_PARAMETER(use3dot2InitialSync, bool, false);
 // during initial sync to prevent rolling over the oplog.
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(initialSyncOplogBuffer,
                                       std::string,
-                                      kBlockingQueueOplogBufferName);
+                                      kCollectionOplogBufferName);
 
 MONGO_INITIALIZER(initialSyncOplogBuffer)(InitializerContext*) {
     if ((initialSyncOplogBuffer != kCollectionOplogBufferName) &&
@@ -155,6 +159,8 @@ bool ReplicationCoordinatorExternalStateImpl::isInitialSyncFlagSet(OperationCont
 }
 
 void ReplicationCoordinatorExternalStateImpl::startInitialSync(OnInitialSyncFinishedFn finished) {
+    LockGuard lk(_threadMutex);
+
     _initialSyncThread.reset(new stdx::thread{[finished, this]() {
         Client::initThreadIfNotAlready("initial sync");
         // Do initial sync.
@@ -165,6 +171,8 @@ void ReplicationCoordinatorExternalStateImpl::startInitialSync(OnInitialSyncFini
 
 void ReplicationCoordinatorExternalStateImpl::runOnInitialSyncThread(
     stdx::function<void(OperationContext* txn)> run) {
+
+    LockGuard lk(_threadMutex);
     _initialSyncThread.reset(new stdx::thread{[run, this]() {
         Client::initThreadIfNotAlready("initial sync");
         auto txn = cc().makeOperationContext();
@@ -174,30 +182,79 @@ void ReplicationCoordinatorExternalStateImpl::runOnInitialSyncThread(
     }});
 }
 
-void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(OperationContext* txn) {
+void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
+    OperationContext* txn, ReplicationCoordinator* replCoord) {
+
+    LockGuard lk(_threadMutex);
+    invariant(replCoord);
     invariant(!_bgSync);
     log() << "Starting replication fetcher thread";
     _bgSync = stdx::make_unique<BackgroundSync>(this, makeSteadyStateOplogBuffer(txn));
     _bgSync->startup(txn);
 
-    log() << "Starting replication applier threads";
+    log() << "Starting replication applier thread";
     invariant(!_applierThread);
-    _applierThread.reset(new stdx::thread(stdx::bind(&runSyncThread, _bgSync.get())));
+    _applierThread.reset(new RSDataSync{_bgSync.get(), replCoord});
+    _applierThread->startup();
     log() << "Starting replication reporter thread";
     invariant(!_syncSourceFeedbackThread);
     _syncSourceFeedbackThread.reset(new stdx::thread(stdx::bind(
         &SyncSourceFeedback::run, &_syncSourceFeedback, _taskExecutor.get(), _bgSync.get())));
 }
 
+void ReplicationCoordinatorExternalStateImpl::stopDataReplication(OperationContext* txn) {
+    UniqueLock lk(_threadMutex);
+    _stopDataReplication_inlock(txn, &lk);
+}
+
+void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(OperationContext* txn,
+                                                                          UniqueLock* lock) {
+    auto oldSSF = std::move(_syncSourceFeedbackThread);
+    auto oldBgSync = std::move(_bgSync);
+    auto oldApplier = std::move(_applierThread);
+    auto oldInitSyncThread = std::move(_initialSyncThread);
+    if (oldSSF) {
+        _syncSourceFeedback.shutdown();
+    }
+    lock->unlock();
+
+    log() << "stopping data replication threads";
+    if (oldSSF) {
+        oldSSF->join();
+    }
+
+    if (oldBgSync) {
+        oldBgSync->shutdown(txn);
+    }
+
+    if (oldApplier) {
+        oldApplier->shutdown();
+        oldApplier->join();
+    }
+
+    if (oldBgSync) {
+        oldBgSync->join(txn);
+    }
+
+    if (oldInitSyncThread) {
+        oldInitSyncThread->join();
+    }
+    lock->lock();
+}
+
+
 void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& settings) {
     stdx::lock_guard<stdx::mutex> lk(_threadMutex);
     if (_startedThreads) {
         return;
     }
-    log() << "Starting replication storage threads";
+
     if (settings.isMajorityReadConcernEnabled() || enableReplSnapshotThread) {
+        log() << "Starting replication snapshot thread";
         _snapshotThread = SnapshotThread::start(getGlobalServiceContext());
     }
+
+    log() << "Starting replication storage threads";
     getGlobalServiceContext()->getGlobalStorageEngine()->setJournalListener(this);
 
     _taskExecutor = stdx::make_unique<executor::ThreadPoolTaskExecutor>(
@@ -216,24 +273,15 @@ void ReplicationCoordinatorExternalStateImpl::startMasterSlave(OperationContext*
 }
 
 void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* txn) {
-    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
+    UniqueLock lk(_threadMutex);
     if (_startedThreads) {
-        log() << "Stopping replication applier threads";
-        if (_syncSourceFeedbackThread) {
-            _syncSourceFeedback.shutdown();
-            _syncSourceFeedbackThread->join();
-        }
-        if (_applierThread) {
-            _applierThread->join();
-        }
+        _stopDataReplication_inlock(txn, &lk);
 
-        if (_bgSync) {
-            _bgSync->shutdown(txn);
-            _bgSync->join(txn);
-        }
-        if (_snapshotThread)
+        if (_snapshotThread) {
             _snapshotThread->shutdown();
+        }
 
+        log() << "Stopping replication storage threads";
         _taskExecutor->shutdown();
         _taskExecutor->join();
         _storageInterface->shutdown();
@@ -519,6 +567,16 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnDrainingStateHook(Operat
             fassertStatusOK(40217, status);
         }
 
+        // For upgrade from 3.2 to 3.4, check if any shards in config.shards are not yet marked as
+        // shard aware, and attempt to initialize sharding awareness on them.
+        auto shardAwareInitializationStatus =
+            Grid::get(txn)->catalogManager()->initializeShardingAwarenessOnUnawareShards(txn);
+        if (!shardAwareInitializationStatus.isOK()) {
+            warning() << "Error while attempting to initialize sharding awareness on sharding "
+                         "unaware shards "
+                      << causedBy(shardAwareInitializationStatus);
+        }
+
         // Free any leftover locks from previous instantiations
         auto distLockManager = Grid::get(txn)->catalogClient(txn)->getDistLockManager();
         distLockManager->unlockAll(txn, distLockManager->getProcessID());
@@ -547,12 +605,14 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnDrainingStateHook(Operat
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
+    LockGuard lk(_threadMutex);
     if (_bgSync) {
         _bgSync->clearSyncTarget();
     }
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToCancelFetcher() {
+    LockGuard lk(_threadMutex);
     invariant(_bgSync);
     _bgSync->cancelFetcher();
 }

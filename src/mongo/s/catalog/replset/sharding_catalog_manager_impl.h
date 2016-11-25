@@ -30,8 +30,10 @@
 
 #include <vector>
 
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/stdx/mutex.h"
 
@@ -76,9 +78,33 @@ public:
                                const std::string& shardName,
                                const std::string& zoneName) override;
 
+    Status assignKeyRangeToZone(OperationContext* txn,
+                                const NamespaceString& ns,
+                                const ChunkRange& range,
+                                const std::string& zoneName) override;
+
+    Status removeKeyRangeFromZone(OperationContext* txn,
+                                  const NamespaceString& ns,
+                                  const ChunkRange& range) override;
+
+    Status commitChunkSplit(OperationContext* txn,
+                            const NamespaceString& ns,
+                            const OID& requestEpoch,
+                            const ChunkRange& range,
+                            const std::vector<BSONObj>& splitPoints,
+                            const std::string& shardName) override;
+
+    Status commitChunkMerge(OperationContext* txn,
+                            const NamespaceString& ns,
+                            const OID& requestEpoch,
+                            const std::vector<BSONObj>& chunkBoundaries,
+                            const std::string& shardName) override;
+
     void appendConnectionStats(executor::ConnectionPoolStats* stats) override;
 
     Status initializeConfigDatabaseIfNeeded(OperationContext* txn) override;
+
+    Status initializeShardingAwarenessOnUnawareShards(OperationContext* txn) override;
 
     Status upsertShardIdentityOnShard(OperationContext* txn, ShardType shardType) override;
 
@@ -86,11 +112,29 @@ public:
     BSONObj createShardIdentityUpsertForAddShard(OperationContext* txn,
                                                  const std::string& shardName) override;
 
+    void cancelAddShardTaskIfNeeded(const ShardId& shardId) override;
+
 private:
     /**
      * Generates a unique name to be given to a newly added shard.
      */
     StatusWith<std::string> _generateNewShardName(OperationContext* txn);
+
+    /**
+     * Used during addShard to determine if there is already an existing shard that matches the
+     * shard that is currently being added.  An OK return with boost::none indicates that there
+     * is no conflicting shard, and we can proceed trying to add the new shard.  An OK return
+     * with a ShardType indicates that there is an existing shard that matches the shard being added
+     * but since the options match, this addShard request can do nothing and return success.  A
+     * non-OK return either indicates a problem reading the existing shards from disk or more likely
+     * indicates that an existing shard conflicts with the shard being added and they have different
+     * options, so the addShard attempt must be aborted.
+     */
+    StatusWith<boost::optional<ShardType>> _checkIfShardExists(
+        OperationContext* txn,
+        const ConnectionString& propsedShardConnectionString,
+        const std::string* shardProposedName,
+        long long maxSize);
 
     /**
      * Validates that the specified endpoint can serve as a shard server. In particular, this
@@ -141,6 +185,11 @@ private:
     Status _initConfigVersion(OperationContext* txn);
 
     /**
+     * Retrieves all shards that are not marked as sharding aware (state = 1) in this cluster.
+     */
+    StatusWith<std::vector<ShardType>> _getAllShardingUnawareShards(OperationContext* txn);
+
+    /**
      * Callback function used when rescheduling an addShard task after the first attempt failed.
      * Checks if the callback has been canceled, and if not, proceeds to call
      * _scheduleAddShardTask.
@@ -180,7 +229,13 @@ private:
     bool _hasAddShardHandle_inlock(const ShardId& shardId);
 
     /**
-     * Adds CallbackHandle handle for the shard with id shardID to the map of running or scheduled
+   * Returns the CallbackHandle associated with the addShard task for the shard with id shardId.
+    * Invariants that there is a handle being tracked for that shard.
+    */
+    const executor::TaskExecutor::CallbackHandle& _getAddShardHandle_inlock(const ShardId& shardId);
+
+    /**
+     * Adds CallbackHandle handle for the shard with id shardId to the map of running or scheduled
      * addShard tasks.
      * The caller must hold _addShardHandlesMutex.
      */
@@ -198,6 +253,7 @@ private:
      * Builds all the expected indexes on the config server.
      */
     Status _initConfigIndexes(OperationContext* txn);
+
     //
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
@@ -240,6 +296,24 @@ private:
 
     // Protects the _addShardHandles map.
     stdx::mutex _addShardHandlesMutex;
+
+    /**
+     * Lock for shard zoning operations. This should be acquired when doing any operations that
+     * can affect the config.tags collection or the tags field of the config.shards collection.
+     * No other locks should be held when locking this. If an operation needs to take database
+     * locks (for example to write to a local collection) those locks should be taken after
+     * taking this.
+     */
+    Lock::ResourceMutex _kZoneOpLock;
+
+    /**
+     * Lock for chunk split/merge/move operations. This should be acquired when doing split/merge/
+     * move operations that can affect the config.chunks collection.
+     * No other locks should be held when locking this. If an operation needs to take database
+     * locks (for example to write to a local collection) those locks should be taken after
+     * taking this.
+     */
+    Lock::ResourceMutex _kChunkOpLock;
 };
 
 }  // namespace mongo

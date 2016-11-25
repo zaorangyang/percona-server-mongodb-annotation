@@ -51,6 +51,7 @@
 #include "mongo/transport/transport_layer.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/message.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 
@@ -127,13 +128,13 @@ ServiceEntryPointTestSuite::MockTLHarness::MockTLHarness()
       _asyncWait(kDefaultAsyncWait),
       _end(kDefaultEnd) {}
 
-Ticket ServiceEntryPointTestSuite::MockTLHarness::sourceMessage(const Session& session,
+Ticket ServiceEntryPointTestSuite::MockTLHarness::sourceMessage(Session& session,
                                                                 Message* message,
                                                                 Date_t expiration) {
     return _sourceMessage(session, message, expiration);
 }
 
-Ticket ServiceEntryPointTestSuite::MockTLHarness::sinkMessage(const Session& session,
+Ticket ServiceEntryPointTestSuite::MockTLHarness::sinkMessage(Session& session,
                                                               const Message& message,
                                                               Date_t expiration) {
     return _sinkMessage(session, message, expiration);
@@ -148,8 +149,9 @@ void ServiceEntryPointTestSuite::MockTLHarness::asyncWait(Ticket&& ticket,
     return _asyncWait(std::move(ticket), std::move(callback));
 }
 
-std::string ServiceEntryPointTestSuite::MockTLHarness::getX509SubjectName(const Session& session) {
-    return "mock";
+SSLPeerInfo ServiceEntryPointTestSuite::MockTLHarness::getX509PeerInfo(
+    const Session& session) const {
+    return SSLPeerInfo("mock", {});
 }
 
 void ServiceEntryPointTestSuite::MockTLHarness::registerTags(const Session& session) {}
@@ -158,7 +160,7 @@ TransportLayer::Stats ServiceEntryPointTestSuite::MockTLHarness::sessionStats() 
     return Stats();
 }
 
-void ServiceEntryPointTestSuite::MockTLHarness::end(const Session& session) {
+void ServiceEntryPointTestSuite::MockTLHarness::end(Session& session) {
     return _end(session);
 }
 
@@ -191,19 +193,17 @@ Status ServiceEntryPointTestSuite::MockTLHarness::_waitOnceThenError(transport::
     return _defaultWait(std::move(ticket));
 }
 
-Ticket ServiceEntryPointTestSuite::MockTLHarness::_defaultSource(const Session& s,
-                                                                 Message* m,
-                                                                 Date_t d) {
+Ticket ServiceEntryPointTestSuite::MockTLHarness::_defaultSource(Session& s, Message* m, Date_t d) {
     return Ticket(this, stdx::make_unique<ServiceEntryPointTestSuite::MockTicket>(s, m, d));
 }
 
-Ticket ServiceEntryPointTestSuite::MockTLHarness::_defaultSink(const Session& s,
+Ticket ServiceEntryPointTestSuite::MockTLHarness::_defaultSink(Session& s,
                                                                const Message&,
                                                                Date_t d) {
     return Ticket(this, stdx::make_unique<ServiceEntryPointTestSuite::MockTicket>(s, d));
 }
 
-Ticket ServiceEntryPointTestSuite::MockTLHarness::_sinkThenErrorOnWait(const Session& s,
+Ticket ServiceEntryPointTestSuite::MockTLHarness::_sinkThenErrorOnWait(Session& s,
                                                                        const Message& m,
                                                                        Date_t d) {
     _wait = stdx::bind(&ServiceEntryPointTestSuite::MockTLHarness::_waitOnceThenError, this, _1);
@@ -264,7 +264,7 @@ void ServiceEntryPointTestSuite::halfLifeCycleTest() {
     // Step 1: SEP gets a ticket to source a Message
     // Step 2: SEP calls wait() on the ticket and receives a Message
     // Step 3: SEP gets a ticket to sink a Message
-    _tl->_sinkMessage = [this](const Session& session, const Message& m, Date_t expiration) {
+    _tl->_sinkMessage = [this](Session& session, const Message& m, Date_t expiration) {
 
         // Step 4: SEP calls wait() on the ticket and receives an error
         _tl->_wait =

@@ -42,22 +42,17 @@ class ValueComparator {
 public:
     /**
      * Functor compatible for use with unordered STL containers.
-     *
-     * TODO SERVER-23349: Remove the no-arguments constructor.
      */
     class EqualTo {
     public:
-        EqualTo() = default;
-
         explicit EqualTo(const ValueComparator* comparator) : _comparator(comparator) {}
 
         bool operator()(const Value& lhs, const Value& rhs) const {
-            return _comparator ? _comparator->compare(lhs, rhs) == 0
-                               : ValueComparator().compare(lhs, rhs) == 0;
+            return _comparator->compare(lhs, rhs) == 0;
         }
 
     private:
-        const ValueComparator* _comparator = nullptr;
+        const ValueComparator* _comparator;
     };
 
     /**
@@ -76,6 +71,25 @@ public:
     };
 
     /**
+     * Functor for computing the hash of a Value, compatible for use with unordered STL containers.
+     */
+    class Hasher {
+    public:
+        explicit Hasher(const ValueComparator* comparator) : _comparator(comparator) {}
+
+        size_t operator()(const Value& val) const {
+            return _comparator->hash(val);
+        }
+
+    private:
+        const ValueComparator* _comparator;
+    };
+
+    // Global comparator for performing simple Value comparisons. Value comparisons that require
+    // special database logic, such as collations, must instantiate their own comparator.
+    static const ValueComparator kInstance;
+
+    /**
      * Constructs a value comparator with simple comparison semantics.
      */
     ValueComparator() = default;
@@ -92,6 +106,16 @@ public:
      */
     int compare(const Value& lhs, const Value& rhs) const {
         return Value::compare(lhs, rhs, _stringComparator);
+    }
+
+    /**
+     * Computes a hash of 'val' since that Values which compare equal under this comparator also
+     * have equal hashes.
+     */
+    size_t hash(const Value& val) const {
+        size_t seed = 0xf0afbeef;
+        val.hash_combine(seed, _stringComparator);
+        return seed;
     }
 
     /**
@@ -117,6 +141,14 @@ public:
     }
 
     /**
+     * Returns a function object which computes the hash of a Value such that equal Values under
+     * this comparator have equal hashes.
+     */
+    Hasher getHasher() const {
+        return Hasher(this);
+    }
+
+    /**
      * Construct an empty ordered set of Value whose ordering and equivalence classes are given by
      * this comparator. This comparator must outlive the returned set.
      */
@@ -127,12 +159,9 @@ public:
     /**
      * Construct an empty unordered set of Value whose equivalence classes are given by this
      * comparator. This comparator must outlive the returned set.
-     *
-     * TODO SERVER-23990: Make Value::Hash use the collation. The returned set won't be correctly
-     * collation-aware until this work is done.
      */
-    std::unordered_set<Value, Value::Hash, EqualTo> makeUnorderedValueSet() const {
-        return std::unordered_set<Value, Value::Hash, EqualTo>(0, Value::Hash(), EqualTo(this));
+    std::unordered_set<Value, Hasher, EqualTo> makeUnorderedValueSet() const {
+        return std::unordered_set<Value, Hasher, EqualTo>(0, Hasher(this), EqualTo(this));
     }
 
     /**
@@ -147,13 +176,10 @@ public:
     /**
      * Construct an empty unordered map from Value to type T whose equivalence classes are given by
      * this comparator. This comparator must outlive the returned set.
-     *
-     * TODO SERVER-23990: Make Value::Hash use the collation. The returned map won't be correctly
-     * collation-aware until this work is done.
      */
     template <typename T>
-    std::unordered_map<Value, T, Value::Hash, EqualTo> makeUnorderedValueMap() const {
-        return std::unordered_map<Value, T, Value::Hash, EqualTo>(0, Value::Hash(), EqualTo(this));
+    std::unordered_map<Value, T, Hasher, EqualTo> makeUnorderedValueMap() const {
+        return std::unordered_map<Value, T, Hasher, EqualTo>(0, Hasher(this), EqualTo(this));
     }
 
 private:
@@ -166,12 +192,14 @@ private:
 
 using ValueSet = std::set<Value, ValueComparator::LessThan>;
 
-using ValueUnorderedSet = std::unordered_set<Value, Value::Hash, ValueComparator::EqualTo>;
+using ValueUnorderedSet =
+    std::unordered_set<Value, ValueComparator::Hasher, ValueComparator::EqualTo>;
 
 template <typename T>
 using ValueMap = std::map<Value, T, ValueComparator::LessThan>;
 
 template <typename T>
-using ValueUnorderedMap = std::unordered_map<Value, T, Value::Hash, ValueComparator::EqualTo>;
+using ValueUnorderedMap =
+    std::unordered_map<Value, T, ValueComparator::Hasher, ValueComparator::EqualTo>;
 
 }  // namespace mongo

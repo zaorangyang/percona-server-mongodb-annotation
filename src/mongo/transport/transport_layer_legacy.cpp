@@ -98,29 +98,37 @@ Status TransportLayerLegacy::start() {
 
 TransportLayerLegacy::~TransportLayerLegacy() = default;
 
-Ticket TransportLayerLegacy::sourceMessage(const Session& session,
-                                           Message* message,
-                                           Date_t expiration) {
-    auto sourceCb = [message](AbstractMessagingPort* amp) -> Status {
+Ticket TransportLayerLegacy::sourceMessage(Session& session, Message* message, Date_t expiration) {
+    auto& compressorMgr = session.getCompressorManager();
+    auto sourceCb = [message, &compressorMgr](AbstractMessagingPort* amp) -> Status {
         if (!amp->recv(*message)) {
             return {ErrorCodes::HostUnreachable, "Recv failed"};
         }
+
+        networkCounter.hitPhysical(message->size(), 0);
+        if (message->operation() == dbCompressed) {
+            auto swm = compressorMgr.decompressMessage(*message);
+            if (!swm.isOK())
+                return swm.getStatus();
+            *message = swm.getValue();
+        }
+        networkCounter.hitLogical(message->size(), 0);
         return Status::OK();
     };
 
     return Ticket(this, stdx::make_unique<LegacyTicket>(session, expiration, std::move(sourceCb)));
 }
 
-std::string TransportLayerLegacy::getX509SubjectName(const Session& session) {
+SSLPeerInfo TransportLayerLegacy::getX509PeerInfo(const Session& session) const {
     {
         stdx::lock_guard<stdx::mutex> lk(_connectionsMutex);
         auto conn = _connections.find(session.id());
         if (conn == _connections.end()) {
             // Return empty string if the session is not found
-            return "";
+            return SSLPeerInfo();
         }
 
-        return conn->second.x509SubjectName.value_or("");
+        return conn->second.sslPeerInfo.value_or(SSLPeerInfo());
     }
 }
 
@@ -137,12 +145,20 @@ TransportLayer::Stats TransportLayerLegacy::sessionStats() {
     return stats;
 }
 
-Ticket TransportLayerLegacy::sinkMessage(const Session& session,
+Ticket TransportLayerLegacy::sinkMessage(Session& session,
                                          const Message& message,
                                          Date_t expiration) {
-    auto sinkCb = [&message](AbstractMessagingPort* amp) -> Status {
+    auto& compressorMgr = session.getCompressorManager();
+    auto sinkCb = [&message, &compressorMgr](AbstractMessagingPort* amp) -> Status {
         try {
-            amp->say(message);
+            networkCounter.hitLogical(0, message.size());
+            auto swm = compressorMgr.compressMessage(message);
+            if (!swm.isOK())
+                return swm.getStatus();
+            const auto& compressedMessage = swm.getValue();
+            amp->say(compressedMessage);
+            networkCounter.hitPhysical(0, compressedMessage.size());
+
             return Status::OK();
         } catch (const SocketException& e) {
             return {ErrorCodes::HostUnreachable, e.what()};
@@ -163,7 +179,7 @@ void TransportLayerLegacy::asyncWait(Ticket&& ticket, TicketCallback callback) {
     MONGO_UNREACHABLE;
 }
 
-void TransportLayerLegacy::end(const Session& session) {
+void TransportLayerLegacy::end(Session& session) {
     stdx::lock_guard<stdx::mutex> lk(_connectionsMutex);
     auto conn = _connections.find(session.id());
     if (conn != _connections.end()) {
@@ -225,11 +241,11 @@ void TransportLayerLegacy::shutdown() {
 
 Status TransportLayerLegacy::_runTicket(Ticket ticket) {
     if (!_running.load()) {
-        return {ErrorCodes::ShutdownInProgress, "TransportLayer in shutdown"};
+        return TransportLayer::ShutdownStatus;
     }
 
     if (ticket.expiration() < Date_t::now()) {
-        return {ErrorCodes::ExceededTimeLimit, "Ticket has expired"};
+        return Ticket::ExpiredStatus;
     }
 
     AbstractMessagingPort* amp;
@@ -239,7 +255,7 @@ Status TransportLayerLegacy::_runTicket(Ticket ticket) {
 
         auto conn = _connections.find(ticket.sessionId());
         if (conn == _connections.end()) {
-            return {ErrorCodes::TransportSessionNotFound, "No such session in TransportLayer"};
+            return TransportLayer::TicketSessionUnknownStatus;
         }
 
         // "check out" the port
@@ -247,12 +263,8 @@ Status TransportLayerLegacy::_runTicket(Ticket ticket) {
         amp = conn->second.amp.get();
     }
 
-    amp->clearCounters();
-
     auto legacyTicket = checked_cast<LegacyTicket*>(getTicketImpl(ticket));
     auto res = legacyTicket->_fill(amp);
-
-    networkCounter.hit(amp->getBytesIn(), amp->getBytesOut());
 
     {
         stdx::lock_guard<stdx::mutex> lk(_connectionsMutex);
@@ -262,10 +274,10 @@ Status TransportLayerLegacy::_runTicket(Ticket ticket) {
 
 #ifdef MONGO_CONFIG_SSL
         // If we didn't have an X509 subject name, see if we have one now
-        if (!conn->second.x509SubjectName) {
-            auto name = amp->getX509SubjectName();
-            if (name != "") {
-                conn->second.x509SubjectName = name;
+        if (!conn->second.sslPeerInfo) {
+            auto info = amp->getX509PeerInfo();
+            if (info.subjectName != "") {
+                conn->second.sslPeerInfo = info;
             }
         }
 #endif

@@ -78,8 +78,14 @@ public:
         return _initCallCount;
     }
 
-private:
+    ServiceContext* getServiceContext() {
+        return &_service;
+    }
+
+protected:
     ServiceContextNoop _service;
+
+private:
     ServiceContext::UniqueClient _client;
     ServiceContext::UniqueOperationContext _opCtx;
 
@@ -87,9 +93,8 @@ private:
 };
 
 TEST_F(CollShardingStateTest, GlobalInitGetsCalledAfterWriteCommits) {
-    std::unique_ptr<CollectionMetadata> nullCollMetadata;
-    CollectionShardingState collShardingState(NamespaceString::kConfigCollectionNamespace,
-                                              std::move(nullCollMetadata));
+    CollectionShardingState collShardingState(&_service,
+                                              NamespaceString::kConfigCollectionNamespace);
 
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
@@ -108,9 +113,8 @@ TEST_F(CollShardingStateTest, GlobalInitGetsCalledAfterWriteCommits) {
 }
 
 TEST_F(CollShardingStateTest, GlobalInitDoesntGetCalledIfWriteAborts) {
-    std::unique_ptr<CollectionMetadata> nullCollMetadata;
-    CollectionShardingState collShardingState(NamespaceString::kConfigCollectionNamespace,
-                                              std::move(nullCollMetadata));
+    CollectionShardingState collShardingState(getServiceContext(),
+                                              NamespaceString::kConfigCollectionNamespace);
 
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
@@ -129,9 +133,7 @@ TEST_F(CollShardingStateTest, GlobalInitDoesntGetCalledIfWriteAborts) {
 }
 
 TEST_F(CollShardingStateTest, GlobalInitDoesntGetsCalledIfNSIsNotForShardIdentity) {
-    std::unique_ptr<CollectionMetadata> nullCollMetadata;
-    CollectionShardingState collShardingState(NamespaceString("admin.user"),
-                                              std::move(nullCollMetadata));
+    CollectionShardingState collShardingState(getServiceContext(), NamespaceString("admin.user"));
 
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
@@ -150,9 +152,8 @@ TEST_F(CollShardingStateTest, GlobalInitDoesntGetsCalledIfNSIsNotForShardIdentit
 }
 
 TEST_F(CollShardingStateTest, OnInsertOpThrowWithIncompleteShardIdentityDocument) {
-    std::unique_ptr<CollectionMetadata> nullCollMetadata;
-    CollectionShardingState collShardingState(NamespaceString::kConfigCollectionNamespace,
-                                              std::move(nullCollMetadata));
+    CollectionShardingState collShardingState(getServiceContext(),
+                                              NamespaceString::kConfigCollectionNamespace);
 
     ShardIdentityType shardIdentity;
     shardIdentity.setShardName("a");
@@ -161,9 +162,8 @@ TEST_F(CollShardingStateTest, OnInsertOpThrowWithIncompleteShardIdentityDocument
 }
 
 TEST_F(CollShardingStateTest, GlobalInitDoesntGetsCalledIfShardIdentityDocWasNotInserted) {
-    std::unique_ptr<CollectionMetadata> nullCollMetadata;
-    CollectionShardingState collShardingState(NamespaceString::kConfigCollectionNamespace,
-                                              std::move(nullCollMetadata));
+    CollectionShardingState collShardingState(getServiceContext(),
+                                              NamespaceString::kConfigCollectionNamespace);
 
     WriteUnitOfWork wuow(txn());
     collShardingState.onInsertOp(txn(), BSON("_id" << 1));

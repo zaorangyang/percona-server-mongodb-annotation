@@ -33,6 +33,12 @@
 
 namespace mongo {
 
+using boost::intrusive_ptr;
+
+ExpressionContext::ResolvedNamespace::ResolvedNamespace(NamespaceString ns,
+                                                        std::vector<BSONObj> pipeline)
+    : ns(std::move(ns)), pipeline(std::move(pipeline)) {}
+
 ExpressionContext::ExpressionContext(OperationContext* opCtx, const AggregationRequest& request)
     : isExplain(request.isExplain()),
       inShard(request.isFromRouter()),
@@ -63,6 +69,33 @@ void ExpressionContext::setCollator(std::unique_ptr<CollatorInterface> coll) {
     // Document/Value comparisons must be aware of the collation.
     _documentComparator = DocumentComparator(_collator.get());
     _valueComparator = ValueComparator(_collator.get());
+}
+
+intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(NamespaceString ns) const {
+    intrusive_ptr<ExpressionContext> expCtx = new ExpressionContext();
+
+    expCtx->isExplain = isExplain;
+    expCtx->inShard = inShard;
+    expCtx->inRouter = inRouter;
+    expCtx->extSortAllowed = extSortAllowed;
+    expCtx->bypassDocumentValidation = bypassDocumentValidation;
+
+    expCtx->ns = std::move(ns);
+    expCtx->tempDir = tempDir;
+
+    expCtx->opCtx = opCtx;
+
+    expCtx->collation = collation;
+    if (_collator) {
+        expCtx->setCollator(_collator->clone());
+    }
+
+    expCtx->resolvedNamespaces = resolvedNamespaces;
+
+    // Note that we intentionally skip copying the value of 'interruptCounter' because 'expCtx' is
+    // intended to be used for executing a separate aggregation pipeline.
+
+    return expCtx;
 }
 
 }  // namespace mongo

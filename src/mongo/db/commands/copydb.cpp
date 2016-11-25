@@ -102,7 +102,7 @@ public:
         return true;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return copydb::checkAuthForCopydbCommand(client, dbname, cmdObj);
@@ -201,7 +201,7 @@ public:
             // If fromSelf leave the cloner's conn empty, it will use a DBDirectClient instead.
             const ConnectionString cs(uassertStatusOK(ConnectionString::parse(fromhost)));
 
-            DBClientBase* conn = cs.connect(errmsg);
+            DBClientBase* conn = cs.connect(StringData(), errmsg);
             if (!conn) {
                 return false;
             }

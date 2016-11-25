@@ -42,11 +42,13 @@
 #include "mongo/db/service_context_d.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/unittest/temp_dir.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
 void ServiceContextMongoDTest::setUp() {
-    ServiceContext* serviceContext = getGlobalServiceContext();
+    Client::initThread(getThreadName().c_str());
+    ServiceContext* serviceContext = getServiceContext();
     if (!serviceContext->getGlobalStorageEngine()) {
         // When using the "ephemeralForTest" storage engine, it is fine for the temporary directory
         // to go away after the global storage engine is initialized.
@@ -60,8 +62,13 @@ void ServiceContextMongoDTest::setUp() {
 }
 
 void ServiceContextMongoDTest::tearDown() {
+    ON_BLOCK_EXIT([&] { Client::destroy(); });
     auto txn = cc().makeOperationContext();
     _dropAllDBs(txn.get());
+}
+
+ServiceContext* ServiceContextMongoDTest::getServiceContext() {
+    return getGlobalServiceContext();
 }
 
 void ServiceContextMongoDTest::_dropAllDBs(OperationContext* txn) {

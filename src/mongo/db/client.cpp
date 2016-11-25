@@ -100,7 +100,8 @@ int64_t generateSeed(const std::string& desc) {
 }  // namespace
 
 Client::Client(std::string desc, ServiceContext* serviceContext, transport::Session* session)
-    : ClientBasic(serviceContext, session),
+    : _serviceContext(serviceContext),
+      _session(session),
       _desc(std::move(desc)),
       _threadId(stdx::this_thread::get_id()),
       _connectionId(session ? session->id() : 0),
@@ -147,13 +148,13 @@ std::string Client::clientAddress(bool includePort) const {
     return getRemote().host();
 }
 
-ClientBasic* ClientBasic::getCurrent() {
+Client* Client::getCurrent() {
     return currentClient.getMake()->get();
 }
 
 Client& cc() {
     Client* c = currentClient.getMake()->get();
-    verify(c);
+    invariant(c);
     return *c;
 }
 

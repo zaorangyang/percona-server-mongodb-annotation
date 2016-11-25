@@ -346,10 +346,7 @@ public:
 
     static ExpressionVector parseArguments(BSONElement bsonExpr, const VariablesParseState& vps);
 
-    // TODO SERVER-23349: Currently there are subclasses which derive from this base class that
-    // require custom logic for expression context injection. Consider making those classes inherit
-    // directly from Expression so that this method can be marked 'final' rather than 'override'.
-    void doInjectExpressionContext() override;
+    void doInjectExpressionContext() final;
 
 protected:
     ExpressionNary() {}
@@ -421,6 +418,7 @@ class ExpressionFromAccumulator
 public:
     Value evaluateInternal(Variables* vars) const final {
         Accumulator accum;
+        accum.injectExpressionContext(this->getExpressionContext());
         const size_t n = this->vpOperand.size();
         // If a single array arg is given, loop through it passing each member to the accumulator.
         // If a single, non-array arg is given, pass it directly to the accumulator.
@@ -1096,6 +1094,10 @@ public:
 };
 
 class ExpressionPow final : public ExpressionFixedArity<ExpressionPow, 2> {
+public:
+    static boost::intrusive_ptr<Expression> create(Value base, Value exp);
+
+private:
     Value evaluateInternal(Variables* vars) const final;
     const char* getOpName() const final;
 };
@@ -1278,7 +1280,7 @@ public:
 };
 
 
-class ExpressionSwitch final : public ExpressionFixedArity<ExpressionSwitch, 1> {
+class ExpressionSwitch final : public Expression {
 public:
     void addDependencies(DepsTracker* deps) const final;
     Value evaluateInternal(Variables* vars) const final;
@@ -1286,7 +1288,6 @@ public:
     static boost::intrusive_ptr<Expression> parse(BSONElement expr,
                                                   const VariablesParseState& vpsIn);
     Value serialize(bool explain) const final;
-    const char* getOpName() const final;
 
     void doInjectExpressionContext() final;
 
@@ -1375,7 +1376,7 @@ public:
 };
 
 
-class ExpressionZip final : public ExpressionFixedArity<ExpressionZip, 1> {
+class ExpressionZip final : public Expression {
 public:
     void addDependencies(DepsTracker* deps) const final;
     Value evaluateInternal(Variables* vars) const final;
@@ -1383,7 +1384,6 @@ public:
     static boost::intrusive_ptr<Expression> parse(BSONElement expr,
                                                   const VariablesParseState& vpsIn);
     Value serialize(bool explain) const final;
-    const char* getOpName() const final;
 
     void doInjectExpressionContext() final;
 

@@ -36,7 +36,10 @@
 #include "mongo/bson/oid.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/active_migrations_registry.h"
+#include "mongo/db/s/collection_range_deleter.h"
 #include "mongo/db/s/migration_destination_manager.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -48,6 +51,7 @@ namespace mongo {
 class BSONObj;
 class BSONObjBuilder;
 struct ChunkVersion;
+class CollectionMetadata;
 class CollectionShardingState;
 class ConnectionString;
 class OperationContext;
@@ -70,6 +74,10 @@ class ShardingState {
 public:
     using GlobalInitFunc =
         stdx::function<Status(OperationContext*, const ConnectionString&, StringData)>;
+
+    // Signature for the callback function used by the MetadataManager to inform the
+    // sharding subsystem that there is range cleanup work to be done.
+    using RangeDeleterCleanupNotificationFunc = stdx::function<void(const NamespaceString&)>;
 
     ShardingState();
     ~ShardingState();
@@ -110,25 +118,10 @@ public:
     void initializeFromConfigConnString(OperationContext* txn, const std::string& configSvr);
 
     /**
-     * Initializes the sharding state of this server from the shard identity document from local
-     * storage.
-     *
-     * Note that this will also try to connect to the config servers and will block until it
-     * succeeds.
-     */
-    Status initializeFromShardIdentity(OperationContext* txn);
-
-    /**
      * Initializes the sharding state of this server from the shard identity document argument.
-     * This is the more genaralized form of the initializeFromShardIdentity(OperationContext*)
-     * method that can accept the shard identity from any source. Note that shardIdentity must
-     * be valid.
-     *
-     * Returns ErrorCodes::ExceededTimeLimit if deadline has passed.
      */
     Status initializeFromShardIdentity(OperationContext* txn,
-                                       const ShardIdentityType& shardIdentity,
-                                       Date_t deadline);
+                                       const ShardIdentityType& shardIdentity);
 
     /**
      * Shuts down sharding machinery on the shard.
@@ -139,7 +132,7 @@ public:
      * Updates the ShardRegistry's stored notion of the config server optime based on the
      * ConfigServerMetadata decoration attached to the OperationContext.
      */
-    void updateConfigServerOpTimeFromMetadata(OperationContext* txn);
+    Status updateConfigServerOpTimeFromMetadata(OperationContext* txn);
 
     /**
      * Assigns a shard name to this MongoD instance.
@@ -153,14 +146,12 @@ public:
      */
     void setShardName(const std::string& shardName);
 
-    CollectionShardingState* getNS(const std::string& ns);
+    CollectionShardingState* getNS(const std::string& ns, OperationContext* txn);
 
     /**
      * Clears the collection metadata cache after step down.
      */
     void clearCollectionMetadata();
-
-    ChunkVersion getVersion(const std::string& ns);
 
     /**
      * Refreshes the local metadata based on whether the expected version is higher than what we
@@ -199,8 +190,6 @@ public:
     void appendInfo(OperationContext* txn, BSONObjBuilder& b);
 
     bool needCollectionMetadata(OperationContext* txn, const std::string& ns);
-
-    ScopedCollectionMetadata getCollectionMetadata(const std::string& ns);
 
     /**
      * Updates the config server field of the shardIdentity document with the given connection
@@ -243,6 +232,32 @@ public:
      * initializeFromShardIdentity after all checks are performed.
      */
     void setGlobalInitMethodForTest(GlobalInitFunc func);
+
+    /**
+     * Schedules for the range to clean of the given namespace to be deleted.
+     * Behavior can be modified through setScheduleCleanupFunctionForTest.
+     */
+    void scheduleCleanup(const NamespaceString& nss);
+
+    /**
+     * Returns a pointer to the collection range deleter task executor.
+     */
+    executor::ThreadPoolTaskExecutor* getRangeDeleterTaskExecutor();
+
+    /**
+     * Sets the function used by scheduleWorkOnRangeDeleterTaskExecutor to
+     * schedule work. Used for mocking the executor for testing. See the ShardingState
+     * for the default implementation of _scheduleWorkFn.
+     */
+    void setScheduleCleanupFunctionForTest(RangeDeleterCleanupNotificationFunc fn);
+
+    /**
+     * If started with --shardsvr, initializes sharding awareness from the shardIdentity document
+     * on disk, if there is one.
+     * If started with --shardsvr in queryableBackupMode, initializes sharding awareness from the
+     * shardIdentity document passed through the --overrideShardIdentity startup parameter.
+     */
+    Status initializeShardingAwarenessIfNeeded(OperationContext* txn);
 
 private:
     friend class ScopedRegisterMigration;
@@ -311,14 +326,19 @@ private:
     void _setInitializationState_inlock(InitializationState newState);
 
     /**
-     * Refreshes collection metadata by asking the config server for the latest information. May or
-     * may not be based on a requested version.
+     * Refreshes collection metadata by asking the config server for the latest information and
+     * returns the latest version at the time the reload was done. This call does network I/O and
+     * should never be called with a lock.
+     *
+     * The metadataForDiff argument indicates that the specified metadata should be used as a base
+     * from which to only load the differences. If nullptr is passed, a full reload will be done.
      */
-    Status _refreshMetadata(OperationContext* txn,
-                            const std::string& ns,
-                            const ChunkVersion& reqShardVersion,
-                            bool useRequestedVersion,
-                            ChunkVersion* latestShardVersion);
+    StatusWith<ChunkVersion> _refreshMetadata(OperationContext* txn,
+                                              const NamespaceString& nss,
+                                              const CollectionMetadata* metadataForDiff);
+
+    // Initializes a TaskExecutor for cleaning up orphaned ranges
+    void _initializeRangeDeleterTaskExecutor();
 
     // Manages the state of the migration recipient shard
     MigrationDestinationManager _migrationDestManager;
@@ -354,6 +374,13 @@ private:
 
     // Function for initializing the external sharding state components not owned here.
     GlobalInitFunc _globalInit;
+
+    // Function for scheduling work on the _rangeDeleterTaskExecutor.
+    // Used in call to scheduleCleanup(NamespaceString).
+    RangeDeleterCleanupNotificationFunc _scheduleWorkFn;
+
+    // Task executor for the collection range deleter.
+    std::unique_ptr<executor::ThreadPoolTaskExecutor> _rangeDeleterTaskExecutor;
 };
 
 }  // namespace mongo

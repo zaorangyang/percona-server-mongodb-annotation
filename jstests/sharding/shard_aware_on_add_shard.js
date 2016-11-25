@@ -14,32 +14,19 @@
     };
 
     var checkShardingStateInitialized = function(conn, configConnStr, shardName, clusterId) {
-        // TODO: SERVER-22665 a mixed-version test should be written specifically testing receiving
-        // addShard from a legacy mongos, and this assert.soon() should be changed back to assert
-        // synchronously.
-        assert.soon(function() {
-            var res = conn.getDB('admin').runCommand({shardingState: 1});
-            assert.commandWorked(res);
-            if (res.enabled && (configConnStr === res.configServer) &&
-                (shardName === res.shardName) && (clusterId.equals(res.clusterId))) {
-                return true;
-            }
-            return false;
-        });
+        var res = conn.getDB('admin').runCommand({shardingState: 1});
+        assert.commandWorked(res);
+        assert(res.enabled);
+        assert.eq(configConnStr, res.configServer);
+        assert.eq(shardName, res.shardName);
+        assert(clusterId.equals(res.clusterId),
+               'cluster id: ' + tojson(clusterId) + ' != ' + tojson(res.clusterId));
     };
 
     var checkShardMarkedAsShardAware = function(mongosConn, shardName) {
-        // TODO: SERVER-22665 a mixed-version test should be written specifically testing receiving
-        // addShard from a legacy mongos, and this assert.soon() should be changed back to assert
-        // synchronously.
-        assert.soon(function() {
-            var res = mongosConn.getDB('config').getCollection('shards').findOne({_id: shardName});
-            assert.neq(null, res, "Could not find new shard " + shardName + " in config.shards");
-            if (res.state && res.state === 1) {
-                return true;
-            }
-            return false;
-        });
+        var res = mongosConn.getDB('config').getCollection('shards').findOne({_id: shardName});
+        assert.neq(null, res, "Could not find new shard " + shardName + " in config.shards");
+        assert.eq(1, res.state);
     };
 
     // Create the cluster to test adding shards to.

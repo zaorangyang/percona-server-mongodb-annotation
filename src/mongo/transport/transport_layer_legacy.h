@@ -67,11 +67,11 @@ public:
     Status setup();
     Status start() override;
 
-    Ticket sourceMessage(const Session& session,
+    Ticket sourceMessage(Session& session,
                          Message* message,
                          Date_t expiration = Ticket::kNoExpirationDate) override;
 
-    Ticket sinkMessage(const Session& session,
+    Ticket sinkMessage(Session& session,
                        const Message& message,
                        Date_t expiration = Ticket::kNoExpirationDate) override;
 
@@ -79,12 +79,13 @@ public:
     void asyncWait(Ticket&& ticket, TicketCallback callback) override;
 
     void registerTags(const Session& session) override;
-    std::string getX509SubjectName(const Session& session) override;
+    SSLPeerInfo getX509PeerInfo(const Session& session) const override;
 
     Stats sessionStats() override;
 
-    void end(const Session& session) override;
+    void end(Session& session) override;
     void endAllSessions(transport::Session::TagMask tags = Session::kKeepOpen) override;
+
     void shutdown() override;
 
 private:
@@ -149,7 +150,7 @@ private:
 
         const long long connectionId;
 
-        boost::optional<std::string> x509SubjectName;
+        boost::optional<SSLPeerInfo> sslPeerInfo;
         Session::TagMask tags;
         bool inUse;
         bool ended;
@@ -160,7 +161,7 @@ private:
     std::unique_ptr<Listener> _listener;
     stdx::thread _listenerThread;
 
-    stdx::mutex _connectionsMutex;
+    mutable stdx::mutex _connectionsMutex;
     std::unordered_map<Session::Id, Connection> _connections;
 
     void _endSession_inlock(decltype(_connections.begin()) conn);

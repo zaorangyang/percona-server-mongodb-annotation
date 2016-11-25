@@ -33,11 +33,7 @@
 #include <boost/optional.hpp>
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/parsed_aggregation_projection.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -45,80 +41,19 @@ using boost::intrusive_ptr;
 using parsed_aggregation_projection::ParsedAggregationProjection;
 using parsed_aggregation_projection::ProjectionType;
 
-DocumentSourceProject::DocumentSourceProject(
-    const intrusive_ptr<ExpressionContext>& expCtx,
-    std::unique_ptr<ParsedAggregationProjection> parsedProject)
-    : DocumentSource(expCtx), _parsedProject(std::move(parsedProject)) {}
+REGISTER_DOCUMENT_SOURCE_ALIAS(project, DocumentSourceProject::createFromBson);
 
-REGISTER_DOCUMENT_SOURCE(project, DocumentSourceProject::createFromBson);
-
-const char* DocumentSourceProject::getSourceName() const {
-    return "$project";
-}
-
-boost::optional<Document> DocumentSourceProject::getNext() {
-    pExpCtx->checkForInterrupt();
-
-    auto input = pSource->getNext();
-    if (!input) {
-        return boost::none;
-    }
-
-    return _parsedProject->applyProjection(*input);
-}
-
-intrusive_ptr<DocumentSource> DocumentSourceProject::optimize() {
-    _parsedProject->optimize();
-    return this;
-}
-
-Pipeline::SourceContainer::iterator DocumentSourceProject::optimizeAt(
-    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
-    invariant(*itr == this);
-
-    auto nextSkip = dynamic_cast<DocumentSourceSkip*>((*std::next(itr)).get());
-    auto nextLimit = dynamic_cast<DocumentSourceLimit*>((*std::next(itr)).get());
-
-    if (nextSkip || nextLimit) {
-        // Swap the $limit/$skip before ourselves, thus reducing the number of documents that
-        // pass through the $project.
-        std::swap(*itr, *std::next(itr));
-        return itr == container->begin() ? itr : std::prev(itr);
-    }
-    return std::next(itr);
-}
-
-void DocumentSourceProject::dispose() {
-    _parsedProject.reset();
-}
-
-Value DocumentSourceProject::serialize(bool explain) const {
-    return Value(Document{{getSourceName(), _parsedProject->serialize(explain)}});
-}
-
-intrusive_ptr<DocumentSource> DocumentSourceProject::createFromBson(
-    BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<DocumentSource> DocumentSourceProject::create(
+    BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     uassert(15969, "$project specification must be an object", elem.type() == Object);
 
-    return new DocumentSourceProject(expCtx, ParsedAggregationProjection::create(elem.Obj()));
+    return new DocumentSourceSingleDocumentTransformation(
+        expCtx, ParsedAggregationProjection::create(elem.Obj()), "$project");
 }
 
-DocumentSource::GetDepsReturn DocumentSourceProject::getDependencies(DepsTracker* deps) const {
-    // Add any fields referenced by the projection.
-    _parsedProject->addDependencies(deps);
-
-    if (_parsedProject->getType() == ProjectionType::kInclusion) {
-        // Stop looking for further dependencies later in the pipeline, since anything that is not
-        // explicitly included or added in this projection will not exist after this stage, so would
-        // be pointless to include in our dependencies.
-        return EXHAUSTIVE_FIELDS;
-    } else {
-        return SEE_NEXT;
-    }
-}
-
-void DocumentSourceProject::doInjectExpressionContext() {
-    _parsedProject->injectExpressionContext(pExpCtx);
+std::vector<intrusive_ptr<DocumentSource>> DocumentSourceProject::createFromBson(
+    BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
+    return {DocumentSourceProject::create(elem, expCtx)};
 }
 
 }  // namespace mongo

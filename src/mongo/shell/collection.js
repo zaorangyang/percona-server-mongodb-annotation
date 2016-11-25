@@ -203,8 +203,10 @@ DBCollection.prototype._massageObject = function(q) {
         return q;
 
     if (type == "string") {
-        if (q.length == 24)
-            return {_id: q};
+        // If the string is 24 hex characters, it is most likely an ObjectId.
+        if (/^[0-9a-fA-F]{24}$/.test(q)) {
+            return {_id: ObjectId(q)};
+        }
 
         return {$where: q};
     }
@@ -680,7 +682,7 @@ DBCollection.prototype.createIndexes = function(keys, options) {
     }
 
     if (this.getMongo().writeMode() == "commands") {
-        for (i = 0; i++; i < indexSpecs.length) {
+        for (var i = 0; i < indexSpecs.length; i++) {
             delete (indexSpecs[i].ns);  // ns is passed to the first element in the command.
         }
         return this._db.runCommand({createIndexes: this.getName(), indexes: indexSpecs});

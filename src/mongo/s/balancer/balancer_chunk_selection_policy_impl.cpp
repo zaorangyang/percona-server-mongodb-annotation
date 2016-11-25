@@ -103,13 +103,13 @@ StatusWith<std::pair<DistributionStatus, ChunkMinimumsSet>> createCollectionDist
     const auto& keyPattern = chunkMgr->getShardKeyPattern().getKeyPattern();
 
     for (const auto& tag : collectionTags) {
-        if (!distribution.addTagRange(TagRange(keyPattern.extendRangeBound(tag.getMinKey(), false),
-                                               keyPattern.extendRangeBound(tag.getMaxKey(), false),
-                                               tag.getTag()))) {
-            return {ErrorCodes::BadValue,
-                    str::stream() << "Tag ranges are not valid for collection " << chunkMgr->getns()
-                                  << ". Balancing for this collection will be skipped until "
-                                     "the ranges are fixed."};
+        auto status = distribution.addRangeToZone(
+            ZoneRange(keyPattern.extendRangeBound(tag.getMinKey(), false),
+                      keyPattern.extendRangeBound(tag.getMaxKey(), false),
+                      tag.getTag()));
+
+        if (!status.isOK()) {
+            return status;
         }
     }
 
@@ -118,9 +118,8 @@ StatusWith<std::pair<DistributionStatus, ChunkMinimumsSet>> createCollectionDist
 
 }  // namespace
 
-BalancerChunkSelectionPolicyImpl::BalancerChunkSelectionPolicyImpl(
-    std::unique_ptr<ClusterStatistics> clusterStats)
-    : _clusterStats(std::move(clusterStats)) {}
+BalancerChunkSelectionPolicyImpl::BalancerChunkSelectionPolicyImpl(ClusterStatistics* clusterStats)
+    : _clusterStats(clusterStats) {}
 
 BalancerChunkSelectionPolicyImpl::~BalancerChunkSelectionPolicyImpl() = default;
 
@@ -324,7 +323,7 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::_getSplitCandidate
             continue;
         }
 
-        shared_ptr<Chunk> chunk = cm->findIntersectingChunk(txn, tagRange.min);
+        shared_ptr<Chunk> chunk = cm->findIntersectingChunkWithSimpleCollation(txn, tagRange.min);
 
         if (!currentChunk) {
             currentChunk = chunk;

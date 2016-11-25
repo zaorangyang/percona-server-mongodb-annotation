@@ -47,6 +47,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/type_shard_identity.h"
@@ -369,14 +370,14 @@ Status ShardingCatalogClientImpl::_log(OperationContext* txn,
     changeLog.setDetails(detail);
 
     BSONObj changeLogBSON = changeLog.toBSON();
-    log() << "about to log metadata event into " << logCollName << ": " << changeLogBSON;
+    log() << "about to log metadata event into " << logCollName << ": " << redact(changeLogBSON);
 
     const NamespaceString nss("config", logCollName);
     Status result = insertConfigDocument(
         txn, nss.ns(), changeLogBSON, ShardingCatalogClient::kMajorityWriteConcern);
     if (!result.isOK()) {
         warning() << "Error encountered while logging config change with ID [" << changeId
-                  << "] into collection " << logCollName << ": " << result;
+                  << "] into collection " << logCollName << ": " << redact(result);
     }
 
     return result;
@@ -390,6 +391,7 @@ StatusWith<DistLockManager::ScopedDistLock> ShardingCatalogClientImpl::distLock(
 Status ShardingCatalogClientImpl::shardCollection(OperationContext* txn,
                                                   const string& ns,
                                                   const ShardKeyPattern& fieldsAndOrder,
+                                                  const BSONObj& defaultCollation,
                                                   bool unique,
                                                   const vector<BSONObj>& initPoints,
                                                   const set<ShardId>& initShardIds) {
@@ -447,7 +449,19 @@ Status ShardingCatalogClientImpl::shardCollection(OperationContext* txn,
         logChange(txn, "shardCollection.start", ns, collectionDetail.obj());
     }
 
-    shared_ptr<ChunkManager> manager(new ChunkManager(ns, fieldsAndOrder, unique));
+    // Construct the collection default collator.
+    std::unique_ptr<CollatorInterface> defaultCollator;
+    if (!defaultCollation.isEmpty()) {
+        auto statusWithCollator =
+            CollatorFactoryInterface::get(txn->getServiceContext())->makeFromBSON(defaultCollation);
+        if (!statusWithCollator.isOK()) {
+            return statusWithCollator.getStatus();
+        }
+        defaultCollator = std::move(statusWithCollator.getValue());
+    }
+
+    shared_ptr<ChunkManager> manager(
+        new ChunkManager(ns, fieldsAndOrder, std::move(defaultCollator), unique));
     Status createFirstChunksStatus =
         manager->createFirstChunks(txn, dbPrimaryShardId, &initPoints, &initShardIds);
     if (!createFirstChunksStatus.isOK()) {
@@ -634,6 +648,7 @@ StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::_fetchData
 
     auto findStatus = _exhaustiveFindOnConfig(txn,
                                               readPref,
+                                              repl::ReadConcernLevel::kMajorityReadConcern,
                                               NamespaceString(DatabaseType::ConfigNS),
                                               BSON(DatabaseType::name(dbName)),
                                               BSONObj(),
@@ -661,6 +676,7 @@ StatusWith<repl::OpTimeWith<CollectionType>> ShardingCatalogClientImpl::getColle
     OperationContext* txn, const std::string& collNs) {
     auto statusFind = _exhaustiveFindOnConfig(txn,
                                               kConfigReadSelector,
+                                              repl::ReadConcernLevel::kMajorityReadConcern,
                                               NamespaceString(CollectionType::ConfigNS),
                                               BSON(CollectionType::fullNs(collNs)),
                                               BSONObj(),
@@ -699,6 +715,7 @@ Status ShardingCatalogClientImpl::getCollections(OperationContext* txn,
 
     auto findStatus = _exhaustiveFindOnConfig(txn,
                                               kConfigReadSelector,
+                                              repl::ReadConcernLevel::kMajorityReadConcern,
                                               NamespaceString(CollectionType::ConfigNS),
                                               b.obj(),
                                               BSONObj(),
@@ -734,7 +751,7 @@ Status ShardingCatalogClientImpl::getCollections(OperationContext* txn,
 Status ShardingCatalogClientImpl::dropCollection(OperationContext* txn, const NamespaceString& ns) {
     logChange(txn, "dropCollection.start", ns.ns(), BSONObj());
 
-    auto shardsStatus = getAllShards(txn);
+    auto shardsStatus = getAllShards(txn, repl::ReadConcernLevel::kMajorityReadConcern);
     if (!shardsStatus.isOK()) {
         return shardsStatus.getStatus();
     }
@@ -894,8 +911,13 @@ Status ShardingCatalogClientImpl::dropCollection(OperationContext* txn, const Na
 
 StatusWith<BSONObj> ShardingCatalogClientImpl::getGlobalSettings(OperationContext* txn,
                                                                  StringData key) {
-    auto findStatus = _exhaustiveFindOnConfig(
-        txn, kConfigReadSelector, kSettingsNamespace, BSON("_id" << key), BSONObj(), 1);
+    auto findStatus = _exhaustiveFindOnConfig(txn,
+                                              kConfigReadSelector,
+                                              repl::ReadConcernLevel::kMajorityReadConcern,
+                                              kSettingsNamespace,
+                                              BSON("_id" << key),
+                                              BSONObj(),
+                                              1);
     if (!findStatus.isOK()) {
         return findStatus.getStatus();
     }
@@ -962,6 +984,7 @@ Status ShardingCatalogClientImpl::getDatabasesForShard(OperationContext* txn,
                                                        vector<string>* dbs) {
     auto findStatus = _exhaustiveFindOnConfig(txn,
                                               kConfigReadSelector,
+                                              repl::ReadConcernLevel::kMajorityReadConcern,
                                               NamespaceString(DatabaseType::ConfigNS),
                                               BSON(DatabaseType::primary(shardId.toString())),
                                               BSONObj(),
@@ -994,8 +1017,13 @@ Status ShardingCatalogClientImpl::getChunks(OperationContext* txn,
 
     // Convert boost::optional<int> to boost::optional<long long>.
     auto longLimit = limit ? boost::optional<long long>(*limit) : boost::none;
-    auto findStatus = _exhaustiveFindOnConfig(
-        txn, kConfigReadSelector, NamespaceString(ChunkType::ConfigNS), query, sort, longLimit);
+    auto findStatus = _exhaustiveFindOnConfig(txn,
+                                              kConfigReadSelector,
+                                              repl::ReadConcernLevel::kMajorityReadConcern,
+                                              NamespaceString(ChunkType::ConfigNS),
+                                              query,
+                                              sort,
+                                              longLimit);
     if (!findStatus.isOK()) {
         return findStatus.getStatus();
     }
@@ -1029,6 +1057,7 @@ Status ShardingCatalogClientImpl::getTagsForCollection(OperationContext* txn,
 
     auto findStatus = _exhaustiveFindOnConfig(txn,
                                               kConfigReadSelector,
+                                              repl::ReadConcernLevel::kMajorityReadConcern,
                                               NamespaceString(TagsType::ConfigNS),
                                               BSON(TagsType::ns(collectionNs)),
                                               BSON(TagsType::min() << 1),
@@ -1058,8 +1087,13 @@ StatusWith<string> ShardingCatalogClientImpl::getTagForChunk(OperationContext* t
         BSON(TagsType::ns(collectionNs) << TagsType::min() << BSON("$lte" << chunk.getMin())
                                         << TagsType::max()
                                         << BSON("$gte" << chunk.getMax()));
-    auto findStatus = _exhaustiveFindOnConfig(
-        txn, kConfigReadSelector, NamespaceString(TagsType::ConfigNS), query, BSONObj(), 1);
+    auto findStatus = _exhaustiveFindOnConfig(txn,
+                                              kConfigReadSelector,
+                                              repl::ReadConcernLevel::kMajorityReadConcern,
+                                              NamespaceString(TagsType::ConfigNS),
+                                              query,
+                                              BSONObj(),
+                                              1);
     if (!findStatus.isOK()) {
         return findStatus.getStatus();
     }
@@ -1083,10 +1117,11 @@ StatusWith<string> ShardingCatalogClientImpl::getTagForChunk(OperationContext* t
 }
 
 StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientImpl::getAllShards(
-    OperationContext* txn) {
+    OperationContext* txn, repl::ReadConcernLevel readConcern) {
     std::vector<ShardType> shards;
     auto findStatus = _exhaustiveFindOnConfig(txn,
                                               kConfigReadSelector,
+                                              readConcern,
                                               NamespaceString(ShardType::ConfigNS),
                                               BSONObj(),     // no query filter
                                               BSONObj(),     // no sort
@@ -1098,21 +1133,14 @@ StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientImpl::
     for (const BSONObj& doc : findStatus.getValue().value) {
         auto shardRes = ShardType::fromBSON(doc);
         if (!shardRes.isOK()) {
-            shards.clear();
             return {ErrorCodes::FailedToParse,
-                    stream() << "Failed to parse shard with id ("
-                             << doc[ShardType::name()].toString()
-                             << ")"
-                             << causedBy(shardRes.getStatus())};
+                    stream() << "Failed to parse shard " << causedBy(shardRes.getStatus()) << doc};
         }
 
         Status validateStatus = shardRes.getValue().validate();
         if (!validateStatus.isOK()) {
             return {validateStatus.code(),
-                    stream() << "Failed to validate shard with id ("
-                             << doc[ShardType::name()].toString()
-                             << ")"
-                             << causedBy(validateStatus)};
+                    stream() << "Failed to validate shard " << causedBy(validateStatus) << doc};
         }
 
         shards.push_back(shardRes.getValue());
@@ -1178,6 +1206,7 @@ bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* 
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         dbname,
         cmdToRun,
+        Shard::kDefaultConfigCommandTimeout,
         Shard::RetryPolicy::kNotIdempotent);
 
     if (!response.isOK()) {
@@ -1217,7 +1246,12 @@ bool ShardingCatalogClientImpl::runUserManagementReadCommand(OperationContext* t
                                                              const BSONObj& cmdObj,
                                                              BSONObjBuilder* result) {
     auto resultStatus = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
-        txn, kConfigPrimaryPreferredSelector, dbname, cmdObj, Shard::RetryPolicy::kIdempotent);
+        txn,
+        kConfigPrimaryPreferredSelector,
+        dbname,
+        cmdObj,
+        Shard::kDefaultConfigCommandTimeout,
+        Shard::RetryPolicy::kIdempotent);
     if (resultStatus.isOK()) {
         result->appendElements(resultStatus.getValue().response);
         return resultStatus.getValue().commandStatus.isOK();
@@ -1267,7 +1301,7 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* txn,
         // collection. The last chunk can be identified by namespace and version number.
 
         warning() << "chunk operation commit failed and metadata will be revalidated"
-                  << causedBy(status);
+                  << causedBy(redact(status));
 
         // Look for the chunk in this shard whose version got bumped. We assume that if that
         // mod made it to the config server, then applyOps was successful.
@@ -1279,12 +1313,13 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* txn,
 
         if (!chunkStatus.isOK()) {
             warning() << "getChunks function failed, unable to validate chunk operation metadata"
-                      << causedBy(chunkStatus);
-            errMsg = str::stream() << "getChunks function failed, unable to validate chunk "
-                                   << "operation metadata: " << causedBy(chunkStatus)
-                                   << ". applyChunkOpsDeprecated failed to get confirmation "
-                                   << "of commit. Unable to save chunk ops. Command: " << cmd
-                                   << ". Result: " << response.getValue().response;
+                      << causedBy(redact(chunkStatus));
+            errMsg = str::stream()
+                << "getChunks function failed, unable to validate chunk "
+                << "operation metadata: " << causedBy(redact(chunkStatus))
+                << ". applyChunkOpsDeprecated failed to get confirmation "
+                << "of commit. Unable to save chunk ops. Command: " << redact(cmd)
+                << ". Result: " << redact(response.getValue().response);
         } else if (!newestChunk.empty()) {
             invariant(newestChunk.size() == 1);
             log() << "chunk operation commit confirmed";
@@ -1320,8 +1355,8 @@ void ShardingCatalogClientImpl::writeConfigServerDirect(OperationContext* txn,
     }
 
     auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
-    *batchResponse =
-        configShard->runBatchWriteCommand(txn, batchRequest, Shard::RetryPolicy::kNotIdempotent);
+    *batchResponse = configShard->runBatchWriteCommandOnConfig(
+        txn, batchRequest, Shard::RetryPolicy::kNotIdempotent);
 }
 
 Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* txn,
@@ -1344,7 +1379,7 @@ Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* txn,
     auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
     for (int retry = 1; retry <= kMaxWriteRetry; retry++) {
         auto response =
-            configShard->runBatchWriteCommand(txn, request, Shard::RetryPolicy::kNoRetry);
+            configShard->runBatchWriteCommandOnConfig(txn, request, Shard::RetryPolicy::kNoRetry);
 
         Status status = response.toStatus();
 
@@ -1366,6 +1401,7 @@ Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* txn,
             auto fetchDuplicate =
                 _exhaustiveFindOnConfig(txn,
                                         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                        repl::ReadConcernLevel::kMajorityReadConcern,
                                         nss,
                                         idField.wrap(),
                                         BSONObj(),
@@ -1426,7 +1462,7 @@ StatusWith<bool> ShardingCatalogClientImpl::updateConfigDocument(
 
     auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
     auto response =
-        configShard->runBatchWriteCommand(txn, request, Shard::RetryPolicy::kIdempotent);
+        configShard->runBatchWriteCommandOnConfig(txn, request, Shard::RetryPolicy::kIdempotent);
 
     Status status = response.toStatus();
     if (!status.isOK()) {
@@ -1458,7 +1494,7 @@ Status ShardingCatalogClientImpl::removeConfigDocuments(OperationContext* txn,
 
     auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
     auto response =
-        configShard->runBatchWriteCommand(txn, request, Shard::RetryPolicy::kIdempotent);
+        configShard->runBatchWriteCommandOnConfig(txn, request, Shard::RetryPolicy::kIdempotent);
 
     return response.toStatus();
 }
@@ -1472,6 +1508,7 @@ Status ShardingCatalogClientImpl::_checkDbDoesNotExist(OperationContext* txn,
 
     auto findStatus = _exhaustiveFindOnConfig(txn,
                                               kConfigReadSelector,
+                                              repl::ReadConcernLevel::kMajorityReadConcern,
                                               NamespaceString(DatabaseType::ConfigNS),
                                               queryBuilder.obj(),
                                               BSONObj(),
@@ -1521,6 +1558,7 @@ Status ShardingCatalogClientImpl::_createCappedConfigCollection(OperationContext
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         "config",
         createCmd,
+        Shard::kDefaultConfigCommandTimeout,
         Shard::RetryPolicy::kIdempotent);
 
     if (!result.isOK()) {
@@ -1550,12 +1588,13 @@ StatusWith<long long> ShardingCatalogClientImpl::_runCountCommandOnConfig(Operat
     countBuilder.append("query", query);
     _appendReadConcern(&countBuilder);
 
-    auto resultStatus = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
-        txn,
-        kConfigReadSelector,
-        ns.db().toString(),
-        countBuilder.done(),
-        Shard::RetryPolicy::kIdempotent);
+    auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+    auto resultStatus = configShard->runCommand(txn,
+                                                kConfigReadSelector,
+                                                ns.db().toString(),
+                                                countBuilder.done(),
+                                                Shard::kDefaultConfigCommandTimeout,
+                                                Shard::RetryPolicy::kIdempotent);
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
     }
@@ -1577,12 +1616,13 @@ StatusWith<long long> ShardingCatalogClientImpl::_runCountCommandOnConfig(Operat
 StatusWith<repl::OpTimeWith<vector<BSONObj>>> ShardingCatalogClientImpl::_exhaustiveFindOnConfig(
     OperationContext* txn,
     const ReadPreferenceSetting& readPref,
+    repl::ReadConcernLevel readConcern,
     const NamespaceString& nss,
     const BSONObj& query,
     const BSONObj& sort,
     boost::optional<long long> limit) {
     auto response = Grid::get(txn)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-        txn, readPref, repl::ReadConcernLevel::kMajorityReadConcern, nss, query, sort, limit);
+        txn, readPref, readConcern, nss, query, sort, limit);
     if (!response.isOK()) {
         return response.getStatus();
     }
@@ -1599,12 +1639,12 @@ void ShardingCatalogClientImpl::_appendReadConcern(BSONObjBuilder* builder) {
 
 Status ShardingCatalogClientImpl::appendInfoForConfigServerDatabases(OperationContext* txn,
                                                                      BSONArrayBuilder* builder) {
-    auto resultStatus = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
-        txn,
-        kConfigPrimaryPreferredSelector,
-        "admin",
-        BSON("listDatabases" << 1),
-        Shard::RetryPolicy::kIdempotent);
+    auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+    auto resultStatus = configShard->runCommand(txn,
+                                                kConfigPrimaryPreferredSelector,
+                                                "admin",
+                                                BSON("listDatabases" << 1),
+                                                Shard::RetryPolicy::kIdempotent);
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();

@@ -131,7 +131,7 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
 }
 
 CollectionCloner::~CollectionCloner() {
-    DESTRUCTOR_GUARD(cancel(); wait(););
+    DESTRUCTOR_GUARD(shutdown(); join(););
 }
 
 const NamespaceString& CollectionCloner::getSourceNamespace() const {
@@ -158,7 +158,7 @@ bool CollectionCloner::isActive() const {
     return _active;
 }
 
-Status CollectionCloner::start() {
+Status CollectionCloner::startup() {
     LockGuard lk(_mutex);
     LOG(0) << "CollectionCloner::start called, on ns:" << _destNss;
 
@@ -177,13 +177,13 @@ Status CollectionCloner::start() {
     return Status::OK();
 }
 
-void CollectionCloner::cancel() {
+void CollectionCloner::shutdown() {
     if (!isActive()) {
         return;
     }
 
-    _listIndexesFetcher.cancel();
-    _findFetcher.cancel();
+    _listIndexesFetcher.shutdown();
+    _findFetcher.shutdown();
     _dbWorkTaskRunner.cancel();
 }
 
@@ -192,7 +192,7 @@ CollectionCloner::Stats CollectionCloner::getStats() const {
     return _stats;
 }
 
-void CollectionCloner::wait() {
+void CollectionCloner::join() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     _condition.wait(lk, [this]() { return !_active; });
 }
@@ -204,7 +204,7 @@ void CollectionCloner::waitForDbWorker() {
     _dbWorkTaskRunner.join();
 }
 
-void CollectionCloner::setScheduleDbWorkFn(const ScheduleDbWorkFn& scheduleDbWorkFn) {
+void CollectionCloner::setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& scheduleDbWorkFn) {
     LockGuard lk(_mutex);
     _scheduleDbWorkFn = scheduleDbWorkFn;
 }
@@ -217,8 +217,13 @@ void CollectionCloner::_listIndexesCallback(const Fetcher::QueryResponseStatus& 
         // Schedule collection creation and finish callback.
         auto&& scheduleResult =
             _scheduleDbWorkFn([this](const executor::TaskExecutor::CallbackArgs& cbd) {
-                auto&& createStatus =
-                    _storageInterface->createCollection(cbd.txn, _destNss, _options);
+                if (!cbd.status.isOK()) {
+                    _finishCallback(cbd.status);
+                    return;
+                }
+                auto txn = cbd.txn;
+                txn->setReplicatedWrites(false);
+                auto&& createStatus = _storageInterface->createCollection(txn, _destNss, _options);
                 _finishCallback(createStatus);
             });
         if (!scheduleResult.isOK()) {

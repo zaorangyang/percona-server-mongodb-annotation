@@ -113,6 +113,10 @@ Reporter::~Reporter() {
     DESTRUCTOR_GUARD(shutdown(); join(););
 }
 
+std::string Reporter::toString() const {
+    return getTarget().toString();
+}
+
 HostAndPort Reporter::getTarget() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _target;
@@ -225,7 +229,7 @@ void Reporter::_sendCommand_inlock(BSONObj commandRequest) {
            << commandRequest;
 
     auto scheduleResult = _executor->scheduleRemoteCommand(
-        executor::RemoteCommandRequest(_target, "admin", commandRequest),
+        executor::RemoteCommandRequest(_target, "admin", commandRequest, nullptr),
         stdx::bind(&Reporter::_processResponseCallback, this, stdx::placeholders::_1));
 
     _status = scheduleResult.getStatus();
@@ -253,14 +257,14 @@ void Reporter::_processResponseCallback(
             return;
         }
 
-        _status = rcbd.response.getStatus();
+        _status = rcbd.response.status;
         if (!_status.isOK()) {
             _onShutdown_inlock();
             return;
         }
 
         // Override _status with the one embedded in the command result.
-        const auto& commandResult = rcbd.response.getValue().data;
+        const auto& commandResult = rcbd.response.data;
         _status = getStatusFromCommandResult(commandResult);
 
         // Some error types are OK and should not cause the reporter to stop sending updates to the

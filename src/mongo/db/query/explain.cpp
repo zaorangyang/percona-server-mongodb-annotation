@@ -598,10 +598,8 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
         const QuerySettings* querySettings = infoCache->getQuerySettings();
         PlanCacheKey planCacheKey =
             infoCache->getPlanCache()->computeKey(*exec->getCanonicalQuery());
-        AllowedIndices* allowedIndicesRaw;
-        if (querySettings->getAllowedIndices(planCacheKey, &allowedIndicesRaw)) {
+        if (auto allowedIndicesFilter = querySettings->getAllowedIndicesFilter(planCacheKey)) {
             // Found an index filter set on the query shape.
-            std::unique_ptr<AllowedIndices> allowedIndices(allowedIndicesRaw);
             indexFilterSet = true;
         }
     }

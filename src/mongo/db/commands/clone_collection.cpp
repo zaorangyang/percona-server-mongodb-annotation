@@ -77,7 +77,7 @@ public:
         return parseNsFullyQualified(dbname, cmdObj);
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         std::string ns = parseNs(dbname, cmdObj);
@@ -148,7 +148,7 @@ public:
         Cloner cloner;
         unique_ptr<DBClientConnection> myconn;
         myconn.reset(new DBClientConnection());
-        if (!myconn->connect(HostAndPort(fromhost), errmsg))
+        if (!myconn->connect(HostAndPort(fromhost), StringData(), errmsg))
             return false;
 
         cloner.setConnection(myconn.release());

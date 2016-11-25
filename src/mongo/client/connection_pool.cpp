@@ -184,11 +184,11 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
     // the number of seconds with a fractional part.
     conn->setSoTimeout(durationCount<Milliseconds>(timeout) / 1000.0);
 
-    uassertStatusOK(conn->connect(target));
+    uassertStatusOK(conn->connect(target, StringData()));
     conn->port().setTag(conn->port().getTag() | _messagingPortTags);
 
     if (isInternalAuthSet()) {
-        conn->auth(getInternalUserAuthParamsWithFallback());
+        conn->auth(getInternalUserAuthParams());
     }
 
     if (_hook) {

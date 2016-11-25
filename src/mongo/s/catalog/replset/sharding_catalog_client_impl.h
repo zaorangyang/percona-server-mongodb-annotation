@@ -90,6 +90,7 @@ public:
     Status shardCollection(OperationContext* txn,
                            const std::string& ns,
                            const ShardKeyPattern& fieldsAndOrder,
+                           const BSONObj& defaultCollation,
                            bool unique,
                            const std::vector<BSONObj>& initPoints,
                            const std::set<ShardId>& initShardsIds) override;
@@ -130,7 +131,7 @@ public:
                                            const ChunkType& chunk) override;
 
     StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-        OperationContext* txn) override;
+        OperationContext* txn, repl::ReadConcernLevel readConcern) override;
 
     bool runUserManagementWriteCommand(OperationContext* txn,
                                        const std::string& commandName,
@@ -226,6 +227,7 @@ private:
     StatusWith<repl::OpTimeWith<std::vector<BSONObj>>> _exhaustiveFindOnConfig(
         OperationContext* txn,
         const ReadPreferenceSetting& readPref,
+        repl::ReadConcernLevel readConcern,
         const NamespaceString& nss,
         const BSONObj& query,
         const BSONObj& sort,

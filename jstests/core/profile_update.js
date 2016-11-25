@@ -21,12 +21,18 @@
     }
     assert.commandWorked(coll.createIndex({a: 1}));
 
-    assert.writeOK(coll.update({a: {$gte: 2}}, {$set: {c: 1}, $inc: {a: -10}}));
+    assert.writeOK(
+        coll.update({a: {$gte: 2}},
+                    {$set: {c: 1}, $inc: {a: -10}},
+                    db.getMongo().writeMode() === "commands" ? {collation: {locale: "fr"}} : {}));
 
     var profileObj = getLatestProfilerEntry(testDB);
 
     assert.eq(profileObj.ns, coll.getFullName(), tojson(profileObj));
     assert.eq(profileObj.op, "update", tojson(profileObj));
+    if (db.getMongo().writeMode() === "commands") {
+        assert.eq(profileObj.collation, {locale: "fr"}, tojson(profileObj));
+    }
     assert.eq(profileObj.keysExamined, 1, tojson(profileObj));
     assert.eq(profileObj.docsExamined, 1, tojson(profileObj));
     assert.eq(profileObj.keysInserted, 1, tojson(profileObj));
@@ -38,6 +44,7 @@
     assert(profileObj.hasOwnProperty("millis"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("numYield"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("locks"), tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 
     //
     // Confirm metrics for multiple indexed document update.
@@ -59,6 +66,7 @@
     assert.eq(profileObj.nModified, 5, tojson(profileObj));
     assert.eq(profileObj.planSummary, "IXSCAN { a: 1.0 }", tojson(profileObj));
     assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 
     //
     // Confirm metrics for insert on update with "upsert: true".
@@ -82,6 +90,7 @@
     assert.eq(profileObj.upsert, true, tojson(profileObj));
     assert.eq(profileObj.planSummary, "IXSCAN { _id: 1 }", tojson(profileObj));
     assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 
     //
     // Confirm 'nmoved' for MMAPv1.
@@ -98,6 +107,7 @@
         assert.eq(profileObj.nMatched, 1, tojson(profileObj));
         assert.eq(profileObj.nModified, 1, tojson(profileObj));
         assert.eq(profileObj.nmoved, 1, tojson(profileObj));
+        assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
     }
 
     //
@@ -114,4 +124,5 @@
     profileObj = getLatestProfilerEntry(testDB);
 
     assert.eq(profileObj.fromMultiPlanner, true, tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 })();

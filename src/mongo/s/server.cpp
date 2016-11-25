@@ -62,7 +62,6 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/s/balancer/balancer.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
@@ -148,7 +147,7 @@ static void cleanupTask() {
         grid.catalogClient(txn)->shutDown(txn);
     }
 
-    audit::logShutdown(ClientBasic::getCurrent());
+    audit::logShutdown(Client::getCurrent());
 }
 
 static BSONObj buildErrReply(const DBException& ex) {
@@ -302,8 +301,6 @@ static ExitCode runMongosServer() {
     shardingUptimeReporter.emplace();
     shardingUptimeReporter->startPeriodicThread();
 
-    Balancer::create(getGlobalServiceContext());
-
     clusterCursorCleanupJob.go();
 
     UserCacheInvalidator cacheInvalidatorThread(getGlobalAuthorizationManager());
@@ -440,11 +437,11 @@ int mongoSMain(int argc, char* argv[], char** envp) {
         int exitCode = _main();
         return exitCode;
     } catch (const SocketException& e) {
-        error() << "uncaught SocketException in mongos main: " << e.toString();
+        error() << "uncaught SocketException in mongos main: " << redact(e);
     } catch (const DBException& e) {
-        error() << "uncaught DBException in mongos main: " << e.toString();
+        error() << "uncaught DBException in mongos main: " << redact(e);
     } catch (const std::exception& e) {
-        error() << "uncaught std::exception in mongos main:" << e.what();
+        error() << "uncaught std::exception in mongos main:" << redact(e.what());
     } catch (...) {
         error() << "uncaught unknown exception in mongos main";
     }

@@ -203,8 +203,9 @@ Database::Database(OperationContext* txn, StringData name, DatabaseCatalogEntry*
       _dbEntry(dbEntry),
       _profileName(_name + ".system.profile"),
       _indexesName(_name + ".system.indexes"),
-      _viewsName(_name + ".system.views"),
-      _views(txn, this) {
+      _viewsName(_name + "." + DurableViewCatalog::viewsCollectionName().toString()),
+      _durableViews(DurableViewCatalogImpl(this)),
+      _views(&_durableViews) {
     Status status = validateDBName(_name);
     if (!status.isOK()) {
         warning() << "tried to open invalid db: " << _name << endl;
@@ -219,8 +220,13 @@ Database::Database(OperationContext* txn, StringData name, DatabaseCatalogEntry*
         const string ns = *it;
         _collections[ns] = _getOrCreateCollectionInstance(txn, ns);
     }
+    // At construction time of the viewCatalog, the _collections map wasn't initialized yet, so no
+    // system.views collection would be found. Now we're sufficiently initialized, signal a version
+    // change. Also force a reload, so if there are problems with the catalog contents as might be
+    // caused by incorrect mongod versions or similar, they are found right away.
+    getViewCatalog()->invalidate();
+    uassertStatusOK(_views.reloadIfNeeded(txn));
 }
-
 
 /*static*/
 string Database::duplicateUncasedName(const string& name, set<string>* duplicates) {
@@ -347,6 +353,12 @@ void Database::getStats(OperationContext* opCtx, BSONObjBuilder* output, double 
     output->appendNumber("indexSize", indexSize / scale);
 
     _dbEntry->appendExtraStats(opCtx, output, scale);
+}
+
+Status Database::dropView(OperationContext* txn, StringData fullns) {
+    Status status = _views.dropView(txn, NamespaceString(fullns));
+    Top::get(txn->getClient()->getServiceContext()).collectionDropped(fullns);
+    return status;
 }
 
 Status Database::dropCollection(OperationContext* txn, StringData fullns) {
@@ -522,7 +534,7 @@ Status Database::createView(OperationContext* txn,
         return Status(ErrorCodes::InvalidNamespace,
                       str::stream() << "invalid namespace name for a view: " + nss.toString());
 
-    return _views.createView(txn, nss, viewOnNss, options.pipeline);
+    return _views.createView(txn, nss, viewOnNss, BSONArray(options.pipeline));
 }
 
 
@@ -643,7 +655,7 @@ Status userCreateNS(OperationContext* txn,
         return Status(ErrorCodes::NamespaceExists,
                       str::stream() << "a collection '" << ns.toString() << "' already exists");
 
-    if (db->getViewCatalog()->lookup(ns))
+    if (db->getViewCatalog()->lookup(txn, ns))
         return Status(ErrorCodes::NamespaceExists,
                       str::stream() << "a view '" << ns.toString() << "' already exists");
 

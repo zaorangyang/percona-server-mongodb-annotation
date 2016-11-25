@@ -191,7 +191,7 @@ var ShardingTest = function(params) {
                 db = self.getDB('test');
 
                 try {
-                    sh[fn].apply(sh, arguments);
+                    return sh[fn].apply(sh, arguments);
                 } finally {
                     db = oldDb;
                 }
@@ -207,20 +207,6 @@ var ShardingTest = function(params) {
         if (!otherParams.enableBalancer) {
             self.stopBalancer();
         }
-
-        // Lower the mongos replica set monitor's threshold for deeming RS shard hosts as
-        // inaccessible in order to speed up tests, which shutdown entire shards and check for
-        // errors. This attempt is best-effort and failure should not have effect on the actual
-        // test execution, just the execution time.
-        self._mongos.forEach(function(mongos) {
-            var res = mongos.adminCommand({setParameter: 1, replMonitorMaxFailedChecks: 2});
-
-            // For tests, which use x509 certificate for authentication, the command above will not
-            // work due to authorization error.
-            if (res.code != ErrorCodes.Unauthorized) {
-                assert.commandWorked(res);
-            }
-        });
     }
 
     function connectionURLTheSame(a, b) {
@@ -929,7 +915,7 @@ var ShardingTest = function(params) {
     var otherParams = Object.merge(params, params.other || {});
 
     var numShards = otherParams.hasOwnProperty('shards') ? otherParams.shards : 2;
-    var verboseLevel = otherParams.hasOwnProperty('verbose') ? otherParams.verbose : 1;
+    var mongosVerboseLevel = otherParams.hasOwnProperty('verbose') ? otherParams.verbose : 1;
     var numMongos = otherParams.hasOwnProperty('mongos') ? otherParams.mongos : 1;
     var numConfigs = otherParams.hasOwnProperty('config') ? otherParams.config : 3;
     var waitForCSRSSecondaries = otherParams.hasOwnProperty('waitForCSRSSecondaries')
@@ -992,6 +978,11 @@ var ShardingTest = function(params) {
     otherParams.useBridge = otherParams.useBridge || false;
     otherParams.bridgeOptions = otherParams.bridgeOptions || {};
 
+    if (jsTestOptions().networkMessageCompressors) {
+        otherParams.bridgeOptions["networkMessageCompressors"] =
+            jsTestOptions().networkMessageCompressors;
+    }
+
     var keyFile = otherParams.keyFile;
     var hostName = getHostName();
 
@@ -1026,7 +1017,7 @@ var ShardingTest = function(params) {
                 noJournalPrealloc: otherParams.nopreallocj,
                 oplogSize: 16,
                 shardsvr: '',
-                pathOpts: Object.merge(pathOpts, {shard: i})
+                pathOpts: Object.merge(pathOpts, {shard: i}),
             };
 
             rsDefaults = Object.merge(rsDefaults, otherParams.rs);
@@ -1078,6 +1069,20 @@ var ShardingTest = function(params) {
                 shardsvr: '',
                 keyFile: keyFile
             };
+
+            if (jsTestOptions().shardMixedBinVersions) {
+                if (!otherParams.shardOptions) {
+                    otherParams.shardOptions = {};
+                }
+                // If the test doesn't depend on specific shard binVersions, create a mixed version
+                // shard cluster that randomly assigns shard binVersions, half "latest" and half
+                // "last-stable".
+                if (!otherParams.shardOptions.binVersion) {
+                    Random.setRandomSeed();
+                    otherParams.shardOptions.binVersion =
+                        MongoRunner.versionIterator(["latest", "last-stable"], true);
+                }
+            }
 
             if (otherParams.shardOptions && otherParams.shardOptions.binVersion) {
                 otherParams.shardOptions.binVersion =
@@ -1237,7 +1242,7 @@ var ShardingTest = function(params) {
             useHostname: otherParams.useHostname,
             pathOpts: Object.merge(pathOpts, {mongos: i}),
             configdb: this._configDB,
-            verbose: verboseLevel || 0,
+            verbose: mongosVerboseLevel,
             keyFile: keyFile,
         };
 

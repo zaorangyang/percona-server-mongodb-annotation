@@ -245,6 +245,21 @@
         assert(planHasStage(explainRes.queryPlanner.winningPlan, "IXSCAN"));
     }
 
+    // Should not be possible to create a text index with an explicit non-simple collation.
+    coll.drop();
+    assert.commandFailed(coll.createIndex({a: "text"}, {collation: {locale: "en"}}));
+
+    // Text index builds which inherit a non-simple default collation should fail.
+    coll.drop();
+    assert.commandWorked(db.createCollection(coll.getName(), {collation: {locale: "en"}}));
+    assert.commandFailed(coll.createIndex({a: "text"}));
+
+    // Text index build should succeed on a collection with a non-simple default collation if it
+    // explicitly overrides the default with {locale: "simple"}.
+    coll.drop();
+    assert.commandWorked(db.createCollection(coll.getName(), {collation: {locale: "en"}}));
+    assert.commandWorked(coll.createIndex({a: "text"}, {collation: {locale: "simple"}}));
+
     //
     // Collation tests for aggregation.
     //
@@ -569,39 +584,6 @@
                       .collation({locale: "en_US", strength: 3})
                       .sort({a: 1});
         assert.eq(res.toArray(), [{a: "a"}, {a: "A"}, {a: "b"}, {a: "B"}]);
-
-        // Ensure results from index with min/max query are sorted to match requested collation.
-        coll.drop();
-        assert.commandWorked(coll.ensureIndex({a: 1, b: 1}));
-        assert.writeOK(coll.insert(
-            [{a: 1, b: 1}, {a: 1, b: 2}, {a: 1, b: "A"}, {a: 1, b: "a"}, {a: 2, b: 2}]));
-        var expected = [{a: 1, b: 1}, {a: 1, b: 2}, {a: 1, b: "a"}, {a: 1, b: "A"}, {a: 2, b: 2}];
-        res = coll.find({}, {_id: 0})
-                  .hint({a: 1, b: 1})
-                  .min({a: 1, b: 1})
-                  .max({a: 2, b: 3})
-                  .collation({locale: "en_US", strength: 3})
-                  .sort({a: 1, b: 1});
-        assert.eq(res.toArray(), expected);
-        res = coll.find({}, {_id: 0})
-                  .hint({a: 1, b: 1})
-                  .min({a: 1, b: 1})
-                  .collation({locale: "en_US", strength: 3})
-                  .sort({a: 1, b: 1});
-        assert.eq(res.toArray(), expected);
-        res = coll.find({}, {_id: 0})
-                  .hint({a: 1, b: 1})
-                  .max({a: 2, b: 3})
-                  .collation({locale: "en_US", strength: 3})
-                  .sort({a: 1, b: 1});
-        assert.eq(res.toArray(), expected);
-        res = coll.find({}, {_id: 0})
-                  .hint({a: 1, b: 1})
-                  .min({a: 1, b: "A"})
-                  .max({a: 2, b: 1})
-                  .collation({locale: "en_US", strength: 3})
-                  .sort({a: 1, b: 1});
-        assert.eq(res.toArray(), [{a: 1, b: "a"}, {a: 1, b: "A"}]);
     }
 
     // Find should return correct results when no collation specified and collection has a default
@@ -1906,5 +1888,179 @@
         assert.commandWorked(db.runCommand(
             {applyOps: [{op: "u", ns: coll.getFullName(), o2: {_id: "FOO"}, o: {$set: {x: 8}}}]}));
         assert.eq(8, coll.findOne({_id: "foo"}).x);
+    }
+
+    // Test that the collections created with the "copydb" command inherit the default collation of
+    // the corresponding collection.
+    {
+        const sourceDB = db.getSiblingDB("collation");
+        const destDB = db.getSiblingDB("collation_cloned");
+
+        sourceDB.dropDatabase();
+        destDB.dropDatabase();
+
+        // Create a collection with a non-simple default collation.
+        assert.commandWorked(
+            sourceDB.runCommand({create: coll.getName(), collation: {locale: "en", strength: 2}}));
+        const sourceCollectionInfos = sourceDB.getCollectionInfos({name: coll.getName()});
+
+        assert.writeOK(sourceDB[coll.getName()].insert({_id: "FOO"}));
+        assert.writeOK(sourceDB[coll.getName()].insert({_id: "bar"}));
+        assert.eq([{_id: "FOO"}],
+                  sourceDB[coll.getName()].find({_id: "foo"}).toArray(),
+                  "query should have performed a case-insensitive match");
+
+        assert.commandWorked(
+            sourceDB.adminCommand({copydb: 1, fromdb: sourceDB.getName(), todb: destDB.getName()}));
+        const destCollectionInfos = destDB.getCollectionInfos({name: coll.getName()});
+        assert.eq(sourceCollectionInfos, destCollectionInfos);
+        assert.eq([{_id: "FOO"}], destDB[coll.getName()].find({_id: "foo"}).toArray());
+    }
+
+    // Test that the collection created with the "cloneCollectionAsCapped" command inherits the
+    // default collation of the corresponding collection. We skip running this command in a sharded
+    // cluster because it isn't supported by mongos.
+    if (!isMongos) {
+        const clonedColl = db.collation_cloned;
+
+        coll.drop();
+        clonedColl.drop();
+
+        // Create a collection with a non-simple default collation.
+        assert.commandWorked(
+            db.runCommand({create: coll.getName(), collation: {locale: "en", strength: 2}}));
+        const originalCollectionInfos = db.getCollectionInfos({name: coll.getName()});
+        assert.eq(originalCollectionInfos.length, 1, tojson(originalCollectionInfos));
+
+        assert.writeOK(coll.insert({_id: "FOO"}));
+        assert.writeOK(coll.insert({_id: "bar"}));
+        assert.eq([{_id: "FOO"}],
+                  coll.find({_id: "foo"}).toArray(),
+                  "query should have performed a case-insensitive match");
+
+        assert.commandWorked(db.runCommand({
+            cloneCollectionAsCapped: coll.getName(),
+            toCollection: clonedColl.getName(),
+            size: 4096
+        }));
+        const clonedCollectionInfos = db.getCollectionInfos({name: clonedColl.getName()});
+        assert.eq(clonedCollectionInfos.length, 1, tojson(clonedCollectionInfos));
+        assert.eq(originalCollectionInfos[0].options.collation,
+                  clonedCollectionInfos[0].options.collation);
+        assert.eq([{_id: "FOO"}], clonedColl.find({_id: "foo"}).toArray());
+    }
+
+    // Test that the collection created with the "convertToCapped" command inherits the default
+    // collation of the corresponding collection. We skip running this command in a sharded cluster
+    // because it isn't supported by mongos.
+    if (!isMongos) {
+        coll.drop();
+
+        // Create a collection with a non-simple default collation.
+        assert.commandWorked(
+            db.runCommand({create: coll.getName(), collation: {locale: "en", strength: 2}}));
+        const originalCollectionInfos = db.getCollectionInfos({name: coll.getName()});
+        assert.eq(originalCollectionInfos.length, 1, tojson(originalCollectionInfos));
+
+        assert.writeOK(coll.insert({_id: "FOO"}));
+        assert.writeOK(coll.insert({_id: "bar"}));
+        assert.eq([{_id: "FOO"}],
+                  coll.find({_id: "foo"}).toArray(),
+                  "query should have performed a case-insensitive match");
+
+        assert.commandWorked(db.runCommand({convertToCapped: coll.getName(), size: 4096}));
+        const cappedCollectionInfos = db.getCollectionInfos({name: coll.getName()});
+        assert.eq(cappedCollectionInfos.length, 1, tojson(cappedCollectionInfos));
+        assert.eq(originalCollectionInfos[0].options.collation,
+                  cappedCollectionInfos[0].options.collation);
+        assert.eq([{_id: "FOO"}], coll.find({_id: "foo"}).toArray());
+    }
+
+    // Test that the find command's min/max options respect the collation.
+    if (db.getMongo().useReadCommands()) {
+        coll.drop();
+        assert.writeOK(coll.insert({str: "a"}));
+        assert.writeOK(coll.insert({str: "A"}));
+        assert.writeOK(coll.insert({str: "b"}));
+        assert.writeOK(coll.insert({str: "B"}));
+        assert.writeOK(coll.insert({str: "c"}));
+        assert.writeOK(coll.insert({str: "C"}));
+        assert.writeOK(coll.insert({str: "d"}));
+        assert.writeOK(coll.insert({str: "D"}));
+
+        // This query should fail, since there is no index to support the min/max.
+        assert.throws(() => coll.find()
+                                .min({str: "b"})
+                                .max({str: "D"})
+                                .collation({locale: "en_US", strength: 2})
+                                .itcount());
+
+        // Even after building an index with the right key pattern, the query should fail since the
+        // collations don't match.
+        assert.commandWorked(coll.createIndex({str: 1}, {name: "noCollation"}));
+        assert.throws(() => coll.find()
+                                .min({str: "b"})
+                                .max({str: "D"})
+                                .collation({locale: "en_US", strength: 2})
+                                .itcount());
+
+        // After building an index with the case-insensitive US English collation, the query should
+        // work. Furthermore, the bounds defined by the min and max should respect the
+        // case-insensitive collation.
+        assert.commandWorked(coll.createIndex(
+            {str: 1}, {name: "withCollation", collation: {locale: "en_US", strength: 2}}));
+        assert.eq(4,
+                  coll.find()
+                      .min({str: "b"})
+                      .max({str: "D"})
+                      .collation({locale: "en_US", strength: 2})
+                      .itcount());
+
+        // Ensure results from index with min/max query are sorted to match requested collation.
+        coll.drop();
+        assert.commandWorked(coll.ensureIndex({a: 1, b: 1}));
+        assert.writeOK(coll.insert(
+            [{a: 1, b: 1}, {a: 1, b: 2}, {a: 1, b: "A"}, {a: 1, b: "a"}, {a: 2, b: 2}]));
+        var expected = [{a: 1, b: 1}, {a: 1, b: 2}, {a: 1, b: "a"}, {a: 1, b: "A"}, {a: 2, b: 2}];
+        res = coll.find({}, {_id: 0})
+                  .hint({a: 1, b: 1})
+                  .min({a: 1, b: 1})
+                  .max({a: 2, b: 3})
+                  .collation({locale: "en_US", strength: 3})
+                  .sort({a: 1, b: 1});
+        assert.eq(res.toArray(), expected);
+        res = coll.find({}, {_id: 0})
+                  .hint({a: 1, b: 1})
+                  .min({a: 1, b: 1})
+                  .collation({locale: "en_US", strength: 3})
+                  .sort({a: 1, b: 1});
+        assert.eq(res.toArray(), expected);
+        res = coll.find({}, {_id: 0})
+                  .hint({a: 1, b: 1})
+                  .max({a: 2, b: 3})
+                  .collation({locale: "en_US", strength: 3})
+                  .sort({a: 1, b: 1});
+        assert.eq(res.toArray(), expected);
+
+        // A min/max query that can use an index whose collation doesn't match should require a sort
+        // stage if there are any in-bounds strings. Verify this using explain.
+        explainRes = coll.find({}, {_id: 0})
+                         .hint({a: 1, b: 1})
+                         .max({a: 2, b: 3})
+                         .collation({locale: "en_US", strength: 3})
+                         .sort({a: 1, b: 1})
+                         .explain();
+        assert.commandWorked(explainRes);
+        assert(planHasStage(explainRes.queryPlanner.winningPlan, "SORT"));
+
+        // This query should fail since min has a string as one of it's boundaries, and the
+        // collation doesn't match that of the index.
+        assert.throws(() => coll.find({}, {_id: 0})
+                                .hint({a: 1, b: 1})
+                                .min({a: 1, b: "A"})
+                                .max({a: 2, b: 1})
+                                .collation({locale: "en_US", strength: 3})
+                                .sort({a: 1, b: 1})
+                                .itcount());
     }
 })();
