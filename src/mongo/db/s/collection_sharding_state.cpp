@@ -44,25 +44,30 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
+#include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
 
 namespace mongo {
 
 namespace {
 
+using std::string;
+
 /**
  * Used to perform shard identity initialization once it is certain that the document is committed.
  */
-class ShardIdentityLopOpHandler final : public RecoveryUnit::Change {
+class ShardIdentityLogOpHandler final : public RecoveryUnit::Change {
 public:
-    ShardIdentityLopOpHandler(OperationContext* txn, ShardIdentityType shardIdentity)
+    ShardIdentityLogOpHandler(OperationContext* txn, ShardIdentityType shardIdentity)
         : _txn(txn), _shardIdentity(std::move(shardIdentity)) {}
 
     void commit() override {
-        fassertNoTrace(
-            40071,
-            ShardingState::get(_txn)->initializeFromShardIdentity(_shardIdentity, Date_t::max()));
+        fassertNoTrace(40071,
+                       ShardingState::get(_txn)->initializeFromShardIdentity(
+                           _txn, _shardIdentity, Date_t::max()));
     }
 
     void rollback() override {}
@@ -72,13 +77,38 @@ private:
     const ShardIdentityType _shardIdentity;
 };
 
-}  // unnamed namespace
+/**
+ * Used by the config server for backwards compatibility with 3.2 mongos to upsert a shardIdentity
+ * document (and thereby perform shard aware initialization) on a newly added shard.
+ */
+class LegacyAddShardLogOpHandler final : public RecoveryUnit::Change {
+public:
+    LegacyAddShardLogOpHandler(OperationContext* txn, ShardType shardType)
+        : _txn(txn), _shardType(std::move(shardType)) {}
 
-using std::string;
+    void commit() override {
+        // Only the primary should complete the addShard process by upserting the shardIdentity on
+        // the new shard.
+        if (repl::getGlobalReplicationCoordinator()->getMemberState().primary()) {
+            uassertStatusOK(
+                Grid::get(_txn)->catalogManager()->upsertShardIdentityOnShard(_txn, _shardType));
+        }
+    }
+
+    void rollback() override {}
+
+private:
+    OperationContext* _txn;
+    const ShardType _shardType;
+};
+
+}  // unnamed namespace
 
 CollectionShardingState::CollectionShardingState(
     NamespaceString nss, std::unique_ptr<CollectionMetadata> initialMetadata)
-    : _nss(std::move(nss)), _metadata(std::move(initialMetadata)) {}
+    : _nss(std::move(nss)), _metadataManager{} {
+    _metadataManager.setActiveMetadata(std::move(initialMetadata));
+}
 
 CollectionShardingState::~CollectionShardingState() {
     invariant(!_sourceMgr);
@@ -98,13 +128,16 @@ CollectionShardingState* CollectionShardingState::get(OperationContext* txn,
     return shardingState->getNS(ns);
 }
 
-void CollectionShardingState::setMetadata(std::shared_ptr<CollectionMetadata> newMetadata) {
+ScopedCollectionMetadata CollectionShardingState::getMetadata() {
+    return _metadataManager.getActiveMetadata();
+}
+
+void CollectionShardingState::setMetadata(std::unique_ptr<CollectionMetadata> newMetadata) {
     if (newMetadata) {
         invariant(!newMetadata->getCollVersion().isWriteCompatibleWith(ChunkVersion::UNSHARDED()));
         invariant(!newMetadata->getShardVersion().isWriteCompatibleWith(ChunkVersion::UNSHARDED()));
     }
-
-    _metadata = std::move(newMetadata);
+    _metadataManager.setActiveMetadata(std::move(newMetadata));
 }
 
 MigrationSourceManager* CollectionShardingState::getMigrationSourceManager() {
@@ -127,7 +160,7 @@ void CollectionShardingState::clearMigrationSourceManager(OperationContext* txn)
     _sourceMgr = nullptr;
 }
 
-void CollectionShardingState::checkShardVersionOrThrow(OperationContext* txn) const {
+void CollectionShardingState::checkShardVersionOrThrow(OperationContext* txn) {
     string errmsg;
     ChunkVersion received;
     ChunkVersion wanted;
@@ -159,9 +192,22 @@ void CollectionShardingState::onInsertOp(OperationContext* txn, const BSONObj& i
         if (auto idElem = insertedDoc["_id"]) {
             if (idElem.str() == ShardIdentityType::IdName) {
                 auto shardIdentityDoc = uassertStatusOK(ShardIdentityType::fromBSON(insertedDoc));
+                uassertStatusOK(shardIdentityDoc.validate());
                 txn->recoveryUnit()->registerChange(
-                    new ShardIdentityLopOpHandler(txn, std::move(shardIdentityDoc)));
+                    new ShardIdentityLogOpHandler(txn, std::move(shardIdentityDoc)));
             }
+        }
+    }
+
+    // For backwards compatibility with 3.2 mongos, perform share aware initialization on a newly
+    // added shard on inserts to config.shards missing the "state" field. (On addShard, a 3.2
+    // mongos performs the insert into config.shards without a "state" field.)
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
+        _nss == ShardType::ConfigNS) {
+        if (insertedDoc[ShardType::state.name()].eoo()) {
+            const auto shardType = uassertStatusOK(ShardType::fromBSON(insertedDoc));
+            txn->recoveryUnit()->registerChange(
+                new LegacyAddShardLogOpHandler(txn, std::move(shardType)));
         }
     }
 
@@ -204,7 +250,7 @@ void CollectionShardingState::onDeleteOp(OperationContext* txn, const BSONObj& d
 bool CollectionShardingState::_checkShardVersionOk(OperationContext* txn,
                                                    string* errmsg,
                                                    ChunkVersion* expectedShardVersion,
-                                                   ChunkVersion* actualShardVersion) const {
+                                                   ChunkVersion* actualShardVersion) {
     Client* client = txn->getClient();
 
     // Operations using the DBDirectClient are unversioned.
@@ -240,7 +286,8 @@ bool CollectionShardingState::_checkShardVersionOk(OperationContext* txn,
     }
 
     // Set this for error messaging purposes before potentially returning false.
-    *actualShardVersion = (_metadata ? _metadata->getShardVersion() : ChunkVersion::UNSHARDED());
+    auto metadata = getMetadata();
+    *actualShardVersion = metadata ? metadata->getShardVersion() : ChunkVersion::UNSHARDED();
 
     if (_sourceMgr && _sourceMgr->getMigrationCriticalSectionSignal()) {
         *errmsg = str::stream() << "migration commit in progress for " << _nss.ns();

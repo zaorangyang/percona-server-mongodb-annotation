@@ -54,7 +54,6 @@
 #include "mongo/s/shard_util.h"
 #include "mongo/s/sharding_raii.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/represent_as.h"
 #include "mongo/util/timer.h"
@@ -196,7 +195,7 @@ Status executeSingleMigration(OperationContext* txn,
         maxChunkSizeBytes,
         secondaryThrottle,
         waitForDelete,
-        true);  // takeDistLock flag.
+        false);  // takeDistLock flag.
 
     appendOperationDeadlineIfSet(txn, &builder);
 
@@ -209,12 +208,61 @@ Status executeSingleMigration(OperationContext* txn,
         status = {ErrorCodes::ShardNotFound,
                   str::stream() << "shard " << migrateInfo.from << " not found"};
     } else {
-        StatusWith<Shard::CommandResponse> cmdStatus =
-            shard->runCommand(txn,
-                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                              "admin",
-                              cmdObj,
-                              Shard::RetryPolicy::kNotIdempotent);
+        const std::string whyMessage(
+            str::stream() << "migrating chunk " << ChunkRange(c->getMin(), c->getMax()).toString()
+                          << " in "
+                          << nss.ns());
+        StatusWith<Shard::CommandResponse> cmdStatus{ErrorCodes::InternalError, "Uninitialized"};
+
+        // Send the first moveChunk command with the balancer holding the distlock.
+        {
+            StatusWith<DistLockManager::ScopedDistLock> distLockStatus =
+                Grid::get(txn)->catalogClient(txn)->distLock(txn, nss.ns(), whyMessage);
+            if (!distLockStatus.isOK()) {
+                const std::string msg = str::stream()
+                    << "Could not acquire collection lock for " << nss.ns() << " to migrate chunk ["
+                    << c->getMin() << "," << c->getMax() << ") due to "
+                    << distLockStatus.getStatus().toString();
+                warning() << msg;
+                return {distLockStatus.getStatus().code(), msg};
+            }
+
+            cmdStatus = shard->runCommand(txn,
+                                          ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                          "admin",
+                                          cmdObj,
+                                          Shard::RetryPolicy::kNotIdempotent);
+        }
+
+        if (cmdStatus == ErrorCodes::LockBusy) {
+            // The moveChunk source shard attempted to take the distlock despite being told not to
+            // do so. The shard is likely v3.2 or earlier, which always expects to take the
+            // distlock. Reattempt the moveChunk without the balancer holding the distlock so that
+            // the shard can successfully acquire it.
+            BSONObjBuilder builder;
+            MoveChunkRequest::appendAsCommand(
+                &builder,
+                nss,
+                cm->getVersion(),
+                Grid::get(txn)->shardRegistry()->getConfigServerConnectionString(),
+                migrateInfo.from,
+                migrateInfo.to,
+                ChunkRange(c->getMin(), c->getMax()),
+                maxChunkSizeBytes,
+                secondaryThrottle,
+                waitForDelete,
+                true);  // takeDistLock flag.
+
+            appendOperationDeadlineIfSet(txn, &builder);
+
+            cmdObj = builder.obj();
+
+            cmdStatus = shard->runCommand(txn,
+                                          ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                          "admin",
+                                          cmdObj,
+                                          Shard::RetryPolicy::kIdempotent);
+        }
 
         if (!cmdStatus.isOK()) {
             status = std::move(cmdStatus.getStatus());
@@ -243,21 +291,13 @@ Status executeSingleMigration(OperationContext* txn,
     return Status::OK();
 }
 
-MONGO_FP_DECLARE(skipBalanceRound);
-
 }  // namespace
-
-const char* Balancer::kStateNames[kStateCount] = {"stopped", "running", "stopping"};
 
 Balancer::Balancer()
     : _balancedLastTime(0),
       _chunkSelectionPolicy(stdx::make_unique<BalancerChunkSelectionPolicyImpl>(
           stdx::make_unique<ClusterStatisticsImpl>())),
-      _clusterStats(stdx::make_unique<ClusterStatisticsImpl>()) {
-
-    static_assert((sizeof(kStateNames) / sizeof(kStateNames[0])) == kStateCount,
-                  "(sizeof(kStateNames) / sizeof(kStateNames[0])) == kStateCount");
-}
+      _clusterStats(stdx::make_unique<ClusterStatisticsImpl>()) {}
 
 Balancer::~Balancer() {
     // The balancer thread must have been stopped
@@ -323,6 +363,13 @@ void Balancer::joinThread() {
     }
 }
 
+void Balancer::joinCurrentRound(OperationContext* txn) {
+    stdx::unique_lock<stdx::mutex> scopedLock(_mutex);
+    const auto numRoundsAtStart = _numBalancerRounds;
+    _condVar.wait(scopedLock,
+                  [&] { return !_inBalancerRound || _numBalancerRounds != numRoundsAtStart; });
+}
+
 Status Balancer::rebalanceSingleChunk(OperationContext* txn, const ChunkType& chunk) {
     auto migrateStatus = _chunkSelectionPolicy->selectSpecificChunkToMove(txn, chunk);
     if (!migrateStatus.isOK()) {
@@ -366,9 +413,14 @@ Status Balancer::moveSingleChunk(OperationContext* txn,
                                   waitForDelete);
 }
 
-void Balancer::report(BSONObjBuilder* builder) {
+void Balancer::report(OperationContext* txn, BSONObjBuilder* builder) {
+    auto balancerConfig = Grid::get(txn)->getBalancerConfiguration();
+    balancerConfig->refreshAndCheck(txn);
+
+    const auto mode = balancerConfig->getBalancerMode();
+
     stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
-    builder->append("state", kStateNames[_state]);
+    builder->append("mode", BalancerSettingsType::kBalancerModes[mode]);
     builder->append("inBalancerRound", _inBalancerRound);
     builder->append("numBalancerRounds", _numBalancerRounds);
 }
@@ -382,8 +434,6 @@ void Balancer::_mainThread() {
 
     log() << "CSRS balancer is starting";
 
-    // TODO (SERVER-23096): Use the actual cluster id
-    const OID csrsBalancerLockSessionID{OID()};
     const Seconds kInitBackoffInterval(60);
 
     // The balancer thread is holding the balancer during its entire lifetime
@@ -392,13 +442,8 @@ void Balancer::_mainThread() {
     // Take the balancer distributed lock
     while (!_stopRequested() && !scopedBalancerLock) {
         auto shardingContext = Grid::get(txn.get());
-        auto scopedDistLock =
-            shardingContext->catalogClient(txn.get())->getDistLockManager()->lockWithSessionID(
-                txn.get(),
-                "balancer",
-                "CSRS balancer starting",
-                csrsBalancerLockSessionID,
-                DistLockManager::kSingleLockAttemptTimeout);
+        auto scopedDistLock = shardingContext->catalogClient(txn.get())->distLock(
+            txn.get(), "balancer", "CSRS Balancer");
         if (!scopedDistLock.isOK()) {
             warning() << "Balancer distributed lock could not be acquired and will be retried in "
                          "one minute"
@@ -411,7 +456,7 @@ void Balancer::_mainThread() {
         scopedBalancerLock = std::move(scopedDistLock.getValue());
     }
 
-    log() << "CSRS balancer started with instance id " << csrsBalancerLockSessionID;
+    log() << "CSRS balancer thread is now running";
 
     // Main balancer loop
     while (!_stopRequested()) {
@@ -423,6 +468,10 @@ void Balancer::_mainThread() {
         try {
             _beginRound(txn.get());
 
+            shardingContext->shardRegistry()->reload(txn.get());
+
+            uassert(13258, "oids broken after resetting!", _checkOIDs(txn.get()));
+
             Status refreshStatus = balancerConfig->refreshAndCheck(txn.get());
             if (!refreshStatus.isOK()) {
                 warning() << "Skipping balancing round" << causedBy(refreshStatus);
@@ -430,7 +479,7 @@ void Balancer::_mainThread() {
                 continue;
             }
 
-            if (!balancerConfig->isBalancerActive() || MONGO_FAIL_POINT(skipBalanceRound)) {
+            if (!balancerConfig->shouldBalance()) {
                 LOG(1) << "Skipping balancing round because balancing is disabled";
                 _endRound(txn.get(), kBalanceRoundDefaultInterval);
                 continue;
@@ -503,11 +552,9 @@ bool Balancer::_stopRequested() {
 }
 
 void Balancer::_beginRound(OperationContext* txn) {
-    Grid::get(txn)->shardRegistry()->reload(txn);
-    uassert(13258, "oids broken after resetting!", _checkOIDs(txn));
-
     stdx::unique_lock<stdx::mutex> lock(_mutex);
     _inBalancerRound = true;
+    _condVar.notify_all();
 }
 
 void Balancer::_endRound(OperationContext* txn, Seconds waitTimeout) {
@@ -515,6 +562,7 @@ void Balancer::_endRound(OperationContext* txn, Seconds waitTimeout) {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
         _inBalancerRound = false;
         _numBalancerRounds++;
+        _condVar.notify_all();
     }
 
     _sleepFor(txn, waitTimeout);
@@ -522,9 +570,7 @@ void Balancer::_endRound(OperationContext* txn, Seconds waitTimeout) {
 
 void Balancer::_sleepFor(OperationContext* txn, Seconds waitTimeout) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
-    if (_state == kRunning) {
-        _condVar.wait_for(lock, waitTimeout.toSystemDuration());
-    }
+    _condVar.wait_for(lock, waitTimeout.toSystemDuration(), [&] { return _state != kRunning; });
 }
 
 bool Balancer::_checkOIDs(OperationContext* txn) {
@@ -614,7 +660,7 @@ Status Balancer::_enforceTagRanges(OperationContext* txn) {
                                                                  splitInfo.collectionVersion,
                                                                  splitInfo.minKey,
                                                                  splitInfo.maxKey,
-                                                                 {splitInfo.splitKey});
+                                                                 splitInfo.splitKeys);
         if (!splitStatus.isOK()) {
             warning() << "Failed to enforce tag range for chunk " << splitInfo
                       << causedBy(splitStatus.getStatus());
@@ -634,7 +680,7 @@ int Balancer::_moveChunks(OperationContext* txn,
         auto balancerConfig = Grid::get(txn)->getBalancerConfiguration();
 
         // If the balancer was disabled since we started this round, don't start new chunk moves
-        if (_stopRequested() || !balancerConfig->isBalancerActive()) {
+        if (_stopRequested() || !balancerConfig->shouldBalance()) {
             LOG(1) << "Stopping balancing round early as balancing was disabled";
             return movedCount;
         }
@@ -662,21 +708,8 @@ int Balancer::_moveChunks(OperationContext* txn,
             } else if (status == ErrorCodes::ChunkTooBig) {
                 log() << "Performing a split because migrate failed for size reasons"
                       << causedBy(status);
-
-                auto scopedCM = uassertStatusOK(ScopedChunkManager::getExisting(txn, nss));
-                ChunkManager* const cm = scopedCM.cm();
-
-                auto c = cm->findIntersectingChunk(txn, migrateInfo.minKey);
-
-                auto splitStatus = c->split(txn, Chunk::normal, nullptr);
-                if (!splitStatus.isOK()) {
-                    log() << "Marking chunk " << c->toString() << " as jumbo.";
-
-                    c->markAsJumbo(txn);
-
-                    // We increment moveCount so we do another round right away
-                    movedCount++;
-                }
+                _splitOrMarkJumbo(txn, nss, migrateInfo.minKey);
+                movedCount++;
             } else {
                 log() << "Balancer move failed" << causedBy(status);
             }
@@ -686,6 +719,21 @@ int Balancer::_moveChunks(OperationContext* txn,
     }
 
     return movedCount;
+}
+
+void Balancer::_splitOrMarkJumbo(OperationContext* txn,
+                                 const NamespaceString& nss,
+                                 const BSONObj& minKey) {
+    auto scopedChunkManager = uassertStatusOK(ScopedChunkManager::getExisting(txn, nss));
+    ChunkManager* const chunkManager = scopedChunkManager.cm();
+
+    auto chunk = chunkManager->findIntersectingChunk(txn, minKey);
+
+    auto splitStatus = chunk->split(txn, Chunk::normal, nullptr);
+    if (!splitStatus.isOK()) {
+        log() << "Marking chunk " << chunk->toString() << " as jumbo.";
+        chunk->markAsJumbo(txn);
+    }
 }
 
 }  // namespace mongo

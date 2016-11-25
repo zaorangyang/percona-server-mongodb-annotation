@@ -48,10 +48,10 @@ namespace mongo {
 class BSONObj;
 class BSONObjBuilder;
 struct ChunkVersion;
-class CollectionMetadata;
 class CollectionShardingState;
 class ConnectionString;
 class OperationContext;
+class ScopedCollectionMetadata;
 class ServiceContext;
 class ShardIdentityType;
 class Status;
@@ -68,7 +68,8 @@ class ShardingState {
     MONGO_DISALLOW_COPYING(ShardingState);
 
 public:
-    using GlobalInitFunc = stdx::function<Status(const ConnectionString&)>;
+    using GlobalInitFunc =
+        stdx::function<Status(OperationContext*, const ConnectionString&, StringData)>;
 
     ShardingState();
     ~ShardingState();
@@ -125,7 +126,9 @@ public:
      *
      * Returns ErrorCodes::ExceededTimeLimit if deadline has passed.
      */
-    Status initializeFromShardIdentity(const ShardIdentityType& shardIdentity, Date_t deadline);
+    Status initializeFromShardIdentity(OperationContext* txn,
+                                       const ShardIdentityType& shardIdentity,
+                                       Date_t deadline);
 
     /**
      * Shuts down sharding machinery on the shard.
@@ -197,7 +200,7 @@ public:
 
     bool needCollectionMetadata(OperationContext* txn, const std::string& ns);
 
-    std::shared_ptr<CollectionMetadata> getCollectionMetadata(const std::string& ns);
+    ScopedCollectionMetadata getCollectionMetadata(const std::string& ns);
 
     /**
      * Updates the config server field of the shardIdentity document with the given connection

@@ -77,11 +77,13 @@ env.Library(
         "collation/collator_factory_icu_decoration.cpp",
         "find_common.cpp",
         "explain_common.cpp",
+        "parsed_distinct.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/util/fail_point",
         "collation/collator_icu",
+        "query_planner",
         "query_request",
     ],
 )
@@ -123,6 +125,7 @@ env.Library(
     target='command_request_response',
     source=[
         'count_request.cpp',
+        'cursor_request.cpp',
         'cursor_response.cpp',
         'find_and_modify_request.cpp',
         'getmore_request.cpp',
@@ -305,6 +308,7 @@ env.CppUnitTest(
         "plan_cache_indexability_test.cpp"
     ],
     LIBDEPS=[
+        "collation/collator_interface_mock",
         "query_planner",
     ],
 )

@@ -224,7 +224,7 @@ intrusive_ptr<Expression> Expression::parseExpression(BSONObj obj, const Variabl
     // Look up the parser associated with the expression name.
     const char* opName = obj.firstElementFieldName();
     auto op = parserMap.find(opName);
-    uassert(15999,
+    uassert(ErrorCodes::InvalidPipelineOperator,
             str::stream() << "Unrecognized expression '" << opName << "'",
             op != parserMap.end());
     return op->second(obj.firstElement(), vps);
@@ -456,7 +456,8 @@ intrusive_ptr<Expression> ExpressionAnd::optimize() {
      */
     bool last = pConst->getValue().coerceToBool();
     if (!last) {
-        intrusive_ptr<ExpressionConstant> pFinal(ExpressionConstant::create(Value(false)));
+        intrusive_ptr<ExpressionConstant> pFinal(
+            ExpressionConstant::create(getExpressionContext(), Value(false)));
         return pFinal;
     }
 
@@ -467,7 +468,8 @@ intrusive_ptr<Expression> ExpressionAnd::optimize() {
       the result will be a boolean.
      */
     if (n == 2) {
-        intrusive_ptr<Expression> pFinal(ExpressionCoerceToBool::create(pAnd->vpOperand[0]));
+        intrusive_ptr<Expression> pFinal(
+            ExpressionCoerceToBool::create(getExpressionContext(), pAnd->vpOperand[0]));
         return pFinal;
     }
 
@@ -612,8 +614,9 @@ const char* ExpressionCeil::getOpName() const {
 /* -------------------- ExpressionCoerceToBool ------------------------- */
 
 intrusive_ptr<ExpressionCoerceToBool> ExpressionCoerceToBool::create(
-    const intrusive_ptr<Expression>& pExpression) {
+    const intrusive_ptr<ExpressionContext>& expCtx, const intrusive_ptr<Expression>& pExpression) {
     intrusive_ptr<ExpressionCoerceToBool> pNew(new ExpressionCoerceToBool(pExpression));
+    pNew->injectExpressionContext(expCtx);
     return pNew;
 }
 
@@ -651,6 +654,11 @@ Value ExpressionCoerceToBool::serialize(bool explain) const {
     // will be optimized back into a ExpressionCoerceToBool.
     const char* name = explain ? "$coerceToBool" : "$and";
     return Value(DOC(name << DOC_ARRAY(pExpression->serialize(explain))));
+}
+
+void ExpressionCoerceToBool::doInjectExpressionContext() {
+    // Inject our ExpressionContext into the operand.
+    pExpression->injectExpressionContext(getExpressionContext());
 }
 
 /* ----------------------- ExpressionCompare --------------------------- */
@@ -854,8 +862,10 @@ intrusive_ptr<Expression> ExpressionConstant::parse(BSONElement exprElement,
 }
 
 
-intrusive_ptr<ExpressionConstant> ExpressionConstant::create(const Value& pValue) {
+intrusive_ptr<ExpressionConstant> ExpressionConstant::create(
+    const intrusive_ptr<ExpressionContext>& expCtx, const Value& pValue) {
     intrusive_ptr<ExpressionConstant> pEC(new ExpressionConstant(pValue));
+    pEC->injectExpressionContext(expCtx);
     return pEC;
 }
 
@@ -1084,6 +1094,10 @@ void ExpressionDateToString::addDependencies(DepsTracker* deps) const {
     _date->addDependencies(deps);
 }
 
+void ExpressionDateToString::doInjectExpressionContext() {
+    _date->injectExpressionContext(getExpressionContext());
+}
+
 /* ---------------------- ExpressionDayOfMonth ------------------------- */
 
 Value ExpressionDayOfMonth::evaluateInternal(Variables* vars) const {
@@ -1235,6 +1249,12 @@ Value ExpressionObject::serialize(bool explain) const {
     return outputDoc.freezeToValue();
 }
 
+void ExpressionObject::doInjectExpressionContext() {
+    for (auto&& pair : _expressions) {
+        pair.second->injectExpressionContext(getExpressionContext());
+    }
+}
+
 /* --------------------- ExpressionFieldPath --------------------------- */
 
 // this is the old deprecated version only used by tests not using variables
@@ -1379,7 +1399,6 @@ intrusive_ptr<Expression> ExpressionFilter::parse(BSONElement expr,
     }
 
     uassert(28648, "Missing 'input' parameter to $filter", !inputElem.eoo());
-    uassert(28649, "Missing 'as' parameter to $filter", !asElem.eoo());
     uassert(28650, "Missing 'cond' parameter to $filter", !condElem.eoo());
 
     // Parse "input", only has outer variables.
@@ -1387,7 +1406,10 @@ intrusive_ptr<Expression> ExpressionFilter::parse(BSONElement expr,
 
     // Parse "as".
     VariablesParseState vpsSub(vpsIn);  // vpsSub gets our variable, vpsIn doesn't.
-    string varName = asElem.str();
+
+    // If "as" is not specified, then use "this" by default.
+    auto varName = asElem.eoo() ? "this" : asElem.str();
+
     Variables::uassertValidNameForUserWrite(varName);
     Variables::Id varId = vpsSub.defineVariable(varName);
 
@@ -1450,6 +1472,11 @@ Value ExpressionFilter::evaluateInternal(Variables* vars) const {
 void ExpressionFilter::addDependencies(DepsTracker* deps) const {
     _input->addDependencies(deps);
     _filter->addDependencies(deps);
+}
+
+void ExpressionFilter::doInjectExpressionContext() {
+    _input->injectExpressionContext(getExpressionContext());
+    _filter->injectExpressionContext(getExpressionContext());
 }
 
 /* ------------------------- ExpressionFloor -------------------------- */
@@ -1567,6 +1594,10 @@ void ExpressionLet::addDependencies(DepsTracker* deps) const {
     _subExpression->addDependencies(deps);
 }
 
+void ExpressionLet::doInjectExpressionContext() {
+    _subExpression->injectExpressionContext(getExpressionContext());
+}
+
 
 /* ------------------------- ExpressionMap ----------------------------- */
 
@@ -1595,7 +1626,6 @@ intrusive_ptr<Expression> ExpressionMap::parse(BSONElement expr, const Variables
     }
 
     uassert(16880, "Missing 'input' parameter to $map", !inputElem.eoo());
-    uassert(16881, "Missing 'as' parameter to $map", !asElem.eoo());
     uassert(16882, "Missing 'in' parameter to $map", !inElem.eoo());
 
     // parse "input"
@@ -1603,7 +1633,10 @@ intrusive_ptr<Expression> ExpressionMap::parse(BSONElement expr, const Variables
 
     // parse "as"
     VariablesParseState vpsSub(vpsIn);  // vpsSub gets our vars, vpsIn doesn't.
-    string varName = asElem.str();
+
+    // If "as" is not specified, then use "this" by default.
+    auto varName = asElem.eoo() ? "this" : asElem.str();
+
     Variables::uassertValidNameForUserWrite(varName);
     Variables::Id varId = vpsSub.defineVariable(varName);
 
@@ -1666,6 +1699,11 @@ void ExpressionMap::addDependencies(DepsTracker* deps) const {
     _each->addDependencies(deps);
 }
 
+void ExpressionMap::doInjectExpressionContext() {
+    _input->injectExpressionContext(getExpressionContext());
+    _each->injectExpressionContext(getExpressionContext());
+}
+
 /* ------------------------- ExpressionMeta ----------------------------- */
 
 REGISTER_EXPRESSION(meta, ExpressionMeta::parse);
@@ -1708,7 +1746,7 @@ Value ExpressionMeta::evaluateInternal(Variables* vars) const {
 
 void ExpressionMeta::addDependencies(DepsTracker* deps) const {
     if (_metaType == MetaType::TEXT_SCORE) {
-        deps->needTextScore = true;
+        deps->setNeedTextScore(true);
     }
 }
 
@@ -1913,7 +1951,7 @@ Value ExpressionIn::evaluateInternal(Variables* vars) const {
                           << typeName(arrayOfValues.getType()),
             arrayOfValues.isArray());
     for (auto&& value : arrayOfValues.getArray()) {
-        if (argument == value) {
+        if (getExpressionContext()->getValueComparator().evaluate(argument == value)) {
             return Value(true);
         }
     }
@@ -1980,7 +2018,7 @@ Value ExpressionIndexOfArray::evaluateInternal(Variables* vars) const {
     }
 
     for (size_t i = startIndex; i < endIndex; i++) {
-        if (array[i] == searchItem) {
+        if (getExpressionContext()->getValueComparator().evaluate(array[i] == searchItem)) {
             return Value(static_cast<int>(i));
         }
     }
@@ -2256,7 +2294,8 @@ intrusive_ptr<Expression> ExpressionNary::optimize() {
     // expression.
     if (constOperandCount == vpOperand.size()) {
         Variables emptyVars;
-        return intrusive_ptr<Expression>(ExpressionConstant::create(evaluateInternal(&emptyVars)));
+        return intrusive_ptr<Expression>(
+            ExpressionConstant::create(getExpressionContext(), evaluateInternal(&emptyVars)));
     }
 
     // If the expression is associative, we can collapse all the consecutive constant operands into
@@ -2300,8 +2339,8 @@ intrusive_ptr<Expression> ExpressionNary::optimize() {
                     ExpressionVector vpOperandSave = std::move(vpOperand);
                     vpOperand = std::move(constExpressions);
                     Variables emptyVars;
-                    optimizedOperands.emplace_back(
-                        ExpressionConstant::create(evaluateInternal(&emptyVars)));
+                    optimizedOperands.emplace_back(ExpressionConstant::create(
+                        getExpressionContext(), evaluateInternal(&emptyVars)));
                     vpOperand = std::move(vpOperandSave);
                 } else {
                     optimizedOperands.insert(
@@ -2317,7 +2356,7 @@ intrusive_ptr<Expression> ExpressionNary::optimize() {
             vpOperand = std::move(constExpressions);
             Variables emptyVars;
             optimizedOperands.emplace_back(
-                ExpressionConstant::create(evaluateInternal(&emptyVars)));
+                ExpressionConstant::create(getExpressionContext(), evaluateInternal(&emptyVars)));
         } else {
             optimizedOperands.insert(
                 optimizedOperands.end(), constExpressions.begin(), constExpressions.end());
@@ -2346,6 +2385,12 @@ Value ExpressionNary::serialize(bool explain) const {
         array.push_back(vpOperand[i]->serialize(explain));
 
     return Value(DOC(getOpName() << array));
+}
+
+void ExpressionNary::doInjectExpressionContext() {
+    for (auto&& operand : vpOperand) {
+        operand->injectExpressionContext(getExpressionContext());
+    }
 }
 
 /* ------------------------- ExpressionNot ----------------------------- */
@@ -2403,7 +2448,8 @@ intrusive_ptr<Expression> ExpressionOr::optimize() {
      */
     bool last = pConst->getValue().coerceToBool();
     if (last) {
-        intrusive_ptr<ExpressionConstant> pFinal(ExpressionConstant::create(Value(true)));
+        intrusive_ptr<ExpressionConstant> pFinal(
+            ExpressionConstant::create(getExpressionContext(), Value(true)));
         return pFinal;
     }
 
@@ -2414,7 +2460,8 @@ intrusive_ptr<Expression> ExpressionOr::optimize() {
       the result will be a boolean.
      */
     if (n == 2) {
-        intrusive_ptr<Expression> pFinal(ExpressionCoerceToBool::create(pOr->vpOperand[0]));
+        intrusive_ptr<Expression> pFinal(
+            ExpressionCoerceToBool::create(getExpressionContext(), pOr->vpOperand[0]));
         return pFinal;
     }
 
@@ -2734,6 +2781,12 @@ Value ExpressionReduce::serialize(bool explain) const {
                                     {"in", _in->serialize(explain)}}}});
 }
 
+void ExpressionReduce::doInjectExpressionContext() {
+    _input->injectExpressionContext(getExpressionContext());
+    _initial->injectExpressionContext(getExpressionContext());
+    _in->injectExpressionContext(getExpressionContext());
+}
+
 /* ------------------------ ExpressionReverseArray ------------------------ */
 
 Value ExpressionReverseArray::evaluateInternal(Variables* vars) const {
@@ -2775,9 +2828,11 @@ const char* ExpressionSecond::getOpName() const {
 }
 
 namespace {
-ValueSet arrayToSet(const Value& val) {
+ValueSet arrayToSet(const Value& val, const ValueComparator& valueComparator) {
     const vector<Value>& array = val.getArray();
-    return ValueSet(array.begin(), array.end());
+    ValueSet valueSet = valueComparator.makeOrderedValueSet();
+    valueSet.insert(array.begin(), array.end());
+    return valueSet;
 }
 }
 
@@ -2802,7 +2857,7 @@ Value ExpressionSetDifference::evaluateInternal(Variables* vars) const {
                           << typeName(rhs.getType()),
             rhs.isArray());
 
-    ValueSet rhsSet = arrayToSet(rhs);
+    ValueSet rhsSet = arrayToSet(rhs, getExpressionContext()->getValueComparator());
     const vector<Value>& lhsArray = lhs.getArray();
     vector<Value> returnVec;
 
@@ -2831,7 +2886,8 @@ void ExpressionSetEquals::validateArguments(const ExpressionVector& args) const 
 
 Value ExpressionSetEquals::evaluateInternal(Variables* vars) const {
     const size_t n = vpOperand.size();
-    std::set<Value> lhs;
+    const auto& valueComparator = getExpressionContext()->getValueComparator();
+    ValueSet lhs = valueComparator.makeOrderedValueSet();
 
     for (size_t i = 0; i < n; i++) {
         const Value nextEntry = vpOperand[i]->evaluateInternal(vars);
@@ -2844,8 +2900,13 @@ Value ExpressionSetEquals::evaluateInternal(Variables* vars) const {
         if (i == 0) {
             lhs.insert(nextEntry.getArray().begin(), nextEntry.getArray().end());
         } else {
-            const std::set<Value> rhs(nextEntry.getArray().begin(), nextEntry.getArray().end());
-            if (lhs != rhs) {
+            ValueSet rhs = valueComparator.makeOrderedValueSet();
+            rhs.insert(nextEntry.getArray().begin(), nextEntry.getArray().end());
+            if (lhs.size() != rhs.size()) {
+                return Value(false);
+            }
+
+            if (!std::equal(lhs.begin(), lhs.end(), rhs.begin(), valueComparator.getEqualTo())) {
                 return Value(false);
             }
         }
@@ -2862,7 +2923,8 @@ const char* ExpressionSetEquals::getOpName() const {
 
 Value ExpressionSetIntersection::evaluateInternal(Variables* vars) const {
     const size_t n = vpOperand.size();
-    ValueSet currentIntersection;
+    const auto& valueComparator = getExpressionContext()->getValueComparator();
+    ValueSet currentIntersection = valueComparator.makeOrderedValueSet();
     for (size_t i = 0; i < n; i++) {
         const Value nextEntry = vpOperand[i]->evaluateInternal(vars);
         if (nextEntry.nullish()) {
@@ -2877,7 +2939,7 @@ Value ExpressionSetIntersection::evaluateInternal(Variables* vars) const {
         if (i == 0) {
             currentIntersection.insert(nextEntry.getArray().begin(), nextEntry.getArray().end());
         } else {
-            ValueSet nextSet = arrayToSet(nextEntry);
+            ValueSet nextSet = arrayToSet(nextEntry, valueComparator);
             if (currentIntersection.size() > nextSet.size()) {
                 // to iterate over whichever is the smaller set
                 nextSet.swap(currentIntersection);
@@ -2935,7 +2997,8 @@ Value ExpressionSetIsSubset::evaluateInternal(Variables* vars) const {
                           << typeName(rhs.getType()),
             rhs.isArray());
 
-    return setIsSubsetHelper(lhs.getArray(), arrayToSet(rhs));
+    return setIsSubsetHelper(lhs.getArray(),
+                             arrayToSet(rhs, getExpressionContext()->getValueComparator()));
 }
 
 /**
@@ -2984,7 +3047,10 @@ intrusive_ptr<Expression> ExpressionSetIsSubset::optimize() {
                               << typeName(rhs.getType()),
                 rhs.isArray());
 
-        return new Optimized(arrayToSet(rhs), vpOperand);
+        intrusive_ptr<Expression> optimizedWithConstant(new Optimized(
+            arrayToSet(rhs, getExpressionContext()->getValueComparator()), vpOperand));
+        optimizedWithConstant->injectExpressionContext(getExpressionContext());
+        return optimizedWithConstant;
     }
     return optimized;
 }
@@ -2997,7 +3063,7 @@ const char* ExpressionSetIsSubset::getOpName() const {
 /* ----------------------- ExpressionSetUnion ---------------------------- */
 
 Value ExpressionSetUnion::evaluateInternal(Variables* vars) const {
-    ValueSet unionedSet;
+    ValueSet unionedSet = getExpressionContext()->getValueComparator().makeOrderedValueSet();
     const size_t n = vpOperand.size();
     for (size_t i = 0; i < n; i++) {
         const Value newEntries = vpOperand[i]->evaluateInternal(vars);
@@ -3602,6 +3668,17 @@ Value ExpressionSwitch::serialize(bool explain) const {
     return Value(Document{{"$switch", Document{{"branches", Value(serializedBranches)}}}});
 }
 
+void ExpressionSwitch::doInjectExpressionContext() {
+    if (_default) {
+        _default->injectExpressionContext(getExpressionContext());
+    }
+
+    for (auto&& pair : _branches) {
+        pair.first->injectExpressionContext(getExpressionContext());
+        pair.second->injectExpressionContext(getExpressionContext());
+    }
+}
+
 /* ------------------------- ExpressionToLower ----------------------------- */
 
 Value ExpressionToLower::evaluateInternal(Variables* vars) const {
@@ -4026,6 +4103,16 @@ void ExpressionZip::addDependencies(DepsTracker* deps) const {
                   [&deps](intrusive_ptr<Expression> defaultExpression) -> void {
                       defaultExpression->addDependencies(deps);
                   });
+}
+
+void ExpressionZip::doInjectExpressionContext() {
+    for (auto&& expr : _inputs) {
+        expr->injectExpressionContext(getExpressionContext());
+    }
+
+    for (auto&& expr : _defaults) {
+        expr->injectExpressionContext(getExpressionContext());
+    }
 }
 
 const char* ExpressionZip::getOpName() const {

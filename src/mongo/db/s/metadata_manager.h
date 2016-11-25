@@ -34,6 +34,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -44,6 +45,7 @@ class MetadataManager {
 
 public:
     MetadataManager();
+    ~MetadataManager();
 
     /**
      * An ActiveMetadata must be set before this function can be called.
@@ -99,7 +101,10 @@ private:
      * Removes the CollectionMetadata stored in the tracker from the _metadataInUse
      * list (if it's there).
      */
-    void _removeMetadata(CollectionMetadataTracker* metadataTracker);
+    void _removeMetadata_inlock(CollectionMetadataTracker* metadataTracker);
+
+    void _addRangeToClean_inlock(const ChunkRange& range);
+    void _removeRangeToClean_inlock(const ChunkRange& range);
 
     std::unique_ptr<CollectionMetadataTracker> _activeMetadataTracker;
 
@@ -109,12 +114,20 @@ private:
     // be deleted from the shard. The map is from the minimum value of the
     // range to be deleted (e.g. BSON("key" << 0)) to the entire chunk range.
     std::map<BSONObj, ChunkRange> _rangesToClean;
+
+    stdx::mutex _managerLock;
 };
 
 class ScopedCollectionMetadata {
     MONGO_DISALLOW_COPYING(ScopedCollectionMetadata);
 
 public:
+    /**
+     * Creates an empty ScopedCollectionMetadata. Using the default constructor means that no
+     * metadata is available.
+     */
+    ScopedCollectionMetadata();
+
     /**
      * Decrements the usageCounter and conditionally makes a call to _removeMetadata on
      * the tracker if the count has reached zero.
@@ -130,6 +143,9 @@ public:
     CollectionMetadata* operator->();
     CollectionMetadata* getMetadata();
 
+    /** True if the ScopedCollectionMetadata stores a metadata (is not empty) */
+    operator bool() const;
+
 private:
     friend ScopedCollectionMetadata MetadataManager::getActiveMetadata();
 
@@ -139,8 +155,8 @@ private:
     ScopedCollectionMetadata(MetadataManager* manager,
                              MetadataManager::CollectionMetadataTracker* tracker);
 
-    MetadataManager* _manager;
-    MetadataManager::CollectionMetadataTracker* _tracker;
+    MetadataManager* _manager{nullptr};
+    MetadataManager::CollectionMetadataTracker* _tracker{nullptr};
 };
 
 }  // namespace mongo

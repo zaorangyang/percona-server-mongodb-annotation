@@ -122,6 +122,12 @@ intrusive_ptr<DocumentSource> DocumentSourceFacet::optimize() {
     return this;
 }
 
+void DocumentSourceFacet::doInjectExpressionContext() {
+    for (auto&& facet : _facetPipelines) {
+        facet.second->injectExpressionContext(pExpCtx);
+    }
+}
+
 void DocumentSourceFacet::doInjectMongodInterface(std::shared_ptr<MongodInterface> mongod) {
     for (auto&& facet : _facetPipelines) {
         for (auto&& stage : facet.second->getSources()) {
@@ -142,6 +148,25 @@ void DocumentSourceFacet::doReattachToOperationContext(OperationContext* opCtx) 
     for (auto&& facet : _facetPipelines) {
         facet.second->reattachToOperationContext(opCtx);
     }
+}
+
+DocumentSource::GetDepsReturn DocumentSourceFacet::getDependencies(DepsTracker* deps) const {
+    for (auto&& facet : _facetPipelines) {
+        auto subDepsTracker = facet.second->getDependencies(deps->getMetadataAvailable());
+
+        deps->fields.insert(subDepsTracker.fields.begin(), subDepsTracker.fields.end());
+
+        deps->needWholeDocument = deps->needWholeDocument || subDepsTracker.needWholeDocument;
+        deps->setNeedTextScore(deps->getNeedTextScore() || subDepsTracker.getNeedTextScore());
+
+        if (deps->needWholeDocument && deps->getNeedTextScore()) {
+            break;
+        }
+    }
+
+    // We will combine multiple documents into one, and the output document will have new fields, so
+    // we will stop looking for dependencies at this point.
+    return GetDepsReturn::EXHAUSTIVE_ALL;
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceFacet::createFromBson(

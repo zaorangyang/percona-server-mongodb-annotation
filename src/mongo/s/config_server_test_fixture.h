@@ -42,7 +42,7 @@ class BSONObj;
 class CatalogCache;
 struct ChunkVersion;
 class CollectionType;
-class DistLockManagerMock;
+class ReplSetDistLockManager;
 class NamespaceString;
 class Shard;
 class ShardFactoryMock;
@@ -100,7 +100,7 @@ public:
 
     MessagingPortMock* getMessagingPort() const;
 
-    DistLockManagerMock* distLock() const;
+    ReplSetDistLockManager* distLock() const;
 
     OperationContext* operationContext() const;
 
@@ -110,6 +110,13 @@ public:
     Status insertToConfigCollection(OperationContext* txn,
                                     const NamespaceString& ns,
                                     const BSONObj& doc);
+
+    /**
+     * Reads a single document from a collection living on the config server.
+     */
+    StatusWith<BSONObj> findOneOnConfigCollection(OperationContext* txn,
+                                                  const NamespaceString& ns,
+                                                  const BSONObj& filter);
 
     /**
      * Blocking methods, which receive one message from the network and respond using the
@@ -134,6 +141,11 @@ public:
      * Returns {ErrorCodes::ShardNotFound} if the given shard does not exists.
      */
     StatusWith<ShardType> getShardDoc(OperationContext* txn, const std::string& shardId);
+
+    /**
+     * Returns the indexes definitions defined on a given collection.
+     */
+    StatusWith<std::vector<BSONObj>> getIndexes(OperationContext* txn, const NamespaceString& ns);
 
     void setUp() override;
 
@@ -160,7 +172,7 @@ private:
     executor::TaskExecutor* _executorForAddShard;
     std::unique_ptr<executor::NetworkTestEnv> _networkTestEnv;
     std::unique_ptr<executor::NetworkTestEnv> _addShardNetworkTestEnv;
-    DistLockManagerMock* _distLockManager = nullptr;
+    ReplSetDistLockManager* _distLockManager = nullptr;
     ShardingCatalogClientImpl* _catalogClient = nullptr;
     ShardingCatalogManagerImpl* _catalogManager = nullptr;
 };

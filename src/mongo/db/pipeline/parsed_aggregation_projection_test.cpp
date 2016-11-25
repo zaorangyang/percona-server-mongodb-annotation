@@ -187,11 +187,23 @@ TEST(ParsedAggregationProjectionType, ShouldRejectMixOfExclusionAndComputedField
         UserException);
 
     ASSERT_THROWS(
+        ParsedAggregationProjection::create(BSON("a" << wrapInLiteral(1) << "b" << false)),
+        UserException);
+
+    ASSERT_THROWS(
         ParsedAggregationProjection::create(BSON("a.b" << false << "a.c" << wrapInLiteral(1))),
+        UserException);
+
+    ASSERT_THROWS(
+        ParsedAggregationProjection::create(BSON("a.b" << wrapInLiteral(1) << "a.c" << false)),
         UserException);
 
     ASSERT_THROWS(ParsedAggregationProjection::create(
                       BSON("a" << BSON("b" << false << "c" << wrapInLiteral(1)))),
+                  UserException);
+
+    ASSERT_THROWS(ParsedAggregationProjection::create(
+                      BSON("a" << BSON("b" << wrapInLiteral(1) << "c" << false))),
                   UserException);
 }
 
@@ -202,7 +214,23 @@ TEST(ParsedAggregationProjectionErrors, ShouldRejectDottedFieldInSubDocument) {
                   UserException);
 }
 
-TEST(ParsedAggregationProjectionErrors, ShouldRejectTopLevelExpression) {
+TEST(ParsedAggregationProjectionErrors, ShouldRejectFieldNamesStartingWithADollar) {
+    ASSERT_THROWS(ParsedAggregationProjection::create(BSON("$dollar" << 0)), UserException);
+    ASSERT_THROWS(ParsedAggregationProjection::create(BSON("$dollar" << 1)), UserException);
+
+    ASSERT_THROWS(ParsedAggregationProjection::create(BSON("b.$dollar" << 0)), UserException);
+    ASSERT_THROWS(ParsedAggregationProjection::create(BSON("b.$dollar" << 1)), UserException);
+
+    ASSERT_THROWS(ParsedAggregationProjection::create(BSON("b" << BSON("$dollar" << 0))),
+                  UserException);
+    ASSERT_THROWS(ParsedAggregationProjection::create(BSON("b" << BSON("$dollar" << 1))),
+                  UserException);
+
+    ASSERT_THROWS(ParsedAggregationProjection::create(BSON("$add" << 0)), UserException);
+    ASSERT_THROWS(ParsedAggregationProjection::create(BSON("$add" << 1)), UserException);
+}
+
+TEST(ParsedAggregationProjectionErrors, ShouldRejectTopLevelExpressions) {
     ASSERT_THROWS(ParsedAggregationProjection::create(BSON("$add" << BSON_ARRAY(4 << 2))),
                   UserException);
 }

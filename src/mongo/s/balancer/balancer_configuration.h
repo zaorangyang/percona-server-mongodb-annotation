@@ -51,13 +51,24 @@ class StatusWith;
  *
  * balancer: {
  *  stopped: <true|false>,
+ *  mode: <full|autoSplitOnly|off>,         // Only consulted if "stopped" is missing or false
  *  activeWindow: { start: "<HH:MM>", stop: "<HH:MM>" }
  * }
  */
 class BalancerSettingsType {
 public:
+    // Supported balancer modes
+    enum BalancerMode {
+        kFull,           // Balancer will always try to keep the cluster even
+        kAutoSplitOnly,  // Only balance on auto splits
+        kOff,            // Balancer is completely off
+    };
+
     // The key under which this setting is stored on the config server
     static const char kKey[];
+
+    // String representation of the balancer modes
+    static const char* kBalancerModes[];
 
     /**
      * Constructs a settings object with the default values. To be used when no balancer settings
@@ -73,8 +84,8 @@ public:
     /**
      * Returns whether the balancer is enabled.
      */
-    bool shouldBalance() const {
-        return _shouldBalance;
+    BalancerMode getMode() const {
+        return _mode;
     }
 
     /**
@@ -99,7 +110,7 @@ public:
 private:
     BalancerSettingsType();
 
-    bool _shouldBalance{true};
+    BalancerMode _mode{kFull};
 
     boost::optional<boost::posix_time::ptime> _activeWindowStart;
     boost::optional<boost::posix_time::ptime> _activeWindowStop;
@@ -150,6 +161,37 @@ private:
 };
 
 /**
+ * Utility class to parse the sharding autoSplit settings document, which has the following format:
+ *
+ * autosplit: { enabled: <true|false> }
+ */
+class AutoSplitSettingsType {
+public:
+    // The key under which this setting is stored on the config server
+    static const char kKey[];
+
+    /**
+     * Constructs a settings object with the default values. To be used when no AutoSplit settings
+     * have been specified.
+     */
+    static AutoSplitSettingsType createDefault();
+
+    /**
+     * Interprets the BSON content as autosplit settings and extracts the respective values
+     */
+    static StatusWith<AutoSplitSettingsType> fromBSON(const BSONObj& obj);
+
+    bool getShouldAutoSplit() const {
+        return _shouldAutoSplit;
+    }
+
+private:
+    AutoSplitSettingsType();
+
+    bool _shouldAutoSplit{true};
+};
+
+/**
  * Contains settings, which control the behaviour of the balancer.
  */
 class BalancerConfiguration {
@@ -164,15 +206,22 @@ public:
     ~BalancerConfiguration();
 
     /**
-     * Synchronous method, which writes the balancer active state to the configuration data.
+     * Non-blocking method, which checks whether the balancer is enabled (without checking for the
+     * balancing window).
      */
-    Status setBalancerActive(OperationContext* txn, bool active);
+    BalancerSettingsType::BalancerMode getBalancerMode() const;
+
+    /**
+     * Synchronous method, which writes the balancer mode to the configuration data.
+     */
+    Status setBalancerMode(OperationContext* txn, BalancerSettingsType::BalancerMode mode);
 
     /**
      * Returns whether balancing is allowed based on both the enabled state of the balancer and the
      * balancing window.
      */
-    bool isBalancerActive() const;
+    bool shouldBalance() const;
+    bool shouldBalanceForAutoSplit() const;
 
     /**
      * Returns the secondary throttle options for the balancer.
@@ -192,10 +241,15 @@ public:
         return _maxChunkSizeBytes.loadRelaxed();
     }
 
+    bool getShouldAutoSplit() const {
+        return _shouldAutoSplit.loadRelaxed();
+    }
+
     /**
      * Blocking method, which refreshes the balancer configuration from the settings in the
      * config.settings collection. It will stop at the first bad configuration value and return an
-     * error indicating what failed.
+     * error indicating what failed. The value for the bad configuration and the ones after it will
+     * remain unchanged.
      *
      * This method is thread-safe but it doesn't make sense to be called from more than one thread
      * at a time.
@@ -216,6 +270,12 @@ private:
      */
     Status _refreshChunkSizeSettings(OperationContext* txn);
 
+    /**
+     * Reloads the autosplit configuration from the settings document. Fails if the settings
+     * document cannot be read.
+     */
+    Status _refreshAutoSplitSettings(OperationContext* txn);
+
     // The latest read balancer settings and a mutex to protect its swaps
     mutable stdx::mutex _balancerSettingsMutex;
     BalancerSettingsType _balancerSettings;
@@ -223,6 +283,7 @@ private:
     // Max chunk size after which a chunk would be considered jumbo and won't be moved. This value
     // is read on the critical path after each write operation, that's why it is cached.
     AtomicUInt64 _maxChunkSizeBytes;
+    AtomicBool _shouldAutoSplit;
 };
 
 }  // namespace mongo

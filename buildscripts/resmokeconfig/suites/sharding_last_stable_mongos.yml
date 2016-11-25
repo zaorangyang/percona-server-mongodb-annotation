@@ -11,6 +11,9 @@ selector:
     - jstests/sharding/shard_aware_primary_failover.js
     - jstests/sharding/shard_identity_config_update.js
     - jstests/sharding/add_shard_to_zone.js
+    - jstests/sharding/remove_shard_from_zone.js
+    # v3.4 replace noAutoSplit flag with document in config.settings
+    - jstests/sharding/disable_autosplit.js
     # v3.4 changes $in shard key extraction.
     - jstests/sharding/upsert_sharded.js
     - jstests/sharding/update_sharded.js
@@ -22,12 +25,20 @@ selector:
     - jstests/sharding/commands_that_write_accept_wc_shards.js
     # NumInitialChunks verification changed. See SERVER-23327.
     - jstests/sharding/shard_collection_verify_initial_chunks.js
+    # avgObjSize scaling behavior fixed. See SERVER-19533.
+    - jstests/sharding/stats.js
     # TODO: Enable when SERVER-22672 is complete
     - jstests/sharding/printShardingStatus.js
     # TODO: Change in error reporting, enable when 3.4 becomes 'last-stable'.
     - jstests/sharding/map_reduce_validation.js
     # TODO Assumes mapReduce can handle the collation option; enable when 3.4 becomes 'last-stable'.
     - jstests/sharding/mapReduce_inSharded.js
+    # TODO Assumes shardCollection can handle the collation option; enable when 3.4 becomes
+    # 'last-stable'.
+    - jstests/sharding/shard_collection_basic.js
+    # TODO Requires mongos to have the 'clientCursorMonitorFrequencySecs' server parameter; enable
+    # when 3.4 becomes 'last-stable'.
+    - jstests/sharding/cursor_timeout.js
 
 executor:
   js_test:

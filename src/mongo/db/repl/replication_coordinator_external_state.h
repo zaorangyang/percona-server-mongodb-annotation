@@ -43,6 +43,7 @@ namespace mongo {
 
 class BSONObj;
 class OID;
+class OldThreadPool;
 class OperationContext;
 class ServiceContext;
 class SnapshotName;
@@ -111,6 +112,16 @@ public:
      * the threads it started.
      */
     virtual void shutdown(OperationContext* txn) = 0;
+
+    /**
+     * Returns task executor for scheduling tasks to be run asynchronously.
+     */
+    virtual executor::TaskExecutor* getTaskExecutor() const = 0;
+
+    /**
+     * Returns shared db worker thread pool for collection cloning.
+     */
+    virtual OldThreadPool* getDbWorkThreadPool() const = 0;
 
     /**
      * Creates the oplog, writes the first entry and stores the replica set config document.
@@ -187,8 +198,8 @@ public:
     virtual HostAndPort getClientHostAndPort(const OperationContext* txn) = 0;
 
     /**
-     * Closes all connections except those marked with the keepOpen property, which should
-     * just be connections used for heartbeating.
+     * Closes all connections in the given TransportLayer except those marked with the
+     * keepOpen property, which should just be connections used for heartbeating.
      * This is used during stepdown, and transition out of primary.
      */
     virtual void closeConnections() = 0;

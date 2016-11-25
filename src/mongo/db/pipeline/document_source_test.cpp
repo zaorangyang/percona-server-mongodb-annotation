@@ -33,6 +33,7 @@
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/service_context.h"
@@ -179,17 +180,17 @@ public:
         }
         {
             const char* array[] = {"a"};  // needTextScore with needWholeDocument
-            DepsTracker deps;
+            DepsTracker deps(DepsTracker::MetadataAvailable::kTextScore);
             deps.fields = arrayToSet(array);
             deps.needWholeDocument = true;
-            deps.needTextScore = true;
+            deps.setNeedTextScore(true);
             ASSERT_EQUALS(deps.toProjection(), BSON(Document::metaFieldTextScore << metaTextScore));
         }
         {
             const char* array[] = {"a"};  // needTextScore without needWholeDocument
-            DepsTracker deps;
+            DepsTracker deps(DepsTracker::MetadataAvailable::kTextScore);
             deps.fields = arrayToSet(array);
-            deps.needTextScore = true;
+            deps.setNeedTextScore(true);
             ASSERT_EQUALS(
                 deps.toProjection(),
                 BSON(Document::metaFieldTextScore << metaTextScore << "a" << 1 << "_id" << 0));
@@ -230,27 +231,27 @@ private:
 TEST(Mock, OneDoc) {
     auto doc = DOC("a" << 1);
     auto source = DocumentSourceMock::create(doc);
-    ASSERT_EQ(*source->getNext(), doc);
+    ASSERT_DOCUMENT_EQ(*source->getNext(), doc);
     ASSERT(!source->getNext());
 }
 
 TEST(Mock, DequeDocuments) {
     auto source = DocumentSourceMock::create({DOC("a" << 1), DOC("a" << 2)});
-    ASSERT_EQ(*source->getNext(), DOC("a" << 1));
-    ASSERT_EQ(*source->getNext(), DOC("a" << 2));
+    ASSERT_DOCUMENT_EQ(*source->getNext(), DOC("a" << 1));
+    ASSERT_DOCUMENT_EQ(*source->getNext(), DOC("a" << 2));
     ASSERT(!source->getNext());
 }
 
 TEST(Mock, StringJSON) {
     auto source = DocumentSourceMock::create("{a : 1}");
-    ASSERT_EQ(*source->getNext(), DOC("a" << 1));
+    ASSERT_DOCUMENT_EQ(*source->getNext(), DOC("a" << 1));
     ASSERT(!source->getNext());
 }
 
 TEST(Mock, DequeStringJSONs) {
     auto source = DocumentSourceMock::create({"{a: 1}", "{a: 2}"});
-    ASSERT_EQ(*source->getNext(), DOC("a" << 1));
-    ASSERT_EQ(*source->getNext(), DOC("a" << 2));
+    ASSERT_DOCUMENT_EQ(*source->getNext(), DOC("a" << 1));
+    ASSERT_DOCUMENT_EQ(*source->getNext(), DOC("a" << 2));
     ASSERT(!source->getNext());
 }
 
@@ -331,7 +332,7 @@ public:
         // The limit's result is as expected.
         boost::optional<Document> next = limit()->getNext();
         ASSERT(bool(next));
-        ASSERT_EQUALS(Value(1), next->getField("a"));
+        ASSERT_VALUE_EQ(Value(1), next->getField("a"));
         // The limit is exhausted.
         ASSERT(!limit()->getNext());
     }
@@ -373,7 +374,7 @@ public:
         // The limit is not exhauted.
         boost::optional<Document> next = limit()->getNext();
         ASSERT(bool(next));
-        ASSERT_EQUALS(Value(1), next->getField("a"));
+        ASSERT_VALUE_EQ(Value(1), next->getField("a"));
         // The limit is exhausted.
         ASSERT(!limit()->getNext());
     }
@@ -388,7 +389,7 @@ public:
         ASSERT_EQUALS(DocumentSource::SEE_NEXT, limit()->getDependencies(&dependencies));
         ASSERT_EQUALS(0U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -458,6 +459,7 @@ protected:
         expressionContext->tempDir = _tempDir.path();
 
         _group = DocumentSourceGroup::createFromBson(specElement, expressionContext);
+        _group->injectExpressionContext(expressionContext);
         assertRoundTrips(_group);
     }
     DocumentSourceGroup* group() {
@@ -998,7 +1000,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("u"));
         ASSERT_EQUALS(1U, dependencies.fields.count("v"));
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -1014,19 +1016,19 @@ public:
 
         auto res = group()->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("_id"), Value(0));
+        ASSERT_VALUE_EQ(res->getField("_id"), Value(0));
 
         ASSERT_TRUE(group()->isStreaming());
 
         res = source->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("a"), Value(1));
+        ASSERT_VALUE_EQ(res->getField("a"), Value(1));
 
         assertExhausted(source);
 
         res = group()->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("_id"), Value(1));
+        ASSERT_VALUE_EQ(res->getField("_id"), Value(1));
 
         assertExhausted(group());
 
@@ -1049,20 +1051,20 @@ public:
 
         auto res = group()->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("_id")["x"], Value(1));
-        ASSERT_EQUALS(res->getField("_id")["y"], Value(2));
+        ASSERT_VALUE_EQ(res->getField("_id")["x"], Value(1));
+        ASSERT_VALUE_EQ(res->getField("_id")["y"], Value(2));
 
         ASSERT_TRUE(group()->isStreaming());
 
         res = group()->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("_id")["x"], Value(1));
-        ASSERT_EQUALS(res->getField("_id")["y"], Value(1));
+        ASSERT_VALUE_EQ(res->getField("_id")["x"], Value(1));
+        ASSERT_VALUE_EQ(res->getField("_id")["y"], Value(1));
 
         res = source->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("a"), Value(2));
-        ASSERT_EQUALS(res->getField("b"), Value(1));
+        ASSERT_VALUE_EQ(res->getField("a"), Value(2));
+        ASSERT_VALUE_EQ(res->getField("b"), Value(1));
 
         assertExhausted(source);
 
@@ -1089,13 +1091,13 @@ public:
 
         auto res = group()->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("_id")["x"]["y"]["z"], Value(3));
+        ASSERT_VALUE_EQ(res->getField("_id")["x"]["y"]["z"], Value(3));
 
         ASSERT_TRUE(group()->isStreaming());
 
         res = source->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("a")["b"]["c"], Value(1));
+        ASSERT_VALUE_EQ(res->getField("a")["b"]["c"], Value(1));
 
         assertExhausted(source);
 
@@ -1125,16 +1127,16 @@ public:
 
         auto res = group()->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("_id")["sub"]["x"], Value(1));
-        ASSERT_EQUALS(res->getField("_id")["sub"]["y"], Value(1));
-        ASSERT_EQUALS(res->getField("_id")["sub"]["z"], Value(1));
+        ASSERT_VALUE_EQ(res->getField("_id")["sub"]["x"], Value(1));
+        ASSERT_VALUE_EQ(res->getField("_id")["sub"]["y"], Value(1));
+        ASSERT_VALUE_EQ(res->getField("_id")["sub"]["z"], Value(1));
 
         ASSERT_TRUE(group()->isStreaming());
 
         res = source->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("a"), Value(2));
-        ASSERT_EQUALS(res->getField("b"), Value(3));
+        ASSERT_VALUE_EQ(res->getField("a"), Value(2));
+        ASSERT_VALUE_EQ(res->getField("b"), Value(3));
 
         BSONObjSet outputSort = group()->getOutputSorts();
 
@@ -1160,16 +1162,16 @@ public:
 
         auto res = group()->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("_id")["sub"]["x"], Value(5));
-        ASSERT_EQUALS(res->getField("_id")["sub"]["y"], Value(1));
-        ASSERT_EQUALS(res->getField("_id")["sub"]["z"], Value("c"));
+        ASSERT_VALUE_EQ(res->getField("_id")["sub"]["x"], Value(5));
+        ASSERT_VALUE_EQ(res->getField("_id")["sub"]["y"], Value(1));
+        ASSERT_VALUE_EQ(res->getField("_id")["sub"]["z"], Value("c"));
 
         ASSERT_TRUE(group()->isStreaming());
 
         res = source->getNext();
         ASSERT_TRUE(bool(res));
-        ASSERT_EQUALS(res->getField("a"), Value(3));
-        ASSERT_EQUALS(res->getField("b"), Value(1));
+        ASSERT_VALUE_EQ(res->getField("a"), Value(3));
+        ASSERT_VALUE_EQ(res->getField("b"), Value(1));
 
         BSONObjSet outputSort = group()->getOutputSorts();
         ASSERT_EQUALS(outputSort.size(), 2U);
@@ -1470,7 +1472,7 @@ TEST_F(ProjectStageTest, ExclusionShouldBeAbleToProcessMultipleDocuments) {
 
 TEST_F(ProjectStageTest, InclusionShouldAddDependenciesOfIncludedAndComputedFields) {
     createProject(fromjson("{a: true, x: '$b', y: {$and: ['$c','$d']}, z: {$meta: 'textScore'}}"));
-    DepsTracker dependencies;
+    DepsTracker dependencies(DepsTracker::MetadataAvailable::kTextScore);
     ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_FIELDS, project()->getDependencies(&dependencies));
     ASSERT_EQUALS(5U, dependencies.fields.size());
 
@@ -1487,7 +1489,7 @@ TEST_F(ProjectStageTest, InclusionShouldAddDependenciesOfIncludedAndComputedFiel
     ASSERT_EQUALS(1U, dependencies.fields.count("c"));
     ASSERT_EQUALS(1U, dependencies.fields.count("d"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(true, dependencies.needTextScore);
+    ASSERT_EQUALS(true, dependencies.getNeedTextScore());
 };
 
 TEST_F(ProjectStageTest, ExclusionShouldNotAddDependencies) {
@@ -1498,7 +1500,7 @@ TEST_F(ProjectStageTest, ExclusionShouldNotAddDependencies) {
 
     ASSERT_EQUALS(0U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.needTextScore);
+    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
 };
 
 }  // namespace DocumentSourceProject
@@ -1903,7 +1905,7 @@ public:
 
         vector<Value> arr;
         sort()->serializeToArray(arr);
-        ASSERT_EQUALS(
+        ASSERT_VALUE_EQ(
             Value(arr),
             DOC_ARRAY(DOC("$sort" << DOC("a" << 1)) << DOC("$limit" << sort()->getLimit())));
 
@@ -2252,7 +2254,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("a"));
         ASSERT_EQUALS(1U, dependencies.fields.count("b.c"));
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -2867,7 +2869,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.size());
         ASSERT_EQUALS(1U, dependencies.fields.count("x.y.z"));
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -3043,8 +3045,8 @@ using std::unique_ptr;
 
 // Helpers to make a DocumentSourceMatch from a query object or json string
 intrusive_ptr<DocumentSourceMatch> makeMatch(const BSONObj& query) {
-    intrusive_ptr<DocumentSource> uncasted =
-        DocumentSourceMatch::createFromBson(BSON("$match" << query).firstElement(), NULL);
+    intrusive_ptr<DocumentSource> uncasted = DocumentSourceMatch::createFromBson(
+        BSON("$match" << query).firstElement(), new ExpressionContext());
     return dynamic_cast<DocumentSourceMatch*>(uncasted.get());
 }
 intrusive_ptr<DocumentSourceMatch> makeMatch(const string& queryJson) {
@@ -3194,7 +3196,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("x.y"));
         ASSERT_EQUALS(2U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -3205,7 +3207,7 @@ public:
         DepsTracker dependencies;
         ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_ALL, match->getDependencies(&dependencies));
         ASSERT_EQUALS(true, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -3219,7 +3221,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("a"));
         ASSERT_EQUALS(1U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -3233,7 +3235,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("a"));
         ASSERT_EQUALS(2U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -3246,7 +3248,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("a"));
         ASSERT_EQUALS(1U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 class DependenciesNotExpression {
@@ -3258,7 +3260,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("b"));
         ASSERT_EQUALS(1U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -3273,7 +3275,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("b.c"));
         ASSERT_EQUALS(2U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -3285,7 +3287,7 @@ public:
         ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
         ASSERT_EQUALS(0U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -3298,7 +3300,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("a"));
         ASSERT_EQUALS(1U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.needTextScore);
+        ASSERT_EQUALS(false, dependencies.getNeedTextScore());
     }
 };
 
@@ -3458,11 +3460,11 @@ public:
         ASSERT_EQUALS(explainedStages.size(), 2UL);
 
         auto groupExplain = explainedStages[0];
-        ASSERT_EQ(groupExplain["$group"], expectedGroupExplain);
+        ASSERT_VALUE_EQ(groupExplain["$group"], expectedGroupExplain);
 
         auto sortExplain = explainedStages[1];
         auto expectedSortExplain = Value{Document{{"sortKey", Document{{"count", -1}}}}};
-        ASSERT_EQ(sortExplain["$sort"], expectedSortExplain);
+        ASSERT_VALUE_EQ(sortExplain["$sort"], expectedSortExplain);
     }
 };
 
@@ -3553,11 +3555,11 @@ public:
             Value{Document{{"_id", Document{{"$const", BSONNULL}}},
                            {countName, Document{{"$sum", Document{{"$const", 1}}}}}}};
         auto groupExplain = explainedStages[0];
-        ASSERT_EQ(groupExplain["$group"], expectedGroupExplain);
+        ASSERT_VALUE_EQ(groupExplain["$group"], expectedGroupExplain);
 
         Value expectedProjectExplain = Value{Document{{"_id", false}, {countName, true}}};
         auto projectExplain = explainedStages[1];
-        ASSERT_EQ(projectExplain["$project"], expectedProjectExplain);
+        ASSERT_VALUE_EQ(projectExplain["$project"], expectedProjectExplain);
     }
 };
 
@@ -3612,6 +3614,247 @@ TEST_F(InvalidCountSpec, PeriodInStringSpec) {
     ASSERT_THROWS_CODE(createCount(spec), UserException, 40160);
 }
 }  // namespace DocumentSourceCount
+
+namespace DocumentSourceBucket {
+using mongo::DocumentSourceBucket;
+using mongo::DocumentSourceGroup;
+using mongo::DocumentSourceSort;
+using mongo::DocumentSourceMock;
+using std::vector;
+using boost::intrusive_ptr;
+
+class BucketReturnsGroupAndSort : public Mock::Base, public unittest::Test {
+public:
+    void testCreateFromBsonResult(BSONObj bucketSpec, Value expectedGroupExplain) {
+        vector<intrusive_ptr<DocumentSource>> result =
+            DocumentSourceBucket::createFromBson(bucketSpec.firstElement(), ctx());
+
+        ASSERT_EQUALS(result.size(), 2UL);
+
+        const auto* groupStage = dynamic_cast<DocumentSourceGroup*>(result[0].get());
+        ASSERT(groupStage);
+
+        const auto* sortStage = dynamic_cast<DocumentSourceSort*>(result[1].get());
+        ASSERT(sortStage);
+
+        // Serialize the DocumentSourceGroup and DocumentSourceSort from $bucket so that we can
+        // check the explain output to make sure $group and $sort have the correct fields.
+        const bool explain = true;
+        vector<Value> explainedStages;
+        groupStage->serializeToArray(explainedStages, explain);
+        sortStage->serializeToArray(explainedStages, explain);
+        ASSERT_EQUALS(explainedStages.size(), 2UL);
+
+        auto groupExplain = explainedStages[0];
+        ASSERT_VALUE_EQ(groupExplain["$group"], expectedGroupExplain);
+
+        auto sortExplain = explainedStages[1];
+
+        auto expectedSortExplain = Value{Document{{"sortKey", Document{{"_id", 1}}}}};
+        ASSERT_VALUE_EQ(sortExplain["$sort"], expectedSortExplain);
+    }
+};
+
+TEST_F(BucketReturnsGroupAndSort, BucketUsesDefaultOutputWhenNoOutputSpecified) {
+    const auto spec =
+        fromjson("{$bucket : {groupBy :'$x', boundaries : [ 0, 2 ], default : 'other'}}");
+    auto expectedGroupExplain =
+        Value(fromjson("{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : "
+                       "0}]}, {$lt : ['$x', {$const : 2}]}]}, then : {$const : 0}}], default : "
+                       "{$const : 'other'}}}, count : {$sum : {$const : 1}}}"));
+
+    testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWhenOutputSpecified) {
+    const auto spec = fromjson(
+        "{$bucket : {groupBy : '$x', boundaries : [0, 2], output : { number : {$sum : 1}}}}");
+    auto expectedGroupExplain = Value(fromjson(
+        "{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : 0}]}, {$lt : "
+        "['$x', {$const : 2}]}]}, then : {$const : 0}}]}}, number : {$sum : {$const : 1}}}"));
+
+    testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWhenNoDefaultSpecified) {
+    const auto spec = fromjson("{$bucket : { groupBy : '$x', boundaries : [0, 2]}}");
+    auto expectedGroupExplain = Value(fromjson(
+        "{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : 0}]}, {$lt : "
+        "['$x', {$const : 2}]}]}, then : {$const : 0}}]}}, count : {$sum : {$const : 1}}}"));
+
+    testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWhenBoundariesAreSameCanonicalType) {
+    const auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [0, 1.5]}}");
+    auto expectedGroupExplain = Value(fromjson(
+        "{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : 0}]}, {$lt : "
+        "['$x', {$const : 1.5}]}]}, then : {$const : 0}}]}},count : {$sum : {$const : 1}}}"));
+
+    testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWhenBoundariesAreConstantExpressions) {
+    const auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [0, {$add : [4, 5]}]}}");
+    auto expectedGroupExplain = Value(fromjson(
+        "{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : 0}]}, {$lt : "
+        "['$x', {$const : 9}]}]}, then : {$const : 0}}]}}, count : {$sum : {$const : 1}}}"));
+
+    testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWhenDefaultIsConstantExpression) {
+    const auto spec =
+        fromjson("{$bucket : {groupBy : '$x', boundaries : [0, 1], default: {$add : [4, 5]}}}");
+    auto expectedGroupExplain =
+        Value(fromjson("{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const :"
+                       "0}]}, {$lt : ['$x', {$const : 1}]}]}, then : {$const : 0}}], default : "
+                       "{$const : 9}}}, count : {$sum : {$const : 1}}}"));
+
+    testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWithMultipleBoundaryValues) {
+    auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [0, 1, 2]}}");
+    auto expectedGroupExplain =
+        Value(fromjson("{_id : {$switch : {branches : [{case : {$and : [{$gte : ['$x', {$const : "
+                       "0}]}, {$lt : ['$x', {$const : 1}]}]}, then : {$const : 0}}, {case : {$and "
+                       ": [{$gte : ['$x', {$const : 1}]}, {$lt : ['$x', {$const : 2}]}]}, then : "
+                       "{$const : 1}}]}}, count : {$sum : {$const : 1}}}"));
+
+    testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+class InvalidBucketSpec : public Mock::Base, public unittest::Test {
+public:
+    vector<intrusive_ptr<DocumentSource>> createBucket(BSONObj bucketSpec) {
+        return DocumentSourceBucket::createFromBson(bucketSpec.firstElement(), ctx());
+    }
+};
+
+TEST_F(InvalidBucketSpec, BucketFailsWithNonObject) {
+    auto spec = fromjson("{$bucket : 1}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40201);
+
+    spec = fromjson("{$bucket : 'test'}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40201);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithUnknownField) {
+    const auto spec =
+        fromjson("{$bucket : {groupBy : '$x', boundaries : [0, 1, 2], unknown : 'field'}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40197);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithNoGroupBy) {
+    const auto spec = fromjson("{$bucket : {boundaries : [0, 1, 2]}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40198);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithNoBoundaries) {
+    const auto spec = fromjson("{$bucket : {groupBy : '$x'}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40198);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithNonExpressionGroupBy) {
+    auto spec = fromjson("{$bucket : {groupBy : {test : 'obj'}, boundaries : [0, 1, 2]}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40202);
+
+    spec = fromjson("{$bucket : {groupBy : 'test', boundaries : [0, 1, 2]}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40202);
+
+    spec = fromjson("{$bucket : {groupBy : 1, boundaries : [0, 1, 2]}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40202);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithNonArrayBoundaries) {
+    auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : 'test'}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40200);
+
+    spec = fromjson("{$bucket : {groupBy : '$x', boundaries : 1}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40200);
+
+    spec = fromjson("{$bucket : {groupBy : '$x', boundaries : {test : 'obj'}}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40200);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithNotEnoughBoundaries) {
+    auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [0]}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40192);
+
+    spec = fromjson("{$bucket : {groupBy : '$x', boundaries : []}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40192);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithNonConstantValueBoundaries) {
+    const auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : ['$x', '$y', '$z']}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40191);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithMixedTypesBoundaries) {
+    const auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [0, 'test']}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40193);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithNonUniqueBoundaries) {
+    auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [1, 1, 2, 3]}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40194);
+
+    spec = fromjson("{$bucket : {groupBy : '$x', boundaries : ['a', 'b', 'b', 'c']}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40194);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithNonSortedBoundaries) {
+    const auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [4, 5, 3, 6]}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40194);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWithNonConstantExpressionDefault) {
+    const auto spec =
+        fromjson("{$bucket : {groupBy : '$x', boundaries : [0, 1, 2], default : '$x'}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40195);
+}
+
+TEST_F(InvalidBucketSpec, BucketFailsWhenDefaultIsInBoundariesRange) {
+    auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [1, 2, 4], default : 3}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40199);
+
+    spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [1, 2, 4], default : 1}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40199);
+}
+
+TEST_F(InvalidBucketSpec, GroupFailsForBucketWithInvalidOutputField) {
+    auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [1, 2, 3], output : 'test'}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 40196);
+
+    spec = fromjson(
+        "{$bucket : {groupBy : '$x', boundaries : [1, 2, 3], output : {number : 'test'}}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 15951);
+
+    spec = fromjson(
+        "{$bucket : {groupBy : '$x', boundaries : [1, 2, 3], output : {'test.test' : {$sum : "
+        "1}}}}");
+    ASSERT_THROWS_CODE(createBucket(spec), UserException, 16414);
+}
+
+TEST_F(InvalidBucketSpec, SwitchFailsForBucketWhenNoDefaultSpecified) {
+    const auto spec = fromjson("{$bucket : {groupBy : '$x', boundaries : [1, 2, 3]}}");
+    vector<intrusive_ptr<DocumentSource>> bucketStages = createBucket(spec);
+
+    ASSERT_EQUALS(bucketStages.size(), 2UL);
+
+    auto* groupStage = dynamic_cast<DocumentSourceGroup*>(bucketStages[0].get());
+    ASSERT(groupStage);
+
+    const auto* sortStage = dynamic_cast<DocumentSourceSort*>(bucketStages[1].get());
+    ASSERT(sortStage);
+
+    auto doc = DOC("x" << 4);
+    auto source = DocumentSourceMock::create(doc);
+    groupStage->setSource(source.get());
+    ASSERT_THROWS_CODE(groupStage->getNext(), UserException, 40066);
+}
+}  // namespace DocumentSourceBucket
 
 class All : public Suite {
 public:

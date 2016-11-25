@@ -80,6 +80,7 @@ class OplogReader;
 class ReplSetRequestVotesArgs;
 class ReplicaSetConfig;
 class SyncSourceFeedback;
+class StorageInterface;
 class TopologyCoordinator;
 class VoteRequester;
 
@@ -96,11 +97,13 @@ public:
                                ReplicationCoordinatorExternalState* externalState,
                                executor::NetworkInterface* network,
                                TopologyCoordinator* topoCoord,
+                               StorageInterface* storage,
                                int64_t prngSeed);
     // Takes ownership of the "externalState" and "topCoord" objects.
     ReplicationCoordinatorImpl(const ReplSettings& settings,
                                ReplicationCoordinatorExternalState* externalState,
                                TopologyCoordinator* topoCoord,
+                               StorageInterface* storage,
                                ReplicationExecutor* replExec,
                                int64_t prngSeed,
                                stdx::function<bool()>* isDurableStorageEngineFn);
@@ -182,8 +185,8 @@ public:
     virtual OpTime getMyLastAppliedOpTime() const override;
     virtual OpTime getMyLastDurableOpTime() const override;
 
-    virtual ReadConcernResponse waitUntilOpTime(OperationContext* txn,
-                                                const ReadConcernArgs& settings) override;
+    virtual Status waitUntilOpTimeForRead(OperationContext* txn,
+                                          const ReadConcernArgs& settings) override;
 
     virtual OID getElectionId() override;
 
@@ -331,6 +334,7 @@ public:
     virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
     virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) override;
 
+    virtual Status stepUpIfEligible() override;
 
     // ================== Test support API ===================
 
@@ -452,6 +456,7 @@ private:
     ReplicationCoordinatorImpl(const ReplSettings& settings,
                                ReplicationCoordinatorExternalState* externalState,
                                TopologyCoordinator* topCoord,
+                               StorageInterface* storage,
                                int64_t prngSeed,
                                executor::NetworkInterface* network,
                                ReplicationExecutor* replExec,
@@ -1267,8 +1272,8 @@ private:
     // _lastCommittedOpTime cannot be set to an earlier OpTime.
     OpTime _firstOpTimeOfMyTerm;  // (M)
 
-    // Data Replicator used to replicate data
-    DataReplicator _dr;  // (S)
+    // Storage interface used by data replicator.
+    StorageInterface* _storage;  // (PS)
 
     // Hands out the next snapshot name.
     AtomicUInt64 _snapshotNameGenerator;  // (S)

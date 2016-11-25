@@ -28,6 +28,11 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/time_support.h"
 
@@ -41,10 +46,13 @@ public:
     /**
      * Constructs a ClockSourceMock with the current time set to the Unix epoch.
      */
-    ClockSourceMock() = default;
+    ClockSourceMock() {
+        _tracksSystemClock = false;
+    }
 
     Milliseconds getPrecision() override;
-    Date_t now() final;
+    Date_t now() override;
+    Status setAlarm(Date_t when, stdx::function<void()> action) override;
 
     /**
      * Advances the current time by the given value.
@@ -57,7 +65,35 @@ public:
     void reset(Date_t newNow);
 
 private:
+    using Alarm = std::pair<Date_t, stdx::function<void()>>;
+    void _processAlarms(stdx::unique_lock<stdx::mutex> lk);
+
+    stdx::mutex _mutex;
     Date_t _now;
+    std::vector<Alarm> _alarms;
+};
+
+class SharedClockSourceAdapter final : public ClockSource {
+public:
+    explicit SharedClockSourceAdapter(std::shared_ptr<ClockSource> source)
+        : _source(std::move(source)) {
+        _tracksSystemClock = _source->tracksSystemClock();
+    }
+
+    Milliseconds getPrecision() override {
+        return _source->getPrecision();
+    }
+
+    Date_t now() override {
+        return _source->now();
+    }
+
+    Status setAlarm(Date_t when, stdx::function<void()> action) override {
+        return _source->setAlarm(when, std::move(action));
+    }
+
+private:
+    std::shared_ptr<ClockSource> _source;
 };
 
 }  // namespace mongo

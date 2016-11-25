@@ -127,6 +127,7 @@ env.Library('saslauth',
                 'authcore',
                 'authmocks', # Wat?
                 'sasl_options',
+                '$BUILD_DIR/mongo/base/secure_allocator',
                 '$BUILD_DIR/mongo/crypto/scramauth',
                 '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
                 '$BUILD_DIR/mongo/util/net/network',
@@ -141,12 +142,11 @@ env.Library('authmongod',
             ],
             LIBDEPS=[
                 'authservercommon',
+                '$BUILD_DIR/mongo/db/db_raii',
+                '$BUILD_DIR/mongo/db/dbdirectclient',
+                '$BUILD_DIR/mongo/db/dbhelpers',
                 '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
                 '$BUILD_DIR/mongo/db/server_parameters',
-            ],
-            LIBDEPS_TAGS=[
-                # Depends on files db_raii.cpp and catalog support files from serverOnlyFiles
-                'incomplete',
             ],
 )
 

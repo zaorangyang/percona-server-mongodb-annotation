@@ -55,6 +55,7 @@
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/sharding_network_connection_hook.h"
+#include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/sharding_egress_metadata_hook.h"
@@ -80,13 +81,7 @@ std::unique_ptr<ThreadPoolTaskExecutor> makeTaskExecutor(std::unique_ptr<Network
 
 std::unique_ptr<ShardingCatalogClient> makeCatalogClient(ServiceContext* service,
                                                          ShardRegistry* shardRegistry,
-                                                         const HostAndPort& thisHost) {
-    std::unique_ptr<SecureRandom> rng(SecureRandom::create());
-    std::string distLockProcessId = str::stream()
-        << thisHost.toString() << ':'
-        << durationCount<Seconds>(service->getPreciseClockSource()->now().toDurationSinceEpoch())
-        << ':' << static_cast<int32_t>(rng->nextInt64());
-
+                                                         StringData distLockProcessId) {
     auto distLockCatalog = stdx::make_unique<DistLockCatalogImpl>(shardRegistry);
     auto distLockManager =
         stdx::make_unique<ReplSetDistLockManager>(service,
@@ -126,7 +121,21 @@ std::unique_ptr<TaskExecutorPool> makeTaskExecutorPool(
 
 }  // namespace
 
-Status initializeGlobalShardingState(const ConnectionString& configCS,
+const StringData kDistLockProcessIdForConfigServer("ConfigServer");
+
+std::string generateDistLockProcessId(OperationContext* txn) {
+    std::unique_ptr<SecureRandom> rng(SecureRandom::create());
+
+    return str::stream()
+        << HostAndPort(getHostName(), serverGlobalParams.port).toString() << ':'
+        << durationCount<Seconds>(
+               txn->getServiceContext()->getPreciseClockSource()->now().toDurationSinceEpoch())
+        << ':' << rng->nextInt64();
+}
+
+Status initializeGlobalShardingState(OperationContext* txn,
+                                     const ConnectionString& configCS,
+                                     StringData distLockProcessId,
                                      std::unique_ptr<ShardFactory> shardFactory,
                                      rpc::ShardingEgressMetadataHookBuilder hookBuilder,
                                      ShardingCatalogManagerBuilder catalogManagerBuilder) {
@@ -144,9 +153,8 @@ Status initializeGlobalShardingState(const ConnectionString& configCS,
 
     auto shardRegistry(stdx::make_unique<ShardRegistry>(std::move(shardFactory), configCS));
 
-    auto catalogClient = makeCatalogClient(getGlobalServiceContext(),
-                                           shardRegistry.get(),
-                                           HostAndPort(getHostName(), serverGlobalParams.port));
+    auto catalogClient =
+        makeCatalogClient(txn->getServiceContext(), shardRegistry.get(), distLockProcessId);
 
     auto rawCatalogClient = catalogClient.get();
 
@@ -193,6 +201,16 @@ Status reloadShardRegistryUntilSuccess(OperationContext* txn) {
         }
 
         try {
+            auto status = ClusterIdentityLoader::get(txn)->loadClusterId(
+                txn, repl::ReadConcernLevel::kMajorityReadConcern);
+            if (!status.isOK()) {
+                warning()
+                    << "Error initializing sharding state, sleeping for 2 seconds and trying again"
+                    << causedBy(status);
+                sleepmillis(2000);
+                continue;
+            }
+
             grid.shardRegistry()->reload(txn);
             return Status::OK();
         } catch (const DBException& ex) {
@@ -204,8 +222,9 @@ Status reloadShardRegistryUntilSuccess(OperationContext* txn) {
                 // servers.
                 grid.shardRegistry()->rebuildConfigShard();
             }
-            log() << "Error initializing sharding state, sleeping for 2 seconds and trying again"
-                  << causedBy(status);
+            warning()
+                << "Error initializing sharding state, sleeping for 2 seconds and trying again"
+                << causedBy(status);
             sleepmillis(2000);
             continue;
         }

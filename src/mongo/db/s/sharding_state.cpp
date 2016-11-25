@@ -270,8 +270,7 @@ void ShardingState::clearCollectionMetadata() {
 }
 
 ChunkVersion ShardingState::getVersion(const string& ns) {
-    shared_ptr<CollectionMetadata> p;
-
+    ScopedCollectionMetadata p;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         CollectionShardingStateMap::const_iterator it = _collections.find(ns);
@@ -319,8 +318,7 @@ Status ShardingState::onStaleShardVersion(OperationContext* txn,
     {
         AutoGetCollection autoColl(txn, nss, MODE_IS);
 
-        shared_ptr<CollectionMetadata> storedMetadata =
-            CollectionShardingState::get(txn, nss)->getMetadata();
+        auto storedMetadata = CollectionShardingState::get(txn, nss)->getMetadata();
         if (storedMetadata) {
             collectionShardVersion = storedMetadata->getShardVersion();
         }
@@ -418,7 +416,7 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* txn) {
         return parseStatus.getStatus();
     }
 
-    auto status = initializeFromShardIdentity(parseStatus.getValue(), txn->getDeadline());
+    auto status = initializeFromShardIdentity(txn, parseStatus.getValue(), txn->getDeadline());
     if (!status.isOK()) {
         return status;
     }
@@ -428,10 +426,20 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* txn) {
 
 // NOTE: This method can be called inside a database lock so it should never take any database
 // locks, perform I/O, or any long running operations.
-Status ShardingState::initializeFromShardIdentity(const ShardIdentityType& shardIdentity,
+Status ShardingState::initializeFromShardIdentity(OperationContext* txn,
+                                                  const ShardIdentityType& shardIdentity,
                                                   Date_t deadline) {
     if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
         return Status::OK();
+    }
+
+    Status validationStatus = shardIdentity.validate();
+    if (!validationStatus.isOK()) {
+        return Status(
+            validationStatus.code(),
+            str::stream()
+                << "Invalid shard identity document found when initializing sharding state: "
+                << validationStatus.reason());
     }
 
     log() << "initializing sharding state with: " << shardIdentity;
@@ -500,7 +508,7 @@ Status ShardingState::initializeFromShardIdentity(const ShardIdentityType& shard
         ShardedConnectionInfo::addHook();
 
         try {
-            Status status = _globalInit(configSvrConnStr);
+            Status status = _globalInit(txn, configSvrConnStr, generateDistLockProcessId(txn));
 
             // For backwards compatibility with old style inits from metadata commands.
             if (status.isOK()) {
@@ -538,7 +546,7 @@ void ShardingState::_initializeImpl(ConnectionString configSvr) {
     ShardedConnectionInfo::addHook();
 
     try {
-        Status status = _globalInit(configSvr);
+        Status status = _globalInit(txn.get(), configSvr, generateDistLockProcessId(txn.get()));
 
         if (status.isOK()) {
             ReplicaSetMonitor::setSynchronousConfigChangeHook(
@@ -646,7 +654,7 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
     // The idea here is that we're going to reload the metadata from the config server, but we need
     // to do so outside any locks.  When we get our result back, if the current metadata has
     // changed, we may not be able to install the new metadata.
-    shared_ptr<CollectionMetadata> beforeMetadata;
+    ScopedCollectionMetadata beforeMetadata;
     {
         ScopedTransaction transaction(txn, MODE_IS);
         AutoGetCollection autoColl(txn, nss, MODE_IS);
@@ -697,12 +705,13 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
     long long refreshMillis;
 
     {
-        Status status = mdLoader.makeCollectionMetadata(txn,
-                                                        grid.catalogClient(txn),
-                                                        ns,
-                                                        getShardName(),
-                                                        fullReload ? nullptr : beforeMetadata.get(),
-                                                        remoteMetadata.get());
+        Status status =
+            mdLoader.makeCollectionMetadata(txn,
+                                            grid.catalogClient(txn),
+                                            ns,
+                                            getShardName(),
+                                            fullReload ? nullptr : beforeMetadata.getMetadata(),
+                                            remoteMetadata.get());
         refreshMillis = refreshTimer.millis();
 
         if (status.code() == ErrorCodes::NamespaceNotFound) {
@@ -726,7 +735,7 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
     // Get ready to install loaded metadata if needed
     //
 
-    shared_ptr<CollectionMetadata> afterMetadata;
+    ScopedCollectionMetadata afterMetadata;
     ChunkVersion afterShardVersion;
     ChunkVersion afterCollVersion;
     VersionChoice choice;
@@ -749,6 +758,7 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
         // Get the metadata now that the load has completed
         auto css = CollectionShardingState::get(txn, nss);
         afterMetadata = css->getMetadata();
+
         if (afterMetadata) {
             afterShardVersion = afterMetadata->getShardVersion();
             afterCollVersion = afterMetadata->getCollVersion();
@@ -760,7 +770,8 @@ Status ShardingState::_refreshMetadata(OperationContext* txn,
         // Resolve newer pending chunks with the remote metadata, finish construction
         //
 
-        Status status = mdLoader.promotePendingChunks(afterMetadata.get(), remoteMetadata.get());
+        Status status =
+            mdLoader.promotePendingChunks(afterMetadata.getMetadata(), remoteMetadata.get());
         if (!status.isOK()) {
             warning() << "remote metadata for " << ns
                       << " is inconsistent with current pending chunks"
@@ -893,7 +904,7 @@ void ShardingState::appendInfo(OperationContext* txn, BSONObjBuilder& builder) {
     for (CollectionShardingStateMap::const_iterator it = _collections.begin();
          it != _collections.end();
          ++it) {
-        shared_ptr<CollectionMetadata> metadata = it->second->getMetadata();
+        ScopedCollectionMetadata metadata = it->second->getMetadata();
         if (metadata) {
             versionB.appendTimestamp(it->first, metadata->getShardVersion().toLong());
         } else {
@@ -916,7 +927,7 @@ bool ShardingState::needCollectionMetadata(OperationContext* txn, const string& 
         OperationShardingState::get(txn).hasShardVersion();
 }
 
-shared_ptr<CollectionMetadata> ShardingState::getCollectionMetadata(const string& ns) {
+ScopedCollectionMetadata ShardingState::getCollectionMetadata(const string& ns) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     CollectionShardingStateMap::const_iterator it = _collections.find(ns);

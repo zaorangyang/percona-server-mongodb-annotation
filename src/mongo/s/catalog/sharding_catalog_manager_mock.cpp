@@ -61,7 +61,27 @@ Status ShardingCatalogManagerMock::addShardToZone(OperationContext* txn,
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
+Status ShardingCatalogManagerMock::removeShardFromZone(OperationContext* txn,
+                                                       const std::string& shardName,
+                                                       const std::string& zoneName) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
 
 void ShardingCatalogManagerMock::appendConnectionStats(executor::ConnectionPoolStats* stats) {}
+
+Status ShardingCatalogManagerMock::initializeConfigDatabaseIfNeeded(OperationContext* txn) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
+Status ShardingCatalogManagerMock::upsertShardIdentityOnShard(OperationContext* txn,
+                                                              ShardType shardType) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
+BSONObj ShardingCatalogManagerMock::createShardIdentityUpsertForAddShard(
+    OperationContext* txn, const std::string& shardName) {
+    MONGO_UNREACHABLE;
+}
 
 }  // namespace mongo

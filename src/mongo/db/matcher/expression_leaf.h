@@ -101,7 +101,7 @@ public:
     /**
      * 'collator' must outlive the ComparisonMatchExpression and any clones made of it.
      */
-    void setCollator(const CollatorInterface* collator) {
+    virtual void _doSetCollator(const CollatorInterface* collator) {
         _collator = collator;
     }
 
@@ -115,6 +115,22 @@ public:
 
     const CollatorInterface* getCollator() const {
         return _collator;
+    }
+
+    /**
+     * Returns true if the MatchExpression is a ComparisonMatchExpression.
+     */
+    static bool isComparisonMatchExpression(const MatchExpression* expr) {
+        switch (expr->matchType()) {
+            case MatchExpression::LT:
+            case MatchExpression::LTE:
+            case MatchExpression::EQ:
+            case MatchExpression::GTE:
+            case MatchExpression::GT:
+                return true;
+            default:
+                return false;
+        }
     }
 
 protected:
@@ -330,7 +346,7 @@ public:
     /**
      * 'collator' must outlive the InMatchExpression and any clones made of it.
      */
-    void setCollator(const CollatorInterface* collator);
+    virtual void _doSetCollator(const CollatorInterface* collator);
 
     Status addEquality(const BSONElement& elt);
 

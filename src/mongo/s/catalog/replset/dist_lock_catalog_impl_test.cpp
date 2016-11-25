@@ -549,7 +549,7 @@ TEST_F(DistLockCatalogFixture, GrabLockWriteConcernError) {
     auto future = launchAsync([this] {
         auto status =
             catalog()->grabLock(txn(), "", OID::gen(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, status.code());
+        ASSERT_EQUALS(ErrorCodes::NotMaster, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
@@ -558,8 +558,8 @@ TEST_F(DistLockCatalogFixture, GrabLockWriteConcernError) {
                 ok: 1,
                 value: null,
                 writeConcernError: {
-                    code: 64,
-                    errmsg: "waiting for replication timed out"
+                    code: 10107,
+                    errmsg: "Not master while waiting for write concern"
                 }
             })");
     });
@@ -1093,31 +1093,26 @@ TEST_F(DistLockCatalogFixture, BasicUnlockAll) {
         ASSERT_OK(status);
     });
 
-    onCommand(
-        [](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
-            ASSERT_EQUALS(dummyHost, request.target);
-            ASSERT_EQUALS("config", request.dbname);
+    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        ASSERT_EQUALS(dummyHost, request.target);
+        ASSERT_EQUALS("config", request.dbname);
 
-            std::string errmsg;
-            BatchedUpdateRequest batchRequest;
-            ASSERT(batchRequest.parseBSON("config", request.cmdObj, &errmsg));
-            ASSERT_EQUALS(LocksType::ConfigNS, batchRequest.getNS().toString());
-            ASSERT_EQUALS(BSON("w"
-                               << "majority"
-                               << "wtimeout"
-                               << 15000),
-                          batchRequest.getWriteConcern());
-            auto updates = batchRequest.getUpdates();
-            ASSERT_EQUALS(1U, updates.size());
-            auto update = updates.front();
-            ASSERT_FALSE(update->getUpsert());
-            ASSERT_TRUE(update->getMulti());
-            ASSERT_EQUALS(BSON(LocksType::process("processID")), update->getQuery());
-            ASSERT_EQUALS(BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))),
-                          update->getUpdateExpr());
+        std::string errmsg;
+        BatchedUpdateRequest batchRequest;
+        ASSERT(batchRequest.parseBSON("config", request.cmdObj, &errmsg));
+        ASSERT_EQUALS(LocksType::ConfigNS, batchRequest.getNS().toString());
+        ASSERT_EQUALS(BSON("w" << 1 << "wtimeout" << 0), batchRequest.getWriteConcern());
+        auto updates = batchRequest.getUpdates();
+        ASSERT_EQUALS(1U, updates.size());
+        auto update = updates.front();
+        ASSERT_FALSE(update->getUpsert());
+        ASSERT_TRUE(update->getMulti());
+        ASSERT_EQUALS(BSON(LocksType::process("processID")), update->getQuery());
+        ASSERT_EQUALS(BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))),
+                      update->getUpdateExpr());
 
-            return BSON("ok" << 1);
-        });
+        return BSON("ok" << 1);
+    });
 
     future.timed_get(kFutureTimeout);
 }

@@ -60,7 +60,6 @@ env.Library(
         'request_types/add_shard_to_zone_request_type.cpp',
         'request_types/assign_key_range_to_zone_request_type.cpp',
         'request_types/balance_chunk_request_type.cpp',
-        'request_types/control_balancer_request_type.cpp',
         'request_types/remove_shard_from_zone_request_type.cpp',
         'chunk_diff.cpp',
         'chunk_version.cpp',
@@ -99,13 +98,10 @@ env.Library(
         '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_client_impl',
         '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_manager_impl',
         '$BUILD_DIR/mongo/s/coreshard',
+        '$BUILD_DIR/mongo/transport/transport_layer_mock',
         '$BUILD_DIR/mongo/util/clock_source_mock',
         '$BUILD_DIR/mongo/util/net/message_port_mock',
         'mongoscore',
-    ],
-    LIBDEPS_TAGS=[
-        # Depends on coreshard, but that would be circular
-        'incomplete',
     ],
 )
 
@@ -196,13 +192,10 @@ env.Library(
     ],
     LIBDEPS=[
         'client/sharding_client',
+        'mongoscore',
         'write_ops/cluster_write_op',
         'write_ops/cluster_write_op_conversion',
         '$BUILD_DIR/mongo/base',
-    ],
-    LIBDEPS_TAGS=[
-        # Circular with coreshard, below
-        'incomplete',
     ],
 )
 
@@ -237,7 +230,6 @@ env.CppUnitTest('request_types_test',
         'request_types/add_shard_to_zone_request_test.cpp',
         'request_types/assign_key_range_to_zone_request_test.cpp',
         'request_types/balance_chunk_request_test.cpp',
-        'request_types/control_balancer_request_test.cpp',
         'request_types/remove_shard_from_zone_request_test.cpp',
     ],
     LIBDEPS=[
@@ -257,9 +249,11 @@ env.Library(
         'balancer/balancer_policy.cpp',
         'balancer/cluster_statistics.cpp',
         'balancer/cluster_statistics_impl.cpp',
+        'balancer/migration_manager.cpp',
         'catalog/catalog_cache.cpp',
         'chunk.cpp',
         'chunk_manager.cpp',
+        'cluster_identity_loader.cpp',
         'config.cpp',
         'config_server_client.cpp',
         'grid.cpp',
@@ -269,14 +263,13 @@ env.Library(
         'sharding_uptime_reporter.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/audit',
+        '$BUILD_DIR/mongo/db/lasterror',
         '$BUILD_DIR/mongo/executor/task_executor_pool',
         '$BUILD_DIR/mongo/s/query/cluster_cursor_manager',
         'catalog/replset/sharding_catalog_client_impl',
         'client/sharding_client',
         'common',
-    ],
-    LIBDEPS_TAGS=[
-        'incomplete',
     ],
 )
 
@@ -335,6 +328,29 @@ env.CppUnitTest(
     ]
 )
 
+env.CppUnitTest(
+    target='cluster_identity_loader_test',
+    source=[
+        'cluster_identity_loader_test.cpp',
+    ],
+    LIBDEPS=[
+        'coreshard',
+        'sharding_test_fixture',
+    ]
+)
+
+env.CppUnitTest(
+    target='migration_manager_test',
+    source=[
+        'balancer/migration_manager_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/repl/replmocks',
+        'config_server_test_fixture',
+        'coreshard',
+    ]
+)
+
 env.Library(
     target='local_sharding_info',
     source=[
@@ -361,9 +377,5 @@ env.Library(
         "$BUILD_DIR/mongo/db/s/sharding",
         "$BUILD_DIR/mongo/executor/network_interface_factory",
         "$BUILD_DIR/mongo/s/client/shard_local",
-    ],
-    LIBDEPS_TAGS=[
-        # Depends on symbols from files in serverOnlyFiles
-        'incomplete',
     ],
 )

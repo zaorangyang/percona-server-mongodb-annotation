@@ -56,6 +56,7 @@
 #include "mongo/db/prefetch.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/data_replicator.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
@@ -117,12 +118,6 @@ static Counter64 opsAppliedStats;
 
 // The oplog entries applied
 static ServerStatusMetricField<Counter64> displayOpsApplied("repl.apply.ops", &opsAppliedStats);
-
-MONGO_FP_DECLARE(rsSyncApplyStop);
-
-// Failpoint which causes the initial sync function to hang before calling shouldRetry on a failed
-// operation.
-MONGO_FP_DECLARE(initialSyncHangBeforeGettingMissingDocument);
 
 // Number and time of each ApplyOps worker pool round
 static TimerStats applyBatchStats;
@@ -307,7 +302,7 @@ Status SyncTail::syncApply(OperationContext* txn,
                            ApplyCommandInLockFn applyCommandInLock,
                            IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
     if (inShutdown()) {
-        return Status::OK();
+        return Status(ErrorCodes::InterruptedAtShutdown, "syncApply shutting down");
     }
 
     // Count each log op application as a separate operation, for reporting purposes
@@ -472,6 +467,75 @@ void applyOps(std::vector<MultiApplier::OperationPtrs>* writerVectors,
     }
 }
 
+void initializeWriterThread() {
+    // Only do this once per thread
+    if (!ClientBasic::getCurrent()) {
+        Client::initThreadIfNotAlready();
+        AuthorizationSession::get(cc())->grantInternalAuthorization();
+    }
+}
+
+// Schedules the writes to the oplog for 'ops' into threadPool. The caller must guarantee that 'ops'
+// stays valid until all scheduled work in the thread pool completes.
+// Returns true if more than one thread will be used to write to the oplog.
+bool scheduleWritesToOplog(OperationContext* txn,
+                           OldThreadPool* threadPool,
+                           const MultiApplier::Operations& ops) {
+
+    auto makeOplogWriterForRange = [&ops](size_t begin, size_t end) {
+        // The returned function will be run in a separate thread after this returns. Therefore all
+        // captures other than 'ops' must be by value since they will not be available. The caller
+        // guarantees that 'ops' will stay in scope until the spawned threads complete.
+        return [&ops, begin, end] {
+            initializeWriterThread();
+            const auto txnHolder = cc().makeOperationContext();
+            const auto txn = txnHolder.get();
+            txn->lockState()->setIsBatchWriter(true);
+            txn->setReplicatedWrites(false);
+
+            std::vector<BSONObj> docs;
+            docs.reserve(end - begin);
+            for (size_t i = begin; i < end; i++) {
+                // Add as unowned BSON to avoid unnecessary ref-count bumps.
+                // 'ops' will outlive 'docs' so the BSON lifetime will be guaranteed.
+                docs.emplace_back(ops[i].raw.objdata());
+            }
+
+            fassertStatusOK(40141,
+                            StorageInterface::get(txn)->insertDocuments(
+                                txn, NamespaceString(rsOplogName), docs));
+        };
+    };
+
+    // We want to be able to take advantage of bulk inserts so we don't use multiple threads if it
+    // would result too little work per thread. This also ensures that we can amortize the
+    // setup/teardown overhead across many writes.
+    const size_t kMinOplogEntriesPerThread = 16;
+    const bool enoughToMultiThread =
+        ops.size() >= kMinOplogEntriesPerThread * threadPool->getNumThreads();
+
+    // Only doc-locking engines support parallel writes to the oplog because they are required to
+    // ensure that oplog entries are ordered correctly, even if inserted out-of-order. Additionally,
+    // there would be no way to take advantage of multiple threads if a storage engine doesn't
+    // support document locking.
+    if (!enoughToMultiThread ||
+        !txn->getServiceContext()->getGlobalStorageEngine()->supportsDocLocking()) {
+
+        threadPool->schedule(makeOplogWriterForRange(0, ops.size()));
+        return false;
+    }
+
+
+    const size_t numOplogThreads = threadPool->getNumThreads();
+    const size_t numOpsPerThread = ops.size() / numOplogThreads;
+    for (size_t thread = 0; thread < numOplogThreads; thread++) {
+        size_t begin = thread * numOpsPerThread;
+        size_t end = (thread == numOplogThreads - 1) ? ops.size() : begin + numOpsPerThread;
+        threadPool->schedule(makeOplogWriterForRange(begin, end));
+    }
+    return true;
+}
+
 /**
  * A caching functor that returns true if a namespace refers to a capped collection.
  * Collections that don't exist are implicitly not capped.
@@ -491,6 +555,7 @@ public:
 
 private:
     bool isCappedImpl(OperationContext* txn, StringData ns) {
+        Lock::DBLock dbLock(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IS);
         auto db = dbHolder().get(txn, ns);
         if (!db)
             return false;
@@ -510,8 +575,6 @@ void fillWriterVectors(OperationContext* txn,
     const bool supportsDocLocking =
         getGlobalServiceContext()->getGlobalStorageEngine()->supportsDocLocking();
     const uint32_t numWriters = writerVectors->size();
-
-    Lock::GlobalRead globalReadLock(txn->lockState());
 
     CachingCappedChecker isCapped;
 
@@ -765,7 +828,7 @@ void SyncTail::oplogApplication() {
         // (last) failed batch, whichever is larger.
         // This will cause this node to go into RECOVERING state
         // if we should crash and restart before updating finishing.
-        const OpTime start(getLastSetTimestamp(), OpTime::kUninitializedTerm);
+        const auto& start = lastWriteOpTime;
 
 
         // Take the max of the first endOptime (if we recovered) and the end of our batch.
@@ -815,9 +878,6 @@ void SyncTail::oplogApplication() {
 bool SyncTail::tryPopAndWaitForMore(OperationContext* txn, SyncTail::OpQueue* ops) {
     {
         BSONObj op;
-        // We must abandon the snapshot for collection based implementations of the oplog buffer.
-        // This ensures that we always read data that is up to date.
-        txn->recoveryUnit()->abandonSnapshot();
         // Check to see if there are ops waiting in the bgsync queue
         bool peek_success = peek(txn, &op);
         if (!peek_success) {
@@ -998,14 +1058,6 @@ bool SyncTail::shouldRetry(OperationContext* txn, const BSONObj& o) {
     MONGO_UNREACHABLE;
 }
 
-static void initializeWriterThread() {
-    // Only do this once per thread
-    if (!ClientBasic::getCurrent()) {
-        Client::initThreadIfNotAlready();
-        AuthorizationSession::get(cc())->grantInternalAuthorization();
-    }
-}
-
 // This free function is used by the writer threads to apply each op
 void multiSyncApply(MultiApplier::OperationPtrs* ops, SyncTail*) {
     initializeWriterThread();
@@ -1013,7 +1065,9 @@ void multiSyncApply(MultiApplier::OperationPtrs* ops, SyncTail*) {
     auto syncApply = [](OperationContext* txn, const BSONObj& op, bool convertUpdateToUpsert) {
         return SyncTail::syncApply(txn, op, convertUpdateToUpsert);
     };
-    fassertNoTrace(16359, multiSyncApply_noAbort(txn.get(), ops, syncApply));
+
+    auto status = multiSyncApply_noAbort(txn.get(), ops, syncApply);
+    fassertNoTrace(16359, status.isOK() || status == ErrorCodes::InterruptedAtShutdown);
 }
 
 Status multiSyncApply_noAbort(OperationContext* txn,
@@ -1088,13 +1142,14 @@ Status multiSyncApply_noAbort(OperationContext* txn,
                 } catch (const DBException& e) {
                     // The group insert failed, log an error and fall through to the
                     // application of an individual op.
+                    if (e.toStatus() == ErrorCodes::InterruptedAtShutdown) {
+                        return e.toStatus();
+                    }
+
                     str::stream msg;
                     msg << "Error applying inserts in bulk " << causedBy(e)
                         << " trying first insert as a lone insert";
                     error() << std::string(msg);
-                    if (inShutdown()) {
-                        return {ErrorCodes::InterruptedAtShutdown, msg};
-                    }
 
                     // Avoid quadratic run time from failed insert by not retrying until we
                     // are beyond this group of ops.
@@ -1105,23 +1160,16 @@ Status multiSyncApply_noAbort(OperationContext* txn,
 
         try {
             // Apply an individual (non-grouped) op.
-            const Status s = syncApply(txn, entry->raw, convertUpdatesToUpserts);
+            const Status status = syncApply(txn, entry->raw, convertUpdatesToUpserts);
 
-            if (!s.isOK()) {
-                severe() << "Error applying operation (" << entry->raw.toString() << "): " << s;
-                if (inShutdown()) {
-                    return {ErrorCodes::InterruptedAtShutdown, s.toString()};
-                }
-                return s;
+            if (!status.isOK()) {
+                severe() << "Error applying operation (" << entry->raw.toString()
+                         << "): " << status;
+                return status;
             }
         } catch (const DBException& e) {
             severe() << "writer worker caught exception: " << causedBy(e)
                      << " on: " << entry->raw.toString();
-
-            if (inShutdown()) {
-                return {ErrorCodes::InterruptedAtShutdown, e.toString()};
-            }
-
             return e.toStatus();
         }
     }
@@ -1133,7 +1181,8 @@ Status multiSyncApply_noAbort(OperationContext* txn,
 void multiInitialSyncApply(MultiApplier::OperationPtrs* ops, SyncTail* st) {
     initializeWriterThread();
     auto txn = cc().makeOperationContext();
-    fassertNoTrace(15915, multiInitialSyncApply_noAbort(txn.get(), ops, st));
+    auto status = multiInitialSyncApply_noAbort(txn.get(), ops, st);
+    fassertNoTrace(15915, status.isOK() || status == ErrorCodes::InterruptedAtShutdown);
 }
 
 Status multiInitialSyncApply_noAbort(OperationContext* txn,
@@ -1165,12 +1214,16 @@ Status multiInitialSyncApply_noAbort(OperationContext* txn,
                 // subsequently got deleted and no longer exists on the Sync Target at all
             }
         } catch (const DBException& e) {
-            severe() << "writer worker caught exception: " << causedBy(e) << " on: " << entry.raw;
-
-            if (inShutdown()) {
-                return {ErrorCodes::InterruptedAtShutdown, e.toString()};
+            // SERVER-24927 and SERVER-24997 If we have a NamespaceNotFound or a
+            // CannotIndexParallelArrays exception, then this document will be
+            // dropped before initial sync ends anyways and we should ignore it.
+            if ((e.getCode() == ErrorCodes::NamespaceNotFound ||
+                 e.getCode() == ErrorCodes::CannotIndexParallelArrays) &&
+                entry.isCrudOpType()) {
+                continue;
             }
 
+            severe() << "writer worker caught exception: " << causedBy(e) << " on: " << entry.raw;
             return e.toStatus();
         }
     }
@@ -1203,16 +1256,14 @@ StatusWith<OpTime> multiApply(OperationContext* txn,
         prefetchOps(ops, workerPool);
     }
 
-    std::vector<MultiApplier::OperationPtrs> writerVectors(workerPool->getNumThreads());
-
-    fillWriterVectors(txn, &ops, &writerVectors);
     LOG(2) << "replication batch size is " << ops.size();
     // We must grab this because we're going to grab write locks later.
     // We hold this mutex the entire time we're writing; it doesn't matter
     // because all readers are blocked anyway.
     stdx::lock_guard<SimpleMutex> fsynclk(filesLockedFsync);
 
-    // stop all readers until we're done
+    // Stop all readers until we're done. This also prevents doc-locking engines from deleting old
+    // entries from the oplog until we finish writing.
     Lock::ParallelBatchWriterMode pbwm(txn->lockState());
 
     auto replCoord = ReplicationCoordinator::get(txn);
@@ -1222,18 +1273,23 @@ StatusWith<OpTime> multiApply(OperationContext* txn,
                 "attempting to replicate ops while primary"};
     }
 
-    applyOps(&writerVectors, workerPool, applyOperation);
-
     {
+        // We must wait for the all work we've dispatched to complete before leaving this block
+        // because the spawned threads refer to objects on our stack, including writerVectors.
+        std::vector<MultiApplier::OperationPtrs> writerVectors;
         ON_BLOCK_EXIT([&] { workerPool->join(); });
 
-        std::vector<BSONObj> docs(ops.size());
-        auto toBSON = [](const OplogEntry& entry) { return entry.raw; };
-        std::transform(ops.begin(), ops.end(), docs.begin(), toBSON);
+        const bool multiThreadedOplogWrites = scheduleWritesToOplog(txn, workerPool, ops);
+        if (multiThreadedOplogWrites) {
+            // Use all threads for oplog application.
+            writerVectors.resize(workerPool->getNumThreads());
+        } else {
+            // We claimed 1 thread for oplog writing, so use 1 less for oplog application.
+            writerVectors.resize(std::max(workerPool->getNumThreads() - 1, size_t(1)));
+        }
 
-        fassertStatusOK(
-            40141,
-            StorageInterface::get(txn)->insertDocuments(txn, NamespaceString(rsOplogName), docs));
+        fillWriterVectors(txn, &ops, &writerVectors);
+        applyOps(&writerVectors, workerPool, applyOperation);
     }
 
     if (inShutdownStrict()) {
@@ -1241,6 +1297,7 @@ StatusWith<OpTime> multiApply(OperationContext* txn,
         return {ErrorCodes::InterruptedAtShutdown,
                 "Cannot apply operations due to shutdown in progress"};
     }
+
     // We have now written all database writes and updated the oplog to match.
     return ops.back().getOpTime();
 }

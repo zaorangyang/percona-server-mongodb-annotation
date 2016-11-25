@@ -45,6 +45,14 @@ DataReplicatorExternalStateImpl::DataReplicatorExternalStateImpl(
     : _replicationCoordinator(replicationCoordinator),
       _replicationCoordinatorExternalState(replicationCoordinatorExternalState) {}
 
+executor::TaskExecutor* DataReplicatorExternalStateImpl::getTaskExecutor() const {
+    return _replicationCoordinatorExternalState->getTaskExecutor();
+}
+
+OldThreadPool* DataReplicatorExternalStateImpl::getDbWorkThreadPool() const {
+    return _replicationCoordinatorExternalState->getDbWorkThreadPool();
+}
+
 OpTimeWithTerm DataReplicatorExternalStateImpl::getCurrentTermAndLastCommittedOpTime() {
     if (!_replicationCoordinator->isV1ElectionProtocol()) {
         return {OpTime::kUninitializedTerm, OpTime()};
@@ -79,6 +87,10 @@ std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeInitialSyncOpl
 std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeSteadyStateOplogBuffer(
     OperationContext* txn) const {
     return _replicationCoordinatorExternalState->makeSteadyStateOplogBuffer(txn);
+}
+
+StatusWith<ReplicaSetConfig> DataReplicatorExternalStateImpl::getCurrentConfig() const {
+    return _replicationCoordinator->getConfig();
 }
 
 StatusWith<OpTime> DataReplicatorExternalStateImpl::_multiApply(

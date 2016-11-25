@@ -62,6 +62,7 @@ class Status;
 template <typename T>
 class StatusWith;
 class TagsType;
+class VersionType;
 
 namespace executor {
 struct ConnectionPoolStats;
@@ -345,6 +346,13 @@ public:
     virtual StatusWith<BSONObj> getGlobalSettings(OperationContext* txn, StringData key) = 0;
 
     /**
+     * Returns the contents of the config.version document - containing the current cluster schema
+     * version as well as the clusterID.
+     */
+    virtual StatusWith<VersionType> getConfigVersion(OperationContext* txn,
+                                                     repl::ReadConcernLevel readConcern) = 0;
+
+    /**
      * Directly sends the specified command to the config server and returns the response.
      *
      * NOTE: Usage of this function is disallowed in new code, which should instead go through
@@ -376,7 +384,7 @@ public:
      * Directly inserts a document in the specified namespace on the config server. The document
      * must have an _id index. Must only be used for insertions in the 'config' database.
      *
-     * NOTE: Should not be used in new code. Instead add a new metadata operation to the interface.
+     * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual Status insertConfigDocument(OperationContext* txn,
                                         const std::string& ns,
@@ -395,7 +403,7 @@ public:
      * was upserted or it existed and any of the fields changed) and false otherwise (basically
      * returns whether the update command's response update.n value is > 0).
      *
-     * NOTE: Should not be used in new code. Instead add a new metadata operation to the interface.
+     * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual StatusWith<bool> updateConfigDocument(OperationContext* txn,
                                                   const std::string& ns,
@@ -408,18 +416,12 @@ public:
      * Removes documents matching a particular query predicate from the specified namespace on the
      * config server. Must only be used for deletions from the 'config' database.
      *
-     * NOTE: Should not be used in new code. Instead add a new metadata operation to the interface.
+     * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual Status removeConfigDocuments(OperationContext* txn,
                                          const std::string& ns,
                                          const BSONObj& query,
                                          const WriteConcernOptions& writeConcern) = 0;
-
-    /**
-     * Performs the necessary checks for version compatibility and creates a new version document
-     * if the current cluster config is empty.
-     */
-    virtual Status initConfigVersion(OperationContext* txn) = 0;
 
     /**
      * Appends the information about the config and admin databases in the config server

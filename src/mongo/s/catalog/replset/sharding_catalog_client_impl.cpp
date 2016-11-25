@@ -96,12 +96,9 @@ using str::stream;
 
 namespace {
 
-const char kWriteConcernField[] = "writeConcern";
-
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
 const ReadPreferenceSetting kConfigPrimaryPreferredSelector(ReadPreference::PrimaryPreferred,
                                                             TagSet{});
-const int kMaxConfigVersionInitRetry = 3;
 const int kMaxReadRetry = 3;
 const int kMaxWriteRetry = 3;
 
@@ -768,12 +765,13 @@ Status ShardingCatalogClientImpl::dropCollection(OperationContext* txn, const Na
             return {ErrorCodes::ShardNotFound,
                     str::stream() << "shard " << shardEntry.getName() << " not found"};
         }
-        auto dropResult = shard->runCommand(
-            txn,
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            ns.db().toString(),
-            BSON("drop" << ns.coll() << "writeConcern" << txn->getWriteConcern().toBSON()),
-            Shard::RetryPolicy::kIdempotent);
+        auto dropResult =
+            shard->runCommand(txn,
+                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                              ns.db().toString(),
+                              BSON("drop" << ns.coll() << WriteConcernOptions::kWriteConcernField
+                                          << txn->getWriteConcern().toBSON()),
+                              Shard::RetryPolicy::kIdempotent);
 
         if (!dropResult.isOK()) {
             return Status(dropResult.getStatus().code(),
@@ -910,6 +908,53 @@ StatusWith<BSONObj> ShardingCatalogClientImpl::getGlobalSettings(OperationContex
 
     invariant(docs.size() == 1);
     return docs.front();
+}
+
+StatusWith<VersionType> ShardingCatalogClientImpl::getConfigVersion(
+    OperationContext* txn, repl::ReadConcernLevel readConcern) {
+    auto findStatus = Grid::get(txn)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+        txn,
+        kConfigReadSelector,
+        readConcern,
+        NamespaceString(VersionType::ConfigNS),
+        BSONObj(),
+        BSONObj(),
+        boost::none /* no limit */);
+    if (!findStatus.isOK()) {
+        return findStatus.getStatus();
+    }
+
+    auto queryResults = findStatus.getValue().docs;
+
+    if (queryResults.size() > 1) {
+        return {ErrorCodes::TooManyMatchingDocuments,
+                str::stream() << "should only have 1 document in " << VersionType::ConfigNS};
+    }
+
+    if (queryResults.empty()) {
+        VersionType versionInfo;
+        versionInfo.setMinCompatibleVersion(UpgradeHistory_EmptyVersion);
+        versionInfo.setCurrentVersion(UpgradeHistory_EmptyVersion);
+        versionInfo.setClusterId(OID{});
+        return versionInfo;
+    }
+
+    BSONObj versionDoc = queryResults.front();
+    auto versionTypeResult = VersionType::fromBSON(versionDoc);
+    if (!versionTypeResult.isOK()) {
+        return Status(ErrorCodes::UnsupportedFormat,
+                      str::stream() << "invalid config.version document: " << versionDoc
+                                    << causedBy(versionTypeResult.getStatus()));
+    }
+
+    auto validationStatus = versionTypeResult.getValue().validate();
+    if (!validationStatus.isOK()) {
+        return Status(validationStatus.code(),
+                      str::stream() << "invalid config.version document: " << versionDoc
+                                    << causedBy(validationStatus.reason()));
+    }
+
+    return versionTypeResult.getValue();
 }
 
 Status ShardingCatalogClientImpl::getDatabasesForShard(OperationContext* txn,
@@ -1088,24 +1133,26 @@ bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* 
         // convert w:1 or no write concern to w:majority before sending.
         WriteConcernOptions writeConcern;
         writeConcern.reset();
-        const char* writeConcernFieldName = "writeConcern";
-        BSONElement writeConcernElement = cmdObj[writeConcernFieldName];
+
+        BSONElement writeConcernElement = cmdObj[WriteConcernOptions::kWriteConcernField];
         bool initialCmdHadWriteConcern = !writeConcernElement.eoo();
         if (initialCmdHadWriteConcern) {
             Status status = writeConcern.parse(writeConcernElement.Obj());
             if (!status.isOK()) {
                 return Command::appendCommandStatus(*result, status);
             }
-            if (!writeConcern.validForConfigServers()) {
+
+            if (!(writeConcern.wNumNodes == 1 ||
+                  writeConcern.wMode == WriteConcernOptions::kMajority)) {
                 return Command::appendCommandStatus(
                     *result,
-                    Status(ErrorCodes::InvalidOptions,
-                           str::stream()
-                               << "Invalid replication write concern.  Writes to config server "
-                                  "replica sets must use w:'majority', got: "
-                               << writeConcern.toBSON()));
+                    {ErrorCodes::InvalidOptions,
+                     str::stream() << "Invalid replication write concern. User management write "
+                                      "commands may only use w:1 or w:'majority', got: "
+                                   << writeConcern.toBSON()});
             }
         }
+
         writeConcern.wMode = WriteConcernOptions::kMajority;
         writeConcern.wNumNodes = 0;
 
@@ -1116,13 +1163,13 @@ bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* 
             BSONObjIterator cmdObjIter(cmdObj);
             while (cmdObjIter.more()) {
                 BSONElement e = cmdObjIter.next();
-                if (str::equals(e.fieldName(), writeConcernFieldName)) {
+                if (WriteConcernOptions::kWriteConcernField == e.fieldName()) {
                     continue;
                 }
                 modifiedCmd.append(e);
             }
         }
-        modifiedCmd.append(writeConcernFieldName, writeConcern.toBSON());
+        modifiedCmd.append(WriteConcernOptions::kWriteConcernField, writeConcern.toBSON());
         cmdToRun = modifiedCmd.obj();
     }
 
@@ -1184,9 +1231,9 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* txn,
                                                           const BSONArray& preCondition,
                                                           const std::string& nss,
                                                           const ChunkVersion& lastChunkVersion) {
-    BSONObj cmd =
-        BSON("applyOps" << updateOps << "preCondition" << preCondition << kWriteConcernField
-                        << kMajorityWriteConcern.toBSON());
+    BSONObj cmd = BSON("applyOps" << updateOps << "preCondition" << preCondition
+                                  << WriteConcernOptions::kWriteConcernField
+                                  << ShardingCatalogClient::kMajorityWriteConcern.toBSON());
 
     auto response = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
         txn,
@@ -1272,41 +1319,9 @@ void ShardingCatalogClientImpl::writeConfigServerDirect(OperationContext* txn,
         return;
     }
 
-    _runBatchWriteCommand(txn, batchRequest, batchResponse, Shard::RetryPolicy::kNotIdempotent);
-}
-
-void ShardingCatalogClientImpl::_runBatchWriteCommand(OperationContext* txn,
-                                                      const BatchedCommandRequest& batchRequest,
-                                                      BatchedCommandResponse* batchResponse,
-                                                      Shard::RetryPolicy retryPolicy) {
-    const std::string dbname = batchRequest.getNS().db().toString();
-    invariant(dbname == "config" || dbname == "admin");
-
-    invariant(batchRequest.sizeWriteOps() == 1);
-
-    const BSONObj cmdObj = batchRequest.toBSON();
-
-    for (int retry = 1; retry <= kMaxWriteRetry; ++retry) {
-        auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
-        auto response = configShard->runCommand(
-            txn,
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            dbname,
-            cmdObj,
-            Shard::RetryPolicy::kNoRetry);  // We're handling our own retries here.
-
-        Status status = Shard::CommandResponse::processBatchWriteResponse(response, batchResponse);
-        if (retry < kMaxWriteRetry && configShard->isRetriableError(status.code(), retryPolicy)) {
-            batchResponse->clear();
-            LOG(1) << "Batch write command failed with retriable error and will be retried"
-                   << causedBy(status);
-            continue;
-        }
-
-        return;
-    }
-
-    MONGO_UNREACHABLE;
+    auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+    *batchResponse =
+        configShard->runBatchWriteCommand(txn, batchRequest, Shard::RetryPolicy::kNotIdempotent);
 }
 
 Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* txn,
@@ -1328,8 +1343,8 @@ Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* txn,
 
     auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
     for (int retry = 1; retry <= kMaxWriteRetry; retry++) {
-        BatchedCommandResponse response;
-        _runBatchWriteCommand(txn, request, &response, Shard::RetryPolicy::kNoRetry);
+        auto response =
+            configShard->runBatchWriteCommand(txn, request, Shard::RetryPolicy::kNoRetry);
 
         Status status = response.toStatus();
 
@@ -1409,8 +1424,9 @@ StatusWith<bool> ShardingCatalogClientImpl::updateConfigDocument(
     request.setNS(nss);
     request.setWriteConcern(writeConcern.toBSON());
 
-    BatchedCommandResponse response;
-    _runBatchWriteCommand(txn, request, &response, Shard::RetryPolicy::kIdempotent);
+    auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+    auto response =
+        configShard->runBatchWriteCommand(txn, request, Shard::RetryPolicy::kIdempotent);
 
     Status status = response.toStatus();
     if (!status.isOK()) {
@@ -1440,8 +1456,9 @@ Status ShardingCatalogClientImpl::removeConfigDocuments(OperationContext* txn,
     request.setNS(nss);
     request.setWriteConcern(writeConcern.toBSON());
 
-    BatchedCommandResponse response;
-    _runBatchWriteCommand(txn, request, &response, Shard::RetryPolicy::kIdempotent);
+    auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+    auto response =
+        configShard->runBatchWriteCommand(txn, request, Shard::RetryPolicy::kIdempotent);
 
     return response.toStatus();
 }
@@ -1495,7 +1512,9 @@ Status ShardingCatalogClientImpl::_checkDbDoesNotExist(OperationContext* txn,
 Status ShardingCatalogClientImpl::_createCappedConfigCollection(OperationContext* txn,
                                                                 StringData collName,
                                                                 int cappedSize) {
-    BSONObj createCmd = BSON("create" << collName << "capped" << true << "size" << cappedSize);
+    BSONObj createCmd = BSON("create" << collName << "capped" << true << "size" << cappedSize
+                                      << WriteConcernOptions::kWriteConcernField
+                                      << ShardingCatalogClient::kMajorityWriteConcern.toBSON());
 
     auto result = Grid::get(txn)->shardRegistry()->getConfigShard()->runCommand(
         txn,
@@ -1553,107 +1572,6 @@ StatusWith<long long> ShardingCatalogClientImpl::_runCountCommandOnConfig(Operat
     }
 
     return result;
-}
-
-Status ShardingCatalogClientImpl::initConfigVersion(OperationContext* txn) {
-    for (int x = 0; x < kMaxConfigVersionInitRetry; x++) {
-        auto versionStatus = _getConfigVersion(txn);
-        if (!versionStatus.isOK()) {
-            return versionStatus.getStatus();
-        }
-
-        auto versionInfo = versionStatus.getValue();
-        if (versionInfo.getMinCompatibleVersion() > CURRENT_CONFIG_VERSION) {
-            return {ErrorCodes::IncompatibleShardingConfigVersion,
-                    str::stream() << "current version v" << CURRENT_CONFIG_VERSION
-                                  << " is older than the cluster min compatible v"
-                                  << versionInfo.getMinCompatibleVersion()};
-        }
-
-        if (versionInfo.getCurrentVersion() == UpgradeHistory_EmptyVersion) {
-            VersionType newVersion;
-            newVersion.setClusterId(OID::gen());
-            newVersion.setMinCompatibleVersion(MIN_COMPATIBLE_CONFIG_VERSION);
-            newVersion.setCurrentVersion(CURRENT_CONFIG_VERSION);
-
-            BSONObj versionObj(newVersion.toBSON());
-            auto upsertStatus = updateConfigDocument(txn,
-                                                     VersionType::ConfigNS,
-                                                     versionObj,
-                                                     versionObj,
-                                                     true,
-                                                     ShardingCatalogClient::kMajorityWriteConcern);
-
-            if ((upsertStatus.isOK() && !upsertStatus.getValue()) ||
-                upsertStatus == ErrorCodes::DuplicateKey) {
-                // Do the check again as someone inserted a new config version document
-                // and the upsert neither inserted nor updated a config version document.
-                // Note: you can get duplicate key errors on upsert because of SERVER-14322.
-                continue;
-            }
-
-            return upsertStatus.getStatus();
-        }
-
-        if (versionInfo.getCurrentVersion() == UpgradeHistory_UnreportedVersion) {
-            return {ErrorCodes::IncompatibleShardingConfigVersion,
-                    "Assuming config data is old since the version document cannot be found in the "
-                    "config server and it contains databases aside 'local' and 'admin'. "
-                    "Please upgrade if this is the case. Otherwise, make sure that the config "
-                    "server is clean."};
-        }
-
-        if (versionInfo.getCurrentVersion() < CURRENT_CONFIG_VERSION) {
-            return {ErrorCodes::IncompatibleShardingConfigVersion,
-                    str::stream() << "need to upgrade current cluster version to v"
-                                  << CURRENT_CONFIG_VERSION
-                                  << "; currently at v"
-                                  << versionInfo.getCurrentVersion()};
-        }
-
-        return Status::OK();
-    }
-
-    return {ErrorCodes::IncompatibleShardingConfigVersion,
-            str::stream() << "unable to create new config version document after "
-                          << kMaxConfigVersionInitRetry
-                          << " retries"};
-}
-
-StatusWith<VersionType> ShardingCatalogClientImpl::_getConfigVersion(OperationContext* txn) {
-    auto findStatus = _exhaustiveFindOnConfig(txn,
-                                              kConfigReadSelector,
-                                              NamespaceString(VersionType::ConfigNS),
-                                              BSONObj(),
-                                              BSONObj(),
-                                              boost::none /* no limit */);
-    if (!findStatus.isOK()) {
-        return findStatus.getStatus();
-    }
-
-    auto queryResults = findStatus.getValue().value;
-
-    if (queryResults.size() > 1) {
-        return {ErrorCodes::RemoteValidationError,
-                str::stream() << "should only have 1 document in " << VersionType::ConfigNS};
-    }
-
-    if (queryResults.empty()) {
-        VersionType versionInfo;
-        versionInfo.setMinCompatibleVersion(UpgradeHistory_EmptyVersion);
-        versionInfo.setCurrentVersion(UpgradeHistory_EmptyVersion);
-        return versionInfo;
-    }
-
-    BSONObj versionDoc = queryResults.front();
-    auto versionTypeResult = VersionType::fromBSON(versionDoc);
-    if (!versionTypeResult.isOK()) {
-        return Status(ErrorCodes::UnsupportedFormat,
-                      str::stream() << "invalid config version document: " << versionDoc
-                                    << versionTypeResult.getStatus().toString());
-    }
-
-    return versionTypeResult.getValue();
 }
 
 StatusWith<repl::OpTimeWith<vector<BSONObj>>> ShardingCatalogClientImpl::_exhaustiveFindOnConfig(

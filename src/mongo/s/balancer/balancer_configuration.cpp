@@ -32,6 +32,8 @@
 
 #include "mongo/s/balancer/balancer_configuration.h"
 
+#include <algorithm>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
@@ -45,7 +47,9 @@ namespace mongo {
 namespace {
 
 const char kValue[] = "value";
+const char kEnabled[] = "enabled";
 const char kStopped[] = "stopped";
+const char kMode[] = "mode";
 const char kActiveWindow[] = "activeWindow";
 const char kWaitForDelete[] = "_waitForDelete";
 
@@ -54,22 +58,33 @@ const NamespaceString kSettingsNamespace("config", "settings");
 }  // namespace
 
 const char BalancerSettingsType::kKey[] = "balancer";
+const char* BalancerSettingsType::kBalancerModes[] = {"full", "autoSplitOnly", "off"};
 
 const char ChunkSizeSettingsType::kKey[] = "chunksize";
 const uint64_t ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes{64 * 1024 * 1024};
 
+const char AutoSplitSettingsType::kKey[] = "autosplit";
+
 BalancerConfiguration::BalancerConfiguration()
     : _balancerSettings(BalancerSettingsType::createDefault()),
-      _maxChunkSizeBytes(ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes) {}
+      _maxChunkSizeBytes(ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes),
+      _shouldAutoSplit(true) {}
 
 BalancerConfiguration::~BalancerConfiguration() = default;
 
-Status BalancerConfiguration::setBalancerActive(OperationContext* txn, bool active) {
+BalancerSettingsType::BalancerMode BalancerConfiguration::getBalancerMode() const {
+    stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
+    return _balancerSettings.getMode();
+}
+
+Status BalancerConfiguration::setBalancerMode(OperationContext* txn,
+                                              BalancerSettingsType::BalancerMode mode) {
     auto updateStatus = Grid::get(txn)->catalogClient(txn)->updateConfigDocument(
         txn,
         kSettingsNamespace.ns(),
         BSON("_id" << BalancerSettingsType::kKey),
-        BSON("$set" << BSON(kStopped << !active)),
+        BSON("$set" << BSON(kStopped << (mode == BalancerSettingsType::kOff) << kMode
+                                     << BalancerSettingsType::kBalancerModes[mode])),
         true,
         ShardingCatalogClient::kMajorityWriteConcern);
 
@@ -78,7 +93,7 @@ Status BalancerConfiguration::setBalancerActive(OperationContext* txn, bool acti
         return refreshStatus;
     }
 
-    if (!updateStatus.isOK() && (isBalancerActive() != active)) {
+    if (!updateStatus.isOK() && (getBalancerMode() != mode)) {
         return {updateStatus.getStatus().code(),
                 str::stream() << "Failed to update balancer configuration due to "
                               << updateStatus.getStatus().reason()};
@@ -87,9 +102,19 @@ Status BalancerConfiguration::setBalancerActive(OperationContext* txn, bool acti
     return Status::OK();
 }
 
-bool BalancerConfiguration::isBalancerActive() const {
+bool BalancerConfiguration::shouldBalance() const {
     stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
-    if (!_balancerSettings.shouldBalance()) {
+    if (_balancerSettings.getMode() == BalancerSettingsType::kOff ||
+        _balancerSettings.getMode() == BalancerSettingsType::kAutoSplitOnly) {
+        return false;
+    }
+
+    return _balancerSettings.isTimeInBalancingWindow(boost::posix_time::second_clock::local_time());
+}
+
+bool BalancerConfiguration::shouldBalanceForAutoSplit() const {
+    stdx::lock_guard<stdx::mutex> lk(_balancerSettingsMutex);
+    if (_balancerSettings.getMode() == BalancerSettingsType::kOff) {
         return false;
     }
 
@@ -121,6 +146,14 @@ Status BalancerConfiguration::refreshAndCheck(OperationContext* txn) {
         return {chunkSizeStatus.code(),
                 str::stream() << "Failed to refresh the chunk sizes settings due to "
                               << chunkSizeStatus.toString()};
+    }
+
+    // AutoSplit settings
+    Status autoSplitStatus = _refreshAutoSplitSettings(txn);
+    if (!autoSplitStatus.isOK()) {
+        return {autoSplitStatus.code(),
+                str::stream() << "Failed to refresh the autoSplit settings due to "
+                              << autoSplitStatus.toString()};
     }
 
     return Status::OK();
@@ -174,6 +207,32 @@ Status BalancerConfiguration::_refreshChunkSizeSettings(OperationContext* txn) {
     return Status::OK();
 }
 
+Status BalancerConfiguration::_refreshAutoSplitSettings(OperationContext* txn) {
+    AutoSplitSettingsType settings = AutoSplitSettingsType::createDefault();
+
+    auto settingsObjStatus =
+        grid.catalogClient(txn)->getGlobalSettings(txn, AutoSplitSettingsType::kKey);
+    if (settingsObjStatus.isOK()) {
+        auto settingsStatus = AutoSplitSettingsType::fromBSON(settingsObjStatus.getValue());
+        if (!settingsStatus.isOK()) {
+            return settingsStatus.getStatus();
+        }
+
+        settings = std::move(settingsStatus.getValue());
+    } else if (settingsObjStatus != ErrorCodes::NoMatchingDocument) {
+        return settingsObjStatus.getStatus();
+    }
+
+    if (settings.getShouldAutoSplit() != getShouldAutoSplit()) {
+        log() << "ShouldAutoSplit changing from " << getShouldAutoSplit() << " to "
+              << settings.getShouldAutoSplit();
+
+        _shouldAutoSplit.store(settings.getShouldAutoSplit());
+    }
+
+    return Status::OK();
+}
+
 BalancerSettingsType::BalancerSettingsType()
     : _secondaryThrottle(
           MigrationSecondaryThrottleOptions::create(MigrationSecondaryThrottleOptions::kDefault)) {}
@@ -190,7 +249,20 @@ StatusWith<BalancerSettingsType> BalancerSettingsType::fromBSON(const BSONObj& o
         Status status = bsonExtractBooleanFieldWithDefault(obj, kStopped, false, &stopped);
         if (!status.isOK())
             return status;
-        settings._shouldBalance = !stopped;
+        if (stopped) {
+            settings._mode = kOff;
+        } else {
+            std::string modeStr;
+            status = bsonExtractStringFieldWithDefault(obj, kMode, kBalancerModes[kFull], &modeStr);
+            if (!status.isOK())
+                return status;
+            auto it = std::find(std::begin(kBalancerModes), std::end(kBalancerModes), modeStr);
+            if (it == std::end(kBalancerModes)) {
+                return Status(ErrorCodes::BadValue, "Invalid balancer mode");
+            }
+
+            settings._mode = static_cast<BalancerMode>(it - std::begin(kBalancerModes));
+        }
     }
 
     {
@@ -317,5 +389,22 @@ bool ChunkSizeSettingsType::checkMaxChunkSizeValid(uint64_t maxChunkSizeBytes) {
     return false;
 }
 
+AutoSplitSettingsType::AutoSplitSettingsType() = default;
+
+AutoSplitSettingsType AutoSplitSettingsType::createDefault() {
+    return AutoSplitSettingsType();
+}
+
+StatusWith<AutoSplitSettingsType> AutoSplitSettingsType::fromBSON(const BSONObj& obj) {
+    bool shouldAutoSplit;
+    Status status = bsonExtractBooleanField(obj, kEnabled, &shouldAutoSplit);
+    if (!status.isOK())
+        return status;
+
+    AutoSplitSettingsType settings;
+    settings._shouldAutoSplit = shouldAutoSplit;
+
+    return settings;
+}
 
 }  // namespace mongo

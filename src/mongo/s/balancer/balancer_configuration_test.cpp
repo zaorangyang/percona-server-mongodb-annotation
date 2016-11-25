@@ -100,13 +100,16 @@ TEST_F(BalancerConfigurationTestFixture, NoConfigurationDocuments) {
 
     expectSettingsQuery(BalancerSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
 
     future.timed_get(kFutureTimeout);
 
-    ASSERT(config.isBalancerActive());
+    ASSERT(config.shouldBalance());
+    ASSERT(config.shouldBalanceForAutoSplit());
     ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
               config.getSecondaryThrottle().getSecondaryThrottle());
     ASSERT_EQ(64 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
+    ASSERT(config.getShouldAutoSplit());
 }
 
 TEST_F(BalancerConfigurationTestFixture, ChunkSizeSettingsDocumentOnly) {
@@ -118,13 +121,16 @@ TEST_F(BalancerConfigurationTestFixture, ChunkSizeSettingsDocumentOnly) {
 
     expectSettingsQuery(BalancerSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>(BSON("value" << 3)));
+    expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
 
     future.timed_get(kFutureTimeout);
 
-    ASSERT(config.isBalancerActive());
+    ASSERT(config.shouldBalance());
+    ASSERT(config.shouldBalanceForAutoSplit());
     ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
               config.getSecondaryThrottle().getSecondaryThrottle());
     ASSERT_EQ(3 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
+    ASSERT(config.getShouldAutoSplit());
 }
 
 TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentOnly) {
@@ -137,19 +143,98 @@ TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentOnly) {
     expectSettingsQuery(BalancerSettingsType::kKey,
                         boost::optional<BSONObj>(BSON("stopped" << true)));
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
 
     future.timed_get(kFutureTimeout);
 
-    ASSERT(!config.isBalancerActive());
+    ASSERT(!config.shouldBalance());
+    ASSERT(!config.shouldBalanceForAutoSplit());
+    ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
+              config.getSecondaryThrottle().getSecondaryThrottle());
+    ASSERT_EQ(64 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
+    ASSERT(config.getShouldAutoSplit());
+}
+
+TEST_F(BalancerConfigurationTestFixture, AutoSplitSettingsDocumentOnly) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
+
+    BalancerConfiguration config;
+
+    auto future = launchAsync([&] { ASSERT_OK(config.refreshAndCheck(operationContext())); });
+
+    expectSettingsQuery(BalancerSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(AutoSplitSettingsType::kKey,
+                        boost::optional<BSONObj>(BSON("enabled" << false)));
+
+    future.timed_get(kFutureTimeout);
+
+    ASSERT(config.shouldBalance());
+    ASSERT(config.shouldBalanceForAutoSplit());
+    ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
+              config.getSecondaryThrottle().getSecondaryThrottle());
+    ASSERT_EQ(64 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
+    ASSERT(!config.getShouldAutoSplit());
+}
+
+TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentBalanceForAutoSplitOnly) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
+
+    BalancerConfiguration config;
+
+    auto future = launchAsync([&] { ASSERT_OK(config.refreshAndCheck(operationContext())); });
+
+    expectSettingsQuery(BalancerSettingsType::kKey,
+                        boost::optional<BSONObj>(BSON("mode"
+                                                      << "autoSplitOnly")));
+    expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(AutoSplitSettingsType::kKey,
+                        boost::optional<BSONObj>(BSON("enabled" << true)));
+
+    future.timed_get(kFutureTimeout);
+
+    ASSERT(!config.shouldBalance());
+    ASSERT(config.shouldBalanceForAutoSplit());
     ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
               config.getSecondaryThrottle().getSecondaryThrottle());
     ASSERT_EQ(64 * 1024 * 1024ULL, config.getMaxChunkSizeBytes());
 }
 
-TEST(BalancerSettingsType, BalancerDisabled) {
+TEST(BalancerSettingsType, Defaults) {
+    BalancerSettingsType settings = assertGet(BalancerSettingsType::fromBSON(BSONObj()));
+    ASSERT_EQ(BalancerSettingsType::kFull, settings.getMode());
+    ASSERT_EQ(MigrationSecondaryThrottleOptions::kDefault,
+              settings.getSecondaryThrottle().getSecondaryThrottle());
+    ASSERT(!settings.getSecondaryThrottle().isWriteConcernSpecified());
+}
+
+TEST(BalancerSettingsType, BalancerDisabledThroughStoppedOption) {
     BalancerSettingsType settings =
         assertGet(BalancerSettingsType::fromBSON(BSON("stopped" << true)));
-    ASSERT(!settings.shouldBalance());
+    ASSERT_EQ(BalancerSettingsType::kOff, settings.getMode());
+}
+
+TEST(BalancerSettingsType, AllValidBalancerModeOptions) {
+    ASSERT_EQ(BalancerSettingsType::kFull,
+              assertGet(BalancerSettingsType::fromBSON(BSON("mode"
+                                                            << "full")))
+                  .getMode());
+    ASSERT_EQ(BalancerSettingsType::kAutoSplitOnly,
+              assertGet(BalancerSettingsType::fromBSON(BSON("mode"
+                                                            << "autoSplitOnly")))
+                  .getMode());
+    ASSERT_EQ(BalancerSettingsType::kOff,
+              assertGet(BalancerSettingsType::fromBSON(BSON("mode"
+                                                            << "off")))
+                  .getMode());
+}
+
+TEST(BalancerSettingsType, InvalidBalancerModeOption) {
+    ASSERT_EQ(ErrorCodes::BadValue,
+              BalancerSettingsType::fromBSON(BSON("mode"
+                                                  << "BAD"))
+                  .getStatus()
+                  .code());
 }
 
 TEST(BalancerSettingsType, BalancingWindowStartLessThanStop) {
