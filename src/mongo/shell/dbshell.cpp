@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/client/dbclientinterface.h"
@@ -65,6 +66,7 @@
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/static_observer.h"
+#include "mongo/util/stringutils.h"
 #include "mongo/util/text.h"
 #include "mongo/util/version.h"
 
@@ -87,6 +89,15 @@ static volatile bool atPrompt = false;  // can eval before getting to prompt
 
 namespace {
 const auto kDefaultMongoURL = "mongodb://127.0.0.1:27017"_sd;
+
+// We set the featureCompatibilityVersion to 3.4 in the mongo shell so that BSON validation always
+// uses BSONVersion::kLatest.
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion34, ("EndStartupOptionSetup"))
+(InitializerContext* context) {
+    mongo::serverGlobalParams.featureCompatibility.version.store(
+        ServerGlobalParams::FeatureCompatibility::Version::k34);
+    return Status::OK();
+}
 }
 
 namespace mongo {
@@ -697,6 +708,7 @@ int _main(int argc, char* argv[], char** envp) {
 
     mongo::ScriptEngine::setConnectCallback(mongo::shell_utils::onConnect);
     mongo::ScriptEngine::setup();
+    mongo::globalScriptEngine->setJSHeapLimitMB(shellGlobalParams.jsHeapLimitMB);
     mongo::globalScriptEngine->setScopeInitCallback(mongo::shell_utils::initScope);
     mongo::globalScriptEngine->enableJIT(!shellGlobalParams.nojit);
     mongo::globalScriptEngine->enableJavaScriptProtection(shellGlobalParams.javascriptProtection);

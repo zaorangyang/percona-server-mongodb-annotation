@@ -54,7 +54,7 @@ const char* DocumentSourceGraphLookUp::getSourceName() const {
     return "$graphLookup";
 }
 
-boost::optional<Document> DocumentSourceGraphLookUp::getNext() {
+DocumentSource::GetNextResult DocumentSourceGraphLookUp::getNext() {
     pExpCtx->checkForInterrupt();
 
     if (_unwind) {
@@ -62,10 +62,12 @@ boost::optional<Document> DocumentSourceGraphLookUp::getNext() {
     }
 
     // We aren't handling a $unwind, process the input document normally.
-    if (!(_input = pSource->getNext())) {
-        dispose();
-        return boost::none;
+    auto input = pSource->getNext();
+    if (!input.isAdvanced()) {
+        return input;
     }
+
+    _input = input.releaseDocument();
 
     performSearch();
 
@@ -87,7 +89,7 @@ boost::optional<Document> DocumentSourceGraphLookUp::getNext() {
     return output.freeze();
 }
 
-boost::optional<Document> DocumentSourceGraphLookUp::getNextUnwound() {
+DocumentSource::GetNextResult DocumentSourceGraphLookUp::getNextUnwound() {
     const boost::optional<FieldPath> indexPath((*_unwind)->indexPath());
 
     // If the unwind is not preserving empty arrays, we might have to process multiple inputs before
@@ -96,11 +98,13 @@ boost::optional<Document> DocumentSourceGraphLookUp::getNextUnwound() {
         if (_visited.empty()) {
             // No results are left for the current input, so we should move on to the next one and
             // perform a new search.
-            if (!(_input = pSource->getNext())) {
-                dispose();
-                return boost::none;
+
+            auto input = pSource->getNext();
+            if (!input.isAdvanced()) {
+                return input;
             }
 
+            _input = input.releaseDocument();
             performSearch();
             _visitedUsageBytes = 0;
             _outputIndex = 0;
@@ -171,7 +175,7 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
             // We've already allocated space for the trailing $match stage in '_fromPipeline'.
             _fromPipeline.back() = *matchStage;
             auto pipeline = uassertStatusOK(_mongod->makePipeline(_fromPipeline, _fromExpCtx));
-            while (auto next = pipeline->output()->getNext()) {
+            while (auto next = pipeline->getNext()) {
                 uassert(40271,
                         str::stream()
                             << "Documents in the '"
@@ -446,6 +450,7 @@ void DocumentSourceGraphLookUp::doReattachToOperationContext(OperationContext* o
 }
 
 DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
     NamespaceString from,
     std::string as,
     std::string connectFromField,
@@ -454,7 +459,7 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
     boost::optional<BSONObj> additionalFilter,
     boost::optional<FieldPath> depthField,
     boost::optional<long long> maxDepth,
-    const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    boost::optional<boost::intrusive_ptr<DocumentSourceUnwind>> unwindSrc)
     : DocumentSourceNeedsMongod(expCtx),
       _from(std::move(from)),
       _as(std::move(as)),
@@ -465,7 +470,8 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
       _depthField(depthField),
       _maxDepth(maxDepth),
       _visited(ValueComparator::kInstance.makeUnorderedValueMap<BSONObj>()),
-      _cache(expCtx->getValueComparator()) {}
+      _cache(expCtx->getValueComparator()),
+      _unwind(unwindSrc) {}
 
 intrusive_ptr<DocumentSourceGraphLookUp> DocumentSourceGraphLookUp::create(
     const intrusive_ptr<ExpressionContext>& expCtx,
@@ -476,9 +482,11 @@ intrusive_ptr<DocumentSourceGraphLookUp> DocumentSourceGraphLookUp::create(
     intrusive_ptr<Expression> startWith,
     boost::optional<BSONObj> additionalFilter,
     boost::optional<FieldPath> depthField,
-    boost::optional<long long> maxDepth) {
+    boost::optional<long long> maxDepth,
+    boost::optional<boost::intrusive_ptr<DocumentSourceUnwind>> unwindSrc) {
     intrusive_ptr<DocumentSourceGraphLookUp> source(
-        new DocumentSourceGraphLookUp(std::move(fromNs),
+        new DocumentSourceGraphLookUp(expCtx,
+                                      std::move(fromNs),
                                       std::move(asField),
                                       std::move(connectFromField),
                                       std::move(connectToField),
@@ -486,7 +494,7 @@ intrusive_ptr<DocumentSourceGraphLookUp> DocumentSourceGraphLookUp::create(
                                       additionalFilter,
                                       depthField,
                                       maxDepth,
-                                      expCtx));
+                                      unwindSrc));
     source->_variables.reset(new Variables());
 
     source->injectExpressionContext(expCtx);
@@ -591,7 +599,8 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
             !isMissingRequiredField);
 
     intrusive_ptr<DocumentSourceGraphLookUp> newSource(
-        new DocumentSourceGraphLookUp(std::move(from),
+        new DocumentSourceGraphLookUp(expCtx,
+                                      std::move(from),
                                       std::move(as),
                                       std::move(connectFromField),
                                       std::move(connectToField),
@@ -599,7 +608,7 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
                                       additionalFilter,
                                       depthField,
                                       maxDepth,
-                                      expCtx));
+                                      boost::none));
 
     newSource->_variables.reset(new Variables(idGenerator.getIdCount()));
 

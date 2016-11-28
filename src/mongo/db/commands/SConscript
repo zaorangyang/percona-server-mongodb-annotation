@@ -155,6 +155,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/pipeline/serveronly',
         '$BUILD_DIR/mongo/db/repl/isself',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_impl',
+        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/stats/serveronly',
         '$BUILD_DIR/mongo/db/storage/mmap_v1/storage_mmapv1',
     ],
@@ -184,6 +185,16 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target="list_collections_filter_test",
+    source=[
+        "list_collections_filter_test.cpp"
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/commands/list_collections_filter',
     ],
 )
 

@@ -66,8 +66,8 @@ DistLockManager::ScopedDistLock acquireCollectionDistLock(OperationContext* txn,
                             << ChunkRange(args.getMinKey(), args.getMaxKey()).toString()
                             << " in "
                             << args.getNss().ns());
-    auto distLockStatus =
-        Grid::get(txn)->catalogClient(txn)->distLock(txn, args.getNss().ns(), whyMessage);
+    auto distLockStatus = Grid::get(txn)->catalogClient(txn)->getDistLockManager()->lock(
+        txn, args.getNss().ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
     if (!distLockStatus.isOK()) {
         const string msg = str::stream()
             << "Could not acquire collection lock for " << args.getNss().ns()
@@ -86,7 +86,7 @@ DistLockManager::ScopedDistLock acquireCollectionDistLock(OperationContext* txn,
  */
 void uassertStatusOKWithWarning(const Status& status) {
     if (!status.isOK()) {
-        warning() << "Chunk move failed" << redact(status);
+        warning() << "Chunk move failed" << causedBy(redact(status));
         uassertStatusOK(status);
     }
 }

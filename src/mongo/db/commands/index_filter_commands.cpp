@@ -32,7 +32,6 @@
 
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "mongo/base/init.h"
@@ -48,6 +47,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/log.h"
 
 
@@ -269,7 +269,7 @@ Status ClearFilters::clear(OperationContext* txn,
         // Remove entry from plan cache
         planCache->remove(*cq);
 
-        LOG(0) << "Removed index filter on " << ns << " " << cq->toStringShort();
+        LOG(0) << "Removed index filter on " << ns << " " << redact(cq->toStringShort());
 
         return Status::OK();
     }
@@ -366,7 +366,7 @@ Status SetFilter::set(OperationContext* txn,
                       "required field indexes must contain at least one index");
     }
     BSONObjSet indexes = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    std::unordered_set<std::string> indexNames;
+    stdx::unordered_set<std::string> indexNames;
     for (vector<BSONElement>::const_iterator i = indexesEltArray.begin();
          i != indexesEltArray.end();
          ++i) {
@@ -396,7 +396,8 @@ Status SetFilter::set(OperationContext* txn,
     // Remove entry from plan cache.
     planCache->remove(*cq);
 
-    LOG(0) << "Index filter set on " << ns << " " << cq->toStringShort() << " " << indexesElt;
+    LOG(0) << "Index filter set on " << ns << " " << redact(cq->toStringShort()) << " "
+           << indexesElt;
 
     return Status::OK();
 }

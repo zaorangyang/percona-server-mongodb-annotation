@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 
 namespace mongo {
@@ -38,7 +38,7 @@ namespace mongo {
  */
 class ShardingCatalogClientMock : public ShardingCatalogClient {
 public:
-    ShardingCatalogClientMock();
+    ShardingCatalogClientMock(std::unique_ptr<DistLockManager> distLockManager);
     ~ShardingCatalogClientMock();
 
     Status startup() override;
@@ -162,16 +162,11 @@ public:
 
     DistLockManager* getDistLockManager() override;
 
-    StatusWith<DistLockManager::ScopedDistLock> distLock(OperationContext* txn,
-                                                         StringData name,
-                                                         StringData whyMessage,
-                                                         Milliseconds waitFor) override;
-
     Status appendInfoForConfigServerDatabases(OperationContext* txn,
                                               BSONArrayBuilder* builder) override;
 
 private:
-    std::unique_ptr<DistLockManagerMock> _mockDistLockMgr;
+    std::unique_ptr<DistLockManager> _distLockManager;
 };
 
 }  // namespace mongo

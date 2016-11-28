@@ -171,7 +171,7 @@ OpTime StorageInterfaceImpl::getMinValid(OperationContext* txn) const {
     }
 
     if (!opTimeStatus.isOK()) {
-        severe() << "Error parsing minvalid entry: " << doc
+        severe() << "Error parsing minvalid entry: " << redact(doc)
                  << ", with status:" << opTimeStatus.getStatus();
         fassertFailedNoTrace(40052);
     }
@@ -253,9 +253,10 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
     std::unique_ptr<CollectionBulkLoader> loaderToReturn;
 
     auto status = runner->runSynchronousTask([&](OperationContext* txn) -> Status {
-        // We are not replicating nor validating these writes.
+        // We are not replicating nor validating writes under this OperationContext*.
+        // The OperationContext* is used for all writes to the (newly) cloned collection.
         txn->setReplicatedWrites(false);
-        DisableDocumentValidation validationDisabler(txn);
+        documentValidationDisabled(txn) = true;
 
         // Retry if WCE.
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
@@ -312,34 +313,58 @@ Status StorageInterfaceImpl::insertDocument(OperationContext* txn,
     return insertDocuments(txn, nss, {doc});
 }
 
+namespace {
+
+Status insertDocumentsSingleBatch(OperationContext* txn,
+                                  const NamespaceString& nss,
+                                  std::vector<BSONObj>::const_iterator begin,
+                                  std::vector<BSONObj>::const_iterator end) {
+    ScopedTransaction transaction(txn, MODE_IX);
+    AutoGetCollection autoColl(txn, nss, MODE_IX);
+    auto collection = autoColl.getCollection();
+    if (!collection) {
+        return {ErrorCodes::NamespaceNotFound,
+                str::stream() << "The collection must exist before inserting documents, ns:"
+                              << nss.ns()};
+    }
+
+    WriteUnitOfWork wunit(txn);
+    OpDebug* const nullOpDebug = nullptr;
+    auto status = collection->insertDocuments(txn, begin, end, nullOpDebug, false);
+    if (!status.isOK()) {
+        return status;
+    }
+    wunit.commit();
+
+    return Status::OK();
+}
+
+}  // namespace
+
 Status StorageInterfaceImpl::insertDocuments(OperationContext* txn,
                                              const NamespaceString& nss,
                                              const std::vector<BSONObj>& docs) {
-    if (docs.empty()) {
-        return {ErrorCodes::EmptyArrayOperation,
-                str::stream() << "unable to insert documents into " << nss.ns()
-                              << " - no documents provided"};
-    }
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-        ScopedTransaction transaction(txn, MODE_IX);
-        AutoGetCollection autoColl(txn, nss, MODE_IX);
-        auto collection = autoColl.getCollection();
-        if (!collection) {
-            return {ErrorCodes::NamespaceNotFound,
-                    str::stream() << "The collection must exist before inserting documents, ns:"
-                                  << nss.ns()};
+    if (docs.size() > 1U) {
+        try {
+            if (insertDocumentsSingleBatch(txn, nss, docs.cbegin(), docs.cend()).isOK()) {
+                return Status::OK();
+            }
+        } catch (...) {
+            // Ignore this failure and behave as-if we never tried to do the combined batch insert.
+            // The loop below will handle reporting any non-transient errors.
         }
+    }
 
-        WriteUnitOfWork wunit(txn);
-        OpDebug* const nullOpDebug = nullptr;
-        auto status =
-            collection->insertDocuments(txn, docs.begin(), docs.end(), nullOpDebug, false);
-        if (!status.isOK()) {
-            return status;
+    // Try to insert the batch one-at-a-time because the batch failed all-at-once inserting.
+    for (auto it = docs.cbegin(); it != docs.cend(); ++it) {
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            auto status = insertDocumentsSingleBatch(txn, nss, it, it + 1);
+            if (!status.isOK()) {
+                return status;
+            }
         }
-        wunit.commit();
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "StorageInterfaceImpl::insertDocuments", nss.ns());
     }
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "StorageInterfaceImpl::insertDocuments", nss.ns());
 
     return Status::OK();
 }
@@ -397,7 +422,11 @@ Status StorageInterfaceImpl::createCollection(OperationContext* txn,
 Status StorageInterfaceImpl::dropCollection(OperationContext* txn, const NamespaceString& nss) {
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         ScopedTransaction transaction(txn, MODE_IX);
-        AutoGetOrCreateDb autoDB(txn, nss.db(), MODE_X);
+        AutoGetDb autoDB(txn, nss.db(), MODE_X);
+        if (!autoDB.getDb()) {
+            // Database does not exist - nothing to do.
+            return Status::OK();
+        }
         WriteUnitOfWork wunit(txn);
         const auto status = autoDB.getDb()->dropCollection(txn, nss.ns());
         if (status.isOK()) {
@@ -428,6 +457,8 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
                                      const NamespaceString& nss,
                                      boost::optional<StringData> indexName,
                                      StorageInterface::ScanDirection scanDirection,
+                                     const BSONObj& startKey,
+                                     BoundInclusion boundInclusion,
                                      FindDeleteMode mode) {
     auto isFind = mode == FindDeleteMode::kFind;
     auto opStr = isFind ? "StorageInterfaceImpl::findOne" : "StorageInterfaceImpl::deleteOne";
@@ -447,6 +478,15 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
 
         std::unique_ptr<PlanExecutor> planExecutor;
         if (!indexName) {
+            if (!startKey.isEmpty()) {
+                return {ErrorCodes::NoSuchKey,
+                        "non-empty startKey not allowed for collection scan"};
+            }
+            if (boundInclusion != BoundInclusion::kIncludeStartKeyOnly) {
+                return {ErrorCodes::InvalidOptions,
+                        "bound inclusion must be BoundInclusion::kIncludeStartKeyOnly for "
+                        "collection scan"};
+            }
             // Use collection scan.
             planExecutor = isFind
                 ? InternalPlanner::collectionScan(
@@ -481,15 +521,16 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
             auto maxKey = Helpers::toKeyFormat(keyPattern.extendRangeBound({}, true));
             auto bounds =
                 isForward ? std::make_pair(minKey, maxKey) : std::make_pair(maxKey, minKey);
-            bool endKeyInclusive = false;
-
+            if (!startKey.isEmpty()) {
+                bounds.first = startKey;
+            }
             planExecutor = isFind
                 ? InternalPlanner::indexScan(txn,
                                              collection,
                                              indexDescriptor,
                                              bounds.first,
                                              bounds.second,
-                                             endKeyInclusive,
+                                             boundInclusion,
                                              PlanExecutor::YIELD_MANUAL,
                                              direction,
                                              InternalPlanner::IXSCAN_FETCH)
@@ -499,7 +540,7 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
                                                        indexDescriptor,
                                                        bounds.first,
                                                        bounds.second,
-                                                       endKeyInclusive,
+                                                       boundInclusion,
                                                        PlanExecutor::YIELD_MANUAL,
                                                        direction);
         }
@@ -522,15 +563,21 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
 StatusWith<BSONObj> StorageInterfaceImpl::findOne(OperationContext* txn,
                                                   const NamespaceString& nss,
                                                   boost::optional<StringData> indexName,
-                                                  ScanDirection scanDirection) {
-    return _findOrDeleteOne(txn, nss, indexName, scanDirection, FindDeleteMode::kFind);
+                                                  ScanDirection scanDirection,
+                                                  const BSONObj& startKey,
+                                                  BoundInclusion boundInclusion) {
+    return _findOrDeleteOne(
+        txn, nss, indexName, scanDirection, startKey, boundInclusion, FindDeleteMode::kFind);
 }
 
 StatusWith<BSONObj> StorageInterfaceImpl::deleteOne(OperationContext* txn,
                                                     const NamespaceString& nss,
                                                     boost::optional<StringData> indexName,
-                                                    ScanDirection scanDirection) {
-    return _findOrDeleteOne(txn, nss, indexName, scanDirection, FindDeleteMode::kDelete);
+                                                    ScanDirection scanDirection,
+                                                    const BSONObj& startKey,
+                                                    BoundInclusion boundInclusion) {
+    return _findOrDeleteOne(
+        txn, nss, indexName, scanDirection, startKey, boundInclusion, FindDeleteMode::kDelete);
 }
 
 Status StorageInterfaceImpl::isAdminDbValid(OperationContext* txn) {

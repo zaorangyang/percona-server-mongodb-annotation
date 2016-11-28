@@ -37,16 +37,20 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -55,6 +59,146 @@
 namespace mongo {
 
 using std::string;
+
+using IndexVersion = IndexDescriptor::IndexVersion;
+
+namespace {
+
+const StringData kIndexesFieldName = "indexes"_sd;
+
+/**
+ * Parses the index specifications from 'cmdObj', validates them, and returns equivalent index
+ * specifications that have any missing attributes filled in. If any index specification is
+ * malformed, then an error status is returned.
+ */
+StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
+    const NamespaceString& ns,
+    const BSONObj& cmdObj,
+    ServerGlobalParams::FeatureCompatibility::Version featureCompatibilityVersion) {
+    bool hasIndexesField = false;
+
+    std::vector<BSONObj> indexSpecs;
+    for (auto&& cmdElem : cmdObj) {
+        auto cmdElemFieldName = cmdElem.fieldNameStringData();
+
+        if (kIndexesFieldName == cmdElemFieldName) {
+            if (cmdElem.type() != BSONType::Array) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream() << "The field '" << kIndexesFieldName
+                                      << "' must be an array, but got "
+                                      << typeName(cmdElem.type())};
+            }
+
+            for (auto&& indexesElem : cmdElem.Obj()) {
+                if (indexesElem.type() != BSONType::Object) {
+                    return {ErrorCodes::TypeMismatch,
+                            str::stream() << "The elements of the '" << kIndexesFieldName
+                                          << "' array must be objects, but got "
+                                          << typeName(indexesElem.type())};
+                }
+
+                auto indexSpec =
+                    validateIndexSpec(indexesElem.Obj(), ns, featureCompatibilityVersion);
+                if (!indexSpec.isOK()) {
+                    return indexSpec.getStatus();
+                }
+                indexSpecs.push_back(std::move(indexSpec.getValue()));
+            }
+
+            hasIndexesField = true;
+        } else {
+            // TODO SERVER-769: Validate top-level options to the "createIndexes" command.
+            continue;
+        }
+    }
+
+    if (!hasIndexesField) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "The '" << kIndexesFieldName
+                              << "' field is a required argument of the createIndexes command"};
+    }
+
+    if (indexSpecs.empty()) {
+        return {ErrorCodes::BadValue, "Must specify at least one index to create"};
+    }
+
+    return indexSpecs;
+}
+
+/**
+ * Returns index specifications with attributes (such as "collation") that are inherited from the
+ * collection filled in.
+ *
+ * The returned index specifications will not be equivalent to the ones specified as 'indexSpecs' if
+ * any missing attributes were filled in; however, the returned index specifications will match the
+ * form stored in the IndexCatalog should any of these indexes already exist.
+ */
+StatusWith<std::vector<BSONObj>> resolveCollectionDefaultProperties(
+    OperationContext* txn, const Collection* collection, std::vector<BSONObj> indexSpecs) {
+    std::vector<BSONObj> indexSpecsWithDefaults = std::move(indexSpecs);
+
+    for (size_t i = 0, numIndexSpecs = indexSpecsWithDefaults.size(); i < numIndexSpecs; ++i) {
+        const BSONObj& indexSpec = indexSpecsWithDefaults[i];
+        if (auto collationElem = indexSpec[IndexDescriptor::kCollationFieldName]) {
+            // validateIndexSpec() should have already verified that 'collationElem' is an object.
+            invariant(collationElem.type() == BSONType::Object);
+
+            auto collator = CollatorFactoryInterface::get(txn->getServiceContext())
+                                ->makeFromBSON(collationElem.Obj());
+            if (!collator.isOK()) {
+                return collator.getStatus();
+            }
+
+            if (collator.getValue()) {
+                // If the collator factory returned a non-null collator, then inject the entire
+                // collation specification into the index specification. This is necessary to fill
+                // in any options that the user omitted.
+                BSONObjBuilder bob;
+
+                for (auto&& indexSpecElem : indexSpec) {
+                    if (IndexDescriptor::kCollationFieldName !=
+                        indexSpecElem.fieldNameStringData()) {
+                        bob.append(indexSpecElem);
+                    }
+                }
+                bob.append(IndexDescriptor::kCollationFieldName,
+                           collator.getValue()->getSpec().toBSON());
+
+                indexSpecsWithDefaults[i] = bob.obj();
+            } else {
+                // If the collator factory returned a null collator (representing the "simple"
+                // collation), then we simply omit the "collation" from the index specification.
+                // This is desirable to make the representation for the "simple" collation
+                // consistent between v=1 and v=2 indexes.
+                indexSpecsWithDefaults[i] =
+                    indexSpec.removeField(IndexDescriptor::kCollationFieldName);
+            }
+        } else if (collection->getDefaultCollator()) {
+            // validateIndexSpec() should have added the "v" field if it was not present and
+            // verified that 'versionElem' is a number.
+            auto versionElem = indexSpec[IndexDescriptor::kIndexVersionFieldName];
+            invariant(versionElem.isNumber());
+
+            if (IndexVersion::kV2 <= static_cast<IndexVersion>(versionElem.numberInt())) {
+                // The user did not specify an explicit collation for this index and the collection
+                // has a default collator. If we're building a v=2 index, then we should inherit the
+                // collection default. However, if we're building a v=1 index, then we're implicitly
+                // building an index that's using the "simple" collation.
+                BSONObjBuilder bob;
+
+                bob.appendElements(indexSpec);
+                bob.append(IndexDescriptor::kCollationFieldName,
+                           collection->getDefaultCollator()->getSpec().toBSON());
+
+                indexSpecsWithDefaults[i] = bob.obj();
+            }
+        }
+    }
+
+    return indexSpecsWithDefaults;
+}
+
+}  // namespace
 
 /**
  * { createIndexes : "bar", indexes : [ { ns : "test.bar", key : { x : 1 }, name: "x_1" } ] }
@@ -81,14 +225,6 @@ public:
         return Status(ErrorCodes::Unauthorized, "Unauthorized");
     }
 
-
-    BSONObj _addNsToSpec(const NamespaceString& ns, const BSONObj& obj) {
-        BSONObjBuilder b;
-        b.append("ns", ns.ns());
-        b.appendElements(obj);
-        return b.obj();
-    }
-
     virtual bool run(OperationContext* txn,
                      const string& dbname,
                      BSONObj& cmdObj,
@@ -101,79 +237,13 @@ public:
         if (!status.isOK())
             return appendCommandStatus(result, status);
 
-        if (cmdObj["indexes"].type() != Array) {
-            errmsg = "indexes has to be an array";
-            result.append("cmdObj", cmdObj);
-            return false;
+        const auto featureCompatibilityVersion =
+            serverGlobalParams.featureCompatibility.version.load();
+        auto specsWithStatus = parseAndValidateIndexSpecs(ns, cmdObj, featureCompatibilityVersion);
+        if (!specsWithStatus.isOK()) {
+            return appendCommandStatus(result, specsWithStatus.getStatus());
         }
-
-        std::vector<BSONObj> specs;
-        {
-            BSONObjIterator i(cmdObj["indexes"].Obj());
-            while (i.more()) {
-                BSONElement e = i.next();
-                if (e.type() != Object) {
-                    errmsg = "everything in indexes has to be an Object";
-                    result.append("cmdObj", cmdObj);
-                    return false;
-                }
-
-                // Verify that there are no duplicate keys
-                BSONElement indexKey = e.Obj()["key"];
-                if (indexKey.type() != Object) {
-                    errmsg = "missing 'key' property in index spec";
-                    result.append("cmdObj", cmdObj);
-                    return false;
-                }
-                BSONObjIterator it(indexKey.Obj());
-                std::vector<StringData> keys;
-                while (it.more()) {
-                    BSONElement e = it.next();
-                    StringData fieldName(e.fieldName(), e.fieldNameSize());
-                    if (std::find(keys.begin(), keys.end(), fieldName) != keys.end()) {
-                        errmsg = str::stream() << "duplicate keys detected in index spec: "
-                                               << indexKey;
-                        return false;
-                    }
-                    keys.push_back(fieldName);
-                }
-                specs.push_back(e.Obj());
-            }
-        }
-
-        if (specs.size() == 0) {
-            errmsg = "no indexes to add";
-            return false;
-        }
-
-        // check specs
-        for (size_t i = 0; i < specs.size(); i++) {
-            BSONObj spec = specs[i];
-            if (spec["ns"].eoo()) {
-                spec = _addNsToSpec(ns, spec);
-                specs[i] = spec;
-            }
-
-            if (spec["ns"].type() != String) {
-                errmsg = "ns field must be a string";
-                result.append("spec", spec);
-                return false;
-            }
-
-            std::string nsFromUser = spec["ns"].String();
-            if (nsFromUser.empty()) {
-                errmsg = "ns field cannot be an empty string";
-                result.append("spec", spec);
-                return false;
-            }
-
-            if (ns != nsFromUser) {
-                errmsg = str::stream() << "value of ns field '" << nsFromUser
-                                       << "' doesn't match namespace " << ns.ns();
-                result.append("spec", spec);
-                return false;
-            }
-        }
+        auto specs = std::move(specsWithStatus.getValue());
 
         // now we know we have to create index(es)
         // Note: createIndexes command does not currently respect shard versioning.
@@ -210,6 +280,13 @@ public:
             result.appendBool("createdCollectionAutomatically", true);
         }
 
+        auto indexSpecsWithDefaults =
+            resolveCollectionDefaultProperties(txn, collection, std::move(specs));
+        if (!indexSpecsWithDefaults.isOK()) {
+            return appendCommandStatus(result, indexSpecsWithDefaults.getStatus());
+        }
+        specs = std::move(indexSpecsWithDefaults.getValue());
+
         const int numIndexesBefore = collection->getIndexCatalog()->numIndexesTotal(txn);
         result.append("numIndexesBefore", numIndexesBefore);
 
@@ -245,17 +322,11 @@ public:
                     return appendCommandStatus(result, status);
                 }
             }
-            if (spec["v"].isNumber() && spec["v"].numberInt() == 0) {
-                return appendCommandStatus(
-                    result,
-                    Status(ErrorCodes::CannotCreateIndex,
-                           str::stream() << "illegal index specification: " << spec << ". "
-                                         << "The option v:0 cannot be passed explicitly"));
-            }
         }
 
+        std::vector<BSONObj> indexInfoObjs;
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            uassertStatusOK(indexer.init(specs));
+            indexInfoObjs = uassertStatusOK(indexer.init(specs));
         }
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createIndexes", ns.ns());
 
@@ -320,11 +391,12 @@ public:
 
             indexer.commit();
 
-            for (size_t i = 0; i < specs.size(); i++) {
+            for (auto&& infoObj : indexInfoObjs) {
                 std::string systemIndexes = ns.getSystemIndexesCollection();
                 auto opObserver = getGlobalServiceContext()->getOpObserver();
-                if (opObserver)
-                    opObserver->onCreateIndex(txn, systemIndexes, specs[i]);
+                if (opObserver) {
+                    opObserver->onCreateIndex(txn, systemIndexes, infoObj);
+                }
             }
 
             wunit.commit();

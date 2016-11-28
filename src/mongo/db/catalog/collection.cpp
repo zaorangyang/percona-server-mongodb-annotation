@@ -39,6 +39,7 @@
 #include "mongo/base/counter.h"
 #include "mongo/base/owned_pointer_map.h"
 #include "mongo/bson/ordering.h"
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
@@ -67,11 +68,17 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 
 #include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
+#include "mongo/rpc/object_check.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
 namespace {
+
+// Used below to fail during inserts.
+MONGO_FP_DECLARE(failCollectionInserts);
+
 const auto bannedExpressionsInValidators = std::set<StringData>{
     "$geoNear", "$near", "$nearSphere", "$text", "$where",
 };
@@ -302,7 +309,7 @@ Status Collection::checkValidation(OperationContext* txn, const BSONObj& documen
 
     if (_validationAction == WARN) {
         warning() << "Document would fail validation"
-                  << " collection: " << ns() << " doc: " << document;
+                  << " collection: " << ns() << " doc: " << redact(document);
         return Status::OK();
     }
 
@@ -368,6 +375,20 @@ Status Collection::insertDocuments(OperationContext* txn,
                                    OpDebug* opDebug,
                                    bool enforceQuota,
                                    bool fromMigrate) {
+
+    MONGO_FAIL_POINT_BLOCK(failCollectionInserts, extraData) {
+        const BSONObj& data = extraData.getData();
+        const auto collElem = data["collectionNS"];
+        // If the failpoint specifies no collection or matches the existing one, fail.
+        if (!collElem || _ns == collElem.str()) {
+            const std::string msg = str::stream()
+                << "Failpoint (failCollectionInserts) has been enabled (" << data
+                << "), so rejecting insert (first doc): " << *begin;
+            log() << msg;
+            return {ErrorCodes::FailPointEnabled, msg};
+        }
+    }
+
     // Should really be done in the collection object at creation and updated on index create.
     const bool hasIdIndex = _indexCatalog.findIdIndex(txn);
 
@@ -417,6 +438,20 @@ Status Collection::insertDocument(OperationContext* txn,
                                   const BSONObj& doc,
                                   const std::vector<MultiIndexBlock*>& indexBlocks,
                                   bool enforceQuota) {
+
+    MONGO_FAIL_POINT_BLOCK(failCollectionInserts, extraData) {
+        const BSONObj& data = extraData.getData();
+        const auto collElem = data["collectionNS"];
+        // If the failpoint specifies no collection or matches the existing one, fail.
+        if (!collElem || _ns == collElem.str()) {
+            const std::string msg = str::stream()
+                << "Failpoint (failCollectionInserts) has been enabled (" << data
+                << "), so rejecting insert: " << doc;
+            log() << msg;
+            return {ErrorCodes::FailPointEnabled, msg};
+        }
+    }
+
     {
         auto status = checkValidation(txn, doc);
         if (!status.isOK())
@@ -538,7 +573,7 @@ Status Collection::aboutToDeleteCapped(OperationContext* txn,
 void Collection::deleteDocument(
     OperationContext* txn, const RecordId& loc, OpDebug* opDebug, bool fromMigrate, bool noWarn) {
     if (isCapped()) {
-        log() << "failing remove on a capped ns " << _ns << endl;
+        log() << "failing remove on a capped ns " << _ns;
         uasserted(10089, "cannot remove from a capped collection");
         return;
     }
@@ -606,7 +641,7 @@ StatusWith<RecordId> Collection::updateDocument(OperationContext* txn,
     SnapshotId sid = txn->recoveryUnit()->getSnapshotId();
 
     BSONElement oldId = oldDoc.value()["_id"];
-    if (!oldId.eoo() && (oldId != newDoc["_id"]))
+    if (!oldId.eoo() && SimpleBSONElementComparator::kInstance.evaluate(oldId != newDoc["_id"]))
         return StatusWith<RecordId>(
             ErrorCodes::InternalError, "in Collection::updateDocument _id mismatch", 13596);
 
@@ -1023,7 +1058,8 @@ public:
 
     virtual Status validate(const RecordId& recordId, const RecordData& record, size_t* dataSize) {
         BSONObj recordBson = record.toBson();
-        const Status status = validateBSON(recordBson.objdata(), recordBson.objsize());
+        const Status status = validateBSON(
+            recordBson.objdata(), recordBson.objsize(), Validator<BSONObj>::enabledBSONVersion());
         if (status.isOK()) {
             *dataSize = recordBson.objsize();
         } else {

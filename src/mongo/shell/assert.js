@@ -3,6 +3,9 @@ doassert = function(msg, obj) {
     if (typeof(msg) == "function")
         msg = msg();
 
+    if (typeof(msg) == "object")
+        msg = tojson(msg);
+
     if (typeof(msg) == "string" && msg.indexOf("assert") == 0)
         print(msg);
     else
@@ -159,7 +162,7 @@ assert.soon = function(f, msg, timeout /*ms*/, interval) {
     }
 
     var start = new Date();
-    timeout = timeout || 30000;
+    timeout = timeout || 5 * 60 * 1000;
     interval = interval || 200;
     var last;
     while (1) {

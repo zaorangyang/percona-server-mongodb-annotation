@@ -210,7 +210,7 @@ public:
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
             error() << "Plan executor error during StageDebug command: "
                     << PlanExecutor::statestr(state)
-                    << ", stats: " << Explain::getWinningPlanStats(exec.get());
+                    << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
             return appendCommandStatus(result,
                                        Status(ErrorCodes::OperationFailed,
@@ -306,7 +306,8 @@ public:
             params.bounds.isSimpleRange = true;
             params.bounds.startKey = stripFieldNames(nodeArgs["startKey"].Obj());
             params.bounds.endKey = stripFieldNames(nodeArgs["endKey"].Obj());
-            params.bounds.endKeyInclusive = nodeArgs["endKeyInclusive"].Bool();
+            params.bounds.boundInclusion = IndexBounds::makeBoundInclusionFromBoundBools(
+                nodeArgs["startKeyInclusive"].Bool(), nodeArgs["endKeyInclusive"].Bool());
             params.direction = nodeArgs["direction"].numberInt();
 
             return new IndexScan(txn, params, workingSet, matcher);

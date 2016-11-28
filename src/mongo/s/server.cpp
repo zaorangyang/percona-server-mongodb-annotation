@@ -131,6 +131,7 @@ static ExitCode initService();
 // prior execution of mongo initializers or the existence of threads.
 static void cleanupTask() {
     {
+        auto serviceContext = getGlobalServiceContext();
         Client::initThreadIfNotAlready();
         Client& client = cc();
         ServiceContext::UniqueOperationContext uniqueTxn;
@@ -140,10 +141,18 @@ static void cleanupTask() {
             txn = uniqueTxn.get();
         }
 
-        auto cursorManager = grid.getCursorManager();
-        cursorManager->shutdown();
-        grid.getExecutorPool()->shutdownAndJoin();
-        grid.catalogClient(txn)->shutDown(txn);
+        if (serviceContext)
+            serviceContext->setKillAllOperations();
+
+        if (auto cursorManager = Grid::get(txn)->getCursorManager()) {
+            cursorManager->shutdown();
+        }
+        if (auto pool = Grid::get(txn)->getExecutorPool()) {
+            pool->shutdownAndJoin();
+        }
+        if (auto catalog = Grid::get(txn)->catalogClient(txn)) {
+            catalog->shutDown(txn);
+        }
     }
 
     audit::logShutdown(Client::getCurrent());
@@ -275,10 +284,6 @@ static ExitCode runMongosServer() {
         Grid::get(opCtx.get())->getBalancerConfiguration()->refreshAndCheck(opCtx.get());
     }
 
-#if !defined(_WIN32)
-    mongo::signalForkSuccess();
-#endif
-
     if (serverGlobalParams.isHttpInterfaceEnabled) {
         std::shared_ptr<DbWebServer> dbWebServer(new DbWebServer(serverGlobalParams.bind_ip,
                                                                  serverGlobalParams.port + 1000,
@@ -316,6 +321,10 @@ static ExitCode runMongosServer() {
         return EXIT_NET_ERROR;
     }
 
+#if !defined(_WIN32)
+    mongo::signalForkSuccess();
+#endif
+
     // Block until shutdown.
     return waitForShutdown();
 }
@@ -323,6 +332,15 @@ static ExitCode runMongosServer() {
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     mongo::forkServerOrDie();
+    return Status::OK();
+}
+
+// We set the featureCompatibilityVersion to 3.4 in the mongos so that BSON validation always uses
+// BSONVersion::kLatest.
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion34, ("EndStartupOptionStorage"))
+(InitializerContext* context) {
+    mongo::serverGlobalParams.featureCompatibility.version.store(
+        ServerGlobalParams::FeatureCompatibility::Version::k34);
     return Status::OK();
 }
 

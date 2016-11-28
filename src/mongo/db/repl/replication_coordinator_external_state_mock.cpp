@@ -84,6 +84,10 @@ void ReplicationCoordinatorExternalStateMock::stopDataReplication(OperationConte
 
 void ReplicationCoordinatorExternalStateMock::startMasterSlave(OperationContext*) {}
 
+Status ReplicationCoordinatorExternalStateMock::runRepairOnLocalDB(OperationContext* txn) {
+    return Status::OK();
+}
+
 Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(OperationContext* txn,
                                                                          const BSONObj& config) {
     return storeLocalConfigDocument(txn, config);
@@ -263,10 +267,14 @@ StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::multiApply(
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
-void ReplicationCoordinatorExternalStateMock::multiSyncApply(MultiApplier::OperationPtrs* ops) {}
+Status ReplicationCoordinatorExternalStateMock::multiSyncApply(MultiApplier::OperationPtrs* ops) {
+    return Status::OK();
+}
 
-void ReplicationCoordinatorExternalStateMock::multiInitialSyncApply(
-    MultiApplier::OperationPtrs* ops, const HostAndPort& source) {}
+Status ReplicationCoordinatorExternalStateMock::multiInitialSyncApply(
+    MultiApplier::OperationPtrs* ops, const HostAndPort& source) {
+    return Status::OK();
+}
 
 std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateMock::makeInitialSyncOplogBuffer(
     OperationContext* txn) const {
@@ -282,9 +290,15 @@ bool ReplicationCoordinatorExternalStateMock::shouldUseDataReplicatorInitialSync
     return true;
 }
 
+std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherMaxFetcherRestarts() const {
+    return 0;
+}
+
 void ReplicationCoordinatorExternalStateMock::setIsReadCommittedEnabled(bool val) {
     _isReadCommittedSupported = val;
 }
+
+void ReplicationCoordinatorExternalStateMock::onDrainComplete(OperationContext* txn) {}
 
 OpTime ReplicationCoordinatorExternalStateMock::onTransitionToPrimary(OperationContext* txn,
                                                                       bool isV1ElectionProtocol) {
@@ -299,5 +313,6 @@ void ReplicationCoordinatorExternalStateMock::startNoopWriter(OpTime opTime) {}
 void ReplicationCoordinatorExternalStateMock::stopNoopWriter() {}
 
 void ReplicationCoordinatorExternalStateMock::setupNoopWriter(Seconds waitTime) {}
+
 }  // namespace repl
 }  // namespace mongo

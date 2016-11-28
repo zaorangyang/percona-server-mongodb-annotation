@@ -31,7 +31,6 @@
 #include <memory>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
@@ -40,6 +39,7 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 
@@ -111,14 +111,17 @@ private:
 
     /**
      * Creates a shard based on the specified information and puts it into the lookup maps.
+     * if useOriginalCS = true it will use the ConnectionSring used for shard creation to update
+     * lookup maps. Otherwise the current connection string from the Shard's RemoteCommandTargeter
+     * will be used.
      */
-    void _addShard_inlock(const std::shared_ptr<Shard>&);
+    void _addShard_inlock(const std::shared_ptr<Shard>&, bool useOriginalCS);
     std::shared_ptr<Shard> _findByShardId_inlock(const ShardId&) const;
     void _rebuildShard_inlock(const ConnectionString& newConnString, ShardFactory* factory);
 
     // Protects the lookup maps below.
     mutable stdx::mutex _mutex;
-    using ShardMap = std::unordered_map<ShardId, std::shared_ptr<Shard>, ShardId::Hasher>;
+    using ShardMap = stdx::unordered_map<ShardId, std::shared_ptr<Shard>, ShardId::Hasher>;
 
     // Map of both shardName -> Shard and hostName -> Shard
     ShardMap _lookup;
@@ -126,7 +129,7 @@ private:
     // Map from replica set name to shard corresponding to this replica set
     ShardMap _rsLookup;
 
-    std::unordered_map<HostAndPort, std::shared_ptr<Shard>> _hostLookup;
+    stdx::unordered_map<HostAndPort, std::shared_ptr<Shard>> _hostLookup;
 
     // store configShard separately to always have a reference
     std::shared_ptr<Shard> _configShard;

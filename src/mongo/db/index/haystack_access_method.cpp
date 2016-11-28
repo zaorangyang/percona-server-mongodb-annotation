@@ -77,8 +77,8 @@ void HaystackAccessMethod::searchCommand(OperationContext* txn,
                                          unsigned limit) {
     Timer t;
 
-    LOG(1) << "SEARCH near:" << nearObj << " maxDistance:" << maxDistance << " search: " << search
-           << endl;
+    LOG(1) << "SEARCH near:" << redact(nearObj) << " maxDistance:" << maxDistance
+           << " search: " << redact(search);
     int x, y;
     {
         BSONObjIterator i(nearObj);
@@ -110,13 +110,14 @@ void HaystackAccessMethod::searchCommand(OperationContext* txn,
             unordered_set<RecordId, RecordId::Hasher> thisPass;
 
 
-            unique_ptr<PlanExecutor> exec(InternalPlanner::indexScan(txn,
-                                                                     collection,
-                                                                     _descriptor,
-                                                                     key,
-                                                                     key,
-                                                                     true,  // endKeyInclusive
-                                                                     PlanExecutor::YIELD_MANUAL));
+            unique_ptr<PlanExecutor> exec(
+                InternalPlanner::indexScan(txn,
+                                           collection,
+                                           _descriptor,
+                                           key,
+                                           key,
+                                           BoundInclusion::kIncludeBothStartAndEndKeys,
+                                           PlanExecutor::YIELD_MANUAL));
             PlanExecutor::ExecState state;
             BSONObj obj;
             RecordId loc;

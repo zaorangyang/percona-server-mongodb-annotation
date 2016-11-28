@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <limits>
 
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/read_preference.h"
@@ -49,6 +50,7 @@
 #include "mongo/util/concurrency/mutex.h"  // for StaticObserver
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/static_observer.h"
 #include "mongo/util/string_map.h"
@@ -61,6 +63,9 @@ using std::numeric_limits;
 using std::set;
 using std::string;
 using std::vector;
+
+// Failpoint for disabling AsyncConfigChangeHook calls on updated RS nodes.
+MONGO_FP_DECLARE(failAsyncConfigChangeHook);
 
 namespace {
 
@@ -194,7 +199,7 @@ void ReplicaSetMonitor::init() {
 
     if (!status.isOK()) {
         severe() << "Can't start refresh for replica set " << getName()
-                 << causedBy(status.getStatus());
+                 << causedBy(redact(status.getStatus()));
         fassertFailed(40139);
     }
 
@@ -245,7 +250,7 @@ void ReplicaSetMonitor::_refresh(const CallbackArgs& cbArgs) {
 
         if (!status.isOK()) {
             severe() << "Can't continue refresh for replica set " << getName() << " due to "
-                     << status.getStatus().toString();
+                     << redact(status.getStatus());
             fassertFailed(40140);
         }
 
@@ -676,7 +681,7 @@ bool Refresher::receivedIsMasterFromMaster(const IsMasterReply& reply) {
         !std::equal(
             _set->nodes.begin(), _set->nodes.end(), reply.normalHosts.begin(), hostsEqual)) {
         LOG(2) << "Adjusting nodes in our view of replica set " << _set->name
-               << " based on master reply: " << reply.raw;
+               << " based on master reply: " << redact(reply.raw);
 
         // remove non-members from _set->nodes
         _set->nodes.erase(
@@ -719,7 +724,7 @@ bool Refresher::receivedIsMasterFromMaster(const IsMasterReply& reply) {
             syncConfigChangeHook(_set->name, _set->getConfirmedServerAddress());
         }
 
-        if (asyncConfigChangeHook) {
+        if (asyncConfigChangeHook && !MONGO_FAIL_POINT(failAsyncConfigChangeHook)) {
             // call from a separate thread to avoid blocking and holding lock while potentially
             // going over the network
             stdx::thread bg(asyncConfigChangeHook, _set->name, _set->getConfirmedServerAddress());
@@ -892,8 +897,10 @@ bool Node::matches(const ReadPreference pref) const {
 
 bool Node::matches(const BSONObj& tag) const {
     BSONForEach(tagCriteria, tag) {
-        if (this->tags[tagCriteria.fieldNameStringData()] != tagCriteria)
+        if (SimpleBSONElementComparator::kInstance.evaluate(
+                this->tags[tagCriteria.fieldNameStringData()] != tagCriteria)) {
             return false;
+        }
     }
 
     return true;

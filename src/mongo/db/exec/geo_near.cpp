@@ -123,12 +123,12 @@ static void extractGeometries(const BSONObj& doc,
                     // Valid geometry element
                     geometries->push_back(stored.release());
                 } else {
-                    warning() << "geoNear stage read non-geometry element " << nextEl.toString()
-                              << " in array " << el.toString();
+                    warning() << "geoNear stage read non-geometry element " << redact(nextEl)
+                              << " in array " << redact(el);
                 }
             }
         } else {
-            warning() << "geoNear stage read non-geometry element " << el.toString();
+            warning() << "geoNear stage read non-geometry element " << redact(el);
         }
     }
 }
@@ -331,7 +331,8 @@ void GeoNear2DStage::DensityEstimator::buildIndexScan(OperationContext* txn,
         mongo::BSONObjBuilder builder;
         it->appendHashMin(&builder, "");
         it->appendHashMax(&builder, "");
-        oil.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(builder.obj(), true, true));
+        oil.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+            builder.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
     }
 
     invariant(oil.isValidFor(1));
@@ -447,7 +448,7 @@ GeoNear2DStage::GeoNear2DStage(const GeoNearParams& nearParams,
       _boundsIncrement(0.0) {
     _specificStats.keyPattern = twoDIndex->keyPattern();
     _specificStats.indexName = twoDIndex->indexName();
-    _specificStats.indexVersion = twoDIndex->version();
+    _specificStats.indexVersion = static_cast<int>(twoDIndex->version());
 }
 
 
@@ -745,7 +746,7 @@ GeoNear2DSphereStage::GeoNear2DSphereStage(const GeoNearParams& nearParams,
       _boundsIncrement(0.0) {
     _specificStats.keyPattern = s2Index->keyPattern();
     _specificStats.indexName = s2Index->indexName();
-    _specificStats.indexVersion = s2Index->version();
+    _specificStats.indexVersion = static_cast<int>(s2Index->version());
 
     // initialize2dsphereParams() does not require the collator during the GEO_NEAR_2DSPHERE stage.
     // It only requires the collator for index key generation. For query execution,

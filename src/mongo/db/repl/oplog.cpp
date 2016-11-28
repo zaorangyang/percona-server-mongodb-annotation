@@ -64,6 +64,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_timestamp.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
@@ -101,6 +102,8 @@ using std::string;
 using std::stringstream;
 using std::unique_ptr;
 using std::vector;
+
+using IndexVersion = IndexDescriptor::IndexVersion;
 
 namespace repl {
 std::string rsOplogName = "local.oplog.rs";
@@ -314,7 +317,7 @@ void truncateOplogTo(OperationContext* txn, Timestamp truncateTimestamp) {
         const auto tsElem = entry["ts"];
         if (count == 1) {
             if (tsElem.eoo())
-                LOG(2) << "Oplog tail entry: " << entry;
+                LOG(2) << "Oplog tail entry: " << redact(entry);
             else
                 LOG(2) << "Oplog tail entry ts field: " << tsElem;
         }
@@ -653,7 +656,7 @@ Status applyOperation_inlock(OperationContext* txn,
                              const BSONObj& op,
                              bool convertUpdateToUpsert,
                              IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
-    LOG(3) << "applying op: " << op;
+    LOG(3) << "applying op: " << redact(op);
 
     OpCounters* opCounters = txn->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
 
@@ -708,9 +711,10 @@ Status applyOperation_inlock(OperationContext* txn,
             uassert(ErrorCodes::TypeMismatch,
                     str::stream() << "Expected object for index spec in field 'o': " << op,
                     fieldO.isABSONObj());
+            BSONObj indexSpec = fieldO.embeddedObject();
 
             std::string indexNs;
-            uassertStatusOK(bsonExtractStringField(o, "ns", &indexNs));
+            uassertStatusOK(bsonExtractStringField(indexSpec, "ns", &indexNs));
             const NamespaceString indexNss(indexNs);
             uassert(ErrorCodes::InvalidNamespace,
                     str::stream() << "Invalid namespace in index spec: " << op,
@@ -723,24 +727,40 @@ Status applyOperation_inlock(OperationContext* txn,
                     nsToDatabaseSubstring(ns) == indexNss.db());
 
             opCounters->gotInsert();
-            if (o["background"].trueValue()) {
+
+            if (!indexSpec["v"]) {
+                // If the "v" field isn't present in the index specification, then we assume it is a
+                // v=1 index from an older version of MongoDB. This is because
+                //   (1) we haven't built v=0 indexes as the default for a long time, and
+                //   (2) the index version has been included in the corresponding oplog entry since
+                //       v=2 indexes were introduced.
+                BSONObjBuilder bob;
+
+                bob.append("v", static_cast<int>(IndexVersion::kV1));
+                bob.appendElements(indexSpec);
+
+                indexSpec = bob.obj();
+            }
+
+            if (indexSpec["background"].trueValue()) {
                 Lock::TempRelease release(txn->lockState());
                 if (txn->lockState()->isLocked()) {
                     // If TempRelease fails, background index build will deadlock.
-                    LOG(3) << "apply op: building background index " << o
+                    LOG(3) << "apply op: building background index " << indexSpec
                            << " in the foreground because temp release failed";
-                    IndexBuilder builder(o);
+                    IndexBuilder builder(indexSpec);
                     Status status = builder.buildInForeground(txn, db);
                     uassertStatusOK(status);
                 } else {
-                    IndexBuilder* builder = new IndexBuilder(o);
+                    IndexBuilder* builder = new IndexBuilder(indexSpec);
                     // This spawns a new thread and returns immediately.
                     builder->go();
                     // Wait for thread to start and register itself
                     IndexBuilder::waitForBgIndexStarting();
                 }
+                txn->recoveryUnit()->abandonSnapshot();
             } else {
-                IndexBuilder builder(o);
+                IndexBuilder builder(indexSpec);
                 Status status = builder.buildInForeground(txn, db);
                 uassertStatusOK(status);
             }
@@ -871,7 +891,7 @@ Status applyOperation_inlock(OperationContext* txn,
             if (ur.modifiers) {
                 if (updateCriteria.nFields() == 1) {
                     // was a simple { _id : ... } update criteria
-                    string msg = str::stream() << "failed to apply update: " << op.toString();
+                    string msg = str::stream() << "failed to apply update: " << redact(op);
                     error() << msg;
                     return Status(ErrorCodes::OperationFailed, msg);
                 }
@@ -887,7 +907,7 @@ Status applyOperation_inlock(OperationContext* txn,
                     // capped collections won't have an _id index
                     (!indexCatalog->haveIdIndex(txn) &&
                      Helpers::findOne(txn, collection, updateCriteria, false).isNull())) {
-                    string msg = str::stream() << "couldn't find doc: " << op.toString();
+                    string msg = str::stream() << "couldn't find doc: " << redact(op);
                     error() << msg;
                     return Status(ErrorCodes::OperationFailed, msg);
                 }
@@ -899,7 +919,7 @@ Status applyOperation_inlock(OperationContext* txn,
                 // (because we are idempotent),
                 // if an regular non-mod update fails the item is (presumably) missing.
                 if (!upsert) {
-                    string msg = str::stream() << "update of non-mod failed: " << op.toString();
+                    string msg = str::stream() << "update of non-mod failed: " << redact(op);
                     error() << msg;
                     return Status(ErrorCodes::OperationFailed, msg);
                 }
@@ -1024,12 +1044,12 @@ Status applyCommand_inlock(OperationContext* txn, const BSONObj& op) {
             }
             default:
                 if (_oplogCollectionName == masterSlaveOplogName) {
-                    error() << "Failed command " << o << " on " << nss.db() << " with status "
-                            << status << " during oplog application";
+                    error() << "Failed command " << redact(o) << " on " << nss.db()
+                            << " with status " << status << " during oplog application";
                 } else if (curOpToApply.acceptableErrors.find(status.code()) ==
                            curOpToApply.acceptableErrors.end()) {
-                    error() << "Failed command " << o << " on " << nss.db() << " with status "
-                            << status << " during oplog application";
+                    error() << "Failed command " << redact(o) << " on " << nss.db()
+                            << " with status " << status << " during oplog application";
                     return status;
                 }
             // fallthrough
@@ -1075,20 +1095,6 @@ void oplogCheckCloseDatabase(OperationContext* txn, Database* db) {
 void signalOplogWaiters() {
     if (_localOplogCollection) {
         _localOplogCollection->notifyCappedWaitersIfNeeded();
-    }
-}
-
-void checkForCappedOplog(OperationContext* txn) {
-    invariant(!_oplogCollectionName.empty());
-    const NamespaceString oplogNss(_oplogCollectionName);
-    ScopedTransaction transaction(txn, MODE_IX);
-    AutoGetDb autoDb(txn, oplogNss.db(), MODE_IX);
-    Lock::CollectionLock oplogCollectionLock(txn->lockState(), oplogNss.ns(), MODE_X);
-    Collection* oplogCollection = autoDb.getDb()->getCollection(oplogNss);
-    if (oplogCollection && !oplogCollection->isCapped()) {
-        severe() << "The oplog collection " << _oplogCollectionName
-                 << " is not capped; a capped oplog is a requirement for replication to function.";
-        fassertFailedNoTrace(40115);
     }
 }
 

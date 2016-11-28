@@ -126,12 +126,16 @@ void Pipeline::optimizePipeline() {
 }
 
 bool Pipeline::aggSupportsWriteConcern(const BSONObj& cmd) {
-    if (cmd.hasField("pipeline") == false) {
+    auto pipelineElement = cmd["pipeline"];
+    if (pipelineElement.type() != BSONType::Array) {
         return false;
     }
 
-    auto stages = cmd["pipeline"].Array();
-    for (auto stage : stages) {
+    for (auto stage : pipelineElement.Obj()) {
+        if (stage.type() != BSONType::Object) {
+            return false;
+        }
+
         if (stage.Obj().hasField("$out")) {
             return true;
         }
@@ -149,7 +153,6 @@ void Pipeline::detachFromOperationContext() {
 }
 
 void Pipeline::reattachToOperationContext(OperationContext* opCtx) {
-    invariant(pCtx->opCtx == nullptr);
     pCtx->opCtx = opCtx;
 
     for (auto&& source : _sources) {
@@ -316,13 +319,12 @@ void Pipeline::run(BSONObjBuilder& result) {
     // the array in which the aggregation results reside
     // cant use subArrayStart() due to error handling
     BSONArrayBuilder resultArray;
-    DocumentSource* finalSource = _sources.back().get();
-    while (boost::optional<Document> next = finalSource->getNext()) {
-        // add the document to the result set
+    while (auto next = getNext()) {
+        // Add the document to the result set.
         BSONObjBuilder documentBuilder(resultArray.subobjStart());
         next->toBson(&documentBuilder);
         documentBuilder.doneFast();
-        // object will be too large, assert. the extra 1KB is for headers
+        // Object will be too large, assert. The extra 1KB is for headers.
         uassert(16389,
                 str::stream() << "aggregation result exceeds maximum document size ("
                               << BSONObjMaxUserSize / (1024 * 1024)
@@ -332,6 +334,16 @@ void Pipeline::run(BSONObjBuilder& result) {
 
     resultArray.done();
     result.appendArray("result", resultArray.arr());
+}
+
+boost::optional<Document> Pipeline::getNext() {
+    invariant(!_sources.empty());
+    auto nextResult = _sources.back()->getNext();
+    while (nextResult.isPaused()) {
+        nextResult = _sources.back()->getNext();
+    }
+    return nextResult.isEOF() ? boost::none
+                              : boost::optional<Document>{nextResult.releaseDocument()};
 }
 
 vector<Value> Pipeline::writeExplainOps() const {

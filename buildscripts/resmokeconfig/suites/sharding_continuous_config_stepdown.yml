@@ -20,7 +20,6 @@ selector:
     - jstests/sharding/balance_tags2.js
     - jstests/sharding/basic_drop_coll.js
     - jstests/sharding/basic_merge.js
-    - jstests/sharding/bulk_shard_insert.js
     - jstests/sharding/count1.js
     - jstests/sharding/count2.js
     - jstests/sharding/cursor1.js
@@ -58,6 +57,9 @@ selector:
     - jstests/sharding/sharding_balance3.js
     - jstests/sharding/sharding_balance4.js
     - jstests/sharding/sharding_migrate_cursor1.js
+    - jstests/sharding/split_with_force.js
+    - jstests/sharding/split_with_force_small.js
+    - jstests/sharding/stale_mongos_updates_and_removes.js
     - jstests/sharding/tag_auto_split.js
     - jstests/sharding/tag_auto_split_partial_key.js
     - jstests/sharding/tag_range.js
@@ -71,6 +73,7 @@ selector:
     - jstests/sharding/listDatabases.js
     - jstests/sharding/bulk_insert.js
     - jstests/sharding/printShardingStatus.js
+    - jstests/sharding/shard_aware_on_set_shard_version.js
     # Balancer writes (direct write to config database with no retries)
     - jstests/sharding/convert_to_and_from_sharded.js
     - jstests/sharding/remove2.js
@@ -96,6 +99,7 @@ selector:
     - jstests/sharding/all_config_servers_blackholed_from_mongos.js
     - jstests/sharding/batch_write_command_sharded.js
     - jstests/sharding/config_rs_no_primary.js
+    - jstests/sharding/config_version_rollback.js
     - jstests/sharding/startup_with_all_configs_down.js
     - jstests/sharding/lagged_config_secondary.js
     - jstests/sharding/autodiscover_config_rs_from_secondary.js

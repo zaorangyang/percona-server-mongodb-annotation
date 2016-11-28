@@ -210,8 +210,11 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         }
     }
 
-    // In case our updated OpTime allows a waiter to finish stepping down, we wake all the waiters.
-    _signalStepDownWaiters();
+    {
+        LockGuard lk(_mutex);
+        // Wake the stepdown waiter when our updated OpTime allows it to finish stepping down.
+        _signalStepDownWaiter_inlock();
+    }
 
     _scheduleHeartbeatToTarget(
         target, targetIndex, std::max(now, action.getNextHeartbeatStartDate()));
@@ -337,10 +340,11 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
     // TODO Add invariant that we've got global shared or global exclusive lock, when supported
     // by lock manager.
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _topCoord->stepDownIfPending();
-    const PostMemberStateUpdateAction action = _updateMemberStateFromTopologyCoordinator_inlock();
-    lk.unlock();
-    _performPostMemberStateUpdateAction(action);
+    if (_topCoord->stepDownIfPending()) {
+        const auto action = _updateMemberStateFromTopologyCoordinator_inlock();
+        lk.unlock();
+        _performPostMemberStateUpdateAction(action);
+    }
     _replExecutor.signalEvent(finishedEvent);
 }
 

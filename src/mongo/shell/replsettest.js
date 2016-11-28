@@ -85,6 +85,8 @@ var ReplSetTest = function(opts) {
     var _unbridgedPorts;
     var _unbridgedNodes;
 
+    this.kDefaultTimeoutMs = 10 * 60 * 1000;
+
     // Publicly exposed variables
 
     /**
@@ -154,7 +156,7 @@ var ReplSetTest = function(opts) {
             return;
         }
 
-        timeout = timeout || 30000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         if (!node.getDB) {
             node = self.nodes[node];
@@ -471,7 +473,7 @@ var ReplSetTest = function(opts) {
      * Blocks until the secondary nodes have completed recovery and their roles are known.
      */
     this.awaitSecondaryNodes = function(timeout) {
-        timeout = timeout || 60000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         assert.soonNoExcept(function() {
             // Reload who the current slaves are
@@ -495,7 +497,7 @@ var ReplSetTest = function(opts) {
      * Blocks until all nodes agree on who the primary is.
      */
     this.awaitNodesAgreeOnPrimary = function(timeout) {
-        timeout = timeout || 60000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         assert.soonNoExcept(function() {
             var primary = -1;
@@ -535,7 +537,7 @@ var ReplSetTest = function(opts) {
      * if primary is available will return a connection to it. Otherwise throws an exception.
      */
     this.getPrimary = function(timeout) {
-        timeout = timeout || 60000;
+        timeout = timeout || self.kDefaultTimeoutMS;
         var primary = null;
 
         assert.soonNoExcept(function() {
@@ -548,7 +550,7 @@ var ReplSetTest = function(opts) {
 
     this.awaitNoPrimary = function(msg, timeout) {
         msg = msg || "Timed out waiting for there to be no primary in replset: " + this.name;
-        timeout = timeout || 30000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         assert.soonNoExcept(function() {
             return _callIsMaster() == false;
@@ -624,7 +626,7 @@ var ReplSetTest = function(opts) {
         var config = cfg || this.getReplSetConfig();
         var cmd = {};
         var cmdKey = initCmd || 'replSetInitiate';
-        timeout = timeout || 120000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         this._setDefaultConfigOptions(config);
 
@@ -713,7 +715,7 @@ var ReplSetTest = function(opts) {
 
     // Wait until the optime of the specified type reaches the primary's last applied optime.
     this.awaitReplication = function(timeout, secondaryOpTimeType) {
-        timeout = timeout || 30000;
+        timeout = timeout || self.kDefaultTimeoutMS;
         secondaryOpTimeType = secondaryOpTimeType || ReplSetTest.OpTimeType.LAST_APPLIED;
 
         var masterLatestOpTime;
@@ -730,7 +732,7 @@ var ReplSetTest = function(opts) {
                 }
 
                 return true;
-            }, "awaiting oplog query", 30000);
+            }, "awaiting oplog query", timeout);
         };
 
         awaitLastOpTimeWrittenFn();
@@ -860,6 +862,13 @@ var ReplSetTest = function(opts) {
         return res;
     };
 
+    this.dumpOplog = function(conn, limit) {
+        print('Dumping the latest ' + limit + ' documents from the oplog of ' + conn.host);
+        var cursor =
+            conn.getDB('local').getCollection('oplog.rs').find().sort({$natural: -1}).limit(limit);
+        cursor.forEach(printjsononeline);
+    };
+
     this.checkReplicatedDataHashes = function(excludedDBs = [], msgPrefix = undefined) {
         // TODO: Remove nested functions -- SERVER-25644
         'use strict';
@@ -913,7 +922,7 @@ var ReplSetTest = function(opts) {
                         missingOnSecondary.push(tojsononeline(primaryDoc));
                         primaryIndex--;
                     } else {
-                        if (bsonWoCompare(primaryDoc, secondaryDoc) !== 0) {
+                        if (!bsonBinaryEqual(primaryDoc, secondaryDoc)) {
                             print('Mismatching documents:');
                             print('    primary: ' + tojsononeline(primaryDoc));
                             print('    secondary: ' + tojsononeline(secondaryDoc));
@@ -1036,7 +1045,7 @@ var ReplSetTest = function(opts) {
                         secondaryCollInfo.forEach(secondaryInfo => {
                             primaryCollInfo.forEach(primaryInfo => {
                                 if (secondaryInfo.name === primaryInfo.name) {
-                                    if (bsonWoCompare(secondaryInfo, primaryInfo) !== 0) {
+                                    if (!bsonBinaryEqual(secondaryInfo, primaryInfo)) {
                                         print(msgPrefix +
                                               ', the primary and secondary have different ' +
                                               'attributes for the collection ' + dbName + '.' +
@@ -1091,21 +1100,10 @@ var ReplSetTest = function(opts) {
                         }
 
                         if (!success) {
-                            var dumpOplog = function(conn, limit) {
-                                print('Dumping the latest ' + limit +
-                                      ' documents from the oplog of ' + conn.host);
-                                var cursor = conn.getDB('local')
-                                                 .getCollection('oplog.rs')
-                                                 .find()
-                                                 .sort({$natural: -1})
-                                                 .limit(limit);
-                                cursor.forEach(printjsononeline);
-                            };
-
                             if (!hasDumpedOplog) {
-                                dumpOplog(primary, 100);
+                                rst.dumpOplog(primary, 100);
                                 rst.getSecondaries().forEach(secondary =>
-                                                                 dumpOplog(secondary, 100));
+                                                                 rst.dumpOplog(secondary, 100));
                                 hasDumpedOplog = true;
                             }
                         }
@@ -1132,7 +1130,8 @@ var ReplSetTest = function(opts) {
             dummyColl.drop();
             assert.commandWorked(dummyColl.createIndex({x: 1}));
             assert.writeOK(dummyColl.insert(
-                {x: 1}, {writeConcern: {w: rst.nodeList().length, wtimeout: 5 * 60 * 1000}}));
+                {x: 1},
+                {writeConcern: {w: rst.nodeList().length, wtimeout: self.kDefaultTimeoutMS}}));
             assert.commandWorked(dummyDB.dropDatabase());
 
             var activeException = false;
@@ -1234,6 +1233,17 @@ var ReplSetTest = function(opts) {
         var pathOpts = {node: n, set: this.name};
         options.pathOpts = Object.merge(options.pathOpts || {}, pathOpts);
 
+        // Turn off periodic noop writes for replica sets by default.
+        options.setParameter = options.setParameter || {};
+        options.setParameter.writePeriodicNoops = options.setParameter.writePeriodicNoops || false;
+        options.setParameter.numInitialSyncAttempts =
+            options.setParameter.numInitialSyncAttempts || 1;
+        // We raise the number of initial sync connect attempts for tests that disallow chaining.
+        // Disabling chaining can cause sync source selection to take longer so we must increase
+        // the number of connection attempts.
+        options.setParameter.numInitialSyncConnectAttempts =
+            options.setParameter.numInitialSyncConnectAttempts || 60;
+
         if (tojson(options) != tojson({}))
             printjson(options);
 
@@ -1276,6 +1286,12 @@ var ReplSetTest = function(opts) {
         this.nodes[n].nodeId = n;
 
         printjson(this.nodes);
+
+        // Clean up after noReplSet to ensure it doesn't effect future restarts.
+        if (options.noReplSet) {
+            this.nodes[n].fullOptions.replSet = defaults.replSet;
+            delete this.nodes[n].fullOptions.noReplSet;
+        }
 
         wait = wait || false;
         if (!wait.toFixed) {
@@ -1627,7 +1643,7 @@ ReplSetTest.awaitRSClientHosts = function(conn, host, hostOk, rs, timeout) {
         return;
     }
 
-    timeout = timeout || 60000;
+    timeout = timeout || 5 * 60 * 1000;
 
     if (hostOk == undefined)
         hostOk = {ok: true};

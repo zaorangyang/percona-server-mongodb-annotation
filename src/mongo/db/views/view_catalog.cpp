@@ -32,29 +32,38 @@
 
 #include "mongo/db/views/view_catalog.h"
 
+#include <memory>
 #include <string>
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/views/resolved_view.h"
 #include "mongo/db/views/view.h"
+#include "mongo/db/views/view_graph.h"
 #include "mongo/util/log.h"
 
-namespace {
-bool enableViews = true;
-}  // namespace
-
 namespace mongo {
-
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly> enableViewsParameter(
-    ServerParameterSet::getGlobal(), "enableViews", &enableViews);
+namespace {
+StatusWith<std::unique_ptr<CollatorInterface>> parseCollator(OperationContext* txn,
+                                                             BSONObj collationSpec) {
+    // If 'collationSpec' is empty, return the null collator, which represents the "simple"
+    // collation.
+    if (collationSpec.isEmpty()) {
+        return {nullptr};
+    }
+    return CollatorFactoryInterface::get(txn->getServiceContext())->makeFromBSON(collationSpec);
+}
+}  // namespace
 
 Status ViewCatalog::reloadIfNeeded(OperationContext* txn) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -70,11 +79,20 @@ Status ViewCatalog::_reloadIfNeeded_inlock(OperationContext* txn) {
     // Need to reload, first clear our cache.
     _viewMap.clear();
 
-    Status status = _durable->iterate(txn, [&](const BSONObj& view) {
+    Status status = _durable->iterate(txn, [&](const BSONObj& view) -> Status {
+        BSONObj collationSpec = view.hasField("collation") ? view["collation"].Obj() : BSONObj();
+        auto collator = parseCollator(txn, collationSpec);
+        if (!collator.isOK()) {
+            return collator.getStatus();
+        }
+
         NamespaceString viewName(view["_id"].str());
-        ViewDefinition def(
-            viewName.db(), viewName.coll(), view["viewOn"].str(), view["pipeline"].Obj());
-        _viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(def);
+        _viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(viewName.db(),
+                                                                   viewName.coll(),
+                                                                   view["viewOn"].str(),
+                                                                   view["pipeline"].Obj(),
+                                                                   std::move(collator.getValue()));
+        return Status::OK();
     });
     _valid.store(status.isOK());
 
@@ -97,14 +115,23 @@ void ViewCatalog::iterate(OperationContext* txn, ViewIteratorCallback callback) 
 Status ViewCatalog::_createOrUpdateView_inlock(OperationContext* txn,
                                                const NamespaceString& viewName,
                                                const NamespaceString& viewOn,
-                                               const BSONArray& pipeline) {
+                                               const BSONArray& pipeline,
+                                               std::unique_ptr<CollatorInterface> collator) {
     _requireValidCatalog_inlock(txn);
-    BSONObj viewDef =
-        BSON("_id" << viewName.ns() << "viewOn" << viewOn.coll() << "pipeline" << pipeline);
+
+    // Build the BSON definition for this view to be saved in the durable view catalog. If the
+    // collation is empty, omit it from the definition altogether.
+    BSONObjBuilder viewDefBuilder;
+    viewDefBuilder.append("_id", viewName.ns());
+    viewDefBuilder.append("viewOn", viewOn.coll());
+    viewDefBuilder.append("pipeline", pipeline);
+    if (collator) {
+        viewDefBuilder.append("collation", collator->getSpec().toBSON());
+    }
 
     BSONObj ownedPipeline = pipeline.getOwned();
     auto view = std::make_shared<ViewDefinition>(
-        viewName.db(), viewName.coll(), viewOn.coll(), ownedPipeline);
+        viewName.db(), viewName.coll(), viewOn.coll(), ownedPipeline, std::move(collator));
 
     // Check that the resulting dependency graph is acyclic and within the maximum depth.
     Status graphStatus = _upsertIntoGraph(txn, *(view.get()));
@@ -112,7 +139,7 @@ Status ViewCatalog::_createOrUpdateView_inlock(OperationContext* txn,
         return graphStatus;
     }
 
-    _durable->upsert(txn, viewName, viewDef);
+    _durable->upsert(txn, viewName, viewDefBuilder.obj());
     _viewMap[viewName.ns()] = view;
     txn->recoveryUnit()->onRollback([this, viewName]() {
         this->_viewMap.erase(viewName.ns());
@@ -144,10 +171,20 @@ Status ViewCatalog::_upsertIntoGraph(OperationContext* txn, const ViewDefinition
         std::vector<NamespaceString> refs = pipelineStatus.getValue()->getInvolvedCollections();
         refs.push_back(viewDef.viewOn());
 
+        int pipelineSize = 0;
+        for (auto obj : viewDef.pipeline()) {
+            pipelineSize += obj.objsize();
+        }
+
         if (needsValidation) {
-            return _viewGraph.insertAndValidate(viewDef.name(), refs);
+            // Check the collation of all the dependent namespaces before updating the graph.
+            auto collationStatus = _validateCollation_inlock(txn, viewDef, refs);
+            if (!collationStatus.isOK()) {
+                return collationStatus;
+            }
+            return _viewGraph.insertAndValidate(viewDef.name(), refs, pipelineSize);
         } else {
-            _viewGraph.insertWithoutValidating(viewDef.name(), refs);
+            _viewGraph.insertWithoutValidating(viewDef.name(), refs, pipelineSize);
             return Status::OK();
         }
     };
@@ -162,6 +199,7 @@ Status ViewCatalog::_upsertIntoGraph(OperationContext* txn, const ViewDefinition
             }
         }
         // Only if the inserts completed without error will we no longer need a refresh.
+        txn->recoveryUnit()->onRollback([this]() { this->_viewGraphNeedsRefresh = true; });
         _viewGraphNeedsRefresh = false;
     }
 
@@ -172,14 +210,36 @@ Status ViewCatalog::_upsertIntoGraph(OperationContext* txn, const ViewDefinition
     return doInsert(viewDef, true);
 }
 
+Status ViewCatalog::_validateCollation_inlock(OperationContext* txn,
+                                              const ViewDefinition& view,
+                                              const std::vector<NamespaceString>& refs) {
+    for (auto&& potentialViewNss : refs) {
+        auto otherView = _lookup_inlock(txn, potentialViewNss.ns());
+        if (otherView &&
+            !CollatorInterface::collatorsMatch(view.defaultCollator(),
+                                               otherView->defaultCollator())) {
+            return {ErrorCodes::OptionNotSupportedOnView,
+                    str::stream() << "View " << view.name().toString()
+                                  << " has conflicting collation with view "
+                                  << otherView->name().toString()};
+        }
+    }
+    return Status::OK();
+}
+
 Status ViewCatalog::createView(OperationContext* txn,
                                const NamespaceString& viewName,
                                const NamespaceString& viewOn,
-                               const BSONArray& pipeline) {
+                               const BSONArray& pipeline,
+                               const BSONObj& collation) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
-    if (!enableViews)
-        return Status(ErrorCodes::CommandNotSupported, "View support not enabled");
+    if (serverGlobalParams.featureCompatibility.version.load() ==
+        ServerGlobalParams::FeatureCompatibility::Version::k32) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "Cannot create view when the featureCompatibilityVersion is 3.2. See "
+                      "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
+    }
 
     if (viewName.db() != viewOn.db())
         return Status(ErrorCodes::BadValue,
@@ -192,7 +252,12 @@ Status ViewCatalog::createView(OperationContext* txn,
         return Status(ErrorCodes::InvalidNamespace,
                       str::stream() << "invalid name for 'viewOn': " << viewOn.coll());
 
-    return _createOrUpdateView_inlock(txn, viewName, viewOn, pipeline);
+    auto collator = parseCollator(txn, collation);
+    if (!collator.isOK())
+        return collator.getStatus();
+
+    return _createOrUpdateView_inlock(
+        txn, viewName, viewOn, pipeline, std::move(collator.getValue()));
 }
 
 Status ViewCatalog::modifyView(OperationContext* txn,
@@ -200,6 +265,13 @@ Status ViewCatalog::modifyView(OperationContext* txn,
                                const NamespaceString& viewOn,
                                const BSONArray& pipeline) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    if (serverGlobalParams.featureCompatibility.version.load() ==
+        ServerGlobalParams::FeatureCompatibility::Version::k32) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "Cannot modify view when the featureCompatibilityVersion is 3.2. See "
+                      "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
+    }
 
     if (viewName.db() != viewOn.db())
         return Status(ErrorCodes::BadValue,
@@ -218,7 +290,13 @@ Status ViewCatalog::modifyView(OperationContext* txn,
     txn->recoveryUnit()->onRollback([this, txn, viewName, savedDefinition]() {
         this->_viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(savedDefinition);
     });
-    return _createOrUpdateView_inlock(txn, viewName, viewOn, pipeline);
+
+    return _createOrUpdateView_inlock(
+        txn,
+        viewName,
+        viewOn,
+        pipeline,
+        CollatorInterface::cloneCollator(savedDefinition.defaultCollator()));
 }
 
 Status ViewCatalog::dropView(OperationContext* txn, const NamespaceString& viewName) {
@@ -284,8 +362,19 @@ StatusWith<ResolvedView> ViewCatalog::resolveView(OperationContext* txn,
 
     for (int i = 0; i < ViewGraph::kMaxViewDepth; i++) {
         auto view = _lookup_inlock(txn, resolvedNss->ns());
-        if (!view)
+        if (!view) {
+            // Return error status if pipeline is too large.
+            int pipelineSize = 0;
+            for (auto obj : resolvedPipeline) {
+                pipelineSize += obj.objsize();
+            }
+            if (pipelineSize > ViewGraph::kMaxViewPipelineSizeBytes) {
+                return {ErrorCodes::ViewPipelineMaxSizeExceeded,
+                        str::stream() << "View pipeline exceeds maximum size; maximum size is "
+                                      << ViewGraph::kMaxViewPipelineSizeBytes};
+            }
             return StatusWith<ResolvedView>({*resolvedNss, resolvedPipeline});
+        }
 
         resolvedNss = &(view->viewOn());
 

@@ -136,8 +136,12 @@ bool DBClientReplicaSet::_authPooledSecondaryConn = true;
 DBClientReplicaSet::DBClientReplicaSet(const string& name,
                                        const vector<HostAndPort>& servers,
                                        StringData applicationName,
-                                       double so_timeout)
-    : _setName(name), _applicationName(applicationName.toString()), _so_timeout(so_timeout) {
+                                       double so_timeout,
+                                       MongoURI uri)
+    : _setName(name),
+      _applicationName(applicationName.toString()),
+      _so_timeout(so_timeout),
+      _uri(std::move(uri)) {
     _rsm =
         ReplicaSetMonitor::createIfNeeded(name, set<HostAndPort>(servers.begin(), servers.end()));
 }
@@ -536,7 +540,7 @@ unique_ptr<DBClientCursor> DBClientReplicaSet::query(const string& ns,
             } catch (const DBException& dbExcep) {
                 StringBuilder errMsgBuilder;
                 errMsgBuilder << "can't query replica set node " << _lastSlaveOkHost.toString()
-                              << ": " << causedBy(dbExcep);
+                              << ": " << causedBy(redact(dbExcep));
                 lastNodeErrMsg = errMsgBuilder.str();
 
                 LOG(1) << lastNodeErrMsg << endl;
@@ -588,7 +592,7 @@ BSONObj DBClientReplicaSet::findOne(const string& ns,
             } catch (const DBException& dbExcep) {
                 StringBuilder errMsgBuilder;
                 errMsgBuilder << "can't findone replica set node " << _lastSlaveOkHost.toString()
-                              << ": " << causedBy(dbExcep);
+                              << ": " << causedBy(redact(dbExcep));
                 lastNodeErrMsg = errMsgBuilder.str();
 
                 LOG(1) << lastNodeErrMsg << endl;
@@ -672,7 +676,7 @@ DBClientConnection* DBClientReplicaSet::selectNodeUsingTags(
     auto selectedNodeStatus = monitor->getHostOrRefresh(*readPref);
     if (!selectedNodeStatus.isOK()) {
         LOG(3) << "dbclient_rs no compatible node found"
-               << causedBy(selectedNodeStatus.getStatus());
+               << causedBy(redact(selectedNodeStatus.getStatus()));
         return nullptr;
     }
 
@@ -773,7 +777,8 @@ void DBClientReplicaSet::say(Message& toSend, bool isRetry, string* actualServer
                 } catch (const DBException& DBExcep) {
                     StringBuilder errMsgBuilder;
                     errMsgBuilder << "can't callLazy replica set node "
-                                  << _lastSlaveOkHost.toString() << ": " << causedBy(DBExcep);
+                                  << _lastSlaveOkHost.toString() << ": "
+                                  << causedBy(redact(DBExcep));
                     lastNodeErrMsg = errMsgBuilder.str();
 
                     LOG(1) << lastNodeErrMsg << endl;
@@ -817,8 +822,8 @@ bool DBClientReplicaSet::recv(Message& m) {
     try {
         return _lazyState._lastClient->recv(m);
     } catch (DBException& e) {
-        log() << "could not receive data from " << _lazyState._lastClient->toString() << causedBy(e)
-              << endl;
+        log() << "could not receive data from " << _lazyState._lastClient->toString()
+              << causedBy(redact(e));
         return false;
     }
 }
@@ -868,7 +873,7 @@ void DBClientReplicaSet::checkResponse(const char* data,
             } else if (_lazyState._lastClient == _master.get()) {
                 isntMaster();
             } else {
-                warning() << "passed " << dataObj << " but last rs client "
+                warning() << "passed " << redact(dataObj) << " but last rs client "
                           << _lazyState._lastClient->toString() << " is not master or secondary"
                           << endl;
             }
@@ -995,7 +1000,7 @@ bool DBClientReplicaSet::call(Message& toSend,
                     return conn->call(toSend, response, assertOk, nullptr);
                 } catch (const DBException& dbExcep) {
                     LOG(1) << "can't call replica set node " << _lastSlaveOkHost << ": "
-                           << causedBy(dbExcep) << endl;
+                           << causedBy(redact(dbExcep));
 
                     if (actualServer)
                         *actualServer = "";

@@ -43,17 +43,24 @@ namespace mongo {
 using std::string;
 using std::vector;
 
-ShardingCatalogClientMock::ShardingCatalogClientMock() {
-    _mockDistLockMgr = stdx::make_unique<DistLockManagerMock>();
-}
+ShardingCatalogClientMock::ShardingCatalogClientMock(
+    std::unique_ptr<DistLockManager> distLockManager)
+    : _distLockManager(std::move(distLockManager)) {}
 
 ShardingCatalogClientMock::~ShardingCatalogClientMock() = default;
 
 Status ShardingCatalogClientMock::startup() {
-    return {ErrorCodes::InternalError, "Method not implemented"};
+    if (_distLockManager) {
+        _distLockManager->startUp();
+    }
+    return Status::OK();
 }
 
-void ShardingCatalogClientMock::shutDown(OperationContext* txn) {}
+void ShardingCatalogClientMock::shutDown(OperationContext* txn) {
+    if (_distLockManager) {
+        _distLockManager->shutDown(txn);
+    }
+}
 
 Status ShardingCatalogClientMock::enableSharding(OperationContext* txn, const std::string& dbName) {
     return {ErrorCodes::InternalError, "Method not implemented"};
@@ -140,11 +147,6 @@ StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientMock::
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
-StatusWith<DistLockManager::ScopedDistLock> ShardingCatalogClientMock::distLock(
-    OperationContext* txn, StringData name, StringData whyMessage, Milliseconds waitFor) {
-    return {ErrorCodes::InternalError, "Method not implemented"};
-}
-
 bool ShardingCatalogClientMock::runUserManagementWriteCommand(OperationContext* txn,
                                                               const string& commandName,
                                                               const string& dbname,
@@ -228,7 +230,7 @@ Status ShardingCatalogClientMock::createDatabase(OperationContext* txn, const st
 }
 
 DistLockManager* ShardingCatalogClientMock::getDistLockManager() {
-    return _mockDistLockMgr.get();
+    return _distLockManager.get();
 }
 
 Status ShardingCatalogClientMock::appendInfoForConfigServerDatabases(OperationContext* txn,

@@ -56,6 +56,7 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
@@ -145,7 +146,7 @@ void Database::close(OperationContext* txn) {
     repl::oplogCheckCloseDatabase(txn, this);
 
     if (BackgroundOperation::inProgForDb(_name)) {
-        log() << "warning: bg op in prog during close db? " << _name << endl;
+        log() << "warning: bg op in prog during close db? " << _name;
     }
 }
 
@@ -208,7 +209,7 @@ Database::Database(OperationContext* txn, StringData name, DatabaseCatalogEntry*
       _views(&_durableViews) {
     Status status = validateDBName(_name);
     if (!status.isOK()) {
-        warning() << "tried to open invalid db: " << _name << endl;
+        warning() << "tried to open invalid db: " << _name;
         uasserted(10028, status.toString());
     }
 
@@ -227,7 +228,7 @@ Database::Database(OperationContext* txn, StringData name, DatabaseCatalogEntry*
     _views.invalidate();
     Status reloadStatus = _views.reloadIfNeeded(txn);
     if (!reloadStatus.isOK()) {
-        warning() << "Unable to parse views: " << reloadStatus
+        warning() << "Unable to parse views: " << redact(reloadStatus)
                   << "; remove any invalid views from the " << _viewsName
                   << " collection to restore server functionality." << startupWarningsLog;
     }
@@ -280,7 +281,7 @@ void Database::clearTmpCollections(OperationContext* txn) {
             WriteUnitOfWork wunit(txn);
             Status status = dropCollection(txn, ns);
             if (!status.isOK()) {
-                warning() << "could not drop temp collection '" << ns << "': " << status;
+                warning() << "could not drop temp collection '" << ns << "': " << redact(status);
                 continue;
             }
 
@@ -321,7 +322,8 @@ void Database::getStats(OperationContext* opCtx, BSONObjBuilder* output, double 
     list<string> collections;
     _dbEntry->getCollectionNamespaces(&collections);
 
-    long long ncollections = 0;
+    long long nCollections = 0;
+    long long nViews = 0;
     long long objects = 0;
     long long size = 0;
     long long storageSize = 0;
@@ -336,7 +338,7 @@ void Database::getStats(OperationContext* opCtx, BSONObjBuilder* output, double 
         if (!collection)
             continue;
 
-        ncollections += 1;
+        nCollections += 1;
         objects += collection->numRecords(opCtx);
         size += collection->dataSize(opCtx);
 
@@ -348,7 +350,10 @@ void Database::getStats(OperationContext* opCtx, BSONObjBuilder* output, double 
         indexSize += collection->getIndexSize(opCtx);
     }
 
-    output->appendNumber("collections", ncollections);
+    getViewCatalog()->iterate(opCtx, [&](const ViewDefinition& view) { nViews += 1; });
+
+    output->appendNumber("collections", nCollections);
+    output->appendNumber("views", nViews);
     output->appendNumber("objects", objects);
     output->append("avgObjSize", objects == 0 ? 0 : double(size) / double(objects));
     output->appendNumber("dataSize", size / scale);
@@ -369,7 +374,7 @@ Status Database::dropView(OperationContext* txn, StringData fullns) {
 Status Database::dropCollection(OperationContext* txn, StringData fullns) {
     invariant(txn->lockState()->isDbLockedForMode(name(), MODE_X));
 
-    LOG(1) << "dropCollection: " << fullns << endl;
+    LOG(1) << "dropCollection: " << fullns;
     massertNamespaceNotIndex(fullns, "dropCollection");
 
     Collection* collection = getCollection(fullns);
@@ -387,6 +392,14 @@ Status Database::dropCollection(OperationContext* txn, StringData fullns) {
                 if (_profile != 0)
                     return Status(ErrorCodes::IllegalOperation,
                                   "turn off profiling before dropping system.profile collection");
+            } else if (nss.isSystemDotViews()) {
+                if (serverGlobalParams.featureCompatibility.version.load() !=
+                    ServerGlobalParams::FeatureCompatibility::Version::k32) {
+                    return Status(ErrorCodes::IllegalOperation,
+                                  "The featureCompatibilityVersion must be 3.2 to drop the "
+                                  "system.views collection. See "
+                                  "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
+                }
             } else {
                 return Status(ErrorCodes::IllegalOperation, "can't drop system ns");
             }
@@ -400,12 +413,12 @@ Status Database::dropCollection(OperationContext* txn, StringData fullns) {
     Status s = collection->getIndexCatalog()->dropAllIndexes(txn, true);
     if (!s.isOK()) {
         warning() << "could not drop collection, trying to drop indexes" << fullns << " because of "
-                  << s.toString();
+                  << redact(s.toString());
         return s;
     }
 
     verify(collection->_details->getTotalIndexCount(txn) == 0);
-    LOG(1) << "\t dropIndexes done" << endl;
+    LOG(1) << "\t dropIndexes done";
 
     Top::get(txn->getClient()->getServiceContext()).collectionDropped(fullns);
 
@@ -539,7 +552,7 @@ Status Database::createView(OperationContext* txn,
         return Status(ErrorCodes::InvalidNamespace,
                       str::stream() << "invalid namespace name for a view: " + nss.toString());
 
-    return _views.createView(txn, nss, viewOnNss, BSONArray(options.pipeline));
+    return _views.createView(txn, nss, viewOnNss, BSONArray(options.pipeline), options.collation);
 }
 
 
@@ -568,8 +581,19 @@ Collection* Database::createCollection(OperationContext* txn,
         if (collection->requiresIdIndex()) {
             if (options.autoIndexId == CollectionOptions::YES ||
                 options.autoIndexId == CollectionOptions::DEFAULT) {
+                // The creation of the _id index isn't replicated and is instead implicit in the
+                // creation of the collection. This means that the version of the _id index to build
+                // is technically unspecified. However, we're able to use the
+                // featureCompatibilityVersion of this server to determine the default index version
+                // to use because we apply commands (opType == 'c') in their own batch. This
+                // guarantees the write to the admin.system.version collection from the
+                // "setFeatureCompatibilityVersion" command either happens entirely before the
+                // collection creation or it happens entirely after.
+                const auto featureCompatibilityVersion =
+                    serverGlobalParams.featureCompatibility.version.load();
                 IndexCatalog* ic = collection->getIndexCatalog();
-                uassertStatusOK(ic->createIndexOnEmptyCollection(txn, ic->getDefaultIdIndexSpec()));
+                uassertStatusOK(ic->createIndexOnEmptyCollection(
+                    txn, ic->getDefaultIdIndexSpec(featureCompatibilityVersion)));
             }
         }
 
@@ -599,7 +623,7 @@ void dropAllDatabasesExceptLocal(OperationContext* txn) {
 
     if (n.size() == 0)
         return;
-    log() << "dropAllDatabasesExceptLocal " << n.size() << endl;
+    log() << "dropAllDatabasesExceptLocal " << n.size();
 
     repl::getGlobalReplicationCoordinator()->dropAllSnapshots();
     for (vector<string>::iterator i = n.begin(); i != n.end(); i++) {
