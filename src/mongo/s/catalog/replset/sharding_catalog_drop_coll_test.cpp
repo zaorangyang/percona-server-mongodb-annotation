@@ -79,11 +79,13 @@ public:
         setupShards({_shard1, _shard2});
 
         auto shard1Targeter = RemoteCommandTargeterMock::get(
-            shardRegistry()->getShard(operationContext(), _shard1.getName())->getTargeter());
+            uassertStatusOK(shardRegistry()->getShard(operationContext(), _shard1.getName()))
+                ->getTargeter());
         shard1Targeter->setFindHostReturnValue(HostAndPort(_shard1.getHost()));
 
         auto shard2Targeter = RemoteCommandTargeterMock::get(
-            shardRegistry()->getShard(operationContext(), _shard2.getName())->getTargeter());
+            uassertStatusOK(shardRegistry()->getShard(operationContext(), _shard2.getName()))
+                ->getTargeter());
         shard2Targeter->setFindHostReturnValue(HostAndPort(_shard2.getHost()));
     }
 
@@ -91,11 +93,11 @@ public:
         onCommand([this, shard](const RemoteCommandRequest& request) {
             ASSERT_EQ(HostAndPort(shard.getHost()), request.target);
             ASSERT_EQ(_dropNS.db(), request.dbname);
-            ASSERT_EQ(BSON("drop" << _dropNS.coll() << "writeConcern"
-                                  << BSON("w" << 0 << "wtimeout" << 0)),
-                      request.cmdObj);
+            ASSERT_BSONOBJ_EQ(BSON("drop" << _dropNS.coll() << "writeConcern"
+                                          << BSON("w" << 0 << "wtimeout" << 0)),
+                              request.cmdObj);
 
-            ASSERT_EQUALS(rpc::makeEmptyMetadata(), request.metadata);
+            ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(), request.metadata);
 
             return BSON("ns" << _dropNS.ns() << "ok" << 1);
         });
@@ -103,7 +105,7 @@ public:
 
     void expectRemoveChunksAndMarkCollectionDropped() {
         onCommand([this](const RemoteCommandRequest& request) {
-            ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+            ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
             ASSERT_EQ(_configHost, request.target);
             ASSERT_EQ("config", request.dbname);
 
@@ -114,7 +116,7 @@ public:
                 maxTimeMS: 30000
             })"));
 
-            ASSERT_EQ(expectedCmd, request.cmdObj);
+            ASSERT_BSONOBJ_EQ(expectedCmd, request.cmdObj);
 
             return BSON("n" << 1 << "ok" << 1);
         });
@@ -137,9 +139,9 @@ public:
         onCommand([shard](const RemoteCommandRequest& request) {
             ASSERT_EQ(HostAndPort(shard.getHost()), request.target);
             ASSERT_EQ("admin", request.dbname);
-            ASSERT_EQ(BSON("unsetSharding" << 1), request.cmdObj);
+            ASSERT_BSONOBJ_EQ(BSON("unsetSharding" << 1), request.cmdObj);
 
-            ASSERT_EQUALS(rpc::makeEmptyMetadata(), request.metadata);
+            ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(), request.metadata);
 
             return BSON("n" << 1 << "ok" << 1);
         });
@@ -216,11 +218,11 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
     onCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ(HostAndPort(shard1().getHost()), request.target);
         ASSERT_EQ(dropNS().db(), request.dbname);
-        ASSERT_EQ(
+        ASSERT_BSONOBJ_EQ(
             BSON("drop" << dropNS().coll() << "writeConcern" << BSON("w" << 0 << "wtimeout" << 0)),
             request.cmdObj);
 
-        ASSERT_EQUALS(rpc::makeEmptyMetadata(), request.metadata);
+        ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(), request.metadata);
 
         return BSON("ok" << 0 << "code" << ErrorCodes::NamespaceNotFound);
     });
@@ -228,11 +230,11 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
     onCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ(HostAndPort(shard2().getHost()), request.target);
         ASSERT_EQ(dropNS().db(), request.dbname);
-        ASSERT_EQ(
+        ASSERT_BSONOBJ_EQ(
             BSON("drop" << dropNS().coll() << "writeConcern" << BSON("w" << 0 << "wtimeout" << 0)),
             request.cmdObj);
 
-        ASSERT_EQUALS(rpc::makeEmptyMetadata(), request.metadata);
+        ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(), request.metadata);
 
         return BSON("ok" << 0 << "code" << ErrorCodes::NamespaceNotFound);
     });
@@ -284,7 +286,8 @@ TEST_F(DropColl2ShardTest, DistLockBusy) {
 
 TEST_F(DropColl2ShardTest, FirstShardTargeterError) {
     auto shard1Targeter = RemoteCommandTargeterMock::get(
-        shardRegistry()->getShard(operationContext(), shard1().getName())->getTargeter());
+        uassertStatusOK(shardRegistry()->getShard(operationContext(), shard1().getName()))
+            ->getTargeter());
     shard1Targeter->setFindHostReturnValue({ErrorCodes::HostUnreachable, "bad test network"});
 
     auto future = launchAsync([this] {
@@ -348,7 +351,8 @@ TEST_F(DropColl2ShardTest, FirstShardDropCmdError) {
 
 TEST_F(DropColl2ShardTest, SecondShardTargeterError) {
     auto shard2Targeter = RemoteCommandTargeterMock::get(
-        shardRegistry()->getShard(operationContext(), shard2().getName())->getTargeter());
+        uassertStatusOK(shardRegistry()->getShard(operationContext(), shard2().getName()))
+            ->getTargeter());
     shard2Targeter->setFindHostReturnValue({ErrorCodes::HostUnreachable, "bad test network"});
 
     auto future = launchAsync([this] {

@@ -14,6 +14,11 @@ selector:
     - jstests/sharding/add_shard_to_zone.js
     - jstests/sharding/remove_shard_from_zone.js
     - jstests/sharding/update_zone_key_range.js
+    - jstests/sharding/movechunk_interrupt_at_primary_stepdown.js
+    # Doesn't use ShardingTest so won't actually be run in a mixed version configuration
+    - jstests/sharding/config_version_rollback.js
+    # TODO Assumes mongod and mongos handle read on view. Enable when 3.4 becomes 'last-stable'.
+    - jstests/sharding/movePrimary1.js
     # v3.4 replace noAutoSplit flag with document in config.settings
     - jstests/sharding/disable_autosplit.js
     # v3.4 changes $in shard key extraction.
@@ -43,8 +48,7 @@ selector:
     - jstests/sharding/cursor_timeout.js
     # Bug in v3.2 shards, fixed in v3.4.
     - jstests/sharding/auth_sharding_cmd_metadata.js
-    # TODO Requires mongos to have fix for SERVER-25258. Enable when v3.2.9+ is 'last-stable'.
-    - jstests/sharding/kill_op_overflow.js
+    - jstests/sharding/split_against_shard_with_invalid_split_points.js
     # TODO Assumes shardCollection can handle the collation option; enable when 3.4 becomes
     # 'last-stable'.
     - jstests/sharding/collation_targeting.js
@@ -53,12 +57,14 @@ selector:
     - jstests/sharding/collation_targeting_inherited.js
     # Behavior change to addShard
     - jstests/sharding/addshard_idempotent.js
-
     # Uses a failpoint that does not exist in v3.2, so the test is incompatible with a v3.2 shard.
     - jstests/sharding/cleanup_orphaned_cmd_during_movechunk.js
     - jstests/sharding/cleanup_orphaned_cmd_during_movechunk_hashed.js
     - jstests/sharding/migration_failure.js
     - jstests/sharding/migration_with_source_ops.js
+    # Testing features that do not exist on v3.2 shards.
+    - jstests/sharding/migration_server_status.js
+    - jstests/sharding/movechunk_parallel.js
 
 executor:
   js_test:

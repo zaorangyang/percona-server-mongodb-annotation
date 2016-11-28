@@ -112,11 +112,14 @@ void updateShardIdentityConfigStringCB(const string& setName, const string& newC
                       ->updateShardIdentityConfigString(uniqOpCtx.get(), newConnectionString);
     if (!status.isOK() && !ErrorCodes::isNotMasterError(status.code())) {
         warning() << "error encountered while trying to update config connection string to "
-                  << newConnectionString << causedBy(status);
+                  << newConnectionString << redact(status);
     }
 }
 
 }  // namespace
+
+const std::set<std::string> ShardingState::_commandsThatInitializeShardingAwareness{
+    "_recvChunkStart", "mergeChunks", "moveChunk", "setShardVersion", "splitChunk"};
 
 ShardingState::ShardingState()
     : _initializationState(static_cast<uint32_t>(InitializationState::kNew)),
@@ -711,8 +714,7 @@ StatusWith<ChunkVersion> ShardingState::_refreshMetadata(
         if (status.code() == ErrorCodes::NamespaceNotFound) {
             remoteMetadata.reset();
         } else if (!status.isOK()) {
-            warning() << "Could not remotely refresh metadata for " << nss.ns()
-                      << causedBy(status.reason());
+            warning() << "Could not remotely refresh metadata for " << nss.ns() << redact(status);
 
             return status;
         }
@@ -746,6 +748,10 @@ StatusWith<ScopedRegisterMigration> ShardingState::registerMigration(const MoveC
 
 boost::optional<NamespaceString> ShardingState::getActiveMigrationNss() {
     return _activeMigrationsRegistry.getActiveMigrationNss();
+}
+
+BSONObj ShardingState::getActiveMigrationStatusReport(OperationContext* txn) {
+    return _activeMigrationsRegistry.getActiveMigrationStatusReport(txn);
 }
 
 void ShardingState::appendInfo(OperationContext* txn, BSONObjBuilder& builder) {

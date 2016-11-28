@@ -74,6 +74,12 @@ namespace {
 const size_t kMallocMemoryLimit = 1024ul * 1024 * 1024 * 1.1;
 
 /**
+ * The threshold (as a fraction of the max) after which garbage collection will be run during
+ * interrupts.
+ */
+const double kInterruptGCThreshold = 0.8;
+
+/**
  * The number of bytes to allocate after which garbage collection is run
  */
 const int kMaxBytesBeforeGC = 8 * 1024 * 1024;
@@ -91,6 +97,9 @@ const int kStackChunkSize = 8192;
 stdx::mutex gRuntimeCreationMutex;
 bool gFirstRuntimeCreated = false;
 
+bool closeToMaxMemory() {
+    return mongo::sm::get_total_bytes() > (kInterruptGCThreshold * mongo::sm::get_max_bytes());
+}
 }  // namespace
 
 MONGO_TRIVIALLY_CONSTRUCTIBLE_THREAD_LOCAL MozJSImplScope* kCurrentScope;
@@ -170,6 +179,10 @@ void MozJSImplScope::kill() {
     JS_RequestInterruptCallback(_runtime);
 }
 
+void MozJSImplScope::interrupt() {
+    JS_RequestInterruptCallback(_runtime);
+}
+
 bool MozJSImplScope::isKillPending() const {
     return _pendingKill.load();
 }
@@ -188,7 +201,7 @@ bool MozJSImplScope::_interruptCallback(JSContext* cx) {
     JS_SetInterruptCallback(scope->_runtime, nullptr);
     auto guard = MakeGuard([&]() { JS_SetInterruptCallback(scope->_runtime, _interruptCallback); });
 
-    if (scope->_pendingGC.load()) {
+    if (scope->_pendingGC.load() || closeToMaxMemory()) {
         scope->_pendingGC.store(false);
         JS_GC(scope->_runtime);
     } else {
@@ -336,12 +349,12 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _bsonProto(_context),
       _codeProto(_context),
       _countDownLatchProto(_context),
-      _cursorProto(_context),
       _cursorHandleProto(_context),
+      _cursorProto(_context),
       _dbCollectionProto(_context),
+      _dbProto(_context),
       _dbPointerProto(_context),
       _dbQueryProto(_context),
-      _dbProto(_context),
       _dbRefProto(_context),
       _errorProto(_context),
       _jsThreadProto(_context),
@@ -351,13 +364,14 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _mongoHelpersProto(_context),
       _mongoLocalProto(_context),
       _nativeFunctionProto(_context),
+      _numberDecimalProto(_context),
       _numberIntProto(_context),
       _numberLongProto(_context),
-      _numberDecimalProto(_context),
       _objectProto(_context),
       _oidProto(_context),
       _regExpProto(_context),
-      _timestampProto(_context) {
+      _timestampProto(_context),
+      _uriProto(_context) {
     kCurrentScope = this;
 
     // The default is quite low and doesn't seem to directly correlate with
@@ -625,14 +639,16 @@ int MozJSImplScope::invoke(ScriptingFunction func,
 
     if (timeoutMs)
         _engine->getDeadlineMonitor().startDeadline(this, timeoutMs);
+    else {
+        _engine->getDeadlineMonitor().startDeadline(this, -1);
+    }
 
     JS::RootedValue out(_context);
     JS::RootedObject obj(_context, smrecv.toObjectOrNull());
 
     bool success = JS::Call(_context, obj, funcValue, args, &out);
 
-    if (timeoutMs)
-        _engine->getDeadlineMonitor().stopDeadline(this);
+    _engine->getDeadlineMonitor().stopDeadline(this);
 
     _checkErrorState(success);
 
@@ -670,15 +686,17 @@ bool MozJSImplScope::exec(StringData code,
     if (_checkErrorState(success, reportError, assertOnError))
         return false;
 
-    if (timeoutMs)
+    if (timeoutMs) {
         _engine->getDeadlineMonitor().startDeadline(this, timeoutMs);
+    } else {
+        _engine->getDeadlineMonitor().startDeadline(this, -1);
+    }
 
     JS::RootedValue out(_context);
 
     success = JS_ExecuteScript(_context, script, &out);
 
-    if (timeoutMs)
-        _engine->getDeadlineMonitor().stopDeadline(this);
+    _engine->getDeadlineMonitor().stopDeadline(this);
 
     if (_checkErrorState(success, reportError, assertOnError))
         return false;
@@ -790,6 +808,7 @@ void MozJSImplScope::installBSONTypes() {
     _oidProto.install(_global);
     _regExpProto.install(_global);
     _timestampProto.install(_global);
+    _uriProto.install(_global);
 
     // This builtin map is a javascript 6 thing.  We want our version.  so
     // take theirs out

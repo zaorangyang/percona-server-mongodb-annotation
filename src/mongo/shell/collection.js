@@ -272,6 +272,11 @@ DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, op
         cursor.readPref(readPrefMode, connObj.getReadPrefTagSet());
     }
 
+    var rc = connObj.getReadConcern();
+    if (rc) {
+        cursor.readConcern(rc);
+    }
+
     return cursor;
 };
 
@@ -1028,7 +1033,7 @@ DBCollection.prototype._getIndexesCommand = function(filter) {
         throw _getErrorWithCode(res, "listIndexes failed: " + tojson(res));
     }
 
-    return new DBCommandCursor(this._mongo, res).toArray();
+    return new DBCommandCursor(res._mongo, res).toArray();
 };
 
 DBCollection.prototype.getIndexes = function(filter) {
@@ -1203,7 +1208,7 @@ DBCollection.prototype.convertToCapped = function(bytes) {
 DBCollection.prototype.exists = function() {
     var res = this._db.runCommand("listCollections", {filter: {name: this._shortName}});
     if (res.ok) {
-        var cursor = new DBCommandCursor(this._mongo, res);
+        var cursor = new DBCommandCursor(res._mongo, res);
         if (!cursor.hasNext())
             return null;
         return cursor.next();
@@ -1301,7 +1306,7 @@ DBCollection.prototype.aggregate = function(pipeline, aggregateOptions) {
     assert.commandWorked(res, "aggregate failed");
 
     if ("cursor" in res) {
-        return new DBCommandCursor(this._mongo, res);
+        return new DBCommandCursor(res._mongo, res);
     }
 
     return res;
@@ -1756,8 +1761,9 @@ DBCollection.prototype._distinct = function(keyString, query) {
     return this._dbReadCommand({distinct: this._shortName, key: keyString, query: query || {}});
 };
 
-DBCollection.prototype.latencyStats = function() {
-    return this.aggregate([{$collStats: {latencyStats: {}}}]);
+DBCollection.prototype.latencyStats = function(options) {
+    options = options || {};
+    return this.aggregate([{$collStats: {latencyStats: options}}]);
 };
 
 /**

@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/client.h"
@@ -164,20 +165,21 @@ void ShardingTestFixture::setUp() {
 
     // For now initialize the global grid object. All sharding objects will be accessible from there
     // until we get rid of it.
-    grid.init(std::move(catalogClient),
-              nullptr,
-              stdx::make_unique<CatalogCache>(),
-              std::move(shardRegistry),
-              stdx::make_unique<ClusterCursorManager>(_service->getPreciseClockSource()),
-              stdx::make_unique<BalancerConfiguration>(),
-              std::move(executorPool),
-              _mockNetwork);
+    Grid::get(operationContext())
+        ->init(std::move(catalogClient),
+               nullptr,
+               stdx::make_unique<CatalogCache>(),
+               std::move(shardRegistry),
+               stdx::make_unique<ClusterCursorManager>(_service->getPreciseClockSource()),
+               stdx::make_unique<BalancerConfiguration>(),
+               std::move(executorPool),
+               _mockNetwork);
 }
 
 void ShardingTestFixture::tearDown() {
-    grid.getExecutorPool()->shutdownAndJoin();
-    grid.catalogClient(_opCtx.get())->shutDown(_opCtx.get());
-    grid.clearForUnitTests();
+    Grid::get(operationContext())->getExecutorPool()->shutdownAndJoin();
+    Grid::get(operationContext())->catalogClient(_opCtx.get())->shutDown(_opCtx.get());
+    Grid::get(operationContext())->clearForUnitTests();
 
     _transportSession.reset();
     _opCtx.reset();
@@ -191,7 +193,7 @@ void ShardingTestFixture::shutdownExecutor() {
 }
 
 ShardingCatalogClient* ShardingTestFixture::catalogClient() const {
-    return grid.catalogClient(_opCtx.get());
+    return Grid::get(operationContext())->catalogClient(_opCtx.get());
 }
 
 ShardingCatalogClientImpl* ShardingTestFixture::getCatalogClient() const {
@@ -199,9 +201,7 @@ ShardingCatalogClientImpl* ShardingTestFixture::getCatalogClient() const {
 }
 
 ShardRegistry* ShardingTestFixture::shardRegistry() const {
-    invariant(grid.shardRegistry());
-
-    return grid.shardRegistry();
+    return Grid::get(operationContext())->shardRegistry();
 }
 
 RemoteCommandTargeterFactoryMock* ShardingTestFixture::targeterFactory() const {
@@ -276,8 +276,8 @@ void ShardingTestFixture::expectGetShards(const std::vector<ShardType>& shards) 
         const auto& query = queryResult.getValue();
         ASSERT_EQ(query->ns(), ShardType::ConfigNS);
 
-        ASSERT_EQ(query->getFilter(), BSONObj());
-        ASSERT_EQ(query->getSort(), BSONObj());
+        ASSERT_BSONOBJ_EQ(query->getFilter(), BSONObj());
+        ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
         ASSERT_FALSE(query->getLimit().is_initialized());
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -311,7 +311,7 @@ void ShardingTestFixture::expectInserts(const NamespaceString& nss,
         auto itExpected = expected.begin();
 
         for (; itInserted != inserted.end(); itInserted++, itExpected++) {
-            ASSERT_EQ(*itExpected, *itInserted);
+            ASSERT_BSONOBJ_EQ(*itExpected, *itInserted);
         }
 
         BatchedCommandResponse response;
@@ -337,7 +337,7 @@ void ShardingTestFixture::expectConfigCollectionCreate(const HostAndPort& config
                                   << 15000)
                           << "maxTimeMS"
                           << 30000);
-        ASSERT_EQUALS(expectedCreateCmd, request.cmdObj);
+        ASSERT_BSONOBJ_EQ(expectedCreateCmd, request.cmdObj);
 
         return response;
     });
@@ -367,7 +367,7 @@ void ShardingTestFixture::expectConfigCollectionInsert(const HostAndPort& config
 
         ASSERT_EQUALS(operationContext()->getClient()->clientAddress(true),
                       actualChangeLog.getClientAddr());
-        ASSERT_EQUALS(detail, actualChangeLog.getDetails());
+        ASSERT_BSONOBJ_EQ(detail, actualChangeLog.getDetails());
         ASSERT_EQUALS(ns, actualChangeLog.getNS());
         ASSERT_EQUALS(network()->getHostName(), actualChangeLog.getServer());
         ASSERT_EQUALS(timestamp, actualChangeLog.getTime());
@@ -382,7 +382,7 @@ void ShardingTestFixture::expectConfigCollectionInsert(const HostAndPort& config
         const std::string timePiece = changeId.substr(firstDash + 1, lastDash - firstDash - 1);
         const std::string oidPiece = changeId.substr(lastDash + 1);
 
-        ASSERT_EQUALS(grid.getNetwork()->getHostName(), serverPiece);
+        ASSERT_EQUALS(Grid::get(operationContext())->getNetwork()->getHostName(), serverPiece);
         ASSERT_EQUALS(timestamp.toString(), timePiece);
 
         OID generatedOID;
@@ -413,7 +413,7 @@ void ShardingTestFixture::expectUpdateCollection(const HostAndPort& expectedHost
                                                  const CollectionType& coll) {
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(expectedHost, request.target);
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
         ASSERT_EQUALS("config", request.dbname);
 
         BatchedUpdateRequest actualBatchedUpdate;
@@ -426,8 +426,9 @@ void ShardingTestFixture::expectUpdateCollection(const HostAndPort& expectedHost
 
         ASSERT_TRUE(update->getUpsert());
         ASSERT_FALSE(update->getMulti());
-        ASSERT_EQUALS(update->getQuery(), BSON(CollectionType::fullNs(coll.getNs().toString())));
-        ASSERT_EQUALS(update->getUpdateExpr(), coll.toBSON());
+        ASSERT_BSONOBJ_EQ(update->getQuery(),
+                          BSON(CollectionType::fullNs(coll.getNs().toString())));
+        ASSERT_BSONOBJ_EQ(update->getUpdateExpr(), coll.toBSON());
 
         BatchedCommandResponse response;
         response.setOk(true);
@@ -443,14 +444,14 @@ void ShardingTestFixture::expectSetShardVersion(const HostAndPort& expectedHost,
                                                 const ChunkVersion& expectedChunkVersion) {
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(expectedHost, request.target);
-        ASSERT_EQUALS(rpc::makeEmptyMetadata(), request.metadata);
+        ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(), request.metadata);
 
         SetShardVersionRequest ssv =
             assertGet(SetShardVersionRequest::parseFromBSON(request.cmdObj));
 
         ASSERT(!ssv.isInit());
         ASSERT(ssv.isAuthoritative());
-        ASSERT_EQ(grid.shardRegistry()->getConfigServerConnectionString().toString(),
+        ASSERT_EQ(shardRegistry()->getConfigServerConnectionString().toString(),
                   ssv.getConfigServer().toString());
         ASSERT_EQ(expectedShard.getHost(), ssv.getShardConnectionString().toString());
         ASSERT_EQ(expectedNs.toString(), ssv.getNS().ns());
@@ -475,7 +476,7 @@ void ShardingTestFixture::expectCount(const HostAndPort& configHost,
             auto queryElem = request.cmdObj["query"];
             ASSERT_TRUE(queryElem.eoo() || queryElem.Obj().isEmpty());
         } else {
-            ASSERT_EQUALS(expectedQuery, request.cmdObj["query"].Obj());
+            ASSERT_BSONOBJ_EQ(expectedQuery, request.cmdObj["query"].Obj());
         }
 
         if (response.isOK()) {

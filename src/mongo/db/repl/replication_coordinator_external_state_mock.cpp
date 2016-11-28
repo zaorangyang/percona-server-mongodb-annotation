@@ -226,15 +226,11 @@ void ReplicationCoordinatorExternalStateMock::killAllUserOperations(OperationCon
 
 void ReplicationCoordinatorExternalStateMock::shardingOnStepDownHook() {}
 
-void ReplicationCoordinatorExternalStateMock::shardingOnDrainingStateHook(OperationContext* txn) {}
-
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
 
 void ReplicationCoordinatorExternalStateMock::signalApplierToCancelFetcher() {
     _isApplierSignaledToCancelFetcher = true;
 }
-
-void ReplicationCoordinatorExternalStateMock::dropAllTempCollections(OperationContext* txn) {}
 
 void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
 
@@ -290,9 +286,18 @@ void ReplicationCoordinatorExternalStateMock::setIsReadCommittedEnabled(bool val
     _isReadCommittedSupported = val;
 }
 
-void ReplicationCoordinatorExternalStateMock::logTransitionToPrimaryToOplog(OperationContext* txn) {
-    _lastOpTime = OpTime(Timestamp(1, 0), 1);
+OpTime ReplicationCoordinatorExternalStateMock::onTransitionToPrimary(OperationContext* txn,
+                                                                      bool isV1ElectionProtocol) {
+    if (isV1ElectionProtocol) {
+        _lastOpTime = OpTime(Timestamp(1, 0), 1);
+    }
+    return fassertStatusOK(40297, _lastOpTime);
 }
 
+void ReplicationCoordinatorExternalStateMock::startNoopWriter(OpTime opTime) {}
+
+void ReplicationCoordinatorExternalStateMock::stopNoopWriter() {}
+
+void ReplicationCoordinatorExternalStateMock::setupNoopWriter(Seconds waitTime) {}
 }  // namespace repl
 }  // namespace mongo

@@ -212,7 +212,8 @@ public:
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
         ReplSetUpdatePositionCommandStyle commandStyle) const override;
 
-    virtual Status processReplSetGetStatus(BSONObjBuilder* result) override;
+    virtual Status processReplSetGetStatus(BSONObjBuilder* result,
+                                           ReplSetGetStatusResponseStyle responseStyle) override;
 
     virtual void fillIsMasterForReplSet(IsMasterResponse* result) override;
 
@@ -230,7 +231,8 @@ public:
 
     virtual bool getMaintenanceMode() override;
 
-    virtual Status processReplSetSyncFrom(const HostAndPort& target,
+    virtual Status processReplSetSyncFrom(OperationContext* txn,
+                                          const HostAndPort& target,
                                           BSONObjBuilder* resultObj) override;
 
     virtual Status processReplSetFreeze(int secs, BSONObjBuilder* resultObj) override;
@@ -1071,11 +1073,11 @@ private:
     void _startElectSelfIfEligibleV1(bool isPriorityTakeover);
 
     /**
-     * Reset the term of last vote to 0 to prevent any node from voting for term 0.
-     * Blocking until last vote write finishes. Must be called without holding _mutex.
+     * Resets the term of last vote to 0 to prevent any node from voting for term 0.
+     * Returns the event handle that indicates when last vote write finishes.
      */
-    void _resetElectionInfoOnProtocolVersionUpgrade(const ReplicaSetConfig& oldConfig,
-                                                    const ReplicaSetConfig& newConfig);
+    EventHandle _resetElectionInfoOnProtocolVersionUpgrade(const ReplicaSetConfig& oldConfig,
+                                                           const ReplicaSetConfig& newConfig);
 
     /**
      * Schedules work and returns handle to callback.
@@ -1322,7 +1324,7 @@ private:
     // Storage interface used by data replicator.
     StorageInterface* _storage;  // (PS)
     // Data Replicator used to replicate data
-    std::unique_ptr<DataReplicator> _dr;  // (S)
+    std::unique_ptr<DataReplicator> _dr;  // (M)
 
     // Hands out the next snapshot name.
     AtomicUInt64 _snapshotNameGenerator;  // (S)

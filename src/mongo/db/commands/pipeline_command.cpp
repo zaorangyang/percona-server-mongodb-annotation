@@ -36,6 +36,7 @@
 #include "mongo/base/init.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
@@ -79,10 +80,12 @@ namespace {
 
 /**
  * Returns true if we need to keep a ClientCursor saved for this pipeline (for future getMore
- * requests).  Otherwise, returns false.
+ * requests). Otherwise, returns false. The passed 'nsForCursor' is only used to determine the
+ * namespace used in the returned cursor. In the case of views, this can be different from that
+ * in 'request'.
  */
 bool handleCursorCommand(OperationContext* txn,
-                         const string& ns,
+                         const string& nsForCursor,
                          ClientCursorPin* pin,
                          PlanExecutor* exec,
                          const AggregationRequest& request,
@@ -139,7 +142,7 @@ bool handleCursorCommand(OperationContext* txn,
             17391,
             str::stream() << "Aggregation has more results than fit in initial batch, but can't "
                           << "create cursor since collection "
-                          << ns
+                          << nsForCursor
                           << " doesn't exist");
     }
 
@@ -159,7 +162,7 @@ bool handleCursorCommand(OperationContext* txn,
     }
 
     const long long cursorId = cursor ? cursor->cursorid() : 0LL;
-    appendCursorResponseObject(cursorId, ns, resultsArray.arr(), &result);
+    appendCursorResponseObject(cursorId, nsForCursor, resultsArray.arr(), &result);
 
     return static_cast<bool>(cursor);
 }
@@ -173,7 +176,8 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
     // This is necessary to prevent a cycle from being formed among the view definitions cached in
     // 'resolvedNamespaces' because we won't re-resolve a view namespace we've already encountered.
     AutoGetDb autoDb(txn, expCtx->ns.db(), MODE_IS);
-    ViewCatalog* viewCatalog = autoDb.getDb() ? autoDb.getDb()->getViewCatalog() : nullptr;
+    Database* const db = autoDb.getDb();
+    ViewCatalog* viewCatalog = db ? db->getViewCatalog() : nullptr;
 
     const auto& pipelineInvolvedNamespaces = pipeline->getInvolvedCollections();
     std::deque<NamespaceString> involvedNamespacesQueue(pipelineInvolvedNamespaces.begin(),
@@ -188,9 +192,15 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
             continue;
         }
 
-        if (viewCatalog && viewCatalog->lookup(txn, involvedNs.ns())) {
-            // If the database exists and 'involvedNs' refers to a view namespace, then we resolve
-            // its definition.
+        if (!db || db->getCollection(involvedNs.ns())) {
+            // If the database exists and 'involvedNs' refers to a collection namespace, then we
+            // resolve it as an empty pipeline in order to read directly from the underlying
+            // collection. If the database doesn't exist, then we still resolve it as an empty
+            // pipeline because 'involvedNs' doesn't refer to a view namespace in our consistent
+            // snapshot of the view catalog.
+            resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
+        } else if (viewCatalog->lookup(txn, involvedNs.ns())) {
+            // If 'involvedNs' refers to a view namespace, then we resolve its definition.
             auto resolvedView = viewCatalog->resolveView(txn, involvedNs);
             if (!resolvedView.isOK()) {
                 return {ErrorCodes::FailedToParse,
@@ -218,11 +228,8 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
                                            resolvedViewInvolvedNamespaces.begin(),
                                            resolvedViewInvolvedNamespaces.end());
         } else {
-            // If the database exists and 'involvedNs' refers to a collection namespace, then we
-            // resolve it as an empty pipeline in order to read directly from the underlying
-            // collection. If the database doesn't exist, then we still resolve it as an empty
-            // pipeline because 'involvedNs' doesn't refer to a view namespace in our consistent
-            // snapshot of the view catalog.
+            // 'involvedNs' is neither a view nor a collection, so resolve it as an empty pipeline
+            // to treat it as reading from a non-existent collection.
             resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
         }
     }
@@ -300,34 +307,25 @@ public:
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) final {
-        return Pipeline::checkAuthForCommand(client, dbname, cmdObj);
+        NamespaceString nss(parseNs(dbname, cmdObj));
+        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj);
     }
 
-    virtual bool run(OperationContext* txn,
-                     const string& db,
-                     BSONObj& cmdObj,
-                     int options,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
-        const std::string ns = parseNs(db, cmdObj);
-        if (nsToCollectionSubstring(ns).empty()) {
-            errmsg = "missing collection name";
-            return false;
-        }
-        NamespaceString nss(ns);
-
-        // Parse the options for this request.
-        auto request = AggregationRequest::parseFromBSON(nss, cmdObj);
-        if (!request.isOK()) {
-            return appendCommandStatus(result, request.getStatus());
-        }
+    bool runParsed(OperationContext* txn,
+                   const NamespaceString& origNss,
+                   const AggregationRequest& request,
+                   BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
+        // For operations on views, this will be the underlying namespace.
+        const NamespaceString& nss = request.getNamespaceString();
 
         // Set up the ExpressionContext.
-        intrusive_ptr<ExpressionContext> expCtx = new ExpressionContext(txn, request.getValue());
+        intrusive_ptr<ExpressionContext> expCtx = new ExpressionContext(txn, request);
         expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
 
         // Parse the pipeline.
-        auto statusWithPipeline = Pipeline::parse(request.getValue().getPipeline(), expCtx);
+        auto statusWithPipeline = Pipeline::parse(request.getPipeline(), expCtx);
         if (!statusWithPipeline.isOK()) {
             return appendCommandStatus(result, statusWithPipeline.getStatus());
         }
@@ -388,13 +386,18 @@ public:
                 ctx.releaseLocksForView();
 
                 // Parse the resolved view into a new aggregation request.
-                auto viewCmd =
-                    resolvedView.getValue().asExpandedViewAggregation(request.getValue());
-                if (!viewCmd.isOK()) {
-                    return appendCommandStatus(result, viewCmd.getStatus());
+                auto newCmd = resolvedView.getValue().asExpandedViewAggregation(request);
+                if (!newCmd.isOK()) {
+                    return appendCommandStatus(result, newCmd.getStatus());
+                }
+                auto newNss = resolvedView.getValue().getNamespace();
+                auto newRequest = AggregationRequest::parseFromBSON(newNss, newCmd.getValue());
+                if (!newRequest.isOK()) {
+                    return appendCommandStatus(result, newRequest.getStatus());
                 }
 
-                bool status = this->run(txn, db, viewCmd.getValue(), options, errmsg, result);
+                bool status = runParsed(
+                    txn, origNss, newRequest.getValue(), newCmd.getValue(), errmsg, result);
                 {
                     // Set the namespace of the curop back to the view namespace so ctx records
                     // stats on this view namespace on destruction.
@@ -406,7 +409,7 @@ public:
 
             // If the pipeline does not have a user-specified collation, set it from the collection
             // default.
-            if (request.getValue().getCollation().isEmpty() && collection &&
+            if (request.getCollation().isEmpty() && collection &&
                 collection->getDefaultCollator()) {
                 invariant(!expCtx->getCollator());
                 expCtx->setCollator(collection->getDefaultCollator()->clone());
@@ -427,7 +430,7 @@ public:
                 // re-parsing every command in debug builds. This is important because sharded
                 // aggregations rely on this ability.  Skipping when inShard because this has
                 // already been through the transformation (and this un-sets expCtx->inShard).
-                pipeline = reparsePipeline(pipeline, request.getValue(), expCtx);
+                pipeline = reparsePipeline(pipeline, request, expCtx);
             }
 
             // This does mongod-specific stuff like creating the input PlanExecutor and adding
@@ -492,7 +495,7 @@ public:
             // BSONObj will also fit inside a single batch.
             //
             // We occasionally log a deprecation warning.
-            if (!request.getValue().isCursorCommand()) {
+            if (!request.isCursorCommand()) {
                 RARELY {
                     warning()
                         << "Use of the aggregate command without the 'cursor' "
@@ -504,12 +507,12 @@ public:
             // If both explain and cursor are specified, explain wins.
             if (expCtx->isExplain) {
                 result << "stages" << Value(pipeline->writeExplainOps());
-            } else if (request.getValue().isCursorCommand()) {
+            } else if (request.isCursorCommand()) {
                 keepCursor = handleCursorCommand(txn,
-                                                 nss.ns(),
+                                                 origNss.ns(),
                                                  pin.get(),
                                                  pin ? pin->c()->getExecutor() : exec.get(),
-                                                 request.getValue(),
+                                                 request,
                                                  result);
             } else {
                 pipeline->run(result);
@@ -547,8 +550,29 @@ public:
             throw;
         }
         // Any code that needs the cursor pinned must be inside the try block, above.
-
         return appendCommandStatus(result, Status::OK());
+    }
+
+    virtual bool run(OperationContext* txn,
+                     const string& db,
+                     BSONObj& cmdObj,
+                     int options,
+                     string& errmsg,
+                     BSONObjBuilder& result) {
+        const std::string ns = parseNs(db, cmdObj);
+        if (nsToCollectionSubstring(ns).empty()) {
+            errmsg = "missing collection name";
+            return false;
+        }
+        NamespaceString nss(ns);
+
+        // Parse the options for this request.
+        auto request = AggregationRequest::parseFromBSON(nss, cmdObj);
+        if (!request.isOK()) {
+            return appendCommandStatus(result, request.getStatus());
+        }
+
+        return runParsed(txn, nss, request.getValue(), cmdObj, errmsg, result);
     }
 };
 

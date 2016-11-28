@@ -36,6 +36,7 @@
 
 #include <vector>
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
@@ -664,8 +665,9 @@ Status IndexCatalog::_doesSpecConflictWithExisting(OperationContext* txn,
         if (desc) {
             // index already exists with same name
 
-            if (desc->keyPattern().equal(key) &&
-                desc->infoObj().getObjectField("collation") != collation) {
+            if (SimpleBSONObjComparator::kInstance.evaluate(desc->keyPattern() == key) &&
+                SimpleBSONObjComparator::kInstance.evaluate(
+                    desc->infoObj().getObjectField("collation") != collation)) {
                 // key patterns are equal but collations differ.
                 return Status(ErrorCodes::IndexOptionsConflict,
                               str::stream()
@@ -678,8 +680,9 @@ Status IndexCatalog::_doesSpecConflictWithExisting(OperationContext* txn,
                                   << spec);
             }
 
-            if (!desc->keyPattern().equal(key) ||
-                desc->infoObj().getObjectField("collation") != collation) {
+            if (SimpleBSONObjComparator::kInstance.evaluate(desc->keyPattern() != key) ||
+                SimpleBSONObjComparator::kInstance.evaluate(
+                    desc->infoObj().getObjectField("collation") != collation)) {
                 return Status(ErrorCodes::IndexKeySpecsConflict,
                               str::stream() << "Index must have unique name."
                                             << "The existing index: "
@@ -1078,9 +1081,11 @@ IndexDescriptor* IndexCatalog::findIndexByKeyPatternAndCollationSpec(
     IndexIterator ii = getIndexIterator(txn, includeUnfinishedIndexes);
     while (ii.more()) {
         IndexDescriptor* desc = ii.next();
-        if (desc->keyPattern() == key &&
-            desc->infoObj().getObjectField("collation") == collationSpec)
+        if (SimpleBSONObjComparator::kInstance.evaluate(desc->keyPattern() == key) &&
+            SimpleBSONObjComparator::kInstance.evaluate(
+                desc->infoObj().getObjectField("collation") == collationSpec)) {
             return desc;
+        }
     }
     return NULL;
 }
@@ -1093,7 +1098,7 @@ void IndexCatalog::findIndexesByKeyPattern(OperationContext* txn,
     IndexIterator ii = getIndexIterator(txn, includeUnfinishedIndexes);
     while (ii.more()) {
         IndexDescriptor* desc = ii.next();
-        if (desc->keyPattern() == key) {
+        if (SimpleBSONObjComparator::kInstance.evaluate(desc->keyPattern() == key)) {
             matches->push_back(desc);
         }
     }

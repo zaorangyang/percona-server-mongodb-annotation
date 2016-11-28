@@ -1077,7 +1077,10 @@ SSLConnection* SSLManager::connect(Socket* socket) {
     std::unique_ptr<SSLConnection> sslConn =
         stdx::make_unique<SSLConnection>(_clientContext.get(), socket, (const char*)NULL, 0);
 
-    int ret;
+    int ret = ::SSL_set_tlsext_host_name(sslConn->ssl, socket->remoteAddr().hostOrIp().c_str());
+    if (ret != 1)
+        _handleSSLError(SSL_get_error(sslConn.get(), ret), ret);
+
     do {
         ret = ::SSL_connect(sslConn->ssl);
     } while (!_doneWithSSLOp(sslConn.get(), ret));
@@ -1345,17 +1348,17 @@ StatusWith<std::unordered_set<RoleName>> SSLManager::_parsePeerRoles(X509* peerC
                                   "Unrecognized entity in MongoDBAuthorizationGrant");
                 }
             }
+            LOG(1) << "MONGODB-X509 authorization parsed the following roles from peer "
+                      "certificate: "
+                   << [&roles]() {
+                          StringBuilder sb;
+                          std::for_each(roles.begin(), roles.end(), [&sb](const RoleName& role) {
+                              sb << role.toString();
+                          });
+                          return sb.str();
+                      }();
         }
     }
-
-    LOG(1) << "MONGODB-X509 authorization parsed the following roles from peer certificate: "
-           << [&roles]() {
-                  StringBuilder sb;
-                  std::for_each(roles.begin(), roles.end(), [&sb](const RoleName& role) {
-                      sb << role.toString();
-                  });
-                  return sb.str();
-              }();
 
     return roles;
 }

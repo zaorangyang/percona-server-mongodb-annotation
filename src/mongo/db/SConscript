@@ -405,6 +405,7 @@ env.Library(
         "dbwebserver.cpp",
         "initialize_server_global_state.cpp",
         "server_extra_log_context.cpp",
+        "server_options_init.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/client/clientdriver",
@@ -557,6 +558,20 @@ env.Library(
     ],
     LIBDEPS=[
         "commands",
+    ],
+)
+
+env.CppUnitTest(
+    target="commands_test",
+    source=[
+        "commands_test.cpp",
+    ],
+    LIBDEPS=[
+        "commands",
+        "commands_test_crutch",
+        "service_context_noop_init",
+        "auth/authorization_manager_mock_init",
+        "repl/replmocks",
     ],
 )
 

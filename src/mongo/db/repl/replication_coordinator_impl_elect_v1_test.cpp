@@ -959,6 +959,11 @@ protected:
                 net->blackHole(noi);
             }
             net->runReadyNetworkOperations();
+            // Successful elections need to write the last vote to disk, which is done by DB worker.
+            // Wait until DB worker finishes its job to ensure the synchronization with the
+            // executor.
+            getReplExec()->waitForDBWork_forTest();
+            net->runReadyNetworkOperations();
             hasReadyRequests = net->hasReadyRequests();
             getNet()->exitNetwork();
         }
@@ -1142,6 +1147,39 @@ TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringFreshnessScan) {
     ASSERT_FALSE(getReplCoord()->isWaitingForApplierToDrain());
     stopCapturingLogMessages();
     ASSERT_EQUALS(1, countLogLinesContaining("Stopped transition to primary"));
+    ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase("test"));
+}
+
+TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringCatchUp) {
+    startCapturingLogMessages();
+
+    OpTime time1(Timestamp(100, 1), 0);
+    OpTime time2(Timestamp(100, 2), 0);
+    ReplicaSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
+
+    processFreshnessScanRequests([this, time2](const NetworkOpIter noi) {
+        auto net = getNet();
+        // The old primary accepted one more op and all nodes caught up after voting for me.
+        net->scheduleResponse(noi, net->now(), makeFreshnessScanResponse(time2));
+    });
+    ASSERT(getReplCoord()->isCatchingUp());
+
+    TopologyCoordinator::UpdateTermResult updateTermResult;
+    auto evh = getReplCoord()->updateTerm_forTest(2, &updateTermResult);
+    ASSERT_TRUE(evh.isValid());
+    getReplExec()->waitForEvent(evh);
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+    auto net = getNet();
+    net->enterNetwork();
+    net->runReadyNetworkOperations();
+    net->exitNetwork();
+    auto txn = makeOperationContext();
+    // Simulate bgsync signaling replCoord to exit drain mode.
+    // At this point, we see the stepdown and reset the states.
+    getReplCoord()->signalDrainComplete(txn.get());
+    ASSERT_FALSE(getReplCoord()->isWaitingForApplierToDrain());
+    stopCapturingLogMessages();
+    ASSERT_EQUALS(1, countLogLinesContaining("Cannot catch up oplog after becoming primary"));
     ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase("test"));
 }
 

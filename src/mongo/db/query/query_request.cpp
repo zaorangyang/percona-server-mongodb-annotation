@@ -32,6 +32,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/namespace_string.h"
@@ -586,7 +587,8 @@ Status QueryRequest::validate() const {
     if (_tailable) {
         // Tailable cursors cannot have any sort other than {$natural: 1}.
         const BSONObj expectedSort = BSON("$natural" << 1);
-        if (!_sort.isEmpty() && _sort != expectedSort) {
+        if (!_sort.isEmpty() &&
+            SimpleBSONObjComparator::kInstance.evaluate(_sort != expectedSort)) {
             return Status(ErrorCodes::BadValue,
                           "cannot use tailable option with a sort other than {$natural: 1}");
         }
@@ -922,11 +924,6 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
         return {ErrorCodes::InvalidPipelineOperator,
                 str::stream() << "Option " << kMaxField << " not supported in aggregation."};
     }
-    if (!_wantMore) {
-        return {ErrorCodes::InvalidPipelineOperator,
-                str::stream() << "Option " << kSingleBatchField
-                              << " not supported in aggregation."};
-    }
     if (_maxScan != 0) {
         return {ErrorCodes::InvalidPipelineOperator,
                 str::stream() << "Option " << kMaxScanField << " not supported in aggregation."};
@@ -978,6 +975,13 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
     if (_ntoreturn) {
         return {ErrorCodes::BadValue,
                 str::stream() << "Cannot convert to an aggregation if ntoreturn is set."};
+    }
+    // The aggregation command normally does not support the 'singleBatch' option, but we make a
+    // special exception if 'limit' is set to 1.
+    if (!_wantMore && _limit.value_or(0) != 1LL) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kSingleBatchField
+                              << " not supported in aggregation."};
     }
 
     // Now that we've successfully validated this QR, begin building the aggregation command.

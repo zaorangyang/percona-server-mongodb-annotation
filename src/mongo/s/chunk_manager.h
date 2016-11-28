@@ -54,7 +54,7 @@ class OperationContext;
 typedef std::shared_ptr<ChunkManager> ChunkManagerPtr;
 
 // The key for the map is max for each Chunk or ChunkRange
-typedef std::map<BSONObj, std::shared_ptr<Chunk>, BSONObjCmp> ChunkMap;
+typedef BSONObjIndexedMap<std::shared_ptr<Chunk>> ChunkMap;
 
 class ChunkManager {
 public:
@@ -128,10 +128,15 @@ public:
      * For instance, to locate the chunk for document {a : "foo" , b : "bar"}
      * when the shard key is {a : "hashed"}, you can call
      *  findIntersectingChunk() on {a : hash("foo") }
+     *
+     * If 'collation' is empty, we use the collection default collation for targeting.
+     *
+     * Returns the error status ShardKeyNotFound if unable to target a single shard due to the
+     * collation.
      */
-    std::shared_ptr<Chunk> findIntersectingChunk(OperationContext* txn,
-                                                 const BSONObj& shardKey,
-                                                 const CollatorInterface* collator) const;
+    StatusWith<std::shared_ptr<Chunk>> findIntersectingChunk(OperationContext* txn,
+                                                             const BSONObj& shardKey,
+                                                             const BSONObj& collation) const;
 
     /*
      * Finds the intersecting chunk, assuming the simple collation.
@@ -232,7 +237,7 @@ private:
     // Contains a compressed map of what range of keys resides on which shard. The index is the max
     // key of the respective range and the union of all ranges in a such constructed map must cover
     // the complete space from [MinKey, MaxKey).
-    using ChunkRangeMap = std::map<BSONObj, ShardAndChunkRange, BSONObjCmp>;
+    using ChunkRangeMap = BSONObjIndexedMap<ShardAndChunkRange>;
 
     /**
      * If load was successful, returns true and it is guaranteed that the _chunkMap and

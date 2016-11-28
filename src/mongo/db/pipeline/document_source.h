@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "mongo/base/init.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/collection_index_usage_tracker.h"
@@ -74,6 +75,10 @@ class RecordCursor;
  * Registers a DocumentSource to have the name 'key'. When a stage with name '$key' is found,
  * 'parser' will be called to construct a DocumentSource.
  *
+ * This can also be used for stages like $project and $addFields which share common functionality
+ * in the unregistered DocumentSourceSingleDocumentTransformation, or for any future single-stage
+ * aliases.
+ *
  * As an example, if your document source looks like {"$foo": <args>}, with a parsing function
  * 'createFromBson', you would add this line:
  * REGISTER_DOCUMENT_SOURCE(foo, DocumentSourceFoo::createFromBson);
@@ -89,14 +94,14 @@ class RecordCursor;
     }
 
 /**
- * Registers an alias to have the name 'key'. When a stage with name '$key' is found,
- * 'parser' will be called to construct a vector of DocumentSources.
+ * Registers a multi-stage alias to have the single name 'key'. When a stage with name '$key' is
+ * found, 'parser' will be called to construct a vector of DocumentSources.
  *
  * As an example, if your document source looks like {"$foo": <args>}, with a parsing function
  * 'createFromBson', you would add this line:
- * REGISTER_DOCUMENT_SOURCE_ALIAS(foo, DocumentSourceFoo::createFromBson);
+ * REGISTER_MULTI_STAGE_ALIAS(foo, DocumentSourceFoo::createFromBson);
  */
-#define REGISTER_DOCUMENT_SOURCE_ALIAS(key, parser)                              \
+#define REGISTER_MULTI_STAGE_ALIAS(key, parser)                                  \
     MONGO_INITIALIZER(addAliasToDocSourceParserMap_##key)(InitializerContext*) { \
         DocumentSource::registerParser("$" #key, (parser));                      \
         return Status::OK();                                                     \
@@ -152,7 +157,7 @@ public:
      * Gets a BSONObjSet representing the sort order(s) of the output of the stage.
      */
     virtual BSONObjSet getOutputSorts() {
-        return BSONObjSet();
+        return SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     }
 
     /**
@@ -372,7 +377,15 @@ public:
          * Appends operation latency statistics for collection "nss" to "builder"
          */
         virtual void appendLatencyStats(const NamespaceString& nss,
+                                        bool includeHistograms,
                                         BSONObjBuilder* builder) const = 0;
+
+        /**
+         * Appends storage statistics for collection "nss" to "builder"
+         */
+        virtual Status appendStorageStats(const NamespaceString& nss,
+                                          const BSONObj& param,
+                                          BSONObjBuilder* builder) const = 0;
 
         /**
          * Gets the collection options for the collection given by 'nss'.
@@ -754,7 +767,8 @@ public:
     Value serialize(bool explain = false) const final;
     boost::intrusive_ptr<DocumentSource> optimize() final;
     BSONObjSet getOutputSorts() final {
-        return pSource ? pSource->getOutputSorts() : BSONObjSet();
+        return pSource ? pSource->getOutputSorts()
+                       : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     }
     /**
      * Attempts to combine with any subsequent $match stages, joining the query objects with a
@@ -1005,11 +1019,10 @@ public:
      * serialization and reporting and returning dependencies. The parser must also provide
      * implementations for optimizing and adding the expression context, even if those functions do
      * nothing.
-     *
-     * SERVER-25509 Make $replaceRoot use this framework.
      */
     class TransformerInterface {
     public:
+        virtual ~TransformerInterface() = default;
         virtual Document applyTransformation(Document input) = 0;
         virtual void optimize() = 0;
         virtual Document serialize(bool explain) const = 0;
@@ -1135,28 +1148,12 @@ private:
 
 /*
  * $replaceRoot takes an object containing only an expression in the newRoot field, and replaces
- * each incoming document with the result of evaluating that expression.
- * Throws an error if the given expression is not an object, and returns an empty document if the
- * expression evaluates to the "missing" Value.
+ * each incoming document with the result of evaluating that expression. Throws an error if the
+ * given expression is not an object or if the expression evaluates to the "missing" Value. This
+ * is implemented as an extension of DocumentSourceSingleDocumentTransformation.
  */
-class DocumentSourceReplaceRoot final : public DocumentSource {
+class DocumentSourceReplaceRoot final {
 public:
-    // virtuals from DocumentSource
-    boost::optional<Document> getNext() final;
-    const char* getSourceName() const final;
-    boost::intrusive_ptr<DocumentSource> optimize() final;
-    Value serialize(bool explain = false) const final;
-    GetDepsReturn getDependencies(DepsTracker* deps) const;
-
-    /**
-     * Since every document that is input to this stage is output as one document (and the documents
-     * that have invalid objects throw an error), we can move skip and limit ahead of this stage.
-     * If we decide to skip documents that don't have the desired field, we will no longer
-     * be able to move skip and limit ahead of this stage.
-     */
-    Pipeline::SourceContainer::iterator optimizeAt(Pipeline::SourceContainer::iterator itr,
-                                                   Pipeline::SourceContainer* container) final;
-
     /**
      * Creates a new replaceRoot DocumentSource from the BSON specification of the $replaceRoot
      * stage.
@@ -1165,11 +1162,7 @@ public:
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
 private:
-    DocumentSourceReplaceRoot(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
-                              const boost::intrusive_ptr<Expression> expr);
-
-    std::unique_ptr<Variables> _variables;
-    boost::intrusive_ptr<Expression> _newRoot;
+    DocumentSourceReplaceRoot() = default;
 };
 
 class DocumentSourceSample final : public DocumentSource, public SplittableDocumentSource {
@@ -1260,8 +1253,10 @@ public:
     boost::optional<Document> getNext() final;
     const char* getSourceName() const final;
     BSONObjSet getOutputSorts() final {
-        return pSource ? pSource->getOutputSorts() : BSONObjSet();
+        return pSource ? pSource->getOutputSorts()
+                       : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     }
+
     /**
      * Attempts to combine with a subsequent $limit stage, setting 'limit' appropriately.
      */
@@ -1489,7 +1484,8 @@ public:
     Value serialize(bool explain = false) const final;
     boost::intrusive_ptr<DocumentSource> optimize() final;
     BSONObjSet getOutputSorts() final {
-        return pSource ? pSource->getOutputSorts() : BSONObjSet();
+        return pSource ? pSource->getOutputSorts()
+                       : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     }
 
     GetDepsReturn getDependencies(DepsTracker* deps) const final {
@@ -1622,7 +1618,8 @@ public:
     }
     Value serialize(bool explain = false) const final;
     BSONObjSet getOutputSorts() final {
-        return {BSON(distanceField->fullPath() << -1)};
+        return SimpleBSONObjComparator::kInstance.makeBSONObjSet(
+            {BSON(distanceField->fullPath() << -1)});
     }
 
     // Virtuals for SplittableDocumentSource
@@ -1970,12 +1967,7 @@ private:
  */
 class DocumentSourceProject final {
 public:
-    // Since $project was once a DocumentSource, other stages that use it expect a pointer instead
-    // of a vector. Use the create function to get a single stage.
-    static boost::intrusive_ptr<DocumentSource> create(
-        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
-
-    static std::vector<boost::intrusive_ptr<DocumentSource>> createFromBson(
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
 private:
@@ -1988,7 +1980,7 @@ private:
  */
 class DocumentSourceAddFields final {
 public:
-    static std::vector<boost::intrusive_ptr<DocumentSource>> createFromBson(
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
 private:
@@ -2016,7 +2008,8 @@ public:
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
 private:
-    bool _latencySpecified = false;
+    // The raw object given to $collStats containing user specified options.
+    BSONObj _collStatsSpec;
     bool _finished = false;
 };
 
@@ -2024,13 +2017,23 @@ private:
  * The $bucketAuto stage takes a user-specified number of buckets and automatically determines
  * boundaries such that the values are approximately equally distributed between those buckets.
  */
-class DocumentSourceBucketAuto final : public DocumentSource {
+class DocumentSourceBucketAuto final : public DocumentSource, public SplittableDocumentSource {
 public:
     Value serialize(bool explain = false) const final;
     GetDepsReturn getDependencies(DepsTracker* deps) const final;
     boost::optional<Document> getNext() final;
     void dispose() final;
     const char* getSourceName() const final;
+
+    /**
+     * The $bucketAuto stage must be run on the merging shard.
+     */
+    boost::intrusive_ptr<DocumentSource> getShardSource() final {
+        return nullptr;
+    }
+    boost::intrusive_ptr<DocumentSource> getMergeSource() final {
+        return this;
+    }
 
     static const uint64_t kMaxMemoryUsageBytes = 100 * 1024 * 1024;
 

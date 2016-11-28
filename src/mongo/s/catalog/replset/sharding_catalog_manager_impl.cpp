@@ -44,16 +44,19 @@
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/balancer/balancer_policy.h"
+#include "mongo/s/balancer/type_migration.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -68,6 +71,7 @@
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/set_shard_version_request.h"
+#include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/memory.h"
@@ -94,14 +98,6 @@ const Seconds kDefaultFindHostMaxWaitTime(20);
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
 const ReadPreferenceSetting kConfigPrimarySelector(ReadPreference::PrimaryOnly);
 const WriteConcernOptions kNoWaitWriteConcern(1, WriteConcernOptions::SyncMode::UNSET, Seconds(0));
-
-/**
- * Lock that guards changes to the set of shards in the cluster (ie addShard and removeShard
- * requests).
- * TODO: Currently only taken during addShard requests, this should also be taken in X mode during
- * removeShard, once removeShard is moved to run on the config server primary instead of on mongos.
- */
-Lock::ResourceMutex kShardMembershipLock;
 
 /**
  * Append min, max and version information from chunk to the buffer for logChange purposes.
@@ -405,8 +401,8 @@ StatusWith<ShardType> ShardingCatalogManagerImpl::_validateHostAsShard(
     const std::string* shardProposedName,
     const ConnectionString& connectionString) {
 
-    // Check for mongos and older version mongod connections, and whether the hosts
-    // can be found for the user specified replset.
+    // Check if the node being added is a mongos or a version of mongod too old to speak the current
+    // communication protocol.
     auto swCommandResponse =
         _runCommandForAddShard(txn, targeter.get(), "admin", BSON("isMaster" << 1));
     if (!swCommandResponse.isOK()) {
@@ -438,10 +434,38 @@ StatusWith<ShardType> ShardingCatalogManagerImpl::_validateHostAsShard(
 
     auto resIsMaster = std::move(swCommandResponse.getValue().response);
 
+    // Check that the node being added is a new enough version.
+    // If we're running this code, that means the mongos that the addShard request originated from
+    // must be at least version 3.4 (since 3.2 mongoses don't know about the _configsvrAddShard
+    // command).  Since it is illegal to have v3.4 mongoses with v3.2 shards, we should reject
+    // adding any shards that are not v3.4.  We can determine this by checking that the
+    // maxWireVersion reported in isMaster is at least COMMANDS_ACCEPT_WRITE_CONCERN.
+    // TODO(SERVER-25623): This approach won't work to prevent v3.6 mongoses from adding v3.4
+    // shards, so we'll have to rethink this during the 3.5 development cycle.
+
+    long long maxWireVersion;
+    Status status = bsonExtractIntegerField(resIsMaster, "maxWireVersion", &maxWireVersion);
+    if (!status.isOK()) {
+        return Status(status.code(),
+                      str::stream() << "isMaster returned invalid 'maxWireVersion' "
+                                    << "field when attempting to add "
+                                    << connectionString.toString()
+                                    << " as a shard: "
+                                    << status.reason());
+    }
+    if (maxWireVersion < WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN) {
+        return Status(ErrorCodes::IncompatibleServerVersion,
+                      str::stream() << "Cannot add " << connectionString.toString()
+                                    << " as a shard because we detected a mongod with server "
+                                       "version older than 3.4.0.  It is invalid to add v3.2 and "
+                                       "older shards through a v3.4 mongos.");
+    }
+
+
     // Check whether there is a master. If there isn't, the replica set may not have been
     // initiated. If the connection is a standalone, it will return true for isMaster.
     bool isMaster;
-    Status status = bsonExtractBooleanField(resIsMaster, "ismaster", &isMaster);
+    status = bsonExtractBooleanField(resIsMaster, "ismaster", &isMaster);
     if (!status.isOK()) {
         return Status(status.code(),
                       str::stream() << "isMaster returned invalid 'ismaster' "
@@ -641,7 +665,7 @@ StatusWith<string> ShardingCatalogManagerImpl::addShard(
     }
 
     // Only one addShard operation can be in progress at a time.
-    Lock::ExclusiveLock lk(txn->lockState(), _kZoneOpLock);
+    Lock::ExclusiveLock lk(txn->lockState(), _kShardMembershipLock);
 
     // TODO: Don't create a detached Shard object, create a detached RemoteCommandTargeter instead.
     const std::shared_ptr<Shard> shard{
@@ -719,6 +743,30 @@ StatusWith<string> ShardingCatalogManagerImpl::addShard(
         shardType.setMaxSizeMB(maxSize);
     }
 
+    // If the minimum allowed version for the cluster is 3.4, set the featureCompatibilityVersion to
+    // 3.4 on the shard.
+    if (serverGlobalParams.featureCompatibilityVersion.load() ==
+        ServerGlobalParams::FeatureCompatibilityVersion_34) {
+        auto versionResponse =
+            _runCommandForAddShard(txn,
+                                   targeter.get(),
+                                   "admin",
+                                   BSON(FeatureCompatibilityVersion::kCommandName
+                                        << FeatureCompatibilityVersion::kVersion34));
+        if (!versionResponse.isOK()) {
+            return versionResponse.getStatus();
+        }
+
+        if (!versionResponse.getValue().commandStatus.isOK()) {
+            if (versionResponse.getStatus().code() == ErrorCodes::CommandNotFound) {
+                return Status(ErrorCodes::OperationFailed,
+                              "featureCompatibilityVersion for cluster is 3.4, cannot add a shard "
+                              "with version below 3.4");
+            }
+            return versionResponse.getValue().commandStatus;
+        }
+    }
+
     auto commandRequest = createShardIdentityUpsertForAddShard(txn, shardType.getName());
 
     LOG(2) << "going to insert shardIdentity document into shard: " << shardType;
@@ -765,11 +813,12 @@ StatusWith<string> ShardingCatalogManagerImpl::addShard(
     shardDetails.append("name", shardType.getName());
     shardDetails.append("host", shardConnectionString.toString());
 
-    _catalogClient->logChange(txn, "addShard", "", shardDetails.obj());
+    _catalogClient->logChange(
+        txn, "addShard", "", shardDetails.obj(), ShardingCatalogClient::kMajorityWriteConcern);
 
     // Ensure the added shard is visible to this process.
     auto shardRegistry = Grid::get(txn)->shardRegistry();
-    if (!shardRegistry->getShard(txn, shardType.getName())) {
+    if (!shardRegistry->getShard(txn, shardType.getName()).isOK()) {
         return {ErrorCodes::OperationFailed,
                 "Could not find shard metadata for shard after adding it. This most likely "
                 "indicates that the shard was removed immediately after it was added."};
@@ -1014,7 +1063,7 @@ Status ShardingCatalogManagerImpl::commitChunkSplit(OperationContext* txn,
     Lock::ExclusiveLock lk(txn->lockState(), _kChunkOpLock);
 
     // Acquire GlobalLock in MODE_X twice to prevent yielding.
-    // GLobalLock and the following lock on config.chunks are only needed to support
+    // GlobalLock and the following lock on config.chunks are only needed to support
     // mixed-mode operation with mongoses from 3.2
     // TODO(SERVER-25337): Remove GlobalLock and config.chunks lock after 3.4
     Lock::GlobalLock firstGlobalLock(txn->lockState(), MODE_X, UINT_MAX);
@@ -1063,12 +1112,30 @@ Status ShardingCatalogManagerImpl::commitChunkSplit(OperationContext* txn,
     BSONArrayBuilder updates;
 
     for (const auto& endKey : newChunkBounds) {
+        // verify that splitPoints are non-equivalent
+        if (endKey.woCompare(startKey) == 0) {
+            return {ErrorCodes::InvalidOptions,
+                    str::stream() << "split on lower bound "
+                                     " of chunk "
+                                  << "["
+                                  << startKey
+                                  << ","
+                                  << endKey
+                                  << ")"
+                                  << "is not allowed"};
+        }
+
+        // verify that splits don't create too-big shard keys
+        Status shardKeyStatus = ShardKeyPattern::checkShardKeySize(endKey);
+        if (!shardKeyStatus.isOK()) {
+            return shardKeyStatus;
+        }
+
         // splits only update the 'minor' portion of version
         currentMaxVersion.incMinor();
 
         // build an update operation against the chunks collection of the config database
-        // with
-        // upsert true
+        // with upsert true
         BSONObjBuilder op;
         op.append("op", "u");
         op.appendBool("b", true);
@@ -1109,18 +1176,28 @@ Status ShardingCatalogManagerImpl::commitChunkSplit(OperationContext* txn,
         BSONObjBuilder b;
         b.append("ns", ChunkType::ConfigNS);
         b.append("q",
-                 BSON("query" << BSON(ChunkType::ns(ns.ns())) << "orderby"
+                 BSON("query" << BSON(ChunkType::ns(ns.ns()) << ChunkType::min() << range.getMin()
+                                                             << ChunkType::max()
+                                                             << range.getMax())
+                              << "orderby"
                               << BSON(ChunkType::DEPRECATED_lastmod() << -1)));
         {
             BSONObjBuilder bb(b.subobjStart("res"));
-            collVersion.addToBSON(bb, ChunkType::DEPRECATED_lastmod());
+            bb.append(ChunkType::DEPRECATED_epoch(), requestEpoch);
+            bb.append(ChunkType::shard(), shardName);
         }
         preCond.append(b.obj());
     }
 
     // apply the batch of updates to remote and local metadata
-    Status applyOpsStatus = grid.catalogClient(txn)->applyChunkOpsDeprecated(
-        txn, updates.arr(), preCond.arr(), ns.ns(), currentMaxVersion);
+    Status applyOpsStatus =
+        grid.catalogClient(txn)->applyChunkOpsDeprecated(txn,
+                                                         updates.arr(),
+                                                         preCond.arr(),
+                                                         ns.ns(),
+                                                         currentMaxVersion,
+                                                         WriteConcernOptions(),
+                                                         repl::ReadConcernLevel::kLocalReadConcern);
     if (!applyOpsStatus.isOK()) {
         return applyOpsStatus;
     }
@@ -1135,10 +1212,11 @@ Status ShardingCatalogManagerImpl::commitChunkSplit(OperationContext* txn,
     }
 
     if (newChunks.size() == 2) {
-        appendShortVersion(&logDetail.subobjStart("left"), newChunks[0]);
-        appendShortVersion(&logDetail.subobjStart("right"), newChunks[1]);
+        _appendShortVersion(logDetail.subobjStart("left"), newChunks[0]);
+        _appendShortVersion(logDetail.subobjStart("right"), newChunks[1]);
 
-        grid.catalogClient(txn)->logChange(txn, "split", ns.ns(), logDetail.obj());
+        grid.catalogClient(txn)->logChange(
+            txn, "split", ns.ns(), logDetail.obj(), WriteConcernOptions());
     } else {
         BSONObj beforeDetailObj = logDetail.obj();
         BSONObj firstDetailObj = beforeDetailObj.getOwned();
@@ -1149,9 +1227,10 @@ Status ShardingCatalogManagerImpl::commitChunkSplit(OperationContext* txn,
             chunkDetail.appendElements(beforeDetailObj);
             chunkDetail.append("number", i + 1);
             chunkDetail.append("of", newChunksSize);
-            appendShortVersion(&chunkDetail.subobjStart("chunk"), newChunks[i]);
+            _appendShortVersion(chunkDetail.subobjStart("chunk"), newChunks[i]);
 
-            grid.catalogClient(txn)->logChange(txn, "multi-split", ns.ns(), chunkDetail.obj());
+            grid.catalogClient(txn)->logChange(
+                txn, "multi-split", ns.ns(), chunkDetail.obj(), WriteConcernOptions());
         }
     }
 
@@ -1278,8 +1357,14 @@ Status ShardingCatalogManagerImpl::commitChunkMerge(OperationContext* txn,
     }
 
     // apply the batch of updates to remote and local metadata
-    Status applyOpsStatus = grid.catalogClient(txn)->applyChunkOpsDeprecated(
-        txn, updates.arr(), preCond.arr(), ns.ns(), mergeVersion);
+    Status applyOpsStatus =
+        grid.catalogClient(txn)->applyChunkOpsDeprecated(txn,
+                                                         updates.arr(),
+                                                         preCond.arr(),
+                                                         ns.ns(),
+                                                         mergeVersion,
+                                                         WriteConcernOptions(),
+                                                         repl::ReadConcernLevel::kLocalReadConcern);
     if (!applyOpsStatus.isOK()) {
         return applyOpsStatus;
     }
@@ -1295,9 +1380,19 @@ Status ShardingCatalogManagerImpl::commitChunkMerge(OperationContext* txn,
     collVersion.addToBSON(logDetail, "prevShardVersion");
     mergeVersion.addToBSON(logDetail, "mergedVersion");
 
-    grid.catalogClient(txn)->logChange(txn, "merge", ns.ns(), logDetail.obj());
+    grid.catalogClient(txn)->logChange(
+        txn, "merge", ns.ns(), logDetail.obj(), WriteConcernOptions());
 
     return applyOpsStatus;
+}
+
+void ShardingCatalogManagerImpl::_appendShortVersion(BufBuilder& b, const ChunkType& chunk) {
+    BSONObjBuilder bb(b);
+    bb.append(ChunkType::min(), chunk.getMin());
+    bb.append(ChunkType::max(), chunk.getMax());
+    if (chunk.isVersionSet())
+        chunk.getVersion().addToBSON(bb, ChunkType::DEPRECATED_lastmod());
+    bb.done();
 }
 
 void ShardingCatalogManagerImpl::appendConnectionStats(executor::ConnectionPoolStats* stats) {
@@ -1313,12 +1408,15 @@ Status ShardingCatalogManagerImpl::initializeConfigDatabaseIfNeeded(OperationCon
         }
     }
 
-    Status status = _initConfigVersion(txn);
+    Status status = _initConfigIndexes(txn);
     if (!status.isOK()) {
         return status;
     }
 
-    status = _initConfigIndexes(txn);
+    // Make sure to write config.version last since we detect rollbacks of config.version and
+    // will re-run initializeConfigDatabaseIfNeeded if that happens, but we don't detect rollback
+    // of the index builds.
+    status = _initConfigVersion(txn);
     if (!status.isOK()) {
         return status;
     }
@@ -1327,6 +1425,11 @@ Status ShardingCatalogManagerImpl::initializeConfigDatabaseIfNeeded(OperationCon
     _configInitialized = true;
 
     return Status::OK();
+}
+
+void ShardingCatalogManagerImpl::discardCachedConfigDatabaseInitializationState() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _configInitialized = false;
 }
 
 Status ShardingCatalogManagerImpl::_initConfigVersion(OperationContext* txn) {
@@ -1410,6 +1513,17 @@ Status ShardingCatalogManagerImpl::_initConfigIndexes(OperationContext* txn) {
     if (!result.isOK()) {
         return Status(result.code(),
                       str::stream() << "couldn't create ns_1_lastmod_1 index on config db"
+                                    << causedBy(result));
+    }
+
+    result = configShard->createIndexOnConfig(
+        txn,
+        NamespaceString(MigrationType::ConfigNS),
+        BSON(MigrationType::ns() << 1 << MigrationType::min() << 1),
+        unique);
+    if (!result.isOK()) {
+        return Status(result.code(),
+                      str::stream() << "couldn't create ns_1_min_1 index on config.migrations"
                                     << causedBy(result));
     }
 
@@ -1808,6 +1922,41 @@ void ShardingCatalogManagerImpl::_untrackAddShardHandle_inlock(const ShardId& sh
     auto it = _addShardHandles.find(shardId);
     invariant(it != _addShardHandles.end());
     _addShardHandles.erase(shardId);
+}
+
+Status ShardingCatalogManagerImpl::setFeatureCompatibilityVersionOnShards(
+    OperationContext* txn, const std::string& version) {
+
+    // No shards should be added until we have forwarded featureCompatibilityVersion to all shards.
+    Lock::SharedLock lk(txn->lockState(), _kShardMembershipLock);
+
+    std::vector<ShardId> shardIds;
+    grid.shardRegistry()->getAllShardIds(&shardIds);
+    for (const ShardId& shardId : shardIds) {
+        const auto shardStatus = grid.shardRegistry()->getShard(txn, shardId);
+        if (!shardStatus.isOK()) {
+            continue;
+        }
+        const auto shard = shardStatus.getValue();
+
+        auto response = shard->runCommandWithFixedRetryAttempts(
+            txn,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            "admin",
+            BSON(FeatureCompatibilityVersion::kCommandName << version),
+            Shard::RetryPolicy::kIdempotent);
+        if (!response.isOK()) {
+            return response.getStatus();
+        }
+        if (!response.getValue().commandStatus.isOK()) {
+            return response.getValue().commandStatus;
+        }
+        if (!response.getValue().writeConcernStatus.isOK()) {
+            return response.getValue().writeConcernStatus;
+        }
+    }
+
+    return Status::OK();
 }
 
 }  // namespace mongo

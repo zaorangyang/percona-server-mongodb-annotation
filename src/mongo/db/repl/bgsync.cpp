@@ -50,7 +50,7 @@
 #include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_source_resolver.h"
-#include "mongo/db/stats/timer_stats.h"
+#include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
@@ -110,17 +110,6 @@ size_t getSize(const BSONObj& o) {
 
 MONGO_FP_DECLARE(pauseRsBgSyncProducer);
 
-// The number and time spent reading batches off the network
-static TimerStats getmoreReplStats;
-static ServerStatusMetricField<TimerStats> displayBatchesRecieved("repl.network.getmores",
-                                                                  &getmoreReplStats);
-// The oplog entries read via the oplog reader
-static Counter64 opsReadStats;
-static ServerStatusMetricField<Counter64> displayOpsRead("repl.network.ops", &opsReadStats);
-// The bytes read via the oplog reader
-static Counter64 networkByteStats;
-static ServerStatusMetricField<Counter64> displayBytesRead("repl.network.bytes", &networkByteStats);
-
 // The count of items in the buffer
 static Counter64 bufferCountGauge;
 static ServerStatusMetricField<Counter64> displayBufferCount("repl.buffer.count",
@@ -160,7 +149,9 @@ void BackgroundSync::startup(OperationContext* txn) {
 void BackgroundSync::shutdown(OperationContext* txn) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
-    // Clear the buffer in case the producerThread is waiting in push() due to a full queue.
+    // Clear the buffer. This unblocks the OplogFetcher if it is blocked with a full queue, but
+    // ensures that it won't add anything. It will also unblock the OpApplier pipeline if it is
+    // waiting for an operation to be past the slaveDelay point.
     clearBuffer(txn);
     _stopped = true;
 
@@ -303,7 +294,8 @@ void BackgroundSync::_produce(OperationContext* txn) {
         if (_replCoord->isCatchingUp()) {
             warning() << "Too stale to catch up.";
             log() << "Our newest OpTime : " << lastOpTimeFetched;
-            log() << "Earliest OpTime available is " << syncSourceResp.earliestOpTimeSeen;
+            log() << "Earliest OpTime available is " << syncSourceResp.earliestOpTimeSeen
+                  << " from " << syncSourceResp.getSyncSource();
             sleepsecs(1);
             return;
         }
@@ -312,12 +304,9 @@ void BackgroundSync::_produce(OperationContext* txn) {
         log() << "Our newest OpTime : " << lastOpTimeFetched;
         log() << "Earliest OpTime available is " << syncSourceResp.earliestOpTimeSeen;
         log() << "See http://dochub.mongodb.org/core/resyncingaverystalereplicasetmember";
-
-        StorageInterface::get(txn)->setMinValid(
-            txn, {lastOpTimeFetched, syncSourceResp.earliestOpTimeSeen});
         auto status = _replCoord->setMaintenanceMode(true);
         if (!status.isOK()) {
-            warning() << "Failed to transition into maintenance mode.";
+            warning() << "Failed to transition into maintenance mode: " << status;
         }
         bool worked = _replCoord->setFollowerMode(MemberState::RS_RECOVERING);
         if (!worked) {
@@ -352,6 +341,13 @@ void BackgroundSync::_produce(OperationContext* txn) {
         }
     }
 
+    // Set the applied point if unset. This is most likely the first time we've established a sync
+    // source since stepping down or otherwise clearing the applied point. We need to set this here,
+    // before the OplogWriter gets a chance to append to the oplog.
+    if (StorageInterface::get(txn)->getAppliedThrough(txn).isNull()) {
+        StorageInterface::get(txn)->setAppliedThrough(txn, _replCoord->getMyLastAppliedOpTime());
+    }
+
     // "lastFetched" not used. Already set in _enqueueDocuments.
     Status fetcherReturnStatus = Status::OK();
     DataReplicatorExternalStateBackgroundSync dataReplicatorExternalState(
@@ -377,8 +373,7 @@ void BackgroundSync::_produce(OperationContext* txn) {
                                                        this,
                                                        stdx::placeholders::_1,
                                                        stdx::placeholders::_2,
-                                                       stdx::placeholders::_3,
-                                                       stdx::placeholders::_4),
+                                                       stdx::placeholders::_3),
                                             onOplogFetcherShutdownCallbackFn);
         oplogFetcher = _oplogFetcher.get();
     } catch (const mongo::DBException& ex) {
@@ -453,13 +448,13 @@ void BackgroundSync::_produce(OperationContext* txn) {
         }
         // check that we are at minvalid, otherwise we cannot roll back as we may be in an
         // inconsistent state
-        BatchBoundaries boundaries = StorageInterface::get(txn)->getMinValid(txn);
-        if (!boundaries.start.isNull() || boundaries.end > lastApplied) {
+        const auto minValid = StorageInterface::get(txn)->getMinValid(txn);
+        if (lastApplied < minValid) {
             fassertNoTrace(18750,
                            Status(ErrorCodes::UnrecoverableRollbackError,
                                   str::stream() << "need to rollback, but in inconsistent state. "
                                                 << "minvalid: "
-                                                << boundaries.end.toString()
+                                                << minValid.toString()
                                                 << " > our last optime: "
                                                 << lastApplied.toString()));
         }
@@ -476,67 +471,57 @@ void BackgroundSync::_produce(OperationContext* txn) {
     }
 }
 
-void BackgroundSync::_recordStats(const OplogFetcher::DocumentsInfo& info,
-                                  Milliseconds getMoreElapsedTime) {
-    // Inc stats.
-    // We read all of the docs in the query.
-    opsReadStats.increment(info.networkDocumentCount);
-    networkByteStats.increment(info.networkDocumentBytes);
-    bufferCountGauge.increment(info.toApplyDocumentCount);
-    bufferSizeGauge.increment(info.toApplyDocumentBytes);
-
-    // record time for each batch
-    getmoreReplStats.recordMillis(durationCount<Milliseconds>(getMoreElapsedTime));
-
-    // Check some things periodically
-    // (whenever we run out of items in the
-    // current cursor batch)
-    if (info.networkDocumentBytes > 0 && info.networkDocumentBytes < kSmallBatchLimitBytes) {
-        // on a very low latency network, if we don't wait a little, we'll be
-        // getting ops to write almost one at a time.  this will both be expensive
-        // for the upstream server as well as potentially defeating our parallel
-        // application of batches on the secondary.
-        //
-        // the inference here is basically if the batch is really small, we are
-        // "caught up".
-        //
-        sleepmillis(kSleepToAllowBatchingMillis);
-    }
-}
-
 void BackgroundSync::_enqueueDocuments(Fetcher::Documents::const_iterator begin,
                                        Fetcher::Documents::const_iterator end,
-                                       const OplogFetcher::DocumentsInfo& info,
-                                       Milliseconds getMoreElapsed) {
-    auto txn = cc().makeOperationContext();
-
+                                       const OplogFetcher::DocumentsInfo& info) {
     // If this is the first batch of operations returned from the query, "toApplyDocumentCount" will
     // be one fewer than "networkDocumentCount" because the first document (which was applied
     // previously) is skipped.
     if (info.toApplyDocumentCount == 0) {
-        _recordStats(info, getMoreElapsed);
-        return;
+        return;  // Nothing to do.
     }
+
+    auto txn = cc().makeOperationContext();
 
     // Wait for enough space.
     _oplogBuffer->waitForSpace(txn.get(), info.toApplyDocumentBytes);
 
-    OCCASIONALLY {
-        LOG(2) << "bgsync buffer has " << _oplogBuffer->getSize() << " bytes";
-    }
-
-    // Buffer docs for later application.
-    _oplogBuffer->pushAllNonBlocking(txn.get(), begin, end);
-
-    // Update last fetched info.
     {
+        // Don't add more to the buffer if we are in shutdown. Continue holding the lock until we
+        // are done to prevent going into shutdown. This avoids a race where shutdown() clears the
+        // buffer between the time we check _inShutdown and the point where we finish writing to the
+        // buffer.
         stdx::unique_lock<stdx::mutex> lock(_mutex);
+        if (_inShutdown) {
+            return;
+        }
+
+        OCCASIONALLY {
+            LOG(2) << "bgsync buffer has " << _oplogBuffer->getSize() << " bytes";
+        }
+
+        // Buffer docs for later application.
+        _oplogBuffer->pushAllNonBlocking(txn.get(), begin, end);
+
+        // Update last fetched info.
         _lastFetchedHash = info.lastDocument.value;
         _lastOpTimeFetched = info.lastDocument.opTime;
         LOG(3) << "batch resetting _lastOpTimeFetched: " << _lastOpTimeFetched;
     }
 
-    _recordStats(info, getMoreElapsed);
+    bufferCountGauge.increment(info.toApplyDocumentCount);
+    bufferSizeGauge.increment(info.toApplyDocumentBytes);
+
+    // Check some things periodically (whenever we run out of items in the current cursor batch).
+    if (info.networkDocumentBytes > 0 && info.networkDocumentBytes < kSmallBatchLimitBytes) {
+        // On a very low latency network, if we don't wait a little, we'll be
+        // getting ops to write almost one at a time.  This will both be expensive
+        // for the upstream server as well as potentially defeating our parallel
+        // application of batches on the secondary.
+        //
+        // The inference here is basically if the batch is really small, we are "caught up".
+        sleepmillis(kSleepToAllowBatchingMillis);
+    }
 }
 
 bool BackgroundSync::peek(OperationContext* txn, BSONObj* op) {
@@ -578,6 +563,25 @@ void BackgroundSync::_rollback(OperationContext* txn,
             if (inShutdown()) {
                 return;
             }
+        }
+
+        // At this point we are about to leave rollback.  Before we do, wait for any writes done
+        // as part of rollback to be durable, and then do any necessary checks that we didn't
+        // wind up rolling back something illegal.  We must wait for the rollback to be durable
+        // so that if we wind up shutting down uncleanly in response to something we rolled back
+        // we know that we won't wind up right back in the same situation when we start back up
+        // because the rollback wasn't durable.
+        txn->recoveryUnit()->waitUntilDurable();
+
+        // If we detected that we rolled back the shardIdentity document as part of this rollback
+        // then we must shut down to clear the in-memory ShardingState associated with the
+        // shardIdentity document.
+        if (ShardIdentityRollbackNotifier::get(txn)->didRollbackHappen()) {
+            severe()
+                << "shardIdentity document rollback detected.  Shutting down to clear "
+                   "in-memory sharding state.  Restarting this process should safely return it "
+                   "to a healthy state";
+            fassertFailedNoTrace(40276);
         }
 
         // It is now safe to clear the ROLLBACK state, which may result in the applier thread

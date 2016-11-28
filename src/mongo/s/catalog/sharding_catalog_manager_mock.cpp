@@ -104,6 +104,8 @@ Status ShardingCatalogManagerMock::initializeConfigDatabaseIfNeeded(OperationCon
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
+void ShardingCatalogManagerMock::discardCachedConfigDatabaseInitializationState() {}
+
 Status ShardingCatalogManagerMock::initializeShardingAwarenessOnUnawareShards(
     OperationContext* txn) {
     return {ErrorCodes::InternalError, "Method not implemented"};
@@ -120,6 +122,11 @@ BSONObj ShardingCatalogManagerMock::createShardIdentityUpsertForAddShard(
 }
 
 void ShardingCatalogManagerMock::cancelAddShardTaskIfNeeded(const ShardId& shardId) {
+    MONGO_UNREACHABLE;
+}
+
+Status ShardingCatalogManagerMock::setFeatureCompatibilityVersionOnShards(
+    OperationContext* txn, const std::string& version) {
     MONGO_UNREACHABLE;
 }
 

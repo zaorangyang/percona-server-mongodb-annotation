@@ -1502,7 +1502,8 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
             oplogProgress,
             oplogDurable,
             lastCommittedOpTime,
-            readConcernMajorityOpTime},
+            readConcernMajorityOpTime,
+            BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);
@@ -1511,11 +1512,12 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     // Test results for all non-self members
     ASSERT_EQUALS(setName, rsStatus["set"].String());
     ASSERT_EQUALS(curTime.asInt64(), rsStatus["date"].Date().asInt64());
-    ASSERT_EQUALS(lastCommittedOpTime.toBSON(), rsStatus["optimes"]["lastCommittedOpTime"].Obj());
+    ASSERT_BSONOBJ_EQ(lastCommittedOpTime.toBSON(),
+                      rsStatus["optimes"]["lastCommittedOpTime"].Obj());
     {
         const auto optimes = rsStatus["optimes"].Obj();
-        ASSERT_EQUALS(readConcernMajorityOpTime.toBSON(),
-                      optimes["readConcernMajorityOpTime"].Obj());
+        ASSERT_BSONOBJ_EQ(readConcernMajorityOpTime.toBSON(),
+                          optimes["readConcernMajorityOpTime"].Obj());
         ASSERT_EQUALS(oplogProgress.getTimestamp(), optimes["appliedOpTime"].timestamp());
         ASSERT_EQUALS((oplogDurable).getTimestamp(), optimes["durableOpTime"].timestamp());
     }
@@ -1582,6 +1584,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     ASSERT_TRUE(selfStatus.hasField("optimeDate"));
     ASSERT_EQUALS(Date_t::fromMillisSinceEpoch(oplogProgress.getSecs() * 1000ULL),
                   selfStatus["optimeDate"].Date());
+    ASSERT_FALSE(rsStatus.hasField("initialSyncStatus"));
 
     ASSERT_EQUALS(2000, rsStatus["heartbeatIntervalMillis"].numberInt());
 
@@ -1617,7 +1620,8 @@ TEST_F(TopoCoordTest, NodeReturnsInvalidReplicaSetConfigInResponseToGetStatusWhe
             oplogProgress,
             oplogProgress,
             OpTime(),
-            OpTime()},
+            OpTime(),
+            BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_NOT_OK(resultStatus);
@@ -2381,7 +2385,8 @@ public:
                                                    OpTime(Timestamp(100, 0), 0),
                                                    OpTime(Timestamp(100, 0), 0),
                                                    OpTime(),
-                                                   OpTime()},
+                                                   OpTime(),
+                                                   BSONObj()},
             &statusBuilder,
             &resultStatus);
         ASSERT_OK(resultStatus);
@@ -2444,7 +2449,8 @@ public:
                                                    OpTime(Timestamp(100, 0), 0),
                                                    OpTime(Timestamp(100, 0), 0),
                                                    OpTime(),
-                                                   OpTime()},
+                                                   OpTime(),
+                                                   BSONObj()},
             &statusBuilder,
             &resultStatus);
         ASSERT_OK(resultStatus);
@@ -2766,7 +2772,8 @@ TEST_F(HeartbeatResponseTestTwoRetries, NodeDoesNotRetryHeartbeatsAfterFailingTw
                                                OpTime(Timestamp(100, 0), 0),
                                                OpTime(Timestamp(100, 0), 0),
                                                OpTime(),
-                                               OpTime()},
+                                               OpTime(),
+                                               BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);
@@ -3010,7 +3017,8 @@ TEST_F(HeartbeatResponseTestTwoRetries,
                                                OpTime(Timestamp(100, 0), 0),
                                                OpTime(Timestamp(100, 0), 0),
                                                OpTime(),
-                                               OpTime()},
+                                               OpTime(),
+                                               BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);

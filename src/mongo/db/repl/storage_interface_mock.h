@@ -125,11 +125,13 @@ public:
     void setInitialSyncFlag(OperationContext* txn) override;
     void clearInitialSyncFlag(OperationContext* txn) override;
 
-    BatchBoundaries getMinValid(OperationContext* txn) const override;
-    void setMinValid(OperationContext* txn,
-                     const OpTime& endOpTime,
-                     const DurableRequirement durReq) override;
-    void setMinValid(OperationContext* txn, const BatchBoundaries& boundaries) override;
+    OpTime getMinValid(OperationContext* txn) const override;
+    void setMinValid(OperationContext* txn, const OpTime& minValid) override;
+    void setMinValidToAtLeast(OperationContext* txn, const OpTime& minValid) override;
+    void setOplogDeleteFromPoint(OperationContext* txn, const Timestamp& timestamp) override;
+    Timestamp getOplogDeleteFromPoint(OperationContext* txn) override;
+    void setAppliedThrough(OperationContext* txn, const OpTime& optime) override;
+    OpTime getAppliedThrough(OperationContext* txn) override;
 
     StatusWith<std::unique_ptr<CollectionBulkLoader>> createCollectionForBulkLoading(
         const NamespaceString& nss,
@@ -158,6 +160,10 @@ public:
     Status createOplog(OperationContext* txn, const NamespaceString& nss) override {
         return createOplogFn(txn, nss);
     };
+
+    StatusWith<size_t> getOplogMaxSize(OperationContext* txn, const NamespaceString& nss) override {
+        return 1024 * 1024 * 1024;
+    }
 
     Status createCollection(OperationContext* txn,
                             const NamespaceString& nss,
@@ -239,7 +245,9 @@ private:
     bool _initialSyncFlag = false;
 
     mutable stdx::mutex _minValidBoundariesMutex;
-    BatchBoundaries _minValidBoundaries = {OpTime(), OpTime()};
+    OpTime _appliedThrough;
+    OpTime _minValid;
+    Timestamp _oplogDeleteFromPoint;
 };
 
 }  // namespace repl

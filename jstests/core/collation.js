@@ -212,15 +212,12 @@
         assert.commandWorked(coll.createIndex({a: 1}, {collation: {locale: "fr_CA"}}));
         assert.commandWorked(coll.createIndex({b: 1}));
         assert.writeOK(coll.insert({a: "foo", b: "foo"}));
-        assert.eq(
-            1, coll.find({}, {_id: 0, a: 1}).collation({locale: "fr_CA"}).hint({a: 1}).itcount());
-        assert.neq(
-            "foo",
-            coll.find({}, {_id: 0, a: 1}).collation({locale: "fr_CA"}).hint({a: 1}).next().a);
-        assert.eq(
-            1, coll.find({}, {_id: 0, b: 1}).collation({locale: "fr_CA"}).hint({b: 1}).itcount());
+        assert.eq(1, coll.find().collation({locale: "fr_CA"}).hint({a: 1}).returnKey().itcount());
+        assert.neq("foo",
+                   coll.find().collation({locale: "fr_CA"}).hint({a: 1}).returnKey().next().a);
+        assert.eq(1, coll.find().collation({locale: "fr_CA"}).hint({b: 1}).returnKey().itcount());
         assert.eq("foo",
-                  coll.find({}, {_id: 0, b: 1}).collation({locale: "fr_CA"}).hint({b: 1}).next().b);
+                  coll.find().collation({locale: "fr_CA"}).hint({b: 1}).returnKey().next().b);
     }
 
     // Test that a query with a string comparison can use an index with a non-simple collation if it
@@ -410,6 +407,15 @@
         version: "57.1",
     });
 
+    // Should be able to use COUNT_SCAN for queries over strings.
+    coll.drop();
+    assert.commandWorked(db.createCollection(coll.getName(), {collation: {locale: "fr_CA"}}));
+    assert.commandWorked(coll.createIndex({a: 1}));
+    explainRes = coll.explain("executionStats").find({a: "foo"}).count();
+    assert.commandWorked(explainRes);
+    assert(planHasStage(explainRes.executionStats.executionStages, "COUNT_SCAN"));
+    assert(!planHasStage(explainRes.executionStats.executionStages, "FETCH"));
+
     //
     // Collation tests for distinct.
     //
@@ -464,6 +470,27 @@
     assert.commandWorked(coll.ensureIndex({a: 1}, {collation: {locale: "en_US"}}));
     var explain = coll.explain("queryPlanner").distinct("a");
     assert(planHasStage(explain.queryPlanner.winningPlan, "DISTINCT_SCAN"));
+    assert(planHasStage(explain.queryPlanner.winningPlan, "FETCH"));
+
+    // Distinct scan on strings can be used over an index with a collation when the predicate has
+    // exact bounds.
+    explain = coll.explain("queryPlanner").distinct("a", {a: {$gt: "foo"}});
+    assert(planHasStage(explain.queryPlanner.winningPlan, "DISTINCT_SCAN"));
+    assert(planHasStage(explain.queryPlanner.winningPlan, "FETCH"));
+    assert(!planHasStage(explain.queryPlanner.winningPlan, "PROJECTION"));
+
+    // Distinct scan cannot be used over an index with a collation when the predicate has inexact
+    // bounds.
+    explain = coll.explain("queryPlanner").distinct("a", {a: {$exists: true}});
+    assert(planHasStage(explain.queryPlanner.winningPlan, "IXSCAN"));
+    assert(planHasStage(explain.queryPlanner.winningPlan, "FETCH"));
+    assert(!planHasStage(explain.queryPlanner.winningPlan, "DISTINCT_SCAN"));
+
+    // Distinct scan can be used without a fetch when predicate has exact non-string bounds.
+    explain = coll.explain("queryPlanner").distinct("a", {a: {$gt: 3}});
+    assert(planHasStage(explain.queryPlanner.winningPlan, "DISTINCT_SCAN"));
+    assert(planHasStage(explain.queryPlanner.winningPlan, "PROJECTION"));
+    assert(!planHasStage(explain.queryPlanner.winningPlan, "FETCH"));
 
     // Distinct should not use index when no collation specified and collection default collation is
     // incompatible with index collation.

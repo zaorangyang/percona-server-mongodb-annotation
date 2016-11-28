@@ -40,16 +40,20 @@
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/s/catalog/type_config_version.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -273,31 +277,79 @@ void CollectionShardingState::onDeleteOp(OperationContext* txn,
                                          const CollectionShardingState::DeleteState& deleteState) {
     dassert(txn->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IX));
 
-    if (txn->writesAreReplicated() && serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
         _nss == NamespaceString::kConfigCollectionNamespace) {
+
         if (auto idElem = deleteState.idDoc["_id"]) {
-            uassert(40070,
-                    "cannot delete shardIdentity document while in --shardsvr mode",
-                    idElem.str() != ShardIdentityType::IdName);
+            auto idStr = idElem.str();
+            if (idStr == ShardIdentityType::IdName) {
+                if (!repl::ReplicationCoordinator::get(txn)->getMemberState().rollback()) {
+                    uasserted(40070,
+                              "cannot delete shardIdentity document while in --shardsvr mode");
+                } else {
+                    warning() << "Shard identity document rolled back.  Will shut down after "
+                                 "finishing rollback.";
+                    ShardIdentityRollbackNotifier::get(txn)->recordThatRollbackHappened();
+                }
+            }
         }
     }
 
-    // For backwards compatibility, cancel a pending asynchronous addShard task created on the
-    // primary config as a result of a 3.2 mongos doing addShard for the shard with id
-    // deletedDocId.
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
-        _nss == ShardType::ConfigNS) {
-        BSONElement idElement = deleteState.idDoc["_id"];
-        invariant(!idElement.eoo());
-        auto shardIdStr = idElement.valuestrsafe();
-        txn->recoveryUnit()->registerChange(
-            new RemoveShardLogOpHandler(txn, ShardId(std::move(shardIdStr))));
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        if (_nss == ShardType::ConfigNS) {
+            // For backwards compatibility, cancel a pending asynchronous addShard task created on
+            // the primary config as a result of a 3.2 mongos doing addShard for the shard with id
+            // deletedDocId.
+            BSONElement idElement = deleteState.idDoc["_id"];
+            invariant(!idElement.eoo());
+            auto shardIdStr = idElement.valuestrsafe();
+            txn->recoveryUnit()->registerChange(
+                new RemoveShardLogOpHandler(txn, ShardId(std::move(shardIdStr))));
+        } else if (_nss == VersionType::ConfigNS) {
+            if (!repl::ReplicationCoordinator::get(txn)->getMemberState().rollback()) {
+                uasserted(40302, "cannot delete config.version document while in --configsvr mode");
+            } else {
+                // Throw out any cached information related to the cluster ID.
+                Grid::get(txn)->catalogManager()->discardCachedConfigDatabaseInitializationState();
+                ClusterIdentityLoader::get(txn)->discardCachedClusterId();
+            }
+        }
     }
 
     checkShardVersionOrThrow(txn);
 
     if (_sourceMgr && deleteState.isMigrating) {
         _sourceMgr->getCloner()->onDeleteOp(txn, deleteState.idDoc);
+    }
+}
+
+void CollectionShardingState::onDropCollection(OperationContext* txn,
+                                               const NamespaceString& collectionName) {
+    dassert(txn->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IX));
+
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
+        _nss == NamespaceString::kConfigCollectionNamespace) {
+        // Dropping system collections is not allowed for end users.
+        invariant(!txn->writesAreReplicated());
+        invariant(repl::ReplicationCoordinator::get(txn)->getMemberState().rollback());
+
+        // Can't confirm whether there was a ShardIdentity document or not yet, so assume there was
+        // one and shut down the process to clear the in-memory sharding state.
+        warning() << "admin.system.version collection rolled back.  Will shut down after "
+                     "finishing rollback";
+        ShardIdentityRollbackNotifier::get(txn)->recordThatRollbackHappened();
+    }
+
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        if (_nss == VersionType::ConfigNS) {
+            if (!repl::ReplicationCoordinator::get(txn)->getMemberState().rollback()) {
+                uasserted(40303, "cannot drop config.version document while in --configsvr mode");
+            } else {
+                // Throw out any cached information related to the cluster ID.
+                Grid::get(txn)->catalogManager()->discardCachedConfigDatabaseInitializationState();
+                ClusterIdentityLoader::get(txn)->discardCachedClusterId();
+            }
+        }
     }
 }
 

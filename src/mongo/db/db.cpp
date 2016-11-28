@@ -42,6 +42,7 @@
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
+#include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/auth_index_d.h"
@@ -56,6 +57,7 @@
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -109,6 +111,8 @@
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balancer/balancer.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
@@ -124,7 +128,6 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
@@ -185,7 +188,7 @@ static void logStartup(OperationContext* txn) {
 
 
     BSONObjBuilder buildinfo(toLog.subobjStart("buildinfo"));
-    appendBuildInfo(buildinfo);
+    VersionInfoInterface::instance().appendBuildInfo(&buildinfo);
     appendStorageEngineList(&buildinfo);
     buildinfo.doneFast();
 
@@ -396,6 +399,26 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
             return;
         }
 
+        // Check if admin.system.version contains an invalid featureCompatibilityVersion.
+        // If a valid featureCompatibilityVersion is present, cache it as a server parameter.
+        if (dbName == "admin") {
+            if (Collection* versionColl =
+                    db->getCollection(FeatureCompatibilityVersion::kCollection)) {
+                BSONObj featureCompatibilityVersion;
+                if (Helpers::findOne(txn,
+                                     versionColl,
+                                     BSON("_id" << FeatureCompatibilityVersion::kParameterName),
+                                     featureCompatibilityVersion)) {
+                    auto version = FeatureCompatibilityVersion::parse(featureCompatibilityVersion);
+                    if (!version.isOK()) {
+                        severe() << version.getStatus();
+                        fassertFailedNoTrace(40283);
+                    }
+                    serverGlobalParams.featureCompatibilityVersion.store(version.getValue());
+                }
+            }
+        }
+
         // Major versions match, check indexes
         const string systemIndexes = db->name() + ".system.indexes";
 
@@ -465,11 +488,11 @@ static void repairDatabasesAndCheckVersion(OperationContext* txn) {
 static void _initWireSpec() {
     WireSpec& spec = WireSpec::instance();
     // accept from any version
-    spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionIncoming = COMMANDS_ACCEPT_WRITE_CONCERN;
+    spec.incoming.minWireVersion = RELEASE_2_4_AND_BEFORE;
+    spec.incoming.maxWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
     // connect to any version
-    spec.minWireVersionOutgoing = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
+    spec.outgoing.minWireVersion = RELEASE_2_4_AND_BEFORE;
+    spec.outgoing.maxWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
 }
 
 
@@ -506,7 +529,7 @@ static ExitCode _initAndListen(int listenPort) {
     DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
 
 #if defined(_WIN32)
-    printTargetMinOS();
+    VersionInfoInterface::instance().logTargetMinOS();
 #endif
 
     logProcessDetails();
@@ -517,10 +540,14 @@ static ExitCode _initAndListen(int listenPort) {
     options.port = listenPort;
     options.ipList = serverGlobalParams.bind_ip;
 
+    auto sep =
+        stdx::make_unique<ServiceEntryPointMongod>(getGlobalServiceContext()->getTransportLayer());
+    auto sepPtr = sep.get();
+
+    getGlobalServiceContext()->setServiceEntryPoint(std::move(sep));
+
     // Create, start, and attach the TL
-    auto transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(
-        options,
-        std::make_shared<ServiceEntryPointMongod>(getGlobalServiceContext()->getTransportLayer()));
+    auto transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(options, sepPtr);
     auto res = transportLayer->setup();
     if (!res.isOK()) {
         error() << "Failed to set up listener: " << res.toString();
@@ -645,93 +672,64 @@ static ExitCode _initAndListen(int listenPort) {
         web.detach();
     }
 
-    {
 #ifndef _WIN32
-        mongo::signalForkSuccess();
+    mongo::signalForkSuccess();
 #endif
-        AuthorizationManager* globalAuthzManager = getGlobalAuthorizationManager();
-        if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
-            Status status = authindex::verifySystemIndexes(startupOpCtx.get());
-            if (!status.isOK()) {
-                log() << status.reason();
-                exitCleanly(EXIT_NEED_UPGRADE);
-            }
-
-            // SERVER-14090: Verify that auth schema version is schemaVersion26Final.
-            int foundSchemaVersion;
-            status = globalAuthzManager->getAuthorizationVersion(startupOpCtx.get(),
-                                                                 &foundSchemaVersion);
-            if (!status.isOK()) {
-                log() << "Auth schema version is incompatible: "
-                      << "User and role management commands require auth data to have "
-                      << "at least schema version " << AuthorizationManager::schemaVersion26Final
-                      << " but startup could not verify schema version: " << status.toString()
-                      << endl;
-                exitCleanly(EXIT_NEED_UPGRADE);
-            }
-            if (foundSchemaVersion < AuthorizationManager::schemaVersion26Final) {
-                log() << "Auth schema version is incompatible: "
-                      << "User and role management commands require auth data to have "
-                      << "at least schema version " << AuthorizationManager::schemaVersion26Final
-                      << " but found " << foundSchemaVersion << ". In order to upgrade "
-                      << "the auth schema, first downgrade MongoDB binaries to version "
-                      << "2.6 and then run the authSchemaUpgrade command." << endl;
-                exitCleanly(EXIT_NEED_UPGRADE);
-            }
-        } else if (globalAuthzManager->isAuthEnabled()) {
-            error() << "Auth must be disabled when starting without auth schema validation";
-            exitCleanly(EXIT_BADOPTIONS);
-        } else {
-            // If authSchemaValidation is disabled and server is running without auth,
-            // warn the user and continue startup without authSchema metadata checks.
-            log() << startupWarningsLog;
-            log() << "** WARNING: Startup auth schema validation checks are disabled for the "
-                     "database."
-                  << startupWarningsLog;
-            log() << "**          This mode should only be used to manually repair corrupted auth "
-                     "data."
-                  << startupWarningsLog;
+    AuthorizationManager* globalAuthzManager = getGlobalAuthorizationManager();
+    if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
+        Status status = authindex::verifySystemIndexes(startupOpCtx.get());
+        if (!status.isOK()) {
+            log() << status.reason();
+            exitCleanly(EXIT_NEED_UPGRADE);
         }
 
-        if (!storageGlobalParams.readOnly) {
-            logStartup(startupOpCtx.get());
-
-            getDeleter()->startWorkers();
-
-            restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
-
-            repl::getGlobalReplicationCoordinator()->startup(startupOpCtx.get());
-
-            const unsigned long long missingRepl =
-                checkIfReplMissingFromCommandLine(startupOpCtx.get());
-            if (missingRepl) {
-                log() << startupWarningsLog;
-                log() << "** WARNING: mongod started without --replSet yet " << missingRepl
-                      << " documents are present in local.system.replset" << startupWarningsLog;
-                log() << "**          Restart with --replSet unless you are doing maintenance and "
-                      << " no other clients are connected." << startupWarningsLog;
-                log() << "**          The TTL collection monitor will not start because of this."
-                      << startupWarningsLog;
-                log() << "**         ";
-                log() << " For more info see http://dochub.mongodb.org/core/ttlcollections";
-                log() << startupWarningsLog;
-            } else {
-                startTTLBackgroundJob();
-            }
+        // SERVER-14090: Verify that auth schema version is schemaVersion26Final.
+        int foundSchemaVersion;
+        status =
+            globalAuthzManager->getAuthorizationVersion(startupOpCtx.get(), &foundSchemaVersion);
+        if (!status.isOK()) {
+            log() << "Auth schema version is incompatible: "
+                  << "User and role management commands require auth data to have "
+                  << "at least schema version " << AuthorizationManager::schemaVersion26Final
+                  << " but startup could not verify schema version: " << status.toString() << endl;
+            exitCleanly(EXIT_NEED_UPGRADE);
         }
+        if (foundSchemaVersion < AuthorizationManager::schemaVersion26Final) {
+            log() << "Auth schema version is incompatible: "
+                  << "User and role management commands require auth data to have "
+                  << "at least schema version " << AuthorizationManager::schemaVersion26Final
+                  << " but found " << foundSchemaVersion << ". In order to upgrade "
+                  << "the auth schema, first downgrade MongoDB binaries to version "
+                  << "2.6 and then run the authSchemaUpgrade command." << endl;
+            exitCleanly(EXIT_NEED_UPGRADE);
+        }
+    } else if (globalAuthzManager->isAuthEnabled()) {
+        error() << "Auth must be disabled when starting without auth schema validation";
+        exitCleanly(EXIT_BADOPTIONS);
+    } else {
+        // If authSchemaValidation is disabled and server is running without auth,
+        // warn the user and continue startup without authSchema metadata checks.
+        log() << startupWarningsLog;
+        log() << "** WARNING: Startup auth schema validation checks are disabled for the "
+                 "database."
+              << startupWarningsLog;
+        log() << "**          This mode should only be used to manually repair corrupted auth "
+                 "data."
+              << startupWarningsLog;
     }
-
-    startClientCursorMonitor();
-
-    PeriodicTask::startRunningPeriodicTasks();
-
-    HostnameCanonicalizationWorker::start(getGlobalServiceContext());
 
     uassertStatusOK(ShardingState::get(startupOpCtx.get())
                         ->initializeShardingAwarenessIfNeeded(startupOpCtx.get()));
 
     if (!storageGlobalParams.readOnly) {
+        logStartup(startupOpCtx.get());
+
         startFTDC();
+
+        getDeleter()->startWorkers();
+
+        restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
+
         if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
             // Note: For replica sets, ShardingStateRecovery happens on transition to primary.
             if (!repl::getGlobalReplicationCoordinator()->isReplEnabled()) {
@@ -744,7 +742,38 @@ static ExitCode _initAndListen(int listenPort) {
                                                        kDistLockProcessIdForConfigServer));
             Balancer::create(startupOpCtx->getServiceContext());
         }
+
+        repl::getGlobalReplicationCoordinator()->startup(startupOpCtx.get());
+
+        const unsigned long long missingRepl =
+            checkIfReplMissingFromCommandLine(startupOpCtx.get());
+        if (missingRepl) {
+            log() << startupWarningsLog;
+            log() << "** WARNING: mongod started without --replSet yet " << missingRepl
+                  << " documents are present in local.system.replset" << startupWarningsLog;
+            log() << "**          Restart with --replSet unless you are doing maintenance and "
+                  << " no other clients are connected." << startupWarningsLog;
+            log() << "**          The TTL collection monitor will not start because of this."
+                  << startupWarningsLog;
+            log() << "**         ";
+            log() << " For more info see http://dochub.mongodb.org/core/ttlcollections";
+            log() << startupWarningsLog;
+        } else {
+            startTTLBackgroundJob();
+        }
+
+        if (!replSettings.usingReplSets() && !replSettings.isSlave() &&
+            storageGlobalParams.engine != "devnull") {
+            ScopedTransaction transaction(startupOpCtx.get(), MODE_X);
+            Lock::GlobalWrite lk(startupOpCtx.get()->lockState());
+            FeatureCompatibilityVersion::setIfCleanStartup(
+                startupOpCtx.get(), repl::StorageInterface::get(getGlobalServiceContext()));
+        }
     }
+
+    startClientCursorMonitor();
+
+    PeriodicTask::startRunningPeriodicTasks();
 
     // MessageServer::run will return when exit code closes its socket and we don't need the
     // operation context anymore
@@ -968,49 +997,65 @@ static void shutdownTask() {
         txn = uniqueTxn.get();
     }
 
-    getGlobalServiceContext()->getTransportLayer()->shutdown();
     log(LogComponent::kNetwork) << "shutdown: going to close listening sockets..." << endl;
     ListeningSockets::get()->closeAll();
 
     log(LogComponent::kNetwork) << "shutdown: going to flush diaglog..." << endl;
     _diaglog.flush();
 
+    if (txn) {
+        // This can wait a long time while we drain the secondary's apply queue, especially if it is
+        // building an index.
+        repl::ReplicationCoordinator::get(txn)->shutdown(txn);
+    }
+
     if (serviceContext)
         serviceContext->setKillAllOperations();
 
+    ReplicaSetMonitor::shutdown();
+    if (auto sr = grid.shardRegistry()) {  // TODO: race: sr is a naked pointer
+        sr->shutdown();
+    }
 #if __has_feature(address_sanitizer)
+    auto sep = static_cast<ServiceEntryPointMongod*>(serviceContext->getServiceEntryPoint());
 
-    // When running under address sanitizer, we get false positive leaks due to disorder around the
-    // lifecycle of a connection and request. When we are running under ASAN, we try a lot harder to
-    // dry up the server from active connections before going on to really shut down.
+    if (sep) {
+        // When running under address sanitizer, we get false positive leaks due to disorder around
+        // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
+        // harder to dry up the server from active connections before going on to really shut down.
 
-    log(LogComponent::kNetwork) << "shutdown: going to close all sockets because ASAN is active...";
+        log(LogComponent::kNetwork)
+            << "shutdown: going to close all sockets because ASAN is active...";
+        getGlobalServiceContext()->getTransportLayer()->shutdown();
 
-    // Close all sockets in a detached thread, and then wait for the number of active connections to
-    // reach zero. Give the detached background thread a 10 second deadline. If we haven't closed
-    // drained all active operations within that deadline, just keep going with shutdown: the OS
-    // will do it for us when the process terminates.
+        // Close all sockets in a detached thread, and then wait for the number of active
+        // connections to reach zero. Give the detached background thread a 10 second deadline. If
+        // we haven't closed drained all active operations within that deadline, just keep going
+        // with shutdown: the OS will do it for us when the process terminates.
 
-    stdx::packaged_task<void()> dryOutTask([] {
-        // There isn't currently a way to wait on the TicketHolder to have all its tickets back,
-        // unfortunately. So, busy wait in this detached thread.
-        while (true) {
-            const auto connected = Listener::globalTicketHolder.used();
-            if (connected == 0) {
-                log(LogComponent::kNetwork) << "shutdown: no active connections found...";
-                break;
+        stdx::packaged_task<void()> dryOutTask([sep] {
+            // There isn't currently a way to wait on the TicketHolder to have all its tickets back,
+            // unfortunately. So, busy wait in this detached thread.
+            while (true) {
+                const auto runningWorkers = sep->getNumberOfActiveWorkerThreads();
+
+                if (runningWorkers == 0) {
+                    log(LogComponent::kNetwork) << "shutdown: no running workers found...";
+                    break;
+                }
+                log(LogComponent::kNetwork) << "shutdown: still waiting on " << runningWorkers
+                                            << " active workers to drain... ";
+                mongo::sleepFor(Milliseconds(250));
             }
-            log(LogComponent::kNetwork) << "shutdown: still waiting on " << connected
-                                        << " active connections to drain... ";
-            mongo::sleepFor(Milliseconds(250));
-        }
-    });
+        });
 
-    auto dryNotification = dryOutTask.get_future();
-    stdx::thread(std::move(dryOutTask)).detach();
-    if (dryNotification.wait_for(Seconds(10).toSystemDuration()) != stdx::future_status::ready) {
-        log(LogComponent::kNetwork) << "shutdown: exhausted grace period for"
-                                    << " active connections to drain; continuing with shutdown... ";
+        auto dryNotification = dryOutTask.get_future();
+        stdx::thread(std::move(dryOutTask)).detach();
+        if (dryNotification.wait_for(Seconds(10).toSystemDuration()) !=
+            stdx::future_status::ready) {
+            log(LogComponent::kNetwork) << "shutdown: exhausted grace period for"
+                                        << " active workers to drain; continuing with shutdown... ";
+        }
     }
 
 #endif
@@ -1019,7 +1064,6 @@ static void shutdownTask() {
     stopFTDC();
 
     if (txn) {
-        repl::ReplicationCoordinator::get(txn)->shutdown(txn);
         ShardingState::get(txn)->shutDown(txn);
     }
 

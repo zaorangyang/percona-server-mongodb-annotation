@@ -178,6 +178,28 @@ struct DataReplicatorOptions {
  */
 class DataReplicator {
 public:
+    struct InitialSyncAttemptInfo {
+        int durationMillis;
+        Status status;
+        HostAndPort syncSource;
+
+        std::string toString() const;
+        BSONObj toBSON() const;
+        void append(BSONObjBuilder* builder) const;
+    };
+
+    struct Stats {
+        size_t failedInitialSyncAttempts{0};
+        size_t maxFailedInitialSyncAttempts{0};
+        Date_t initialSyncStart;
+        Date_t initialSyncEnd;
+        std::vector<DataReplicator::InitialSyncAttemptInfo> initialSyncAttemptInfos;
+
+        std::string toString() const;
+        BSONObj toBSON() const;
+        void append(BSONObjBuilder* builder) const;
+    };
+
     DataReplicator(DataReplicatorOptions opts,
                    std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
                    StorageInterface* storage);
@@ -242,6 +264,12 @@ public:
 
     std::string getDiagnosticString() const;
 
+    /**
+     * Returns stats about the progress of initial sync. If initial sync is not in progress it
+     * returns summary statistics for what occurred during initial sync.
+     */
+    BSONObj getInitialSyncProgress() const;
+
     // For testing only
 
     void _resetState_inlock(OperationContext* txn, OpTimeWithHash lastAppliedOpTime);
@@ -274,8 +302,7 @@ private:
      */
     void _enqueueDocuments(Fetcher::Documents::const_iterator begin,
                            Fetcher::Documents::const_iterator end,
-                           const OplogFetcher::DocumentsInfo& info,
-                           Milliseconds elapsed);
+                           const OplogFetcher::DocumentsInfo& info);
     void _onOplogFetchFinish(const Status& status, const OpTimeWithHash& lastFetched);
     void _rollbackOperations(const CallbackArgs& cbData);
     void _doNextActions();
@@ -283,15 +310,17 @@ private:
     void _doNextActions_Rollback_inlock();
     void _doNextActions_Steady_inlock();
 
+    BSONObj _getInitialSyncProgress_inlock() const;
+
     // Applies up till the specified Timestamp and pauses automatic application
     Timestamp _applyUntilAndPause(Timestamp);
     Timestamp _applyUntil(Timestamp);
     void _pauseApplier();
 
     StatusWith<Operations> _getNextApplierBatch_inlock();
-    void _onApplyBatchFinish(const StatusWith<Timestamp>&,
-                             const Operations&,
-                             const size_t numApplied);
+    void _onApplyBatchFinish(const Status& status,
+                             OpTimeWithHash lastApplied,
+                             std::size_t numApplied);
 
     // Called when the DatabasesCloner finishes.
     void _onDataClonerFinish(const Status& status, HostAndPort syncSource);
@@ -348,6 +377,7 @@ private:
     Event _onShutdown;                                                          // (M)
     Timestamp _rollbackCommonOptime;                                            // (MX)
     CollectionCloner::ScheduleDbWorkFn _scheduleDbWorkFn;                       // (M)
+    Stats _stats;                                                               // (M)
 };
 
 }  // namespace repl

@@ -74,7 +74,6 @@
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
@@ -110,6 +109,7 @@ void ConfigServerTestFixture::setUp() {
     repl::ReplSettings replSettings;
     replSettings.setReplSetString("mySet/node1:12345,node2:54321,node3:12543");
     auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(replSettings);
+    _replCoord = replCoord.get();
 
     repl::ReplicaSetConfig config;
     config.initialize(BSON("_id"
@@ -210,29 +210,25 @@ void ConfigServerTestFixture::setUp() {
 
     // For now initialize the global grid object. All sharding objects will be accessible from there
     // until we get rid of it.
-    grid.init(std::move(catalogClient),
-              std::move(catalogManager),
-              stdx::make_unique<CatalogCache>(),
-              std::move(shardRegistry),
-              stdx::make_unique<ClusterCursorManager>(serviceContext->getPreciseClockSource()),
-              stdx::make_unique<BalancerConfiguration>(),
-              std::move(executorPool),
-              _mockNetwork);
+    Grid::get(operationContext())
+        ->init(std::move(catalogClient),
+               std::move(catalogManager),
+               stdx::make_unique<CatalogCache>(),
+               std::move(shardRegistry),
+               stdx::make_unique<ClusterCursorManager>(serviceContext->getPreciseClockSource()),
+               stdx::make_unique<BalancerConfiguration>(),
+               std::move(executorPool),
+               _mockNetwork);
 
     _catalogClient->startup();
     _catalogManager->startup();
-
-    // Needed if serverStatus gets called.
-    if (!HostnameCanonicalizationWorker::get(getGlobalServiceContext())) {
-        HostnameCanonicalizationWorker::start(getGlobalServiceContext());
-    }
 }
 
 void ConfigServerTestFixture::tearDown() {
-    grid.getExecutorPool()->shutdownAndJoin();
-    grid.catalogManager()->shutDown(_opCtx.get());
-    grid.catalogClient(_opCtx.get())->shutDown(_opCtx.get());
-    grid.clearForUnitTests();
+    Grid::get(operationContext())->getExecutorPool()->shutdownAndJoin();
+    Grid::get(operationContext())->catalogManager()->shutDown(_opCtx.get());
+    Grid::get(operationContext())->catalogClient(_opCtx.get())->shutDown(_opCtx.get());
+    Grid::get(operationContext())->clearForUnitTests();
 
     _opCtx.reset();
     _client.reset();
@@ -248,11 +244,11 @@ void ConfigServerTestFixture::shutdownExecutor() {
 }
 
 ShardingCatalogClient* ConfigServerTestFixture::catalogClient() const {
-    return grid.catalogClient(_opCtx.get());
+    return Grid::get(operationContext())->catalogClient(_opCtx.get());
 }
 
 ShardingCatalogManager* ConfigServerTestFixture::catalogManager() const {
-    return grid.catalogManager();
+    return Grid::get(operationContext())->catalogManager();
 }
 
 ShardingCatalogClientImpl* ConfigServerTestFixture::getCatalogClient() const {
@@ -260,9 +256,7 @@ ShardingCatalogClientImpl* ConfigServerTestFixture::getCatalogClient() const {
 }
 
 ShardRegistry* ConfigServerTestFixture::shardRegistry() const {
-    invariant(grid.shardRegistry());
-
-    return grid.shardRegistry();
+    return Grid::get(operationContext())->shardRegistry();
 }
 
 RemoteCommandTargeterFactoryMock* ConfigServerTestFixture::targeterFactory() const {
@@ -272,10 +266,7 @@ RemoteCommandTargeterFactoryMock* ConfigServerTestFixture::targeterFactory() con
 }
 
 std::shared_ptr<Shard> ConfigServerTestFixture::getConfigShard() const {
-    auto shardRegistry = grid.shardRegistry();
-    invariant(shardRegistry);
-
-    return shardRegistry->getConfigShard();
+    return shardRegistry()->getConfigShard();
 }
 
 executor::NetworkInterfaceMock* ConfigServerTestFixture::network() const {
@@ -317,6 +308,12 @@ OperationContext* ConfigServerTestFixture::operationContext() const {
     return _opCtx.get();
 }
 
+repl::ReplicationCoordinatorMock* ConfigServerTestFixture::getReplicationCoordinator() const {
+    invariant(_replCoord);
+
+    return _replCoord;
+}
+
 void ConfigServerTestFixture::onCommand(NetworkTestEnv::OnCommandFunction func) {
     _networkTestEnv->onCommand(func);
 }
@@ -351,12 +348,13 @@ Status ConfigServerTestFixture::insertToConfigCollection(OperationContext* txn,
     auto config = getConfigShard();
     invariant(config);
 
-    auto insertResponse = config->runCommand(txn,
-                                             kReadPref,
-                                             ns.db().toString(),
-                                             request.toBSON(),
-                                             Shard::kDefaultConfigCommandTimeout,
-                                             Shard::RetryPolicy::kNoRetry);
+    auto insertResponse =
+        config->runCommandWithFixedRetryAttempts(txn,
+                                                 kReadPref,
+                                                 ns.db().toString(),
+                                                 request.toBSON(),
+                                                 Shard::kDefaultConfigCommandTimeout,
+                                                 Shard::RetryPolicy::kNoRetry);
 
     BatchedCommandResponse batchResponse;
     auto status = Shard::CommandResponse::processBatchWriteResponse(insertResponse, &batchResponse);
@@ -415,9 +413,8 @@ Status ConfigServerTestFixture::setupChunks(const std::vector<ChunkType>& chunks
     const NamespaceString chunkNS(ChunkType::ConfigNS);
     for (const auto& chunk : chunks) {
         auto insertStatus = insertToConfigCollection(operationContext(), chunkNS, chunk.toBSON());
-        if (!insertStatus.isOK()) {
+        if (!insertStatus.isOK())
             return insertStatus;
-        }
     }
 
     return Status::OK();
@@ -437,11 +434,12 @@ StatusWith<std::vector<BSONObj>> ConfigServerTestFixture::getIndexes(OperationCo
                                                                      const NamespaceString& ns) {
     auto configShard = getConfigShard();
 
-    auto response = configShard->runCommand(txn,
-                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                            ns.db().toString(),
-                                            BSON("listIndexes" << ns.coll().toString()),
-                                            Shard::RetryPolicy::kIdempotent);
+    auto response = configShard->runCommandWithFixedRetryAttempts(
+        txn,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        ns.db().toString(),
+        BSON("listIndexes" << ns.coll().toString()),
+        Shard::RetryPolicy::kIdempotent);
     if (!response.isOK()) {
         return response.getStatus();
     }

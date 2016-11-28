@@ -48,6 +48,7 @@
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/thread_idle_callback.h"
 #include "mongo/util/quick_exit.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
@@ -92,8 +93,12 @@ using transport::TransportLayer;
 ServiceEntryPointMongod::ServiceEntryPointMongod(TransportLayer* tl) : _tl(tl) {}
 
 void ServiceEntryPointMongod::startSession(Session&& session) {
-    launchWrappedServiceEntryWorkerThread(std::move(session),
-                                          [this](Session* session) { _sessionLoop(session); });
+    launchWrappedServiceEntryWorkerThread(std::move(session), [this](Session* session) {
+        _nWorkers.fetchAndAdd(1);
+        auto guard = MakeGuard([&] { _nWorkers.fetchAndSubtract(1); });
+
+        _sessionLoop(session);
+    });
 }
 
 void ServiceEntryPointMongod::_sessionLoop(Session* session) {
@@ -107,7 +112,8 @@ void ServiceEntryPointMongod::_sessionLoop(Session* session) {
             inMessage.reset();
             auto status = session->sourceMessage(&inMessage).wait();
 
-            if (ErrorCodes::isInterruption(status.code())) {
+            if (ErrorCodes::isInterruption(status.code()) ||
+                ErrorCodes::isNetworkError(status.code())) {
                 break;
             }
 
@@ -132,7 +138,6 @@ void ServiceEntryPointMongod::_sessionLoop(Session* session) {
 
             // If this is an exhaust cursor, don't source more Messages
             if (dbresponse.exhaustNS.size() > 0 && setExhaustMessage(&inMessage, dbresponse)) {
-                log() << "we are in exhaust";
                 inExhaust = true;
             } else {
                 inExhaust = false;
