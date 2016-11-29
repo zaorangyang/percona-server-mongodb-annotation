@@ -42,6 +42,8 @@
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/platform/random.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -362,6 +364,10 @@ void CurOp::reportState(BSONObjBuilder* builder) {
         appendAsObjOrString("query", _query, maxQuerySize, builder);
     }
 
+    if (!_collation.isEmpty()) {
+        appendAsObjOrString("collation", _collation, maxQuerySize, builder);
+    }
+
     if (!_originatingCommand.isEmpty()) {
         appendAsObjOrString("originatingCommand", _originatingCommand, maxQuerySize, builder);
     }
@@ -415,7 +421,9 @@ StringData getProtoString(int op) {
     if (x)                            \
     s << " " #x ":" << (x)
 
-string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockStats) const {
+string OpDebug::report(Client* client,
+                       const CurOp& curop,
+                       const SingleThreadedLockStats& lockStats) const {
     StringBuilder s;
     if (iscommand)
         s << "command ";
@@ -423,6 +431,14 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
         s << networkOpToString(networkOp) << ' ';
 
     s << curop.getNS();
+
+    const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata();
+    if (clientMetadata) {
+        auto appName = clientMetadata.get().getApplicationName();
+        if (!appName.empty()) {
+            s << " appName:" << appName;
+        }
+    }
 
     auto query = curop.query();
 
@@ -457,6 +473,12 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
     if (!updateobj.isEmpty()) {
         s << " update: ";
         updateobj.toString(s);
+    }
+
+    auto collation = curop.collation();
+    if (!collation.isEmpty()) {
+        s << " collation: ";
+        collation.toString(s);
     }
 
     OPDEBUG_TOSTRING_HELP(cursorid);
@@ -558,6 +580,11 @@ void OpDebug::append(const CurOp& curop,
 
     if (!updateobj.isEmpty()) {
         appendAsObjOrString("updateobj", updateobj, maxElementSize, &b);
+    }
+
+    auto collation = curop.collation();
+    if (!collation.isEmpty()) {
+        appendAsObjOrString("collation", collation, maxElementSize, &b);
     }
 
     OPDEBUG_APPEND_NUMBER(cursorid);

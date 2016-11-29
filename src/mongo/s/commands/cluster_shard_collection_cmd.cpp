@@ -41,13 +41,12 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/balancer/balancer.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -55,6 +54,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/config.h"
+#include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/migration_secondary_throttle_options.h"
 #include "mongo/s/shard_util.h"
@@ -92,7 +92,7 @@ public:
              << "   { enablesharding : \"<dbname>\" }\n";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -234,9 +234,34 @@ public:
             return false;
         }
 
+        // Get collection default collation.
+        BSONObj defaultCollation;
+        {
+            BSONElement collationElement;
+            auto status = bsonExtractTypedField(
+                collectionOptions, "collation", BSONType::Object, &collationElement);
+            if (status.isOK()) {
+                defaultCollation = collationElement.Obj().getOwned();
+                if (defaultCollation.isEmpty()) {
+                    conn.done();
+                    return appendCommandStatus(
+                        result,
+                        {ErrorCodes::BadValue,
+                         "Default collation in collection metadata cannot be empty."});
+                }
+            } else if (status != ErrorCodes::NoSuchKey) {
+                conn.done();
+                return appendCommandStatus(
+                    result,
+                    {status.code(),
+                     str::stream() << "Could not parse default collation in collection metadata "
+                                   << causedBy(status)});
+            }
+        }
+
         // If the collection has a non-simple default collation but the user did not specify the
         // simple collation explicitly, return an error.
-        if (collectionOptions["collation"] && !simpleCollationSpecified) {
+        if (!defaultCollation.isEmpty() && !simpleCollationSpecified) {
             return appendCommandStatus(result,
                                        {ErrorCodes::BadValue,
                                         str::stream()
@@ -375,7 +400,12 @@ public:
             // 5. If no useful index exists, and collection empty, create one on proposedKey.
             //    Only need to call ensureIndex on primary shard, since indexes get copied to
             //    receiving shard whenever a migrate occurs.
-            Status status = clusterCreateIndex(txn, nss.ns(), proposedKey, careAboutUnique);
+            Status status = clusterCreateIndex(
+                txn,
+                nss.ns(),
+                proposedKey,
+                BSON(CollationSpec::kLocaleField << CollationSpec::kSimpleBinaryComparison),
+                careAboutUnique);
             if (!status.isOK()) {
                 errmsg = str::stream() << "ensureIndex failed to create index on "
                                        << "primary shard: " << status.reason();
@@ -450,11 +480,15 @@ public:
 
         LOG(0) << "CMD: shardcollection: " << cmdObj;
 
-        audit::logShardCollection(
-            ClientBasic::getCurrent(), nss.ns(), proposedKey, careAboutUnique);
+        audit::logShardCollection(Client::getCurrent(), nss.ns(), proposedKey, careAboutUnique);
 
-        Status status = grid.catalogClient(txn)->shardCollection(
-            txn, nss.ns(), proposedShardKey, careAboutUnique, initSplits, std::set<ShardId>{});
+        Status status = grid.catalogClient(txn)->shardCollection(txn,
+                                                                 nss.ns(),
+                                                                 proposedShardKey,
+                                                                 defaultCollation,
+                                                                 careAboutUnique,
+                                                                 initSplits,
+                                                                 std::set<ShardId>{});
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -495,7 +529,7 @@ public:
                 chunkType.setShard(chunk->getShardId());
                 chunkType.setVersion(chunkManager->getVersion());
 
-                Status moveStatus = Balancer::get(txn)->moveSingleChunk(
+                Status moveStatus = configsvr_client::moveChunk(
                     txn,
                     chunkType,
                     to->getId(),
@@ -504,8 +538,9 @@ public:
                         MigrationSecondaryThrottleOptions::kOff),
                     true);
                 if (!moveStatus.isOK()) {
-                    warning() << "couldn't move chunk " << chunk->toString() << " to shard " << *to
-                              << " while sharding collection " << nss.ns() << causedBy(moveStatus);
+                    warning() << "couldn't move chunk " << redact(chunk->toString()) << " to shard "
+                              << *to << " while sharding collection " << nss.ns()
+                              << causedBy(redact(moveStatus));
                 }
             }
 
@@ -518,7 +553,8 @@ public:
 
             // 3. Subdivide the big chunks by splitting at each of the points in "allSplits"
             //    that we haven't already split by.
-            shared_ptr<Chunk> currentChunk = chunkManager->findIntersectingChunk(txn, allSplits[0]);
+            shared_ptr<Chunk> currentChunk =
+                chunkManager->findIntersectingChunkWithSimpleCollation(txn, allSplits[0]);
 
             vector<BSONObj> subSplits;
             for (unsigned i = 0; i <= allSplits.size(); i++) {
@@ -534,16 +570,17 @@ public:
                             currentChunk->getMax(),
                             subSplits);
                         if (!splitStatus.isOK()) {
-                            warning() << "couldn't split chunk " << currentChunk->toString()
+                            warning() << "couldn't split chunk " << redact(currentChunk->toString())
                                       << " while sharding collection " << nss.ns()
-                                      << causedBy(splitStatus.getStatus());
+                                      << causedBy(redact(splitStatus.getStatus()));
                         }
 
                         subSplits.clear();
                     }
 
                     if (i < allSplits.size()) {
-                        currentChunk = chunkManager->findIntersectingChunk(txn, allSplits[i]);
+                        currentChunk = chunkManager->findIntersectingChunkWithSimpleCollation(
+                            txn, allSplits[i]);
                     }
                 } else {
                     BSONObj splitPoint(allSplits[i]);

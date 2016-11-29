@@ -140,6 +140,20 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, const CollatorInterface* col
 }
 
 void QueryPlannerTest::addIndex(BSONObj keyPattern,
+                                const CollatorInterface* collator,
+                                StringData indexName) {
+    const bool sparse = false;
+    const bool unique = false;
+    const bool multikey = false;
+    const auto name = indexName.toString();
+    const MatchExpression* filterExpr = nullptr;
+    const BSONObj infoObj;
+    IndexEntry entry(keyPattern, multikey, sparse, unique, name, filterExpr, infoObj);
+    entry.collator = collator;
+    params.indices.push_back(entry);
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern,
                                 MatchExpression* filterExpr,
                                 const CollatorInterface* collator) {
     const bool sparse = false;
@@ -341,6 +355,25 @@ void QueryPlannerTest::runQueryAsCommand(const BSONObj& cmdObj) {
 
     Status s = QueryPlanner::plan(*cq, params, &solns.mutableVector());
     ASSERT_OK(s);
+}
+
+void QueryPlannerTest::runInvalidQueryAsCommand(const BSONObj& cmdObj) {
+    solns.clear();
+    cq.reset();
+
+    invariant(nss.isValid());
+
+    const bool isExplain = false;
+    std::unique_ptr<QueryRequest> qr(
+        assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
+
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(txn(), std::move(qr), ExtensionsCallbackNoop());
+    ASSERT_OK(statusWithCQ.getStatus());
+    cq = std::move(statusWithCQ.getValue());
+
+    Status status = QueryPlanner::plan(*cq, params, &solns.mutableVector());
+    ASSERT_NOT_OK(status);
 }
 
 size_t QueryPlannerTest::getNumSolutions() const {

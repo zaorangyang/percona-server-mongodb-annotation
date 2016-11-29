@@ -36,8 +36,10 @@
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/global_conn_pool.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/client/replica_set_monitor_internal.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/server_options.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/condition_variable.h"
@@ -98,6 +100,10 @@ bool isMaster(const Node& node) {
     return node.isMaster;
 }
 
+bool opTimeGreater(const Node* lhs, const Node* rhs) {
+    return lhs->opTime > rhs->opTime;
+}
+
 bool compareLatencies(const Node* lhs, const Node* rhs) {
     // NOTE: this automatically compares Node::unknownLatency worse than all others.
     return lhs->latencyMicros < rhs->latencyMicros;
@@ -151,16 +157,13 @@ struct HostNotIn {
     }
     const std::set<HostAndPort>& _hosts;
 };
+
 /**
  * Replica set refresh period on the task executor.
+ * This value must be equal to ReadPreferenceSettings::kMinimalMaxStalenessValue / 2
  */
 const Seconds kRefreshPeriod(30);
-
-
 }  // namespace
-
-// At 1 check every 10 seconds, 30 checks takes 5 minutes
-std::atomic<int> ReplicaSetMonitor::maxConsecutiveFailedChecks(30);  // NOLINT
 
 // If we cannot find a host after 15 seconds of refreshing, give up
 const Seconds ReplicaSetMonitor::kDefaultFindHostTimeout(15);
@@ -175,6 +178,7 @@ ReplicaSetMonitor::ReplicaSetMonitor(StringData name, const std::set<HostAndPort
 void ReplicaSetMonitor::init() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     invariant(_executor);
+    invariant(kRefreshPeriod * 2 == ReadPreferenceSetting::kMinimalMaxStalenessValue);
     std::weak_ptr<ReplicaSetMonitor> that(shared_from_this());
     auto status = _executor->scheduleWork([=](const CallbackArgs& cbArgs) {
         if (auto ptr = that.lock()) {
@@ -221,16 +225,6 @@ void ReplicaSetMonitor::_refresh(const CallbackArgs& cbArgs) {
     Timer t;
     startOrContinueRefresh().refreshAll();
     LOG(1) << "Refreshing replica set " << getName() << " took " << t.millis() << " msec";
-
-    if (!isSetUsable()) {
-        log() << "Stopping periodic monitoring of set " << getName()
-              << " because none of the hosts could be contacted for an extended period of "
-                 "time.";
-
-        ReplicaSetMonitor::remove(getName());
-        return;
-    }
-
     {
         // reschedule itself
         invariant(_executor);
@@ -281,12 +275,6 @@ StatusWith<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreference
         HostAndPort out = refresher.refreshUntilMatches(criteria);
         if (!out.empty())
             return out;
-
-        if (!isSetUsable()) {
-            return Status(ErrorCodes::ReplicaSetNotFound,
-                          str::stream() << "None of the hosts for replica set " << getName()
-                                        << " could be contacted.");
-        }
 
         const Milliseconds remaining = maxWait - (Date_t::now() - startTimeMs);
 
@@ -361,11 +349,6 @@ int ReplicaSetMonitor::getMaxWireVersion() const {
     return maxVersion;
 }
 
-bool ReplicaSetMonitor::isSetUsable() const {
-    stdx::lock_guard<stdx::mutex> lk(_state->mutex);
-    return _state->isUsable();
-}
-
 std::string ReplicaSetMonitor::getName() const {
     // name is const so don't need to lock
     return _state->name;
@@ -381,8 +364,9 @@ bool ReplicaSetMonitor::contains(const HostAndPort& host) const {
     return _state->seedNodes.count(host);
 }
 
-void ReplicaSetMonitor::createIfNeeded(const string& name, const set<HostAndPort>& servers) {
-    globalRSMonitorManager.getOrCreateMonitor(
+shared_ptr<ReplicaSetMonitor> ReplicaSetMonitor::createIfNeeded(const string& name,
+                                                                const set<HostAndPort>& servers) {
+    return globalRSMonitorManager.getOrCreateMonitor(
         ConnectionString::forReplicaSet(name, vector<HostAndPort>(servers.begin(), servers.end())));
 }
 
@@ -472,11 +456,6 @@ Refresher::Refresher(const SetStatePtr& setState)
 }
 
 Refresher::NextStep Refresher::getNextStep() {
-    // If the set is faulty, don't try anymore
-    if (!_set->isUsable()) {
-        return NextStep(NextStep::DONE);
-    }
-
     // No longer the current scan
     if (_scan != _set->currentScan) {
         return NextStep(NextStep::DONE);
@@ -527,12 +506,12 @@ Refresher::NextStep Refresher::getNextStep() {
         if (_scan->foundAnyUpNodes) {
             _set->consecutiveFailedScans = 0;
         } else {
-            _set->consecutiveFailedScans++;
-            log() << "All nodes for set " << _set->name << " are down. "
-                  << "This has happened for " << _set->consecutiveFailedScans
-                  << " checks in a row. Polling will stop after "
-                  << maxConsecutiveFailedChecks - _set->consecutiveFailedScans
-                  << " more failed checks";
+            auto nScans = _set->consecutiveFailedScans++;
+            if (nScans <= 10 || nScans % 10 == 0) {
+                log() << "All nodes for set " << _set->name << " are down. "
+                      << "This has happened for " << _set->consecutiveFailedScans
+                      << " checks in a row.";
+            }
         }
 
         // Makes sure all other Refreshers in this round return DONE
@@ -868,6 +847,14 @@ void IsMasterReply::parse(const BSONObj& obj) {
         }
 
         tags = raw.getObjectField("tags");
+        BSONObj lastWriteField = raw.getObjectField("lastWrite");
+        if (!lastWriteField.isEmpty()) {
+            if (auto lastWrite = lastWriteField["lastWriteDate"]) {
+                lastWriteDate = lastWrite.date();
+            }
+
+            uassertStatusOK(bsonExtractOpTimeField(lastWriteField, "opTime", &opTime));
+        }
     } catch (const std::exception& e) {
         ok = false;
         log() << "exception while parsing isMaster reply: " << e.what() << " " << obj;
@@ -934,6 +921,13 @@ void Node::update(const IsMasterReply& reply) {
             latencyMicros += (reply.latencyMicros - latencyMicros) / 4;
         }
     }
+
+    LOG(3) << "Updating " << host << " lastWriteDate to " << reply.lastWriteDate;
+    lastWriteDate = reply.lastWriteDate;
+
+    LOG(3) << "Updating " << host << " opTime to " << reply.opTime;
+    opTime = reply.opTime;
+    lastWriteDateUpdateTime = Date_t::now();
 }
 
 SetState::SetState(StringData name, const std::set<HostAndPort>& seedNodes)
@@ -961,10 +955,6 @@ SetState::SetState(StringData name, const std::set<HostAndPort>& seedNodes)
     DEV checkInvariants();
 }
 
-bool SetState::isUsable() const {
-    return consecutiveFailedScans < maxConsecutiveFailedChecks;
-}
-
 HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) const {
     switch (criteria.pref) {
         // "Prefered" read preferences are defined in terms of other preferences
@@ -974,13 +964,13 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
             // NOTE: the spec says we should use the primary even if tags don't match
             if (!out.empty())
                 return out;
-            return getMatchingHost(
-                ReadPreferenceSetting(ReadPreference::SecondaryOnly, criteria.tags));
+            return getMatchingHost(ReadPreferenceSetting(
+                ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessMS));
         }
 
         case ReadPreference::SecondaryPreferred: {
-            HostAndPort out = getMatchingHost(
-                ReadPreferenceSetting(ReadPreference::SecondaryOnly, criteria.tags));
+            HostAndPort out = getMatchingHost(ReadPreferenceSetting(
+                ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessMS));
             if (!out.empty())
                 return out;
             // NOTE: the spec says we should use the primary even if tags don't match
@@ -999,25 +989,88 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
         // The difference between these is handled by Node::matches
         case ReadPreference::SecondaryOnly:
         case ReadPreference::Nearest: {
+            stdx::function<bool(const Node&)> matchNode = [](const Node& node) -> bool {
+                return true;
+            };
+            // build comparator
+            if (criteria.maxStalenessMS.count()) {
+                auto masterIt = std::find_if(nodes.begin(), nodes.end(), isMaster);
+                if (masterIt == nodes.end() || !masterIt->lastWriteDate.toMillisSinceEpoch()) {
+                    auto writeDateCmp = [](const Node* a, const Node* b) -> bool {
+                        return a->lastWriteDate < b->lastWriteDate;
+                    };
+                    // use only non failed nodes
+                    std::vector<const Node*> upNodes;
+                    for (auto nodeIt = nodes.begin(); nodeIt != nodes.end(); ++nodeIt) {
+                        if (nodeIt->isUp && nodeIt->lastWriteDate.toMillisSinceEpoch()) {
+                            upNodes.push_back(&(*nodeIt));
+                        }
+                    }
+                    auto latestSecNode =
+                        std::max_element(upNodes.begin(), upNodes.end(), writeDateCmp);
+                    if (latestSecNode == upNodes.end()) {
+                        matchNode = [](const Node& node) -> bool { return false; };
+                    } else {
+                        Date_t maxWriteTime = (*latestSecNode)->lastWriteDate;
+                        matchNode = [=](const Node& node) -> bool {
+                            return Milliseconds(maxWriteTime - node.lastWriteDate) +
+                                kRefreshPeriod <=
+                                criteria.maxStalenessMS;
+                        };
+                    }
+                } else {
+                    Milliseconds primaryStaleness =
+                        masterIt->lastWriteDateUpdateTime - masterIt->lastWriteDate;
+                    matchNode = [=](const Node& node) -> bool {
+                        return Milliseconds(node.lastWriteDateUpdateTime - node.lastWriteDate) -
+                            primaryStaleness + kRefreshPeriod <=
+                            criteria.maxStalenessMS;
+                    };
+                }
+            }
+
             BSONForEach(tagElem, criteria.tags.getTagBSON()) {
                 uassert(16358, "Tags should be a BSON object", tagElem.isABSONObj());
                 BSONObj tag = tagElem.Obj();
 
                 std::vector<const Node*> matchingNodes;
                 for (size_t i = 0; i < nodes.size(); i++) {
-                    if (nodes[i].matches(criteria.pref) && nodes[i].matches(tag)) {
+                    if (nodes[i].matches(criteria.pref) && nodes[i].matches(tag) &&
+                        matchNode(nodes[i])) {
                         matchingNodes.push_back(&nodes[i]);
                     }
                 }
 
                 // don't do more complicated selection if not needed
-                if (matchingNodes.empty())
+                if (matchingNodes.empty()) {
                     continue;
-                if (matchingNodes.size() == 1)
+                }
+                if (matchingNodes.size() == 1) {
                     return matchingNodes.front()->host;
+                }
 
-                // order by latency and don't consider hosts further than a threshold from the
-                // closest.
+                // Only consider nodes that satisfy the minOpTime
+                if (!criteria.minOpTime.isNull()) {
+                    std::sort(matchingNodes.begin(), matchingNodes.end(), opTimeGreater);
+                    for (size_t i = 0; i < matchingNodes.size(); i++) {
+                        if (matchingNodes[i]->opTime < criteria.minOpTime) {
+                            if (i == 0) {
+                                // If no nodes satisfy the minOpTime criteria, we ignore the
+                                // minOpTime requirement.
+                                break;
+                            }
+                            matchingNodes.erase(matchingNodes.begin() + i, matchingNodes.end());
+                            break;
+                        }
+                    }
+
+                    if (matchingNodes.size() == 1) {
+                        return matchingNodes.front()->host;
+                    }
+                }
+
+                // If there are multiple nodes satisfying the minOpTime, next order by latency
+                // and don't consider hosts further than a threshold from the closest.
                 std::sort(matchingNodes.begin(), matchingNodes.end(), compareLatencies);
                 for (size_t i = 1; i < matchingNodes.size(); i++) {
                     int64_t distance =

@@ -96,10 +96,18 @@ bool gFirstRuntimeCreated = false;
 MONGO_TRIVIALLY_CONSTRUCTIBLE_THREAD_LOCAL MozJSImplScope* kCurrentScope;
 
 struct MozJSImplScope::MozJSEntry {
-    MozJSEntry(MozJSImplScope* scope) : ar(scope->_context), ac(scope->_context, scope->_global) {}
+    MozJSEntry(MozJSImplScope* scope)
+        : ar(scope->_context), ac(scope->_context, scope->_global), _scope(scope) {
+        ++_scope->_inOp;
+    }
+
+    ~MozJSEntry() {
+        --_scope->_inOp;
+    }
 
     JSAutoRequest ar;
     JSAutoCompartment ac;
+    MozJSImplScope* _scope;
 };
 
 void MozJSImplScope::_reportError(JSContext* cx, const char* message, JSErrorReport* report) {
@@ -137,23 +145,23 @@ std::string MozJSImplScope::getError() {
 }
 
 void MozJSImplScope::registerOperation(OperationContext* txn) {
-    invariant(_opId == 0);
+    invariant(_opCtx == nullptr);
 
     // getPooledScope may call registerOperation with a nullptr, so we have to
     // check for that here.
     if (!txn)
         return;
 
+    _opCtx = txn;
     _opId = txn->getOpID();
 
     _engine->registerOperation(txn, this);
 }
 
 void MozJSImplScope::unregisterOperation() {
-    if (_opId != 0) {
+    if (_opCtx) {
         _engine->unregisterOperation(_opId);
-
-        _opId = 0;
+        _opCtx = nullptr;
     }
 }
 
@@ -192,6 +200,14 @@ bool MozJSImplScope::_interruptCallback(JSContext* cx) {
     } else if (scope->isKillPending()) {
         scope->_status = Status(ErrorCodes::Interrupted, "Interrupted by the host");
     }
+    // If we are on the right thread, in the middle of an operation, and we have a registered opCtx,
+    // then we should check the opCtx for interrupts.
+    if ((scope->_mr._thread == PR_GetCurrentThread()) && (scope->_inOp > 0) && scope->_opCtx) {
+        auto status = scope->_opCtx->checkForInterruptNoAssert();
+        if (!status.isOK()) {
+            scope->_status = status;
+        }
+    }
 
     if (!scope->_status.isOK()) {
         scope->_engine->getDeadlineMonitor().stopDeadline(scope);
@@ -208,8 +224,7 @@ void MozJSImplScope::_gcCallback(JSRuntime* rt, JSGCStatus status, void* data) {
     }
 
     log() << "MozJS GC " << (status == JSGC_BEGIN ? "prologue" : "epilogue") << " heap stats - "
-          << " total: " << mongo::sm::get_total_bytes() << " limit: " << mongo::sm::get_max_bytes()
-          << std::endl;
+          << " total: " << mongo::sm::get_total_bytes() << " limit: " << mongo::sm::get_max_bytes();
 }
 
 MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
@@ -310,6 +325,7 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _pendingKill(false),
       _opId(0),
       _opCtx(nullptr),
+      _inOp(0),
       _pendingGC(false),
       _connectState(ConnectState::Not),
       _status(Status::OK()),
@@ -697,9 +713,6 @@ void MozJSImplScope::gc() {
 void MozJSImplScope::localConnectForDbEval(OperationContext* txn, const char* dbName) {
     MozJSEntry entry(this);
 
-    invariant(_opCtx == NULL);
-    _opCtx = txn;
-
     if (_connectState == ConnectState::External)
         uasserted(12510, "externalSetup already called, can't call localConnect");
     if (_connectState == ConnectState::Local) {
@@ -823,7 +836,7 @@ bool MozJSImplScope::_checkErrorState(bool success, bool reportError, bool asser
     _error = _status.reason();
 
     if (reportError)
-        error() << _error << std::endl;
+        error() << redact(_error);
 
     // Clear the status state
     auto status = std::move(_status);

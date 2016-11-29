@@ -38,6 +38,7 @@
 
 #include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/client.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
@@ -84,11 +85,15 @@ DatabasesCloner::DatabasesCloner(StorageInterface* si,
     uassert(ErrorCodes::InvalidOptions, "includeDbPred must be provided.", includeDbPred);
 };
 
+DatabasesCloner::~DatabasesCloner() {
+    DESTRUCTOR_GUARD(shutdown(); join(););
+}
+
 std::string DatabasesCloner::toString() const {
     return str::stream() << "initial sync --"
                          << " active:" << _active << " status:" << _status.toString()
                          << " source:" << _source.toString()
-                         << " db cloners active:" << _clonersActive
+                         << " db cloners completed:" << _currentClonerIndex
                          << " db count:" << _databaseCloners.size();
 }
 
@@ -107,7 +112,7 @@ void DatabasesCloner::join() {
 
     lk.unlock();
     for (auto&& cloner : clonersToWaitOn) {
-        cloner->wait();
+        cloner->join();
     }
     lk.lock();
 }
@@ -131,7 +136,7 @@ void DatabasesCloner::_cancelCloners_inlock(UniqueLock& lk) {
 
     lk.unlock();
     for (auto&& cloner : clonersToCancel) {
-        cloner->cancel();
+        cloner->shutdown();
     }
     lk.lock();
 }
@@ -161,7 +166,8 @@ Status DatabasesCloner::startup() {
     Request listDBsReq(_source,
                        "admin",
                        BSON("listDatabases" << true),
-                       rpc::ServerSelectionMetadata(true, boost::none).toBSON());
+                       rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                       nullptr);
     _listDBsScheduler = stdx::make_unique<RemoteCommandRetryScheduler>(
         _exec,
         listDBsReq,
@@ -179,10 +185,15 @@ Status DatabasesCloner::startup() {
     return _status;
 }
 
+void DatabasesCloner::setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& work) {
+    LockGuard lk(_mutex);
+    _scheduleDbWorkFn = work;
+}
+
 void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
-    Status respStatus = cbd.response.getStatus();
+    Status respStatus = cbd.response.status;
     if (respStatus.isOK()) {
-        respStatus = getStatusFromCommandResult(cbd.response.getValue().data);
+        respStatus = getStatusFromCommandResult(cbd.response.data);
     }
 
     UniqueLock lk(_mutex);
@@ -193,7 +204,7 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
         return;
     }
 
-    const auto respBSON = cbd.response.getValue().data;
+    const auto respBSON = cbd.response.data;
     // There should not be any cloners yet
     invariant(_databaseCloners.size() == 0);
     const auto dbsElem = respBSON["databases"].Obj();
@@ -207,16 +218,13 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
         }
 
         const std::string dbName = dbBSON["name"].str();
-        ++_clonersActive;
         std::shared_ptr<DatabaseCloner> dbCloner{nullptr};
-        Status startStatus(ErrorCodes::NotYetInitialized,
-                           "The DatabasesCloner could not be started.");
 
         // filters for DatabasesCloner.
         const auto collectionFilterPred = [dbName](const BSONObj& collInfo) {
             const auto collName = collInfo["name"].str();
             const NamespaceString ns(dbName, collName);
-            if (ns.isSystem() && !legalClientSystemNS(ns.ns(), true)) {
+            if (ns.isSystem() && !legalClientSystemNS(ns.ns())) {
                 LOG(1) << "Skipping 'system' collection: " << ns.ns();
                 return false;
             }
@@ -239,6 +247,7 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
         const auto onDbFinish = [this, dbName](const Status& status) {
             _onEachDBCloneFinish(status, dbName);
         };
+        Status startStatus = Status::OK();
         try {
             dbCloner.reset(new DatabaseCloner(
                 _exec,
@@ -250,8 +259,13 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
                 _storage,  // use storage provided.
                 onCollectionFinish,
                 onDbFinish));
-            // Start database cloner.
-            startStatus = dbCloner->start();
+            if (_scheduleDbWorkFn) {
+                dbCloner->setScheduleDbWorkFn_forTest(_scheduleDbWorkFn);
+            }
+            // Start first database cloner.
+            if (_databaseCloners.empty()) {
+                startStatus = dbCloner->startup();
+            }
         } catch (...) {
             startStatus = exceptionToStatus();
         }
@@ -281,36 +295,55 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
 
 void DatabasesCloner::_onEachDBCloneFinish(const Status& status, const std::string& name) {
     UniqueLock lk(_mutex);
-    auto clonersLeft = --_clonersActive;
-
     if (!status.isOK()) {
-        warning() << "database '" << name << "' clone failed due to " << status.toString();
+        warning() << "database '" << name << "' (" << (_currentClonerIndex + 1) << " of "
+                  << _databaseCloners.size() << ") clone failed due to " << status.toString();
         _setStatus_inlock(status);
-        if (clonersLeft == 0) {
-            _failed_inlock(lk);
-        } else {
-            // After cancellation this callback will called until clonersLeft = 0.
-            _cancelCloners_inlock(lk);
-        }
+        _failed_inlock(lk);
         return;
     }
 
-    LOG(2) << "Database clone finished: " << name;
     if (StringData(name).equalCaseInsensitive("admin")) {
         LOG(1) << "Finished the 'admin' db, now calling isAdminDbValid.";
         // Do special checks for the admin database because of auth. collections.
-        const auto adminStatus = _storage->isAdminDbValid(nullptr /* TODO: wire in txn*/);
+        auto adminStatus = Status(ErrorCodes::NotYetInitialized, "");
+        {
+            // TODO: Move isAdminDbValid() out of the collection/database cloner code paths.
+            OperationContext* txn = cc().getOperationContext();
+            ServiceContext::UniqueOperationContext txnPtr;
+            if (!txn) {
+                txnPtr = cc().makeOperationContext();
+                txn = txnPtr.get();
+            }
+            adminStatus = _storage->isAdminDbValid(txn);
+        }
         if (!adminStatus.isOK()) {
+            LOG(1) << "Validation failed on 'admin' db due to " << adminStatus;
             _setStatus_inlock(adminStatus);
+            _failed_inlock(lk);
+            return;
         }
     }
 
-    if (clonersLeft == 0) {
+    _currentClonerIndex++;
+
+    if (_currentClonerIndex == _databaseCloners.size()) {
         _active = false;
         // All cloners are done, trigger event.
         LOG(2) << "All database clones finished, calling _finishFn.";
         lk.unlock();
         _finishFn(_status);
+        return;
+    }
+
+    // Start next database cloner.
+    auto&& dbCloner = _databaseCloners[_currentClonerIndex];
+    auto startStatus = dbCloner->startup();
+    if (!startStatus.isOK()) {
+        warning() << "failed to schedule database '" << name << "' (" << (_currentClonerIndex + 1)
+                  << " of " << _databaseCloners.size() << ") due to " << startStatus.toString();
+        _setStatus_inlock(startStatus);
+        _failed_inlock(lk);
         return;
     }
 }

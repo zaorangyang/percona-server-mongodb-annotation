@@ -335,13 +335,13 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
     else {
         if (_port <= 0)
             log() << "error: a port number is expected when running " << program
-                  << " from the shell" << endl;
+                  << " from the shell";
         verify(_port > 0);
     }
     if (_port > 0) {
         bool haveDbForPort = registry.isPortRegistered(_port);
         if (haveDbForPort) {
-            log() << "already have db for port: " << _port << endl;
+            log() << "already have db for port: " << _port;
             verify(!haveDbForPort);
         }
     }
@@ -351,7 +351,7 @@ void ProgramRunner::start() {
     int pipeEnds[2];
     int status = pipe(pipeEnds);
     if (status != 0) {
-        error() << "failed to create pipe: " << errnoWithDescription() << endl;
+        error() << "failed to create pipe: " << errnoWithDescription();
         fassertFailed(16701);
     }
 
@@ -371,7 +371,7 @@ void ProgramRunner::start() {
         for (unsigned i = 0; i < _argv.size(); i++) {
             ss << " " << _argv[i];
         }
-        log() << ss.str() << endl;
+        log() << ss.str();
     }
 }
 
@@ -386,8 +386,8 @@ void ProgramRunner::operator()() {
         while (1) {
             int lenToRead = (bufSize - 1) - (start - buf);
             if (lenToRead <= 0) {
-                log() << "error: lenToRead: " << lenToRead << endl;
-                log() << "first 300: " << string(buf, 0, 300) << endl;
+                log() << "error: lenToRead: " << lenToRead;
+                log() << "first 300: " << string(buf, 0, 300);
             }
             verify(lenToRead > 0);
             int ret = read(_pipe, (void*)start, lenToRead);
@@ -794,7 +794,15 @@ void copyDir(const boost::filesystem::path& from, const boost::filesystem::path&
     boost::filesystem::directory_iterator i(from);
     while (i != end) {
         boost::filesystem::path p = *i;
-        if (p.leaf() != "mongod.lock" && p.leaf() != "WiredTiger.lock") {
+        if (p.leaf() == "metrics.interim" || p.leaf() == "metrics.interim.temp") {
+            // Ignore any errors for metrics.interim* files as these may disappear during copy
+            boost::system::error_code ec;
+            boost::filesystem::copy_file(p, to / p.leaf(), ec);
+            if (ec) {
+                log() << "Skipping copying of file from '" << p.generic_string() << "' to '"
+                      << (to / p.leaf()).generic_string() << "' due to: " << ec.message();
+            }
+        } else if (p.leaf() != "mongod.lock" && p.leaf() != "WiredTiger.lock") {
             if (boost::filesystem::is_directory(p)) {
                 boost::filesystem::path newDir = to / p.leaf();
                 boost::filesystem::create_directory(newDir);
@@ -848,7 +856,8 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
             //
             try {
                 DBClientConnection conn;
-                conn.connect(HostAndPort{"127.0.0.1:" + BSONObjBuilder::numStr(port)});
+                conn.connect(HostAndPort{"127.0.0.1:" + BSONObjBuilder::numStr(port)},
+                             "MongoDB Shell");
 
                 BSONElement authObj = opt["auth"];
 
@@ -887,7 +896,7 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
     if (x) {
         if (errno == ESRCH) {
         } else {
-            log() << "killFailed: " << errnoWithDescription() << endl;
+            log() << "killFailed: " << errnoWithDescription();
             verify(x == 0);
         }
     }
@@ -978,7 +987,7 @@ BSONObj StopMongoProgram(const BSONObj& a, void* data) {
     uassert(15853, "stopMongo needs a number", a.firstElement().isNumber());
     int port = int(a.firstElement().number());
     int code = killDb(port, ProcessId::fromNative(0), getSignal(a), getStopMongodOpts(a));
-    log() << "shell: stopped mongo program on port " << port << endl;
+    log() << "shell: stopped mongo program on port " << port;
     return BSON("" << (double)code);
 }
 
@@ -987,7 +996,7 @@ BSONObj StopMongoProgramByPid(const BSONObj& a, void* data) {
     uassert(15852, "stopMongoByPid needs a number", a.firstElement().isNumber());
     ProcessId pid = ProcessId::fromNative(int(a.firstElement().number()));
     int code = killDb(0, pid, getSignal(a));
-    log() << "shell: stopped mongo program on pid " << pid << endl;
+    log() << "shell: stopped mongo program on pid " << pid;
     return BSON("" << (double)code);
 }
 

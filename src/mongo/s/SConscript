@@ -58,9 +58,12 @@ env.Library(
         'catalog/type_tags.cpp',
         'request_types/add_shard_request_type.cpp',
         'request_types/add_shard_to_zone_request_type.cpp',
-        'request_types/assign_key_range_to_zone_request_type.cpp',
         'request_types/balance_chunk_request_type.cpp',
+        'request_types/commit_chunk_migration_request_type.cpp',
         'request_types/remove_shard_from_zone_request_type.cpp',
+        'request_types/split_chunk_request_type.cpp',
+        'request_types/merge_chunk_request_type.cpp',
+        'request_types/update_zone_key_range_request_type.cpp',
         'chunk_diff.cpp',
         'chunk_version.cpp',
         'migration_secondary_throttle_options.cpp',
@@ -88,6 +91,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/db/query/collation/collator_factory_mock',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/client/remote_command_targeter_mock',
         '$BUILD_DIR/mongo/executor/network_test_env',
@@ -96,7 +100,6 @@ env.Library(
         '$BUILD_DIR/mongo/rpc/metadata',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
         '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_client_impl',
-        '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_manager_impl',
         '$BUILD_DIR/mongo/s/coreshard',
         '$BUILD_DIR/mongo/transport/transport_layer_mock',
         '$BUILD_DIR/mongo/util/clock_source_mock',
@@ -228,9 +231,12 @@ env.CppUnitTest('request_types_test',
     source=[
         'request_types/add_shard_request_test.cpp',
         'request_types/add_shard_to_zone_request_test.cpp',
-        'request_types/assign_key_range_to_zone_request_test.cpp',
         'request_types/balance_chunk_request_test.cpp',
+        'request_types/commit_chunk_migration_request_test.cpp',
         'request_types/remove_shard_from_zone_request_test.cpp',
+        'request_types/split_chunk_request_test.cpp',
+        'request_types/merge_chunk_request_test.cpp',
+        'request_types/update_zone_key_range_request_test.cpp',
     ],
     LIBDEPS=[
         'common',
@@ -260,7 +266,6 @@ env.Library(
         'shard_util.cpp',
         'sharding_egress_metadata_hook.cpp',
         'sharding_raii.cpp',
-        'sharding_uptime_reporter.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/audit',
@@ -288,8 +293,6 @@ env.Library(
     ]
 )
 
-# This library is only used by the mongos execuable and any tests which require mongos runtime
-# objects, such as the request processing pipeline or the balancer.
 env.Library(
     target='mongoscore',
     source=[
@@ -298,6 +301,7 @@ env.Library(
         's_only.cpp',
         's_sharding_server_status.cpp',
         'sharding_egress_metadata_hook_for_mongos.cpp',
+        'sharding_uptime_reporter.cpp',
         'version_mongos.cpp',
     ],
     LIBDEPS=[

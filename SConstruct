@@ -1491,6 +1491,7 @@ elif env.TargetOSIs('windows'):
             'crypt32.lib',
             'kernel32.lib',
             'shell32.lib',
+            'pdh.lib',
             'version.lib',
             'winmm.lib',
             'ws2_32.lib',
@@ -2022,8 +2023,8 @@ def doConfigure(myenv):
         elif get_option('cxx-std') == "14":
             if not AddToCXXFLAGSIfSupported(myenv, '-std=c++14'):
                 myenv.ConfError('Compiler does not honor -std=c++14')
-        if not AddToCFLAGSIfSupported(myenv, '-std=c99'):
-            myenv.ConfError("C++11 mode selected for C++ files, but can't enable C99 for C files")
+        if not AddToCFLAGSIfSupported(myenv, '-std=c11'):
+            myenv.ConfError("C++11 mode selected for C++ files, but can't enable C11 for C files")
 
     if using_system_version_of_cxx_libraries():
         print( 'WARNING: System versions of C++ libraries must be compiled with C++11/14 support' )
@@ -2377,7 +2378,7 @@ def doConfigure(myenv):
         else:
             myenv.ConfError("Don't know how to enable --lto on current toolchain")
 
-    if get_option('runtime-hardening') == "on":
+    if get_option('runtime-hardening') == "on" and optBuild:
         # Older glibc doesn't work well with _FORTIFY_SOURCE=2. Selecting 2.11 as the minimum was an
         # emperical decision, as that is the oldest non-broken glibc we seem to require. It is possible
         # that older glibc's work, but we aren't trying.
@@ -2657,6 +2658,13 @@ def doConfigure(myenv):
             """):
             conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_FIPS_MODE_SET')
 
+        if conf.CheckDeclaration(
+            "d2i_ASN1_SEQUENCE_ANY",
+            includes="""
+                #include <openssl/asn1.h>
+            """):
+            conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_ASN1_ANY_DEFINITIONS')
+
     else:
         env.Append( MONGO_CRYPTO=["tom"] )
 
@@ -2836,6 +2844,9 @@ env = doConfigure( env )
 # compilation database entries for the configure tests, which is weird.
 env.Tool("compilation_db")
 
+# Load the dagger tool for build dependency graph introspection
+env.Tool("dagger")
+
 def checkErrorCodes():
     import buildscripts.errorcodes as x
     if x.checkErrorCodes() == False:
@@ -2938,6 +2949,7 @@ def injectMongoIncludePaths(thisEnv):
 env.AddMethod(injectMongoIncludePaths, 'InjectMongoIncludePaths')
 
 compileDb = env.Alias("compiledb", env.CompilationDatabase('compile_commands.json'))
+dependencyDb = env.Alias("dagger", env.Dagger('library_dependency_graph.json'))
 
 env.Alias("distsrc-tar", env.DistSrc("mongodb-src-${MONGO_VERSION}.tar"))
 env.Alias("distsrc-tgz", env.GZip(
@@ -2949,7 +2961,10 @@ env.Alias("distsrc", "distsrc-tgz")
 
 env.SConscript('src/SConscript', variant_dir='$BUILD_DIR', duplicate=False)
 
-env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests'])
+all = env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests'])
+
+# Require everything to be built before trying to extract build dependency information
+env.Requires(dependencyDb, all)
 
 # Substitute environment variables in any build targets so that we can
 # say, for instance:

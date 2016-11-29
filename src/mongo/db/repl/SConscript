@@ -775,6 +775,7 @@ env.Library(
     ],
     LIBDEPS=[
         'collection_cloner',
+        '$BUILD_DIR/mongo/db/commands/list_collections_filter',
         '$BUILD_DIR/mongo/executor/task_executor_interface',
     ],
 )
@@ -795,6 +796,7 @@ env.Library(
     ],
     LIBDEPS=[
         'database_cloner',
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 
@@ -809,6 +811,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/commands_test_crutch',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
+        '$BUILD_DIR/mongo/unittest/task_executor_proxy',
     ],
 )
 
@@ -926,27 +929,6 @@ env.CppUnitTest(
 )
 
 env.Library(
-    target='applier',
-    source=[
-        'applier.cpp',
-    ],
-    LIBDEPS=[
-        'oplog_entry',
-        'replication_executor',
-    ],
-)
-
-env.CppUnitTest(
-    target='applier_test',
-    source='applier_test.cpp',
-    LIBDEPS=[
-        'applier',
-        'replication_executor_test_fixture',
-        '$BUILD_DIR/mongo/unittest/concurrency',
-    ],
-)
-
-env.Library(
     target='data_replicator_external_state_impl',
     source=[
         'data_replicator_external_state_impl.cpp',
@@ -978,7 +960,6 @@ env.Library(
         'data_replicator.cpp',
     ],
     LIBDEPS=[
-        'applier',
         'collection_cloner',
         'database_cloner',
         'databases_cloner',
@@ -1092,6 +1073,8 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver',
         '$BUILD_DIR/mongo/db/auth/authcore',
         '$BUILD_DIR/mongo/db/commands',
+        '$BUILD_DIR/mongo/db/commands/list_collections_filter',
+        '$BUILD_DIR/mongo/rpc/client_metadata',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/lasterror',

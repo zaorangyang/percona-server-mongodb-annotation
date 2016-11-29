@@ -51,14 +51,20 @@ namespace mongo {
 
 namespace {
 
+    static SaslAuthenticationSession::SaslAuthenticationSessionFactoryFn createSaslBase;
+
     SaslAuthenticationSession* createExternalSaslAuthenticationSession(
         AuthorizationSession* authzSession,
-        const std::string& mechanism) {
-        return new IntegratedAuthenticationSession(authzSession);
+        StringData db,
+        StringData mechanism) {
+        if (mechanism == "PLAIN" && db == saslDefaultDBName)
+            return new ExternalSaslAuthenticationSession(authzSession);
+        else
+            return createSaslBase(authzSession, db, mechanism);
     }
 
     // External SASL session factory needs to be set AFTER the native one has been set.
-    MONGO_INITIALIZER_WITH_PREREQUISITES(ExternalSaslServerCore, ("NativeSaslServerCore"))
+    MONGO_INITIALIZER_GENERAL(ExternalSaslServerCore, ("NativeSaslServerCore"), ("PostSaslCommands"))
         (InitializerContext* context) {
         if (saslGlobalParams.hostName.empty())
             saslGlobalParams.hostName = getHostNameCached();
@@ -72,6 +78,7 @@ namespace {
         }
 
         log() << "Initialized External Auth Session" << std::endl;
+        createSaslBase = SaslAuthenticationSession::create;
         SaslAuthenticationSession::create = createExternalSaslAuthenticationSession;
         return Status::OK();
     }
@@ -80,7 +87,7 @@ namespace {
 
     ExternalSaslAuthenticationSession::ExternalSaslAuthenticationSession(
         AuthorizationSession* authzSession) :
-        NativeSaslAuthenticationSession(authzSession),
+        SaslAuthenticationSession(authzSession),
         _saslConnection(NULL),
         _mechanism("") {
         _results.result = SASL_FAIL;
@@ -218,60 +225,4 @@ namespace {
         return sasl_getprop(_saslConnection, SASL_USERNAME, (const void**)username);
     }
 
-    IntegratedAuthenticationSession::IntegratedAuthenticationSession(AuthorizationSession* authSession)
-        : ExternalSaslAuthenticationSession(authSession),
-          _external(false) {
-    }
-
-    IntegratedAuthenticationSession::~IntegratedAuthenticationSession() {
-    }
-
-    Status IntegratedAuthenticationSession::start(StringData authenticationDatabase,
-                                                  StringData mechanism,
-                                                  StringData serviceName,
-                                                  StringData serviceHostname,
-                                                  int64_t conversationId,
-                                                  bool autoAuthorize) {
-        if (authenticationDatabase == saslDefaultDBName) {
-            _external = true;
-            return this->ExternalSaslAuthenticationSession::start(authenticationDatabase,
-                                                            mechanism,
-                                                            serviceName,
-                                                            serviceHostname,
-                                                            conversationId,
-                                                            autoAuthorize);
-        }
-
-        _external = false;
-        return this->NativeSaslAuthenticationSession::start(authenticationDatabase,
-                                                      mechanism,
-                                                      serviceName,
-                                                      serviceHostname,
-                                                      conversationId,
-                                                      autoAuthorize);
-    }
-
-    Status IntegratedAuthenticationSession::step(StringData inputData, std::string* outputData) {
-        if (_external) {
-            return this->ExternalSaslAuthenticationSession::step(inputData, outputData);
-        }
-
-        return this->NativeSaslAuthenticationSession::step(inputData, outputData);
-    }
-
-    std::string IntegratedAuthenticationSession::getPrincipalId() const {
-        if (_external) {
-            return this->ExternalSaslAuthenticationSession::getPrincipalId();
-        }
-
-        return this->NativeSaslAuthenticationSession::getPrincipalId();
-    }
-
-    const char* IntegratedAuthenticationSession::getMechanism() const {
-        if (_external) {
-            return this->ExternalSaslAuthenticationSession::getMechanism();
-        }
-
-        return this->NativeSaslAuthenticationSession::getMechanism();
-    }
 }  // namespace mongo

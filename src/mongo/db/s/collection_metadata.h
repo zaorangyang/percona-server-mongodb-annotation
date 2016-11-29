@@ -57,13 +57,13 @@ class CollectionMetadata {
 
 public:
     /**
-     * Use the MetadataLoader to fill the empty metadata from the config server, or use
-     * clone*() methods to use existing metadatas to build new ones.
+     * The main way to construct CollectionMetadata is through MetadataLoader or the clone*()
+     * methods.
      *
-     * Unless you are the MetadataLoader or a test you should probably not be using this
-     * directly.
+     * The constructors should not be used directly outside of tests.
      */
     CollectionMetadata();
+    CollectionMetadata(const BSONObj& keyPattern, ChunkVersion collectionVersion);
     ~CollectionMetadata();
 
     /**
@@ -175,6 +175,10 @@ public:
         return _shardVersion;
     }
 
+    const RangeMap& getChunks() const {
+        return _chunksMap;
+    }
+
     BSONObj getKeyPattern() const {
         return _keyPattern;
     }
@@ -196,14 +200,9 @@ public:
     }
 
     /**
-     * BSON output of the metadata information.
+     * BSON output of the basic metadata information (chunk and shard version).
      */
-    BSONObj toBSON() const;
-
-    /**
-     * BSON output of the metadata information, into a builder.
-     */
-    void toBSON(BSONObjBuilder& bb) const;
+    void toBSONBasic(BSONObjBuilder& bb) const;
 
     /**
      * BSON output of the chunks metadata into a BSONArray
@@ -215,10 +214,7 @@ public:
      */
     void toBSONPending(BSONArrayBuilder& bb) const;
 
-    /**
-     * std::string output of the metadata information.
-     */
-    std::string toString() const;
+    std::string toStringBasic() const;
 
     /**
      * This method is used only for unit-tests and it returns a new metadata's instance based on
@@ -229,6 +225,11 @@ public:
     std::unique_ptr<CollectionMetadata> clonePlusChunk(const BSONObj& minKey,
                                                        const BSONObj& maxKey,
                                                        const ChunkVersion& newShardVersion) const;
+
+    /**
+     * Returns true if this metadata was loaded with all necessary information.
+     */
+    bool isValid() const;
 
 private:
     // Effectively, the MetadataLoader is this class's builder. So we open an exception and grant it
@@ -267,11 +268,6 @@ private:
     // w.r.t. _chunkMap but we expect high chunk contiguity, especially in small
     // installations.
     RangeMap _rangesMap;
-
-    /**
-     * Returns true if this metadata was loaded with all necessary information.
-     */
-    bool isValid() const;
 
     /**
      * Try to find chunks that are adjacent and record these intervals in the _rangesMap

@@ -35,6 +35,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_buffer.h"
@@ -66,7 +67,8 @@ using UniqueLock = stdx::unique_lock<stdx::mutex>;
 }  // namespace
 
 
-extern const int kInitialSyncMaxRetries;
+extern const std::size_t kInitialSyncMaxRetries;
+extern const std::size_t kInitialSyncMaxConnectRetries;
 
 // TODO: Remove forward declares once we remove rs_initialsync.cpp and other dependents.
 // Failpoint which fails initial sync and leaves an oplog entry in the buffer.
@@ -219,7 +221,8 @@ public:
      *
      *  This should be the first method called after construction (see class comment).
      */
-    StatusWith<OpTimeWithHash> doInitialSync(OperationContext* txn);
+    StatusWith<OpTimeWithHash> doInitialSync(OperationContext* txn,
+                                             std::size_t maxRetries = kInitialSyncMaxRetries);
 
     DataReplicatorState getState() const;
 
@@ -243,12 +246,18 @@ public:
 
     void _resetState_inlock(OperationContext* txn, OpTimeWithHash lastAppliedOpTime);
 
+    /**
+     * Overrides how executor schedules database work.
+     *
+     * For testing only.
+     */
+    void setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
+
 private:
     // Runs a single initial sync attempt.
     Status _runInitialSyncAttempt_inlock(OperationContext* txn,
                                          UniqueLock& lk,
-                                         const HostAndPort& syncSource,
-                                         RollbackChecker& rollbackChecker);
+                                         HostAndPort syncSource);
 
     void _setState(const DataReplicatorState& newState);
     void _setState_inlock(const DataReplicatorState& newState);
@@ -285,7 +294,7 @@ private:
                              const size_t numApplied);
 
     // Called when the DatabasesCloner finishes.
-    void _onDataClonerFinish(const Status& status);
+    void _onDataClonerFinish(const Status& status, HostAndPort syncSource);
     // Called after _onDataClonerFinish when the new Timestamp is avail, to use for minvalid.
     void _onApplierReadyStart(const QueryResponseStatus& fetchResult);
 
@@ -298,7 +307,7 @@ private:
     Status _scheduleReport();
 
     void _cancelAllHandles_inlock();
-    void _waitOnAndResetAll(UniqueLock& lk);
+    void _waitOnAndResetAll_inlock(UniqueLock* lk);
     bool _anyActiveHandles_inlock() const;
 
     Status _shutdown(OperationContext* txn);
@@ -338,6 +347,7 @@ private:
     std::unique_ptr<OplogBuffer> _oplogBuffer;                                  // (M)
     Event _onShutdown;                                                          // (M)
     Timestamp _rollbackCommonOptime;                                            // (MX)
+    CollectionCloner::ScheduleDbWorkFn _scheduleDbWorkFn;                       // (M)
 };
 
 }  // namespace repl

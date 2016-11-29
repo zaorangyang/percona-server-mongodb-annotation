@@ -735,7 +735,7 @@ Value ExpressionCompare::evaluateInternal(Variables* vars) const {
     Value pLeft(vpOperand[0]->evaluateInternal(vars));
     Value pRight(vpOperand[1]->evaluateInternal(vars));
 
-    int cmp = Value::compare(pLeft, pRight);
+    int cmp = getExpressionContext()->getValueComparator().compare(pLeft, pRight);
 
     // Make cmp one of 1, 0, or -1.
     if (cmp == 0) {
@@ -1596,6 +1596,9 @@ void ExpressionLet::addDependencies(DepsTracker* deps) const {
 
 void ExpressionLet::doInjectExpressionContext() {
     _subExpression->injectExpressionContext(getExpressionContext());
+    for (auto&& variable : _variables) {
+        variable.second.expression->injectExpressionContext(getExpressionContext());
+    }
 }
 
 
@@ -2478,6 +2481,15 @@ const char* ExpressionOr::getOpName() const {
 }
 
 /* ----------------------- ExpressionPow ---------------------------- */
+
+intrusive_ptr<Expression> ExpressionPow::create(Value base, Value exp) {
+    intrusive_ptr<ExpressionPow> expr(new ExpressionPow());
+    expr->vpOperand.push_back(
+        ExpressionConstant::create(expr->getExpressionContext(), std::move(base)));
+    expr->vpOperand.push_back(
+        ExpressionConstant::create(expr->getExpressionContext(), std::move(exp)));
+    return expr;
+}
 
 Value ExpressionPow::evaluateInternal(Variables* vars) const {
     Value baseVal = vpOperand[0]->evaluateInternal(vars);
@@ -3541,9 +3553,6 @@ const char* ExpressionSubtract::getOpName() const {
 /* ------------------------- ExpressionSwitch ------------------------------ */
 
 REGISTER_EXPRESSION(switch, ExpressionSwitch::parse);
-const char* ExpressionSwitch::getOpName() const {
-    return "$switch";
-}
 
 Value ExpressionSwitch::evaluateInternal(Variables* vars) const {
     for (auto&& branch : _branches) {
@@ -4115,7 +4124,4 @@ void ExpressionZip::doInjectExpressionContext() {
     }
 }
 
-const char* ExpressionZip::getOpName() const {
-    return "$zip";
-}
-}
+}  // namespace mongo

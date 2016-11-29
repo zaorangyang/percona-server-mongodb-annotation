@@ -38,7 +38,7 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/server_status_internal.h"
@@ -47,6 +47,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/transport/message_compressor_registry.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostname_canonicalization_worker.h"
@@ -97,7 +98,7 @@ public:
         const auto runStart = clock->now();
         BSONObjBuilder timeBuilder(256);
 
-        const auto authSession = AuthorizationSession::get(ClientBasic::getCurrent());
+        const auto authSession = AuthorizationSession::get(Client::getCurrent());
         auto canonicalizer = HostnameCanonicalizationWorker::get(service);
 
         // --- basic fields that are global
@@ -287,6 +288,7 @@ public:
     BSONObj generateSection(OperationContext* txn, const BSONElement& configElement) const {
         BSONObjBuilder b;
         networkCounter.append(b);
+        appendMessageCompressionStats(&b);
         return b.obj();
     }
 

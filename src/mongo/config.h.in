@@ -76,5 +76,8 @@
 // Defined if SSL support is enabled
 @mongo_config_ssl@
 
+// Defined if OpenSSL has SEQUENCE_ANY
+@mongo_config_ssl_has_asn1_any_definitions@
+
 // Defined if WiredTiger storage engine is enabled
 @mongo_config_wiredtiger_enabled@

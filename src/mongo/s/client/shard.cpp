@@ -89,6 +89,8 @@ Status Shard::CommandResponse::processBatchWriteResponse(
     return status;
 }
 
+const Milliseconds Shard::kDefaultConfigCommandTimeout = Seconds{30};
+
 Shard::Shard(const ShardId& id) : _id(id) {}
 
 const ShardId Shard::getId() const {
@@ -104,13 +106,24 @@ StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* txn,
                                                      const std::string& dbName,
                                                      const BSONObj& cmdObj,
                                                      RetryPolicy retryPolicy) {
+    return runCommand(txn, readPref, dbName, cmdObj, Milliseconds::max(), retryPolicy);
+}
+
+StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* txn,
+                                                     const ReadPreferenceSetting& readPref,
+                                                     const std::string& dbName,
+                                                     const BSONObj& cmdObj,
+                                                     Milliseconds maxTimeMSOverride,
+                                                     RetryPolicy retryPolicy) {
     for (int retry = 1; retry <= kOnErrorNumRetries; ++retry) {
-        auto swCmdResponse = _runCommand(txn, readPref, dbName, cmdObj).commandResponse;
+        auto hostWithResponse = _runCommand(txn, readPref, dbName, maxTimeMSOverride, cmdObj);
+        auto swCmdResponse = std::move(hostWithResponse.commandResponse);
         auto commandStatus = _getEffectiveCommandStatus(swCmdResponse);
 
         if (retry < kOnErrorNumRetries && isRetriableError(commandStatus.code(), retryPolicy)) {
-            LOG(2) << "Command " << cmdObj << " failed with retriable error and will be retried"
-                   << causedBy(commandStatus);
+            LOG(2) << "Command " << redact(cmdObj)
+                   << " failed with retriable error and will be retried"
+                   << causedBy(redact(commandStatus));
             continue;
         }
 
@@ -119,17 +132,21 @@ StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* txn,
     MONGO_UNREACHABLE;
 }
 
-BatchedCommandResponse Shard::runBatchWriteCommand(OperationContext* txn,
-                                                   const BatchedCommandRequest& batchRequest,
-                                                   RetryPolicy retryPolicy) {
+BatchedCommandResponse Shard::runBatchWriteCommandOnConfig(
+    OperationContext* txn, const BatchedCommandRequest& batchRequest, RetryPolicy retryPolicy) {
+    invariant(isConfig());
+
     const std::string dbname = batchRequest.getNS().db().toString();
     invariant(batchRequest.sizeWriteOps() == 1);
 
     const BSONObj cmdObj = batchRequest.toBSON();
 
     for (int retry = 1; retry <= kOnErrorNumRetries; ++retry) {
-        auto response =
-            _runCommand(txn, ReadPreferenceSetting{ReadPreference::PrimaryOnly}, dbname, cmdObj);
+        auto response = _runCommand(txn,
+                                    ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                    dbname,
+                                    kDefaultConfigCommandTimeout,
+                                    cmdObj);
 
         BatchedCommandResponse batchResponse;
         Status writeStatus =
@@ -141,7 +158,7 @@ BatchedCommandResponse Shard::runBatchWriteCommand(OperationContext* txn,
 
         if (retry < kOnErrorNumRetries && isRetriableError(writeStatus.code(), retryPolicy)) {
             LOG(2) << "Batch write command failed with retriable error and will be retried"
-                   << causedBy(writeStatus);
+                   << causedBy(redact(writeStatus));
             continue;
         }
 
@@ -158,6 +175,9 @@ StatusWith<Shard::QueryResponse> Shard::exhaustiveFindOnConfig(
     const BSONObj& query,
     const BSONObj& sort,
     const boost::optional<long long> limit) {
+    // Do not allow exhaustive finds to be run against regular shards.
+    invariant(isConfig());
+
     for (int retry = 1; retry <= kOnErrorNumRetries; retry++) {
         auto result =
             _exhaustiveFindOnConfig(txn, readPref, readConcernLevel, nss, query, sort, limit);
@@ -169,7 +189,6 @@ StatusWith<Shard::QueryResponse> Shard::exhaustiveFindOnConfig(
 
         return result;
     }
-
     MONGO_UNREACHABLE;
 }
 

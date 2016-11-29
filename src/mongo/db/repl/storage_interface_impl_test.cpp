@@ -28,6 +28,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/optional.hpp>
 #include <memory>
 
 #include "mongo/bson/bsonmisc.h"
@@ -168,13 +169,11 @@ protected:
 private:
     void setUp() override {
         ServiceContextMongoDTest::setUp();
-        // Initializes cc() used in ServiceContextMongoD::_newOpCtx().
-        Client::initThreadIfNotAlready("StorageInterfaceImplTest");
 
         ReplSettings settings;
         settings.setOplogSizeBytes(5 * 1024 * 1024);
         settings.setReplSetString("mySet/node1:12345");
-        ReplicationCoordinator::set(getGlobalServiceContext(),
+        ReplicationCoordinator::set(getServiceContext(),
                                     stdx::make_unique<ReplicationCoordinatorMock>(settings));
     }
 };
@@ -183,7 +182,6 @@ class StorageInterfaceImplWithReplCoordTest : public ServiceContextMongoDTest {
 protected:
     void setUp() override {
         ServiceContextMongoDTest::setUp();
-        Client::initThreadIfNotAlready();
         createOptCtx();
         _coordinator = new ReplicationCoordinatorMock(createReplSettings());
         setGlobalReplicationCoordinator(_coordinator);
@@ -195,7 +193,6 @@ protected:
 
 
     void createOptCtx() {
-        Client::initThreadIfNotAlready();
         _txn = cc().makeOperationContext();
         // We are not replicating nor validating these writes.
         _txn->setReplicatedWrites(false);
@@ -228,7 +225,7 @@ bool RecoveryUnitWithDurabilityTracking::waitUntilDurable() {
 }
 
 TEST_F(StorageInterfaceImplTest, ServiceContextDecorator) {
-    auto serviceContext = getGlobalServiceContext();
+    auto serviceContext = getServiceContext();
     ASSERT_FALSE(StorageInterface::get(serviceContext));
     StorageInterface* storageInterface = new StorageInterfaceImpl();
     StorageInterface::set(serviceContext, std::unique_ptr<StorageInterface>(storageInterface));
@@ -331,10 +328,10 @@ TEST_F(StorageInterfaceImplTest, MinValid) {
     ASSERT_TRUE(recoveryUnit->waitUntilDurableCalled);
 }
 
-TEST_F(StorageInterfaceImplTest, SnapshotNotSupported) {
+TEST_F(StorageInterfaceImplTest, SnapshotSupported) {
     auto txn = getClient()->makeOperationContext();
     Status status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
-    ASSERT_EQUALS(status, ErrorCodes::CommandNotSupported);
+    ASSERT(status.isOK());
 }
 
 TEST_F(StorageInterfaceImplTest,
@@ -549,19 +546,19 @@ TEST_F(StorageInterfaceImplWithReplCoordTest, FindOneReturnsInvalidNamespaceIfCo
     auto txn = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto keyPattern = BSON("_id" << 1);
+    auto indexName = "_id_"_sd;
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  storage.findOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kForward));
+                  storage.findOne(txn, nss, indexName, StorageInterface::ScanDirection::kForward));
 }
 
 TEST_F(StorageInterfaceImplWithReplCoordTest, FindOneReturnsIndexNotFoundIfIndexIsMissing) {
     auto txn = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto keyPattern = BSON("x" << 1);
+    auto indexName = "nonexistent"_sd;
     ASSERT_OK(storage.createCollection(txn, nss, CollectionOptions()));
     ASSERT_EQUALS(ErrorCodes::IndexNotFound,
-                  storage.findOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kForward));
+                  storage.findOne(txn, nss, indexName, StorageInterface::ScanDirection::kForward));
 }
 
 TEST_F(StorageInterfaceImplWithReplCoordTest,
@@ -581,19 +578,19 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
     std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 1), BSON("_id" << 2)};
     ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end()));
     ASSERT_OK(loader->commit());
-    auto keyPattern = BSON("x" << 1);
+    auto indexName = "x_1"_sd;
     ASSERT_EQUALS(ErrorCodes::IndexOptionsConflict,
-                  storage.findOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kForward));
+                  storage.findOne(txn, nss, indexName, StorageInterface::ScanDirection::kForward));
 }
 
 TEST_F(StorageInterfaceImplWithReplCoordTest, FindOneReturnsCollectionIsEmptyIfCollectionIsEmpty) {
     auto txn = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto keyPattern = BSON("_id" << 1);
+    auto indexName = "_id_"_sd;
     ASSERT_OK(storage.createCollection(txn, nss, CollectionOptions()));
     ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty,
-                  storage.findOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kForward));
+                  storage.findOne(txn, nss, indexName, StorageInterface::ScanDirection::kForward));
 }
 
 TEST_F(StorageInterfaceImplWithReplCoordTest,
@@ -601,12 +598,12 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
     auto txn = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto keyPattern = BSON("_id" << 1);
+    auto indexName = "_id_"_sd;
     ASSERT_OK(storage.createCollection(txn, nss, CollectionOptions()));
     ASSERT_OK(
         storage.insertDocuments(txn, nss, {BSON("_id" << 0), BSON("_id" << 1), BSON("_id" << 2)}));
     ASSERT_EQUALS(BSON("_id" << 0),
-                  storage.findOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kForward));
+                  storage.findOne(txn, nss, indexName, StorageInterface::ScanDirection::kForward));
 
     // Check collection contents. OplogInterface returns documents in reverse natural order.
     OplogInterfaceLocal oplog(txn, nss.ns());
@@ -622,13 +619,12 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
     auto txn = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto keyPattern = BSON("_id" << 1);
+    auto indexName = "_id_"_sd;
     ASSERT_OK(storage.createCollection(txn, nss, CollectionOptions()));
     ASSERT_OK(
         storage.insertDocuments(txn, nss, {BSON("_id" << 0), BSON("_id" << 1), BSON("_id" << 2)}));
-    ASSERT_EQUALS(
-        BSON("_id" << 2),
-        storage.findOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kBackward));
+    ASSERT_EQUALS(BSON("_id" << 2),
+                  storage.findOne(txn, nss, indexName, StorageInterface::ScanDirection::kBackward));
 
     // Check collection contents. OplogInterface returns documents in reverse natural order.
     OplogInterfaceLocal oplog(txn, nss.ns());
@@ -647,8 +643,9 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
     ASSERT_OK(storage.createCollection(txn, nss, CollectionOptions()));
     ASSERT_OK(
         storage.insertDocuments(txn, nss, {BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 0)}));
-    ASSERT_EQUALS(BSON("_id" << 1),
-                  storage.findOne(txn, nss, BSONObj(), StorageInterface::ScanDirection::kForward));
+    ASSERT_EQUALS(
+        BSON("_id" << 1),
+        storage.findOne(txn, nss, boost::none, StorageInterface::ScanDirection::kForward));
 
     // Check collection contents. OplogInterface returns documents in reverse natural order.
     OplogInterfaceLocal oplog(txn, nss.ns());
@@ -667,8 +664,9 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
     ASSERT_OK(storage.createCollection(txn, nss, CollectionOptions()));
     ASSERT_OK(
         storage.insertDocuments(txn, nss, {BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 0)}));
-    ASSERT_EQUALS(BSON("_id" << 0),
-                  storage.findOne(txn, nss, BSONObj(), StorageInterface::ScanDirection::kBackward));
+    ASSERT_EQUALS(
+        BSON("_id" << 0),
+        storage.findOne(txn, nss, boost::none, StorageInterface::ScanDirection::kBackward));
 
     // Check collection contents. OplogInterface returns documents in reverse natural order.
     OplogInterfaceLocal oplog(txn, nss.ns());
@@ -684,21 +682,21 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
     auto txn = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto keyPattern = BSON("_id" << 1);
+    auto indexName = "_id_"_sd;
     ASSERT_EQUALS(
         ErrorCodes::NamespaceNotFound,
-        storage.deleteOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kForward));
+        storage.deleteOne(txn, nss, indexName, StorageInterface::ScanDirection::kForward));
 }
 
 TEST_F(StorageInterfaceImplWithReplCoordTest, DeleteOneReturnsIndexNotFoundIfIndexIsMissing) {
     auto txn = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto keyPattern = BSON("x" << 1);
+    auto indexName = "nonexistent"_sd;
     ASSERT_OK(storage.createCollection(txn, nss, CollectionOptions()));
     ASSERT_EQUALS(
         ErrorCodes::IndexNotFound,
-        storage.deleteOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kForward));
+        storage.deleteOne(txn, nss, indexName, StorageInterface::ScanDirection::kForward));
 }
 
 TEST_F(StorageInterfaceImplWithReplCoordTest,
@@ -706,11 +704,11 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
     auto txn = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto keyPattern = BSON("_id" << 1);
+    auto indexName = "_id_"_sd;
     ASSERT_OK(storage.createCollection(txn, nss, CollectionOptions()));
     ASSERT_EQUALS(
         ErrorCodes::CollectionIsEmpty,
-        storage.deleteOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kForward));
+        storage.deleteOne(txn, nss, indexName, StorageInterface::ScanDirection::kForward));
 }
 
 TEST_F(StorageInterfaceImplWithReplCoordTest,
@@ -718,13 +716,13 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
     auto txn = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto keyPattern = BSON("_id" << 1);
+    auto indexName = "_id_"_sd;
     ASSERT_OK(storage.createCollection(txn, nss, CollectionOptions()));
     ASSERT_OK(
         storage.insertDocuments(txn, nss, {BSON("_id" << 0), BSON("_id" << 1), BSON("_id" << 2)}));
     ASSERT_EQUALS(
         BSON("_id" << 0),
-        storage.deleteOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kForward));
+        storage.deleteOne(txn, nss, indexName, StorageInterface::ScanDirection::kForward));
 
     // Check collection contents. OplogInterface returns documents in reverse natural order.
     OplogInterfaceLocal oplog(txn, nss.ns());
@@ -739,13 +737,13 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
     auto txn = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto keyPattern = BSON("_id" << 1);
+    auto indexName = "_id_"_sd;
     ASSERT_OK(storage.createCollection(txn, nss, CollectionOptions()));
     ASSERT_OK(
         storage.insertDocuments(txn, nss, {BSON("_id" << 0), BSON("_id" << 1), BSON("_id" << 2)}));
     ASSERT_EQUALS(
         BSON("_id" << 2),
-        storage.deleteOne(txn, nss, keyPattern, StorageInterface::ScanDirection::kBackward));
+        storage.deleteOne(txn, nss, indexName, StorageInterface::ScanDirection::kBackward));
 
     // Check collection contents. OplogInterface returns documents in reverse natural order.
     OplogInterfaceLocal oplog(txn, nss.ns());
@@ -765,7 +763,7 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
         storage.insertDocuments(txn, nss, {BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 0)}));
     ASSERT_EQUALS(
         BSON("_id" << 1),
-        storage.deleteOne(txn, nss, BSONObj(), StorageInterface::ScanDirection::kForward));
+        storage.deleteOne(txn, nss, boost::none, StorageInterface::ScanDirection::kForward));
 
     // Check collection contents. OplogInterface returns documents in reverse natural order.
     OplogInterfaceLocal oplog(txn, nss.ns());
@@ -785,7 +783,7 @@ TEST_F(StorageInterfaceImplWithReplCoordTest,
         storage.insertDocuments(txn, nss, {BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 0)}));
     ASSERT_EQUALS(
         BSON("_id" << 0),
-        storage.deleteOne(txn, nss, BSONObj(), StorageInterface::ScanDirection::kBackward));
+        storage.deleteOne(txn, nss, boost::none, StorageInterface::ScanDirection::kBackward));
 
     // Check collection contents. OplogInterface returns documents in reverse natural order.
     OplogInterfaceLocal oplog(txn, nss.ns());

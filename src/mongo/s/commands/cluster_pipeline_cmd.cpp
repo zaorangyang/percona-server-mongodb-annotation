@@ -43,6 +43,9 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/views/resolved_view.h"
+#include "mongo/db/views/view.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/platform/random.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -93,7 +96,7 @@ public:
     }
 
     // virtuals from Command
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) final {
         return Pipeline::checkAuthForCommand(client, dbname, cmdObj);
@@ -115,7 +118,7 @@ public:
         shared_ptr<DBConfig> conf = status.getValue();
 
         if (!conf->isShardingEnabled()) {
-            return aggPassthrough(txn, conf, cmdObj, result, options);
+            return aggPassthrough(txn, dbname, conf, cmdObj, result, options, errmsg);
         }
 
         auto request = AggregationRequest::parseFromBSON(NamespaceString(fullns), cmdObj);
@@ -132,28 +135,63 @@ public:
         if (!pipeline.isOK()) {
             return appendCommandStatus(result, pipeline.getStatus());
         }
-        pipeline.getValue()->optimizePipeline();
 
         for (auto&& ns : pipeline.getValue()->getInvolvedCollections()) {
             uassert(
                 28769, str::stream() << ns.ns() << " cannot be sharded", !conf->isSharded(ns.ns()));
+            // We won't try to execute anything on a mongos, but we still have to populate this map
+            // so that any $lookups etc will be able to have a resolved view definition. It's okay
+            // that this is incorrect, we will repopulate the real resolved namespace map on the
+            // mongod.
+            // TODO SERVER-25038 This should become unnecessary once we can get the involved
+            // namespaces before parsing.
+            mergeCtx->resolvedNamespaces[ns.coll()] = {ns, std::vector<BSONObj>{}};
         }
 
         if (!conf->isSharded(fullns)) {
-            return aggPassthrough(txn, conf, cmdObj, result, options);
+            return aggPassthrough(txn, dbname, conf, cmdObj, result, options, errmsg);
         }
 
-        // If the first $match stage is an exact match on the shard key, we only have to send it
-        // to one shard, so send the command to that shard.
-        BSONObj firstMatchQuery = pipeline.getValue()->getInitialQuery();
         ChunkManagerPtr chunkMgr = conf->getChunkManager(txn, fullns);
-        BSONObj shardKeyMatches = uassertStatusOK(
+
+        // If there was no collation specified, but there is a default collation for the collation,
+        // use that.
+        if (request.getValue().getCollation().isEmpty() && chunkMgr->getDefaultCollator()) {
+            mergeCtx->setCollator(chunkMgr->getDefaultCollator()->clone());
+        }
+
+        // Now that we know the collation we'll be using, inject the ExpressionContext and optimize.
+        // TODO SERVER-25038: this must happen before we parse the pipeline, since we can make
+        // string comparisons during parse time.
+        pipeline.getValue()->injectExpressionContext(mergeCtx);
+        pipeline.getValue()->optimizePipeline();
+
+        // If the first $match stage is an exact match on the shard key (with a simple collation or
+        // no string matching), we only have to send it to one shard, so send the command to that
+        // shard.
+        BSONObj firstMatchQuery = pipeline.getValue()->getInitialQuery();
+        BSONObj shardKeyMatches;
+        shardKeyMatches = uassertStatusOK(
             chunkMgr->getShardKeyPattern().extractShardKeyFromQuery(txn, firstMatchQuery));
+        bool singleShard = false;
+        if (!shardKeyMatches.isEmpty()) {
+            try {
+                auto chunk =
+                    chunkMgr->findIntersectingChunk(txn, shardKeyMatches, mergeCtx->getCollator());
+                singleShard = true;
+            } catch (const MsgAssertionException& msg) {
+                if (msg.getCode() == ErrorCodes::ShardKeyNotFound) {
+                    singleShard = false;
+                } else {
+                    throw msg;
+                }
+            }
+        }
 
         // Don't need to split pipeline if the first $match is an exact match on shard key, unless
         // there is a stage that needs to be run on the primary shard.
         const bool needPrimaryShardMerger = pipeline.getValue()->needsPrimaryShardMerger();
-        const bool needSplit = shardKeyMatches.isEmpty() || needPrimaryShardMerger;
+        const bool needSplit = !singleShard || needPrimaryShardMerger;
 
         // Split the pipeline into pieces for mongod(s) and this mongos. If needSplit is true,
         // 'pipeline' will become the merger side.
@@ -185,8 +223,14 @@ public:
         // Run the command on the shards
         // TODO need to make sure cursors are killed if a retry is needed
         vector<Strategy::CommandResult> shardResults;
-        Strategy::commandOp(
-            txn, dbname, shardedCommand, options, fullns, shardQuery, &shardResults);
+        Strategy::commandOp(txn,
+                            dbname,
+                            shardedCommand,
+                            options,
+                            fullns,
+                            shardQuery,
+                            request.getValue().getCollation(),
+                            &shardResults);
 
         if (mergeCtx->isExplain) {
             // This must be checked before we start modifying result.
@@ -243,6 +287,16 @@ public:
 
         // Not propagating readConcern to merger since it doesn't do local reads.
 
+        // If the user didn't specify a collation already, make sure there's a collation attached to
+        // the merge command, since the merging shard may not have the collection metadata.
+        if (mergeCmd.peek()["collation"].missing()) {
+            mergeCmd.setField("collation",
+                              mergeCtx->getCollator()
+                                  ? Value(mergeCtx->getCollator()->getSpec().toBSON())
+                                  : Value(Document{{CollationSpec::kLocaleField,
+                                                    CollationSpec::kSimpleBinaryComparison}}));
+        }
+
         string outputNsOrEmpty;
         if (DocumentSourceOut* out =
                 dynamic_cast<DocumentSourceOut*>(pipeline.getValue()->output())) {
@@ -287,10 +341,12 @@ private:
     BSONObj aggRunCommand(DBClientBase* conn, const string& db, BSONObj cmd, int queryOptions);
 
     bool aggPassthrough(OperationContext* txn,
+                        const std::string& dbname,
                         shared_ptr<DBConfig> conf,
                         BSONObj cmd,
                         BSONObjBuilder& result,
-                        int queryOptions);
+                        int queryOptions,
+                        std::string& errmsg);
 } clusterPipelineCmd;
 
 std::vector<DocumentSourceMergeCursors::CursorDescriptor> PipelineCommand::parseCursors(
@@ -385,10 +441,10 @@ void PipelineCommand::killAllCursors(const vector<Strategy::CommandResult>& shar
             conn.done();
         } catch (const DBException& e) {
             log() << "Couldn't kill aggregation cursor on shard: " << shardResults[i].target
-                  << " due to DBException: " << e.toString();
+                  << " due to DBException: " << redact(e);
         } catch (const std::exception& e) {
             log() << "Couldn't kill aggregation cursor on shard: " << shardResults[i].target
-                  << " due to std::exception: " << e.what();
+                  << " due to std::exception: " << redact(e.what());
         } catch (...) {
             log() << "Couldn't kill aggregation cursor on shard: " << shardResults[i].target
                   << " due to non-exception";
@@ -432,14 +488,16 @@ BSONObj PipelineCommand::aggRunCommand(DBClientBase* conn,
 }
 
 bool PipelineCommand::aggPassthrough(OperationContext* txn,
+                                     const std::string& dbname,
                                      shared_ptr<DBConfig> conf,
-                                     BSONObj cmd,
+                                     BSONObj cmdObj,
                                      BSONObjBuilder& out,
-                                     int queryOptions) {
+                                     int queryOptions,
+                                     std::string& errmsg) {
     // Temporary hack. See comment on declaration for details.
     const auto shard = grid.shardRegistry()->getShard(txn, conf->getPrimaryId());
     ShardConnection conn(shard->getConnString(), "");
-    BSONObj result = aggRunCommand(conn.get(), conf->name(), cmd, queryOptions);
+    BSONObj result = aggRunCommand(conn.get(), conf->name(), cmdObj, queryOptions);
     conn.done();
 
     // First append the properly constructed writeConcernError. It will then be skipped
@@ -449,6 +507,28 @@ bool PipelineCommand::aggPassthrough(OperationContext* txn,
     }
 
     out.appendElementsUnique(result);
+
+    BSONObj responseObj = out.asTempObj();
+    if (ResolvedView::isResolvedViewErrorResponse(responseObj)) {
+        auto resolvedView = ResolvedView::fromBSON(responseObj);
+
+        auto request = AggregationRequest::parseFromBSON(resolvedView.getNamespace(), cmdObj);
+        if (!request.isOK()) {
+            out.resetToEmpty();
+            return appendCommandStatus(out, request.getStatus());
+        }
+
+        auto aggCmd = resolvedView.asExpandedViewAggregation(request.getValue());
+        if (!aggCmd.isOK()) {
+            out.resetToEmpty();
+            return appendCommandStatus(out, aggCmd.getStatus());
+        }
+
+        out.resetToEmpty();
+        return Command::findCommand("aggregate")
+            ->run(txn, dbname, aggCmd.getValue(), queryOptions, errmsg, out);
+    }
+
     return result["ok"].trueValue();
 }
 

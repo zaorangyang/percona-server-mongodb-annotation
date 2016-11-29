@@ -17,11 +17,13 @@ env.Library(
     source=[
         'session.cpp',
         'ticket.cpp',
+        'transport_layer.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/unittest/unittest',
         '$BUILD_DIR/mongo/util/foundation',
         '$BUILD_DIR/mongo/util/net/network',
+        '$BUILD_DIR/mongo/transport/message_compressor',
     ],
 )
 
@@ -89,3 +91,40 @@ env.CppUnitTest(
         'service_entry_point_test_suite',
     ],
 )
+
+env.CppUnitTest(
+    target='transport_layer_mock_test',
+    source=[
+        'transport_layer_mock_test.cpp',
+    ],
+    LIBDEPS=[
+        'transport_layer_mock',
+    ],
+)
+
+env.Library(
+    target='message_compressor',
+    source=[
+        'message_compressor_manager.cpp',
+        'message_compressor_metrics.cpp',
+        'message_compressor_registry.cpp',
+        'message_compressor_snappy.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
+        '$BUILD_DIR/third_party/shim_snappy',
+    ]
+)
+
+env.CppUnitTest(
+    target='message_compressor_test',
+    source=[
+        'message_compressor_manager_test.cpp',
+        'message_compressor_registry_test.cpp',
+    ],
+    LIBDEPS=[
+        'message_compressor',
+    ]
+)
+

@@ -42,6 +42,7 @@
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/transport/message_compressor_manager.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/abstract_message_port.h"
 #include "mongo/util/net/message.h"
@@ -691,12 +692,6 @@ public:
     std::list<std::string> getDatabaseNames();
 
     /**
-     * Get a list of all the current collections in db.
-     * Returns fully qualified names.
-     */
-    std::list<std::string> getCollectionNames(const std::string& db);
-
-    /**
      * { name : "<short collection name>",
      *   options : { }
      * }
@@ -975,7 +970,9 @@ public:
      * @param errmsg any relevant error message will appended to the string
      * @return false if fails to connect.
      */
-    virtual bool connect(const HostAndPort& server, std::string& errmsg);
+    virtual bool connect(const HostAndPort& server,
+                         StringData applicationName,
+                         std::string& errmsg);
 
     /**
      * Semantically equivalent to the previous connect method, but returns a Status
@@ -986,7 +983,7 @@ public:
      * @param a hook to validate the 'isMaster' reply received during connection. If the hook
      * fails, the connection will be terminated and a non-OK status will be returned.
      */
-    Status connect(const HostAndPort& server);
+    Status connect(const HostAndPort& server, StringData applicationName);
 
     /**
      * This version of connect does not run 'isMaster' after creating a TCP connection to the
@@ -1117,6 +1114,10 @@ public:
 
     uint64_t getSockCreationMicroSec() const;
 
+    MessageCompressorManager& getCompressorManager() {
+        return _compressorManager;
+    }
+
 protected:
     int _minWireVersion{0};
     int _maxWireVersion{0};
@@ -1131,6 +1132,7 @@ protected:
 
     HostAndPort _serverAddress;
     std::string _resolvedAddress;
+    std::string _applicationName;
 
     void _checkConnection();
 
@@ -1159,6 +1161,8 @@ private:
 
     // Hook ran on every call to connect()
     HandshakeValidationHook _hook;
+
+    MessageCompressorManager _compressorManager;
 };
 
 BSONElement getErrField(const BSONObj& result);

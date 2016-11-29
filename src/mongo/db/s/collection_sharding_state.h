@@ -57,11 +57,22 @@ class CollectionShardingState {
 
 public:
     /**
-     * Instantiates a new per-collection sharding state with some initial metadata.
+     * Instantiates a new per-collection sharding state as unsharded.
      */
-    CollectionShardingState(NamespaceString nss,
-                            std::unique_ptr<CollectionMetadata> initialMetadata);
+    CollectionShardingState(ServiceContext* sc, NamespaceString nss);
     ~CollectionShardingState();
+
+    /**
+     * Holds information used for tracking document removals during chunk migration.
+     */
+    struct DeleteState {
+        // Contains the _id field of the document being deleted.
+        BSONObj idDoc;
+
+        // True if the document being deleted belongs to a chunk which is currently being migrated
+        // out of this shard.
+        bool isMigrating = false;
+    };
 
     /**
      * Obtains the sharding state for the specified collection. If it does not exist, it will be
@@ -79,9 +90,27 @@ public:
     ScopedCollectionMetadata getMetadata();
 
     /**
-     * Set a new metadata to be used for this collection.
+     * Updates the metadata based on changes received from the config server and also resolves the
+     * pending receives map in case some of these pending receives have completed or have been
+     * abandoned.
+     *
+     * Must always be called with an exclusive collection lock.
      */
-    void setMetadata(std::unique_ptr<CollectionMetadata> newMetadata);
+    void refreshMetadata(OperationContext* txn, std::unique_ptr<CollectionMetadata> newMetadata);
+
+    /**
+     * Modifies the collection's sharding state to indicate that it is beginning to receive the
+     * given ChunkRange.
+     */
+    void beginReceive(const ChunkRange& range);
+
+    /*
+     * Modifies the collection's sharding state to indicate that the previous pending migration
+     * failed. If the range was not previously pending, this function will crash the server.
+     *
+     * This function is the mirror image of beginReceive.
+     */
+    void forgetReceive(const ChunkRange& range);
 
     /**
      * Returns the active migration source manager, if one is available.
@@ -113,6 +142,12 @@ public:
      */
     void checkShardVersionOrThrow(OperationContext* txn);
 
+    /**
+     * Returns whether this collection is sharded. Valid only if mongoD is primary.
+     * TODO SERVER-24960: This method may return a false positive until SERVER-24960 is fixed.
+     */
+    bool collectionIsSharded();
+
     // Replication subsystem hooks. If this collection is serving as a source for migration, these
     // methods inform it of any changes to its contents.
 
@@ -122,9 +157,11 @@ public:
 
     void onUpdateOp(OperationContext* txn, const BSONObj& updatedDoc);
 
-    void onDeleteOp(OperationContext* txn, const BSONObj& deletedDocId);
+    void onDeleteOp(OperationContext* txn, const DeleteState& deleteState);
 
 private:
+    friend class CollectionRangeDeleter;
+
     /**
      * Checks whether the shard version of the operation matches that of the collection.
      *
@@ -146,6 +183,7 @@ private:
     // Namespace to which this state belongs.
     const NamespaceString _nss;
 
+    // Contains all the metadata associated with this collection.
     MetadataManager _metadataManager;
 
     // If this collection is serving as a source shard for chunk migration, this value will be

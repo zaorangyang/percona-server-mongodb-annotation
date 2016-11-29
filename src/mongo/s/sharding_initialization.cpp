@@ -73,6 +73,8 @@ using executor::NetworkInterfaceThreadPool;
 using executor::TaskExecutorPool;
 using executor::ThreadPoolTaskExecutor;
 
+static constexpr auto kRetryInterval = Seconds{2};
+
 std::unique_ptr<ThreadPoolTaskExecutor> makeTaskExecutor(std::unique_ptr<NetworkInterface> net) {
     auto netPtr = net.get();
     return stdx::make_unique<ThreadPoolTaskExecutor>(
@@ -95,13 +97,13 @@ std::unique_ptr<ShardingCatalogClient> makeCatalogClient(ServiceContext* service
 
 std::unique_ptr<TaskExecutorPool> makeTaskExecutorPool(
     std::unique_ptr<NetworkInterface> fixedNet,
-    std::unique_ptr<rpc::EgressMetadataHook> metadataHook) {
+    rpc::ShardingEgressMetadataHookBuilder metadataHookBuilder) {
     std::vector<std::unique_ptr<executor::TaskExecutor>> executors;
     for (size_t i = 0; i < TaskExecutorPool::getSuggestedPoolSize(); ++i) {
         auto net = executor::makeNetworkInterface(
             "NetworkInterfaceASIO-TaskExecutorPool-" + std::to_string(i),
             stdx::make_unique<ShardingNetworkConnectionHook>(),
-            std::move(metadataHook));
+            metadataHookBuilder());
         auto netPtr = net.get();
         auto exec = stdx::make_unique<ThreadPoolTaskExecutor>(
             stdx::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
@@ -148,7 +150,7 @@ Status initializeGlobalShardingState(OperationContext* txn,
                                        stdx::make_unique<ShardingNetworkConnectionHook>(),
                                        hookBuilder());
     auto networkPtr = network.get();
-    auto executorPool = makeTaskExecutorPool(std::move(network), hookBuilder());
+    auto executorPool = makeTaskExecutorPool(std::move(network), hookBuilder);
     executorPool->startup();
 
     auto shardRegistry(stdx::make_unique<ShardRegistry>(std::move(shardFactory), configCS));
@@ -172,6 +174,9 @@ Status initializeGlobalShardingState(OperationContext* txn,
         stdx::make_unique<BalancerConfiguration>(),
         std::move(executorPool),
         networkPtr);
+
+    // must be started once the grid is initialized
+    grid.shardRegistry()->startup();
 
     auto status = rawCatalogClient->startup();
     if (!status.isOK()) {
@@ -201,31 +206,19 @@ Status reloadShardRegistryUntilSuccess(OperationContext* txn) {
         }
 
         try {
-            auto status = ClusterIdentityLoader::get(txn)->loadClusterId(
-                txn, repl::ReadConcernLevel::kMajorityReadConcern);
-            if (!status.isOK()) {
-                warning()
-                    << "Error initializing sharding state, sleeping for 2 seconds and trying again"
-                    << causedBy(status);
-                sleepmillis(2000);
-                continue;
+            uassertStatusOK(ClusterIdentityLoader::get(txn)->loadClusterId(
+                txn, repl::ReadConcernLevel::kMajorityReadConcern));
+            if (grid.shardRegistry()->isUp()) {
+                return Status::OK();
             }
-
-            grid.shardRegistry()->reload(txn);
-            return Status::OK();
+            sleepFor(kRetryInterval);
+            continue;
         } catch (const DBException& ex) {
             Status status = ex.toStatus();
-            if (status == ErrorCodes::ReplicaSetNotFound) {
-                // ReplicaSetNotFound most likely means we've been waiting for the config replica
-                // set to come up for so long that the ReplicaSetMonitor stopped monitoring the set.
-                // Rebuild the config shard to force the monitor to resume monitoring the config
-                // servers.
-                grid.shardRegistry()->rebuildConfigShard();
-            }
             warning()
                 << "Error initializing sharding state, sleeping for 2 seconds and trying again"
                 << causedBy(status);
-            sleepmillis(2000);
+            sleepFor(kRetryInterval);
             continue;
         }
     }

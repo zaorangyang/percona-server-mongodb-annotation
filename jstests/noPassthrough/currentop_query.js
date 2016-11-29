@@ -71,6 +71,8 @@
                     assert.commandWorked(result);
 
                     if (result.inprog.length === 1) {
+                        assert.eq(result.inprog[0].appName, "MongoDB Shell", tojson(result));
+
                         return true;
                     }
 
@@ -96,32 +98,42 @@
         var testList = [
             {
               test: function() {
-                  assert.eq(
-                      db.currentop_query.aggregate([{$match: {a: 1, $comment: "currentop_query"}}])
-                          .itcount(),
-                      1);
+                  assert.eq(db.currentop_query
+                                .aggregate([{$match: {a: 1, $comment: "currentop_query"}}],
+                                           {collation: {locale: "fr"}})
+                                .itcount(),
+                            1);
               },
               command: "aggregate",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.pipeline.0.$match.$comment": "currentop_query"}
+              currentOpFilter: {
+                  "query.pipeline.0.$match.$comment": "currentop_query",
+                  "query.collation": {locale: "fr"}
+              }
             },
             {
               test: function() {
-                  assert.eq(db.currentop_query.find({a: 1, $comment: "currentop_query"}).count(),
+                  assert.eq(db.currentop_query.find({a: 1, $comment: "currentop_query"})
+                                .collation({locale: "fr"})
+                                .count(),
                             1);
               },
               command: "count",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.query.$comment": "currentop_query"}
+              currentOpFilter:
+                  {"query.query.$comment": "currentop_query", "query.collation": {locale: "fr"}}
             },
             {
               test: function() {
-                  assert.eq(db.currentop_query.distinct("a", {a: 1, $comment: "currentop_query"}),
-                            [1]);
+                  assert.eq(
+                      db.currentop_query.distinct(
+                          "a", {a: 1, $comment: "currentop_query"}, {collation: {locale: "fr"}}),
+                      [1]);
               },
               command: "distinct",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.query.$comment": "currentop_query"}
+              currentOpFilter:
+                  {"query.query.$comment": "currentop_query", "query.collation": {locale: "fr"}}
             },
             {
               test: function() {
@@ -134,14 +146,17 @@
             },
             {
               test: function() {
-                  assert.eq(
-                      db.currentop_query.findAndModify(
-                          {query: {a: 1, $comment: "currentop_query"}, update: {$inc: {b: 1}}}),
-                      {"_id": 1, "a": 1});
+                  assert.eq(db.currentop_query.findAndModify({
+                      query: {a: 1, $comment: "currentop_query"},
+                      update: {$inc: {b: 1}},
+                      collation: {locale: "fr"}
+                  }),
+                            {"_id": 1, "a": 1});
               },
               command: "findandmodify",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.query.$comment": "currentop_query"}
+              currentOpFilter:
+                  {"query.query.$comment": "currentop_query", "query.collation": {locale: "fr"}}
             },
             {
               test: function() {
@@ -149,13 +164,17 @@
                       key: {a: 1},
                       cond: {a: 1, $comment: "currentop_query"},
                       reduce: function() {},
-                      initial: {}
+                      initial: {},
+                      collation: {locale: "fr"}
                   }),
                             [{"a": 1}]);
               },
               command: "group",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.group.cond.$comment": "currentop_query"}
+              currentOpFilter: {
+                  "query.group.cond.$comment": "currentop_query",
+                  "query.group.collation": {locale: "fr"}
+              }
             },
             {
               test: function() {
@@ -166,28 +185,35 @@
                       function(a, b) {
                           return Array.sum(b);
                       },
-                      {query: {a: 1, $comment: "currentop_query"}, out: {inline: 1}}));
+                      {
+                        query: {a: 1, $comment: "currentop_query"},
+                        out: {inline: 1},
+                        collation: {locale: "fr"}
+                      }));
               },
               command: "mapreduce",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.query.$comment": "currentop_query"}
+              currentOpFilter:
+                  {"query.query.$comment": "currentop_query", "query.collation": {locale: "fr"}}
             },
             {
               test: function() {
-                  assert.writeOK(db.currentop_query.remove({a: 2, $comment: "currentop_query"}));
+                  assert.writeOK(db.currentop_query.remove({a: 2, $comment: "currentop_query"},
+                                                           {collation: {locale: "fr"}}));
               },
               operation: "remove",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.$comment": "currentop_query"}
+              currentOpFilter: {"query.$comment": "currentop_query", "collation": {locale: "fr"}}
             },
             {
               test: function() {
                   assert.writeOK(db.currentop_query.update({a: 1, $comment: "currentop_query"},
-                                                           {$inc: {b: 1}}));
+                                                           {$inc: {b: 1}},
+                                                           {collation: {locale: "fr"}}));
               },
               operation: "update",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.$comment": "currentop_query"}
+              currentOpFilter: {"query.$comment": "currentop_query", "collation": {locale: "fr"}}
             }
         ];
 
@@ -198,6 +224,25 @@
         }
 
         testList.forEach(confirmCurrentOpContents);
+
+        //
+        // Confirm currentOp contains collation for find command.
+        //
+        if (params.readMode === "commands") {
+            confirmCurrentOpContents({
+                test: function() {
+                    assert.eq(db.currentop_query.find({a: 1})
+                                  .comment("currentop_query")
+                                  .collation({locale: "fr"})
+                                  .itcount(),
+                              1);
+                },
+                command: "find",
+                planSummary: "COLLSCAN",
+                currentOpFilter:
+                    {"query.comment": "currentop_query", "query.collation": {locale: "fr"}}
+            });
+        }
 
         //
         // Confirm currentOp content for geoNear.
@@ -214,12 +259,14 @@
                     geoNear: "currentop_query",
                     near: {type: "Point", coordinates: [1, 1]},
                     spherical: true,
-                    query: {$comment: "currentop_query"}
+                    query: {$comment: "currentop_query"},
+                    collation: {locale: "fr"}
                 }));
             },
             command: "geoNear",
             planSummary: "GEO_NEAR_2DSPHERE { loc: \"2dsphere\" }",
-            currentOpFilter: {"query.query.$comment": "currentop_query"}
+            currentOpFilter:
+                {"query.query.$comment": "currentop_query", "query.collation": {locale: "fr"}}
         });
 
         //
@@ -294,5 +341,4 @@
 
     runTest({readMode: "commands"});
     runTest({readMode: "legacy"});
-
 })();

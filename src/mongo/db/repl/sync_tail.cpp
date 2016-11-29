@@ -81,6 +81,8 @@ using std::endl;
 
 namespace repl {
 
+std::atomic<int> SyncTail::replBatchLimitOperations{50 * 1000};  // NOLINT
+
 /**
  * This variable determines the number of writer threads SyncTail will have. It has a default
  * value, which varies based on architecture and can be overridden using the
@@ -94,7 +96,6 @@ int replWriterThreadCount = 2;
 #else
 #error need to include something that defines MONGO_PLATFORM_XX
 #endif
-}  // namespace
 
 class ExportedWriterThreadCountParameter
     : public ExportedServerParameter<int, ServerParameterType::kStartupOnly> {
@@ -113,6 +114,25 @@ public:
 
 } exportedWriterThreadCountParam;
 
+class ExportedBatchLimitOperationsParameter
+    : public ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime> {
+public:
+    ExportedBatchLimitOperationsParameter()
+        : ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime>(
+              ServerParameterSet::getGlobal(),
+              "replBatchLimitOperations",
+              &SyncTail::replBatchLimitOperations) {}
+
+    virtual Status validate(const int& potentialNewValue) {
+        if (potentialNewValue < 1 || potentialNewValue > (1000 * 1000)) {
+            return Status(ErrorCodes::BadValue,
+                          "replBatchLimitOperations must be between 1 and 1 million, inclusive");
+        }
+
+        return Status::OK();
+    }
+} exportedBatchLimitOperationsParam;
+}  // namespace
 
 static Counter64 opsAppliedStats;
 
@@ -124,7 +144,7 @@ static TimerStats applyBatchStats;
 static ServerStatusMetricField<TimerStats> displayOpBatchesApplied("repl.apply.batches",
                                                                    &applyBatchStats);
 void initializePrefetchThread() {
-    if (!ClientBasic::getCurrent()) {
+    if (!Client::getCurrent()) {
         Client::initThreadIfNotAlready();
         AuthorizationSession::get(cc())->grantInternalAuthorization();
     }
@@ -469,7 +489,7 @@ void applyOps(std::vector<MultiApplier::OperationPtrs>* writerVectors,
 
 void initializeWriterThread() {
     // Only do this once per thread
-    if (!ClientBasic::getCurrent()) {
+    if (!Client::getCurrent()) {
         Client::initThreadIfNotAlready();
         AuthorizationSession::get(cc())->grantInternalAuthorization();
     }
@@ -537,34 +557,49 @@ bool scheduleWritesToOplog(OperationContext* txn,
 }
 
 /**
- * A caching functor that returns true if a namespace refers to a capped collection.
- * Collections that don't exist are implicitly not capped.
+ * Caches per-collection properties which are relevant for oplog application, so that they don't
+ * have to be retrieved repeatedly for each op.
  */
-class CachingCappedChecker {
+class CachedCollectionProperties {
 public:
-    bool operator()(OperationContext* txn, const StringMapTraits::HashedKey& ns) {
+    struct CollectionProperties {
+        bool isCapped = false;
+        const CollatorInterface* collator = nullptr;
+    };
+
+    CollectionProperties getCollectionProperties(OperationContext* txn,
+                                                 const StringMapTraits::HashedKey& ns) {
         auto it = _cache.find(ns);
         if (it != _cache.end()) {
             return it->second;
         }
 
-        bool isCapped = isCappedImpl(txn, ns.key());
-        _cache[ns] = isCapped;
-        return isCapped;
+        auto collProperties = getCollectionPropertiesImpl(txn, ns.key());
+        _cache[ns] = collProperties;
+        return collProperties;
     }
 
 private:
-    bool isCappedImpl(OperationContext* txn, StringData ns) {
+    CollectionProperties getCollectionPropertiesImpl(OperationContext* txn, StringData ns) {
+        CollectionProperties collProperties;
+
         Lock::DBLock dbLock(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IS);
         auto db = dbHolder().get(txn, ns);
-        if (!db)
-            return false;
+        if (!db) {
+            return collProperties;
+        }
 
         auto collection = db->getCollection(ns);
-        return collection && collection->isCapped();
+        if (!collection) {
+            return collProperties;
+        }
+
+        collProperties.isCapped = collection->isCapped();
+        collProperties.collator = collection->getDefaultCollator();
+        return collProperties;
     }
 
-    StringMap<bool> _cache;
+    StringMap<CollectionProperties> _cache;
 };
 
 // This only modifies the isForCappedCollection field on each op. It does not alter the ops vector
@@ -576,26 +611,36 @@ void fillWriterVectors(OperationContext* txn,
         getGlobalServiceContext()->getGlobalStorageEngine()->supportsDocLocking();
     const uint32_t numWriters = writerVectors->size();
 
-    CachingCappedChecker isCapped;
+    CachedCollectionProperties collPropertiesCache;
 
     for (auto&& op : *ops) {
         StringMapTraits::HashedKey hashedNs(op.ns);
         uint32_t hash = hashedNs.hash();
 
-        // For doc locking engines, include the _id of the document in the hash so we get
-        // parallelism even if all writes are to a single collection. We can't do this for capped
-        // collections because the order of inserts is a guaranteed property, unlike for normal
-        // collections.
-        if (supportsDocLocking && op.isCrudOpType() && !isCapped(txn, hashedNs)) {
-            BSONElement id = op.getIdElement();
-            const size_t idHash = BSONElement::Hasher()(id);
-            MurmurHash3_x86_32(&idHash, sizeof(idHash), hash, &hash);
-        }
+        if (op.isCrudOpType()) {
+            auto collProperties = collPropertiesCache.getCollectionProperties(txn, hashedNs);
 
-        if (op.opType == "i" && isCapped(txn, hashedNs)) {
-            // Mark capped collection ops before storing them to ensure we do not attempt to bulk
-            // insert them.
-            op.isForCappedCollection = true;
+            // For doc locking engines, include the _id of the document in the hash so we get
+            // parallelism even if all writes are to a single collection.
+            //
+            // For capped collections, this is illegal, since capped collections must preserve
+            // insertion order.
+            //
+            // For collections with a non-simple default collation, this is also illegal, since we
+            // can't currently hash the _id BSONElement with respect to the collation.
+            // TODO SERVER-23990: Lift this restriction once there is a mechanism for
+            // collation-aware hashing of BSONElement.
+            if (supportsDocLocking && !collProperties.isCapped && !collProperties.collator) {
+                BSONElement id = op.getIdElement();
+                const size_t idHash = BSONElement::Hasher()(id);
+                MurmurHash3_x86_32(&idHash, sizeof(idHash), hash, &hash);
+            }
+
+            if (op.opType == "i" && collProperties.isCapped) {
+                // Mark capped collection ops before storing them to ensure we do not attempt to
+                // bulk insert them.
+                op.isForCappedCollection = true;
+            }
         }
 
         auto& writer = (*writerVectors)[hash % numWriters];
@@ -669,7 +714,10 @@ class SyncTail::OpQueueBatcher {
     MONGO_DISALLOW_COPYING(OpQueueBatcher);
 
 public:
-    explicit OpQueueBatcher(SyncTail* syncTail) : _syncTail(syncTail), _thread([&] { run(); }) {}
+    OpQueueBatcher(SyncTail* syncTail, stdx::function<bool()> shouldShutdown)
+        : _syncTail(syncTail), _thread([this, shouldShutdown] {
+              run([this, shouldShutdown] { return _inShutdown.load() || shouldShutdown(); });
+          }) {}
     ~OpQueueBatcher() {
         _inShutdown.store(true);
         _cv.notify_all();
@@ -692,14 +740,14 @@ public:
     }
 
 private:
-    void run() {
+    void run(stdx::function<bool()> shouldShutdown) {
         Client::initThread("ReplBatcher");
         const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
         OperationContext& txn = *txnPtr;
         const auto replCoord = ReplicationCoordinator::get(&txn);
         const auto fastClockSource = txn.getServiceContext()->getFastClockSource();
 
-        while (!_inShutdown.load()) {
+        while (!shouldShutdown()) {
             const auto batchStartTime = fastClockSource->now();
             const int slaveDelaySecs = durationCount<Seconds>(replCoord->getSlaveDelaySecs());
 
@@ -711,7 +759,7 @@ private:
                     const auto batchDuration = fastClockSource->now() - batchStartTime;
                     if (durationCount<Seconds>(batchDuration) >= replBatchLimitSeconds)
                         break;
-                    if (ops.getCount() >= replBatchLimitOperations)
+                    if (ops.getCount() >= size_t(replBatchLimitOperations))
                         break;
                     if (ops.getBytes() >= replBatchLimitBytes)
                         break;
@@ -744,7 +792,7 @@ private:
             stdx::unique_lock<stdx::mutex> lk(_mutex);
             while (!_ops.empty()) {
                 // Block until the previous batch has been taken.
-                if (_inShutdown.load())
+                if (shouldShutdown())
                     return;
                 _cv.wait(lk);
             }
@@ -764,12 +812,12 @@ private:
 };
 
 /* tail an oplog.  ok to return, will be re-called. */
-void SyncTail::oplogApplication() {
-    OpQueueBatcher batcher(this);
+void SyncTail::oplogApplication(ReplicationCoordinator* replCoord,
+                                stdx::function<bool()> shouldShutdown) {
+    OpQueueBatcher batcher(this, shouldShutdown);
 
     const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
     OperationContext& txn = *txnPtr;
-    auto replCoord = ReplicationCoordinator::get(&txn);
     std::unique_ptr<ApplyBatchFinalizer> finalizer{
         getGlobalServiceContext()->getGlobalStorageEngine()->isDurable()
             ? new ApplyBatchFinalizerForJournal(replCoord)
@@ -778,11 +826,7 @@ void SyncTail::oplogApplication() {
     auto minValidBoundaries = StorageInterface::get(&txn)->getMinValid(&txn);
     OpTime originalEndOpTime(minValidBoundaries.end);
     OpTime lastWriteOpTime{replCoord->getMyLastAppliedOpTime()};
-    while (!inShutdown()) {
-        if (replCoord->getInitialSyncRequestedFlag()) {
-            // got a resync command
-            return;
-        }
+    while (!shouldShutdown()) {
 
         tryToGoLiveAsASecondary(&txn, replCoord, minValidBoundaries, lastWriteOpTime);
 
@@ -1267,7 +1311,8 @@ StatusWith<OpTime> multiApply(OperationContext* txn,
     Lock::ParallelBatchWriterMode pbwm(txn->lockState());
 
     auto replCoord = ReplicationCoordinator::get(txn);
-    if (replCoord->getMemberState().primary() && !replCoord->isWaitingForApplierToDrain()) {
+    if (replCoord->getMemberState().primary() && !replCoord->isWaitingForApplierToDrain() &&
+        !replCoord->isCatchingUp()) {
         severe() << "attempting to replicate ops while primary";
         return {ErrorCodes::CannotApplyOplogWhilePrimary,
                 "attempting to replicate ops while primary"};

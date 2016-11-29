@@ -30,7 +30,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/bson/bson_field.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
@@ -79,7 +79,7 @@ namespace mongo {
             const BSONElement &e = jsobj["logApplicationMessage"];
 
             if (e.type() == String) {
-                audit::logApplicationMessage(ClientBasic::getCurrent(), e.checkAndGetStringData());
+                audit::logApplicationMessage(Client::getCurrent(), e.checkAndGetStringData());
             } else {
                 errmsg = "logApplicationMessage only accepts string messages";
                 ok = false;

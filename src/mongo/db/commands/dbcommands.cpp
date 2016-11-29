@@ -76,6 +76,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
@@ -114,6 +115,41 @@ using std::ostringstream;
 using std::string;
 using std::stringstream;
 using std::unique_ptr;
+
+namespace {
+/**
+ * Checks for additional required privileges when creating or modifying a view. Call this function
+ * after verifying that the user has the "createCollection" or "collMod" action, respectively.
+ *
+ * 'cmdObj' must have a String field named 'viewOn'.
+ */
+Status canCreateOrModifyView(Client* client,
+                             const std::string& dbname,
+                             const BSONObj& cmdObj,
+                             ResourcePattern resource) {
+    AuthorizationSession* authzSession = AuthorizationSession::get(client);
+
+    // It's safe to allow a user to create or modify a view if they can't read it anyway.
+    if (!authzSession->isAuthorizedForActionsOnResource(resource, ActionType::find)) {
+        return Status::OK();
+    }
+
+    // The user can read the view they're trying to create/modify, so we must ensure that they also
+    // have the find action on all namespaces in "viewOn" and "pipeline". If "pipeline" is not
+    // specified, default to the empty pipeline.
+    auto viewPipeline =
+        cmdObj.hasField("pipeline") ? BSONArray(cmdObj["pipeline"].Obj()) : BSONArray();
+
+    // This check ignores some invalid pipeline specifications. For example, if a user specifies a
+    // view definition with an invalid specification like {$lookup: "blah"}, the authorization check
+    // will succeed but the pipeline will fail to parse later in Command::run().
+    return Pipeline::checkAuthForCommand(
+        client,
+        dbname,
+        BSON("aggregate" << cmdObj["viewOn"].checkAndGetStringData() << "pipeline"
+                         << viewPipeline));
+}
+}  // namespace
 
 class CmdShutdownMongoD : public CmdShutdown {
 public:
@@ -311,7 +347,7 @@ public:
         return false;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
@@ -529,22 +565,35 @@ public:
         help << "create a collection explicitly\n"
                 "{ create: <ns>[, capped: <bool>, size: <collSizeInBytes>, max: <nDocs>] }";
     }
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
+        auto cmdNsResource = parseResourcePattern(dbname, cmdObj);
         if (cmdObj["capped"].trueValue()) {
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    parseResourcePattern(dbname, cmdObj), ActionType::convertToCapped)) {
+            if (!authzSession->isAuthorizedForActionsOnResource(cmdNsResource,
+                                                                ActionType::convertToCapped)) {
                 return Status(ErrorCodes::Unauthorized, "unauthorized");
             }
         }
 
-        // ActionType::createCollection or ActionType::insert are both acceptable
-        if (authzSession->isAuthorizedForActionsOnResource(parseResourcePattern(dbname, cmdObj),
-                                                           ActionType::createCollection) ||
-            authzSession->isAuthorizedForActionsOnResource(parseResourcePattern(dbname, cmdObj),
-                                                           ActionType::insert)) {
+        const bool hasCreateCollectionAction = authzSession->isAuthorizedForActionsOnResource(
+            cmdNsResource, ActionType::createCollection);
+
+        // If attempting to create a view, check for additional required privileges.
+        if (cmdObj["viewOn"]) {
+            // You need the createCollection action on this namespace; the insert action is not
+            // sufficient.
+            if (!hasCreateCollectionAction) {
+                return Status(ErrorCodes::Unauthorized, "unauthorized");
+            }
+            return canCreateOrModifyView(client, dbname, cmdObj, cmdNsResource);
+        }
+
+        // To create a regular collection, ActionType::createCollection or ActionType::insert are
+        // both acceptable.
+        if (hasCreateCollectionAction ||
+            authzSession->isAuthorizedForActionsOnResource(cmdNsResource, ActionType::insert)) {
             return Status::OK();
         }
 
@@ -795,8 +844,12 @@ public:
         AutoGetCollectionForRead ctx(txn, ns);
 
         Collection* collection = ctx.getCollection();
+        long long numRecords = 0;
+        if (collection) {
+            numRecords = collection->numRecords(txn);
+        }
 
-        if (!collection || collection->numRecords(txn) == 0) {
+        if (numRecords == 0) {
             result.appendNumber("size", 0);
             result.appendNumber("numObjects", 0);
             result.append("millis", timer.millis());
@@ -809,8 +862,7 @@ public:
         if (min.isEmpty() && max.isEmpty()) {
             if (estimate) {
                 result.appendNumber("size", static_cast<long long>(collection->dataSize(txn)));
-                result.appendNumber("numObjects",
-                                    static_cast<long long>(collection->numRecords(txn)));
+                result.appendNumber("numObjects", numRecords);
                 result.append("millis", timer.millis());
                 return 1;
             }
@@ -847,7 +899,7 @@ public:
                                               PlanExecutor::YIELD_MANUAL);
         }
 
-        long long avgObjSize = collection->dataSize(txn) / collection->numRecords(txn);
+        long long avgObjSize = collection->dataSize(txn) / numRecords;
 
         long long maxSize = jsobj["maxSize"].numberLong();
         long long maxObjects = jsobj["maxObjects"].numberLong();
@@ -1018,15 +1070,26 @@ public:
     virtual void help(stringstream& help) const {
         help << "Sets collection options.\n"
                 "Example: { collMod: 'foo', usePowerOf2Sizes:true }\n"
-                "Example: { collMod: 'foo', index: {keyPattern: {a: 1}, expireAfterSeconds: 600} }";
+                "Example: { collMod: 'foo', index: {keyPattern: {a: 1}, expireAfterSeconds: 600} "
+                "Example: { collMod: 'foo', index: {name: 'bar', expireAfterSeconds: 600} }\n";
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::collMod);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    virtual Status checkAuthForCommand(Client* client,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj) {
+        AuthorizationSession* authzSession = AuthorizationSession::get(client);
+        if (!authzSession->isAuthorizedForActionsOnResource(parseResourcePattern(dbname, cmdObj),
+                                                            ActionType::collMod)) {
+            return Status(ErrorCodes::Unauthorized, "unauthorized");
+        }
+
+        // Check for additional required privileges if attempting to modify a view.
+        if (cmdObj["viewOn"] || cmdObj["pipeline"]) {
+            return canCreateOrModifyView(
+                client, dbname, cmdObj, parseResourcePattern(dbname, cmdObj));
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* txn,
@@ -1168,7 +1231,7 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return Status::OK();
@@ -1385,7 +1448,7 @@ void Command::execCommand(OperationContext* txn,
             if (shardingState->enabled()) {
                 // TODO(spencer): Do this unconditionally once all nodes are sharding aware
                 // by default.
-                shardingState->updateConfigServerOpTimeFromMetadata(txn);
+                uassertStatusOK(shardingState->updateConfigServerOpTimeFromMetadata(txn));
             } else {
                 massert(
                     34422,
@@ -1453,33 +1516,30 @@ bool Command::run(OperationContext* txn,
     const std::string db = request.getDatabase().toString();
 
     BSONObjBuilder inPlaceReplyBob(replyBuilder->getInPlaceReplyBuilder(bytesToReserve));
+    auto readConcernArgsStatus = extractReadConcern(txn, cmd, supportsReadConcern());
 
-    {
-        auto readConcernArgsStatus = extractReadConcern(txn, cmd, supportsReadConcern());
-        if (!readConcernArgsStatus.isOK()) {
-            auto result = appendCommandStatus(inPlaceReplyBob, readConcernArgsStatus.getStatus());
-            inPlaceReplyBob.doneFast();
-            replyBuilder->setMetadata(rpc::makeEmptyMetadata());
-            return result;
-        }
-
-        Status rcStatus = waitForReadConcern(txn, readConcernArgsStatus.getValue());
-        if (!rcStatus.isOK()) {
-            if (rcStatus == ErrorCodes::ExceededTimeLimit) {
-                const int debugLevel =
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
-                LOG(debugLevel) << "Command on database " << db
-                                << " timed out waiting for read concern to be satisfied. Command: "
-                                << getRedactedCopyForLogging(request.getCommandArgs());
-            }
-
-            auto result = appendCommandStatus(inPlaceReplyBob, rcStatus);
-            inPlaceReplyBob.doneFast();
-            replyBuilder->setMetadata(rpc::makeEmptyMetadata());
-            return result;
-        }
+    if (!readConcernArgsStatus.isOK()) {
+        auto result = appendCommandStatus(inPlaceReplyBob, readConcernArgsStatus.getStatus());
+        inPlaceReplyBob.doneFast();
+        replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+        return result;
     }
 
+    Status rcStatus = waitForReadConcern(txn, readConcernArgsStatus.getValue());
+    if (!rcStatus.isOK()) {
+        if (rcStatus == ErrorCodes::ExceededTimeLimit) {
+            const int debugLevel =
+                serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
+            LOG(debugLevel) << "Command on database " << db
+                            << " timed out waiting for read concern to be satisfied. Command: "
+                            << getRedactedCopyForLogging(request.getCommandArgs());
+        }
+
+        auto result = appendCommandStatus(inPlaceReplyBob, rcStatus);
+        inPlaceReplyBob.doneFast();
+        replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+        return result;
+    }
     auto wcResult = extractWriteConcern(txn, cmd, db, supportsWriteConcern(cmd));
     if (!wcResult.isOK()) {
         auto result = appendCommandStatus(inPlaceReplyBob, wcResult.getStatus());
@@ -1487,7 +1547,6 @@ bool Command::run(OperationContext* txn,
         replyBuilder->setMetadata(rpc::makeEmptyMetadata());
         return result;
     }
-
     std::string errmsg;
     bool result;
     if (!supportsWriteConcern(cmd)) {
@@ -1519,6 +1578,23 @@ bool Command::run(OperationContext* txn,
             inPlaceReplyBob.resetToEmpty();
             appendCommandStatus(inPlaceReplyBob, waitForWCStatus);
             inPlaceReplyBob.appendElementsUnique(temp);
+        }
+    }
+
+    // When a linearizable read command is passed in, check to make sure we're reading
+    // from the primary.
+    if (supportsReadConcern() && (readConcernArgsStatus.getValue().getLevel() ==
+                                  repl::ReadConcernLevel::kLinearizableReadConcern) &&
+        (request.getCommandName() != "getMore")) {
+
+        auto linearizableReadStatus = waitForLinearizableReadConcern(txn);
+
+        if (!linearizableReadStatus.isOK()) {
+            inPlaceReplyBob.resetToEmpty();
+            auto result = appendCommandStatus(inPlaceReplyBob, linearizableReadStatus);
+            inPlaceReplyBob.doneFast();
+            replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+            return result;
         }
     }
 

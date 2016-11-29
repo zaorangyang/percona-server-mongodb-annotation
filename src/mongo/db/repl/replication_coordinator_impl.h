@@ -73,6 +73,7 @@ namespace repl {
 
 class ElectCmdRunner;
 class FreshnessChecker;
+class FreshnessScanner;
 class HandshakeArgs;
 class HeartbeatResponseAction;
 class LastVote;
@@ -198,11 +199,15 @@ public:
 
     virtual bool isWaitingForApplierToDrain() override;
 
+    virtual bool isCatchingUp() override;
+
     virtual void signalDrainComplete(OperationContext* txn) override;
 
     virtual Status waitForDrainFinish(Milliseconds timeout) override;
 
     virtual void signalUpstreamUpdater() override;
+
+    virtual Status resyncData(OperationContext* txn, bool waitUntilCompleted) override;
 
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
         ReplSetUpdatePositionCommandStyle commandStyle) const override;
@@ -326,10 +331,6 @@ public:
 
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) override;
-
-
-    virtual bool getInitialSyncRequestedFlag() const override;
-    virtual void setInitialSyncRequestedFlag(bool value) override;
 
     virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
     virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) override;
@@ -505,6 +506,25 @@ private:
 
     // Struct that holds information about clients waiting for replication.
     struct WaiterInfo;
+    struct WaiterInfoGuard;
+
+    class WaiterList {
+    public:
+        using WaiterType = WaiterInfo*;
+
+        // Adds waiter into the list. Usually, the waiter will be signaled only once and then
+        // removed.
+        void add_inlock(WaiterType waiter);
+        // Returns whether waiter is found and removed.
+        bool remove_inlock(WaiterType waiter);
+        // Signals and removes all waiters that satisfy the condition.
+        void signalAndRemoveIf_inlock(stdx::function<bool(WaiterType)> fun);
+        // Signals and removes all waiters from the list.
+        void signalAndRemoveAll_inlock();
+
+    private:
+        std::vector<WaiterType> _list;
+    };
 
     // Struct that holds information about nodes in this replication group, mainly used for
     // tracking replication progress for write concern satisfaction.
@@ -568,6 +588,8 @@ private:
      * _slaveInfo.
      */
     size_t _getMyIndexInSlaveInfo_inlock() const;
+
+    void _resetMyLastOpTimes_inlock();
 
     /**
      * Returns the _writeConcernMajorityJournalDefault of our current _rsConfig.
@@ -806,12 +828,13 @@ private:
     /**
      * Start replicating data, and does an initial sync if needed first.
      */
-    void _startDataReplication(OperationContext* txn);
+    void _startDataReplication(OperationContext* txn,
+                               stdx::function<void()> startCompleted = nullptr);
 
     /**
      * Stops replicating data by stopping the applier, fetcher and such.
      */
-    void _stopDataReplication();
+    void _stopDataReplication(OperationContext* txn);
 
     /**
      * Finishes the work of processReplSetInitiate() while holding _topoMutex, in the event of
@@ -1113,6 +1136,27 @@ private:
      */
     executor::TaskExecutor::CallbackFn _wrapAsCallbackFn(const stdx::function<void()>& work);
 
+    /**
+     * Scan all nodes to find out the the latest optime in the replset, thus we know when there's no
+     * more to catch up before the timeout. It also schedules the actual catch-up once we get the
+     * response from the freshness scan.
+     */
+    void _scanOpTimeForCatchUp_inlock();
+    /**
+     * Wait for data replication until we reach the latest optime, or the timeout expires.
+     * "originalTerm" is the term when catch-up work is scheduled and used to detect
+     * the step-down (and potential following step-up) after catch-up gets scheduled.
+     */
+    void _catchUpOplogToLatest_inlock(const FreshnessScanner& scanner,
+                                      Milliseconds timeout,
+                                      long long originalTerm);
+    /**
+     * Finish catch-up mode and start drain mode.
+     * If "startToDrain" is true, the node enters drain mode. Otherwise, it goes back to secondary
+     * mode.
+     */
+    void _finishCatchUpOplog_inlock(bool startToDrain);
+
     //
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
@@ -1176,11 +1220,11 @@ private:
     int _rbid;  // (M)
 
     // list of information about clients waiting on replication.  Does *not* own the WaiterInfos.
-    std::vector<WaiterInfo*> _replicationWaiterList;  // (M)
+    WaiterList _replicationWaiterList;  // (M)
 
     // list of information about clients waiting for a particular opTime.
     // Does *not* own the WaiterInfos.
-    std::vector<WaiterInfo*> _opTimeWaiterList;  // (M)
+    WaiterList _opTimeWaiterList;  // (M)
 
     // Set to true when we are in the process of shutting down replication.
     bool _inShutdown;  // (M)
@@ -1209,6 +1253,9 @@ private:
 
     // True if we are waiting for the applier to finish draining.
     bool _isWaitingForDrainToComplete;  // (M)
+
+    // True if we are waiting for oplog catch-up to finish.
+    bool _isCatchingUp = false;  // (M)
 
     // Used to signal threads waiting for changes to _rsConfigState.
     stdx::condition_variable _rsConfigStateChange;  // (M)
@@ -1274,6 +1321,8 @@ private:
 
     // Storage interface used by data replicator.
     StorageInterface* _storage;  // (PS)
+    // Data Replicator used to replicate data
+    std::unique_ptr<DataReplicator> _dr;  // (S)
 
     // Hands out the next snapshot name.
     AtomicUInt64 _snapshotNameGenerator;  // (S)
@@ -1331,11 +1380,6 @@ private:
 
     // Lambda indicating durability of storageEngine.
     stdx::function<bool()> _isDurableStorageEngine;  // (R)
-
-    // bool for indicating resync need on this node and the mutex that protects it
-    // The resync command sets this flag; the Applier thread observes and clears it.
-    mutable stdx::mutex _initialSyncMutex;
-    bool _initialSyncRequestedFlag = false;  // (I)
 
     // This setting affects the Applier prefetcher behavior.
     mutable stdx::mutex _indexPrefetchMutex;

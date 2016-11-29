@@ -211,8 +211,36 @@ Date_t NetworkInterfaceASIO::now() {
     return Date_t::now();
 }
 
+namespace {
+
+Status attachMetadataIfNeeded(RemoteCommandRequest& request,
+                              rpc::EgressMetadataHook* metadataHook) {
+
+    // Append the metadata of the request with metadata from the metadata hook
+    // if a hook is installed
+    if (metadataHook) {
+        BSONObjBuilder augmentedBob;
+        augmentedBob.appendElements(request.metadata);
+
+        auto writeStatus = callNoexcept(*metadataHook,
+                                        &rpc::EgressMetadataHook::writeRequestMetadata,
+                                        request.txn,
+                                        request.target,
+                                        &augmentedBob);
+        if (!writeStatus.isOK()) {
+            return writeStatus;
+        }
+
+        request.metadata = augmentedBob.obj();
+    }
+
+    return Status::OK();
+}
+
+}  // namespace
+
 Status NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                          const RemoteCommandRequest& request,
+                                          RemoteCommandRequest& request,
                                           const RemoteCommandCompletionFn& onFinish) {
     MONGO_ASIO_INVARIANT(onFinish, "Invalid completion function");
     {
@@ -226,9 +254,14 @@ Status NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cb
         return {ErrorCodes::ShutdownInProgress, "NetworkInterfaceASIO shutdown in progress"};
     }
 
-    LOG(2) << "startCommand: " << request.toString();
+    LOG(2) << "startCommand: " << redact(request.toString());
 
     auto getConnectionStartTime = now();
+
+    auto statusMetadata = attachMetadataIfNeeded(request, _metadataHook.get());
+    if (!statusMetadata.isOK()) {
+        return statusMetadata;
+    }
 
     auto nextStep = [this, getConnectionStartTime, cbHandle, request, onFinish](
         StatusWith<ConnectionPool::ConnectionHandle> swConn) {
@@ -243,9 +276,10 @@ Status NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cb
                 wasPreviouslyCanceled = _inGetConnection.erase(cbHandle) == 0;
             }
 
-            onFinish(wasPreviouslyCanceled
-                         ? Status(ErrorCodes::CallbackCanceled, "Callback canceled")
-                         : swConn.getStatus());
+            Status status = wasPreviouslyCanceled
+                ? Status(ErrorCodes::CallbackCanceled, "Callback canceled")
+                : swConn.getStatus();
+            onFinish({status, now() - getConnectionStartTime});
             signalWorkAvailable();
             return;
         }
@@ -262,7 +296,9 @@ Status NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cb
         if (eraseCount == 0) {
             lk.unlock();
 
-            onFinish({ErrorCodes::CallbackCanceled, "Callback canceled"});
+            onFinish({ErrorCodes::CallbackCanceled,
+                      "Callback canceled",
+                      now() - getConnectionStartTime});
 
             // Though we were canceled, we know that the stream is fine, so indicate success.
             conn->indicateSuccess();
@@ -309,7 +345,9 @@ Status NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cb
                     std::stringstream msg;
                     msg << "Remote command timed out while waiting to get a connection from the "
                         << "pool, took " << getConnectionDuration;
-                    return _completeOperation(op, {ErrorCodes::ExceededTimeLimit, msg.str()});
+                    auto rs = ResponseStatus(
+                        ErrorCodes::ExceededTimeLimit, msg.str(), getConnectionDuration);
+                    return _completeOperation(op, rs);
                 }
 
                 // The above conditional guarantees that the adjusted timeout will never underflow.
@@ -341,12 +379,13 @@ Status NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cb
                         if (!ec) {
                             LOG(2) << "Request " << requestId << " timed out"
                                    << ", adjusted timeout after getting connection from pool was "
-                                   << adjustedTimeout << ", op was " << op->toString();
+                                   << adjustedTimeout << ", op was " << redact(op->toString());
 
                             op->timeOut_inlock();
                         } else {
                             LOG(2) << "Failed to time request " << requestId
-                                   << "out: " << ec.message() << ", op was " << op->toString();
+                                   << "out: " << ec.message() << ", op was "
+                                   << redact(op->toString());
                         }
                     });
             }

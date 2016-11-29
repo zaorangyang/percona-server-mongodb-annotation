@@ -180,7 +180,8 @@ Status checkOkayToGrantRolesToRole(OperationContext* txn,
         }
 
         BSONObj roleToAddDoc;
-        Status status = authzManager->getRoleDescription(txn, roleToAdd, false, &roleToAddDoc);
+        Status status =
+            authzManager->getRoleDescription(txn, roleToAdd, PrivilegeFormat::kOmit, &roleToAddDoc);
         if (status == ErrorCodes::RoleNotFound) {
             return Status(ErrorCodes::RoleNotFound,
                           "Cannot grant nonexistent role " + roleToAdd.toString());
@@ -607,7 +608,7 @@ public:
         ss << "Adds a user to the system" << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForCreateUserCommand(client, dbname, cmdObj);
@@ -715,13 +716,14 @@ public:
         // Role existence has to be checked after acquiring the update lock
         for (size_t i = 0; i < args.roles.size(); ++i) {
             BSONObj ignored;
-            status = authzManager->getRoleDescription(txn, args.roles[i], false, &ignored);
+            status = authzManager->getRoleDescription(
+                txn, args.roles[i], PrivilegeFormat::kOmit, &ignored);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
         }
 
-        audit::logCreateUser(ClientBasic::getCurrent(),
+        audit::logCreateUser(Client::getCurrent(),
                              args.userName,
                              args.hasHashedPassword,
                              args.hasCustomData ? &args.customData : NULL,
@@ -752,7 +754,7 @@ public:
         ss << "Used to update a user, for example to change its password" << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForUpdateUserCommand(client, dbname, cmdObj);
@@ -827,14 +829,15 @@ public:
         if (args.hasRoles) {
             for (size_t i = 0; i < args.roles.size(); ++i) {
                 BSONObj ignored;
-                status = authzManager->getRoleDescription(txn, args.roles[i], false, &ignored);
+                status = authzManager->getRoleDescription(
+                    txn, args.roles[i], PrivilegeFormat::kOmit, &ignored);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }
             }
         }
 
-        audit::logUpdateUser(ClientBasic::getCurrent(),
+        audit::logUpdateUser(Client::getCurrent(),
                              args.userName,
                              args.hasHashedPassword,
                              args.hasCustomData ? &args.customData : NULL,
@@ -869,7 +872,7 @@ public:
         ss << "Drops a single user." << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForDropUserCommand(client, dbname, cmdObj);
@@ -895,7 +898,7 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        audit::logDropUser(ClientBasic::getCurrent(), userName);
+        audit::logDropUser(Client::getCurrent(), userName);
 
         long long nMatched;
         status = removePrivilegeDocuments(txn,
@@ -938,7 +941,7 @@ public:
         ss << "Drops all users for a single database." << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForDropAllUsersFromDatabaseCommand(client, dbname);
@@ -963,7 +966,7 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        audit::logDropAllUsersFromDatabase(ClientBasic::getCurrent(), dbname);
+        audit::logDropAllUsersFromDatabase(Client::getCurrent(), dbname);
 
         long long numRemoved;
         status = removePrivilegeDocuments(
@@ -996,7 +999,7 @@ public:
         ss << "Grants roles to a user." << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForGrantRolesToUserCommand(client, dbname, cmdObj);
@@ -1035,7 +1038,8 @@ public:
         for (vector<RoleName>::iterator it = roles.begin(); it != roles.end(); ++it) {
             RoleName& roleName = *it;
             BSONObj roleDoc;
-            status = authzManager->getRoleDescription(txn, roleName, false, &roleDoc);
+            status =
+                authzManager->getRoleDescription(txn, roleName, PrivilegeFormat::kOmit, &roleDoc);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1043,7 +1047,7 @@ public:
             userRoles.insert(roleName);
         }
 
-        audit::logGrantRolesToUser(ClientBasic::getCurrent(), userName, roles);
+        audit::logGrantRolesToUser(Client::getCurrent(), userName, roles);
         BSONArray newRolesBSONArray = roleSetToBSONArray(userRoles);
         status = updatePrivilegeDocument(
             txn, userName, BSON("$set" << BSON("roles" << newRolesBSONArray)));
@@ -1070,7 +1074,7 @@ public:
         ss << "Revokes roles from a user." << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForRevokeRolesFromUserCommand(client, dbname, cmdObj);
@@ -1109,7 +1113,8 @@ public:
         for (vector<RoleName>::iterator it = roles.begin(); it != roles.end(); ++it) {
             RoleName& roleName = *it;
             BSONObj roleDoc;
-            status = authzManager->getRoleDescription(txn, roleName, false, &roleDoc);
+            status =
+                authzManager->getRoleDescription(txn, roleName, PrivilegeFormat::kOmit, &roleDoc);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1117,7 +1122,7 @@ public:
             userRoles.erase(roleName);
         }
 
-        audit::logRevokeRolesFromUser(ClientBasic::getCurrent(), userName, roles);
+        audit::logRevokeRolesFromUser(Client::getCurrent(), userName, roles);
         BSONArray newRolesBSONArray = roleSetToBSONArray(userRoles);
         status = updatePrivilegeDocument(
             txn, userName, BSON("$set" << BSON("roles" << newRolesBSONArray)));
@@ -1148,7 +1153,7 @@ public:
         ss << "Returns information about users." << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForUsersInfoCommand(client, dbname, cmdObj);
@@ -1210,7 +1215,8 @@ public:
             // If you don't need privileges, you can just do a regular query on system.users
             BSONObjBuilder queryBuilder;
             if (args.allForDB) {
-                queryBuilder.append(AuthorizationManager::USER_DB_FIELD_NAME, dbname);
+                queryBuilder.append("query",
+                                    BSON(AuthorizationManager::USER_DB_FIELD_NAME << dbname));
             } else {
                 BSONArrayBuilder usersMatchArray;
                 for (size_t i = 0; i < args.userNames.size(); ++i) {
@@ -1219,19 +1225,21 @@ public:
                                                 << AuthorizationManager::USER_DB_FIELD_NAME
                                                 << args.userNames[i].getDB()));
                 }
-                queryBuilder.append("$or", usersMatchArray.arr());
+                queryBuilder.append("query", BSON("$or" << usersMatchArray.arr()));
             }
+            // Order results by user field then db field, matching how UserNames are ordered
+            queryBuilder.append("orderby", BSON("user" << 1 << "db" << 1));
 
-            BSONObjBuilder projection;
+            BSONObj projection;
             if (!args.showCredentials) {
-                projection.append("credentials", 0);
+                projection = BSON("credentials" << 0);
             }
             const stdx::function<void(const BSONObj&)> function = stdx::bind(
                 appendBSONObjToBSONArrayBuilder, &usersArrayBuilder, stdx::placeholders::_1);
             queryAuthzDocument(txn,
                                AuthorizationManager::usersCollectionNamespace,
                                queryBuilder.done(),
-                               projection.done(),
+                               projection,
                                function);
         }
         result.append("users", usersArrayBuilder.arr());
@@ -1256,7 +1264,7 @@ public:
         ss << "Adds a role to the system" << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForCreateRoleCommand(client, dbname, cmdObj);
@@ -1346,7 +1354,7 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        audit::logCreateRole(ClientBasic::getCurrent(), args.roleName, args.roles, args.privileges);
+        audit::logCreateRole(Client::getCurrent(), args.roleName, args.roles, args.privileges);
 
         status = insertRoleDocument(txn, roleObjBuilder.done());
         return appendCommandStatus(result, status);
@@ -1370,7 +1378,7 @@ public:
         ss << "Used to update a role" << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForUpdateRoleCommand(client, dbname, cmdObj);
@@ -1421,7 +1429,8 @@ public:
 
         // Role existence has to be checked after acquiring the update lock
         BSONObj ignored;
-        status = authzManager->getRoleDescription(txn, args.roleName, false, &ignored);
+        status =
+            authzManager->getRoleDescription(txn, args.roleName, PrivilegeFormat::kOmit, &ignored);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1440,7 +1449,7 @@ public:
             }
         }
 
-        audit::logUpdateRole(ClientBasic::getCurrent(),
+        audit::logUpdateRole(Client::getCurrent(),
                              args.roleName,
                              args.hasRoles ? &args.roles : NULL,
                              args.hasPrivileges ? &args.privileges : NULL);
@@ -1468,7 +1477,7 @@ public:
         ss << "Grants privileges to a role" << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForGrantPrivilegesToRoleCommand(client, dbname, cmdObj);
@@ -1480,6 +1489,7 @@ public:
              int options,
              string& errmsg,
              BSONObjBuilder& result) {
+
         RoleName roleName;
         PrivilegeVector privilegesToAdd;
         Status status = auth::parseAndValidateRolePrivilegeManipulationCommands(
@@ -1511,7 +1521,8 @@ public:
         }
 
         BSONObj roleDoc;
-        status = authzManager->getRoleDescription(txn, roleName, true, &roleDoc);
+        status = authzManager->getRoleDescription(
+            txn, roleName, PrivilegeFormat::kShowSeparate, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1549,7 +1560,7 @@ public:
         BSONObjBuilder updateBSONBuilder;
         updateObj.writeTo(&updateBSONBuilder);
 
-        audit::logGrantPrivilegesToRole(ClientBasic::getCurrent(), roleName, privilegesToAdd);
+        audit::logGrantPrivilegesToRole(Client::getCurrent(), roleName, privilegesToAdd);
 
         status = updateRoleDocument(txn, roleName, updateBSONBuilder.done());
         // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
@@ -1575,7 +1586,7 @@ public:
         ss << "Revokes privileges from a role" << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForRevokePrivilegesFromRoleCommand(client, dbname, cmdObj);
@@ -1613,7 +1624,8 @@ public:
         }
 
         BSONObj roleDoc;
-        status = authzManager->getRoleDescription(txn, roleName, true, &roleDoc);
+        status = authzManager->getRoleDescription(
+            txn, roleName, PrivilegeFormat::kShowSeparate, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1657,7 +1669,7 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        audit::logRevokePrivilegesFromRole(ClientBasic::getCurrent(), roleName, privilegesToRemove);
+        audit::logRevokePrivilegesFromRole(Client::getCurrent(), roleName, privilegesToRemove);
 
         BSONObjBuilder updateBSONBuilder;
         updateObj.writeTo(&updateBSONBuilder);
@@ -1685,7 +1697,7 @@ public:
         ss << "Grants roles to another role." << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForGrantRolesToRoleCommand(client, dbname, cmdObj);
@@ -1725,7 +1737,7 @@ public:
 
         // Role existence has to be checked after acquiring the update lock
         BSONObj roleDoc;
-        status = authzManager->getRoleDescription(txn, roleName, false, &roleDoc);
+        status = authzManager->getRoleDescription(txn, roleName, PrivilegeFormat::kOmit, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1749,7 +1761,7 @@ public:
                 directRoles.push_back(*it);
         }
 
-        audit::logGrantRolesToRole(ClientBasic::getCurrent(), roleName, rolesToAdd);
+        audit::logGrantRolesToRole(Client::getCurrent(), roleName, rolesToAdd);
 
         status = updateRoleDocument(
             txn, roleName, BSON("$set" << BSON("roles" << rolesVectorToBSONArray(directRoles))));
@@ -1776,7 +1788,7 @@ public:
         ss << "Revokes roles from another role." << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForRevokeRolesFromRoleCommand(client, dbname, cmdObj);
@@ -1815,7 +1827,7 @@ public:
         }
 
         BSONObj roleDoc;
-        status = authzManager->getRoleDescription(txn, roleName, false, &roleDoc);
+        status = authzManager->getRoleDescription(txn, roleName, PrivilegeFormat::kOmit, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1835,7 +1847,7 @@ public:
             }
         }
 
-        audit::logRevokeRolesFromRole(ClientBasic::getCurrent(), roleName, rolesToRemove);
+        audit::logRevokeRolesFromRole(Client::getCurrent(), roleName, rolesToRemove);
 
         status = updateRoleDocument(
             txn, roleName, BSON("$set" << BSON("roles" << rolesVectorToBSONArray(roles))));
@@ -1866,7 +1878,7 @@ public:
            << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForDropRoleCommand(client, dbname, cmdObj);
@@ -1902,7 +1914,7 @@ public:
         }
 
         BSONObj roleDoc;
-        status = authzManager->getRoleDescription(txn, roleName, false, &roleDoc);
+        status = authzManager->getRoleDescription(txn, roleName, PrivilegeFormat::kOmit, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1966,7 +1978,7 @@ public:
                                      << status.reason()));
         }
 
-        audit::logDropRole(ClientBasic::getCurrent(), roleName);
+        audit::logDropRole(Client::getCurrent(), roleName);
         // Finally, remove the actual role document
         status = removeRoleDocuments(txn,
                                      BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
@@ -2020,7 +2032,7 @@ public:
            << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForDropAllRolesFromDatabaseCommand(client, dbname);
@@ -2097,7 +2109,7 @@ public:
                                                             << status.reason()));
         }
 
-        audit::logDropAllRolesFromDatabase(ClientBasic::getCurrent(), dbname);
+        audit::logDropAllRolesFromDatabase(Client::getCurrent(), dbname);
         // Finally, remove the actual role documents
         status = removeRoleDocuments(
             txn, BSON(AuthorizationManager::ROLE_DB_FIELD_NAME << dbname), &nMatched);
@@ -2121,6 +2133,29 @@ public:
 
 } cmdDropAllRolesFromDatabase;
 
+/**
+ * Provides information about one or more roles, the indirect roles they are members of, and
+ * optionally the privileges they provide.
+ *
+ * This command accepts the following arguments:
+ * rolesInfo:
+ *   (String) Returns information about a single role on the current database.
+ *   {role: (String), db: (String)} Returns information about a specified role, on a specific db
+ *   (BooleanTrue) Returns information about all roles in this database
+ *   [ //Zero or more of
+ *     {role: (String), db: (String) ] Returns information about all specified roles
+ *
+ * showBuiltinRoles:
+ *   (Boolean) If true, and rolesInfo == (BooleanTrue), include built-in roles from the database
+ *
+ * showPrivileges:
+ *   (BooleanFalse) Do not show information about privileges
+ *   (BooleanTrue) Attach all privileges inherited from roles to role descriptions
+ *   "asUserFragment" Render results as a partial user document as-if a user existed which possessed
+ *                    these roles. This format may change over time with changes to the auth
+ *                    schema.
+ */
+
 class CmdRolesInfo : public Command {
 public:
     virtual bool slaveOk() const {
@@ -2141,7 +2176,7 @@ public:
         ss << "Returns information about roles." << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForRolesInfoCommand(client, dbname, cmdObj);
@@ -2164,33 +2199,40 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        BSONArrayBuilder rolesArrayBuilder;
         if (args.allForDB) {
             std::vector<BSONObj> rolesDocs;
             status = getGlobalAuthorizationManager()->getRoleDescriptionsForDB(
-                txn, dbname, args.showPrivileges, args.showBuiltinRoles, &rolesDocs);
+                txn, dbname, args.privilegeFormat, args.showBuiltinRoles, &rolesDocs);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
 
+            if (args.privilegeFormat == PrivilegeFormat::kShowAsUserFragment) {
+                return appendCommandStatus(
+                    result,
+                    Status(ErrorCodes::IllegalOperation,
+                           "Cannot get user fragment for all roles in a database"));
+            }
+            BSONArrayBuilder rolesArrayBuilder;
             for (size_t i = 0; i < rolesDocs.size(); ++i) {
                 rolesArrayBuilder.append(rolesDocs[i]);
             }
-        } else {
-            for (size_t i = 0; i < args.roleNames.size(); ++i) {
-                BSONObj roleDetails;
-                status = getGlobalAuthorizationManager()->getRoleDescription(
-                    txn, args.roleNames[i], args.showPrivileges, &roleDetails);
-                if (status.code() == ErrorCodes::RoleNotFound) {
-                    continue;
-                }
-                if (!status.isOK()) {
-                    return appendCommandStatus(result, status);
-                }
-                rolesArrayBuilder.append(roleDetails);
-            }
+            result.append("roles", rolesArrayBuilder.arr());
         }
-        result.append("roles", rolesArrayBuilder.arr());
+
+        BSONObj roleDetails;
+        status = getGlobalAuthorizationManager()->getRolesDescription(
+            txn, args.roleNames, args.privilegeFormat, &roleDetails);
+        if (!status.isOK()) {
+            return appendCommandStatus(result, status);
+        }
+
+        if (args.privilegeFormat == PrivilegeFormat::kShowAsUserFragment) {
+            result.append("userFragment", roleDetails);
+        } else {
+            result.append("roles", BSONArray(roleDetails));
+        }
+
         return true;
     }
 
@@ -2216,7 +2258,7 @@ public:
         ss << "Invalidates the in-memory cache of user information" << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForInvalidateUserCacheCommand(client);
@@ -2255,7 +2297,7 @@ public:
         ss << "internal" << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForGetUserCacheGenerationCommand(client);
@@ -2304,7 +2346,7 @@ public:
         ss << "Internal command used by mongorestore for updating user/role data" << endl;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForMergeAuthzCollectionsCommand(client, cmdObj);
@@ -2370,13 +2412,13 @@ public:
         }
 
         if (create) {
-            audit::logCreateUser(ClientBasic::getCurrent(),
+            audit::logCreateUser(Client::getCurrent(),
                                  userName,
                                  userObj["credentials"].Obj().hasField("MONGODB-CR"),
                                  userObj.hasField("customData") ? &customData : NULL,
                                  roles);
         } else {
-            audit::logUpdateUser(ClientBasic::getCurrent(),
+            audit::logUpdateUser(Client::getCurrent(),
                                  userName,
                                  userObj["credentials"].Obj().hasField("MONGODB-CR"),
                                  userObj.hasField("customData") ? &customData : NULL,
@@ -2396,9 +2438,9 @@ public:
         uassertStatusOK(auth::parseAndValidatePrivilegeArray(BSONArray(roleObj["privileges"].Obj()),
                                                              &privileges));
         if (create) {
-            audit::logCreateRole(ClientBasic::getCurrent(), roleName, roles, privileges);
+            audit::logCreateRole(Client::getCurrent(), roleName, roles, privileges);
         } else {
-            audit::logUpdateRole(ClientBasic::getCurrent(), roleName, &roles, &privileges);
+            audit::logUpdateRole(Client::getCurrent(), roleName, &roles, &privileges);
         }
     }
 
@@ -2542,7 +2584,7 @@ public:
                  it != usersToDrop.end();
                  ++it) {
                 const UserName& userName = *it;
-                audit::logDropUser(ClientBasic::getCurrent(), userName);
+                audit::logDropUser(Client::getCurrent(), userName);
                 status = removePrivilegeDocuments(txn,
                                                   BSON(AuthorizationManager::USER_NAME_FIELD_NAME
                                                        << userName.getUser().toString()
@@ -2622,7 +2664,7 @@ public:
                  it != rolesToDrop.end();
                  ++it) {
                 const RoleName& roleName = *it;
-                audit::logDropRole(ClientBasic::getCurrent(), roleName);
+                audit::logDropRole(Client::getCurrent(), roleName);
                 status = removeRoleDocuments(txn,
                                              BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
                                                   << roleName.getRole().toString()
@@ -2871,7 +2913,7 @@ public:
         ss << "Upgrades the auth data storage schema";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return auth::checkAuthForAuthSchemaUpgradeCommand(client);

@@ -64,7 +64,7 @@ public:
           << "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ] }";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -169,7 +169,8 @@ public:
         minKey = manager->getShardKeyPattern().normalizeShardKey(minKey);
         maxKey = manager->getShardKeyPattern().normalizeShardKey(maxKey);
 
-        shared_ptr<Chunk> firstChunk = manager->findIntersectingChunk(txn, minKey);
+        shared_ptr<Chunk> firstChunk =
+            manager->findIntersectingChunkWithSimpleCollation(txn, minKey);
         verify(firstChunk);
 
         BSONObjBuilder remoteCmdObjB;

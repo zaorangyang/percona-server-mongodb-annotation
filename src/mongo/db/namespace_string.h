@@ -45,9 +45,8 @@ const size_t MaxDatabaseNameLen = 128;  // max str len for the db name, includin
 
 /** @return true if a client can modify this namespace even though it is under ".system."
     For example <dbname>.system.users is ok for regular clients to update.
-    @param write used when .system.js
 */
-bool legalClientSystemNS(StringData ns, bool write);
+bool legalClientSystemNS(StringData ns);
 
 /* e.g.
    NamespaceString ns("acme.orders");
@@ -56,6 +55,12 @@ bool legalClientSystemNS(StringData ns, bool write);
 class NamespaceString {
 public:
     // Reserved system namespaces
+
+    // Namespace for the admin database
+    static const StringData kAdminDb;
+
+    // Namespace for the local database
+    static const StringData kLocalDb;
 
     // Namespace for storing configuration data, which needs to be replicated if the server is
     // running as a replica set. Documents in this collection should represent some configuration

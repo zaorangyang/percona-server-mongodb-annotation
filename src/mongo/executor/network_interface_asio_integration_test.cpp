@@ -87,23 +87,22 @@ public:
         return _rng;
     }
 
-    Deferred<StatusWith<RemoteCommandResponse>> runCommand(
-        const TaskExecutor::CallbackHandle& cbHandle, const RemoteCommandRequest& request) {
-        Deferred<StatusWith<RemoteCommandResponse>> deferred;
-        net().startCommand(
-            cbHandle, request, [deferred](StatusWith<RemoteCommandResponse> resp) mutable {
-                deferred.emplace(std::move(resp));
-            });
+    Deferred<RemoteCommandResponse> runCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                                               RemoteCommandRequest& request) {
+        Deferred<RemoteCommandResponse> deferred;
+        net().startCommand(cbHandle, request, [deferred](RemoteCommandResponse resp) mutable {
+            deferred.emplace(std::move(resp));
+        });
         return deferred;
     }
 
-    StatusWith<RemoteCommandResponse> runCommandSync(const RemoteCommandRequest& request) {
+    RemoteCommandResponse runCommandSync(RemoteCommandRequest& request) {
         auto deferred = runCommand(makeCallbackHandle(), request);
         auto& res = deferred.get();
         if (res.isOK()) {
-            log() << "got command result: " << res.getValue().toString();
+            log() << "got command result: " << res.toString();
         } else {
-            log() << "command failed: " << res.getStatus();
+            log() << "command failed: " << res.status;
         }
         return res;
     }
@@ -111,8 +110,10 @@ public:
     void assertCommandOK(StringData db,
                          const BSONObj& cmd,
                          Milliseconds timeoutMillis = Milliseconds(-1)) {
-        auto res = unittest::assertGet(runCommandSync(
-            {fixture().getServers()[0], db.toString(), cmd, BSONObj(), timeoutMillis}));
+        RemoteCommandRequest request{
+            fixture().getServers()[0], db.toString(), cmd, BSONObj(), nullptr, timeoutMillis};
+        auto res = runCommandSync(request);
+        ASSERT_OK(res.status);
         ASSERT_OK(getStatusFromCommandResult(res.data));
     }
 
@@ -120,19 +121,22 @@ public:
                                     const BSONObj& cmd,
                                     Milliseconds timeoutMillis,
                                     ErrorCodes::Error reason) {
-        auto clientStatus = runCommandSync(
-            {fixture().getServers()[0], db.toString(), cmd, BSONObj(), timeoutMillis});
-        ASSERT_TRUE(clientStatus == reason);
+        RemoteCommandRequest request{
+            fixture().getServers()[0], db.toString(), cmd, BSONObj(), nullptr, timeoutMillis};
+        auto res = runCommandSync(request);
+        ASSERT_EQ(reason, res.status.code());
     }
 
     void assertCommandFailsOnServer(StringData db,
                                     const BSONObj& cmd,
                                     Milliseconds timeoutMillis,
                                     ErrorCodes::Error reason) {
-        auto res = unittest::assertGet(runCommandSync(
-            {fixture().getServers()[0], db.toString(), cmd, BSONObj(), timeoutMillis}));
+        RemoteCommandRequest request{
+            fixture().getServers()[0], db.toString(), cmd, BSONObj(), nullptr, timeoutMillis};
+        auto res = runCommandSync(request);
+        ASSERT_OK(res.status);
         auto serverStatus = getStatusFromCommandResult(res.data);
-        ASSERT_TRUE(serverStatus == reason);
+        ASSERT_EQ(reason, serverStatus);
     }
 
 private:
@@ -176,16 +180,15 @@ public:
                          Milliseconds timeout = RemoteCommandRequest::kNoTimeout) {
         auto cb = makeCallbackHandle();
         auto self = *this;
-        auto out = fixture
-                       ->runCommand(cb,
-                                    {unittest::getFixtureConnectionString().getServers()[0],
+        RemoteCommandRequest request{unittest::getFixtureConnectionString().getServers()[0],
                                      "admin",
                                      _command,
-                                     timeout})
-                       .then(pool, [self](StatusWith<RemoteCommandResponse> resp) -> Status {
-                           auto status = resp.isOK()
-                               ? getStatusFromCommandResult(resp.getValue().data)
-                               : resp.getStatus();
+                                     nullptr,
+                                     timeout};
+        auto out = fixture->runCommand(cb, request)
+                       .then(pool, [self](RemoteCommandResponse resp) -> Status {
+                           auto status =
+                               resp.isOK() ? getStatusFromCommandResult(resp.data) : resp.status;
 
                            return status == self._expected
                                ? Status::OK()
@@ -324,7 +327,8 @@ class HangingHook : public executor::NetworkConnectionHook {
                                                                        << "none"
                                                                        << "secs"
                                                                        << 100000000),
-                                                          BSONObj()))};
+                                                          BSONObj(),
+                                                          nullptr))};
     }
 
     Status handleReply(const HostAndPort& remoteHost, RemoteCommandResponse&& response) final {

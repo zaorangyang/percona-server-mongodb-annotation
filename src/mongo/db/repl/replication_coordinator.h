@@ -399,6 +399,12 @@ public:
     virtual bool isWaitingForApplierToDrain() = 0;
 
     /**
+     * A new primary tries to have its oplog catch up after winning an election.
+     * Return true if the coordinator is waiting for catch-up to finish.
+     */
+    virtual bool isCatchingUp() = 0;
+
+    /**
      * Signals that a previously requested pause and drain of the applier buffer
      * has completed.
      *
@@ -438,6 +444,11 @@ public:
      * Handles an incoming replSetGetStatus command. Adds BSON to 'result'.
      */
     virtual Status processReplSetGetStatus(BSONObjBuilder* result) = 0;
+
+    /**
+     * Does an initial sync of data, after dropping existing data.
+     */
+    virtual Status resyncData(OperationContext* txn, bool waitUntilCompleted) = 0;
 
     /**
      * Handles an incoming isMaster command for a replica set node.  Should not be
@@ -772,10 +783,6 @@ public:
      */
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) = 0;
-
-    virtual bool getInitialSyncRequestedFlag() const = 0;
-    virtual void setInitialSyncRequestedFlag(bool value) = 0;
-
     virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const = 0;
     virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) = 0;
 

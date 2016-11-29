@@ -88,7 +88,7 @@ public:
                      BSONObjBuilder& result) {
         auto parsedRequest = uassertStatusOK(AddShardRequest::parseFromMongosCommand(cmdObj));
 
-        audit::logAddShard(ClientBasic::getCurrent(),
+        audit::logAddShard(Client::getCurrent(),
                            parsedRequest.hasName() ? parsedRequest.getName() : "",
                            parsedRequest.getConnString().toString(),
                            parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize()

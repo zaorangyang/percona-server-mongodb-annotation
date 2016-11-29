@@ -103,7 +103,7 @@ void ReplSetDistLockManager::shutDown(OperationContext* txn) {
     auto status = _catalog->stopPing(txn, _processID);
     if (!status.isOK()) {
         warning() << "error encountered while cleaning up distributed ping entry for " << _processID
-                  << causedBy(status);
+                  << causedBy(redact(status));
     }
 }
 
@@ -261,22 +261,12 @@ StatusWith<bool> ReplSetDistLockManager::isLockExpired(OperationContext* txn,
     return false;
 }
 
-StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lock(
-    OperationContext* txn,
-    StringData name,
-    StringData whyMessage,
-    Milliseconds waitFor,
-    Milliseconds lockTryInterval) {
-    return lockWithSessionID(txn, name, whyMessage, OID::gen(), waitFor, lockTryInterval);
-}
-
-StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lockWithSessionID(
-    OperationContext* txn,
-    StringData name,
-    StringData whyMessage,
-    const OID lockSessionID,
-    Milliseconds waitFor,
-    Milliseconds lockTryInterval) {
+StatusWith<DistLockHandle> ReplSetDistLockManager::lockWithSessionID(OperationContext* txn,
+                                                                     StringData name,
+                                                                     StringData whyMessage,
+                                                                     const OID lockSessionID,
+                                                                     Milliseconds waitFor,
+                                                                     Milliseconds lockTryInterval) {
     Timer timer(_serviceContext->getTickSource());
     Timer msgTimer(_serviceContext->getTickSource());
 
@@ -286,6 +276,7 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lockWithSess
     int networkErrorRetries = 0;
 
     auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+
     // Distributed lock acquisition works by tring to update the state of the lock to 'taken'. If
     // the lock is currently taken, we will back off and try the acquisition again, repeating this
     // until the lockTryInterval has been reached. If a network error occurs at each lock
@@ -298,24 +289,30 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lockWithSess
             const BSONObj& data = customTimeout.getData();
             lockExpiration = Milliseconds(data["timeoutMs"].numberInt());
         }
-
+        // REDACT: can this whyMessage ever have PII?
         LOG(1) << "trying to acquire new distributed lock for " << name
                << " ( lock timeout : " << durationCount<Milliseconds>(lockExpiration)
                << " ms, ping interval : " << durationCount<Milliseconds>(_pingInterval)
                << " ms, process : " << _processID << " )"
-               << " with lockSessionID: " << lockSessionID << ", why: " << whyMessage;
+               << " with lockSessionID: " << lockSessionID
+               << ", why: " << redact(whyMessage.toString());
 
-        auto lockResult = _catalog->grabLock(
-            txn, name, lockSessionID, who, _processID, Date_t::now(), whyMessage);
+        auto lockResult = _catalog->grabLock(txn,
+                                             name,
+                                             lockSessionID,
+                                             who,
+                                             _processID,
+                                             Date_t::now(),
+                                             redact(whyMessage.toString()));
 
         auto status = lockResult.getStatus();
 
         if (status.isOK()) {
             // Lock is acquired since findAndModify was able to successfully modify
             // the lock document.
-            log() << "distributed lock '" << name << "' acquired for '" << whyMessage
-                  << "', ts : " << lockSessionID;
-            return ScopedDistLock(txn, lockSessionID, this);
+            log() << "distributed lock '" << name << "' acquired for '"
+                  << redact(whyMessage.toString()) << "', ts : " << lockSessionID;
+            return lockSessionID;
         }
 
         // If a network error occurred, unlock the lock synchronously and try again
@@ -323,7 +320,7 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lockWithSess
             networkErrorRetries < kMaxNumLockAcquireRetries) {
             LOG(1) << "Failed to acquire distributed lock because of retriable error. Retrying "
                       "acquisition by first unlocking the stale entry, which possibly exists now"
-                   << causedBy(status);
+                   << causedBy(redact(status));
 
             networkErrorRetries++;
 
@@ -338,7 +335,7 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lockWithSess
 
             LOG(1)
                 << "Failed to retry acqusition of distributed lock. No more attempts will be made"
-                << causedBy(status);
+                << causedBy(redact(status));
         }
 
         if (status != ErrorCodes::LockStateChangeFailed) {
@@ -384,7 +381,7 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lockWithSess
 
                     LOG(0) << "lock '" << name << "' successfully forced";
                     LOG(0) << "distributed lock '" << name << "' acquired, ts : " << lockSessionID;
-                    return ScopedDistLock(txn, lockSessionID, this);
+                    return lockSessionID;
                 }
 
                 if (overtakeStatus != ErrorCodes::LockStateChangeFailed) {
@@ -405,7 +402,7 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lockWithSess
         // Periodically message for debugging reasons
         if (msgTimer.seconds() > 10) {
             LOG(0) << "waited " << timer.seconds() << "s for distributed lock " << name << " for "
-                   << whyMessage;
+                   << redact(whyMessage.toString());
 
             msgTimer.reset();
         }
@@ -436,7 +433,8 @@ void ReplSetDistLockManager::unlock(OperationContext* txn, const DistLockHandle&
 void ReplSetDistLockManager::unlockAll(OperationContext* txn, const std::string& processID) {
     Status status = _catalog->unlockAll(txn, processID);
     if (!status.isOK()) {
-        warning() << "Error while trying to unlock existing distributed locks" << causedBy(status);
+        warning() << "Error while trying to unlock existing distributed locks"
+                  << causedBy(redact(status));
     }
 }
 

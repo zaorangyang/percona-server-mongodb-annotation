@@ -649,35 +649,53 @@ static ExitCode _initAndListen(int listenPort) {
 #ifndef _WIN32
         mongo::signalForkSuccess();
 #endif
+        AuthorizationManager* globalAuthzManager = getGlobalAuthorizationManager();
+        if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
+            Status status = authindex::verifySystemIndexes(startupOpCtx.get());
+            if (!status.isOK()) {
+                log() << status.reason();
+                exitCleanly(EXIT_NEED_UPGRADE);
+            }
 
-        Status status = authindex::verifySystemIndexes(startupOpCtx.get());
-        if (!status.isOK()) {
-            log() << status.reason();
-            exitCleanly(EXIT_NEED_UPGRADE);
-        }
-
-        // SERVER-14090: Verify that auth schema version is schemaVersion26Final.
-        int foundSchemaVersion;
-        status = getGlobalAuthorizationManager()->getAuthorizationVersion(startupOpCtx.get(),
-                                                                          &foundSchemaVersion);
-        if (!status.isOK()) {
-            log() << "Auth schema version is incompatible: "
-                  << "User and role management commands require auth data to have "
-                  << "at least schema version " << AuthorizationManager::schemaVersion26Final
-                  << " but startup could not verify schema version: " << status.toString() << endl;
-            exitCleanly(EXIT_NEED_UPGRADE);
-        }
-        if (foundSchemaVersion < AuthorizationManager::schemaVersion26Final) {
-            log() << "Auth schema version is incompatible: "
-                  << "User and role management commands require auth data to have "
-                  << "at least schema version " << AuthorizationManager::schemaVersion26Final
-                  << " but found " << foundSchemaVersion << ". In order to upgrade "
-                  << "the auth schema, first downgrade MongoDB binaries to version "
-                  << "2.6 and then run the authSchemaUpgrade command." << endl;
-            exitCleanly(EXIT_NEED_UPGRADE);
+            // SERVER-14090: Verify that auth schema version is schemaVersion26Final.
+            int foundSchemaVersion;
+            status = globalAuthzManager->getAuthorizationVersion(startupOpCtx.get(),
+                                                                 &foundSchemaVersion);
+            if (!status.isOK()) {
+                log() << "Auth schema version is incompatible: "
+                      << "User and role management commands require auth data to have "
+                      << "at least schema version " << AuthorizationManager::schemaVersion26Final
+                      << " but startup could not verify schema version: " << status.toString()
+                      << endl;
+                exitCleanly(EXIT_NEED_UPGRADE);
+            }
+            if (foundSchemaVersion < AuthorizationManager::schemaVersion26Final) {
+                log() << "Auth schema version is incompatible: "
+                      << "User and role management commands require auth data to have "
+                      << "at least schema version " << AuthorizationManager::schemaVersion26Final
+                      << " but found " << foundSchemaVersion << ". In order to upgrade "
+                      << "the auth schema, first downgrade MongoDB binaries to version "
+                      << "2.6 and then run the authSchemaUpgrade command." << endl;
+                exitCleanly(EXIT_NEED_UPGRADE);
+            }
+        } else if (globalAuthzManager->isAuthEnabled()) {
+            error() << "Auth must be disabled when starting without auth schema validation";
+            exitCleanly(EXIT_BADOPTIONS);
+        } else {
+            // If authSchemaValidation is disabled and server is running without auth,
+            // warn the user and continue startup without authSchema metadata checks.
+            log() << startupWarningsLog;
+            log() << "** WARNING: Startup auth schema validation checks are disabled for the "
+                     "database."
+                  << startupWarningsLog;
+            log() << "**          This mode should only be used to manually repair corrupted auth "
+                     "data."
+                  << startupWarningsLog;
         }
 
         if (!storageGlobalParams.readOnly) {
+            logStartup(startupOpCtx.get());
+
             getDeleter()->startWorkers();
 
             restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
@@ -709,12 +727,12 @@ static ExitCode _initAndListen(int listenPort) {
 
     HostnameCanonicalizationWorker::start(getGlobalServiceContext());
 
+    uassertStatusOK(ShardingState::get(startupOpCtx.get())
+                        ->initializeShardingAwarenessIfNeeded(startupOpCtx.get()));
+
     if (!storageGlobalParams.readOnly) {
         startFTDC();
         if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-            uassertStatusOK(ShardingState::get(startupOpCtx.get())
-                                ->initializeFromShardIdentity(startupOpCtx.get()));
-
             // Note: For replica sets, ShardingStateRecovery happens on transition to primary.
             if (!repl::getGlobalReplicationCoordinator()->isReplEnabled()) {
                 uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
@@ -726,15 +744,6 @@ static ExitCode _initAndListen(int listenPort) {
                                                        kDistLockProcessIdForConfigServer));
             Balancer::create(startupOpCtx->getServiceContext());
         }
-
-        logStartup(startupOpCtx.get());
-    } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-        auto parseStatus = ShardIdentityType::fromBSON(serverGlobalParams.overrideShardIdentity);
-        uassertStatusOK(parseStatus);
-        uassertStatusOK(ShardingState::get(startupOpCtx.get())
-                            ->initializeFromShardIdentity(
-                                startupOpCtx.get(), parseStatus.getValue(), Date_t::max()));
-        uassertStatusOK(reloadShardRegistryUntilSuccess(startupOpCtx.get()));
     }
 
     // MessageServer::run will return when exit code closes its socket and we don't need the

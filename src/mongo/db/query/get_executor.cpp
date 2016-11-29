@@ -32,6 +32,7 @@
 
 #include "mongo/db/query/get_executor.h"
 
+#include <boost/optional.hpp>
 #include <limits>
 #include <memory>
 
@@ -92,7 +93,7 @@ using std::vector;
 using stdx::make_unique;
 
 // static
-void filterAllowedIndexEntries(const AllowedIndices& allowedIndices,
+void filterAllowedIndexEntries(const AllowedIndicesFilter& allowedIndicesFilter,
                                std::vector<IndexEntry>* indexEntries) {
     invariant(indexEntries);
 
@@ -104,15 +105,9 @@ void filterAllowedIndexEntries(const AllowedIndices& allowedIndices,
          i != indexEntries->end();
          ++i) {
         const IndexEntry& indexEntry = *i;
-        for (std::vector<BSONObj>::const_iterator j = allowedIndices.indexKeyPatterns.begin();
-             j != allowedIndices.indexKeyPatterns.end();
-             ++j) {
-            const BSONObj& index = *j;
-            // Copy index entry to temp vector if found in query settings.
-            if (0 == indexEntry.keyPattern.woCompare(index)) {
-                temp.push_back(indexEntry);
-                break;
-            }
+        if (allowedIndicesFilter.allows(indexEntry)) {
+            // Copy index entry into temp vector if found in query settings.
+            temp.push_back(indexEntry);
         }
     }
 
@@ -149,15 +144,14 @@ void fillOutPlannerParams(OperationContext* txn,
 
     // If query supports index filters, filter params.indices by indices in query settings.
     QuerySettings* querySettings = collection->infoCache()->getQuerySettings();
-    AllowedIndices* allowedIndicesRaw;
     PlanCacheKey planCacheKey =
         collection->infoCache()->getPlanCache()->computeKey(*canonicalQuery);
 
     // Filter index catalog if index filters are specified for query.
     // Also, signal to planner that application hint should be ignored.
-    if (querySettings->getAllowedIndices(planCacheKey, &allowedIndicesRaw)) {
-        unique_ptr<AllowedIndices> allowedIndices(allowedIndicesRaw);
-        filterAllowedIndexEntries(*allowedIndices, &plannerParams->indices);
+    if (boost::optional<AllowedIndicesFilter> allowedIndicesFilter =
+            querySettings->getAllowedIndicesFilter(planCacheKey)) {
+        filterAllowedIndexEntries(*allowedIndicesFilter, &plannerParams->indices);
         plannerParams->indexFiltersApplied = true;
     }
 
@@ -693,8 +687,7 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDelete(OperationContext* txn,
     const NamespaceString& nss(request->getNamespaceString());
     if (!request->isGod()) {
         if (nss.isSystem()) {
-            uassert(
-                12050, "cannot delete from system namespace", legalClientSystemNS(nss.ns(), true));
+            uassert(12050, "cannot delete from system namespace", legalClientSystemNS(nss.ns()));
         }
         if (nss.isVirtualized()) {
             log() << "cannot delete from a virtual collection: " << nss;
@@ -833,7 +826,7 @@ inline void validateUpdate(const char* ns, const BSONObj& updateobj, const BSONO
                 str::stream() << "cannot update system collection: " << ns << " q: " << patternOrig
                               << " u: "
                               << updateobj,
-                legalClientSystemNS(ns, true));
+                legalClientSystemNS(ns));
     }
 }
 
@@ -1095,8 +1088,7 @@ bool turnIxscanIntoCount(QuerySolution* soln) {
     }
 
     // Make the count node that we replace the fetch + ixscan with.
-    CountScanNode* csn = new CountScanNode();
-    csn->indexKeyPattern = isn->indexKeyPattern;
+    CountScanNode* csn = new CountScanNode(isn->index);
     csn->startKey = startKey;
     csn->startKeyInclusive = startKeyInclusive;
     csn->endKey = endKey;
@@ -1330,8 +1322,7 @@ bool turnIxscanIntoDistinctIxscan(QuerySolution* soln, const string& field) {
         }
 
         // Make a new DistinctNode.  We swap this for the ixscan in the provided solution.
-        DistinctNode* dn = new DistinctNode();
-        dn->indexKeyPattern = isn->indexKeyPattern;
+        DistinctNode* dn = new DistinctNode(isn->index);
         dn->direction = isn->direction;
         dn->bounds = isn->bounds;
 
@@ -1339,7 +1330,7 @@ bool turnIxscanIntoDistinctIxscan(QuerySolution* soln, const string& field) {
         // try to distinct-hack when there is an index prefixed by the field we're distinct-ing
         // over.  Consider removing this code if we stick with that policy.
         dn->fieldNo = 0;
-        BSONObjIterator it(isn->indexKeyPattern);
+        BSONObjIterator it(isn->index.keyPattern);
         while (it.more()) {
             if (field == it.next().fieldName()) {
                 break;
@@ -1447,10 +1438,9 @@ StatusWith<unique_ptr<PlanExecutor>> getExecutorDistinct(OperationContext* txn,
                              parsedDistinct->getKey(),
                              cq->getCollator(),
                              &distinctNodeIndex)) {
-        auto dn = stdx::make_unique<DistinctNode>();
-        dn->indexKeyPattern = plannerParams.indices[distinctNodeIndex].keyPattern;
+        auto dn = stdx::make_unique<DistinctNode>(plannerParams.indices[distinctNodeIndex]);
         dn->direction = 1;
-        IndexBoundsBuilder::allValuesBounds(dn->indexKeyPattern, &dn->bounds);
+        IndexBoundsBuilder::allValuesBounds(dn->index.keyPattern, &dn->bounds);
         dn->fieldNo = 0;
 
         // An index with a non-simple collation requires a FETCH stage.

@@ -35,6 +35,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/service_context.h"
+#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -50,10 +51,13 @@ namespace rpc {
 using std::shared_ptr;
 
 Status ShardingEgressMetadataHook::writeRequestMetadata(bool shardedConnection,
+                                                        OperationContext* txn,
                                                         const StringData target,
                                                         BSONObjBuilder* metadataBob) {
     try {
-        audit::writeImpersonatedUsersToMetadata(metadataBob);
+        audit::writeImpersonatedUsersToMetadata(txn, metadataBob);
+
+        ClientMetadataIsMasterState::writeToMetadata(txn, metadataBob);
         if (!shardedConnection) {
             return Status::OK();
         }
@@ -64,10 +68,12 @@ Status ShardingEgressMetadataHook::writeRequestMetadata(bool shardedConnection,
     }
 }
 
-Status ShardingEgressMetadataHook::writeRequestMetadata(const HostAndPort& target,
+Status ShardingEgressMetadataHook::writeRequestMetadata(OperationContext* txn,
+                                                        const HostAndPort& target,
                                                         BSONObjBuilder* metadataBob) {
     try {
-        audit::writeImpersonatedUsersToMetadata(metadataBob);
+        audit::writeImpersonatedUsersToMetadata(txn, metadataBob);
+        ClientMetadataIsMasterState::writeToMetadata(txn, metadataBob);
         rpc::ConfigServerMetadata(_getConfigServerOpTime()).writeToMetadata(metadataBob);
         return Status::OK();
     } catch (...) {

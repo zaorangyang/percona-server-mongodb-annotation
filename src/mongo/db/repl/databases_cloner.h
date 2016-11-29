@@ -72,6 +72,8 @@ public:
                     IncludeDbFilterFn includeDbPred,
                     OnFinishFn finishFn);
 
+    ~DatabasesCloner();
+
     Status startup();
     bool isActive();
     void join();
@@ -84,6 +86,13 @@ public:
      */
     Status getStatus();
     std::string toString() const;
+
+    /**
+     * Overrides how executor schedules database work.
+     *
+     * For testing only.
+     */
+    void setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
 
 private:
     /**
@@ -120,8 +129,9 @@ private:
     HostAndPort _source;               // (R) The source to use, until we get an error
     bool _active = false;              // (M) false until we start
     std::vector<std::shared_ptr<DatabaseCloner>> _databaseCloners;  // (M) database cloners by name
-    int _clonersActive = 0;  // (M) Number of active cloners left.
+    std::size_t _currentClonerIndex = 0U;  // (M) Index of currently active database cloner.
     std::unique_ptr<RemoteCommandRetryScheduler> _listDBsScheduler;  // (M) scheduler for listDBs.
+    CollectionCloner::ScheduleDbWorkFn _scheduleDbWorkFn;            // (M)
 
     const IncludeDbFilterFn _includeDbFn;  // (R) function which decides which dbs are cloned.
     const OnFinishFn _finishFn;            // (R) function called when finished.

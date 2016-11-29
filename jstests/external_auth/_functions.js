@@ -4,6 +4,8 @@
 
 // from linuxask.com
 
+Random.setRandomSeed();
+
 function randomString(len) { 
   var chars = "abcdefghiklmnopqrstuvwxyz"; 
   var randomstring = ''; 

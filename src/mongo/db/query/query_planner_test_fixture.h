@@ -72,6 +72,8 @@ protected:
                   MatchExpression* filterExpr,
                   const CollatorInterface* collator);
 
+    void addIndex(BSONObj keyPattern, const CollatorInterface* collator, StringData indexName);
+
     //
     // Execute planner.
     //
@@ -159,6 +161,8 @@ protected:
      * version goes through find command parsing, and will be planned like a find command.
      */
     void runQueryAsCommand(const BSONObj& cmdObj);
+
+    void runInvalidQueryAsCommand(const BSONObj& cmdObj);
 
     //
     // Introspect solutions.

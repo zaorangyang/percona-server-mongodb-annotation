@@ -103,14 +103,24 @@ Status wrappedRun(OperationContext* txn,
     }
 
     if (f.type() == Object) {
-        IndexDescriptor* desc =
-            collection->getIndexCatalog()->findIndexByKeyPattern(txn, f.embeddedObject());
-        if (desc == NULL) {
+        std::vector<IndexDescriptor*> indexes;
+        collection->getIndexCatalog()->findIndexesByKeyPattern(
+            txn, f.embeddedObject(), false, &indexes);
+        if (indexes.empty()) {
             return Status(ErrorCodes::IndexNotFound,
-                          str::stream() << "can't find index with key: "
-                                        << f.embeddedObject().toString());
+                          str::stream() << "can't find index with key: " << f.embeddedObject());
+        } else if (indexes.size() > 1) {
+            return Status(ErrorCodes::AmbiguousIndexKeyPattern,
+                          str::stream() << indexes.size() << " indexes found for key: "
+                                        << f.embeddedObject()
+                                        << ", identify by name instead."
+                                        << " Conflicting indexes: "
+                                        << indexes[0]->infoObj()
+                                        << ", "
+                                        << indexes[1]->infoObj());
         }
 
+        IndexDescriptor* desc = indexes[0];
         if (desc->isIdIndex()) {
             return Status(ErrorCodes::InvalidOptions, "cannot drop _id index");
         }
@@ -135,13 +145,19 @@ Status dropIndexes(OperationContext* txn,
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         ScopedTransaction transaction(txn, MODE_IX);
         AutoGetDb autoDb(txn, dbName, MODE_X);
+        Database* db = autoDb.getDb();
 
         bool userInitiatedWritesAndNotPrimary = txn->writesAreReplicated() &&
             !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nss);
 
         if (userInitiatedWritesAndNotPrimary) {
-            return Status(ErrorCodes::NotMaster,
-                          str::stream() << "Not primary while dropping indexes in " << nss.ns());
+            return {ErrorCodes::NotMaster,
+                    str::stream() << "Not primary while dropping indexes in " << nss.ns()};
+        }
+
+        if (db && db->getViewCatalog()->lookup(txn, nss.ns())) {
+            return {ErrorCodes::CommandNotSupportedOnView,
+                    str::stream() << "Cannot drop indexes on view " << nss.ns()};
         }
 
         WriteUnitOfWork wunit(txn);

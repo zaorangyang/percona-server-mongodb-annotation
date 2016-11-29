@@ -32,6 +32,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/storage_interface.h"
@@ -107,12 +108,13 @@ public:
         stdx::function<Status(OperationContext* txn, const NamespaceString& nss)>;
     using FindOneFn = stdx::function<StatusWith<BSONObj>(OperationContext* txn,
                                                          const NamespaceString& nss,
-                                                         const BSONObj& indexKeyPattern,
+                                                         boost::optional<StringData> indexName,
                                                          ScanDirection scanDirection)>;
     using DeleteOneFn = stdx::function<StatusWith<BSONObj>(OperationContext* txn,
                                                            const NamespaceString& nss,
-                                                           const BSONObj& indexKeyPattern,
+                                                           boost::optional<StringData> indexName,
                                                            ScanDirection scanDirection)>;
+    using IsAdminDbValidFn = stdx::function<Status(OperationContext* txn)>;
 
     StorageInterfaceMock() = default;
 
@@ -169,20 +171,20 @@ public:
 
     StatusWith<BSONObj> findOne(OperationContext* txn,
                                 const NamespaceString& nss,
-                                const BSONObj& indexKeyPattern,
+                                boost::optional<StringData> indexName,
                                 ScanDirection scanDirection) override {
-        return findOneFn(txn, nss, indexKeyPattern, scanDirection);
+        return findOneFn(txn, nss, indexName, scanDirection);
     }
 
     StatusWith<BSONObj> deleteOne(OperationContext* txn,
                                   const NamespaceString& nss,
-                                  const BSONObj& indexKeyPattern,
+                                  boost::optional<StringData> indexName,
                                   ScanDirection scanDirection) override {
-        return deleteOneFn(txn, nss, indexKeyPattern, scanDirection);
+        return deleteOneFn(txn, nss, indexName, scanDirection);
     }
 
     Status isAdminDbValid(OperationContext* txn) override {
-        return Status::OK();
+        return isAdminDbValidFn(txn);
     };
 
 
@@ -218,15 +220,18 @@ public:
     };
     FindOneFn findOneFn = [](OperationContext* txn,
                              const NamespaceString& nss,
-                             const BSONObj& indexKeyPattern,
+                             boost::optional<StringData> indexName,
                              ScanDirection scanDirection) {
         return Status{ErrorCodes::IllegalOperation, "FindOneFn not implemented."};
     };
     DeleteOneFn deleteOneFn = [](OperationContext* txn,
                                  const NamespaceString& nss,
-                                 const BSONObj& indexKeyPattern,
+                                 boost::optional<StringData> indexName,
                                  ScanDirection scanDirection) {
         return Status{ErrorCodes::IllegalOperation, "DeleteOneFn not implemented."};
+    };
+    IsAdminDbValidFn isAdminDbValidFn = [](OperationContext*) {
+        return Status{ErrorCodes::IllegalOperation, "IsAdminDbValidFn not implemented."};
     };
 
 private:

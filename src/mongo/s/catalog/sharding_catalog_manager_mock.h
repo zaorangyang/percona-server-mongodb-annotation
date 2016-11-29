@@ -60,14 +60,40 @@ public:
                                const std::string& shardName,
                                const std::string& zoneName) override;
 
+    Status assignKeyRangeToZone(OperationContext* txn,
+                                const NamespaceString& ns,
+                                const ChunkRange& range,
+                                const std::string& zoneName) override;
+
+    Status removeKeyRangeFromZone(OperationContext* txn,
+                                  const NamespaceString& ns,
+                                  const ChunkRange& range) override;
+
+    Status commitChunkSplit(OperationContext* txn,
+                            const NamespaceString& ns,
+                            const OID& requestEpoch,
+                            const ChunkRange& range,
+                            const std::vector<BSONObj>& splitPoints,
+                            const std::string& shardName) override;
+
+    Status commitChunkMerge(OperationContext* txn,
+                            const NamespaceString& ns,
+                            const OID& requestEpoch,
+                            const std::vector<BSONObj>& chunkBoundaries,
+                            const std::string& shardName) override;
+
     void appendConnectionStats(executor::ConnectionPoolStats* stats) override;
 
     Status initializeConfigDatabaseIfNeeded(OperationContext* txn) override;
+
+    Status initializeShardingAwarenessOnUnawareShards(OperationContext* txn) override;
 
     Status upsertShardIdentityOnShard(OperationContext* txn, ShardType shardType) override;
 
     BSONObj createShardIdentityUpsertForAddShard(OperationContext* txn,
                                                  const std::string& shardName) override;
+
+    void cancelAddShardTaskIfNeeded(const ShardId& shardId) override;
 };
 
 }  // namespace mongo

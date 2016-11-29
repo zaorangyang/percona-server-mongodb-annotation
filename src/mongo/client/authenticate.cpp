@@ -67,13 +67,6 @@ bool isOk(const BSONObj& o) {
     return getStatusFromCommandResult(o).isOK();
 }
 
-BSONObj getFallbackAuthParams(const BSONObj& params) {
-    if (params["fallbackParams"].type() != Object) {
-        return BSONObj();
-    }
-    return params["fallbackParams"].Obj();
-}
-
 StatusWith<std::string> extractDBField(const BSONObj& params) {
     std::string db;
     if (params.hasField(kUserSourceFieldName)) {
@@ -166,7 +159,7 @@ void authMongoCR(RunCommandHook runCommand, const BSONObj& params, AuthCompletio
 
         // Ensure response was valid
         std::string nonce;
-        BSONObj nonceResponse = response.getValue().data;
+        BSONObj nonceResponse = response.data;
         auto valid = bsonExtractStringField(nonceResponse, "nonce", &nonce);
         if (!valid.isOK())
             return handler({ErrorCodes::AuthenticationFailed,
@@ -242,7 +235,8 @@ void authX509(RunCommandHook runCommand,
 //
 
 bool isFailedAuthOk(const AuthResponse& response) {
-    return (response == ErrorCodes::AuthenticationFailed && serverGlobalParams.transitionToAuth);
+    return (response.status == ErrorCodes::AuthenticationFailed &&
+            serverGlobalParams.transitionToAuth);
 }
 
 void auth(RunCommandHook runCommand,
@@ -289,34 +283,12 @@ void auth(RunCommandHook runCommand,
                     mechanism + " mechanism support not compiled into client library."});
 };
 
-bool needsFallback(const AuthResponse& response) {
-    // TODO: BadValue is sometimes returned for auth failures with unsupported mechanisms
-    // in 2.6 servers. We should investigate removing this BadValue check eventually.
-    return (response == ErrorCodes::BadValue || response == ErrorCodes::CommandNotFound);
-}
-
 void asyncAuth(RunCommandHook runCommand,
                const BSONObj& params,
                StringData hostname,
                StringData clientName,
                AuthCompletionHandler handler) {
-    auth(runCommand,
-         params,
-         hostname,
-         clientName,
-         [runCommand, params, hostname, clientName, handler](AuthResponse response) {
-             // If auth failed, try again with fallback params when appropriate
-             if (needsFallback(response)) {
-                 return auth(runCommand,
-                             std::move(getFallbackAuthParams(params)),
-                             hostname,
-                             clientName,
-                             handler);
-             }
-
-             // otherwise, call handler
-             return handler(std::move(response));
-         });
+    auth(runCommand, params, hostname, clientName, std::move(handler));
 }
 
 }  // namespace
@@ -334,9 +306,9 @@ void authenticateClient(const BSONObj& params,
         // NOTE: this assumes that runCommand executes synchronously.
         asyncAuth(runCommand, params, hostname, clientName, [](AuthResponse response) {
             // DBClient expects us to throw in case of an auth error.
-            uassertStatusOK(response);
+            uassertStatusOK(response.status);
 
-            auto serverResponse = response.getValue().data;
+            auto serverResponse = response.data;
             uassert(ErrorCodes::AuthenticationFailed,
                     serverResponse["errmsg"].str(),
                     isOk(serverResponse));

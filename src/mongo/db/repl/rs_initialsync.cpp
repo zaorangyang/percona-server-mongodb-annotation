@@ -42,6 +42,7 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/cloner.h"
+#include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
@@ -229,9 +230,6 @@ bool _initialSyncApplyOplog(OperationContext* txn,
 }
 
 
-// Number of connection retries allowed during initial sync.
-const auto kConnectRetryLimit = 10;
-
 /**
  * Do the initial sync for this member.  There are several steps to this process:
  *
@@ -271,7 +269,7 @@ Status _initialSync(BackgroundSync* bgsync) {
 
     OplogReader r;
 
-    auto currentRetry = 0;
+    std::size_t currentRetry = 0;
     while (r.getHost().empty()) {
         // We must prime the sync source selector so that it considers all candidates regardless
         // of oplog position, by passing in null OpTime as the last op fetched time.
@@ -280,10 +278,10 @@ Status _initialSync(BackgroundSync* bgsync) {
         if (r.getHost().empty()) {
             std::string msg =
                 "No valid sync source found in current replica set to do an initial sync.";
-            if (++currentRetry >= kConnectRetryLimit) {
+            if (++currentRetry >= kInitialSyncMaxConnectRetries) {
                 return Status(ErrorCodes::InitialSyncOplogSourceMissing, msg);
             }
-            LOG(1) << msg << ", retry " << currentRetry << " of " << kConnectRetryLimit;
+            LOG(1) << msg << ", retry " << currentRetry << " of " << kInitialSyncMaxConnectRetries;
             sleepsecs(1);
         }
 
@@ -335,8 +333,8 @@ Status _initialSync(BackgroundSync* bgsync) {
         CloneOptions options;
         options.fromDB = db;
         log() << "fetching and creating collections for " << db;
-        std::list<BSONObj> initialCollections =
-            r.conn()->getCollectionInfos(options.fromDB);  // may uassert
+        std::list<BSONObj> initialCollections = r.conn()->getCollectionInfos(
+            options.fromDB, ListCollectionsFilter::makeTypeCollectionFilter());  // may uassert
         auto fetchStatus = cloner.filterCollectionsForClone(options, initialCollections);
         if (!fetchStatus.isOK()) {
             return fetchStatus.getStatus();
@@ -437,7 +435,6 @@ Status _initialSync(BackgroundSync* bgsync) {
 
         // Initial sync is now complete.  Flag this by setting minValid to the last thing we synced.
         StorageInterface::get(&txn)->setMinValid(&txn, lastOpTimeWritten, DurableRequirement::None);
-        getGlobalReplicationCoordinator()->setInitialSyncRequestedFlag(false);
     }
 
     // Clear the initial sync flag -- cannot be done under a db lock, or recursive.

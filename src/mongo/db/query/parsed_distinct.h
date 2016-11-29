@@ -32,11 +32,11 @@
 #include <string>
 
 #include "mongo/base/status_with.h"
+#include "mongo/db/query/canonical_query.h"
 
 namespace mongo {
 
 class BSONObj;
-class CanonicalQuery;
 class ExtensionsCallback;
 class NamespaceString;
 class OperationContext;
@@ -68,6 +68,11 @@ public:
     const std::string& getKey() const {
         return _key;
     }
+
+    /**
+     * Convert this ParsedDistinct into an aggregation command object.
+     */
+    StatusWith<BSONObj> asAggregationCommand() const;
 
     /**
      * 'extensionsCallback' allows for additional mongod parsing. If called from mongos, an

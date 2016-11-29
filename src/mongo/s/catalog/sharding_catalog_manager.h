@@ -36,7 +36,9 @@
 namespace mongo {
 
 class BSONObj;
+class ChunkRange;
 class ConnectionString;
+class NamespaceString;
 class OperationContext;
 class RemoteCommandTargeter;
 class ShardId;
@@ -64,6 +66,10 @@ class ShardingCatalogManager {
     MONGO_DISALLOW_COPYING(ShardingCatalogManager);
 
 public:
+    static Seconds getAddShardTaskRetryInterval() {
+        return Seconds{30};
+    }
+
     virtual ~ShardingCatalogManager() = default;
 
     /**
@@ -113,6 +119,46 @@ public:
                                        const std::string& zoneName) = 0;
 
     /**
+     * Assigns a range of a sharded collection to a particular shard zone. If range is a prefix of
+     * the shard key, the range will be converted into a new range with full shard key filled
+     * with MinKey values.
+     */
+    virtual Status assignKeyRangeToZone(OperationContext* txn,
+                                        const NamespaceString& ns,
+                                        const ChunkRange& range,
+                                        const std::string& zoneName) = 0;
+
+    /**
+     * Removes a range from a zone.
+     * Note: unlike assignKeyRangeToZone, the given range will never be converted to include the
+     * full shard key.
+     */
+    virtual Status removeKeyRangeFromZone(OperationContext* txn,
+                                          const NamespaceString& ns,
+                                          const ChunkRange& range) = 0;
+
+    /**
+     * Updates chunk metadata in config.chunks collection to reflect the given chunk being split
+     * into multiple smaller chunks based on the specified split points.
+     */
+    virtual Status commitChunkSplit(OperationContext* txn,
+                                    const NamespaceString& ns,
+                                    const OID& requestEpoch,
+                                    const ChunkRange& range,
+                                    const std::vector<BSONObj>& splitPoints,
+                                    const std::string& shardName) = 0;
+
+    /**
+     * Updates chunk metadata in config.chunks collection to reflect the given chunks being merged
+     * into a single larger chunk based on the specified boundaries of the smaller chunks.
+     */
+    virtual Status commitChunkMerge(OperationContext* txn,
+                                    const NamespaceString& ns,
+                                    const OID& requestEpoch,
+                                    const std::vector<BSONObj>& chunkBoundaries,
+                                    const std::string& shardName) = 0;
+
+    /**
      * Append information about the connection pools owned by the CatalogManager.
      */
     virtual void appendConnectionStats(executor::ConnectionPoolStats* stats) = 0;
@@ -122,6 +168,13 @@ public:
      * necessary indexes and populating the config.version document.
      */
     virtual Status initializeConfigDatabaseIfNeeded(OperationContext* txn) = 0;
+
+    /**
+     * For upgrade from 3.2 to 3.4, for each shard in config.shards that is not marked as sharding
+     * aware, schedules a task to upsert a shardIdentity doc into the shard and mark the shard as
+     * sharding aware.
+     */
+    virtual Status initializeShardingAwarenessOnUnawareShards(OperationContext* txn) = 0;
 
     /**
      * For rolling upgrade and backwards compatibility with 3.2 mongos, schedules an asynchronous
@@ -139,6 +192,12 @@ public:
      */
     virtual BSONObj createShardIdentityUpsertForAddShard(OperationContext* txn,
                                                          const std::string& shardName) = 0;
+
+    /**
+     * For rolling upgrade and backwards compatibility, cancels a pending addShard task to upsert
+     * a shardIdentity document into the shard with id shardId (if there is such a task pending).
+     */
+    virtual void cancelAddShardTaskIfNeeded(const ShardId& shardId) = 0;
 
 protected:
     ShardingCatalogManager() = default;

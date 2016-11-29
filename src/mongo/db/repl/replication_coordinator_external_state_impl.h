@@ -34,6 +34,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
+#include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/sync_source_feedback.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/snapshot_manager.h"
@@ -45,6 +46,9 @@ namespace mongo {
 class ServiceContext;
 
 namespace repl {
+namespace {
+using UniqueLock = stdx::unique_lock<stdx::mutex>;
+}  // namespace
 
 class SnapshotThread;
 class StorageInterface;
@@ -58,7 +62,9 @@ public:
     virtual ~ReplicationCoordinatorExternalStateImpl();
     virtual void startThreads(const ReplSettings& settings) override;
     virtual void startInitialSync(OnInitialSyncFinishedFn finished) override;
-    virtual void startSteadyStateReplication(OperationContext* txn) override;
+    virtual void startSteadyStateReplication(OperationContext* txn,
+                                             ReplicationCoordinator* replCoord) override;
+    virtual void stopDataReplication(OperationContext* txn) override;
     virtual void runOnInitialSyncThread(stdx::function<void(OperationContext* txn)> run) override;
 
     virtual bool isInitialSyncFlagSet(OperationContext* txn) override;
@@ -113,6 +119,11 @@ public:
     virtual void onDurable(const JournalListener::Token& token);
 
 private:
+    /**
+     * Stops data replication and returns with 'lock' locked.
+     */
+    void _stopDataReplication_inlock(OperationContext* txn, UniqueLock* lock);
+
     // Guards starting threads and setting _startedThreads
     stdx::mutex _threadMutex;
 
@@ -136,7 +147,7 @@ private:
     std::unique_ptr<stdx::thread> _syncSourceFeedbackThread;
 
     // Thread running runSyncThread().
-    std::unique_ptr<stdx::thread> _applierThread;
+    std::unique_ptr<RSDataSync> _applierThread;
 
     // Mutex guarding the _nextThreadId value to prevent concurrent incrementing.
     stdx::mutex _nextThreadIdMutex;

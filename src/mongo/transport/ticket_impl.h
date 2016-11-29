@@ -30,6 +30,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/transport/session_id.h"
+#include "mongo/util/net/message.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {

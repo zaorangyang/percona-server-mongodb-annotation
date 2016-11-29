@@ -33,6 +33,7 @@
 #include "mongo/base/status.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/net/ssl_types.h"
 #include "mongo/util/time_support.h"
 #include <limits>
 
@@ -43,13 +44,11 @@ namespace transport {
 
 TransportLayerManager::TransportLayerManager() = default;
 
-Ticket TransportLayerManager::sourceMessage(const Session& session,
-                                            Message* message,
-                                            Date_t expiration) {
+Ticket TransportLayerManager::sourceMessage(Session& session, Message* message, Date_t expiration) {
     return session.getTransportLayer()->sourceMessage(session, message, expiration);
 }
 
-Ticket TransportLayerManager::sinkMessage(const Session& session,
+Ticket TransportLayerManager::sinkMessage(Session& session,
                                           const Message& message,
                                           Date_t expiration) {
     return session.getTransportLayer()->sinkMessage(session, message, expiration);
@@ -63,8 +62,8 @@ void TransportLayerManager::asyncWait(Ticket&& ticket, TicketCallback callback) 
     return getTicketTransportLayer(ticket)->asyncWait(std::move(ticket), std::move(callback));
 }
 
-std::string TransportLayerManager::getX509SubjectName(const Session& session) {
-    return session.getX509SubjectName();
+SSLPeerInfo TransportLayerManager::getX509PeerInfo(const Session& session) const {
+    return session.getX509PeerInfo();
 }
 
 template <typename Callable>
@@ -100,7 +99,7 @@ void TransportLayerManager::registerTags(const Session& session) {
     session.getTransportLayer()->registerTags(session);
 }
 
-void TransportLayerManager::end(const Session& session) {
+void TransportLayerManager::end(Session& session) {
     session.getTransportLayer()->end(session);
 }
 

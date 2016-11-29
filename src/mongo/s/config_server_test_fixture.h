@@ -33,6 +33,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/executor/network_test_env.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/message_port_mock.h"
 
@@ -96,7 +97,11 @@ public:
 
     executor::NetworkInterfaceMock* network() const;
 
+    executor::NetworkInterfaceMock* networkForAddShard() const;
+
     executor::TaskExecutor* executor() const;
+
+    executor::TaskExecutor* executorForAddShard() const;
 
     MessagingPortMock* getMessagingPort() const;
 
@@ -143,6 +148,16 @@ public:
     StatusWith<ShardType> getShardDoc(OperationContext* txn, const std::string& shardId);
 
     /**
+     * Setup the config.chunks collection to contain the given chunks.
+     */
+    Status setupChunks(const std::vector<ChunkType>& chunks);
+
+    /**
+     * Retrieves the chunk document from the config server.
+     */
+    StatusWith<ChunkType> getChunkDoc(OperationContext* txn, const BSONObj& minKey);
+
+    /**
      * Returns the indexes definitions defined on a given collection.
      */
     StatusWith<std::vector<BSONObj>> getIndexes(OperationContext* txn, const NamespaceString& ns);
@@ -168,6 +183,7 @@ private:
     RemoteCommandTargeterFactoryMock* _targeterFactory;
 
     executor::NetworkInterfaceMock* _mockNetwork;
+    executor::NetworkInterfaceMock* _mockNetworkForAddShard;
     executor::TaskExecutor* _executor;
     executor::TaskExecutor* _executorForAddShard;
     std::unique_ptr<executor::NetworkTestEnv> _networkTestEnv;

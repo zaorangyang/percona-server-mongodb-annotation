@@ -62,6 +62,7 @@ Status ShardingCatalogClientMock::enableSharding(OperationContext* txn, const st
 Status ShardingCatalogClientMock::shardCollection(OperationContext* txn,
                                                   const string& ns,
                                                   const ShardKeyPattern& fieldsAndOrder,
+                                                  const BSONObj& defaultCollation,
                                                   bool unique,
                                                   const vector<BSONObj>& initPoints,
                                                   const std::set<ShardId>& initShardIds) {
@@ -134,7 +135,7 @@ StatusWith<string> ShardingCatalogClientMock::getTagForChunk(OperationContext* t
 }
 
 StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientMock::getAllShards(
-    OperationContext* txn) {
+    OperationContext* txn, repl::ReadConcernLevel readConcern) {
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 

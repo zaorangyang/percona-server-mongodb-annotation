@@ -63,7 +63,11 @@ MultiApplier::MultiApplier(executor::TaskExecutor* executor,
 }
 
 MultiApplier::~MultiApplier() {
-    DESTRUCTOR_GUARD(cancel(); wait(););
+    DESTRUCTOR_GUARD(shutdown(); join(););
+}
+
+std::string MultiApplier::toString() const {
+    return getDiagnosticString();
 }
 
 std::string MultiApplier::getDiagnosticString() const {
@@ -82,7 +86,7 @@ bool MultiApplier::isActive() const {
     return _active;
 }
 
-Status MultiApplier::start() {
+Status MultiApplier::startup() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     if (_active) {
@@ -101,7 +105,7 @@ Status MultiApplier::start() {
     return Status::OK();
 }
 
-void MultiApplier::cancel() {
+void MultiApplier::shutdown() {
     executor::TaskExecutor::CallbackHandle dbWorkCallbackHandle;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -118,7 +122,7 @@ void MultiApplier::cancel() {
     }
 }
 
-void MultiApplier::wait() {
+void MultiApplier::join() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     while (_active) {
@@ -137,13 +141,6 @@ void MultiApplier::_callback(const executor::TaskExecutor::CallbackArgs& cbd) {
     StatusWith<OpTime> applyStatus(ErrorCodes::InternalError, "not mutated");
     try {
         auto txn = cc().makeOperationContext();
-
-        // Refer to multiSyncApply() and multiInitialSyncApply() in sync_tail.cpp.
-        txn->setReplicatedWrites(false);
-
-        // allow us to get through the magic barrier
-        txn->lockState()->setIsBatchWriter(true);
-
         applyStatus = _multiApply(txn.get(), _operations, _applyOperation);
     } catch (...) {
         applyStatus = exceptionToStatus();

@@ -51,12 +51,14 @@ namespace mongo {
 namespace repl {
 
 CollectionBulkLoaderImpl::CollectionBulkLoaderImpl(OperationContext* txn,
-                                                   TaskRunner* runner,
                                                    Collection* coll,
                                                    const BSONObj idIndexSpec,
+                                                   std::unique_ptr<OldThreadPool> threadPool,
+                                                   std::unique_ptr<TaskRunner> runner,
                                                    std::unique_ptr<AutoGetOrCreateDb> autoDb,
                                                    std::unique_ptr<AutoGetCollection> autoColl)
-    : _runner(runner),
+    : _threadPool(std::move(threadPool)),
+      _runner(std::move(runner)),
       _autoColl(std::move(autoColl)),
       _autoDB(std::move(autoDb)),
       _txn(txn),
@@ -67,7 +69,7 @@ CollectionBulkLoaderImpl::CollectionBulkLoaderImpl(OperationContext* txn,
       _idIndexSpec(idIndexSpec) {
     invariant(txn);
     invariant(coll);
-    invariant(runner);
+    invariant(_runner);
     invariant(_autoDB);
     invariant(_autoColl);
     invariant(_autoDB->getDb());
@@ -75,7 +77,11 @@ CollectionBulkLoaderImpl::CollectionBulkLoaderImpl(OperationContext* txn,
 }
 
 CollectionBulkLoaderImpl::~CollectionBulkLoaderImpl() {
-    DESTRUCTOR_GUARD(_runner->cancel();)
+    DESTRUCTOR_GUARD({
+        _runner->cancel();
+        _runner->join();
+        _threadPool->join();
+    })
 }
 
 Status CollectionBulkLoaderImpl::init(OperationContext* txn,
@@ -136,6 +142,8 @@ Status CollectionBulkLoaderImpl::insertDocuments(const std::vector<BSONObj>::con
 Status CollectionBulkLoaderImpl::commit() {
     return _runner->runSynchronousTask(
         [this](OperationContext* txn) -> Status {
+            _stats.startBuildingIndexes = Date_t::now();
+            LOG(2) << "Creating indexes for ns: " << _nss.ns();
             invariant(txn->getClient() == &cc());
             invariant(txn == _txn);
 
@@ -194,6 +202,9 @@ Status CollectionBulkLoaderImpl::commit() {
                 MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
                     _txn, "CollectionBulkLoaderImpl::commit", _nss.ns());
             }
+            _stats.endBuildingIndexes = Date_t::now();
+            LOG(2) << "Done creating indexes for ns: " << _nss.ns()
+                   << ", stats: " << _stats.toString();
 
             // release locks.
             _autoColl.reset(nullptr);
@@ -203,6 +214,25 @@ Status CollectionBulkLoaderImpl::commit() {
         },
         TaskRunner::NextAction::kDisposeOperationContext);
 }
+
+CollectionBulkLoaderImpl::Stats CollectionBulkLoaderImpl::getStats() const {
+    return _stats;
+}
+
+std::string CollectionBulkLoaderImpl::Stats::toString() const {
+    return toBSON().toString();
+}
+
+BSONObj CollectionBulkLoaderImpl::Stats::toBSON() const {
+    BSONObjBuilder bob;
+    bob.appendDate("startBuildingIndexes", startBuildingIndexes);
+    bob.appendDate("endBuildingIndexes", endBuildingIndexes);
+    auto indexElapsed = endBuildingIndexes - startBuildingIndexes;
+    long long indexElapsedMillis = duration_cast<Milliseconds>(indexElapsed).count();
+    bob.appendNumber("indexElapsedMillis", indexElapsedMillis);
+    return bob.obj();
+}
+
 
 std::string CollectionBulkLoaderImpl::toString() const {
     return toBSON().toString();

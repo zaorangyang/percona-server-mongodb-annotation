@@ -64,7 +64,7 @@ std::vector<RemoteCommandRequest> FreshnessScanner::Algorithm::getRequests() con
 
     std::vector<RemoteCommandRequest> requests;
     for (auto& target : _targets) {
-        requests.push_back(RemoteCommandRequest(target, "admin", getStatusCmd, _timeout));
+        requests.push_back(RemoteCommandRequest(target, "admin", getStatusCmd, nullptr, _timeout));
     }
     return requests;
 }
@@ -74,12 +74,14 @@ void FreshnessScanner::Algorithm::processResponse(const RemoteCommandRequest& re
     _responsesProcessed++;
     if (!response.isOK()) {  // failed response
         LOG(2) << "FreshnessScanner: Got failed response from " << request.target << ": "
-               << response.getStatus();
+               << response.status;
     } else {
-        BSONObj opTimesObj = response.getValue().data.getObjectField("optimes");
+        BSONObj opTimesObj = response.data.getObjectField("optimes");
         OpTime lastOpTime;
         Status status = bsonExtractOpTimeField(opTimesObj, "appliedOpTime", &lastOpTime);
         if (!status.isOK()) {
+            LOG(2) << "FreshnessScanner: failed to parse opTime in " << opTimesObj << " from "
+                   << request.target << causedBy(status);
             return;
         }
 
@@ -92,6 +94,8 @@ void FreshnessScanner::Algorithm::processResponse(const RemoteCommandRequest& re
         auto iter =
             std::upper_bound(_freshnessInfos.begin(), _freshnessInfos.end(), freshnessInfo, cmp);
         _freshnessInfos.insert(iter, freshnessInfo);
+        LOG(2) << "FreshnessScanner: processed response " << opTimesObj << " from "
+               << request.target;
     }
 }
 

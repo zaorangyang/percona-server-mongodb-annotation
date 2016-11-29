@@ -28,6 +28,7 @@
 
 #include "mongo/db/auth/user_management_commands_parser.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -352,6 +353,7 @@ Status parseUsersInfoCommand(const BSONObj& cmdObj, StringData dbname, UsersInfo
         if (!status.isOK()) {
             return status;
         }
+        std::sort(parsedArgs->userNames.begin(), parsedArgs->userNames.end());
     } else {
         UserName name;
         status = _parseNameFromBSONElement(cmdObj["usersInfo"],
@@ -412,10 +414,20 @@ Status parseRolesInfoCommand(const BSONObj& cmdObj, StringData dbname, RolesInfo
         parsedArgs->roleNames.push_back(name);
     }
 
-    status = bsonExtractBooleanFieldWithDefault(
-        cmdObj, "showPrivileges", false, &parsedArgs->showPrivileges);
-    if (!status.isOK()) {
-        return status;
+    BSONElement showPrivileges = cmdObj["showPrivileges"];
+    if (showPrivileges.eoo()) {
+        parsedArgs->privilegeFormat = PrivilegeFormat::kOmit;
+    } else if (showPrivileges.isNumber() || showPrivileges.isBoolean()) {
+        parsedArgs->privilegeFormat =
+            showPrivileges.trueValue() ? PrivilegeFormat::kShowSeparate : PrivilegeFormat::kOmit;
+    } else if (showPrivileges.type() == BSONType::String &&
+               showPrivileges.String() == "asUserFragment") {
+        parsedArgs->privilegeFormat = PrivilegeFormat::kShowAsUserFragment;
+    } else {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Failed to parse 'showPrivileges'. 'showPrivileges' should "
+                                       "either be a boolean or the string 'asUserFragment', given: "
+                                    << showPrivileges.toString());
     }
 
     status = bsonExtractBooleanFieldWithDefault(

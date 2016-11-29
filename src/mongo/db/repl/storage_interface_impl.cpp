@@ -33,10 +33,12 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 
 #include <algorithm>
+#include <boost/optional.hpp>
 #include <utility>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
@@ -59,13 +61,14 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/rs_initialsync.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/db/repl/task_runner.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/old_thread_pool.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+
 namespace mongo {
 namespace repl {
 
@@ -75,8 +78,6 @@ const char StorageInterfaceImpl::kBeginFieldName[] = "begin";
 
 namespace {
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
-
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(dataReplicatorInitialSyncInserterThreads, int, 4);
 
 const BSONObj kInitialSyncFlag(BSON(StorageInterfaceImpl::kInitialSyncFlagFieldName << true));
 }  // namespace
@@ -91,17 +92,9 @@ StorageInterfaceImpl::~StorageInterfaceImpl() {
     DESTRUCTOR_GUARD(shutdown(););
 }
 
-void StorageInterfaceImpl::startup() {
-    _bulkLoaderThreads.reset(
-        new OldThreadPool{dataReplicatorInitialSyncInserterThreads, "InitialSyncInserters-"});
-};
+void StorageInterfaceImpl::startup() {}
 
-void StorageInterfaceImpl::shutdown() {
-    if (_bulkLoaderThreads) {
-        _bulkLoaderThreads->join();
-        _bulkLoaderThreads.reset();
-    }
-}
+void StorageInterfaceImpl::shutdown() {}
 
 NamespaceString StorageInterfaceImpl::getMinValidNss() const {
     return _minValidNss;
@@ -245,21 +238,10 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
     const BSONObj idIndexSpec,
     const std::vector<BSONObj>& secondaryIndexSpecs) {
 
-    UniqueLock lk(_runnersMutex);
-    // Check to make sure we don't already have a runner.
-    for (auto&& item : _runners) {
-        if (item.first == nss) {
-            return {ErrorCodes::IllegalOperation,
-                    str::stream() << "There is already an active collection cloner for: "
-                                  << nss.ns()};
-        }
-    }
-    // Create the runner, and schedule the collection creation.
-    _runners.emplace_back(
-        std::make_pair(nss, stdx::make_unique<TaskRunner>(_bulkLoaderThreads.get())));
-    auto&& inserter = _runners.back();
-    TaskRunner* runner = inserter.second.get();
-    lk.unlock();
+    LOG(2) << "StorageInterfaceImpl::createCollectionForBulkLoading called for ns: " << nss.ns();
+    auto threadPool =
+        stdx::make_unique<OldThreadPool>(1, str::stream() << "InitialSyncInserters-" << nss.ns());
+    std::unique_ptr<TaskRunner> runner = stdx::make_unique<TaskRunner>(threadPool.get());
 
     // Setup cond_var for signalling when done.
     std::unique_ptr<CollectionBulkLoader> loaderToReturn;
@@ -289,8 +271,13 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
             coll = stdx::make_unique<AutoGetCollection>(txn, nss, MODE_IX);
 
             // Move locks into loader, so it now controls their lifetime.
-            auto loader = stdx::make_unique<CollectionBulkLoaderImpl>(
-                txn, runner, collection, idIndexSpec, std::move(db), std::move(coll));
+            auto loader = stdx::make_unique<CollectionBulkLoaderImpl>(txn,
+                                                                      collection,
+                                                                      idIndexSpec,
+                                                                      std::move(threadPool),
+                                                                      std::move(runner),
+                                                                      std::move(db),
+                                                                      std::move(coll));
             invariant(collection);
             auto status = loader->init(txn, collection, secondaryIndexSpecs);
             if (!status.isOK()) {
@@ -418,7 +405,7 @@ DeleteStageParams makeDeleteStageParamsForDeleteOne() {
 enum class FindDeleteMode { kFind, kDelete };
 StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
                                      const NamespaceString& nss,
-                                     const BSONObj& indexKeyPattern,
+                                     boost::optional<StringData> indexName,
                                      StorageInterface::ScanDirection scanDirection,
                                      FindDeleteMode mode) {
     auto isFind = mode == FindDeleteMode::kFind;
@@ -438,7 +425,7 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
         auto direction = isForward ? InternalPlanner::FORWARD : InternalPlanner::BACKWARD;
 
         std::unique_ptr<PlanExecutor> planExecutor;
-        if (indexKeyPattern.isEmpty()) {
+        if (!indexName) {
             // Use collection scan.
             planExecutor = isFind
                 ? InternalPlanner::collectionScan(
@@ -453,22 +440,22 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
             auto indexCatalog = collection->getIndexCatalog();
             invariant(indexCatalog);
             bool includeUnfinishedIndexes = false;
-            auto indexDescriptor =
-                indexCatalog->findIndexByKeyPattern(txn, indexKeyPattern, includeUnfinishedIndexes);
+            IndexDescriptor* indexDescriptor =
+                indexCatalog->findIndexByName(txn, *indexName, includeUnfinishedIndexes);
             if (!indexDescriptor) {
                 return {ErrorCodes::IndexNotFound,
                         str::stream() << "Index not found, ns:" << nss.ns() << ", index: "
-                                      << indexKeyPattern};
+                                      << *indexName};
             }
             if (indexDescriptor->isPartial()) {
                 return {ErrorCodes::IndexOptionsConflict,
                         str::stream() << "Partial index is not allowed for this operation, ns:"
                                       << nss.ns()
                                       << ", index: "
-                                      << indexKeyPattern};
+                                      << *indexName};
             }
 
-            KeyPattern keyPattern(indexKeyPattern);
+            KeyPattern keyPattern(indexDescriptor->keyPattern());
             auto minKey = Helpers::toKeyFormat(keyPattern.extendRangeBound({}, false));
             auto maxKey = Helpers::toKeyFormat(keyPattern.extendRangeBound({}, true));
             auto bounds =
@@ -500,11 +487,10 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
         auto state = planExecutor->getNext(&doc, nullptr);
         if (PlanExecutor::IS_EOF == state) {
             return {ErrorCodes::CollectionIsEmpty,
-                    str::stream() << "Collection is empty, ns: " << nss.ns() << ", index: "
-                                  << indexKeyPattern};
+                    str::stream() << "Collection is empty, ns: " << nss.ns()};
         }
         invariant(PlanExecutor::ADVANCED == state);
-        return doc;
+        return doc.getOwned();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, opStr, nss.ns());
     MONGO_UNREACHABLE;
@@ -514,30 +500,22 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
 
 StatusWith<BSONObj> StorageInterfaceImpl::findOne(OperationContext* txn,
                                                   const NamespaceString& nss,
-                                                  const BSONObj& indexKeyPattern,
+                                                  boost::optional<StringData> indexName,
                                                   ScanDirection scanDirection) {
-    return _findOrDeleteOne(txn, nss, indexKeyPattern, scanDirection, FindDeleteMode::kFind);
+    return _findOrDeleteOne(txn, nss, indexName, scanDirection, FindDeleteMode::kFind);
 }
 
 StatusWith<BSONObj> StorageInterfaceImpl::deleteOne(OperationContext* txn,
                                                     const NamespaceString& nss,
-                                                    const BSONObj& indexKeyPattern,
+                                                    boost::optional<StringData> indexName,
                                                     ScanDirection scanDirection) {
-    return _findOrDeleteOne(txn, nss, indexKeyPattern, scanDirection, FindDeleteMode::kDelete);
+    return _findOrDeleteOne(txn, nss, indexName, scanDirection, FindDeleteMode::kDelete);
 }
 
 Status StorageInterfaceImpl::isAdminDbValid(OperationContext* txn) {
-    log() << "StorageInterfaceImpl::isAdminDbValid called.";
-    // TODO: plumb through operation context from caller, for now run on ioThread with runner.
-    TaskRunner runner(_bulkLoaderThreads.get());
-    auto status = runner.runSynchronousTask(
-        [](OperationContext* txn) -> Status {
-            ScopedTransaction transaction(txn, MODE_IX);
-            AutoGetDb autoDB(txn, "admin", MODE_X);
-            return checkAdminDatabase(txn, autoDB.getDb());
-        },
-        TaskRunner::NextAction::kDisposeOperationContext);
-    return status;
+    ScopedTransaction transaction(txn, MODE_IX);
+    AutoGetDb autoDB(txn, "admin", MODE_X);
+    return checkAdminDatabase(txn, autoDB.getDb());
 }
 
 }  // namespace repl

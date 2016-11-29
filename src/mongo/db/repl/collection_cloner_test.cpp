@@ -170,7 +170,7 @@ TEST_F(CollectionClonerTest, ClonerLifeCycle) {
 }
 
 TEST_F(CollectionClonerTest, FirstRemoteCommand) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     auto net = getNet();
     executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
@@ -213,7 +213,7 @@ TEST_F(CollectionClonerTest, DoNotCreateIDIndexIfAutoIndexIdUsed) {
             return std::unique_ptr<CollectionBulkLoader>(loader);
         };
 
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
     {
         executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
         processNetworkResponse(createListIndexesResponse(0, BSONArray()));
@@ -229,7 +229,7 @@ TEST_F(CollectionClonerTest, DoNotCreateIDIndexIfAutoIndexIdUsed) {
         executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
         processNetworkResponse(createCursorResponse(0, BSON_ARRAY(doc)));
     }
-    collectionCloner->wait();
+    collectionCloner->join();
     ASSERT_EQUALS(1, collectionStats.insertCount);
     ASSERT_TRUE(collectionStats.commitCalled);
 
@@ -243,7 +243,7 @@ TEST_F(CollectionClonerTest, DoNotCreateIDIndexIfAutoIndexIdUsed) {
 // A collection may have no indexes. The cloner will produce a warning but
 // will still proceed with cloning.
 TEST_F(CollectionClonerTest, ListIndexesReturnedNoIndexes) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     // Using a non-zero cursor to ensure that
     // the cloner stops the fetcher from retrieving more results.
@@ -262,12 +262,14 @@ TEST_F(CollectionClonerTest, ListIndexesReturnedNoIndexes) {
 }
 
 TEST_F(CollectionClonerTest, ListIndexesReturnedNamespaceNotFound) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     bool collectionCreated = false;
+    bool writesAreReplicatedOnOpCtx = false;
     NamespaceString collNss;
-    storageInterface->createCollFn = [&collNss, &collectionCreated](
-        OperationContext*, const NamespaceString& nss, const CollectionOptions& options) {
+    storageInterface->createCollFn = [&collNss, &collectionCreated, &writesAreReplicatedOnOpCtx](
+        OperationContext* txn, const NamespaceString& nss, const CollectionOptions& options) {
+        writesAreReplicatedOnOpCtx = txn->writesAreReplicated();
         collectionCreated = true;
         collNss = nss;
         return Status::OK();
@@ -279,21 +281,59 @@ TEST_F(CollectionClonerTest, ListIndexesReturnedNamespaceNotFound) {
         processNetworkResponse(ErrorCodes::NamespaceNotFound, "The collection doesn't exist.");
     }
 
-    collectionCloner->wait();
+    collectionCloner->join();
     ASSERT_OK(getStatus());
     ASSERT_FALSE(collectionCloner->isActive());
     ASSERT_TRUE(collectionCreated);
+    ASSERT_FALSE(writesAreReplicatedOnOpCtx);
     ASSERT_EQ(collNss, nss);
 }
 
+TEST_F(CollectionClonerTest,
+       ListIndexesReturnedNamespaceNotFoundAndCreateCollectionCallbackCanceled) {
+    ASSERT_OK(collectionCloner->startup());
+
+    // Replace scheduleDbWork function to schedule the create collection task with an injected error
+    // status.
+    auto exec = &getExecutor();
+    collectionCloner->setScheduleDbWorkFn_forTest(
+        [exec](const executor::TaskExecutor::CallbackFn& workFn) {
+            auto wrappedTask = [workFn](const executor::TaskExecutor::CallbackArgs& cbd) {
+                workFn(executor::TaskExecutor::CallbackArgs(
+                    cbd.executor, cbd.myHandle, Status(ErrorCodes::CallbackCanceled, ""), cbd.txn));
+            };
+            return exec->scheduleWork(wrappedTask);
+        });
+
+    bool collectionCreated = false;
+    storageInterface->createCollFn = [&collectionCreated](
+        OperationContext*, const NamespaceString& nss, const CollectionOptions&) {
+        collectionCreated = true;
+        return Status::OK();
+    };
+
+    // Using a non-zero cursor to ensure that
+    // the cloner stops the fetcher from retrieving more results.
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+        processNetworkResponse(ErrorCodes::NamespaceNotFound, "The collection doesn't exist.");
+    }
+
+    collectionCloner->join();
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, getStatus());
+    ASSERT_FALSE(collectionCloner->isActive());
+    ASSERT_FALSE(collectionCreated);
+}
+
 TEST_F(CollectionClonerTest, BeginCollectionScheduleDbWorkFailed) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     // Replace scheduleDbWork function so that cloner will fail to schedule DB work after
     // getting index specs.
-    collectionCloner->setScheduleDbWorkFn([](const executor::TaskExecutor::CallbackFn& workFn) {
-        return StatusWith<executor::TaskExecutor::CallbackHandle>(ErrorCodes::UnknownError, "");
-    });
+    collectionCloner->setScheduleDbWorkFn_forTest(
+        [](const executor::TaskExecutor::CallbackFn& workFn) {
+            return StatusWith<executor::TaskExecutor::CallbackHandle>(ErrorCodes::UnknownError, "");
+        });
 
     {
         executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
@@ -305,19 +345,20 @@ TEST_F(CollectionClonerTest, BeginCollectionScheduleDbWorkFailed) {
 }
 
 TEST_F(CollectionClonerTest, BeginCollectionCallbackCanceled) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     // Replace scheduleDbWork function so that the callback runs with a cancelled status.
     auto&& executor = getExecutor();
-    collectionCloner->setScheduleDbWorkFn([&](const executor::TaskExecutor::CallbackFn& workFn) {
-        executor::TaskExecutor::CallbackHandle handle(std::make_shared<MockCallbackState>());
-        mongo::executor::TaskExecutor::CallbackArgs args{
-            &executor,
-            handle,
-            {ErrorCodes::CallbackCanceled, "Never run, but treat like cancelled."}};
-        workFn(args);
-        return StatusWith<executor::TaskExecutor::CallbackHandle>(handle);
-    });
+    collectionCloner->setScheduleDbWorkFn_forTest(
+        [&](const executor::TaskExecutor::CallbackFn& workFn) {
+            executor::TaskExecutor::CallbackHandle handle(std::make_shared<MockCallbackState>());
+            mongo::executor::TaskExecutor::CallbackArgs args{
+                &executor,
+                handle,
+                {ErrorCodes::CallbackCanceled, "Never run, but treat like cancelled."}};
+            workFn(args);
+            return StatusWith<executor::TaskExecutor::CallbackHandle>(handle);
+        });
 
     {
         executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
@@ -330,7 +371,7 @@ TEST_F(CollectionClonerTest, BeginCollectionCallbackCanceled) {
 }
 
 TEST_F(CollectionClonerTest, BeginCollectionFailed) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     storageInterface->createCollectionForBulkFn = [&](const NamespaceString& theNss,
                                                       const CollectionOptions& theOptions,
@@ -351,7 +392,7 @@ TEST_F(CollectionClonerTest, BeginCollectionFailed) {
 }
 
 TEST_F(CollectionClonerTest, BeginCollection) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     CollectionMockStats stats;
     CollectionBulkLoaderMock* loader = new CollectionBulkLoaderMock(&stats);
@@ -414,7 +455,7 @@ TEST_F(CollectionClonerTest, BeginCollection) {
 }
 
 TEST_F(CollectionClonerTest, FindFetcherScheduleFailed) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     // Shut down executor while in beginCollection callback.
     // This will cause the fetcher to fail to schedule the find command.
@@ -444,7 +485,7 @@ TEST_F(CollectionClonerTest, FindFetcherScheduleFailed) {
 }
 
 TEST_F(CollectionClonerTest, FindCommandAfterBeginCollection) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     CollectionMockStats stats;
     CollectionBulkLoaderMock* loader = new CollectionBulkLoaderMock(&stats);
@@ -480,7 +521,7 @@ TEST_F(CollectionClonerTest, FindCommandAfterBeginCollection) {
 }
 
 TEST_F(CollectionClonerTest, FindCommandFailed) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     {
         executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
@@ -503,7 +544,7 @@ TEST_F(CollectionClonerTest, FindCommandFailed) {
 }
 
 TEST_F(CollectionClonerTest, FindCommandCanceled) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     ASSERT_TRUE(collectionCloner->isActive());
     {
@@ -528,7 +569,7 @@ TEST_F(CollectionClonerTest, FindCommandCanceled) {
     }
     ASSERT_TRUE(collectionCloner->isActive());
 
-    collectionCloner->cancel();
+    collectionCloner->shutdown();
 
     {
         executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
@@ -541,7 +582,7 @@ TEST_F(CollectionClonerTest, FindCommandCanceled) {
 }
 
 TEST_F(CollectionClonerTest, InsertDocumentsScheduleDbWorkFailed) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     {
         executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
@@ -552,9 +593,10 @@ TEST_F(CollectionClonerTest, InsertDocumentsScheduleDbWorkFailed) {
 
     // Replace scheduleDbWork function so that cloner will fail to schedule DB work after
     // getting documents.
-    collectionCloner->setScheduleDbWorkFn([](const executor::TaskExecutor::CallbackFn& workFn) {
-        return StatusWith<executor::TaskExecutor::CallbackHandle>(ErrorCodes::UnknownError, "");
-    });
+    collectionCloner->setScheduleDbWorkFn_forTest(
+        [](const executor::TaskExecutor::CallbackFn& workFn) {
+            return StatusWith<executor::TaskExecutor::CallbackHandle>(ErrorCodes::UnknownError, "");
+        });
 
     const BSONObj doc = BSON("_id" << 1);
     {
@@ -567,7 +609,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsScheduleDbWorkFailed) {
 }
 
 TEST_F(CollectionClonerTest, InsertDocumentsCallbackCanceled) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
 
     {
         executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
@@ -578,15 +620,16 @@ TEST_F(CollectionClonerTest, InsertDocumentsCallbackCanceled) {
 
     // Replace scheduleDbWork function so that the callback runs with a cancelled status.
     auto&& executor = getExecutor();
-    collectionCloner->setScheduleDbWorkFn([&](const executor::TaskExecutor::CallbackFn& workFn) {
-        executor::TaskExecutor::CallbackHandle handle(std::make_shared<MockCallbackState>());
-        mongo::executor::TaskExecutor::CallbackArgs args{
-            &executor,
-            handle,
-            {ErrorCodes::CallbackCanceled, "Never run, but treat like cancelled."}};
-        workFn(args);
-        return StatusWith<executor::TaskExecutor::CallbackHandle>(handle);
-    });
+    collectionCloner->setScheduleDbWorkFn_forTest(
+        [&](const executor::TaskExecutor::CallbackFn& workFn) {
+            executor::TaskExecutor::CallbackHandle handle(std::make_shared<MockCallbackState>());
+            mongo::executor::TaskExecutor::CallbackArgs args{
+                &executor,
+                handle,
+                {ErrorCodes::CallbackCanceled, "Never run, but treat like cancelled."}};
+            workFn(args);
+            return StatusWith<executor::TaskExecutor::CallbackHandle>(handle);
+        });
 
     {
         executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
@@ -598,7 +641,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsCallbackCanceled) {
 }
 
 TEST_F(CollectionClonerTest, InsertDocumentsFailed) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
     ASSERT_TRUE(collectionCloner->isActive());
 
     {
@@ -623,7 +666,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsFailed) {
         processNetworkResponse(createCursorResponse(0, BSON_ARRAY(BSON("_id" << 1))));
     }
 
-    collectionCloner->wait();
+    collectionCloner->join();
     ASSERT_FALSE(collectionCloner->isActive());
     ASSERT_EQUALS(0, collectionStats.insertCount);
 
@@ -631,7 +674,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsFailed) {
 }
 
 TEST_F(CollectionClonerTest, InsertDocumentsSingleBatch) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
     ASSERT_TRUE(collectionCloner->isActive());
 
     {
@@ -661,7 +704,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsSingleBatch) {
 }
 
 TEST_F(CollectionClonerTest, InsertDocumentsMultipleBatches) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
     ASSERT_TRUE(collectionCloner->isActive());
 
     {
@@ -705,7 +748,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsMultipleBatches) {
 }
 
 TEST_F(CollectionClonerTest, LastBatchContainsNoDocuments) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
     ASSERT_TRUE(collectionCloner->isActive());
 
     {
@@ -757,7 +800,7 @@ TEST_F(CollectionClonerTest, LastBatchContainsNoDocuments) {
 }
 
 TEST_F(CollectionClonerTest, MiddleBatchContainsNoDocuments) {
-    ASSERT_OK(collectionCloner->start());
+    ASSERT_OK(collectionCloner->startup());
     ASSERT_TRUE(collectionCloner->isActive());
 
     {
@@ -802,6 +845,95 @@ TEST_F(CollectionClonerTest, MiddleBatchContainsNoDocuments) {
 
     collectionCloner->waitForDbWorker();
 
+    ASSERT_EQUALS(2, collectionStats.insertCount);
+    ASSERT_TRUE(collectionStats.commitCalled);
+
+    ASSERT_OK(getStatus());
+    ASSERT_FALSE(collectionCloner->isActive());
+}
+
+/**
+ * Start cloning.
+ * Make it fail while copying collection.
+ * Restart cloning.
+ * Run to completion.
+ */
+TEST_F(CollectionClonerTest, CollectionClonerCanBeRestartedAfterPreviousFailure) {
+    // First cloning attempt - fails while reading documents from source collection.
+    unittest::log() << "Starting first collection cloning attempt";
+    ASSERT_OK(collectionCloner->startup());
+    ASSERT_TRUE(collectionCloner->isActive());
+
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+        processNetworkResponse(createListIndexesResponse(0, BSON_ARRAY(idIndexSpec)));
+    }
+    ASSERT_TRUE(collectionCloner->isActive());
+
+    collectionCloner->waitForDbWorker();
+    ASSERT_TRUE(collectionCloner->isActive());
+    ASSERT_TRUE(collectionStats.initCalled);
+
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+        processNetworkResponse(createCursorResponse(1, BSON_ARRAY(BSON("_id" << 1))));
+    }
+
+    collectionCloner->waitForDbWorker();
+    ASSERT_EQUALS(1, collectionStats.insertCount);
+
+    // Check that the status hasn't changed from the initial value.
+    ASSERT_EQUALS(getDetectableErrorStatus(), getStatus());
+    ASSERT_TRUE(collectionCloner->isActive());
+
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+        processNetworkResponse(ErrorCodes::OperationFailed,
+                               "failed to read remaining documents from source collection");
+    }
+
+    collectionCloner->waitForDbWorker();
+    ASSERT_EQUALS(1, collectionStats.insertCount);
+
+    ASSERT_EQUALS(ErrorCodes::OperationFailed, getStatus());
+    ASSERT_FALSE(collectionCloner->isActive());
+
+    // Second cloning attempt - run to completion.
+    unittest::log() << "Starting second collection cloning attempt";
+    collectionStats = CollectionMockStats();
+    setStatus(getDetectableErrorStatus());
+
+    ASSERT_OK(collectionCloner->startup());
+    ASSERT_TRUE(collectionCloner->isActive());
+
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+        processNetworkResponse(createListIndexesResponse(0, BSON_ARRAY(idIndexSpec)));
+    }
+    ASSERT_TRUE(collectionCloner->isActive());
+
+    collectionCloner->waitForDbWorker();
+    ASSERT_TRUE(collectionCloner->isActive());
+    ASSERT_TRUE(collectionStats.initCalled);
+
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+        processNetworkResponse(createCursorResponse(1, BSON_ARRAY(BSON("_id" << 1))));
+    }
+
+    collectionCloner->waitForDbWorker();
+    ASSERT_EQUALS(1, collectionStats.insertCount);
+
+    // Check that the status hasn't changed from the initial value.
+    ASSERT_EQUALS(getDetectableErrorStatus(), getStatus());
+    ASSERT_TRUE(collectionCloner->isActive());
+
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+        processNetworkResponse(createCursorResponse(0, BSON_ARRAY(BSON("_id" << 2)), "nextBatch"));
+    }
+
+    collectionCloner->waitForDbWorker();
     ASSERT_EQUALS(2, collectionStats.insertCount);
     ASSERT_TRUE(collectionStats.commitCalled);
 

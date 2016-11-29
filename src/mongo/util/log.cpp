@@ -37,11 +37,14 @@
 #include <unistd.h>
 #endif
 
+#include "mongo/logger/console_appender.h"
+#include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logger/ramlog.h"
 #include "mongo/logger/rotatable_file_manager.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/concurrency/threadlocal.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/text.h"
 #include "mongo/util/time_support.h"
@@ -75,13 +78,13 @@ Status logger::registerExtraLogContextFn(logger::ExtraLogContextFn contextFn) {
 bool rotateLogs(bool renameFiles) {
     using logger::RotatableFileManager;
     RotatableFileManager* manager = logger::globalRotatableFileManager();
+    log() << "Log rotation initiated";
     RotatableFileManager::FileNameStatusPairVector result(
         manager->rotateAll(renameFiles, "." + terseCurrentTime(false)));
     for (RotatableFileManager::FileNameStatusPairVector::iterator it = result.begin();
          it != result.end();
          it++) {
-        warning() << "Rotating log file " << it->first << " failed: " << it->second.toString()
-                  << endl;
+        warning() << "Rotating log file " << it->first << " failed: " << it->second.toString();
     }
     return result.empty();
 }
@@ -113,6 +116,7 @@ string errnoWithDescription(int errNumber) {
                    nullptr);
 
     if (errorText) {
+        ON_BLOCK_EXIT([&errorText] { LocalFree(errorText); });
         string utf8ErrorText = toUtf8String(errorText);
         auto size = utf8ErrorText.find_first_of("\r\n");
         if (size == string::npos) {  // not found
@@ -126,7 +130,6 @@ string errnoWithDescription(int errNumber) {
         memcpy(buf, utf8ErrorText.c_str(), size);
         buf[size] = '\0';
         msg = buf;
-        LocalFree(errorText);
     } else if (strerror_s(buf, kBuflen, errNumber) != 0) {
         msg = buf;
     }
@@ -159,6 +162,14 @@ void logContext(const char* errmsg) {
     // NOTE: We disable long-line truncation for the stack trace, because the JSON representation of
     // the stack trace can sometimes exceed the long line limit.
     printStackTrace(log().setIsTruncatable(false).stream());
+}
+
+void setPlainConsoleLogger() {
+    logger::globalLogManager()->getGlobalDomain()->clearAppenders();
+    logger::globalLogManager()->getGlobalDomain()->attachAppender(
+        logger::MessageLogDomain::AppenderAutoPtr(
+            new logger::ConsoleAppender<logger::MessageEventEphemeral>(
+                new logger::MessageEventUnadornedEncoder)));
 }
 
 Tee* const warnings = RamLog::get("warnings");  // Things put here go in serverStatus

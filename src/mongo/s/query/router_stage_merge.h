@@ -45,13 +45,15 @@ class RouterStageMerge final : public RouterExecStage {
 public:
     RouterStageMerge(executor::TaskExecutor* executor, ClusterClientCursorParams&& params);
 
-    StatusWith<boost::optional<BSONObj>> next() final;
+    StatusWith<ClusterQueryResult> next() final;
 
     void kill() final;
 
     bool remotesExhausted() final;
 
     Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) final;
+
+    void setOperationContext(OperationContext* txn) final;
 
 private:
     // Not owned here.

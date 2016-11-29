@@ -63,37 +63,16 @@ namespace {
 // be used to run multiple distinct requests.
 AtomicUInt64 kAsyncOpIdCounter(0);
 
-// Metadata listener can be nullptr.
 StatusWith<Message> messageFromRequest(const RemoteCommandRequest& request,
-                                       rpc::Protocol protocol,
-                                       rpc::EgressMetadataHook* metadataHook) {
+                                       rpc::Protocol protocol) {
     BSONObj query = request.cmdObj;
     auto requestBuilder = rpc::makeRequestBuilder(protocol);
-
-    BSONObj maybeAugmented;
-    // Handle outgoing request metadata.
-    if (metadataHook) {
-        BSONObjBuilder augmentedBob;
-        augmentedBob.appendElements(request.metadata);
-
-        auto writeStatus = callNoexcept(*metadataHook,
-                                        &rpc::EgressMetadataHook::writeRequestMetadata,
-                                        request.target,
-                                        &augmentedBob);
-        if (!writeStatus.isOK()) {
-            return writeStatus;
-        }
-
-        maybeAugmented = augmentedBob.obj();
-    } else {
-        maybeAugmented = request.metadata;
-    }
 
     auto toSend = rpc::makeRequestBuilder(protocol)
                       ->setDatabase(request.dbname)
                       .setCommandName(request.cmdObj.firstElementFieldName())
                       .setCommandArgs(request.cmdObj)
-                      .setMetadata(maybeAugmented)
+                      .setMetadata(request.metadata)
                       .done();
     return std::move(toSend);
 }
@@ -124,7 +103,7 @@ NetworkInterfaceASIO::AsyncOp::AsyncOp(NetworkInterfaceASIO* const owner,
 }
 
 void NetworkInterfaceASIO::AsyncOp::cancel() {
-    LOG(2) << "Canceling operation; original request was: " << request().toString();
+    LOG(2) << "Canceling operation; original request was: " << redact(request().toString());
     stdx::lock_guard<stdx::mutex> lk(_access->mutex);
     auto access = _access;
     auto generation = access->id;
@@ -148,7 +127,7 @@ bool NetworkInterfaceASIO::AsyncOp::canceled() const {
 }
 
 void NetworkInterfaceASIO::AsyncOp::timeOut_inlock() {
-    LOG(2) << "Operation timing out; original request was: " << request().toString();
+    LOG(2) << "Operation timing out; original request was: " << redact(request().toString());
     auto access = _access;
     auto generation = access->id;
 
@@ -192,13 +171,16 @@ Status NetworkInterfaceASIO::AsyncOp::beginCommand(Message&& newCommand,
     MONGO_ASYNC_OP_INVARIANT(_connection.is_initialized(),
                              "Connection should not change over AsyncOp's lifetime");
 
+    auto swm = _connection->getCompressorManager().compressMessage(newCommand);
+    if (!swm.isOK())
+        return swm.getStatus();
+
     // Construct a new AsyncCommand object for each command.
-    _command.emplace(_connection.get_ptr(), type, std::move(newCommand), _owner->now(), target);
+    _command.emplace(_connection.get_ptr(), type, std::move(swm.getValue()), _owner->now(), target);
     return Status::OK();
 }
 
-Status NetworkInterfaceASIO::AsyncOp::beginCommand(const RemoteCommandRequest& request,
-                                                   rpc::EgressMetadataHook* metadataHook) {
+Status NetworkInterfaceASIO::AsyncOp::beginCommand(const RemoteCommandRequest& request) {
     // Check if we need to downconvert find or getMore commands.
     StringData commandName = request.cmdObj.firstElement().fieldNameStringData();
     const auto isFindCmd = commandName == QueryRequest::kFindCommandName;
@@ -208,7 +190,7 @@ Status NetworkInterfaceASIO::AsyncOp::beginCommand(const RemoteCommandRequest& r
     // If we aren't sending a find or getMore, or the server supports OP_COMMAND we don't have
     // to worry about downconversion.
     if (!isFindOrGetMoreCmd || connection().serverProtocols() == rpc::supports::kAll) {
-        auto newCommand = messageFromRequest(request, operationProtocol(), metadataHook);
+        auto newCommand = messageFromRequest(request, operationProtocol());
         if (!newCommand.isOK()) {
             return newCommand.getStatus();
         }
@@ -239,16 +221,15 @@ NetworkInterfaceASIO::AsyncCommand* NetworkInterfaceASIO::AsyncOp::command() {
     return _command.get_ptr();
 }
 
-void NetworkInterfaceASIO::AsyncOp::finish(const ResponseStatus& status) {
+void NetworkInterfaceASIO::AsyncOp::finish(const ResponseStatus& rs) {
     // We never hold the access lock when we call finish from NetworkInterfaceASIO.
     _transitionToState(AsyncOp::State::kFinished);
 
     LOG(2) << "Request " << _request.id << " finished with response: "
-           << (status.getStatus().isOK() ? status.getValue().data.toString()
-                                         : status.getStatus().toString());
+           << redact(rs.isOK() ? rs.data.toString() : rs.status.toString());
 
     // Calling the completion handler may invalidate state in this op, so do it last.
-    _onFinish(status);
+    _onFinish(rs);
 }
 
 const RemoteCommandRequest& NetworkInterfaceASIO::AsyncOp::request() const {
@@ -273,6 +254,14 @@ rpc::Protocol NetworkInterfaceASIO::AsyncOp::operationProtocol() const {
 void NetworkInterfaceASIO::AsyncOp::setOperationProtocol(rpc::Protocol proto) {
     MONGO_ASYNC_OP_INVARIANT(!_operationProtocol.is_initialized(), "Protocol already set");
     _operationProtocol = proto;
+}
+
+void NetworkInterfaceASIO::AsyncOp::setResponseMetadata(BSONObj m) {
+    _responseMetadata = m;
+}
+
+BSONObj NetworkInterfaceASIO::AsyncOp::getResponseMetadata() {
+    return _responseMetadata;
 }
 
 void NetworkInterfaceASIO::AsyncOp::reset() {

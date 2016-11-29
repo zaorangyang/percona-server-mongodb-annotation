@@ -45,6 +45,8 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/stats/fill_locker_info.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -66,12 +68,21 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) final {
-        bool isAuthorized = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-            ResourcePattern::forClusterResource(), ActionType::inprog);
-        return isAuthorized ? Status::OK() : Status(ErrorCodes::Unauthorized, "Unauthorized");
+        AuthorizationSession* authzSession = AuthorizationSession::get(client);
+        if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                           ActionType::inprog)) {
+            return Status::OK();
+        }
+
+        bool isAuthenticated = authzSession->getAuthenticatedUserNames().more();
+        if (isAuthenticated && cmdObj["$ownOps"].trueValue()) {
+            return Status::OK();
+        }
+
+        return Status(ErrorCodes::Unauthorized, "Unauthorized");
     }
 
     bool run(OperationContext* txn,
@@ -81,6 +92,7 @@ public:
              std::string& errmsg,
              BSONObjBuilder& result) final {
         const bool includeAll = cmdObj["$all"].trueValue();
+        const bool ownOpsOnly = cmdObj["$ownOps"].trueValue();
 
         // Filter the output
         BSONObj filter;
@@ -92,6 +104,8 @@ public:
             while (i.more()) {
                 BSONElement e = i.next();
                 if (str::equals("$all", e.fieldName())) {
+                    continue;
+                } else if (str::equals("$ownOps", e.fieldName())) {
                     continue;
                 }
 
@@ -115,6 +129,12 @@ public:
             invariant(client);
 
             stdx::lock_guard<Client> lk(*client);
+
+            if (ownOpsOnly &&
+                !AuthorizationSession::get(txn->getClient())->isCoauthorizedWithClient(client)) {
+                continue;
+            }
+
             const OperationContext* opCtx = client->getOperationContext();
 
             if (!includeAll) {
@@ -127,6 +147,15 @@ public:
 
             // The client information
             client->reportState(infoBuilder);
+
+            const auto& clientMetadata =
+                ClientMetadataIsMasterState::get(txn->getClient()).getClientMetadata();
+            if (clientMetadata) {
+                auto appName = clientMetadata.get().getApplicationName();
+                if (!appName.empty()) {
+                    infoBuilder.append("appName", appName);
+                }
+            }
 
             // Operation context specific information
             infoBuilder.appendBool("active", static_cast<bool>(opCtx));

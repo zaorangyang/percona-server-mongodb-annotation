@@ -165,6 +165,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/query/command_request_response',
+        '$BUILD_DIR/mongo/rpc/client_metadata',
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/progress_meter',
@@ -347,6 +348,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
+        '$BUILD_DIR/mongo/transport/message_compressor',
         # The dependency on network is a temporary crutch that should go away once the
         # networking library has separate options
         '$BUILD_DIR/mongo/util/net/network',
@@ -478,7 +480,6 @@ env.Library(
     target='service_context',
     source=[
         'client.cpp',
-        'client_basic.cpp',
         'operation_context.cpp',
         'service_context.cpp',
         'service_context_noop.cpp',
@@ -659,6 +660,7 @@ serveronlyLibdeps = [
     "$BUILD_DIR/mongo/util/net/network",
     "$BUILD_DIR/mongo/db/storage/mmap_v1/file_allocator",
     "$BUILD_DIR/third_party/shim_snappy",
+    '$BUILD_DIR/mongo/db/ttl_collection_cache',
     "auth/authmongod",
     "catalog/catalog",
     "catalog/collection_options",
@@ -695,7 +697,6 @@ serveronlyLibdeps = [
     "repl/repl_coordinator_global",
     "repl/repl_coordinator_impl",
     "repl/repl_settings",
-    "repl/replset_commands",
     "repl/rs_rollback",
     "repl/rslog",
     "repl/serveronly",
@@ -718,7 +719,7 @@ serveronlyLibdeps = [
     "storage/storage_engine_metadata",
     "storage/storage_options",
     "update_index_data",
-    "views/views",
+    "views/views_mongod",
 ]
 
 if rocksdb:
@@ -771,5 +772,16 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver',
         '$BUILD_DIR/mongo/db/server_parameters',
         '$BUILD_DIR/mongo/s/client/sharding_client',
+    ],
+)
+
+env.Library(
+    target='ttl_collection_cache',
+    source=[
+        'ttl_collection_cache.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )

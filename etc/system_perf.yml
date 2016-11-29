@@ -8,19 +8,16 @@ post:
     - command: attach.results
       params:
         file_location: work/report.json
-    - command: shell.cleanup
     - command: shell.exec
-      # destroy the cluster
       params:
-        working_dir: work
+        working_dir: src
         script: |
-          set -e
-          set -o verbose
-          source ./dsienv.sh
-          if [ ! -f "test.success" ]; then
-            yes yes | ./terraform destroy
-            if [ $? != 0 ]; then yes yes | ./terraform destroy; fi
-            echo "Cluster DESTROYED."
+          # removes files from the (local) scons cache when it's over a
+          # threshold, to the $prune_ratio percentage. Ideally override
+          # these default values in the distro config in evergreen.
+
+          if [ -d "${scons_cache_path}" ]; then
+              ${python|python} buildscripts/scons_cache_prune.py --cache-dir ${scons_cache_path} --cache-size ${scons_cache_size|200} --prune-ratio ${scons_prune_ratio|0.8}
           fi
 
 functions:
@@ -79,57 +76,80 @@ functions:
       params:
         working_dir: work
         script: |
-           set -v
-           ./terraform get --update
-  "bring up cluster":
+          set -v
+          ./terraform get --update
     - command: shell.exec
-      # bring up the cluster
+      # set up $HOME/infrastructure_provisioning to keep track of resources,
+      # and allow Evergreen to release resources from there
       params:
-        working_dir: work
         script: |
-          # to create a mongod EC2 cluster
-          set -e
           set -o verbose
-          pwd
-          ls
-          cat dsienv.sh
-          source ./dsienv.sh
-          # create all resources and instances
-          $DSI_PATH/bin/setup-cluster.sh ${cluster} ../terraform
-    - command: shell.exec # End on setup-cluster.sh so it's error code is scripts error code
-      # After cluster up
-      params:
-        working_dir: work
-        script: |
-          echo "EC2 Cluster CREATED."
-          tar -czvf cluster_config.tgz infrastructure_provisioning.out.yml ips.sh ips.py terraform.tfstate cluster.tf terraform.tfvars variables.tf
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "work/cluster_config.tgz"
-        remote_file: dsi/${build_variant}/${revision}/cluster_configs/cluster_config-${build_id}.tgz
-        bucket: mciuploads
-        permissions: public-read
-        content_type: ${content_type|application/x-gzip}
-        display_name: ${cluster}-cluster-config
+          if [ ! -d "$HOME/infrastructure_provisioning" ]; then
+            echo "copying terraform to Evergreen host"
+            mkdir $HOME/infrastructure_provisioning
+            cp -r terraform $HOME/infrastructure_provisioning/.
+            cp -r modules $HOME/infrastructure_provisioning/.
+            echo "copying infrastructure_teardown.sh to Evergreen host"
+            cp src/dsi/dsi/bin/destroy_cluster.sh $HOME/infrastructure_provisioning/terraform/infrastructure_teardown.sh
+          fi
+          ls -l $HOME/infrastructure_provisioning
 
-  "restore cluster":
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: dsi/${build_variant}/${revision}/cluster_configs/cluster_config-${build_id}.tgz
-        bucket: mciuploads
-        local_file: "work/cluster_config.tgz"
+  "infrastructure provisioning":
     - command: shell.exec
+      # if $HOME/infrastructure_provisioning exists, get info about provisioned resources
+      # from there otherwise provision resources from the cloud
       params:
         working_dir: work
-        silent: true
         script: |
           set -e
           set -o verbose
-          tar -xf cluster_config.tgz
+          if [ -e "$HOME/infrastructure_provisioning/terraform/terraform.tfstate" ]; then
+            echo "Restrieving info for existing resources"
+            cp $HOME/infrastructure_provisioning/terraform/terraform.tfstate .
+          else
+            echo "No existing resources found"
+          fi
+    - command: shell.exec
+      # call setup-cluster.sh, in most cases this only updates expire-on tag
+      params:
+        working_dir: work
+        script: |
+          # don't run this with "set -e" so we can set up properly for the teardown.sh
+          set -o verbose
+          source ./dsienv.sh
+          if [ ! -e $HOME/infrastructure_provisioning/terraform/provisioned.${cluster} ]; then
+            echo "Provisinging new resources."
+            $DSI_PATH/bin/setup-cluster.sh ${cluster} ../terraform
+          else
+            # on host with pre-existing resources, call terraform directly to
+            # avoid recreating instances due to terraform apply concurrency limitation
+            echo "Update expire-on tag for existing resources."
+            ./terraform apply -var-file=cluster.json
+            # call env.sh to generate ips.sh, etc. for downstream modules
+            $DSI_PATH/bin/env.sh
+          fi
+          # handle the case when setup-cluster.sh fail
+          if [ $? -eq 0 ]; then
+            echo "Resource provisioned/updated."
+            # copy terraform information needed for teardown
+            cp {terraform.tfstate,cluster.tf,terraform.tfvars,security.tf,variables.tf} $HOME/infrastructure_provisioning/terraform/.
+            rsync -vr ../modules $HOME/infrastructure_provisioning/modules
+            cd $HOME/infrastructure_provisioning/terraform
+            ./terraform get
+            # use provisioned.${shard} to indicate the type of clusters held by EVG host
+            # remove previous information and keep the latest cluster type
+            rm provisioned.*
+            touch provisioned.${cluster}
+            echo "Provisioning state updated on Evergreen host."
+          else
+            echo "Failed to provision resources. Cleaning up partial state."
+            yes yes | ./terraform destroy
+            if [ $? != 0 ]; then yes yes | ./terraform destroy; fi
+            echo "Resource released."
+            rm -r $HOME/infrastructure_provisioning
+            echo "Cleaned up provisioning state on Evergreen host. Exiting test."
+            exit 1
+          fi
 
   "configure mongodb cluster":
     - command: shell.exec
@@ -142,8 +162,8 @@ functions:
           source ./dsienv.sh
           source ./venv/bin/activate
           cp mongodb_setup.${setup}.${storageEngine}.yml mongodb_setup.yml
-          $DSI_PATH/bin/mongodb_setup.py --config && echo "${cluster} MongoDB Cluster STARTED."
-
+          $DSI_PATH/bin/mongodb_setup.py --mongodb-binary-archive https://s3.amazonaws.com/mciuploads/dsi/${version_id}/${revision}/${platform}/mongod-${version_id}.tar.gz --config && echo "${cluster} MongoDB Cluster STARTED."
+ 
   "run test":
     - command: shell.exec
       params:
@@ -154,34 +174,24 @@ functions:
           source ./dsienv.sh
           source ./venv/bin/activate
           echo "Run test for ${test}-${storageEngine} with setup ${setup}"
+          # Copy over the proper test control file
+          # This is to work around the fact that multinode clusters need a different ycsb test control.
+          # This should eventually be fixed in a better fashion and removed.
+          if [ ${test} == 'ycsb' ] && ( [ ${cluster} == 'shard' ] || [ ${cluster} == 'replica' ] )
+          then
+            cp $DSI_PATH/test_control/test_control.ycsb.multi_node.yml test_control.yml
+          else
+            cp $DSI_PATH/test_control/test_control.${test}.yml test_control.yml
+          fi
+          # Specify the test list to use. Change the testList parameter
+          # if you want to run a non-default list.
+          $DSI_PATH/bin/update_test_list.py ${testList}
           $DSI_PATH/bin/run-${test}.sh ${storageEngine} ${setup} ${cluster}
           echo "Done test for ${test}-${storageEngine} with setup ${setup}!"
     - command: "json.send"
       params:
          name: "perf"
          file: "work/perf.json"
-    - command: shell.exec
-      params:
-        working_dir: work
-        script: |
-          set -e
-          set -v
-          touch test.success
-
-  "destroy cluster":
-    - command: shell.exec
-      # destroy the cluster
-      params:
-        working_dir: work
-        script: |
-          set -e
-          set -o verbose
-          source ./dsienv.sh
-          # destroy the EC2 cluster
-          yes yes | ./terraform destroy; true
-          # make sure we destroy the cluster in case of AWS API timing issue
-          yes yes | ./terraform destroy; true
-          echo "Cluster DESTROYED."
 
   "make test log artifact":
     - command: shell.exec
@@ -266,7 +276,7 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          python -u ../src/dsi/dsi/analysis/post_run_check.py --reports-dir .. --rev ${revision} -f history.json -t tags.json --refTag 3.2.1-Baseline --overrideFile ../src/dsi/dsi/analysis/master/system_perf_override.json --project_id sys-perf --task_name ${task_name} --variant ${build_variant}
+          python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --log-analysis .. --perf-file reports/perf.json --rev ${revision} -f history.json -t tags.json --refTag 3.2.1-Baseline --overrideFile ../src/dsi/dsi/analysis/master/system_perf_override.json --project_id sys-perf --task_name ${task_name} --variant ${build_variant}
 
   "compare":
     - command: shell.exec
@@ -318,16 +328,35 @@ tasks:
     - command: git.get_project
       params:
         directory: src
-    - command: git.apply_patch
-      params:
-        directory: src
     - command: shell.exec
       params:
         working_dir: src
         script: |
           set -o errexit
           set -o verbose
-          ${scons|scons} ${compile_flags|} mongo${extension} mongod${extension} mongos${extension}
+
+          # We get the raw version string (r1.2.3-45-gabcdef) from git
+          MONGO_VERSION=$(git describe)
+          # If this is a patch build, we add the patch version id to the version string so we know
+          # this build was a patch, and which evergreen task it came from
+          if [ "${is_patch|}" = "true" ]; then
+            MONGO_VERSION="$MONGO_VERSION-patch-${version_id}"
+          fi
+
+          # This script converts the generated version string into a sanitized version string for
+          # use by scons and uploading artifacts as well as information about for the scons cache.
+          echo $MONGO_VERSION | USE_SCONS_CACHE=${use_scons_cache|false} ${python|python} buildscripts/generate_compile_expansions.py | tee compile_expansions.yml
+    # Then we load the generated version data into the agent so we can use it in task definitions
+    - command: expansions.update
+      params:
+        file: src/compile_expansions.yml
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+          ${python|python} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} mongo${extension} mongod${extension} mongos${extension} MONGO_VERSION=${version}
           mkdir -p mongodb/bin
           mv mongo${extension|} mongodb/bin
           mv mongod${extension|} mongodb/bin
@@ -345,21 +374,13 @@ tasks:
         content_type: ${content_type|application/x-gzip}
         display_name: mongodb.tar.gz
 
-
-# The industry_benchmarks_WT task runs the "bring up cluster" task and is
-# the only one to do so - all other tasks run "restore cluster".  As such,
-# all buildvariants must run industry_benchmarks_WT and run it first.
-
-# When adding or removing tasks, you also must ensure that the final task
-# and only the final task runs the "destroy cluster" function.
-
 - name: industry_benchmarks_WT
   depends_on:
     - name: compile
       variant: linux-standalone
   commands:
     - func: "prepare environment"
-    - func: "bring up cluster"
+    - func: "infrastructure provisioning"
     - func: "configure mongodb cluster"
       vars:
         storageEngine: "wiredTiger"
@@ -367,19 +388,22 @@ tasks:
       vars:
         storageEngine: "wiredTiger"
         test: "ycsb"
+        testList: "default"
     - func: "make test log artifact"
     - func: "upload log file"
       vars:
         test: "ycsb"
     - func: "analyze"
+      vars:
+        script_flags: --ycsb-throughput-analysis reports
 
 - name: industry_benchmarks_MMAPv1
   depends_on:
-    - name: core_workloads_WT
-      status : "*"
+    - name: compile
+      variant: linux-standalone
   commands:
     - func: "prepare environment"
-    - func: "restore cluster"
+    - func: "infrastructure provisioning"
     - func: "configure mongodb cluster"
       vars:
         storageEngine: "mmapv1"
@@ -387,19 +411,22 @@ tasks:
       vars:
         storageEngine: "mmapv1"
         test: "ycsb"
+        testList: "default"
     - func: "make test log artifact"
     - func: "upload log file"
       vars:
         test: "ycsb"
     - func: "analyze"
+      vars:
+        script_flags: --ycsb-throughput-analysis reports
 
 - name: core_workloads_WT
   depends_on:
-    - name: industry_benchmarks_WT
-      status : "*"
+    - name: compile
+      variant: linux-standalone
   commands:
     - func: "prepare environment"
-    - func: "restore cluster"
+    - func: "infrastructure provisioning"
     - func: "configure mongodb cluster"
       vars:
         storageEngine: "wiredTiger"
@@ -407,6 +434,7 @@ tasks:
       vars:
         storageEngine: "wiredTiger"
         test: "benchRun"
+        testList: "default"
     - func: "make test log artifact"
     - func: "upload log file"
       vars:
@@ -415,11 +443,11 @@ tasks:
 
 - name: core_workloads_MMAPv1
   depends_on:
-    - name: industry_benchmarks_MMAPv1
-      status : "*"
+    - name: compile
+      variant: linux-standalone
   commands:
     - func: "prepare environment"
-    - func: "restore cluster"
+    - func: "infrastructure provisioning"
     - func: "configure mongodb cluster"
       vars:
         storageEngine: "mmapv1"
@@ -427,11 +455,11 @@ tasks:
       vars:
         storageEngine: "mmapv1"
         test: "benchRun"
+        testList: "default"
     - func: "make test log artifact"
     - func: "upload log file"
       vars:
         test: "core_workloads_MMAPv1"
-    - func: "destroy cluster"
     - func: "analyze"
 
 - name: industry_benchmarks_WT_oplog_comp
@@ -452,8 +480,6 @@ tasks:
 
 - name: industry_benchmarks_MMAPv1_oplog_comp
   depends_on:
-    - name: core_workloads_WT_oplog_comp
-      status: "*"
     - name: industry_benchmarks_MMAPv1
       variant: linux-standalone
       status: "*"
@@ -470,8 +496,6 @@ tasks:
 
 - name: core_workloads_WT_oplog_comp
   depends_on:
-    - name: industry_benchmarks_WT_oplog_comp
-      status: "*"
     - name: core_workloads_WT
       variant: linux-standalone
       status: "*"
@@ -488,8 +512,6 @@ tasks:
 
 - name: core_workloads_MMAPv1_oplog_comp
   depends_on:
-    - name: industry_benchmarks_MMAPv1_oplog_comp
-      status: "*"
     - name: core_workloads_MMAPv1
       variant: linux-standalone
       status: "*"
@@ -510,7 +532,7 @@ tasks:
       variant: linux-standalone
   commands:
     - func: "prepare environment"
-    - func: "bring up cluster"
+    - func: "infrastructure provisioning"
     - func: "configure mongodb cluster"
       vars:
         storageEngine: "wiredTiger"
@@ -518,6 +540,7 @@ tasks:
       vars:
         storageEngine: "wiredTiger"
         test: "initialSync"
+        testList: "default"
     - func: "make test log artifact"
     - func: "upload log file"
       vars:
@@ -526,11 +549,11 @@ tasks:
 
 - name: initialsync_MMAPv1
   depends_on:
-    - name: initialsync_WT
-      status: "*"
+    - name: compile
+      variant : linux-standalone
   commands:
     - func: "prepare environment"
-    - func: "restore cluster"
+    - func: "infrastructure provisioning"
     - func: "configure mongodb cluster"
       vars:
         storageEngine: "mmapv1"
@@ -538,11 +561,55 @@ tasks:
       vars:
         storageEngine: "mmapv1"
         test: "initialSync"
+        testList: "default"
     - func: "make test log artifact"
     - func: "upload log file"
       vars:
         test: "initialsync_MMAPv1"
-    - func: "destroy cluster"
+    - func: "analyze"
+
+- name: initialsync_WT_dr
+  depends_on:
+    - name: compile
+      variant: linux-standalone
+  commands:
+    - func: "prepare environment"
+    - func: "infrastructure provisioning"
+    - func: "configure mongodb cluster"
+      vars:
+        storageEngine: "wiredTiger"
+        setup: replica-2node.dr
+    - func: "run test"
+      vars:
+        storageEngine: "wiredTiger"
+        test: "initialSync"
+        testList: "default"
+    - func: "make test log artifact"
+    - func: "upload log file"
+      vars:
+        test: "initialsync_WT"
+    - func: "analyze"
+
+- name: initialsync_MMAPv1_dr
+  depends_on:
+    - name: compile
+      variant: linux-standalone
+  commands:
+    - func: "prepare environment"
+    - func: "infrastructure provisioning"
+    - func: "configure mongodb cluster"
+      vars:
+        storageEngine: "mmapv1"
+        setup: replica-2node.dr
+    - func: "run test"
+      vars:
+        storageEngine: "mmapv1"
+        test: "initialSync"
+        testList: "default"
+    - func: "make test log artifact"
+    - func: "upload log file"
+      vars:
+        test: "initialsync_MMAPv1"
     - func: "analyze"
 
 
@@ -582,12 +649,13 @@ buildvariants:
     - workloads
     - YCSB
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     setup: single-replica
     cluster: single
     platform: linux
+    use_scons_cache: true
   run_on:
-      - "rhel70-perf-standalone"
+      - "rhel70-perf-single"
   tasks:
     - name: industry_benchmarks_WT
     - name: core_workloads_WT
@@ -599,50 +667,17 @@ buildvariants:
   batchtime: 1440 # 24 hours
   modules: *modules
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     setup: standalone
     cluster: single
     platform: linux
+    use_scons_cache: true
   run_on:
-      - "rhel70-perf-standalone"
+      - "rhel70-perf-single"
   tasks:
     - name: compile
       distros:
       - rhel70
-    - name: industry_benchmarks_WT
-    - name: core_workloads_WT
-    - name: industry_benchmarks_MMAPv1
-    - name: core_workloads_MMAPv1
-
-- name: linux-standalone-c3-4xlarge
-  display_name: Linux Standalone (c3.4xlarge trial)
-  batchtime: 480 # 8 hours
-  disabled: true
-  modules: *modules
-  expansions:
-    setup: standalone
-    cluster: single-c3-4xlarge
-    platform: linux
-  run_on:
-      - "rhel70-perf-standalone"
-  tasks:
-    - name: industry_benchmarks_WT
-    - name: core_workloads_WT
-    - name: industry_benchmarks_MMAPv1
-    - name: core_workloads_MMAPv1
-
-- name: linux-standalone-c3-2xlarge
-  display_name: Linux Standalone (c3.2xlarge trial)
-  batchtime: 480 # 8 hours
-  modules: *modules
-  disabled: true
-  expansions:
-    setup: standalone
-    cluster: single-c3-2xlarge
-    platform: linux
-  run_on:
-      - "rhel70-perf-standalone"
-  tasks:
     - name: industry_benchmarks_WT
     - name: core_workloads_WT
     - name: industry_benchmarks_MMAPv1
@@ -653,12 +688,13 @@ buildvariants:
   batchtime: 1440 # 24 hours
   modules: *modules
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     setup: shard
     cluster: shard
     platform: linux
+    use_scons_cache: true
   run_on:
-      - "rhel70-perf-standalone"
+      - "rhel70-perf-shard"
   tasks:
     - name: industry_benchmarks_WT
     - name: core_workloads_WT
@@ -670,12 +706,12 @@ buildvariants:
   batchtime: 1440 # 24 hours
   modules: *modules
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     setup: replica
     cluster: replica
     platform: linux
   run_on:
-      - "rhel70-perf-standalone"
+      - "rhel70-perf-replset"
   tasks:
     - name: industry_benchmarks_WT
     - name: core_workloads_WT
@@ -687,75 +723,30 @@ buildvariants:
   batchtime: 1440 # 24 hours
   modules: *modules
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --release
-    setup: replica
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
+    setup: replica-2node
     cluster: replica
     platform: linux
+    use_scons_cache: true
   run_on:
-      - "rhel70-perf-standalone"
+      - "rhel70-perf-replset"
   tasks:
     - name: initialsync_WT
     - name: initialsync_MMAPv1
+    - name: initialsync_WT_dr
+    - name: initialsync_MMAPv1_dr
 
 - name: linux-oplog-compare
   display_name: Linux Oplog Compare
   batchtime: 1440 # 24 hours
   modules: *modules
+  expansions:
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
+    use_scons_cache: true
   run_on:
-      - "rhel70-perf-standalone"
+      - "rhel70-perf-single"
   tasks:
     - name: industry_benchmarks_WT_oplog_comp
     - name: core_workloads_WT_oplog_comp
     - name: industry_benchmarks_MMAPv1_oplog_comp
     - name: core_workloads_MMAPv1_oplog_comp
-
-
-#######################################
-#        Windows Buildvariants        #
-#######################################
-
-- name: windows-standalone
-  display_name: Windows Standalone (trial)
-  batchtime: 480 # 8 hours
-  modules: *modules
-  disabled: true
-  expansions:
-    setup: standalone-win
-    cluster: windows-single
-    extension: ".exe"
-    compile_flags: --release --win-version-min=ws08r2 -j$(grep -c ^processor /proc/cpuinfo) MONGO_DISTMOD=2008plus VARIANT_DIR=win32
-    platform: windows
-  run_on:
-      - "rhel70-perf-standalone"
-  tasks:
-    - name: compile
-      distros:
-      - windows-64-vs2015-compile
-    - name: industry_benchmarks_WT
-      depends_on:
-        - name: compile
-    - name: core_workloads_WT
-    - name: industry_benchmarks_MMAPv1
-    - name: core_workloads_MMAPv1
-
-- name: windows-1-node-replSet
-  display_name: Windows 1-node ReplSet (trial)
-  batchtime: 480 # 8 hours
-  modules: *modules
-  disabled: true
-  expansions:
-    setup: replica-win
-    cluster: windows-single
-    numShard: 0
-    extension: ".exe"
-    platform: windows
-  run_on:
-      - "rhel70-perf-standalone"
-  tasks:
-    - name: industry_benchmarks_WT
-      depends_on:
-        - name: compile
-          variant: windows-standalone
-    - name: core_workloads_WT
-    - name: industry_benchmarks_MMAPv1
-    - name: core_workloads_MMAPv1

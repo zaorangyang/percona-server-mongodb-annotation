@@ -26,9 +26,35 @@
  * then also delete it in the license file.
  */
 
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/ftdc/controller.h"
+#include "mongo/db/ftdc/controller.h"
+
 namespace mongo {
 
 class FTDCController;
+
+/**
+ * Base class for system metrics collectors. Sets collector name to a common name all system metrics
+ * collectors to use.
+ */
+class SystemMetricsCollector : public FTDCCollectorInterface {
+public:
+    std::string name() const final;
+
+protected:
+    /**
+     * Convert any errors we see into BSON for the user to see in the final FTDC document. It is
+     * acceptable for the collector to fail, but we do not want to shutdown the FTDC loop because
+     * of it. We assume that the BSONBuilder is not corrupt on non-OK Status but nothing else with
+     * regards to the final document output.
+     */
+    static void processStatusErrors(Status s, BSONObjBuilder* builder);
+};
+
 
 /**
  * Install a system metrics collector if it exists as a periodic collector.
