@@ -607,8 +607,9 @@ bool handlePreValidationMongodOptions(const moe::Environment& params,
     }
     if (params.count("version") && params["version"].as<bool>() == true) {
         setPlainConsoleLogger();
-        log() << mongodVersion() << endl;
-        printBuildInfo();
+        auto&& vii = VersionInfoInterface::instance();
+        log() << mongodVersion(vii);
+        vii.logBuildInfo();
         return false;
     }
     if (params.count("sysinfo") && params["sysinfo"].as<bool>() == true) {
@@ -992,8 +993,8 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
     return Status::OK();
 }
 
-Status storeMongodOptions(const moe::Environment& params, const std::vector<std::string>& args) {
-    Status ret = storeServerOptions(params, args);
+Status storeMongodOptions(const moe::Environment& params) {
+    Status ret = storeServerOptions(params);
     if (!ret.isOK()) {
         return ret;
     }

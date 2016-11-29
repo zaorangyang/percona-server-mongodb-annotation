@@ -33,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
@@ -47,7 +48,9 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/split_chunk_request_type.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -60,17 +63,7 @@ using std::vector;
 
 namespace {
 
-/**
- * Append min, max and version information from chunk to the buffer.
- */
-void appendShortVersion(BufBuilder& b, const ChunkType& chunk) {
-    BSONObjBuilder bb(b);
-    bb.append(ChunkType::min(), chunk.getMin());
-    bb.append(ChunkType::max(), chunk.getMax());
-    if (chunk.isVersionSet())
-        chunk.getVersion().addToBSON(bb, ChunkType::DEPRECATED_lastmod());
-    bb.done();
-}
+const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
 
 bool checkIfSingleDoc(OperationContext* txn,
                       Collection* collection,
@@ -100,6 +93,45 @@ bool checkIfSingleDoc(OperationContext* txn,
     invariant(PlanExecutor::ADVANCED == state || PlanExecutor::IS_EOF == state);
 
     return false;
+}
+
+//
+// Checks the collection's metadata for a successful split on the specified chunkRange
+// using the specified splitPoints. Returns false if the metadata's chunks don't match
+// the new chunk boundaries exactly.
+//
+bool checkMetadataForSuccess(OperationContext* txn,
+                             const NamespaceString& nss,
+                             const ChunkRange& chunkRange,
+                             const std::vector<BSONObj>& splitKeys) {
+    ScopedCollectionMetadata metadataAfterSplit;
+    {
+        AutoGetCollection autoColl(txn, nss, MODE_IS);
+
+        // Get collection metadata
+        metadataAfterSplit = CollectionShardingState::get(txn, nss.ns())->getMetadata();
+    }
+
+    auto newChunkBounds(splitKeys);
+    auto startKey = chunkRange.getMin();
+    newChunkBounds.push_back(chunkRange.getMax());
+
+    ChunkType nextChunk;
+    for (const auto& endKey : newChunkBounds) {
+        log() << "checking metadataAfterSplit for new chunk boundaries [" << redact(startKey) << ","
+              << redact(endKey) << ")";
+        // Check that all new chunks fit the new chunk boundaries
+        if (!metadataAfterSplit->getNextChunk(startKey, &nextChunk) ||
+            nextChunk.getMax().woCompare(endKey)) {
+            log() << "ERROR, found [" << redact(startKey) << "," << redact(nextChunk.getMax())
+                  << ")";
+            return false;
+        }
+
+        startKey = endKey;
+    }
+
+    return true;
 }
 
 class SplitChunkCommand : public Command {
@@ -146,9 +178,8 @@ public:
              std::string& errmsg,
              BSONObjBuilder& result) override {
         //
-        // 1. check whether parameters passed to splitChunk are sound
+        // Check whether parameters passed to splitChunk are sound
         //
-
         const NamespaceString nss = NamespaceString(parseNs(dbname, cmdObj));
         if (!nss.isValid()) {
             errmsg = str::stream() << "invalid namespace '" << nss.toString()
@@ -156,45 +187,51 @@ public:
             return false;
         }
 
-        const BSONObj keyPattern = cmdObj["keyPattern"].Obj();
-        if (keyPattern.isEmpty()) {
-            errmsg = "need to specify the key pattern the collection is sharded over";
-            return false;
+        BSONObj keyPatternObj;
+        {
+            BSONElement keyPatternElem;
+            auto keyPatternStatus =
+                bsonExtractTypedField(cmdObj, "keyPattern", Object, &keyPatternElem);
+
+            if (!keyPatternStatus.isOK()) {
+                errmsg = "need to specify the key pattern the collection is sharded over";
+                return false;
+            }
+            keyPatternObj = keyPatternElem.Obj();
         }
 
-        const BSONObj min = cmdObj["min"].Obj();
-        if (min.isEmpty()) {
-            errmsg = "need to specify the min key for the chunk";
-            return false;
-        }
+        auto chunkRangeStatus = ChunkRange::fromBSON(cmdObj);
+        if (!chunkRangeStatus.isOK())
+            return appendCommandStatus(result, chunkRangeStatus.getStatus());
 
-        const BSONObj max = cmdObj["max"].Obj();
-        if (max.isEmpty()) {
-            errmsg = "need to specify the max key for the chunk";
-            return false;
-        }
+        auto chunkRange = chunkRangeStatus.getValue();
+        const BSONObj min = chunkRange.getMin();
+        const BSONObj max = chunkRange.getMax();
 
-        const string shardName = cmdObj["from"].str();
-        if (shardName.empty()) {
-            errmsg = "need specify server to split chunk at";
-            return false;
-        }
-
-        const BSONObj splitKeysElem = cmdObj["splitKeys"].Obj();
-        if (splitKeysElem.isEmpty()) {
-            errmsg = "need to provide the split points to chunk over";
-            return false;
-        }
         vector<BSONObj> splitKeys;
-        BSONObjIterator it(splitKeysElem);
-        while (it.more()) {
-            splitKeys.push_back(it.next().Obj().getOwned());
+        {
+            BSONElement splitKeysElem;
+            auto splitKeysElemStatus =
+                bsonExtractTypedField(cmdObj, "splitKeys", mongo::Array, &splitKeysElem);
+
+            if (!splitKeysElemStatus.isOK()) {
+                errmsg = "need to provide the split points to chunk over";
+                return false;
+            }
+            BSONObjIterator it(splitKeysElem.Obj());
+            while (it.more()) {
+                splitKeys.push_back(it.next().Obj().getOwned());
+            }
         }
+
+        string shardName;
+        auto parseShardNameStatus = bsonExtractStringField(cmdObj, "from", &shardName);
+        if (!parseShardNameStatus.isOK())
+            return appendCommandStatus(result, parseShardNameStatus);
 
         //
         // Get sharding state up-to-date
         //
-
         ShardingState* const shardingState = ShardingState::get(txn);
 
         // This could be the first call that enables sharding - make sure we initialize the
@@ -213,12 +250,12 @@ public:
         // Initialize our current shard name in the shard state if needed
         shardingState->setShardName(shardName);
 
-        log() << "received splitChunk request: " << cmdObj;
+        log() << "received splitChunk request: " << redact(cmdObj);
 
         //
-        // 2. lock the collection's metadata and get highest version for the current shard
+        // Lock the collection's metadata and get highest version for the current shard
+        // TODO(SERVER-25086): Remove distLock aquisition from split chunk
         //
-
         const string whyMessage(str::stream() << "splitting chunk [" << min << ", " << max
                                               << ") in "
                                               << nss.toString());
@@ -226,8 +263,8 @@ public:
             txn, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
         if (!scopedDistLock.isOK()) {
             errmsg = str::stream() << "could not acquire collection lock for " << nss.toString()
-                                   << " to split chunk [" << min << "," << max << ")"
-                                   << causedBy(scopedDistLock.getStatus());
+                                   << " to split chunk [" << redact(min) << "," << redact(max)
+                                   << ") " << redact(scopedDistLock.getStatus());
             warning() << errmsg;
             return false;
         }
@@ -238,8 +275,8 @@ public:
 
         if (!refreshStatus.isOK()) {
             errmsg = str::stream() << "splitChunk cannot split chunk "
-                                   << "[" << min << "," << max << ")"
-                                   << causedBy(refreshStatus.reason());
+                                   << "[" << redact(min) << "," << redact(max) << ") "
+                                   << redact(refreshStatus);
 
             warning() << errmsg;
             return false;
@@ -248,38 +285,29 @@ public:
         if (shardVersion.majorVersion() == 0) {
             // It makes no sense to split if our version is zero and we have no chunks
             errmsg = str::stream() << "splitChunk cannot split chunk "
-                                   << "[" << min << "," << max << ")"
+                                   << "[" << redact(min) << "," << redact(max) << ") "
                                    << " with zero shard version";
 
             warning() << errmsg;
             return false;
         }
 
-        ChunkVersion cmdVersion;
-        {
-            // Mongos >= v3.2 sends the full version, v3.0 only sends the epoch.
-            // TODO(SERVER-20742): Stop parsing epoch separately after 3.2.
-            OID cmdEpoch;
-            auto& oss = OperationShardingState::get(txn);
-            if (oss.hasShardVersion()) {
-                cmdVersion = oss.getShardVersion(nss);
-                cmdEpoch = cmdVersion.epoch();
-            } else {
-                BSONElement epochElem(cmdObj["epoch"]);
-                if (epochElem.type() == jstOID) {
-                    cmdEpoch = epochElem.OID();
-                }
-            }
+        const auto& oss = OperationShardingState::get(txn);
+        uassert(ErrorCodes::InvalidOptions, "collection version is missing", oss.hasShardVersion());
 
-            if (cmdEpoch != shardVersion.epoch()) {
-                std::string msg = str::stream() << "splitChunk cannot split chunk "
-                                                << "[" << min << "," << max << "), "
-                                                << "collection may have been dropped. "
-                                                << "current epoch: " << shardVersion.epoch()
-                                                << ", cmd epoch: " << cmdEpoch;
-                warning() << msg;
-                throw SendStaleConfigException(nss.toString(), msg, cmdVersion, shardVersion);
-            }
+        // Even though the splitChunk command transmits a value in the operation's shardVersion
+        // field, this value does not actually contain the shard version, but the global collection
+        // version.
+        ChunkVersion expectedCollectionVersion = oss.getShardVersion(nss);
+        if (expectedCollectionVersion.epoch() != shardVersion.epoch()) {
+            std::string msg = str::stream() << "splitChunk cannot split chunk "
+                                            << "[" << redact(min) << "," << redact(max) << "), "
+                                            << "collection may have been dropped. "
+                                            << "current epoch: " << shardVersion.epoch()
+                                            << ", cmd epoch: " << expectedCollectionVersion.epoch();
+            warning() << msg;
+            throw SendStaleConfigException(
+                nss.toString(), msg, expectedCollectionVersion, shardVersion);
         }
 
         ScopedCollectionMetadata collMetadata;
@@ -302,168 +330,91 @@ public:
             origChunk.getMax().woCompare(max)) {
             // Our boundaries are different from those passed in
             std::string msg = str::stream() << "splitChunk cannot find chunk "
-                                            << "[" << min << "," << max << ")"
+                                            << "[" << redact(min) << "," << redact(max) << ") "
                                             << " to split, the chunk boundaries may be stale";
             warning() << msg;
-            throw SendStaleConfigException(nss.toString(), msg, cmdVersion, shardVersion);
+            throw SendStaleConfigException(
+                nss.toString(), msg, expectedCollectionVersion, shardVersion);
         }
+
+        auto newShardVersion = collVersion;
+        // Increment the minor verison once. cloneSplit will increment the minor verison
+        // once per every split point past the first.
+        //
+        // TODO: Revisit this interface, it's a bit clunky
+        newShardVersion.incMinor();
+
+        // Ensure that the newly applied chunks would result in a correct metadata state
+        uassertStatusOK(collMetadata->cloneSplit(min, max, splitKeys, newShardVersion));
 
         log() << "splitChunk accepted at version " << shardVersion;
 
+        auto request = SplitChunkRequest(
+            nss, expectedCollectionVersion.epoch(), chunkRange, splitKeys, shardName);
+
+        auto configCmdObj = request.toConfigCommandBSON(
+            BSON(WriteConcernOptions::kWriteConcernField << WriteConcernOptions::Majority));
+
+        auto cmdResponseStatus =
+            Grid::get(txn)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
+                txn,
+                kPrimaryOnlyReadPreference,
+                "admin",
+                configCmdObj,
+                Shard::RetryPolicy::kIdempotent);
+
         //
-        // 3. create the batch of updates to metadata ( the new chunks ) to be applied via
-        //    'applyOps' command
+        // Refresh chunk metadata regardless of whether or not the split succeeded
         //
+        ChunkVersion shardVersionAfterSplit;
+        refreshStatus = shardingState->refreshMetadataNow(txn, nss.ns(), &shardVersionAfterSplit);
 
-        BSONObjBuilder logDetail;
-        appendShortVersion(logDetail.subobjStart("before"), origChunk);
-        LOG(1) << "before split on " << origChunk;
-        OwnedPointerVector<ChunkType> newChunks;
+        if (!refreshStatus.isOK()) {
+            errmsg = str::stream() << "failed to refresh metadata for split chunk [" << redact(min)
+                                   << "," << redact(max) << ") " << redact(refreshStatus);
 
-        ChunkVersion nextChunkVersion = collVersion;
-        BSONObj startKey = min;
-        splitKeys.push_back(max);  // makes it easier to have 'max' in the next loop. remove later.
-
-        BSONArrayBuilder updates;
-
-        for (vector<BSONObj>::const_iterator it = splitKeys.begin(); it != splitKeys.end(); ++it) {
-            BSONObj endKey = *it;
-
-            if (endKey.woCompare(startKey) == 0) {
-                errmsg = str::stream() << "split on the lower bound of chunk "
-                                       << "[" << min << ", " << max << ")"
-                                       << " is not allowed";
-
-                warning() << errmsg;
-                return false;
-            }
-
-            // Make sure splits don't create too-big shard keys
-            Status status = ShardKeyPattern::checkShardKeySize(endKey);
-            if (!status.isOK()) {
-                errmsg = status.reason();
-                warning() << errmsg;
-                return false;
-            }
-
-            // splits only update the 'minor' portion of version
-            nextChunkVersion.incMinor();
-
-            // build an update operation against the chunks collection of the config database with
-            // upsert true
-            BSONObjBuilder op;
-            op.append("op", "u");
-            op.appendBool("b", true);
-            op.append("ns", ChunkType::ConfigNS);
-
-            // add the modified (new) chunk information as the update object
-            BSONObjBuilder n(op.subobjStart("o"));
-            n.append(ChunkType::name(), ChunkType::genID(nss.ns(), startKey));
-            nextChunkVersion.addToBSON(n, ChunkType::DEPRECATED_lastmod());
-            n.append(ChunkType::ns(), nss.ns());
-            n.append(ChunkType::min(), startKey);
-            n.append(ChunkType::max(), endKey);
-            n.append(ChunkType::shard(), shardName);
-            n.done();
-
-            // add the chunk's _id as the query part of the update statement
-            BSONObjBuilder q(op.subobjStart("o2"));
-            q.append(ChunkType::name(), ChunkType::genID(nss.ns(), startKey));
-            q.done();
-
-            updates.append(op.obj());
-
-            // remember this chunk info for logging later
-            unique_ptr<ChunkType> chunk(new ChunkType());
-            chunk->setMin(startKey);
-            chunk->setMax(endKey);
-            chunk->setVersion(nextChunkVersion);
-
-            newChunks.push_back(chunk.release());
-
-            startKey = endKey;
+            warning() << errmsg;
+            return false;
         }
 
-        splitKeys.pop_back();  // 'max' was used as sentinel
+        if (!cmdResponseStatus.isOK())
+            return appendCommandStatus(result, cmdResponseStatus.getStatus());
 
-        BSONArrayBuilder preCond;
-        {
-            BSONObjBuilder b;
-            b.append("ns", ChunkType::ConfigNS);
-            b.append("q",
-                     BSON("query" << BSON(ChunkType::ns(nss.ns())) << "orderby"
-                                  << BSON(ChunkType::DEPRECATED_lastmod() << -1)));
-            {
-                BSONObjBuilder bb(b.subobjStart("res"));
-                // TODO: For backwards compatibility, we can't yet require an epoch here
-                bb.appendTimestamp(ChunkType::DEPRECATED_lastmod(), collVersion.toLong());
-                bb.done();
-            }
-            preCond.append(b.obj());
+        // Check commandStatus and writeConcernStatus
+        auto commandStatus = cmdResponseStatus.getValue().commandStatus;
+        auto writeConcernStatus = cmdResponseStatus.getValue().writeConcernStatus;
+
+        // Send stale epoch if epoch of request did not match epoch of collection
+        if (commandStatus == ErrorCodes::StaleEpoch) {
+            std::string msg = str::stream() << "splitChunk cannot split chunk "
+                                            << "[" << redact(min) << "," << redact(max) << "), "
+                                            << "collection may have been dropped. "
+                                            << "current epoch: " << collVersion.epoch()
+                                            << ", cmd epoch: " << expectedCollectionVersion.epoch();
+            warning() << msg;
+
+            throw SendStaleConfigException(
+                nss.toString(), msg, expectedCollectionVersion, collVersion);
+
+            return appendCommandStatus(result, commandStatus);
         }
 
         //
-        // 4. apply the batch of updates to remote and local metadata
+        // If _configsvrSplitChunk returned an error, look at this shard's metadata to deterine if
+        // the split actually did happen. This can happen if there's a network error getting the
+        // response from the first call to _configsvrSplitChunk, but it actually succeeds, thus the
+        // automatic retry fails with a precondition violation, for example.
         //
+        if ((!commandStatus.isOK() || !writeConcernStatus.isOK()) &&
+            checkMetadataForSuccess(txn, nss, chunkRange, splitKeys)) {
 
-        Status applyOpsStatus = grid.catalogClient(txn)->applyChunkOpsDeprecated(
-            txn, updates.arr(), preCond.arr(), nss.ns(), nextChunkVersion);
-        if (!applyOpsStatus.isOK()) {
-            return appendCommandStatus(result, applyOpsStatus);
+            LOG(1) << "splitChunk [" << redact(min) << "," << redact(max)
+                   << ") has already been committed.";
+        } else if (!commandStatus.isOK()) {
+            return appendCommandStatus(result, commandStatus);
+        } else if (!writeConcernStatus.isOK()) {
+            return appendCommandStatus(result, writeConcernStatus);
         }
-
-        //
-        // Install chunk metadata with knowledge about newly split chunks in this shard's state
-        //
-
-        {
-            ScopedTransaction scopedXact(txn, MODE_IX);
-            AutoGetCollection autoColl(txn, nss, MODE_IX, MODE_X);
-
-            auto css = CollectionShardingState::get(txn, nss);
-
-            // NOTE: The newShardVersion resulting from this split is higher than any other chunk
-            // version, so it's also implicitly the newCollVersion
-            ChunkVersion newShardVersion = collVersion;
-
-            // Increment the minor version once, splitChunk increments once per split point
-            // (resulting in the correct final shard/collection version)
-            //
-            // TODO: Revisit this interface, it's a bit clunky
-            newShardVersion.incMinor();
-
-            std::unique_ptr<CollectionMetadata> cloned(fassertStatusOK(
-                40221, css->getMetadata()->cloneSplit(min, max, splitKeys, newShardVersion)));
-            css->refreshMetadata(txn, std::move(cloned));
-        }
-
-        //
-        // 5. logChanges
-        //
-
-        // single splits are logged different than multisplits
-        if (newChunks.size() == 2) {
-            appendShortVersion(logDetail.subobjStart("left"), *newChunks[0]);
-            appendShortVersion(logDetail.subobjStart("right"), *newChunks[1]);
-
-            grid.catalogClient(txn)->logChange(txn, "split", nss.ns(), logDetail.obj());
-        } else {
-            BSONObj beforeDetailObj = logDetail.obj();
-            BSONObj firstDetailObj = beforeDetailObj.getOwned();
-            const int newChunksSize = newChunks.size();
-
-            for (int i = 0; i < newChunksSize; i++) {
-                BSONObjBuilder chunkDetail;
-                chunkDetail.appendElements(beforeDetailObj);
-                chunkDetail.append("number", i + 1);
-                chunkDetail.append("of", newChunksSize);
-                appendShortVersion(chunkDetail.subobjStart("chunk"), *newChunks[i]);
-
-                grid.catalogClient(txn)->logChange(txn, "multi-split", nss.ns(), chunkDetail.obj());
-            }
-        }
-
-        dassert(newChunks.size() > 1);
 
         {
             // Select chunk to move out for "top chunk optimization".
@@ -482,23 +433,28 @@ public:
             // single-valued. Therefore, any multi-key index prefixed by shard
             // key cannot be multikey over the shard key fields.
             IndexDescriptor* idx =
-                collection->getIndexCatalog()->findShardKeyPrefixedIndex(txn, keyPattern, false);
+                collection->getIndexCatalog()->findShardKeyPrefixedIndex(txn, keyPatternObj, false);
 
             if (idx == NULL) {
                 return true;
             }
 
-            const ChunkType* backChunk = newChunks.vector().back();
-            const ChunkType* frontChunk = newChunks.vector().front();
+            auto backChunk = ChunkType();
+            backChunk.setMin(splitKeys.back());
+            backChunk.setMax(max);
 
-            if (shardKeyPattern.globalMax().woCompare(backChunk->getMax()) == 0 &&
-                checkIfSingleDoc(txn, collection, idx, backChunk)) {
+            auto frontChunk = ChunkType();
+            frontChunk.setMin(min);
+            frontChunk.setMax(splitKeys.front());
+
+            if (shardKeyPattern.globalMax().woCompare(backChunk.getMax()) == 0 &&
+                checkIfSingleDoc(txn, collection, idx, &backChunk)) {
                 result.append("shouldMigrate",
-                              BSON("min" << backChunk->getMin() << "max" << backChunk->getMax()));
-            } else if (shardKeyPattern.globalMin().woCompare(frontChunk->getMin()) == 0 &&
-                       checkIfSingleDoc(txn, collection, idx, frontChunk)) {
+                              BSON("min" << backChunk.getMin() << "max" << backChunk.getMax()));
+            } else if (shardKeyPattern.globalMin().woCompare(frontChunk.getMin()) == 0 &&
+                       checkIfSingleDoc(txn, collection, idx, &frontChunk)) {
                 result.append("shouldMigrate",
-                              BSON("min" << frontChunk->getMin() << "max" << frontChunk->getMax()));
+                              BSON("min" << frontChunk.getMin() << "max" << frontChunk.getMax()));
             }
         }
 

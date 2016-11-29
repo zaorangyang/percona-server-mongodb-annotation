@@ -236,10 +236,16 @@ rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData databas
     return rpc::UniqueReply(std::move(replyMsg), std::move(commandReply));
 }
 
-bool DBClientWithCommands::runCommand(const string& dbname,
-                                      const BSONObj& cmd,
-                                      BSONObj& info,
-                                      int options) {
+std::tuple<rpc::UniqueReply, DBClientWithCommands*>
+DBClientWithCommands::runCommandWithMetadataAndTarget(StringData database,
+                                                      StringData command,
+                                                      const BSONObj& metadata,
+                                                      const BSONObj& commandArgs) {
+    return std::make_tuple(runCommandWithMetadata(database, command, metadata, commandArgs), this);
+}
+
+std::tuple<bool, DBClientWithCommands*> DBClientWithCommands::runCommandWithTarget(
+    const string& dbname, const BSONObj& cmd, BSONObj& info, int options) {
     BSONObj upconvertedCmd;
     BSONObj upconvertedMetadata;
 
@@ -251,12 +257,23 @@ bool DBClientWithCommands::runCommand(const string& dbname,
 
     auto commandName = upconvertedCmd.firstElementFieldName();
 
-    auto result = runCommandWithMetadata(dbname, commandName, upconvertedMetadata, upconvertedCmd);
+    auto resultTuple =
+        runCommandWithMetadataAndTarget(dbname, commandName, upconvertedMetadata, upconvertedCmd);
+    auto result = std::move(std::get<0>(resultTuple));
 
     info = result->getCommandReply().getOwned();
 
-    return isOk(info);
+    return std::make_tuple(isOk(info), std::get<1>(resultTuple));
 }
+
+bool DBClientWithCommands::runCommand(const string& dbname,
+                                      const BSONObj& cmd,
+                                      BSONObj& info,
+                                      int options) {
+    auto res = runCommandWithTarget(dbname, cmd, info, options);
+    return std::get<0>(res);
+}
+
 
 /* note - we build a bson obj here -- for something that is super common like getlasterror you
           should have that object prebuilt as that would be faster.
@@ -725,8 +742,10 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
             bob.append("hostInfo", sb.str());
         }
 
+        auto versionString = VersionInfoInterface::instance().version();
+
         Status serializeStatus = ClientMetadata::serialize(
-            "MongoDB Internal Client", mongo::versionString, applicationName, &bob);
+            "MongoDB Internal Client", versionString, applicationName, &bob);
         if (!serializeStatus.isOK()) {
             return serializeStatus;
         }
@@ -800,12 +819,18 @@ Status DBClientConnection::connect(const HostAndPort& serverAddress, StringData 
         return swProtocolSet.getStatus();
     }
 
-    _setServerRPCProtocols(swProtocolSet.getValue());
+    auto validateStatus =
+        rpc::validateWireVersion(WireSpec::instance().outgoing, swProtocolSet.getValue().version);
+    if (!validateStatus.isOK()) {
+        warning() << "remote host has incompatible wire version: " << validateStatus;
 
-    auto negotiatedProtocol =
-        rpc::negotiate(getServerRPCProtocols(),
-                       rpc::computeProtocolSet(WireSpec::instance().minWireVersionOutgoing,
-                                               WireSpec::instance().maxWireVersionOutgoing));
+        return validateStatus;
+    }
+
+    _setServerRPCProtocols(swProtocolSet.getValue().protocolSet);
+
+    auto negotiatedProtocol = rpc::negotiate(
+        getServerRPCProtocols(), rpc::computeProtocolSet(WireSpec::instance().outgoing));
 
     if (!negotiatedProtocol.isOK()) {
         return negotiatedProtocol.getStatus();
@@ -1176,7 +1201,7 @@ list<BSONObj> DBClientWithCommands::getIndexSpecs(const string& ns, int options)
         const long long id = cursorObj["id"].Long();
 
         if (id != 0) {
-            const std::string ns = cursorObj["ns"].String();
+            invariant(ns == cursorObj["ns"].String());
             unique_ptr<DBClientCursor> cursor = getMore(ns, id, 0, 0);
             while (cursor->more()) {
                 specs.push_back(cursor->nextSafe().getOwned());

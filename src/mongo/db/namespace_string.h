@@ -35,6 +35,7 @@
 #include <string>
 
 #include "mongo/base/string_data.h"
+#include "mongo/platform/hash_namespace.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -84,6 +85,18 @@ public:
      * "dbName" must not contain a ".", and "collectionName" must not start with one.
      */
     NamespaceString(StringData dbName, StringData collectionName);
+
+    /**
+     * Contructs a NamespaceString representing a listCollections namespace. The format for this
+     * namespace is "<dbName>.$cmd.listCollections".
+     */
+    static NamespaceString makeListCollectionsNSS(StringData dbName);
+
+    /**
+     * Contructs a NamespaceString representing a listIndexes namespace. The format for this
+     * namespace is "<dbName>.$cmd.listIndexes.<collectionName>".
+     */
+    static NamespaceString makeListIndexesNSS(StringData dbName, StringData collectionName);
 
     /**
      * Note that these values are derived from the mmap_v1 implementation and that
@@ -368,31 +381,20 @@ inline bool nsIsDbOnly(StringData ns) {
 }
 
 /**
- * NamespaceDBHash and NamespaceDBEquals allow you to do something like
- * unordered_map<std::string,int,NamespaceDBHash,NamespaceDBEquals>
- * and use the full namespace for the string
- * but comparisons are done only on the db piece
- */
-
-/**
  * this can change, do not store on disk
  */
 int nsDBHash(const std::string& ns);
 
-bool nsDBEquals(const std::string& a, const std::string& b);
-
-struct NamespaceDBHash {
-    int operator()(const std::string& ns) const {
-        return nsDBHash(ns);
-    }
-};
-
-struct NamespaceDBEquals {
-    bool operator()(const std::string& a, const std::string& b) const {
-        return nsDBEquals(a, b);
-    }
-};
-
 }  // namespace mongo
 
 #include "mongo/db/namespace_string-inl.h"
+
+MONGO_HASH_NAMESPACE_START
+template <>
+struct hash<mongo::NamespaceString> {
+    size_t operator()(const mongo::NamespaceString& nss) const {
+        mongo::NamespaceString::Hasher hasher;
+        return hasher(nss);
+    }
+};
+MONGO_HASH_NAMESPACE_END

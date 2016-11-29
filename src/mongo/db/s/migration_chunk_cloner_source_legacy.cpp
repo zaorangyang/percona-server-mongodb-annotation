@@ -184,12 +184,20 @@ Status MigrationChunkClonerSourceLegacy::startClone(OperationContext* txn) {
     // Resolve the donor and recipient shards and their connection string
 
     {
-        auto donorShard = grid.shardRegistry()->getShard(txn, _args.getFromShardId());
-        _donorCS = donorShard->getConnString();
+        auto donorShardStatus = grid.shardRegistry()->getShard(txn, _args.getFromShardId());
+        if (!donorShardStatus.isOK()) {
+            return donorShardStatus.getStatus();
+        }
+        _donorCS = donorShardStatus.getValue()->getConnString();
     }
 
     {
-        auto recipientShard = grid.shardRegistry()->getShard(txn, _args.getToShardId());
+        auto recipientShardStatus = grid.shardRegistry()->getShard(txn, _args.getToShardId());
+        if (!recipientShardStatus.isOK()) {
+            return recipientShardStatus.getStatus();
+        }
+        auto recipientShard = recipientShardStatus.getValue();
+
         auto shardHostStatus = recipientShard->getTargeter()->findHost(
             ReadPreferenceSetting{ReadPreference::PrimaryOnly});
         if (!shardHostStatus.isOK()) {
@@ -212,6 +220,7 @@ Status MigrationChunkClonerSourceLegacy::startClone(OperationContext* txn) {
                                             _sessionId,
                                             _args.getConfigServerCS(),
                                             _donorCS,
+                                            _args.getFromShardId(),
                                             _args.getToShardId(),
                                             _args.getMinKey(),
                                             _args.getMaxKey(),
@@ -344,7 +353,7 @@ void MigrationChunkClonerSourceLegacy::onInsertOp(OperationContext* txn,
     BSONElement idElement = insertedDoc["_id"];
     if (idElement.eoo()) {
         warning() << "logInsertOp got a document with no _id field, ignoring inserted document: "
-                  << insertedDoc;
+                  << redact(insertedDoc);
         return;
     }
 
@@ -362,7 +371,7 @@ void MigrationChunkClonerSourceLegacy::onUpdateOp(OperationContext* txn,
     BSONElement idElement = updatedDoc["_id"];
     if (idElement.eoo()) {
         warning() << "logUpdateOp got a document with no _id field, ignoring updatedDoc: "
-                  << updatedDoc;
+                  << redact(updatedDoc);
         return;
     }
 
@@ -380,7 +389,7 @@ void MigrationChunkClonerSourceLegacy::onDeleteOp(OperationContext* txn,
     BSONElement idElement = deletedDocId["_id"];
     if (idElement.eoo()) {
         warning() << "logDeleteOp got a document with no _id field, ignoring deleted doc: "
-                  << deletedDocId;
+                  << redact(deletedDocId);
         return;
     }
 

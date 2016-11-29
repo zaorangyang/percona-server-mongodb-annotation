@@ -148,8 +148,8 @@ public:
 
             // TODO: SERVER-21397 remove post v3.3.
             // Send back wire version to let mongos know what protocol we can speak
-            result.append("minWireVersion", WireSpec::instance().minWireVersionIncoming);
-            result.append("maxWireVersion", WireSpec::instance().maxWireVersionIncoming);
+            result.append("minWireVersion", WireSpec::instance().incoming.minWireVersion);
+            result.append("maxWireVersion", WireSpec::instance().incoming.maxWireVersion);
 
             return true;
         }
@@ -187,7 +187,8 @@ public:
             autoDb.emplace(txn, nss.db(), MODE_IS);
 
             // Views do not require a shard version check.
-            if (autoDb->getDb() && autoDb->getDb()->getViewCatalog()->lookup(txn, nss.ns())) {
+            if (autoDb->getDb() && !autoDb->getDb()->getCollection(nss.ns()) &&
+                autoDb->getDb()->getViewCatalog()->lookup(txn, nss.ns())) {
                 return true;
             }
 
@@ -313,7 +314,7 @@ public:
                 errmsg = str::stream()
                     << "could not refresh metadata for " << ns << " with requested shard version "
                     << requestedVersion.toString() << ", stored shard version is "
-                    << currVersion.toString() << causedBy(status.reason());
+                    << currVersion.toString() << redact(status);
 
                 warning() << errmsg;
 

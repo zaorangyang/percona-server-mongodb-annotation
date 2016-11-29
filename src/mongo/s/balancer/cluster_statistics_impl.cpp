@@ -62,16 +62,18 @@ const char kVersionField[] = "version";
  */
 StatusWith<string> retrieveShardMongoDVersion(OperationContext* txn, ShardId shardId) {
     auto shardRegistry = Grid::get(txn)->shardRegistry();
-    auto shard = shardRegistry->getShard(txn, shardId);
-    if (!shard) {
-        return {ErrorCodes::ShardNotFound, str::stream() << "shard " << shardId << " not found"};
+    auto shardStatus = shardRegistry->getShard(txn, shardId);
+    if (!shardStatus.isOK()) {
+        return shardStatus.getStatus();
     }
+    auto shard = shardStatus.getValue();
 
-    auto commandResponse = shard->runCommand(txn,
-                                             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                             "admin",
-                                             BSON("serverStatus" << 1),
-                                             Shard::RetryPolicy::kIdempotent);
+    auto commandResponse =
+        shard->runCommandWithFixedRetryAttempts(txn,
+                                                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                                "admin",
+                                                BSON("serverStatus" << 1),
+                                                Shard::RetryPolicy::kIdempotent);
     if (!commandResponse.isOK()) {
         return commandResponse.getStatus();
     }

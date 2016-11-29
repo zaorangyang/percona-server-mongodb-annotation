@@ -40,6 +40,7 @@ using unittest::assertGet;
 namespace {
 
 const auto kNamespaceString = NamespaceString("TestDB", "TestColl");
+const auto kShardHasDistributedLock = false;
 
 const auto kShardId0 = ShardId("shard0");
 const auto kShardId1 = ShardId("shard1");
@@ -63,8 +64,13 @@ TEST(CommitChunkMigrationRequest, WithControlChunk) {
     controlChunkTypeTemp.setMax(kKey3);
     boost::optional<ChunkType> controlChunkType = std::move(controlChunkTypeTemp);
 
-    CommitChunkMigrationRequest::appendAsCommand(
-        &builder, kNamespaceString, kShardId0, kShardId1, migratedChunkType, controlChunkType);
+    CommitChunkMigrationRequest::appendAsCommand(&builder,
+                                                 kNamespaceString,
+                                                 kShardId0,
+                                                 kShardId1,
+                                                 migratedChunkType,
+                                                 controlChunkType,
+                                                 kShardHasDistributedLock);
 
     BSONObj cmdObj = builder.obj();
 
@@ -74,11 +80,12 @@ TEST(CommitChunkMigrationRequest, WithControlChunk) {
     ASSERT_EQ(kNamespaceString, request.getNss());
     ASSERT_EQ(kShardId0, request.getFromShard());
     ASSERT_EQ(kShardId1, request.getToShard());
-    ASSERT_EQ(kKey0, request.getMigratedChunkRange().getMin());
-    ASSERT_EQ(kKey1, request.getMigratedChunkRange().getMax());
+    ASSERT_BSONOBJ_EQ(kKey0, request.getMigratedChunkRange().getMin());
+    ASSERT_BSONOBJ_EQ(kKey1, request.getMigratedChunkRange().getMax());
     ASSERT(request.hasControlChunkRange());
-    ASSERT_EQ(kKey2, request.getControlChunkRange().getMin());
-    ASSERT_EQ(kKey3, request.getControlChunkRange().getMax());
+    ASSERT_BSONOBJ_EQ(kKey2, request.getControlChunkRange().getMin());
+    ASSERT_BSONOBJ_EQ(kKey3, request.getControlChunkRange().getMax());
+    ASSERT_EQ(kShardHasDistributedLock, request.shardHasDistributedLock());
 }
 
 TEST(CommitChunkMigrationRequest, WithoutControlChunk) {
@@ -88,8 +95,13 @@ TEST(CommitChunkMigrationRequest, WithoutControlChunk) {
     migratedChunkType.setMin(kKey0);
     migratedChunkType.setMax(kKey1);
 
-    CommitChunkMigrationRequest::appendAsCommand(
-        &builder, kNamespaceString, kShardId0, kShardId1, migratedChunkType, boost::none);
+    CommitChunkMigrationRequest::appendAsCommand(&builder,
+                                                 kNamespaceString,
+                                                 kShardId0,
+                                                 kShardId1,
+                                                 migratedChunkType,
+                                                 boost::none,
+                                                 kShardHasDistributedLock);
 
     BSONObj cmdObj = builder.obj();
 
@@ -99,9 +111,10 @@ TEST(CommitChunkMigrationRequest, WithoutControlChunk) {
     ASSERT_EQ(kNamespaceString, request.getNss());
     ASSERT_EQ(kShardId0, request.getFromShard());
     ASSERT_EQ(kShardId1, request.getToShard());
-    ASSERT_EQ(kKey0, request.getMigratedChunkRange().getMin());
-    ASSERT_EQ(kKey1, request.getMigratedChunkRange().getMax());
+    ASSERT_BSONOBJ_EQ(kKey0, request.getMigratedChunkRange().getMin());
+    ASSERT_BSONOBJ_EQ(kKey1, request.getMigratedChunkRange().getMax());
     ASSERT(!request.hasControlChunkRange());
+    ASSERT_EQ(kShardHasDistributedLock, request.shardHasDistributedLock());
 }
 
 }  // namespace

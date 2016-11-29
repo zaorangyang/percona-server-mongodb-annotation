@@ -264,6 +264,7 @@ void DBClientCursor::commandDataReceived() {
 
     QueryResult::View qr = batch.m.singleData().view2ptr();
     batch.data = qr.data();
+    batch.remainingBytes = qr.dataLen();
 }
 
 void DBClientCursor::dataReceived(bool& retry, string& host) {
@@ -302,6 +303,7 @@ void DBClientCursor::dataReceived(bool& retry, string& host) {
     batch.nReturned = qr.getNReturned();
     batch.pos = 0;
     batch.data = qr.data();
+    batch.remainingBytes = qr.dataLen();
 
     _client->checkResponse(batch.data, batch.nReturned, &retry, &host);  // watches for "not master"
 
@@ -319,8 +321,6 @@ void DBClientCursor::dataReceived(bool& retry, string& host) {
 
 /** If true, safe to call next().  Requests more from server if necessary. */
 bool DBClientCursor::more() {
-    _assertIfNull();
-
     if (!_putBack.empty())
         return true;
 
@@ -338,7 +338,6 @@ bool DBClientCursor::more() {
 }
 
 BSONObj DBClientCursor::next() {
-    DEV _assertIfNull();
     if (!_putBack.empty()) {
         BSONObj ret = _putBack.top();
         _putBack.pop();
@@ -347,9 +346,19 @@ BSONObj DBClientCursor::next() {
 
     uassert(13422, "DBClientCursor next() called but more() is false", batch.pos < batch.nReturned);
 
-    batch.pos++;
+    uassert(ErrorCodes::InvalidBSON,
+            "Got invalid BSON from external server while reading from cursor.",
+            validateBSON(batch.data,
+                         batch.remainingBytes,
+                         enableBSON1_1 ? BSONVersion::kV1_1 : BSONVersion::kV1_0)
+                .isOK());
+
     BSONObj o(batch.data);
+
+    batch.pos++;
     batch.data += o.objsize();
+    batch.remainingBytes -= o.objsize();
+
     /* todo would be good to make data null at end of batch for safety */
     return o;
 }

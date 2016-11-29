@@ -184,7 +184,6 @@ env.Library(
         ],
     LIBDEPS=[
         'document_value',
-        'document_value_test_util',
         'expression',
         'field_path',
     ]
@@ -255,7 +254,6 @@ env.Library(
         'document_value',
         'expression_context',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
-        '$BUILD_DIR/mongo/db/auth/authcore',
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
@@ -420,6 +418,7 @@ env.CppUnitTest(
         'granularity_rounder_preferred_numbers_test.cpp',
     ],
     LIBDEPS=[
+        'document_value_test_util',
         'granularity_rounder',
     ],
 )
@@ -445,5 +444,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/dbdirectclient',
         '$BUILD_DIR/mongo/db/index/index_access_methods',
         '$BUILD_DIR/mongo/db/matcher/expressions_mongod_only',
+        '$BUILD_DIR/mongo/db/stats/serveronly',
     ],
 )

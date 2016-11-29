@@ -228,6 +228,14 @@ public:
     boost::optional<NamespaceString> getActiveMigrationNss();
 
     /**
+     * Get a migration status report from the migration registry. If no migration is active, this
+     * returns an empty BSONObj.
+     *
+     * Takes an IS lock on the namespace of the active migration, if one is active.
+     */
+    BSONObj getActiveMigrationStatusReport(OperationContext* txn);
+
+    /**
      * For testing only. Mock the initialization method used by initializeFromConfigConnString and
      * initializeFromShardIdentity after all checks are performed.
      */
@@ -258,6 +266,16 @@ public:
      * shardIdentity document passed through the --overrideShardIdentity startup parameter.
      */
     Status initializeShardingAwarenessIfNeeded(OperationContext* txn);
+
+    /**
+     * Check if a command is one of the whitelisted commands that can be accepted with shardVersion
+     * information before this node is sharding aware, because the command initializes sharding
+     * awareness.
+     */
+    static bool commandInitializesShardingAwareness(const std::string& commandName) {
+        return _commandsThatInitializeShardingAwareness.find(commandName) !=
+            _commandsThatInitializeShardingAwareness.end();
+    }
 
 private:
     friend class ScopedRegisterMigration;
@@ -371,6 +389,10 @@ private:
 
     // The id for the cluster this shard belongs to.
     OID _clusterId;
+
+    // A whitelist of sharding commands that are allowed when running with --shardsvr but not yet
+    // shard aware, because they initialize sharding awareness.
+    static const std::set<std::string> _commandsThatInitializeShardingAwareness;
 
     // Function for initializing the external sharding state components not owned here.
     GlobalInitFunc _globalInit;

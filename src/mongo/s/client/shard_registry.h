@@ -185,12 +185,14 @@ public:
     void updateReplSetHosts(const ConnectionString& newConnString);
 
     /**
-     * Returns a shared pointer to the shard object with the given shard id.
+     * Returns a shared pointer to the shard object with the given shard id, or ShardNotFound error
+     * otherwise.
+     *
      * May refresh the shard registry if there's no cached information about the shard. The shardId
      * parameter can actually be the shard name or the HostAndPort for any
      * server in the shard.
      */
-    std::shared_ptr<Shard> getShard(OperationContext* txn, const ShardId& shardId);
+    StatusWith<std::shared_ptr<Shard>> getShard(OperationContext* txn, const ShardId& shardId);
 
     /**
      * Returns a shared pointer to the shard object with the given shard id. The shardId parameter
@@ -238,6 +240,12 @@ public:
      */
     void init();
 
+    /**
+     * Shuts down _executor. Needs to be called explicitly because ShardRegistry is never destroyed
+     * as it's owned by the static grid object.
+     */
+    void shutdown();
+
 private:
     /**
      * Factory to create shards.  Never changed after startup so safe to access outside of _mutex.
@@ -267,6 +275,9 @@ private:
 
     // Executor for reloading.
     std::unique_ptr<executor::TaskExecutor> _executor{};
+
+    // Set to true in shutdown call to prevent calling it twice.
+    bool _isShutdown{false};
 };
 
 }  // namespace mongo

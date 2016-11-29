@@ -52,6 +52,7 @@ using UniqueLock = stdx::unique_lock<stdx::mutex>;
 
 class SnapshotThread;
 class StorageInterface;
+class NoopWriter;
 
 class ReplicationCoordinatorExternalStateImpl final : public ReplicationCoordinatorExternalState,
                                                       public JournalListener {
@@ -74,7 +75,7 @@ public:
     virtual executor::TaskExecutor* getTaskExecutor() const override;
     virtual OldThreadPool* getDbWorkThreadPool() const override;
     virtual Status initializeReplSetStorage(OperationContext* txn, const BSONObj& config);
-    virtual void logTransitionToPrimaryToOplog(OperationContext* txn);
+    virtual OpTime onTransitionToPrimary(OperationContext* txn, bool isV1ElectionProtocol);
     virtual void forwardSlaveProgress();
     virtual OID ensureMe(OperationContext* txn);
     virtual bool isSelf(const HostAndPort& host, ServiceContext* ctx);
@@ -89,10 +90,8 @@ public:
     virtual void closeConnections();
     virtual void killAllUserOperations(OperationContext* txn);
     virtual void shardingOnStepDownHook();
-    virtual void shardingOnDrainingStateHook(OperationContext* txn);
     virtual void signalApplierToChooseNewSyncSource();
     virtual void signalApplierToCancelFetcher();
-    virtual void dropAllTempCollections(OperationContext* txn);
     void dropAllSnapshots() final;
     void updateCommittedSnapshot(SnapshotName newCommitPoint) final;
     void forceSnapshotCreation() final;
@@ -118,11 +117,31 @@ public:
     virtual JournalListener::Token getToken();
     virtual void onDurable(const JournalListener::Token& token);
 
+    virtual void setupNoopWriter(Seconds waitTime);
+    virtual void startNoopWriter(OpTime);
+    virtual void stopNoopWriter();
+
 private:
     /**
      * Stops data replication and returns with 'lock' locked.
      */
     void _stopDataReplication_inlock(OperationContext* txn, UniqueLock* lock);
+
+    /**
+     * Called when the instance transitions to primary in order to notify a potentially sharded host
+     * to perform respective state changes, such as starting the balancer, etc.
+     *
+     * Throws on errors.
+     */
+    void _shardingOnTransitionToPrimaryHook(OperationContext* txn);
+
+    /**
+    * Drops all temporary collections on all databases except "local".
+    *
+    * The implementation may assume that the caller has acquired the global exclusive lock
+    * for "txn".
+    */
+    void _dropAllTempCollections(OperationContext* txn);
 
     // Guards starting threads and setting _startedThreads
     stdx::mutex _threadMutex;
@@ -166,6 +185,9 @@ private:
 
     // Used by repl::multiApply() to apply the sync source's operations in parallel.
     std::unique_ptr<OldThreadPool> _writerPool;
+
+    // Writes a noop every 10 seconds.
+    std::unique_ptr<NoopWriter> _noopWriter;
 };
 
 }  // namespace repl

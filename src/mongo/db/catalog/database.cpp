@@ -224,8 +224,13 @@ Database::Database(OperationContext* txn, StringData name, DatabaseCatalogEntry*
     // system.views collection would be found. Now we're sufficiently initialized, signal a version
     // change. Also force a reload, so if there are problems with the catalog contents as might be
     // caused by incorrect mongod versions or similar, they are found right away.
-    getViewCatalog()->invalidate();
-    uassertStatusOK(_views.reloadIfNeeded(txn));
+    _views.invalidate();
+    Status reloadStatus = _views.reloadIfNeeded(txn);
+    if (!reloadStatus.isOK()) {
+        warning() << "Unable to parse views: " << reloadStatus
+                  << "; remove any invalid views from the " << _viewsName
+                  << " collection to restore server functionality." << startupWarningsLog;
+    }
 }
 
 /*static*/
@@ -626,6 +631,10 @@ void Database::dropDatabase(OperationContext* txn, Database* db) {
     BackgroundOperation::assertNoBgOpInProgForDb(name);
 
     audit::logDropDatabase(txn->getClient(), name);
+
+    for (auto&& coll : *db) {
+        Top::get(txn->getClient()->getServiceContext()).collectionDropped(coll->ns().ns(), true);
+    }
 
     dbHolder().close(txn, name);
     db = NULL;  // d is now deleted

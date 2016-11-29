@@ -37,6 +37,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
@@ -76,7 +77,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
@@ -89,6 +89,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
@@ -115,41 +116,6 @@ using std::ostringstream;
 using std::string;
 using std::stringstream;
 using std::unique_ptr;
-
-namespace {
-/**
- * Checks for additional required privileges when creating or modifying a view. Call this function
- * after verifying that the user has the "createCollection" or "collMod" action, respectively.
- *
- * 'cmdObj' must have a String field named 'viewOn'.
- */
-Status canCreateOrModifyView(Client* client,
-                             const std::string& dbname,
-                             const BSONObj& cmdObj,
-                             ResourcePattern resource) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-
-    // It's safe to allow a user to create or modify a view if they can't read it anyway.
-    if (!authzSession->isAuthorizedForActionsOnResource(resource, ActionType::find)) {
-        return Status::OK();
-    }
-
-    // The user can read the view they're trying to create/modify, so we must ensure that they also
-    // have the find action on all namespaces in "viewOn" and "pipeline". If "pipeline" is not
-    // specified, default to the empty pipeline.
-    auto viewPipeline =
-        cmdObj.hasField("pipeline") ? BSONArray(cmdObj["pipeline"].Obj()) : BSONArray();
-
-    // This check ignores some invalid pipeline specifications. For example, if a user specifies a
-    // view definition with an invalid specification like {$lookup: "blah"}, the authorization check
-    // will succeed but the pipeline will fail to parse later in Command::run().
-    return Pipeline::checkAuthForCommand(
-        client,
-        dbname,
-        BSON("aggregate" << cmdObj["viewOn"].checkAndGetStringData() << "pipeline"
-                         << viewPipeline));
-}
-}  // namespace
 
 class CmdShutdownMongoD : public CmdShutdown {
 public:
@@ -568,37 +534,10 @@ public:
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
-        AuthorizationSession* authzSession = AuthorizationSession::get(client);
-        auto cmdNsResource = parseResourcePattern(dbname, cmdObj);
-        if (cmdObj["capped"].trueValue()) {
-            if (!authzSession->isAuthorizedForActionsOnResource(cmdNsResource,
-                                                                ActionType::convertToCapped)) {
-                return Status(ErrorCodes::Unauthorized, "unauthorized");
-            }
-        }
-
-        const bool hasCreateCollectionAction = authzSession->isAuthorizedForActionsOnResource(
-            cmdNsResource, ActionType::createCollection);
-
-        // If attempting to create a view, check for additional required privileges.
-        if (cmdObj["viewOn"]) {
-            // You need the createCollection action on this namespace; the insert action is not
-            // sufficient.
-            if (!hasCreateCollectionAction) {
-                return Status(ErrorCodes::Unauthorized, "unauthorized");
-            }
-            return canCreateOrModifyView(client, dbname, cmdObj, cmdNsResource);
-        }
-
-        // To create a regular collection, ActionType::createCollection or ActionType::insert are
-        // both acceptable.
-        if (hasCreateCollectionAction ||
-            authzSession->isAuthorizedForActionsOnResource(cmdNsResource, ActionType::insert)) {
-            return Status::OK();
-        }
-
-        return Status(ErrorCodes::Unauthorized, "unauthorized");
+        NamespaceString nss(parseNs(dbname, cmdObj));
+        return AuthorizationSession::get(client)->checkAuthForCreate(nss, cmdObj);
     }
+
     virtual bool run(OperationContext* txn,
                      const string& dbname,
                      BSONObj& cmdObj,
@@ -977,20 +916,6 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        int scale = 1;
-        if (jsobj["scale"].isNumber()) {
-            scale = jsobj["scale"].numberInt();
-            if (scale <= 0) {
-                errmsg = "scale has to be >= 1";
-                return false;
-            }
-        } else if (jsobj["scale"].trueValue()) {
-            errmsg = "scale has to be a number >= 1";
-            return false;
-        }
-
-        bool verbose = jsobj["verbose"].trueValue();
-
         const NamespaceString nss(parseNs(dbname, jsobj));
 
         if (nss.coll().empty()) {
@@ -998,59 +923,12 @@ public:
             return false;
         }
 
-        AutoGetCollectionForRead ctx(txn, nss);
-        if (!ctx.getDb()) {
-            errmsg = "Database [" + nss.db().toString() + "] not found.";
-            return false;
-        }
-
-        Collection* collection = ctx.getCollection();
-        if (!collection) {
-            errmsg = "Collection [" + nss.toString() + "] not found.";
-            return false;
-        }
-
         result.append("ns", nss.ns());
-
-        long long size = collection->dataSize(txn) / scale;
-        long long numRecords = collection->numRecords(txn);
-        result.appendNumber("count", numRecords);
-        result.appendNumber("size", size);
-        if (numRecords)
-            result.append("avgObjSize", collection->averageObjectSize(txn));
-
-        result.appendNumber("storageSize",
-                            static_cast<long long>(collection->getRecordStore()->storageSize(
-                                txn, &result, verbose ? 1 : 0)) /
-                                scale);
-
-        collection->getRecordStore()->appendCustomStats(txn, &result, scale);
-
-        IndexCatalog* indexCatalog = collection->getIndexCatalog();
-        result.append("nindexes", indexCatalog->numIndexesReady(txn));
-
-        // indexes
-        BSONObjBuilder indexDetails;
-
-        IndexCatalog::IndexIterator i = indexCatalog->getIndexIterator(txn, false);
-        while (i.more()) {
-            const IndexDescriptor* descriptor = i.next();
-            IndexAccessMethod* iam = indexCatalog->getIndex(descriptor);
-            invariant(iam);
-
-            BSONObjBuilder bob;
-            if (iam->appendCustomStats(txn, &bob, scale)) {
-                indexDetails.append(descriptor->indexName(), bob.obj());
-            }
+        Status status = appendCollectionStorageStats(txn, nss, jsobj, &result);
+        if (!status.isOK()) {
+            errmsg = status.reason();
+            return false;
         }
-
-        result.append("indexDetails", indexDetails.done());
-
-        BSONObjBuilder indexSizes;
-        long long indexSize = collection->getIndexSize(txn, &indexSizes, scale);
-
-        result.appendNumber("totalIndexSize", indexSize / scale);
-        result.append("indexSizes", indexSizes.obj());
 
         return true;
     }
@@ -1077,19 +955,8 @@ public:
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
-        AuthorizationSession* authzSession = AuthorizationSession::get(client);
-        if (!authzSession->isAuthorizedForActionsOnResource(parseResourcePattern(dbname, cmdObj),
-                                                            ActionType::collMod)) {
-            return Status(ErrorCodes::Unauthorized, "unauthorized");
-        }
-
-        // Check for additional required privileges if attempting to modify a view.
-        if (cmdObj["viewOn"] || cmdObj["pipeline"]) {
-            return canCreateOrModifyView(
-                client, dbname, cmdObj, parseResourcePattern(dbname, cmdObj));
-        }
-
-        return Status::OK();
+        NamespaceString nss(parseNs(dbname, cmdObj));
+        return AuthorizationSession::get(client)->checkAuthForCollMod(nss, cmdObj);
     }
 
     bool run(OperationContext* txn,
@@ -1445,19 +1312,30 @@ void Command::execCommand(OperationContext* txn,
             oss.initializeShardVersion(commandNS, extractedFields[kShardVersionFieldIdx]);
 
             auto shardingState = ShardingState::get(txn);
+
+            if (oss.hasShardVersion()) {
+                if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+                    uassertStatusOK(
+                        {ErrorCodes::IllegalOperation,
+                         "Cannot accept sharding commands if not started with --shardsvr"});
+                } else if (!shardingState->enabled()) {
+                    // TODO(esha): Once 3.4 ships, we no longer need to support initializing
+                    // sharding awareness through commands, so just reject all sharding commands.
+                    if (!shardingState->commandInitializesShardingAwareness(
+                            request.getCommandName().toString())) {
+                        uassertStatusOK({ErrorCodes::IllegalOperation,
+                                         str::stream()
+                                             << "Received a command with sharding chunk version "
+                                                "information but this node is not sharding aware: "
+                                             << request.getCommandArgs().jsonString()});
+                    }
+                }
+            }
+
             if (shardingState->enabled()) {
                 // TODO(spencer): Do this unconditionally once all nodes are sharding aware
                 // by default.
                 uassertStatusOK(shardingState->updateConfigServerOpTimeFromMetadata(txn));
-            } else {
-                massert(
-                    34422,
-                    str::stream()
-                        << "Received a command with sharding chunk version information but this "
-                           "node is not sharding aware: "
-                        << request.getCommandArgs().jsonString(),
-                    !oss.hasShardVersion() ||
-                        ChunkVersion::isIgnoredVersion(oss.getShardVersion(commandNS)));
             }
         }
 
@@ -1561,7 +1439,8 @@ bool Command::run(OperationContext* txn,
         result = run(txn, db, cmd, 0, errmsg, inPlaceReplyBob);
 
         // Nothing in run() should change the writeConcern.
-        dassert(txn->getWriteConcern().toBSON() == wcResult.getValue().toBSON());
+        dassert(SimpleBSONObjComparator::kInstance.evaluate(txn->getWriteConcern().toBSON() ==
+                                                            wcResult.getValue().toBSON()));
 
         WriteConcernResult res;
         auto waitForWCStatus =

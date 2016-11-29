@@ -465,8 +465,8 @@ void State::prepTempCollection() {
         OldClientWriteContext tempCtx(_txn, _config.tempNamespace);
         WriteUnitOfWork wuow(_txn);
         NamespaceString tempNss(_config.tempNamespace);
-        uassert(ErrorCodes::NotMaster,
-                "no longer master",
+        uassert(ErrorCodes::PrimarySteppedDown,
+                "no longer primary",
                 repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(tempNss));
         Collection* tempColl = tempCtx.getCollection();
         invariant(!tempColl);
@@ -711,8 +711,8 @@ void State::insert(const string& ns, const BSONObj& o) {
         OldClientWriteContext ctx(_txn, ns);
         WriteUnitOfWork wuow(_txn);
         NamespaceString nss(ns);
-        uassert(ErrorCodes::NotMaster,
-                "no longer master",
+        uassert(ErrorCodes::PrimarySteppedDown,
+                "no longer primary",
                 repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nss));
         Collection* coll = getCollectionOrUassert(ctx.db(), ns);
 
@@ -1720,11 +1720,9 @@ public:
                 std::string server = e.fieldName();
                 servers.insert(server);
 
-                if (!grid.shardRegistry()->getShard(txn, server)) {
-                    return appendCommandStatus(
-                        result,
-                        Status(ErrorCodes::ShardNotFound,
-                               str::stream() << "Shard not found for server: " << server));
+                auto shardStatus = grid.shardRegistry()->getShard(txn, server);
+                if (!shardStatus.isOK()) {
+                    return appendCommandStatus(result, shardStatus.getStatus());
                 }
             }
         }

@@ -102,7 +102,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
     onFindWithMetadataCommand(
         [this, &expectedColl, newOpTime](const RemoteCommandRequest& request) {
 
-            ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+            ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
             const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
             ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
@@ -111,8 +111,9 @@ TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
 
             // Ensure the query is correct
             ASSERT_EQ(query->ns(), CollectionType::ConfigNS);
-            ASSERT_EQ(query->getFilter(), BSON(CollectionType::fullNs(expectedColl.getNs().ns())));
-            ASSERT_EQ(query->getSort(), BSONObj());
+            ASSERT_BSONOBJ_EQ(query->getFilter(),
+                              BSON(CollectionType::fullNs(expectedColl.getNs().ns())));
+            ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
             ASSERT_EQ(query->getLimit().get(), 1);
 
             checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -127,7 +128,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
     // Now wait for the getCollection call to return
     const auto collOpTimePair = future.timed_get(kFutureTimeout);
     ASSERT_EQ(newOpTime, collOpTimePair.opTime);
-    ASSERT_EQ(expectedColl.toBSON(), collOpTimePair.value.toBSON());
+    ASSERT_BSONOBJ_EQ(expectedColl.toBSON(), collOpTimePair.value.toBSON());
 }
 
 TEST_F(ShardingCatalogClientTest, GetCollectionNotExisting) {
@@ -168,13 +169,13 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseExisting) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), DatabaseType::ConfigNS);
 
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), DatabaseType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSON(DatabaseType::name(expectedDb.getName())));
-        ASSERT_EQ(query->getSort(), BSONObj());
+        ASSERT_BSONOBJ_EQ(query->getFilter(), BSON(DatabaseType::name(expectedDb.getName())));
+        ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
         ASSERT_EQ(query->getLimit().get(), 1);
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -188,7 +189,7 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseExisting) {
 
     const auto dbOpTimePair = future.timed_get(kFutureTimeout);
     ASSERT_EQ(newOpTime, dbOpTimePair.opTime);
-    ASSERT_EQ(expectedDb.toBSON(), dbOpTimePair.value.toBSON());
+    ASSERT_BSONOBJ_EQ(expectedDb.toBSON(), dbOpTimePair.value.toBSON());
 }
 
 TEST_F(ShardingCatalogClientTest, GetDatabaseStaleSecondaryRetrySuccess) {
@@ -219,7 +220,7 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseStaleSecondaryRetrySuccess) {
     });
 
     const auto dbOpTimePair = future.timed_get(kFutureTimeout);
-    ASSERT_EQ(expectedDb.toBSON(), dbOpTimePair.value.toBSON());
+    ASSERT_BSONOBJ_EQ(expectedDb.toBSON(), dbOpTimePair.value.toBSON());
 }
 
 TEST_F(ShardingCatalogClientTest, GetDatabaseStaleSecondaryRetryNoPrimary) {
@@ -395,7 +396,7 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsValid) {
     });
 
     onFindCommand([this, &s1, &s2, &s3](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), ShardType::ConfigNS);
@@ -403,8 +404,8 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsValid) {
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), ShardType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSONObj());
-        ASSERT_EQ(query->getSort(), BSONObj());
+        ASSERT_BSONOBJ_EQ(query->getFilter(), BSONObj());
+        ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
         ASSERT_FALSE(query->getLimit().is_initialized());
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -416,7 +417,7 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsValid) {
     ASSERT_EQ(actualShardsList.size(), expectedShardsList.size());
 
     for (size_t i = 0; i < actualShardsList.size(); ++i) {
-        ASSERT_EQ(actualShardsList[i].toBSON(), expectedShardsList[i].toBSON());
+        ASSERT_BSONOBJ_EQ(actualShardsList[i].toBSON(), expectedShardsList[i].toBSON());
     }
 }
 
@@ -482,7 +483,8 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
                                              BSON(ChunkType::DEPRECATED_lastmod() << -1),
                                              1,
                                              &chunks,
-                                             &opTime));
+                                             &opTime,
+                                             repl::ReadConcernLevel::kMajorityReadConcern));
         ASSERT_EQ(2U, chunks.size());
         ASSERT_EQ(newOpTime, opTime);
 
@@ -491,7 +493,7 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
 
     onFindWithMetadataCommand([this, &chunksQuery, chunkA, chunkB, newOpTime](
         const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), ChunkType::ConfigNS);
@@ -499,8 +501,8 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), ChunkType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), chunksQuery);
-        ASSERT_EQ(query->getSort(), BSON(ChunkType::DEPRECATED_lastmod() << -1));
+        ASSERT_BSONOBJ_EQ(query->getFilter(), chunksQuery);
+        ASSERT_BSONOBJ_EQ(query->getSort(), BSON(ChunkType::DEPRECATED_lastmod() << -1));
         ASSERT_EQ(query->getLimit().get(), 1);
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -513,8 +515,8 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
     });
 
     const auto& chunks = future.timed_get(kFutureTimeout);
-    ASSERT_EQ(chunkA.toBSON(), chunks[0].toBSON());
-    ASSERT_EQ(chunkB.toBSON(), chunks[1].toBSON());
+    ASSERT_BSONOBJ_EQ(chunkA.toBSON(), chunks[0].toBSON());
+    ASSERT_BSONOBJ_EQ(chunkB.toBSON(), chunks[1].toBSON());
 }
 
 TEST_F(ShardingCatalogClientTest, GetChunksForNSNoSortNoLimit) {
@@ -530,15 +532,20 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSNoSortNoLimit) {
     auto future = launchAsync([this, &chunksQuery] {
         vector<ChunkType> chunks;
 
-        ASSERT_OK(catalogClient()->getChunks(
-            operationContext(), chunksQuery, BSONObj(), boost::none, &chunks, nullptr));
+        ASSERT_OK(catalogClient()->getChunks(operationContext(),
+                                             chunksQuery,
+                                             BSONObj(),
+                                             boost::none,
+                                             &chunks,
+                                             nullptr,
+                                             repl::ReadConcernLevel::kMajorityReadConcern));
         ASSERT_EQ(0U, chunks.size());
 
         return chunks;
     });
 
     onFindCommand([this, &chunksQuery](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), ChunkType::ConfigNS);
@@ -546,8 +553,8 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSNoSortNoLimit) {
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), ChunkType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), chunksQuery);
-        ASSERT_EQ(query->getSort(), BSONObj());
+        ASSERT_BSONOBJ_EQ(query->getFilter(), chunksQuery);
+        ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
         ASSERT_FALSE(query->getLimit().is_initialized());
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -570,8 +577,13 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSInvalidChunk) {
 
     auto future = launchAsync([this, &chunksQuery] {
         vector<ChunkType> chunks;
-        Status status = catalogClient()->getChunks(
-            operationContext(), chunksQuery, BSONObj(), boost::none, &chunks, nullptr);
+        Status status = catalogClient()->getChunks(operationContext(),
+                                                   chunksQuery,
+                                                   BSONObj(),
+                                                   boost::none,
+                                                   &chunks,
+                                                   nullptr,
+                                                   repl::ReadConcernLevel::kMajorityReadConcern);
 
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
         ASSERT_EQ(0U, chunks.size());
@@ -614,10 +626,10 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementReadCommand) {
     });
 
     onCommand([](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         ASSERT_EQUALS("test", request.dbname);
-        ASSERT_EQUALS(BSON("usersInfo" << 1 << "maxTimeMS" << 30000), request.cmdObj);
+        ASSERT_BSONOBJ_EQ(BSON("usersInfo" << 1 << "maxTimeMS" << 30000), request.cmdObj);
 
         return BSON("ok" << 1 << "users" << BSONArrayBuilder().arr());
     });
@@ -658,18 +670,18 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandSuccess) {
     onCommand([](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("test", request.dbname);
         // Since no write concern was sent we will add w:majority
-        ASSERT_EQUALS(BSON("dropUser"
-                           << "test"
-                           << "writeConcern"
-                           << BSON("w"
-                                   << "majority"
-                                   << "wtimeout"
-                                   << 0)
-                           << "maxTimeMS"
-                           << 30000),
-                      request.cmdObj);
+        ASSERT_BSONOBJ_EQ(BSON("dropUser"
+                               << "test"
+                               << "writeConcern"
+                               << BSON("w"
+                                       << "majority"
+                                       << "wtimeout"
+                                       << 0)
+                               << "maxTimeMS"
+                               << 30000),
+                          request.cmdObj);
 
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         BSONObjBuilder responseBuilder;
         Command::appendCommandStatus(responseBuilder,
@@ -733,18 +745,18 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandRewriteWriteConce
 
     onCommand([](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("test", request.dbname);
-        ASSERT_EQUALS(BSON("dropUser"
-                           << "test"
-                           << "writeConcern"
-                           << BSON("w"
-                                   << "majority"
-                                   << "wtimeout"
-                                   << 30)
-                           << "maxTimeMS"
-                           << 30000),
-                      request.cmdObj);
+        ASSERT_BSONOBJ_EQ(BSON("dropUser"
+                               << "test"
+                               << "writeConcern"
+                               << BSON("w"
+                                       << "majority"
+                                       << "wtimeout"
+                                       << 30)
+                               << "maxTimeMS"
+                               << 30000),
+                          request.cmdObj);
 
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         BSONObjBuilder responseBuilder;
         Command::appendCommandStatus(responseBuilder,
@@ -822,18 +834,18 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandNotMasterRetrySuc
         ASSERT_EQUALS(host2, request.target);
         ASSERT_EQUALS("test", request.dbname);
         // Since no write concern was sent we will add w:majority
-        ASSERT_EQUALS(BSON("dropUser"
-                           << "test"
-                           << "writeConcern"
-                           << BSON("w"
-                                   << "majority"
-                                   << "wtimeout"
-                                   << 0)
-                           << "maxTimeMS"
-                           << 30000),
-                      request.cmdObj);
+        ASSERT_BSONOBJ_EQ(BSON("dropUser"
+                               << "test"
+                               << "writeConcern"
+                               << BSON("w"
+                                       << "majority"
+                                       << "wtimeout"
+                                       << 0)
+                               << "maxTimeMS"
+                               << 30000),
+                          request.cmdObj);
 
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         return BSON("ok" << 1);
     });
@@ -886,7 +898,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
 
     onFindWithMetadataCommand(
         [this, coll1, coll2, coll3, newOpTime](const RemoteCommandRequest& request) {
-            ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+            ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
             const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
             ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
@@ -894,8 +906,8 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
             auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
             ASSERT_EQ(query->ns(), CollectionType::ConfigNS);
-            ASSERT_EQ(query->getFilter(), BSONObj());
-            ASSERT_EQ(query->getSort(), BSONObj());
+            ASSERT_BSONOBJ_EQ(query->getFilter(), BSONObj());
+            ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
 
             checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
@@ -909,9 +921,9 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
 
     const auto& actualColls = future.timed_get(kFutureTimeout);
     ASSERT_EQ(3U, actualColls.size());
-    ASSERT_EQ(coll1.toBSON(), actualColls[0].toBSON());
-    ASSERT_EQ(coll2.toBSON(), actualColls[1].toBSON());
-    ASSERT_EQ(coll3.toBSON(), actualColls[2].toBSON());
+    ASSERT_BSONOBJ_EQ(coll1.toBSON(), actualColls[0].toBSON());
+    ASSERT_BSONOBJ_EQ(coll2.toBSON(), actualColls[1].toBSON());
+    ASSERT_BSONOBJ_EQ(coll3.toBSON(), actualColls[2].toBSON());
 }
 
 TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsWithDb) {
@@ -943,7 +955,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsWithDb) {
     });
 
     onFindCommand([this, coll1, coll2](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
@@ -954,7 +966,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsWithDb) {
         {
             BSONObjBuilder b;
             b.appendRegex(CollectionType::fullNs(), "^test\\.");
-            ASSERT_EQ(query->getFilter(), b.obj());
+            ASSERT_BSONOBJ_EQ(query->getFilter(), b.obj());
         }
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -964,8 +976,8 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsWithDb) {
 
     const auto& actualColls = future.timed_get(kFutureTimeout);
     ASSERT_EQ(2U, actualColls.size());
-    ASSERT_EQ(coll1.toBSON(), actualColls[0].toBSON());
-    ASSERT_EQ(coll2.toBSON(), actualColls[1].toBSON());
+    ASSERT_BSONOBJ_EQ(coll1.toBSON(), actualColls[0].toBSON());
+    ASSERT_BSONOBJ_EQ(coll2.toBSON(), actualColls[1].toBSON());
 }
 
 TEST_F(ShardingCatalogClientTest, GetCollectionsInvalidCollectionType) {
@@ -994,7 +1006,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsInvalidCollectionType) {
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), CollectionType::ConfigNS);
 
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
@@ -1002,7 +1014,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsInvalidCollectionType) {
         {
             BSONObjBuilder b;
             b.appendRegex(CollectionType::fullNs(), "^test\\.");
-            ASSERT_EQ(query->getFilter(), b.obj());
+            ASSERT_BSONOBJ_EQ(query->getFilter(), b.obj());
         }
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -1037,7 +1049,7 @@ TEST_F(ShardingCatalogClientTest, GetDatabasesForShardValid) {
     });
 
     onFindCommand([this, dbt1, dbt2](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), DatabaseType::ConfigNS);
@@ -1045,8 +1057,9 @@ TEST_F(ShardingCatalogClientTest, GetDatabasesForShardValid) {
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), DatabaseType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSON(DatabaseType::primary(dbt1.getPrimary().toString())));
-        ASSERT_EQ(query->getSort(), BSONObj());
+        ASSERT_BSONOBJ_EQ(query->getFilter(),
+                          BSON(DatabaseType::primary(dbt1.getPrimary().toString())));
+        ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
@@ -1111,7 +1124,7 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollection) {
     });
 
     onFindCommand([this, tagA, tagB](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
@@ -1119,8 +1132,8 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollection) {
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), TagsType::ConfigNS);
-        ASSERT_EQ(query->getFilter(), BSON(TagsType::ns("TestDB.TestColl")));
-        ASSERT_EQ(query->getSort(), BSON(TagsType::min() << 1));
+        ASSERT_BSONOBJ_EQ(query->getFilter(), BSON(TagsType::ns("TestDB.TestColl")));
+        ASSERT_BSONOBJ_EQ(query->getSort(), BSON(TagsType::min() << 1));
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
@@ -1128,8 +1141,8 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollection) {
     });
 
     const auto& tags = future.timed_get(kFutureTimeout);
-    ASSERT_EQ(tagA.toBSON(), tags[0].toBSON());
-    ASSERT_EQ(tagB.toBSON(), tags[1].toBSON());
+    ASSERT_BSONOBJ_EQ(tagA.toBSON(), tags[0].toBSON());
+    ASSERT_BSONOBJ_EQ(tagB.toBSON(), tags[1].toBSON());
 }
 
 TEST_F(ShardingCatalogClientTest, GetTagsForCollectionNoTags) {
@@ -1197,7 +1210,7 @@ TEST_F(ShardingCatalogClientTest, GetTagForChunkOneTagFound) {
     });
 
     onFindCommand([this, chunk](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
@@ -1205,11 +1218,11 @@ TEST_F(ShardingCatalogClientTest, GetTagForChunkOneTagFound) {
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), TagsType::ConfigNS);
-        ASSERT_EQ(query->getFilter(),
-                  BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
-                                                   << BSON("$lte" << chunk.getMin())
-                                                   << TagsType::max()
-                                                   << BSON("$gte" << chunk.getMax())));
+        ASSERT_BSONOBJ_EQ(query->getFilter(),
+                          BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
+                                                           << BSON("$lte" << chunk.getMin())
+                                                           << TagsType::max()
+                                                           << BSON("$gte" << chunk.getMax())));
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
@@ -1242,7 +1255,7 @@ TEST_F(ShardingCatalogClientTest, GetTagForChunkNoTagFound) {
     });
 
     onFindCommand([this, chunk](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
@@ -1250,11 +1263,11 @@ TEST_F(ShardingCatalogClientTest, GetTagForChunkNoTagFound) {
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), TagsType::ConfigNS);
-        ASSERT_EQ(query->getFilter(),
-                  BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
-                                                   << BSON("$lte" << chunk.getMin())
-                                                   << TagsType::max()
-                                                   << BSON("$gte" << chunk.getMax())));
+        ASSERT_BSONOBJ_EQ(query->getFilter(),
+                          BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
+                                                           << BSON("$lte" << chunk.getMin())
+                                                           << TagsType::max()
+                                                           << BSON("$gte" << chunk.getMax())));
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
@@ -1284,7 +1297,7 @@ TEST_F(ShardingCatalogClientTest, GetTagForChunkInvalidTagDoc) {
     });
 
     onFindCommand([this, chunk](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
@@ -1292,11 +1305,11 @@ TEST_F(ShardingCatalogClientTest, GetTagForChunkInvalidTagDoc) {
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(query->ns(), TagsType::ConfigNS);
-        ASSERT_EQ(query->getFilter(),
-                  BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
-                                                   << BSON("$lte" << chunk.getMin())
-                                                   << TagsType::max()
-                                                   << BSON("$gte" << chunk.getMax())));
+        ASSERT_BSONOBJ_EQ(query->getFilter(),
+                          BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
+                                                           << BSON("$lte" << chunk.getMin())
+                                                           << TagsType::max()
+                                                           << BSON("$gte" << chunk.getMax())));
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
@@ -1324,7 +1337,7 @@ TEST_F(ShardingCatalogClientTest, UpdateDatabase) {
     onCommand([dbt](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("config", request.dbname);
 
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         BatchedUpdateRequest actualBatchedUpdate;
         std::string errmsg;
@@ -1336,8 +1349,8 @@ TEST_F(ShardingCatalogClientTest, UpdateDatabase) {
 
         ASSERT_TRUE(update->getUpsert());
         ASSERT_FALSE(update->getMulti());
-        ASSERT_EQUALS(update->getQuery(), BSON(DatabaseType::name(dbt.getName())));
-        ASSERT_EQUALS(update->getUpdateExpr(), dbt.toBSON());
+        ASSERT_BSONOBJ_EQ(update->getQuery(), BSON(DatabaseType::name(dbt.getName())));
+        ASSERT_BSONOBJ_EQ(update->getUpdateExpr(), dbt.toBSON());
 
         BatchedCommandResponse response;
         response.setOk(true);
@@ -1394,25 +1407,30 @@ TEST_F(ShardingCatalogClientTest, ApplyChunkOpsDeprecatedSuccessful) {
     ChunkVersion lastChunkVersion(0, 0, OID());
 
     auto future = launchAsync([this, updateOps, preCondition, nss, lastChunkVersion] {
-        auto status = catalogClient()->applyChunkOpsDeprecated(
-            operationContext(), updateOps, preCondition, nss, lastChunkVersion);
+        auto status =
+            catalogClient()->applyChunkOpsDeprecated(operationContext(),
+                                                     updateOps,
+                                                     preCondition,
+                                                     nss,
+                                                     lastChunkVersion,
+                                                     ShardingCatalogClient::kMajorityWriteConcern,
+                                                     repl::ReadConcernLevel::kMajorityReadConcern);
         ASSERT_OK(status);
     });
 
-    onCommand(
-        [updateOps, preCondition, nss](const RemoteCommandRequest& request) {
-            ASSERT_EQUALS("config", request.dbname);
-            ASSERT_EQUALS(BSON("w"
+    onCommand([updateOps, preCondition, nss](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS("config", request.dbname);
+        ASSERT_BSONOBJ_EQ(BSON("w"
                                << "majority"
                                << "wtimeout"
                                << 15000),
                           request.cmdObj["writeConcern"].Obj());
-            ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
-            ASSERT_EQUALS(updateOps, request.cmdObj["applyOps"].Obj());
-            ASSERT_EQUALS(preCondition, request.cmdObj["preCondition"].Obj());
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_BSONOBJ_EQ(updateOps, request.cmdObj["applyOps"].Obj());
+        ASSERT_BSONOBJ_EQ(preCondition, request.cmdObj["preCondition"].Obj());
 
-            return BSON("ok" << 1);
-        });
+        return BSON("ok" << 1);
+    });
 
     // Now wait for the applyChunkOpsDeprecated call to return
     future.timed_get(kFutureTimeout);
@@ -1433,8 +1451,14 @@ TEST_F(ShardingCatalogClientTest, ApplyChunkOpsDeprecatedSuccessfulWithCheck) {
     ChunkVersion lastChunkVersion(0, 0, OID());
 
     auto future = launchAsync([this, updateOps, preCondition, nss, lastChunkVersion] {
-        auto status = catalogClient()->applyChunkOpsDeprecated(
-            operationContext(), updateOps, preCondition, nss, lastChunkVersion);
+        auto status =
+            catalogClient()->applyChunkOpsDeprecated(operationContext(),
+                                                     updateOps,
+                                                     preCondition,
+                                                     nss,
+                                                     lastChunkVersion,
+                                                     ShardingCatalogClient::kMajorityWriteConcern,
+                                                     repl::ReadConcernLevel::kMajorityReadConcern);
         ASSERT_OK(status);
     });
 
@@ -1475,8 +1499,14 @@ TEST_F(ShardingCatalogClientTest, ApplyChunkOpsDeprecatedFailedWithCheck) {
     ChunkVersion lastChunkVersion(0, 0, OID());
 
     auto future = launchAsync([this, updateOps, preCondition, nss, lastChunkVersion] {
-        auto status = catalogClient()->applyChunkOpsDeprecated(
-            operationContext(), updateOps, preCondition, nss, lastChunkVersion);
+        auto status =
+            catalogClient()->applyChunkOpsDeprecated(operationContext(),
+                                                     updateOps,
+                                                     preCondition,
+                                                     nss,
+                                                     lastChunkVersion,
+                                                     ShardingCatalogClient::kMajorityWriteConcern,
+                                                     repl::ReadConcernLevel::kMajorityReadConcern);
         ASSERT_EQUALS(ErrorCodes::NoMatchingDocument, status);
     });
 
@@ -1515,14 +1545,14 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
 
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(configHost, request.target);
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(ShardType::ConfigNS, query->ns());
-        ASSERT_EQ(BSONObj(), query->getFilter());
-        ASSERT_EQ(BSONObj(), query->getSort());
+        ASSERT_BSONOBJ_EQ(BSONObj(), query->getFilter());
+        ASSERT_BSONOBJ_EQ(BSONObj(), query->getSort());
         ASSERT_FALSE(query->getLimit().is_initialized());
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -1534,15 +1564,14 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
 
     // Set up all the target mocks return values.
     RemoteCommandTargeterMock::get(
-        shardRegistry()->getShard(operationContext(), s0.getName())->getTargeter())
+        uassertStatusOK(shardRegistry()->getShard(operationContext(), s0.getName()))->getTargeter())
         ->setFindHostReturnValue(HostAndPort(s0.getHost()));
     RemoteCommandTargeterMock::get(
-        shardRegistry()->getShard(operationContext(), s1.getName())->getTargeter())
+        uassertStatusOK(shardRegistry()->getShard(operationContext(), s1.getName()))->getTargeter())
         ->setFindHostReturnValue(HostAndPort(s1.getHost()));
     RemoteCommandTargeterMock::get(
-        shardRegistry()->getShard(operationContext(), s2.getName())->getTargeter())
+        uassertStatusOK(shardRegistry()->getShard(operationContext(), s2.getName()))->getTargeter())
         ->setFindHostReturnValue(HostAndPort(s2.getHost()));
-
 
     // Now actually start the createDatabase work.
 
@@ -1562,7 +1591,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(configHost, request.target);
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
         ASSERT_EQ(DatabaseType::ConfigNS, nss.ns());
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
         return vector<BSONObj>{};
@@ -1576,7 +1605,8 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_EQUALS(rpc::ServerSelectionMetadata(true, boost::none).toBSON(), request.metadata);
+        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                          request.metadata);
 
         return BSON("ok" << 1 << "totalSize" << 10);
     });
@@ -1589,7 +1619,8 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_EQUALS(rpc::ServerSelectionMetadata(true, boost::none).toBSON(), request.metadata);
+        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                          request.metadata);
 
         return BSON("ok" << 1 << "totalSize" << 1);
     });
@@ -1601,7 +1632,8 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
         string cmdName = request.cmdObj.firstElement().fieldName();
         ASSERT_EQUALS("listDatabases", cmdName);
 
-        ASSERT_EQUALS(rpc::ServerSelectionMetadata(true, boost::none).toBSON(), request.metadata);
+        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                          request.metadata);
 
         return BSON("ok" << 1 << "totalSize" << 100);
     });
@@ -1611,7 +1643,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
         ASSERT_EQUALS(configHost, request.target);
         ASSERT_EQUALS("config", request.dbname);
 
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         BatchedInsertRequest actualBatchedInsert;
         std::string errmsg;
@@ -1627,7 +1659,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
             ShardId(s1.getName()));  // This is the one we reported with the smallest size
         expectedDb.setSharded(false);
 
-        ASSERT_EQUALS(expectedDb.toBSON(), insert);
+        ASSERT_BSONOBJ_EQ(expectedDb.toBSON(), insert);
 
         BatchedCommandResponse response;
         response.setOk(true);
@@ -1678,7 +1710,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDBExists) {
     });
 
     onFindCommand([this, dbname](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
@@ -1688,7 +1720,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDBExists) {
             DatabaseType::name(), (string) "^" + pcrecpp::RE::QuoteMeta(dbname) + "$", "i");
 
         ASSERT_EQ(DatabaseType::ConfigNS, query->ns());
-        ASSERT_EQ(queryBuilder.obj(), query->getFilter());
+        ASSERT_BSONOBJ_EQ(queryBuilder.obj(), query->getFilter());
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
         return vector<BSONObj>{BSON("_id" << dbname)};
@@ -1717,7 +1749,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDBExistsDifferentCase) {
     });
 
     onFindCommand([this, dbname, dbnameDiffCase](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
@@ -1727,7 +1759,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDBExistsDifferentCase) {
             DatabaseType::name(), (string) "^" + pcrecpp::RE::QuoteMeta(dbname) + "$", "i");
 
         ASSERT_EQ(DatabaseType::ConfigNS, query->ns());
-        ASSERT_EQ(queryBuilder.obj(), query->getFilter());
+        ASSERT_BSONOBJ_EQ(queryBuilder.obj(), query->getFilter());
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
 
         return vector<BSONObj>{BSON("_id" << dbnameDiffCase)};
@@ -1756,7 +1788,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseNoShards) {
 
     // Report no databases with the same name already exist
     onFindCommand([this, dbname](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(DatabaseType::ConfigNS, nss.ns());
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -1765,13 +1797,13 @@ TEST_F(ShardingCatalogClientTest, createDatabaseNoShards) {
 
     // Report no shards exist
     onFindCommand([this](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(ShardType::ConfigNS, query->ns());
-        ASSERT_EQ(BSONObj(), query->getFilter());
-        ASSERT_EQ(BSONObj(), query->getSort());
+        ASSERT_BSONOBJ_EQ(BSONObj(), query->getFilter());
+        ASSERT_BSONOBJ_EQ(BSONObj(), query->getSort());
         ASSERT_FALSE(query->getLimit().is_initialized());
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -1804,13 +1836,13 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
 
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(configHost, request.target);
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
 
         ASSERT_EQ(ShardType::ConfigNS, query->ns());
-        ASSERT_EQ(BSONObj(), query->getFilter());
-        ASSERT_EQ(BSONObj(), query->getSort());
+        ASSERT_BSONOBJ_EQ(BSONObj(), query->getFilter());
+        ASSERT_BSONOBJ_EQ(BSONObj(), query->getSort());
         ASSERT_FALSE(query->getLimit().is_initialized());
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -1822,15 +1854,14 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
 
     // Set up all the target mocks return values.
     RemoteCommandTargeterMock::get(
-        shardRegistry()->getShard(operationContext(), s0.getName())->getTargeter())
+        uassertStatusOK(shardRegistry()->getShard(operationContext(), s0.getName()))->getTargeter())
         ->setFindHostReturnValue(HostAndPort(s0.getHost()));
     RemoteCommandTargeterMock::get(
-        shardRegistry()->getShard(operationContext(), s1.getName())->getTargeter())
+        uassertStatusOK(shardRegistry()->getShard(operationContext(), s1.getName()))->getTargeter())
         ->setFindHostReturnValue(HostAndPort(s1.getHost()));
     RemoteCommandTargeterMock::get(
-        shardRegistry()->getShard(operationContext(), s2.getName())->getTargeter())
+        uassertStatusOK(shardRegistry()->getShard(operationContext(), s2.getName()))->getTargeter())
         ->setFindHostReturnValue(HostAndPort(s2.getHost()));
-
 
     // Now actually start the createDatabase work.
 
@@ -1849,7 +1880,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
     // Report no databases with the same name already exist
     onFindCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(configHost, request.target);
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(DatabaseType::ConfigNS, nss.ns());
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -1864,7 +1895,8 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_EQUALS(rpc::ServerSelectionMetadata(true, boost::none).toBSON(), request.metadata);
+        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                          request.metadata);
 
         return BSON("ok" << 1 << "totalSize" << 10);
     });
@@ -1877,7 +1909,8 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_EQUALS(rpc::ServerSelectionMetadata(true, boost::none).toBSON(), request.metadata);
+        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                          request.metadata);
 
         return BSON("ok" << 1 << "totalSize" << 1);
     });
@@ -1890,7 +1923,8 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_EQUALS(rpc::ServerSelectionMetadata(true, boost::none).toBSON(), request.metadata);
+        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                          request.metadata);
 
         return BSON("ok" << 1 << "totalSize" << 100);
     });
@@ -1901,7 +1935,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS("config", request.dbname);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         BatchedInsertRequest actualBatchedInsert;
         std::string errmsg;
@@ -1917,7 +1951,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
             ShardId(s1.getName()));  // This is the one we reported with the smallest size
         expectedDb.setSharded(false);
 
-        ASSERT_EQUALS(expectedDb.toBSON(), insert);
+        ASSERT_BSONOBJ_EQ(expectedDb.toBSON(), insert);
 
         BatchedCommandResponse response;
         response.setOk(false);
@@ -1941,7 +1975,8 @@ TEST_F(ShardingCatalogClientTest, EnableShardingNoDBExists) {
     setupShards(vector<ShardType>{shard});
 
     auto shardTargeter = RemoteCommandTargeterMock::get(
-        shardRegistry()->getShard(operationContext(), ShardId("shard0"))->getTargeter());
+        uassertStatusOK(shardRegistry()->getShard(operationContext(), ShardId("shard0")))
+            ->getTargeter());
     shardTargeter->setFindHostReturnValue(HostAndPort("shard0:12"));
 
     distLock()->expectLock(
@@ -1958,7 +1993,7 @@ TEST_F(ShardingCatalogClientTest, EnableShardingNoDBExists) {
 
     // Query to find if db already exists in config.
     onFindCommand([this](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(DatabaseType::ConfigNS, nss.toString());
 
@@ -1969,8 +2004,8 @@ TEST_F(ShardingCatalogClientTest, EnableShardingNoDBExists) {
         BSONObj expectedQuery(fromjson(R"({ _id: { $regex: "^test$", $options: "i" }})"));
 
         ASSERT_EQ(DatabaseType::ConfigNS, query->ns());
-        ASSERT_EQ(expectedQuery, query->getFilter());
-        ASSERT_EQ(BSONObj(), query->getSort());
+        ASSERT_BSONOBJ_EQ(expectedQuery, query->getFilter());
+        ASSERT_BSONOBJ_EQ(BSONObj(), query->getSort());
         ASSERT_EQ(1, query->getLimit().get());
 
         checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
@@ -1982,9 +2017,10 @@ TEST_F(ShardingCatalogClientTest, EnableShardingNoDBExists) {
     onCommand([](const RemoteCommandRequest& request) {
         ASSERT_EQ(HostAndPort("shard0:12"), request.target);
         ASSERT_EQ("admin", request.dbname);
-        ASSERT_EQ(BSON("listDatabases" << 1), request.cmdObj);
+        ASSERT_BSONOBJ_EQ(BSON("listDatabases" << 1), request.cmdObj);
 
-        ASSERT_EQUALS(rpc::ServerSelectionMetadata(true, boost::none).toBSON(), request.metadata);
+        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                          request.metadata);
 
         return fromjson(R"({
                 databases: [],
@@ -1997,7 +2033,7 @@ TEST_F(ShardingCatalogClientTest, EnableShardingNoDBExists) {
         ASSERT_EQ(HostAndPort("config:123"), request.target);
         ASSERT_EQ("config", request.dbname);
 
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         BSONObj expectedCmd(fromjson(R"({
             update: "databases",
@@ -2011,7 +2047,7 @@ TEST_F(ShardingCatalogClientTest, EnableShardingNoDBExists) {
             maxTimeMS: 30000
         })"));
 
-        ASSERT_EQ(expectedCmd, request.cmdObj);
+        ASSERT_BSONOBJ_EQ(expectedCmd, request.cmdObj);
 
         return fromjson(R"({
                 nModified: 0,
@@ -2090,7 +2126,7 @@ TEST_F(ShardingCatalogClientTest, EnableShardingDBExists) {
         ASSERT_EQ(HostAndPort("config:123"), request.target);
         ASSERT_EQ("config", request.dbname);
 
-        ASSERT_EQUALS(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         BSONObj expectedCmd(fromjson(R"({
             update: "databases",
@@ -2104,7 +2140,7 @@ TEST_F(ShardingCatalogClientTest, EnableShardingDBExists) {
             maxTimeMS: 30000
         })"));
 
-        ASSERT_EQ(expectedCmd, request.cmdObj);
+        ASSERT_BSONOBJ_EQ(expectedCmd, request.cmdObj);
 
         return fromjson(R"({
                 nModified: 0,
@@ -2208,7 +2244,7 @@ TEST_F(ShardingCatalogClientTest, BasicReadAfterOpTime) {
         onCommandWithMetadata([this, &newOpTime, &lastOpTime](const RemoteCommandRequest& request) {
             ASSERT_EQUALS("test", request.dbname);
 
-            ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+            ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
             ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
             checkReadConcern(request.cmdObj, lastOpTime.getTimestamp(), lastOpTime.getTerm());
@@ -2243,7 +2279,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeShouldNotGoBack) {
     onCommandWithMetadata([this, &newOpTime, &highestOpTime](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("test", request.dbname);
 
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
@@ -2271,7 +2307,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeShouldNotGoBack) {
     onCommandWithMetadata([this, &oldOpTime, &highestOpTime](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("test", request.dbname);
 
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
@@ -2295,7 +2331,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeShouldNotGoBack) {
     onCommandWithMetadata([this, &oldOpTime, &highestOpTime](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("test", request.dbname);
 
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
@@ -2322,7 +2358,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeFindThenCmd) {
 
     onFindWithMetadataCommand(
         [this, &newOpTime, &highestOpTime](const RemoteCommandRequest& request) {
-            ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+            ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
             checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
 
             ReplSetMetadata metadata(10, newOpTime, newOpTime, 100, OID(), 30, -1);
@@ -2353,7 +2389,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeFindThenCmd) {
     onCommand([this, &oldOpTime, &highestOpTime](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("test", request.dbname);
 
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
@@ -2380,7 +2416,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeCmdThenFind) {
     onCommandWithMetadata([this, &newOpTime, &highestOpTime](const RemoteCommandRequest& request) {
         ASSERT_EQUALS("test", request.dbname);
 
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         ASSERT_EQ(string("dummy"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
@@ -2404,7 +2440,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeCmdThenFind) {
     const OpTime oldOpTime(Timestamp(3, 10), 5);
 
     onFindCommand([this, &oldOpTime, &highestOpTime](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(kReplSecondaryOkMetadata, request.metadata);
+        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata, request.metadata);
 
         ASSERT_EQ(string("find"), request.cmdObj.firstElementFieldName());
         checkReadConcern(request.cmdObj, highestOpTime.getTimestamp(), highestOpTime.getTerm());
@@ -2453,7 +2489,7 @@ TEST_F(ShardingCatalogClientTest, RetryOnReadCommandNetworkErrorSucceedsAtMaxRet
             operationContext(), "test", BSON("dummy" << 1), &responseBuilder);
         ASSERT_TRUE(ok);
         auto response = responseBuilder.obj();
-        ASSERT_EQ(expectedResult, response);
+        ASSERT_BSONOBJ_EQ(expectedResult, response);
     });
 
     for (int i = 0; i < kMaxCommandRetry - 1; ++i) {

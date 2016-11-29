@@ -104,6 +104,8 @@ public:
 
     Status initializeConfigDatabaseIfNeeded(OperationContext* txn) override;
 
+    void discardCachedConfigDatabaseInitializationState() override;
+
     Status initializeShardingAwarenessOnUnawareShards(OperationContext* txn) override;
 
     Status upsertShardIdentityOnShard(OperationContext* txn, ShardType shardType) override;
@@ -113,6 +115,9 @@ public:
                                                  const std::string& shardName) override;
 
     void cancelAddShardTaskIfNeeded(const ShardId& shardId) override;
+
+    Status setFeatureCompatibilityVersionOnShards(OperationContext* txn,
+                                                  const std::string& version) override;
 
 private:
     /**
@@ -188,6 +193,11 @@ private:
      * Retrieves all shards that are not marked as sharding aware (state = 1) in this cluster.
      */
     StatusWith<std::vector<ShardType>> _getAllShardingUnawareShards(OperationContext* txn);
+
+    /**
+     * Append min, max and version information from chunk to the buffer for logChange purposes.
+     */
+    void _appendShortVersion(BufBuilder& b, const ChunkType& chunk);
 
     /**
      * Callback function used when rescheduling an addShard task after the first attempt failed.
@@ -314,6 +324,16 @@ private:
      * taking this.
      */
     Lock::ResourceMutex _kChunkOpLock;
+
+    /**
+     * Lock that guards changes to the set of shards in the cluster (ie addShard and removeShard
+     * requests).
+     * TODO: Currently only taken during addShard requests, this should also be taken in X mode
+     * during removeShard, once removeShard is moved to run on the config server primary instead of
+     * on mongos.  At that point we should also change any operations that expect the shard not to
+     * be removed while they are running (such as removeShardFromZone) to take this in shared mode.
+     */
+    Lock::ResourceMutex _kShardMembershipLock;
 };
 
 }  // namespace mongo

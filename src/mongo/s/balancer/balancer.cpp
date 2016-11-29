@@ -44,7 +44,6 @@
 #include "mongo/s/balancer/balancer_chunk_selection_policy_impl.h"
 #include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/balancer/cluster_statistics_impl.h"
-#include "mongo/s/balancer/migration_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard.h"
@@ -118,9 +117,12 @@ private:
  * in the cluster.
  */
 void warnOnMultiVersion(const vector<ClusterStatistics::ShardStatistics>& clusterStats) {
+
+    auto&& vii = VersionInfoInterface::instance();
+
     bool isMultiVersion = false;
     for (const auto& stat : clusterStats) {
-        if (!isSameMajorVersion(stat.mongoVersion.c_str())) {
+        if (!vii.isSameMajorVersion(stat.mongoVersion.c_str())) {
             isMultiVersion = true;
             break;
         }
@@ -131,7 +133,7 @@ void warnOnMultiVersion(const vector<ClusterStatistics::ShardStatistics>& cluste
         return;
 
     StringBuilder sb;
-    sb << "Multi version cluster detected. Local version: " << versionString
+    sb << "Multi version cluster detected. Local version: " << vii.version()
        << ", shard versions: ";
 
     for (const auto& stat : clusterStats) {
@@ -143,11 +145,12 @@ void warnOnMultiVersion(const vector<ClusterStatistics::ShardStatistics>& cluste
 
 }  // namespace
 
-Balancer::Balancer()
+Balancer::Balancer(ServiceContext* serviceContext)
     : _balancedLastTime(0),
       _clusterStats(stdx::make_unique<ClusterStatisticsImpl>()),
       _chunkSelectionPolicy(
-          stdx::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get())) {}
+          stdx::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get())),
+      _migrationManager(serviceContext) {}
 
 Balancer::~Balancer() {
     // The balancer thread must have been stopped
@@ -157,7 +160,7 @@ Balancer::~Balancer() {
 
 void Balancer::create(ServiceContext* serviceContext) {
     invariant(!getBalancer(serviceContext));
-    getBalancer(serviceContext) = stdx::make_unique<Balancer>();
+    getBalancer(serviceContext) = stdx::make_unique<Balancer>(serviceContext);
 }
 
 Balancer* Balancer::get(ServiceContext* serviceContext) {
@@ -177,6 +180,10 @@ Status Balancer::startThread(OperationContext* txn) {
         case kStopped:
             invariant(!_thread.joinable());
             _state = kRunning;
+
+            // Allow new migrations to be scheduled
+            _migrationManager.enableMigrations();
+
             _thread = stdx::thread([this] { _mainThread(); });
         // Intentional fall through
         case kRunning:
@@ -189,6 +196,10 @@ Status Balancer::startThread(OperationContext* txn) {
 void Balancer::stopThread() {
     stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
     if (_state == kRunning) {
+        // Stop any active migrations and prevent any new migrations from getting scheduled
+        _migrationManager.interruptAndDisableMigrations();
+
+        // Request the balancer thread to stop
         _state = kStopping;
         _condVar.notify_all();
     }
@@ -206,6 +217,9 @@ void Balancer::joinThread() {
 
     if (_thread.joinable()) {
         _thread.join();
+
+        // Wait for any scheduled migrations to finish draining
+        _migrationManager.drainActiveMigrations();
 
         stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
         _state = kStopped;
@@ -238,26 +252,11 @@ Status Balancer::rebalanceSingleChunk(OperationContext* txn, const ChunkType& ch
         return refreshStatus;
     }
 
-    MigrationManager migrationManager;
-    auto migrationStatuses = migrationManager.scheduleMigrations(
-        txn,
-        {MigrationManager::MigrationRequest(std::move(*migrateInfo),
-                                            balancerConfig->getMaxChunkSizeBytes(),
-                                            balancerConfig->getSecondaryThrottle(),
-                                            balancerConfig->waitForDelete())});
-
-    invariant(migrationStatuses.size() == 1);
-
-    auto scopedCMStatus = ScopedChunkManager::getExisting(txn, NamespaceString(chunk.getNS()));
-    if (!scopedCMStatus.isOK()) {
-        return scopedCMStatus.getStatus();
-    }
-
-    auto scopedCM = std::move(scopedCMStatus.getValue());
-    ChunkManager* const cm = scopedCM.cm();
-    cm->reload(txn);
-
-    return migrationStatuses.begin()->second;
+    return _migrationManager.executeManualMigration(txn,
+                                                    *migrateInfo,
+                                                    balancerConfig->getMaxChunkSizeBytes(),
+                                                    balancerConfig->getSecondaryThrottle(),
+                                                    balancerConfig->waitForDelete());
 }
 
 Status Balancer::moveSingleChunk(OperationContext* txn,
@@ -271,26 +270,11 @@ Status Balancer::moveSingleChunk(OperationContext* txn,
         return moveAllowedStatus;
     }
 
-    MigrationManager migrationManager;
-    auto migrationStatuses = migrationManager.scheduleMigrations(
-        txn,
-        {MigrationManager::MigrationRequest(MigrateInfo(chunk.getNS(), newShardId, chunk),
-                                            maxChunkSizeBytes,
-                                            secondaryThrottle,
-                                            waitForDelete)});
-
-    invariant(migrationStatuses.size() == 1);
-
-    auto scopedCMStatus = ScopedChunkManager::getExisting(txn, NamespaceString(chunk.getNS()));
-    if (!scopedCMStatus.isOK()) {
-        return scopedCMStatus.getStatus();
-    }
-
-    auto scopedCM = std::move(scopedCMStatus.getValue());
-    ChunkManager* const cm = scopedCM.cm();
-    cm->reload(txn);
-
-    return migrationStatuses.begin()->second;
+    return _migrationManager.executeManualMigration(txn,
+                                                    MigrateInfo(chunk.getNS(), newShardId, chunk),
+                                                    maxChunkSizeBytes,
+                                                    secondaryThrottle,
+                                                    waitForDelete);
 }
 
 void Balancer::report(OperationContext* txn, BSONObjBuilder* builder) {
@@ -416,7 +400,7 @@ void Balancer::_mainThread() {
         }
     }
 
-    log() << "CSRS balancer is stopped";
+    log() << "CSRS balancer is now stopped";
 }
 
 bool Balancer::_stopRequested() {
@@ -460,17 +444,18 @@ bool Balancer::_checkOIDs(OperationContext* txn) {
             return false;
         }
 
-        const auto s = shardingContext->shardRegistry()->getShard(txn, shardId);
-        if (!s) {
+        auto shardStatus = shardingContext->shardRegistry()->getShard(txn, shardId);
+        if (!shardStatus.isOK()) {
             continue;
         }
+        const auto s = shardStatus.getValue();
 
-        auto result =
-            uassertStatusOK(s->runCommand(txn,
-                                          ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                          "admin",
-                                          BSON("features" << 1),
-                                          Shard::RetryPolicy::kIdempotent));
+        auto result = uassertStatusOK(
+            s->runCommandWithFixedRetryAttempts(txn,
+                                                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                                "admin",
+                                                BSON("features" << 1),
+                                                Shard::RetryPolicy::kIdempotent));
         uassertStatusOK(result.commandStatus);
         BSONObj f = std::move(result.response);
 
@@ -482,22 +467,23 @@ bool Balancer::_checkOIDs(OperationContext* txn) {
                 log() << "error: 2 machines have " << x << " as oid machine piece: " << shardId
                       << " and " << oids[x];
 
-                result = uassertStatusOK(
-                    s->runCommand(txn,
-                                  ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                  "admin",
-                                  BSON("features" << 1 << "oidReset" << 1),
-                                  Shard::RetryPolicy::kIdempotent));
+                result = uassertStatusOK(s->runCommandWithFixedRetryAttempts(
+                    txn,
+                    ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                    "admin",
+                    BSON("features" << 1 << "oidReset" << 1),
+                    Shard::RetryPolicy::kIdempotent));
                 uassertStatusOK(result.commandStatus);
 
-                const auto otherShard = shardingContext->shardRegistry()->getShard(txn, oids[x]);
-                if (otherShard) {
+                auto otherShardStatus = shardingContext->shardRegistry()->getShard(txn, oids[x]);
+                if (otherShardStatus.isOK()) {
                     result = uassertStatusOK(
-                        otherShard->runCommand(txn,
-                                               ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                               "admin",
-                                               BSON("features" << 1 << "oidReset" << 1),
-                                               Shard::RetryPolicy::kIdempotent));
+                        otherShardStatus.getValue()->runCommandWithFixedRetryAttempts(
+                            txn,
+                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                            "admin",
+                            BSON("features" << 1 << "oidReset" << 1),
+                            Shard::RetryPolicy::kIdempotent));
                     uassertStatusOK(result.commandStatus);
                 }
 
@@ -533,6 +519,7 @@ Status Balancer::_enforceTagRanges(OperationContext* txn) {
                                                                  splitInfo.collectionVersion,
                                                                  splitInfo.minKey,
                                                                  splitInfo.maxKey,
+                                                                 splitInfo.chunkVersion,
                                                                  splitInfo.splitKeys);
         if (!splitStatus.isOK()) {
             warning() << "Failed to enforce tag range for chunk " << redact(splitInfo.toString())
@@ -555,21 +542,14 @@ int Balancer::_moveChunks(OperationContext* txn,
         return 0;
     }
 
-    // Schedule all migrations in parallel
-    MigrationManager migrationManager;
-
-    MigrationManager::MigrationRequestVector migrationRequests;
-
-    for (const auto& migrateInfo : candidateChunks) {
-        migrationRequests.emplace_back(migrateInfo,
-                                       balancerConfig->getMaxChunkSizeBytes(),
-                                       balancerConfig->getSecondaryThrottle(),
-                                       balancerConfig->waitForDelete());
-    }
+    auto migrationStatuses =
+        _migrationManager.executeMigrationsForAutoBalance(txn,
+                                                          candidateChunks,
+                                                          balancerConfig->getMaxChunkSizeBytes(),
+                                                          balancerConfig->getSecondaryThrottle(),
+                                                          balancerConfig->waitForDelete());
 
     int numChunksProcessed = 0;
-
-    auto migrationStatuses = migrationManager.scheduleMigrations(txn, std::move(migrationRequests));
 
     for (const auto& migrationStatusEntry : migrationStatuses) {
         const Status& status = migrationStatusEntry.second;

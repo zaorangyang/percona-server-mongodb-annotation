@@ -57,6 +57,7 @@ namespace repl {
 class LastVote;
 class ReplSettings;
 class ReplicationCoordinator;
+class ReplicationExecutor;
 
 using OnInitialSyncFinishedFn = stdx::function<void()>;
 using StartInitialSyncFn = stdx::function<void(OnInitialSyncFinishedFn callback)>;
@@ -136,9 +137,16 @@ public:
     virtual Status initializeReplSetStorage(OperationContext* txn, const BSONObj& config) = 0;
 
     /**
-     * Writes a message about our transition to primary to the oplog.
+     * Called as part of the process of transitioning to primary. See the call site in
+     * ReplicationCoordinatorImpl for details about when and how it is called.
+     *
+     * Among other things, this writes a message about our transition to primary to the oplog if
+     * isV1 and and returns the optime of that message. If !isV1, returns the optime of the last op
+     * in the oplog.
+     *
+     * Throws on errors.
      */
-    virtual void logTransitionToPrimaryToOplog(OperationContext* txn) = 0;
+    virtual OpTime onTransitionToPrimary(OperationContext* txn, bool isV1ElectionProtocol) = 0;
 
     /**
      * Simple wrapper around SyncSourceFeedback::forwardSlaveProgress.  Signals to the
@@ -225,14 +233,6 @@ public:
     virtual void shardingOnStepDownHook() = 0;
 
     /**
-     * Called when the instance transitions to primary in order to notify a potentially sharded host
-     * to perform respective state changes, such as starting the balancer, etc.
-     *
-     * Throws on errors.
-     */
-    virtual void shardingOnDrainingStateHook(OperationContext* txn) = 0;
-
-    /**
      * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.
      */
     virtual void signalApplierToChooseNewSyncSource() = 0;
@@ -241,14 +241,6 @@ public:
      * Notifies the bgsync to cancel the current oplog fetcher.
      */
     virtual void signalApplierToCancelFetcher() = 0;
-
-    /**
-     * Drops all temporary collections on all databases except "local".
-     *
-     * The implementation may assume that the caller has acquired the global exclusive lock
-     * for "txn".
-     */
-    virtual void dropAllTempCollections(OperationContext* txn) = 0;
 
     /**
      * Drops all snapshots and clears the "committed" snapshot.
@@ -324,6 +316,22 @@ public:
      * Returns true if the user specified to use the data replicator for initial sync.
      */
     virtual bool shouldUseDataReplicatorInitialSync() const = 0;
+
+    /*
+     * Creates noop writer instance. Setting the _noopWriter member is not protected by a guard,
+     * hence it must be called before multi-threaded operations start.
+     */
+    virtual void setupNoopWriter(Seconds waitTime) = 0;
+
+    /*
+     * Starts periodic noop writes to oplog.
+     */
+    virtual void startNoopWriter(OpTime) = 0;
+
+    /*
+     * Stops periodic noop writes to oplog.
+     */
+    virtual void stopNoopWriter() = 0;
 };
 
 }  // namespace repl

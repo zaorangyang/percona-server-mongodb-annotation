@@ -15,6 +15,8 @@ import uuid
 from buildscripts import utils
 from buildscripts import moduleconfig
 
+import SCons
+
 from mongo_scons_utils import (
     default_buildinfo_environment_data,
     default_variant_dir_generator,
@@ -454,8 +456,10 @@ add_option('win-version-min',
 )
 
 add_option('cache',
+    choices=["all", "nolinked"],
+    const='all',
     help='Use an object cache rather than a per-build variant directory (experimental)',
-    nargs=0,
+    nargs='?',
 )
 
 add_option('cache-dir',
@@ -506,6 +510,13 @@ add_option('runtime-hardening',
     choices=["on", "off"],
     default="on",
     help="Enable runtime hardening features (e.g. stack smash protection)",
+    type='choice',
+)
+
+add_option('use-s390x-crc32',
+    choices=["on", "off"],
+    default="on",
+    help="Enable CRC32 hardware accelaration on s390x",
     type='choice',
 )
 
@@ -614,6 +625,20 @@ env_vars.Add('ABIDW',
 env_vars.Add('ARFLAGS',
     help='Sets flags for the archiver',
     converter=variable_shlex_converter)
+
+env_vars.Add(
+    'CACHE_SIZE',
+    help='Maximum size of the cache (in gigabytes)',
+    default=32,
+    converter=lambda x:int(x)
+)
+
+env_vars.Add(
+    'CACHE_PRUNE_TARGET',
+    help='Maximum percent in-use in cache after pruning',
+    default=66,
+    converter=lambda x:int(x)
+)
 
 env_vars.Add('CC',
     help='Select the C compiler to use')
@@ -1145,12 +1170,30 @@ else:
     env['MONGO_ALLOCATOR'] = get_option('allocator')
 
 if has_option("cache"):
-    if has_option("release"):
-        env.FatalError(
-            "Using the experimental --cache option is not permitted for --release builds")
     if has_option("gcov"):
         env.FatalError("Mixing --cache and --gcov doesn't work correctly yet. See SERVER-11084")
     env.CacheDir(str(env.Dir(cacheDir)))
+
+    if get_option("cache") == "nolinked":
+        def noCacheEmitter(target, source, env):
+            for t in target:
+                env.NoCache(t)
+            return target, source
+
+        def addNoCacheEmitter(builder):
+            origEmitter = builder.emitter
+            if SCons.Util.is_Dict(origEmitter):
+                for k,v in origEmitter:
+                    origEmitter[k] = SCons.Builder.ListEmitter([v, noCacheEmitter])
+            elif SCons.Util.is_List(origEmitter):
+                emitter.append(noCacheEmitter)
+            else:
+                builder.emitter = SCons.Builder.ListEmitter([origEmitter, noCacheEmitter])
+
+        addNoCacheEmitter(env['BUILDERS']['Program'])
+        addNoCacheEmitter(env['BUILDERS']['StaticLibrary'])
+        addNoCacheEmitter(env['BUILDERS']['SharedLibrary'])
+        addNoCacheEmitter(env['BUILDERS']['LoadableModule'])
 
 # Normalize the link model. If it is auto, then a release build uses 'object' mode. Otherwise
 # we automatically select the 'static' model on non-windows platforms, or 'object' if on
@@ -2239,6 +2282,10 @@ def doConfigure(myenv):
         if not myenv.ToolchainIs('clang', 'gcc'):
             env.FatalError('sanitize is only supported with clang or gcc')
 
+        if myenv.ToolchainIs('gcc'):
+            # GCC's implementation of ASAN depends on libdl.
+            env.Append(LIBS=['dl'])
+
         if env['MONGO_ALLOCATOR'] == 'tcmalloc':
             # There are multiply defined symbols between the sanitizer and
             # our vendorized tcmalloc.
@@ -2965,6 +3012,23 @@ all = env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tes
 
 # Require everything to be built before trying to extract build dependency information
 env.Requires(dependencyDb, all)
+
+# We don't want installing files to cause them to flow into the cache,
+# since presumably we can re-install them from the origin if needed.
+env.NoCache(env.FindInstalledFiles())
+
+# Declare the cache prune target
+cachePrune = env.Command(
+    target="#cache-prune",
+    source=[
+        "#buildscripts/scons_cache_prune.py",
+    ],
+    action="$PYTHON ${SOURCES[0]} --cache-dir=${CACHE_DIR.abspath} --cache-size=${CACHE_SIZE} --prune-ratio=${CACHE_PRUNE_TARGET/100.00}",
+    CACHE_DIR=env.Dir(cacheDir),
+)
+
+env.AlwaysBuild(cachePrune)
+env.Alias('cache-prune', cachePrune)
 
 # Substitute environment variables in any build targets so that we can
 # say, for instance:

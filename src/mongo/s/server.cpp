@@ -91,7 +91,6 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -213,11 +212,11 @@ static Status initializeSharding(OperationContext* txn) {
 static void _initWireSpec() {
     WireSpec& spec = WireSpec::instance();
     // accept from any version
-    spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionIncoming = COMMANDS_ACCEPT_WRITE_CONCERN;
+    spec.incoming.minWireVersion = RELEASE_2_4_AND_BEFORE;
+    spec.incoming.maxWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
     // connect to version supporting Write Concern only
-    spec.minWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
-    spec.maxWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
+    spec.outgoing.minWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
+    spec.outgoing.maxWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
 }
 
 static ExitCode runMongosServer() {
@@ -231,9 +230,12 @@ static ExitCode runMongosServer() {
     opts.ipList = serverGlobalParams.bind_ip;
 
     auto sep =
-        std::make_shared<ServiceEntryPointMongos>(getGlobalServiceContext()->getTransportLayer());
+        stdx::make_unique<ServiceEntryPointMongos>(getGlobalServiceContext()->getTransportLayer());
+    auto sepPtr = sep.get();
 
-    auto transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(opts, sep);
+    getGlobalServiceContext()->setServiceEntryPoint(std::move(sep));
+
+    auto transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(opts, sepPtr);
     auto res = transportLayer->setup();
     if (!res.isOK()) {
         return EXIT_NET_ERROR;
@@ -287,8 +289,6 @@ static ExitCode runMongosServer() {
         stdx::thread web(stdx::bind(&webServerListenThread, dbWebServer));
         web.detach();
     }
-
-    HostnameCanonicalizationWorker::start(getGlobalServiceContext());
 
     Status status = getGlobalAuthorizationManager()->initialize(NULL);
     if (!status.isOK()) {

@@ -32,6 +32,7 @@
 
 #include "mongo/db/pipeline/pipeline_d.h"
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -57,6 +58,7 @@
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
@@ -114,8 +116,17 @@ public:
         return collection->infoCache()->getIndexUsageStats();
     }
 
-    void appendLatencyStats(const NamespaceString& nss, BSONObjBuilder* builder) const final {
-        Top::get(_ctx->opCtx->getServiceContext()).appendLatencyStats(nss.ns(), builder);
+    void appendLatencyStats(const NamespaceString& nss,
+                            bool includeHistograms,
+                            BSONObjBuilder* builder) const final {
+        Top::get(_ctx->opCtx->getServiceContext())
+            .appendLatencyStats(nss.ns(), includeHistograms, builder);
+    }
+
+    Status appendStorageStats(const NamespaceString& nss,
+                              const BSONObj& param,
+                              BSONObjBuilder* builder) const final {
+        return appendCollectionStorageStats(_ctx->opCtx, nss, param, builder);
     }
 
     BSONObj getCollectionOptions(const NamespaceString& nss) final {
@@ -131,7 +142,8 @@ public:
         const std::list<BSONObj>& originalIndexes) final {
         Lock::GlobalWrite globalLock(_ctx->opCtx->lockState());
 
-        if (originalCollectionOptions != getCollectionOptions(targetNs)) {
+        if (SimpleBSONObjComparator::kInstance.evaluate(originalCollectionOptions !=
+                                                        getCollectionOptions(targetNs))) {
             return {ErrorCodes::CommandFailed,
                     str::stream() << "collection options of target collection " << targetNs.ns()
                                   << " changed during processing. Original options: "
@@ -139,7 +151,13 @@ public:
                                   << ", new options: "
                                   << getCollectionOptions(targetNs)};
         }
-        if (originalIndexes != _client.getIndexSpecs(targetNs.ns())) {
+
+        auto currentIndexes = _client.getIndexSpecs(targetNs.ns());
+        if (originalIndexes.size() != currentIndexes.size() ||
+            !std::equal(originalIndexes.begin(),
+                        originalIndexes.end(),
+                        currentIndexes.begin(),
+                        SimpleBSONObjComparator::kInstance.makeEqualTo())) {
             return {ErrorCodes::CommandFailed,
                     str::stream() << "indexes of target collection " << targetNs.ns()
                                   << " changed during processing."};

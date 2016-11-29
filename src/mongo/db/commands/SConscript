@@ -17,7 +17,7 @@ env.Library(
         'server_status_metric.cpp',
         ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/util/net/hostname_canonicalization_worker',
+        '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/base'
         ]
     )
@@ -107,6 +107,7 @@ env.Library(
         "drop_indexes.cpp",
         "eval.cpp",
         "explain_cmd.cpp",
+        "feature_compatibility_version.cpp",
         "find_and_modify.cpp",
         "find_cmd.cpp",
         "fsync.cpp",
@@ -129,6 +130,7 @@ env.Library(
         "plan_cache_commands.cpp",
         "rename_collection_cmd.cpp",
         "repair_cursor.cpp",
+        "set_feature_compatibility_version_command.cpp",
         "snapshot_management.cpp",
         "test_commands.cpp",
         "top_command.cpp",

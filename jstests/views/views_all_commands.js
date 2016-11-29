@@ -19,9 +19,8 @@
  *      view named "view", built on top of a collection named "collection". A command can also be a
  *      function that takes a db handle as argument and handles pass/failure checking internally.
  *
- *  runOnDb
- *      Specifies the database against which to run db.runCommand(). If not specified, defaults to
- *      "test".
+ *  isAdminCommand
+ *      If true, will execute 'command' against the admin db.
  *
  *  skip
  *      A string that, if present, causes the test runner to skip running this command altogether.
@@ -29,16 +28,20 @@
  *      selection of commonly-used reasons below.)
  *
  *  expectFailure
- *      If true, assert that the command fails with a views-specific error code. Otherwise, all
- *      commands are expected to succeed.
+ *      If true, assert that the command fails. Otherwise, all commands are expected to succeed.
+ *
+ *  expectedErrorCode
+ *      When 'expectFailure' is true, specifies the error code expected. Defaults to
+ *      'CommandNotSupportedOnView' when not specified. Set to 'null' when expecting an error
+ *      without an error code field.
  *
  *  setup
- *      A function that will be run before the command is executed. It takes a handle to a
- *      connection object as its single argument.
+ *      A function that will be run before the command is executed. It takes a handle to the 'test'
+ *      database as its single argument.
  *
  *  teardown
- *      A function that will be run after the command is executed. It takes a handle to a connection
- *      object as its single argument.
+ *      A function that will be run after the command is executed. It takes a handle to the 'test'
+ *      database as its single argument.
  *
  *  skipSharded
  *      If true, do not run this command on a mongos.
@@ -61,8 +64,11 @@
         _configsvrBalancerStatus: {skip: isAnInternalCommand},
         _configsvrBalancerStop: {skip: isAnInternalCommand},
         _configsvrCommitChunkMigration: {skip: isAnInternalCommand},
+        _configsvrMergeChunk: {skip: isAnInternalCommand},
         _configsvrMoveChunk: {skip: isAnInternalCommand},
         _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
+        _configsvrSetFeatureCompatibilityVersion: {skip: isAnInternalCommand},
+        _configsvrSplitChunk: {skip: isAnInternalCommand},
         _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
         _getUserCacheGeneration: {skip: isAnInternalCommand},
         _hashBSONElement: {skip: isAnInternalCommand},
@@ -74,22 +80,30 @@
         _recvChunkStart: {skip: isAnInternalCommand},
         _recvChunkStatus: {skip: isAnInternalCommand},
         _transferMods: {skip: isAnInternalCommand},
+        addShard: {skip: isUnrelated},
+        addShardToZone: {skip: isUnrelated},
         aggregate: {command: {aggregate: "view", pipeline: [{$match: {}}]}},
         appendOplogNote: {skip: isUnrelated},
         applyOps: {
             command: {applyOps: [{op: "i", o: {_id: 1}, ns: "test.view"}]},
             expectFailure: true,
+            skipSharded: true,
         },
         authSchemaUpgrade: {skip: isUnrelated},
         authenticate: {skip: isUnrelated},
         availableQueryOptions: {skip: isAnInternalCommand},
+        balancerStart: {skip: isUnrelated},
+        balancerStatus: {skip: isUnrelated},
+        balancerStop: {skip: isUnrelated},
         buildInfo: {skip: isUnrelated},
         captrunc: {
             command: {captrunc: "view", n: 2, inc: false},
             expectFailure: true,
         },
         checkShardingIndex: {skip: isUnrelated},
-        cleanupOrphaned: {command: {cleanupOrphaned: 1}, skip: "TODO(SERVER-24764)"},
+        cleanupOrphaned: {
+            skip: "Tested in views/views_sharded.js",
+        },
         clone: {skip: "TODO(SERVER-24506)"},
         cloneCollection: {skip: "TODO(SERVER-24506)"},
         cloneCollectionAsCapped: {
@@ -98,7 +112,7 @@
         },
         collMod: {command: {collMod: "view", viewOn: "other", pipeline: []}},
         collStats: {command: {collStats: "view"}, skip: "TODO(SERVER-24568)"},
-        compact: {command: {compact: "view", force: true}, expectFailure: true},
+        compact: {command: {compact: "view", force: true}, expectFailure: true, skipSharded: true},
         configureFailPoint: {skip: isUnrelated},
         connPoolStats: {skip: isUnrelated},
         connPoolSync: {skip: isUnrelated},
@@ -181,15 +195,17 @@
             command: {emptycapped: "view"},
             expectFailure: true,
         },
+        enableSharding: {skip: "Tested as part of shardCollection"},
         eval: {skip: isUnrelated},
         explain: {command: {explain: {count: "view"}}},
         features: {skip: isUnrelated},
         filemd5: {skip: isUnrelated},
-        find: {skip: "tested in views/views_find.js"},
+        find: {skip: "tested in views/views_find.js & views/views_sharded.js"},
         findAndModify: {
             command: {findAndModify: "view", query: {a: 1}, update: {$set: {a: 2}}},
             expectFailure: true
         },
+        flushRouterConfig: {skip: isUnrelated},
         forceerror: {skip: isUnrelated},
         fsync: {skip: isUnrelated},
         fsyncUnlock: {skip: isUnrelated},
@@ -210,15 +226,50 @@
         getDiagnosticData: {skip: isUnrelated},
         getLastError: {skip: isUnrelated},
         getLog: {skip: isUnrelated},
-        getMore: {skip: "TODO(SERVER-24724)"},
+        getMore: {
+            setup: function(conn) {
+                assert.writeOK(conn.collection.remove({}));
+                assert.writeOK(conn.collection.insert([{_id: 1}, {_id: 2}, {_id: 3}]));
+            },
+            command: function(conn) {
+                function testGetMoreForCommand(cmd) {
+                    let res = conn.runCommand(cmd);
+                    assert.commandWorked(res, cmd);
+                    let cursor = res.cursor;
+                    assert.eq(cursor.ns,
+                              "test.view",
+                              "expected view namespace in cursor: " + tojson(cursor));
+                    let expectedFirstBatch = [{_id: 1}, {_id: 2}];
+                    assert.eq(cursor.firstBatch, expectedFirstBatch, "returned wrong firstBatch");
+                    let getmoreCmd = {getMore: cursor.id, collection: "view"};
+                    res = conn.runCommand(getmoreCmd);
+
+                    assert.commandWorked(res, getmoreCmd);
+                    assert.eq("test.view",
+                              res.cursor.ns,
+                              "expected view namespace in cursor: " + tojson(res));
+                }
+                // find command.
+                let findCmd = {find: "view", filter: {_id: {$gt: 0}}, batchSize: 2};
+                testGetMoreForCommand(findCmd);
+
+                // aggregate command.
+                let aggCmd = {
+                    aggregate: "view",
+                    pipeline: [{$match: {_id: {$gt: 0}}}],
+                    cursor: {batchSize: 2}
+                };
+                testGetMoreForCommand(aggCmd);
+            }
+        },
         getParameter: {skip: isUnrelated},
         getPrevError: {skip: isUnrelated},
         getShardMap: {skip: isUnrelated},
         getShardVersion: {
             command: {getShardVersion: "test.view"},
-            runOnDb: "admin",
+            isAdminCommand: true,
             expectFailure: true,
-            skip: "TODO(SERVER-24764)"
+            skipSharded: true,  // mongos is tested in views/views_sharded.js
         },
         getnonce: {skip: isUnrelated},
         godinsert: {skip: isAnInternalCommand},
@@ -263,14 +314,45 @@
         hostInfo: {skip: isUnrelated},
         insert: {command: {insert: "view", documents: [{x: 1}]}, expectFailure: true},
         invalidateUserCache: {skip: isUnrelated},
+        isdbgrid: {skip: isUnrelated},
         isMaster: {skip: isUnrelated},
         journalLatencyTest: {skip: isUnrelated},
-        killCursors: {skip: "TODO(SERVER-24771)"},
+        killCursors: {
+            setup: function(conn) {
+                assert.writeOK(conn.collection.remove({}));
+                assert.writeOK(conn.collection.insert([{_id: 1}, {_id: 2}, {_id: 3}]));
+            },
+            command: function(conn) {
+                // First get and check a partial result for an aggregate command.
+                let aggCmd = {aggregate: "view", pipeline: [], cursor: {batchSize: 2}};
+                let res = conn.runCommand(aggCmd);
+                assert.commandWorked(res, aggCmd);
+                let cursor = res.cursor;
+                assert.eq(
+                    cursor.ns, "test.view", "expected view namespace in cursor: " + tojson(cursor));
+                let expectedFirstBatch = [{_id: 1}, {_id: 2}];
+                assert.eq(cursor.firstBatch, expectedFirstBatch, "find returned wrong firstBatch");
+
+                // Then check correct execution of the killCursors command.
+                let killCursorsCmd = {killCursors: "view", cursors: [cursor.id]};
+                res = conn.runCommand(killCursorsCmd);
+                assert.commandWorked(res, killCursorsCmd);
+                let expectedRes = {
+                    cursorsKilled: [cursor.id],
+                    cursorsNotFound: [],
+                    cursorsAlive: [],
+                    cursorsUnknown: [],
+                    ok: 1
+                };
+                assert.eq(expectedRes, res, "unexpected result for: " + tojson(killCursorsCmd));
+            }
+        },
         killOp: {skip: isUnrelated},
         listCollections: {skip: "tested in views/views_creation.js"},
         listCommands: {skip: isUnrelated},
         listDatabases: {skip: isUnrelated},
         listIndexes: {command: {listIndexes: "view"}, expectFailure: true},
+        listShards: {skip: isUnrelated},
         lockInfo: {skip: isUnrelated},
         logApplicationMessage: {skip: isUnrelated},
         logRotate: {skip: isUnrelated},
@@ -284,14 +366,26 @@
         "mapreduce.shardedfinish": {skip: isAnInternalCommand},
         mergeChunks: {
             command: {mergeChunks: "test.view", bounds: [{x: 0}, {x: 10}]},
-            runOnDb: "admin",
-            skip: isAnInternalCommand,
+            setup: function(conn) {
+                assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
+            },
+            skipStandalone: true,
+            isAdminCommand: true,
+            expectFailure: true,
+            expectedErrorCode: ErrorCodes.NamespaceNotSharded,
         },
         moveChunk: {
             command: {moveChunk: "test.view"},
-            runOnDb: "admin",
-            skip: isAnInternalCommand,
+            setup: function(conn) {
+                assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
+            },
+            skipStandalone: true,
+            isAdminCommand: true,
+            expectFailure: true,
+            expectedErrorCode: ErrorCodes.NamespaceNotSharded,
         },
+        movePrimary: {skip: "Tested in sharding/movePrimary1.js"},
+        netstat: {skip: isAnInternalCommand},
         parallelCollectionScan: {command: {parallelCollectionScan: "view"}, expectFailure: true},
         ping: {command: {ping: 1}},
         planCacheClear: {command: {planCacheClear: "view"}, expectFailure: true},
@@ -303,16 +397,19 @@
         planCacheSetFilter: {command: {planCacheSetFilter: "view"}, expectFailure: true},
         profile: {skip: isUnrelated},
         reIndex: {command: {reIndex: "view"}, expectFailure: true},
+        removeShard: {skip: isUnrelated},
+        removeShardFromZone: {skip: isUnrelated},
         renameCollection: [
             {
-              runOnDb: "admin",
+              isAdminCommand: true,
               command: {renameCollection: "test.view", to: "test.otherview"},
               expectFailure: true,
             },
             {
-              runOnDb: "admin",
+              isAdminCommand: true,
               command: {renameCollection: "test.collection", to: "test.view"},
-              expectFailure: ErrorCodes.NamespaceExists,
+              expectFailure: true,
+              expectedErrorCode: ErrorCodes.NamespaceExists,
             }
         ],
         repairCursor: {command: {repairCursor: "view"}, expectFailure: true},
@@ -355,16 +452,57 @@
         saslStart: {skip: isUnrelated},
         serverStatus: {command: {serverStatus: 1}, skip: isUnrelated},
         setCommittedSnapshot: {skip: isAnInternalCommand},
+        setFeatureCompatibilityVersion: {skip: isUnrelated},
         setParameter: {skip: isUnrelated},
         setShardVersion: {skip: isUnrelated},
+        shardCollection: {
+            command: {shardCollection: "test.view", key: {_id: 1}},
+            setup: function(conn) {
+                assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
+            },
+            skipStandalone: true,
+            expectFailure: true,
+            isAdminCommand: true,
+        },
         shardConnPoolStats: {skip: isUnrelated},
         shardingState: {skip: isUnrelated},
         shutdown: {skip: isUnrelated},
         sleep: {skip: isUnrelated},
-        splitChunk: {skip: isAnInternalCommand},
-        splitVector: {skip: isAnInternalCommand},
+        split: {
+            command: {split: "test.view", find: {_id: 1}},
+            setup: function(conn) {
+                assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
+            },
+            skipStandalone: true,
+            expectFailure: true,
+            expectedErrorCode: ErrorCodes.NamespaceNotSharded,
+            isAdminCommand: true,
+        },
+        splitChunk: {
+            command: {
+                splitChunk: "test.view",
+                from: "shard0000",
+                min: {x: MinKey},
+                max: {x: 0},
+                keyPattern: {x: 1},
+                splitKeys: [{x: -2}, {x: -1}],
+                shardVersion: [1, 2]
+            },
+            skipSharded: true,
+            expectFailure: true,
+            expectedErrorCode: null,
+            isAdminCommand: true,
+        },
+        splitVector: {
+            command: {
+                splitVector: "test.view",
+                keyPattern: {x: 1},
+                maxChunkSize: 1,
+            },
+            expectFailure: true,
+        },
         stageDebug: {skip: isAnInternalCommand},
-        top: {command: {top: "view"}, runOnDb: "admin", skip: "TODO(SERVER-24568)"},
+        top: {command: {top: "view"}, isAdminCommand: true, skip: "TODO(SERVER-24568)"},
         touch: {
             command: {touch: "view", data: true},
             expectFailure: true,
@@ -385,84 +523,109 @@
             }
         },
         updateUser: {skip: isUnrelated},
+        updateZoneKeyRange: {skip: isUnrelated},
         usersInfo: {skip: isUnrelated},
-        validate: {command: {validate: "view"}, skip: "TODO(SERVER-24768)"},
+        validate: {command: {validate: "view"}, expectFailure: true},
         whatsmyuri: {skip: isUnrelated}
     };
 
     /**
      * Helper function for failing commands or writes that checks the result 'res' of either.
-     * If 'code' is undefined or true, the expected error defaults to CommandNotSupportedOnView.
-     * Otherwise it is the numerical value of code. On no error, or wrong error code, the resulting
-     * assert includes the message 'msg'.
+     * If 'code' is null we only check for failure, otherwise we confirm error code matches as
+     * well. On assert 'msg' is printed.
      */
     let assertCommandOrWriteFailed = function(res, code, msg) {
-        if (code == undefined || code === true)
-            code = ErrorCodes.CommandNotSupportedOnView;
-
         if (res.writeErrors !== undefined)
             assert.neq(0, res.writeErrors.length, msg);
-        else
+        else if (res.code !== null)
             assert.commandFailedWithCode(res, code, msg);
+        else
+            assert.commandFailed(res, msg);
     };
 
-    // Are we on a mongos?
-    let dbgridRes = db.adminCommand({isdbgrid: 1});
-    const isMongos = (dbgridRes.ok === 1 && dbgridRes.isdbgrid === 1);
+    function runTests(db) {
+        // Are we on a mongos?
+        var isMaster = db.runCommand("ismaster");
+        assert.commandWorked(isMaster);
+        var isMongos = (isMaster.msg === "isdbgrid");
 
-    // Obtain a list of all commands.
-    let res = db.runCommand({listCommands: 1});
-    assert.commandWorked(res);
+        // Obtain a list of all commands.
+        let res = db.runCommand({listCommands: 1});
+        assert.commandWorked(res);
 
-    let commands = Object.keys(res.commands);
-    for (let command of commands) {
-        let test = viewsCommandTests[command];
-        assert(test !== undefined,
-               "Coverage failure: must explicitly define a views test for " + command);
+        let commands = Object.keys(res.commands);
+        for (let command of commands) {
+            let test = viewsCommandTests[command];
+            assert(test !== undefined,
+                   "Coverage failure: must explicitly define a views test for " + command);
 
-        if (!(test instanceof Array))
-            test = [test];
-        let subtest_nr = 0;
-        for (let subtest of test) {
-            // Tests can be explicitly skipped. Print the name of the skipped test, as well as the
-            // reason why.
-            if (subtest.skip !== undefined) {
-                print("Skipping " + command + ": " + subtest.skip);
-                continue;
+            if (!(test instanceof Array))
+                test = [test];
+            let subtest_nr = 0;
+            for (let subtest of test) {
+                // Tests can be explicitly skipped. Print the name of the skipped test, as well as
+                // the reason why.
+                if (subtest.skip !== undefined) {
+                    print("Skipping " + command + ": " + subtest.skip);
+                    continue;
+                }
+
+                let dbHandle = db.getSiblingDB("test");
+                let commandHandle = dbHandle;
+
+                // Skip tests depending on sharding configuration.
+                if (subtest.skipSharded && isMongos) {
+                    print("Skipping " + command + ": not applicable to mongoS");
+                    continue;
+                }
+
+                if (subtest.skipStandalone && !isMongos) {
+                    print("Skipping " + command + ": not applicable to mongoD");
+                    continue;
+                }
+
+                // Perform test setup, and call any additional setup callbacks provided by the test.
+                // All tests assume that there exists a view named 'view' that is backed by
+                // 'collection'.
+                assert.commandWorked(dbHandle.dropDatabase());
+                assert.commandWorked(dbHandle.runCommand({create: "view", viewOn: "collection"}));
+                assert.writeOK(dbHandle.collection.insert({x: 1}));
+                if (subtest.setup !== undefined)
+                    subtest.setup(dbHandle);
+
+                // Execute the command. Print the command name for the first subtest, as otherwise
+                // it may be hard to figure out what command caused a failure.
+                if (!subtest_nr++)
+                    print("Testing " + command);
+
+                if (subtest.isAdminCommand)
+                    commandHandle = db.getSiblingDB("admin");
+
+                if (subtest.expectFailure) {
+                    let expectedErrorCode = subtest.expectedErrorCode;
+                    if (expectedErrorCode === undefined)
+                        expectedErrorCode = ErrorCodes.CommandNotSupportedOnView;
+
+                    assertCommandOrWriteFailed(commandHandle.runCommand(subtest.command),
+                                               expectedErrorCode,
+                                               tojson(subtest.command));
+                } else if (subtest.command instanceof Function)
+                    subtest.command(commandHandle);
+                else
+                    assert.commandWorked(commandHandle.runCommand(subtest.command),
+                                         tojson(subtest.command));
+
+                if (subtest.teardown !== undefined)
+                    subtest.teardown(dbHandle);
             }
-            let dbName = (subtest.runOnDb === undefined) ? "test" : subtest.runOnDb;
-            let dbHandle = db.getSiblingDB(dbName);
-
-            // Skip tests depending on sharding configuration.
-            if (subtest.skipSharded && isMongos)
-                continue;
-            if (subtest.skipStandalone && !isMongos)
-                continue;
-
-            // Perform test setup, and call any additional setup callbacks provided by the test. All
-            // tests assume that there exists a view named 'view' that is backed by 'collection'.
-            assert.commandWorked(dbHandle.dropDatabase());
-            assert.commandWorked(dbHandle.runCommand({create: "view", viewOn: "collection"}));
-            assert.writeOK(dbHandle.collection.insert({x: 1}));
-            if (subtest.setup !== undefined)
-                subtest.setup(dbHandle);
-
-            // Execute the command. Print the command name for the first subtest, as otherwise it
-            // may be hard to figure out what command caused a failure.
-            if (!subtest_nr++)
-                print("Testing " + command);
-
-            if (subtest.expectFailure)
-                assertCommandOrWriteFailed(dbHandle.runCommand(subtest.command),
-                                           subtest.expectFailure,
-                                           tojson(subtest.command));
-            else if (subtest.command instanceof Function)
-                subtest.command(dbHandle);
-            else
-                assert.commandWorked(dbHandle.runCommand(subtest.command), tojson(subtest.command));
-
-            if (subtest.teardown !== undefined)
-                subtest.teardown(dbHandle);
         }
     }
+
+    // Run tests against mongoD.
+    runTests(db.getSiblingDB("test"));
+
+    // Run tests against mongoS.
+    var st = new ShardingTest({shards: 2});
+    runTests(st.s.getDB("test"));
+    st.stop();
 }());

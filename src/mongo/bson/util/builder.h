@@ -41,6 +41,7 @@
 #include "mongo/base/data_view.h"
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/inline_decls.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/stdx/type_traits.h"
@@ -411,6 +412,10 @@ public:
         append(str);
         return *this;
     }
+    StringBuilderImpl& operator<<(BSONType type) {
+        append(typeName(type));
+        return *this;
+    }
 
     void appendDoubleNice(double x) {
         const int prev = _buf.l;
@@ -439,6 +444,15 @@ public:
 
     std::string str() const {
         return std::string(_buf.buf(), _buf.l);
+    }
+
+    /**
+     * Returns a view of this string without copying.
+     *
+     * WARNING: the view expires when this StringBuilder is modified or destroyed.
+     */
+    StringData stringData() const {
+        return StringData(_buf.buf(), _buf.l);
     }
 
     /** size of current std::string */

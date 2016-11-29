@@ -143,7 +143,7 @@ public:
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
         ReplSetUpdatePositionCommandStyle commandStyle) const override;
 
-    virtual Status processReplSetGetStatus(BSONObjBuilder* result);
+    virtual Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle);
 
     virtual void fillIsMasterForReplSet(IsMasterResponse* result);
 
@@ -163,7 +163,9 @@ public:
 
     virtual bool getMaintenanceMode();
 
-    virtual Status processReplSetSyncFrom(const HostAndPort& target, BSONObjBuilder* resultObj);
+    virtual Status processReplSetSyncFrom(OperationContext* txn,
+                                          const HostAndPort& target,
+                                          BSONObjBuilder* resultObj);
 
     virtual Status processReplSetFreeze(int secs, BSONObjBuilder* resultObj);
 

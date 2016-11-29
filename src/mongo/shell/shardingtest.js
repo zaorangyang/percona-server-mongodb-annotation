@@ -727,8 +727,10 @@ var ShardingTest = function(params) {
     /**
      * Stops and restarts a mongos process.
      *
-     * If opts is specified, the new mongos is started using those options. Otherwise, it is started
-     * with its previous parameters.
+     * If 'opts' is not specified, starts the mongos with its previous parameters.  If 'opts' is
+     * specified and 'opts.restart' is false or missing, starts mongos with the parameters specified
+     * in 'opts'.  If opts is specified and 'opts.restart' is true, merges the previous options
+     * with the options specified in 'opts', with the options in 'opts' taking precedence.
      *
      * Warning: Overwrites the old s (if n = 0) admin, config, and sn member variables.
      */
@@ -759,6 +761,10 @@ var ShardingTest = function(params) {
             });
 
             this._mongos[n] = new MongoBridge(bridgeOptions);
+        }
+
+        if (opts.restart) {
+            opts = Object.merge(mongos.fullOptions, opts);
         }
 
         var newConn = MongoRunner.runMongos(opts);
@@ -1202,6 +1208,54 @@ var ShardingTest = function(params) {
 
     // Wait for master to be elected before starting mongos
     var csrsPrimary = this.configRS.getPrimary();
+
+    /**
+     * Helper method to check whether we should set featureCompatibilityVersion to 3.2 on the CSRS.
+     * We do this if we have a 3.2 shard or a 3.2 mongos and a 3.4 CSRS because older versions of
+     * mongod and mongos are unable to interact with a mongod having featureCompatibilityVersion set
+     * to 3.4.
+     */
+    function shouldSetFeatureCompatibilityVersion32() {
+        if (otherParams.configOptions && otherParams.configOptions.binVersion &&
+            otherParams.configOptions.binVersion === '3.2') {
+            return false;
+        }
+        if (jsTestOptions().shardMixedBinVersions) {
+            return true;
+        }
+        if (otherParams.shardOptions && otherParams.shardOptions.binVersion &&
+            otherParams.shardOptions.binVersion === '3.2') {
+            return true;
+        }
+        for (var i = 0; i < numShards; i++) {
+            if (otherParams['d' + i] && otherParams['d' + i].binVersion &&
+                otherParams['d' + i].binVersion === '3.2') {
+                return true;
+            }
+        }
+        if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion &&
+            otherParams.mongosOptions.binVersion === '3.2') {
+            return true;
+        }
+        for (var i = 0; i < numMongos; i++) {
+            if (otherParams['s' + i] && otherParams['s' + i].binVersion &&
+                otherParams['s' + i].binVersion === '3.2') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (shouldSetFeatureCompatibilityVersion32()) {
+        function setFeatureCompatibilityVersion() {
+            assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: '3.2'}));
+        }
+        if (keyFile) {
+            authutil.asCluster(csrsPrimary, keyFile, setFeatureCompatibilityVersion);
+        } else {
+            setFeatureCompatibilityVersion();
+        }
+    }
 
     // If chunkSize has been requested for this test, write the configuration
     if (otherParams.chunkSize) {

@@ -105,7 +105,7 @@ public:
 
     static Status syncApply(OperationContext* txn, const BSONObj& o, bool convertUpdateToUpsert);
 
-    void oplogApplication(ReplicationCoordinator* replCoord, stdx::function<bool()> shouldShutdown);
+    void oplogApplication(ReplicationCoordinator* replCoord);
     bool peek(OperationContext* txn, BSONObj* obj);
 
     class OpQueue {
@@ -123,6 +123,10 @@ public:
         bool empty() const {
             return _batch.empty();
         }
+        const OplogEntry& front() const {
+            invariant(!_batch.empty());
+            return _batch.front();
+        }
         const OplogEntry& back() const {
             invariant(!_batch.empty());
             return _batch.back();
@@ -132,12 +136,29 @@ public:
         }
 
         void emplace_back(BSONObj obj) {
+            invariant(!_mustShutdown);
             _bytes += obj.objsize();
             _batch.emplace_back(std::move(obj));
         }
         void pop_back() {
             _bytes -= back().raw.objsize();
             _batch.pop_back();
+        }
+
+        /**
+         * A batch with this set indicates that the upstream stages of the pipeline are shutdown and
+         * no more batches will be coming.
+         *
+         * This can only happen with empty batches.
+         *
+         * TODO replace the empty object used to signal draining with this.
+         */
+        bool mustShutdown() const {
+            return _mustShutdown;
+        }
+        void setMustShutdownFlag() {
+            invariant(empty());
+            _mustShutdown = true;
         }
 
         /**
@@ -150,11 +171,27 @@ public:
     private:
         std::vector<OplogEntry> _batch;
         size_t _bytes;
+        bool _mustShutdown = false;
     };
 
-    // returns true if we should continue waiting for BSONObjs, false if we should
-    // stop waiting and apply the queue we have.  Only returns false if !ops.empty().
-    bool tryPopAndWaitForMore(OperationContext* txn, OpQueue* ops);
+    struct BatchLimits {
+        size_t bytes = replBatchLimitBytes;
+        size_t ops = replBatchLimitOperations.load();
+
+        // If provided, the batch will not include any operations with timestamps after this point.
+        // This is intended for implementing slaveDelay, so it should be some number of seconds
+        // before now.
+        boost::optional<Date_t> slaveDelayLatestTimestamp = {};
+    };
+
+    /**
+     * Attempts to pop an OplogEntry off the BGSync queue and add it to ops.
+     *
+     * Returns true if the (possibly empty) batch in ops should be ended and a new one started.
+     * If ops is empty on entry and nothing can be added yet, will wait up to a second before
+     * returning true.
+     */
+    bool tryPopAndWaitForMore(OperationContext* txn, OpQueue* ops, const BatchLimits& limits);
 
     /**
      * Fetch a single document referenced in the operation from the sync source.
@@ -201,9 +238,8 @@ private:
  * Applies the operations described in the oplog entries contained in "ops" using the
  * "applyOperation" function.
  *
- * Returns ErrorCode::InterruptedAtShutdown if the node enters shutdown while applying ops,
- * ErrorCodes::CannotApplyOplogWhilePrimary if the node has become primary, and the OpTime of the
- * final operation applied otherwise.
+ * Returns ErrorCodes::CannotApplyOplogWhilePrimary if the node has become primary, and the OpTime
+ * of the final operation applied otherwise.
  *
  * Shared between here and MultiApplier.
  */

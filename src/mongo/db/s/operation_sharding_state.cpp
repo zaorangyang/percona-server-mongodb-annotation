@@ -42,7 +42,7 @@ const OperationContext::Decoration<OperationShardingState> shardingMetadataDecor
 // Max time to wait for the migration critical section to complete
 const Microseconds kMaxWaitForMigrationCriticalSection = Minutes(5);
 
-}  // namespace mongo
+}  // namespace
 
 OperationShardingState::OperationShardingState() = default;
 
@@ -53,11 +53,6 @@ OperationShardingState& OperationShardingState::get(OperationContext* txn) {
 void OperationShardingState::initializeShardVersion(NamespaceString nss,
                                                     const BSONElement& shardVersionElt) {
     invariant(!hasShardVersion());
-
-    if (nss.isSystemDotIndexes()) {
-        setShardVersion(std::move(nss), ChunkVersion::IGNORED());
-        return;
-    }
 
     if (shardVersionElt.eoo() || shardVersionElt.type() != BSONType::Array) {
         return;
@@ -89,11 +84,15 @@ ChunkVersion OperationShardingState::getShardVersion(const NamespaceString& nss)
 void OperationShardingState::setShardVersion(NamespaceString nss, ChunkVersion newVersion) {
     // This currently supports only setting the shard version for one namespace.
     invariant(!_hasVersion || _ns == nss);
-    invariant(!nss.isSystemDotIndexes() || ChunkVersion::isIgnoredVersion(newVersion));
 
     _ns = std::move(nss);
     _shardVersion = std::move(newVersion);
     _hasVersion = true;
+}
+
+void OperationShardingState::unsetShardVersion(NamespaceString nss) {
+    invariant(!_hasVersion || _ns == nss);
+    _clear();
 }
 
 bool OperationShardingState::waitForMigrationCriticalSectionSignal(OperationContext* txn) {

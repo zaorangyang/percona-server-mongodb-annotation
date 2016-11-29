@@ -34,13 +34,11 @@
 
 #include <string>
 
-#include "mongo/base/counter.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/internal_user_auth.h"
-#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/oplog.h"
@@ -60,13 +58,6 @@ namespace repl {
 
 const BSONObj reverseNaturalObj = BSON("$natural" << -1);
 
-// number of readers created;
-//  this happens when the source source changes, a reconfig/network-error or the cursor dies
-static Counter64 readersCreatedStats;
-static ServerStatusMetricField<Counter64> displayReadersCreated("repl.network.readersCreated",
-                                                                &readersCreatedStats);
-
-
 bool replAuthenticate(DBClientBase* conn) {
     if (isInternalAuthSet())
         return conn->authenticateInternalUser();
@@ -83,8 +74,6 @@ OplogReader::OplogReader() {
 
     /* TODO: slaveOk maybe shouldn't use? */
     _tailingQueryOptions |= QueryOption_AwaitData;
-
-    readersCreatedStats.increment();
 }
 
 bool OplogReader::connect(const HostAndPort& host) {
@@ -165,10 +154,9 @@ void OplogReader::connectToSyncSource(OperationContext* txn,
             log() << "our last optime : " << lastOpTimeFetched;
             log() << "oldest available is " << oldestOpTimeSeen;
             log() << "See http://dochub.mongodb.org/core/resyncingaverystalereplicasetmember";
-            StorageInterface::get(txn)->setMinValid(txn, {lastOpTimeFetched, oldestOpTimeSeen});
             auto status = replCoord->setMaintenanceMode(true);
             if (!status.isOK()) {
-                warning() << "Failed to transition into maintenance mode.";
+                warning() << "Failed to transition into maintenance mode: " << status;
             }
             bool worked = replCoord->setFollowerMode(MemberState::RS_RECOVERING);
             if (!worked) {

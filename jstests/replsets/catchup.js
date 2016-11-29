@@ -50,7 +50,7 @@ load("jstests/replsets/rslib.js");
             assert.commandWorked(
                 node.adminCommand({configureFailPoint: 'pauseRsBgSyncProducer', mode: 'off'}),
                 'Failed to disable pauseRsBgSyncProducer failpoint.');
-        } catch (ex) {
+        } catch (e) {
             // Enable bgsync producer may cause rollback, which will close all connections
             // including the one sending "configureFailPoint".
             print("got exception when disabling fail point 'pauseRsBgSyncProducer': " + e);
@@ -98,7 +98,7 @@ load("jstests/replsets/rslib.js");
     // Should complete transition to primary immediately.
     rst.awaitReplication(30000, ReplSetTest.OpTimeType.LAST_DURABLE);
     var newPrimary = stepUp(rst.getSecondary());
-    rst.waitForState(newPrimary, ReplSetTest.State.PRIMARY, 1000);
+    rst.awaitNodesAgreeOnPrimary();
     // Should win an election and finish the transition very quickly.
     assert.eq(newPrimary, rst.getPrimary());
 
@@ -110,7 +110,7 @@ load("jstests/replsets/rslib.js");
     var latestOp = getLatestOp(rst.getPrimary());
     // New primary wins immediately, but needs to catch up.
     newPrimary = stepUp(rst.getSecondary());
-    rst.waitForState(newPrimary, ReplSetTest.State.PRIMARY, 1000);
+    rst.awaitNodesAgreeOnPrimary();
     // Check this node is not writable.
     assert.eq(newPrimary.getDB("test").isMaster().ismaster, false);
     // Disable fail point to allow replication.
@@ -131,7 +131,7 @@ load("jstests/replsets/rslib.js");
 
     // New primary wins immediately, but needs to catch up.
     newPrimary = stepUp(rst.getSecondary());
-    rst.waitForState(newPrimary, ReplSetTest.State.PRIMARY, 1000);
+    rst.awaitNodesAgreeOnPrimary();
     var latestOpOnNewPrimary = getLatestOp(newPrimary);
     // Wait until the new primary completes the transition to primary and writes a no-op.
     assert.soon(function() {
@@ -158,10 +158,11 @@ load("jstests/replsets/rslib.js");
     var oldSecondaries = rst.getSecondaries();
     latestOp = getLatestOp(oldPrimary);
     newPrimary = stepUp(oldSecondaries[0]);
-    rst.waitForState(newPrimary, ReplSetTest.State.PRIMARY, 1000);
+    rst.awaitNodesAgreeOnPrimary();
     // Disable fail point on one of the other secondaries.
     // Wait until it catches up with the old primary.
     disableFailPoint(oldSecondaries[1]);
+    assert.commandWorked(oldSecondaries[1].adminCommand({replSetSyncFrom: oldPrimary.host}));
     awaitOpTime(oldSecondaries[1], latestOp.ts);
     // Disconnect the new primary and the old one.
     oldPrimary.disconnect(newPrimary);

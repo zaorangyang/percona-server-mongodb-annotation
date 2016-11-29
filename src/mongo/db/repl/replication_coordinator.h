@@ -440,10 +440,14 @@ public:
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
         ReplSetUpdatePositionCommandStyle commandStyle) const = 0;
 
+    enum class ReplSetGetStatusResponseStyle { kBasic, kInitialSync };
+
     /**
-     * Handles an incoming replSetGetStatus command. Adds BSON to 'result'.
+     * Handles an incoming replSetGetStatus command. Adds BSON to 'result'. If kInitialSync is
+     * requested but initial sync is not running, kBasic will be used.
      */
-    virtual Status processReplSetGetStatus(BSONObjBuilder* result) = 0;
+    virtual Status processReplSetGetStatus(BSONObjBuilder* result,
+                                           ReplSetGetStatusResponseStyle responseStyle) = 0;
 
     /**
      * Does an initial sync of data, after dropping existing data.
@@ -509,7 +513,9 @@ public:
      * returns Status::OK if the sync target could be set and an ErrorCode indicating why it
      * couldn't otherwise.
      */
-    virtual Status processReplSetSyncFrom(const HostAndPort& target, BSONObjBuilder* resultObj) = 0;
+    virtual Status processReplSetSyncFrom(OperationContext* txn,
+                                          const HostAndPort& target,
+                                          BSONObjBuilder* resultObj) = 0;
 
     /**
      * Handles an incoming replSetFreeze command. Adds BSON to 'resultObj'

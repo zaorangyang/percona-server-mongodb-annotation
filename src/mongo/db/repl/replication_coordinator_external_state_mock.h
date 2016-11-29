@@ -69,7 +69,7 @@ public:
     virtual executor::TaskExecutor* getTaskExecutor() const override;
     virtual OldThreadPool* getDbWorkThreadPool() const override;
     virtual Status initializeReplSetStorage(OperationContext* txn, const BSONObj& config);
-    virtual void logTransitionToPrimaryToOplog(OperationContext* txn);
+    virtual OpTime onTransitionToPrimary(OperationContext* txn, bool isV1ElectionProtocol);
     virtual void forwardSlaveProgress();
     virtual OID ensureMe(OperationContext*);
     virtual bool isSelf(const HostAndPort& host, ServiceContext* ctx);
@@ -84,10 +84,8 @@ public:
     virtual void closeConnections();
     virtual void killAllUserOperations(OperationContext* txn);
     virtual void shardingOnStepDownHook();
-    virtual void shardingOnDrainingStateHook(OperationContext* txn);
     virtual void signalApplierToChooseNewSyncSource();
     virtual void signalApplierToCancelFetcher();
-    virtual void dropAllTempCollections(OperationContext* txn);
     virtual void dropAllSnapshots();
     virtual void updateCommittedSnapshot(SnapshotName newCommitPoint);
     virtual void forceSnapshotCreation();
@@ -176,6 +174,21 @@ public:
      * Sets if we are taking snapshots for read concern majority use.
      */
     void setAreSnapshotsEnabled(bool val);
+
+    /**
+     * Noop
+     */
+    virtual void setupNoopWriter(Seconds waitTime);
+
+    /**
+     * Noop
+     */
+    virtual void startNoopWriter(OpTime lastKnownOpTime);
+
+    /**
+     * Noop
+     */
+    virtual void stopNoopWriter();
 
 private:
     StatusWith<BSONObj> _localRsConfigDocument;
