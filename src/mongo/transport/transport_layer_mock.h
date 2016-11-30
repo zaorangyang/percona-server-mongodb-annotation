@@ -28,9 +28,8 @@
 
 #pragma once
 
-#include <unordered_map>
-
 #include "mongo/base/status.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/ticket.h"
 #include "mongo/transport/ticket_impl.h"
@@ -104,11 +103,14 @@ public:
     bool inShutdown() const;
 
 private:
+    void _destroy(Session& session) override;
+
     struct Connection {
+        bool ended;
         std::unique_ptr<Session> session;
         SSLPeerInfo peerInfo;
     };
-    std::unordered_map<Session::Id, Connection> _sessions;
+    stdx::unordered_map<Session::Id, Connection> _sessions;
     bool _shutdown;
 };
 

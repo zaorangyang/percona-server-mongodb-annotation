@@ -66,10 +66,6 @@ using UniqueLock = stdx::unique_lock<stdx::mutex>;
 
 }  // namespace
 
-
-extern const std::size_t kInitialSyncMaxRetries;
-extern const std::size_t kInitialSyncMaxConnectRetries;
-
 // TODO: Remove forward declares once we remove rs_initialsync.cpp and other dependents.
 // Failpoint which fails initial sync and leaves an oplog entry in the buffer.
 MONGO_FP_FORWARD_DECLARE(failInitSyncWithBufferedEntriesLeft);
@@ -157,6 +153,10 @@ struct DataReplicatorOptions {
 
     SyncSourceSelector* syncSourceSelector = nullptr;
 
+    // The oplog fetcher will restart the oplog tailing query this many times on non-cancellation
+    // failures.
+    std::size_t oplogFetcherMaxFetcherRestarts = 0;
+
     std::string toString() const {
         return str::stream() << "DataReplicatorOptions -- "
                              << " localOplogNs: " << localOplogNS.toString()
@@ -229,22 +229,18 @@ public:
     // Pauses replication and application
     Status pause();
 
-    // Pauses replication and waits to return until all un-applied ops have been applied
-    StatusWith<Timestamp> flushAndPause();
-
     // Called when a slave has progressed to a new oplog position
     void slavesHaveProgressed();
 
     // Just like initialSync but can be called any time.
-    StatusWith<Timestamp> resync(OperationContext* txn);
+    StatusWith<Timestamp> resync(OperationContext* txn, std::size_t maxAttempts);
 
     /**
-     *  Does an initial sync, with up to 'kInitialSyncMaxRetries' retries.
+     *  Does an initial sync, with the provided number of attempts.
      *
      *  This should be the first method called after construction (see class comment).
      */
-    StatusWith<OpTimeWithHash> doInitialSync(OperationContext* txn,
-                                             std::size_t maxRetries = kInitialSyncMaxRetries);
+    StatusWith<OpTimeWithHash> doInitialSync(OperationContext* txn, std::size_t maxAttempts);
 
     DataReplicatorState getState() const;
 
@@ -367,9 +363,9 @@ private:
     bool _reporterPaused = false;                                               // (M)
     Handle _reporterHandle;                                                     // (M)
     std::unique_ptr<Reporter> _reporter;                                        // (M)
-    bool _applierActive = false;                                                // (M)
     bool _applierPaused = false;                                                // (X)
     std::unique_ptr<MultiApplier> _applier;                                     // (M)
+    std::unique_ptr<MultiApplier> _shuttingDownApplier;                         // (M)
     HostAndPort _syncSource;                                                    // (M)
     OpTimeWithHash _lastFetched;                                                // (MX)
     OpTimeWithHash _lastApplied;                                                // (MX)

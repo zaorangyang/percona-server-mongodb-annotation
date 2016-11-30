@@ -78,7 +78,7 @@ bool checkIfSingleDoc(OperationContext* txn,
                                                              idx,
                                                              newmin,
                                                              newmax,
-                                                             false,  // endKeyInclusive
+                                                             BoundInclusion::kIncludeStartKeyOnly,
                                                              PlanExecutor::YIELD_MANUAL));
     // check if exactly one document found
     PlanExecutor::ExecState state;
@@ -100,10 +100,10 @@ bool checkIfSingleDoc(OperationContext* txn,
 // using the specified splitPoints. Returns false if the metadata's chunks don't match
 // the new chunk boundaries exactly.
 //
-bool checkMetadataForSuccess(OperationContext* txn,
-                             const NamespaceString& nss,
-                             const ChunkRange& chunkRange,
-                             const std::vector<BSONObj>& splitKeys) {
+bool _checkMetadataForSuccess(OperationContext* txn,
+                              const NamespaceString& nss,
+                              const ChunkRange& chunkRange,
+                              const std::vector<BSONObj>& splitKeys) {
     ScopedCollectionMetadata metadataAfterSplit;
     {
         AutoGetCollection autoColl(txn, nss, MODE_IS);
@@ -118,13 +118,9 @@ bool checkMetadataForSuccess(OperationContext* txn,
 
     ChunkType nextChunk;
     for (const auto& endKey : newChunkBounds) {
-        log() << "checking metadataAfterSplit for new chunk boundaries [" << redact(startKey) << ","
-              << redact(endKey) << ")";
         // Check that all new chunks fit the new chunk boundaries
         if (!metadataAfterSplit->getNextChunk(startKey, &nextChunk) ||
             nextChunk.getMax().woCompare(endKey)) {
-            log() << "ERROR, found [" << redact(startKey) << "," << redact(nextChunk.getMax())
-                  << ")";
             return false;
         }
 
@@ -254,17 +250,17 @@ public:
 
         //
         // Lock the collection's metadata and get highest version for the current shard
-        // TODO(SERVER-25086): Remove distLock aquisition from split chunk
+        // TODO(SERVER-25086): Remove distLock acquisition from split chunk
         //
         const string whyMessage(str::stream() << "splitting chunk [" << min << ", " << max
                                               << ") in "
                                               << nss.toString());
-        auto scopedDistLock = grid.catalogClient(txn)->distLock(
+        auto scopedDistLock = grid.catalogClient(txn)->getDistLockManager()->lock(
             txn, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
         if (!scopedDistLock.isOK()) {
             errmsg = str::stream() << "could not acquire collection lock for " << nss.toString()
                                    << " to split chunk [" << redact(min) << "," << redact(max)
-                                   << ") " << redact(scopedDistLock.getStatus());
+                                   << ") " << causedBy(redact(scopedDistLock.getStatus()));
             warning() << errmsg;
             return false;
         }
@@ -276,7 +272,7 @@ public:
         if (!refreshStatus.isOK()) {
             errmsg = str::stream() << "splitChunk cannot split chunk "
                                    << "[" << redact(min) << "," << redact(max) << ") "
-                                   << redact(refreshStatus);
+                                   << causedBy(redact(refreshStatus));
 
             warning() << errmsg;
             return false;
@@ -350,10 +346,10 @@ public:
         log() << "splitChunk accepted at version " << shardVersion;
 
         auto request = SplitChunkRequest(
-            nss, expectedCollectionVersion.epoch(), chunkRange, splitKeys, shardName);
+            nss, shardName, expectedCollectionVersion.epoch(), chunkRange, splitKeys);
 
-        auto configCmdObj = request.toConfigCommandBSON(
-            BSON(WriteConcernOptions::kWriteConcernField << WriteConcernOptions::Majority));
+        auto configCmdObj =
+            request.toConfigCommandBSON(ShardingCatalogClient::kMajorityWriteConcern.toBSON());
 
         auto cmdResponseStatus =
             Grid::get(txn)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
@@ -366,17 +362,23 @@ public:
         //
         // Refresh chunk metadata regardless of whether or not the split succeeded
         //
-        ChunkVersion shardVersionAfterSplit;
-        refreshStatus = shardingState->refreshMetadataNow(txn, nss.ns(), &shardVersionAfterSplit);
+        {
+            ChunkVersion shardVersionAfterSplit;
+            refreshStatus =
+                shardingState->refreshMetadataNow(txn, nss.ns(), &shardVersionAfterSplit);
 
-        if (!refreshStatus.isOK()) {
-            errmsg = str::stream() << "failed to refresh metadata for split chunk [" << redact(min)
-                                   << "," << redact(max) << ") " << redact(refreshStatus);
+            if (!refreshStatus.isOK()) {
+                errmsg = str::stream() << "failed to refresh metadata for split chunk ["
+                                       << redact(min) << "," << redact(max) << ") "
+                                       << causedBy(redact(refreshStatus));
 
-            warning() << errmsg;
-            return false;
+                warning() << errmsg;
+                return false;
+            }
         }
 
+        // If we failed to get any response from the config server at all, despite retries, then we
+        // should just go ahead and fail the whole operation.
         if (!cmdResponseStatus.isOK())
             return appendCommandStatus(result, cmdResponseStatus.getStatus());
 
@@ -400,13 +402,13 @@ public:
         }
 
         //
-        // If _configsvrSplitChunk returned an error, look at this shard's metadata to deterine if
-        // the split actually did happen. This can happen if there's a network error getting the
-        // response from the first call to _configsvrSplitChunk, but it actually succeeds, thus the
-        // automatic retry fails with a precondition violation, for example.
+        // If _configsvrCommitChunkSplit returned an error, look at this shard's metadata to
+        // determine if  the split actually did happen. This can happen if there's a network error
+        // getting the response from the first call to _configsvrCommitChunkSplit, but it actually
+        // succeeds, thus the automatic retry fails with a precondition violation, for example.
         //
         if ((!commandStatus.isOK() || !writeConcernStatus.isOK()) &&
-            checkMetadataForSuccess(txn, nss, chunkRange, splitKeys)) {
+            _checkMetadataForSuccess(txn, nss, chunkRange, splitKeys)) {
 
             LOG(1) << "splitChunk [" << redact(min) << "," << redact(max)
                    << ") has already been committed.";

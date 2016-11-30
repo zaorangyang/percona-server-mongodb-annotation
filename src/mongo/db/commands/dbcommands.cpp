@@ -452,7 +452,7 @@ public:
         int was = _diaglog.setLevel(cmdObj.firstElement().numberInt());
         _diaglog.flush();
         if (!serverGlobalParams.quiet) {
-            LOG(0) << "CMD: diagLogging set to " << _diaglog.getLevel() << " from: " << was << endl;
+            LOG(0) << "CMD: diagLogging set to " << _diaglog.getLevel() << " from: " << was;
         }
         result.append("was", was);
         result.append("note", deprecationWarning);
@@ -550,6 +550,18 @@ public:
             warning() << deprecationWarning;
             result.append("note", deprecationWarning);
         }
+
+        auto featureCompatibilityVersion = serverGlobalParams.featureCompatibility.version.load();
+        if (ServerGlobalParams::FeatureCompatibility::Version::k32 == featureCompatibilityVersion &&
+            cmdObj.hasField("collation")) {
+            return appendCommandStatus(
+                result,
+                {ErrorCodes::InvalidOptions,
+                 "The featureCompatibilityVersion must be 3.4 to create a collection or "
+                 "view with a default collation. See "
+                 "http://dochub.mongodb.org/core/3.4-feature-compatibility."});
+        }
+
         return appendCommandStatus(result, createCollection(txn, dbname, cmdObj));
     }
 } cmdCreate;
@@ -662,7 +674,7 @@ public:
                     if (partialOk) {
                         break;  // skipped chunk is probably on another shard
                     }
-                    log() << "should have chunk: " << n << " have:" << myn << endl;
+                    log() << "should have chunk: " << n << " have:" << myn;
                     dumpChunks(txn, ns, query, sort);
                     uassert(10040, "chunks out of order", n == myn);
                 }
@@ -834,7 +846,7 @@ public:
                                               idx,
                                               min,
                                               max,
-                                              false,  // endKeyInclusive
+                                              BoundInclusion::kIncludeStartKeyOnly,
                                               PlanExecutor::YIELD_MANUAL);
         }
 
@@ -864,7 +876,7 @@ public:
         }
 
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
-            warning() << "Internal error while reading " << ns << endl;
+            warning() << "Internal error while reading " << ns;
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::OperationFailed,
@@ -1038,6 +1050,7 @@ public:
             // is not needed for the missing DB case, we can just do the same that's done in
             // CollectionStats.
             result.appendNumber("collections", 0);
+            result.appendNumber("views", 0);
             result.appendNumber("objects", 0);
             result.append("avgObjSize", 0);
             result.appendNumber("dataSize", 0);
@@ -1316,14 +1329,14 @@ void Command::execCommand(OperationContext* txn,
             if (oss.hasShardVersion()) {
                 if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
                     uassertStatusOK(
-                        {ErrorCodes::IllegalOperation,
+                        {ErrorCodes::NoShardingEnabled,
                          "Cannot accept sharding commands if not started with --shardsvr"});
                 } else if (!shardingState->enabled()) {
                     // TODO(esha): Once 3.4 ships, we no longer need to support initializing
                     // sharding awareness through commands, so just reject all sharding commands.
                     if (!shardingState->commandInitializesShardingAwareness(
                             request.getCommandName().toString())) {
-                        uassertStatusOK({ErrorCodes::IllegalOperation,
+                        uassertStatusOK({ErrorCodes::NoShardingEnabled,
                                          str::stream()
                                              << "Received a command with sharding chunk version "
                                                 "information but this node is not sharding aware: "
@@ -1410,7 +1423,7 @@ bool Command::run(OperationContext* txn,
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
             LOG(debugLevel) << "Command on database " << db
                             << " timed out waiting for read concern to be satisfied. Command: "
-                            << getRedactedCopyForLogging(request.getCommandArgs());
+                            << redact(getRedactedCopyForLogging(request.getCommandArgs()));
         }
 
         auto result = appendCommandStatus(inPlaceReplyBob, rcStatus);

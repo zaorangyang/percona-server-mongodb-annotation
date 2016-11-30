@@ -30,7 +30,6 @@
 
 #include <list>
 #include <map>
-#include <unordered_map>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
@@ -42,6 +41,7 @@
 #include "mongo/s/migration_secondary_throttle_options.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/notification.h"
 
 namespace mongo {
@@ -99,20 +99,39 @@ public:
                                   bool waitForDelete);
 
     /**
-     * Non-blocking method, which puts the migration manager in a state where new migrations can be
-     * scheduled (kEnabled). May only be called if the manager is in the kStopped state.
+     * Non-blocking method that puts the migration manager in the kRecovering state, in which
+     * new migration requests will block until finishRecovery is called. Then does local writes to
+     * reacquire the distributed locks for active migrations.
+     *
+     * The active migration recovery may fail and be abandoned, setting the state to kEnabled.
      */
-    void enableMigrations();
+    void startRecoveryAndAcquireDistLocks(OperationContext* txn);
 
     /**
-     * Non-blocking method, which puts the manager in a state where all subsequently scheduled
-     * migrations will immediately fail (without ever getting scheduled) and all active ones will be
-     * cancelled. It has no effect if the migration manager is not enabled.
+     * Blocking method that must only be called after startRecovery has been called. Recovers the
+     * state of the migration manager (if necessary and able) and puts it in the kEnabled state,
+     * where it will accept new migrations. Any migrations waiting on the recovery state will be
+     * unblocked once the state is kEnabled, and then this function waits for the recovered active
+     * migrations to finish before returning.
+     *
+     * The active migration recovery may fail and be abandoned, setting the state to kEnabled and
+     * unblocking any process waiting on the recovery state.
+     */
+    void finishRecovery(OperationContext* txn,
+                        uint64_t maxChunkSizeBytes,
+                        const MigrationSecondaryThrottleOptions& secondaryThrottle,
+                        bool waitForDelete);
+
+    /**
+     * Non-blocking method that should never be called concurrently with finishRecovery. Puts the
+     * manager in a state where all subsequently scheduled migrations will immediately fail (without
+     * ever getting scheduled) and all active ones will be cancelled. It has no effect if the
+     * migration manager is already stopping or stopped.
      */
     void interruptAndDisableMigrations();
 
     /**
-     * Blocking method, which waits for any currently scheduled migrations to complete. Must be
+     * Blocking method that waits for any currently scheduled migrations to complete. Must be
      * called after interruptAndDisableMigrations has been called in order to be able to re-enable
      * migrations again.
      */
@@ -120,7 +139,12 @@ public:
 
 private:
     // The current state of the migration manager
-    enum State { kEnabled, kStopping, kStopped };
+    enum class State {  // Allowed transitions:
+        kStopped,       // kRecovering
+        kRecovering,    // kEnabled, kStopping
+        kEnabled,       // kStopping
+        kStopping,      // kStopped
+    };
 
     /**
      * Tracks the execution state of a single migration.
@@ -164,7 +188,7 @@ private:
     };
 
     using CollectionMigrationsStateMap =
-        std::unordered_map<NamespaceString, CollectionMigrationsState>;
+        stdx::unordered_map<NamespaceString, CollectionMigrationsState>;
 
     /**
      * Optionally takes the collection distributed lock and schedules a chunk migration with the
@@ -217,22 +241,46 @@ private:
                                          Migration migration);
 
     /**
-     * If the state of the migration manager is kStopping checks whether there are any outstanding
-     * scheduled requests and if there aren't any signals the 'stopped' conditional variable.
+     * If the state of the migration manager is kStopping, checks whether there are any outstanding
+     * scheduled requests and if there aren't any signals the class condition variable.
      */
     void _checkDrained_inlock();
 
-    // The service context under which this migration manager runs
+    /**
+     * Blocking call, which waits for the migration manager to leave the recovering state (if it is
+     * currently recovering).
+     */
+    void _waitForRecovery();
+
+    /**
+     * Should only be called from startRecovery or finishRecovery functions when the migration
+     * manager is in either the kStopped or kRecovering state. Releases all the distributed locks
+     * that the balancer holds, clears the config.migrations collection, changes the state of the
+     * migration manager to kEnabled. Then unblocks all processes waiting for kEnabled state.
+     */
+    void _abandonActiveMigrationsAndEnableManager(OperationContext* txn);
+
+    // The service context under which this migration manager runs.
     ServiceContext* const _serviceContext;
 
-    // Protects the class state below
+    // Used as a constant session ID for all distributed locks that this MigrationManager holds.
+    // Currently required so that locks can be reacquired for the balancer in startRecovery and then
+    // overtaken in later operations.
+    OID _lockSessionID;
+
+    // Carries migration information over from startRecovery to finishRecovery. Should only be set
+    // in startRecovery and then accessed in finishRecovery.
+    stdx::unordered_map<NamespaceString, std::list<MigrateInfo>> _migrationRecoveryMap;
+
+    // Protects the class state below.
     stdx::mutex _mutex;
 
-    // Start the migration manager as stopped
-    State _state{kStopped};
+    // Always start the migration manager in a stopped state.
+    State _state{State::kStopped};
 
-    // Condition variable, which is signaled when the migration manager has no more active requests
-    stdx::condition_variable _stoppedCondVar;
+    // Condition variable, which is waited on when the migration manager's state is changing and
+    // signaled when the state change is complete.
+    stdx::condition_variable _condVar;
 
     // Holds information about each collection's distributed lock and active migrations via a
     // CollectionMigrationState object.

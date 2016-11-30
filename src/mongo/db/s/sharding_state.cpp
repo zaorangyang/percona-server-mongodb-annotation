@@ -112,7 +112,7 @@ void updateShardIdentityConfigStringCB(const string& setName, const string& newC
                       ->updateShardIdentityConfigString(uniqOpCtx.get(), newConnectionString);
     if (!status.isOK() && !ErrorCodes::isNotMasterError(status.code())) {
         warning() << "error encountered while trying to update config connection string to "
-                  << newConnectionString << redact(status);
+                  << newConnectionString << causedBy(redact(status));
     }
 }
 
@@ -145,7 +145,7 @@ bool ShardingState::enabled() const {
 ConnectionString ShardingState::getConfigServer(OperationContext* txn) {
     invariant(enabled());
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return grid.shardRegistry()->getConfigServerConnectionString();
+    return Grid::get(txn)->shardRegistry()->getConfigServerConnectionString();
 }
 
 string ShardingState::getShardName() {
@@ -241,17 +241,12 @@ CollectionShardingState* ShardingState::getNS(const std::string& ns, OperationCo
     return it->second.get();
 }
 
-void ShardingState::clearCollectionMetadata() {
+void ShardingState::markCollectionsNotShardedAtStepdown() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _collections.clear();
-}
-
-void ShardingState::resetMetadata(const string& ns) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-    warning() << "resetting metadata for " << ns << ", this should only be used in testing";
-
-    _collections.erase(ns);
+    for (auto& coll : _collections) {
+        auto& css = coll.second;
+        css->markNotShardedAtStepdown();
+    }
 }
 
 void ShardingState::setGlobalInitMethodForTest(GlobalInitFunc func) {
@@ -575,7 +570,7 @@ void ShardingState::_signalInitializationComplete(Status status) {
     _initializationFinishedCondition.notify_all();
 }
 
-Status ShardingState::initializeShardingAwarenessIfNeeded(OperationContext* txn) {
+StatusWith<bool> ShardingState::initializeShardingAwarenessIfNeeded(OperationContext* txn) {
     // In sharded readOnly mode, we ignore the shardIdentity document on disk and instead *require*
     // a shardIdentity document to be passed through --overrideShardIdentity.
     if (storageGlobalParams.readOnly) {
@@ -594,7 +589,7 @@ Status ShardingState::initializeShardingAwarenessIfNeeded(OperationContext* txn)
             if (!status.isOK()) {
                 return status;
             }
-            return reloadShardRegistryUntilSuccess(txn);
+            return true;
         } else {
             // Error if --overrideShardIdentity is used but *not* started with --shardsvr.
             if (!serverGlobalParams.overrideShardIdentity.isEmpty()) {
@@ -605,7 +600,7 @@ Status ShardingState::initializeShardingAwarenessIfNeeded(OperationContext* txn)
                            "through --overrideShardIdentity: "
                         << serverGlobalParams.overrideShardIdentity};
             }
-            return Status::OK();
+            return false;
         }
     }
     // In sharded *non*-readOnly mode, error if --overrideShardIdentity is provided. Use the
@@ -644,7 +639,7 @@ Status ShardingState::initializeShardingAwarenessIfNeeded(OperationContext* txn)
                           << NamespaceString::kConfigCollectionNamespace
                           << ". This most likely means this server has not yet been added to a "
                              "sharded cluster.";
-                return Status::OK();
+                return false;
             }
             auto swShardIdentity = ShardIdentityType::fromBSON(shardIdentityBSON);
             if (!swShardIdentity.isOK()) {
@@ -654,7 +649,7 @@ Status ShardingState::initializeShardingAwarenessIfNeeded(OperationContext* txn)
             if (!status.isOK()) {
                 return status;
             }
-            return reloadShardRegistryUntilSuccess(txn);
+            return true;
         } else {
             // Warn if a shardIdentity document is found on disk but *not* started with --shardsvr.
             if (!shardIdentityBSON.isEmpty()) {
@@ -663,7 +658,7 @@ Status ShardingState::initializeShardingAwarenessIfNeeded(OperationContext* txn)
                           << NamespaceString::kConfigCollectionNamespace << ": "
                           << shardIdentityBSON;
             }
-            return Status::OK();
+            return false;
         }
     }
 }
@@ -714,7 +709,8 @@ StatusWith<ChunkVersion> ShardingState::_refreshMetadata(
         if (status.code() == ErrorCodes::NamespaceNotFound) {
             remoteMetadata.reset();
         } else if (!status.isOK()) {
-            warning() << "Could not remotely refresh metadata for " << nss.ns() << redact(status);
+            warning() << "Could not remotely refresh metadata for " << nss.ns()
+                      << causedBy(redact(status));
 
             return status;
         }
@@ -737,10 +733,9 @@ StatusWith<ChunkVersion> ShardingState::_refreshMetadata(
 
 StatusWith<ScopedRegisterMigration> ShardingState::registerMigration(const MoveChunkRequest& args) {
     if (_migrationDestManager.isActive()) {
-        return {
-            ErrorCodes::ConflictingOperationInProgress,
-            str::stream()
-                << "Unable start new migration because this shard is currently receiving a chunk"};
+        return {ErrorCodes::ConflictingOperationInProgress,
+                str::stream() << "Unable to start new migration because this shard is currently "
+                                 "receiving a chunk"};
     }
 
     return _activeMigrationsRegistry.registerMigration(args);

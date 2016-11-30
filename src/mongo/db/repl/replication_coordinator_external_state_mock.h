@@ -68,8 +68,10 @@ public:
     virtual void shutdown(OperationContext* txn);
     virtual executor::TaskExecutor* getTaskExecutor() const override;
     virtual OldThreadPool* getDbWorkThreadPool() const override;
+    virtual Status runRepairOnLocalDB(OperationContext* txn) override;
     virtual Status initializeReplSetStorage(OperationContext* txn, const BSONObj& config);
-    virtual OpTime onTransitionToPrimary(OperationContext* txn, bool isV1ElectionProtocol);
+    void onDrainComplete(OperationContext* txn) override;
+    OpTime onTransitionToPrimary(OperationContext* txn, bool isV1ElectionProtocol) override;
     virtual void forwardSlaveProgress();
     virtual OID ensureMe(OperationContext*);
     virtual bool isSelf(const HostAndPort& host, ServiceContext* ctx);
@@ -96,14 +98,15 @@ public:
     virtual StatusWith<OpTime> multiApply(OperationContext* txn,
                                           MultiApplier::Operations ops,
                                           MultiApplier::ApplyOperationFn applyOperation) override;
-    virtual void multiSyncApply(MultiApplier::OperationPtrs* ops) override;
-    virtual void multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                       const HostAndPort& source) override;
+    virtual Status multiSyncApply(MultiApplier::OperationPtrs* ops) override;
+    virtual Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+                                         const HostAndPort& source) override;
     virtual std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(
         OperationContext* txn) const override;
     virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(
         OperationContext* txn) const override;
     virtual bool shouldUseDataReplicatorInitialSync() const override;
+    virtual std::size_t getOplogFetcherMaxFetcherRestarts() const override;
 
     /**
      * Adds "host" to the list of hosts that this mock will match when responding to "isSelf"

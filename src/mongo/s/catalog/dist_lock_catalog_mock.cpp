@@ -38,8 +38,8 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
 namespace {
+
 Status kBadRetValue(ErrorCodes::InternalError, "no return value");
 StatusWith<LocksType> kLocksTypeBadRetValue(kBadRetValue);
 StatusWith<LockpingsType> kLockpingsTypeBadRetValue(kBadRetValue);
@@ -120,7 +120,7 @@ void noGetServerInfoSet() {
     FAIL("getServerInfo not expected to be called");
 }
 
-}  // unnamed namespace
+}  // namespace
 
 DistLockCatalogMock::DistLockCatalogMock()
     : _grabLockChecker(noGrabLockFuncSet),
@@ -179,7 +179,8 @@ StatusWith<LocksType> DistLockCatalogMock::grabLock(OperationContext* txn,
                                                     StringData who,
                                                     StringData processId,
                                                     Date_t time,
-                                                    StringData why) {
+                                                    StringData why,
+                                                    const WriteConcernOptions& writeConcern) {
     auto ret = kLocksTypeBadRetValue;
     GrabLockFunc checkerFunc = noGrabLockFuncSet;
 
@@ -373,4 +374,5 @@ Status DistLockCatalogMock::unlockAll(OperationContext* txn, const std::string& 
     return Status(ErrorCodes::IllegalOperation,
                   str::stream() << "unlockAll not expected to be called; processID: " << processID);
 }
-}
+
+}  // namespace mongo

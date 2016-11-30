@@ -36,6 +36,7 @@
 
 #include <vector>
 
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
@@ -58,13 +59,16 @@
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete.h"
+#include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/represent_as.h"
 
 namespace mongo {
 
@@ -73,11 +77,10 @@ using std::endl;
 using std::string;
 using std::vector;
 
+using IndexVersion = IndexDescriptor::IndexVersion;
+
 static const int INDEX_CATALOG_INIT = 283711;
 static const int INDEX_CATALOG_UNINIT = 654321;
-
-// What's the default version of our indices?
-const int DefaultIndexVersionNumber = 1;
 
 const BSONObj IndexCatalog::_idObj = BSON("_id" << 1);
 
@@ -137,7 +140,7 @@ IndexCatalogEntry* IndexCatalog::_setupInMemoryStructures(OperationContext* txn,
     Status status = _isSpecOk(txn, descriptor->infoObj());
     if (!status.isOK() && status != ErrorCodes::IndexAlreadyExists) {
         severe() << "Found an invalid index " << descriptor->infoObj() << " on the "
-                 << _collection->ns().ns() << " collection: " << status.reason();
+                 << _collection->ns().ns() << " collection: " << redact(status);
         fassertFailedNoTrace(28782);
     }
 
@@ -208,14 +211,14 @@ bool IndexCatalog::_shouldOverridePlugin(OperationContext* txn, const BSONObj& k
 
     // RulesFor22
     if (!known) {
-        log() << "warning: can't find plugin [" << pluginName << "]" << endl;
+        log() << "warning: can't find plugin [" << pluginName << "]";
         return true;
     }
 
     if (!IndexNames::existedBefore24(pluginName)) {
         warning() << "Treating index " << keyPattern << " as ascending since "
                   << "it was created before 2.4 and '" << pluginName << "' "
-                  << "was not a valid type at that time." << endl;
+                  << "was not a valid type at that time.";
         return true;
     }
 
@@ -402,6 +405,8 @@ void IndexCatalog::IndexBuildBlock::fail() {
 void IndexCatalog::IndexBuildBlock::success() {
     Collection* collection = _catalog->_collection;
     fassert(17207, collection->ok());
+    NamespaceString ns(_indexNamespace);
+    invariant(_txn->lockState()->isDbLockedForMode(ns.db(), MODE_X));
 
     collection->getCatalogEntry()->indexBuildSuccess(_txn, _indexName);
 
@@ -411,6 +416,8 @@ void IndexCatalog::IndexBuildBlock::success() {
     fassert(17331, entry && entry == _entry);
 
     OperationContext* txn = _txn;
+    LOG(2) << "marking index " << _indexName << " as ready in snapshot id "
+           << txn->recoveryUnit()->getSnapshotId();
     _txn->recoveryUnit()->onCommit([txn, entry, collection] {
         // Note: this runs after the WUOW commits but before we release our X lock on the
         // collection. This means that any snapshot created after this must include the full index,
@@ -466,28 +473,41 @@ Status IndexCatalog::_isSpecOk(OperationContext* txn, const BSONObj& spec) const
     const NamespaceString& nss = _collection->ns();
 
     BSONElement vElt = spec["v"];
-    if (!vElt.eoo()) {
-        if (!vElt.isNumber()) {
-            return Status(ErrorCodes::CannotCreateIndex,
-                          str::stream() << "non-numeric value for \"v\" field: " << vElt);
-        }
-        double v = vElt.Number();
+    if (!vElt) {
+        return {ErrorCodes::InternalError,
+                str::stream()
+                    << "An internal operation failed to specify the 'v' field, which is a required "
+                       "property of an index specification: "
+                    << spec};
+    }
 
-        // SERVER-16893 Forbid use of v0 indexes with non-mmapv1 engines
-        if (v == 0 && !txn->getServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
-            return Status(ErrorCodes::CannotCreateIndex,
-                          str::stream() << "use of v0 indexes is only allowed with the "
-                                        << "mmapv1 storage engine");
-        }
+    if (!vElt.isNumber()) {
+        return Status(ErrorCodes::CannotCreateIndex,
+                      str::stream() << "non-numeric value for \"v\" field: " << vElt);
+    }
 
-        // note (one day) we may be able to fresh build less versions than we can use
-        // isASupportedIndexVersionNumber() is what we can use
-        if (v != 0 && v != 1) {
-            return Status(ErrorCodes::CannotCreateIndex,
-                          str::stream() << "this version of mongod cannot build new indexes "
-                                        << "of version number "
-                                        << v);
-        }
+    auto vEltAsInt = representAs<int>(vElt.number());
+    if (!vEltAsInt) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "Index version must be representable as a 32-bit integer, but got "
+                              << vElt.toString(false, false)};
+    }
+
+    auto indexVersion = static_cast<IndexVersion>(*vEltAsInt);
+
+    // SERVER-16893 Forbid use of v0 indexes with non-mmapv1 engines
+    if (indexVersion == IndexVersion::kV0 &&
+        !txn->getServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
+        return Status(ErrorCodes::CannotCreateIndex,
+                      str::stream() << "use of v0 indexes is only allowed with the "
+                                    << "mmapv1 storage engine");
+    }
+
+    if (!IndexDescriptor::isIndexVersionSupported(indexVersion)) {
+        return Status(ErrorCodes::CannotCreateIndex,
+                      str::stream() << "this version of mongod cannot build new indexes "
+                                    << "of version number "
+                                    << static_cast<int>(indexVersion));
     }
 
     if (nss.isSystemDotIndexes())
@@ -556,9 +576,26 @@ Status IndexCatalog::_isSpecOk(OperationContext* txn, const BSONObj& spec) const
         }
         collator = std::move(statusWithCollator.getValue());
 
+        if (!collator) {
+            return {ErrorCodes::InternalError,
+                    str::stream() << "An internal operation specified the collation "
+                                  << CollationSpec::kSimpleSpec
+                                  << " explicitly, which should instead be implied by omitting the "
+                                     "'collation' field from the index specification"};
+        }
+
+        if (static_cast<IndexVersion>(vElt.numberInt()) < IndexVersion::kV2) {
+            return {ErrorCodes::CannotCreateIndex,
+                    str::stream() << "Index version " << vElt.fieldNameStringData() << "="
+                                  << vElt.numberInt()
+                                  << " does not support the '"
+                                  << collationElement.fieldNameStringData()
+                                  << "' option"};
+        }
+
         string pluginName = IndexNames::findPluginName(key);
-        if (collator && (pluginName != IndexNames::BTREE) &&
-            (pluginName != IndexNames::GEO_2DSPHERE) && (pluginName != IndexNames::HASHED)) {
+        if ((pluginName != IndexNames::BTREE) && (pluginName != IndexNames::GEO_2DSPHERE) &&
+            (pluginName != IndexNames::HASHED)) {
             return Status(ErrorCodes::CannotCreateIndex,
                           str::stream() << "Index type '" << pluginName
                                         << "' does not support collation: "
@@ -711,7 +748,7 @@ Status IndexCatalog::_doesSpecConflictWithExisting(OperationContext* txn,
             findIndexByKeyPatternAndCollationSpec(txn, key, collation, findInProgressIndexes);
         if (desc) {
             LOG(2) << "index already exists with diff name " << name << " pattern: " << key
-                   << " collation: " << collation << endl;
+                   << " collation: " << collation;
 
             IndexDescriptor temp(_collection, _getAccessMethodName(txn, key), spec);
             if (!desc->areIndexOptionsEquivalent(&temp))
@@ -750,13 +787,21 @@ Status IndexCatalog::_doesSpecConflictWithExisting(OperationContext* txn,
     return Status::OK();
 }
 
-BSONObj IndexCatalog::getDefaultIdIndexSpec() const {
+BSONObj IndexCatalog::getDefaultIdIndexSpec(
+    ServerGlobalParams::FeatureCompatibility::Version featureCompatibilityVersion) const {
     dassert(_idObj["_id"].type() == NumberInt);
 
+    const auto indexVersion = IndexDescriptor::getDefaultIndexVersion(featureCompatibilityVersion);
+
     BSONObjBuilder b;
+    b.append("v", static_cast<int>(indexVersion));
     b.append("name", "_id_");
     b.append("ns", _collection->ns().ns());
     b.append("key", _idObj);
+    if (_collection->getDefaultCollator() && indexVersion >= IndexVersion::kV2) {
+        // Creating an index with the "collation" option requires a v=2 index.
+        b.append("collation", _collection->getDefaultCollator()->getSpec().toBSON());
+    }
     return b.obj();
 }
 
@@ -930,7 +975,7 @@ void IndexCatalog::_deleteIndexFromDisk(OperationContext* txn,
         // this is ok, as we may be partially through index creation
     } else if (!status.isOK()) {
         warning() << "couldn't drop index " << indexName << " on collection: " << _collection->ns()
-                  << " because of " << status.toString();
+                  << " because of " << redact(status);
     }
 }
 
@@ -1117,7 +1162,7 @@ IndexDescriptor* IndexCatalog::findShardKeyPrefixedIndex(OperationContext* txn,
         if (desc->isPartial())
             continue;
 
-        if (!shardKey.isPrefixOf(desc->keyPattern()))
+        if (!shardKey.isPrefixOf(desc->keyPattern(), SimpleBSONElementComparator::kInstance))
             continue;
 
         if (!desc->isMultikey(txn) && hasSimpleCollation)
@@ -1265,8 +1310,8 @@ Status IndexCatalog::_unindexRecord(OperationContext* txn,
     Status status = index->accessMethod()->remove(txn, obj, loc, options, &removed);
 
     if (!status.isOK()) {
-        log() << "Couldn't unindex record " << obj.toString() << " from collection "
-              << _collection->ns() << ". Status: " << status.toString();
+        log() << "Couldn't unindex record " << redact(obj) << " from collection "
+              << _collection->ns() << ". Status: " << redact(status);
     }
 
     if (keysDeletedOut) {
@@ -1334,13 +1379,12 @@ StatusWith<BSONObj> IndexCatalog::_fixIndexSpec(OperationContext* txn,
 
     BSONObjBuilder b;
 
-    int v = DefaultIndexVersionNumber;
-    if (!o["v"].eoo()) {
-        v = o["v"].numberInt();
-    }
+    // We've already verified in IndexCatalog::_isSpecOk() that the index version is present and
+    // that it is representable as a 32-bit integer.
+    auto vElt = o["v"];
+    invariant(vElt);
 
-    // idea is to put things we use a lot earlier
-    b.append("v", v);
+    b.append("v", vElt.numberInt());
 
     if (o["unique"].trueValue())
         b.appendBool("unique", true);  // normalize to bool true in case was int 1 or something...
@@ -1354,33 +1398,6 @@ StatusWith<BSONObj> IndexCatalog::_fixIndexSpec(OperationContext* txn,
     }
     b.append("name", name);
 
-    if (auto collationElt = spec["collation"]) {
-        // This should already have been verified by _isSpecOk().
-        invariant(collationElt.type() == BSONType::Object);
-
-        auto collator = CollatorFactoryInterface::get(txn->getServiceContext())
-                            ->makeFromBSON(collationElt.Obj());
-        if (!collator.isOK()) {
-            return collator.getStatus();
-        }
-
-        // If the collator factory returned a non-null collator, set the collation option to the
-        // result of serializing the collator's spec back into BSON. We do this in order to fill in
-        // all options that the user omitted.
-        //
-        // If the collator factory returned a null collator (representing the "simple" collation),
-        // we simply omit the "collation" from the index spec. This ensures that indices with the
-        // simple collation built on versions which do not support the collation feature have the
-        // same format for representing the simple collation as indices built on this version.
-        if (collator.getValue()) {
-            b.append("collation", collator.getValue()->getSpec().toBSON());
-        }
-    } else if (collection->getDefaultCollator()) {
-        // The user did not specify an explicit collation for this index and the collection has a
-        // default collator. In this case, the index inherits the collection default.
-        b.append("collation", collection->getDefaultCollator()->getSpec().toBSON());
-    }
-
     {
         BSONObjIterator i(o);
         while (i.more()) {
@@ -1391,7 +1408,7 @@ StatusWith<BSONObj> IndexCatalog::_fixIndexSpec(OperationContext* txn,
                 // skip
             } else if (s == "dropDups") {
                 // dropDups is silently ignored and removed from the spec as of SERVER-14710.
-            } else if (s == "v" || s == "unique" || s == "key" || s == "name" || s == "collation") {
+            } else if (s == "v" || s == "unique" || s == "key" || s == "name") {
                 // covered above
             } else {
                 b.append(e);

@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <map>
 #include <string>
 #include <vector>
 
@@ -43,6 +42,7 @@
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/time_support.h"
 
@@ -149,9 +149,10 @@ public:
     CollectionShardingState* getNS(const std::string& ns, OperationContext* txn);
 
     /**
-     * Clears the collection metadata cache after step down.
+     * Iterates through all known sharded collections and marks them (in memory only) as not sharded
+     * so that no filtering will be happening for slaveOk queries.
      */
-    void clearCollectionMetadata();
+    void markCollectionsNotShardedAtStepdown();
 
     /**
      * Refreshes the local metadata based on whether the expected version is higher than what we
@@ -199,12 +200,6 @@ public:
      */
     Status updateShardIdentityConfigString(OperationContext* txn,
                                            const std::string& newConnectionString);
-
-    /**
-     * TESTING ONLY
-     * Uninstalls the metadata for a given collection.
-     */
-    void resetMetadata(const std::string& ns);
 
     /**
      * If there are no migrations running on this shard, registers an active migration with the
@@ -264,8 +259,13 @@ public:
      * on disk, if there is one.
      * If started with --shardsvr in queryableBackupMode, initializes sharding awareness from the
      * shardIdentity document passed through the --overrideShardIdentity startup parameter.
+     *
+     * If returns true, the ShardingState::_globalInit method was called, meaning all the core
+     * classes for sharding were initialized, but no networking calls were made yet (with the
+     * exception of the duplicate ShardRegistry reload in ShardRegistry::startup() (see
+     * SERVER-26123). Outgoing networking calls to cluster members can now be made.
      */
-    Status initializeShardingAwarenessIfNeeded(OperationContext* txn);
+    StatusWith<bool> initializeShardingAwarenessIfNeeded(OperationContext* txn);
 
     /**
      * Check if a command is one of the whitelisted commands that can be accepted with shardVersion
@@ -281,7 +281,7 @@ private:
     friend class ScopedRegisterMigration;
 
     // Map from a namespace into the sharding state for each collection we have
-    typedef std::map<std::string, std::unique_ptr<CollectionShardingState>>
+    typedef stdx::unordered_map<std::string, std::unique_ptr<CollectionShardingState>>
         CollectionShardingStateMap;
 
     // Progress of the sharding state initialization

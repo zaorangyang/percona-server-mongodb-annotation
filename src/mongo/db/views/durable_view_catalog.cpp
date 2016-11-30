@@ -33,7 +33,6 @@
 #include "mongo/db/views/durable_view_catalog.h"
 
 #include <string>
-#include <unordered_set>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -42,6 +41,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/record_data.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/string_map.h"
@@ -78,7 +78,9 @@ Status DurableViewCatalogImpl::iterate(OperationContext* txn, Callback callback)
         RecordData& data = record->data;
 
         // Check the document is valid BSON, with only the expected fields.
-        fassertStatusOK(40224, validateBSON(data.data(), data.size()));
+        // Use the latest BSON validation version. Existing view definitions are allowed to contain
+        // decimal data even if decimal is disabled.
+        fassertStatusOK(40224, validateBSON(data.data(), data.size(), BSONVersion::kLatest));
         BSONObj viewDef = data.toBson();
 
         // Check read definitions for correct structure, and refuse reading past invalid
@@ -86,7 +88,7 @@ Status DurableViewCatalogImpl::iterate(OperationContext* txn, Callback callback)
         bool valid = true;
         for (const BSONElement& e : viewDef) {
             std::string name(e.fieldName());
-            valid &= name == "_id" || name == "viewOn" || name == "pipeline";
+            valid &= name == "_id" || name == "viewOn" || name == "pipeline" || name == "collation";
         }
         NamespaceString viewName(viewDef["_id"].str());
         valid &= viewName.isValid() && viewName.db() == _db->name();
@@ -98,6 +100,9 @@ Status DurableViewCatalogImpl::iterate(OperationContext* txn, Callback callback)
             valid &= viewDef["pipeline"].type() == mongo::Array;
         }
 
+        valid &=
+            (!viewDef.hasField("collation") || viewDef["collation"].type() == BSONType::Object);
+
         if (!valid) {
             return {ErrorCodes::InvalidViewDefinition,
                     str::stream() << "found invalid view definition " << viewDef["_id"]
@@ -106,7 +111,10 @@ Status DurableViewCatalogImpl::iterate(OperationContext* txn, Callback callback)
                                   << "'"};
         }
 
-        callback(viewDef);
+        Status callbackStatus = callback(viewDef);
+        if (!callbackStatus.isOK()) {
+            return callbackStatus;
+        }
     }
     return Status::OK();
 }

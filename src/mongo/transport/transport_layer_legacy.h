@@ -28,11 +28,10 @@
 
 #pragma once
 
-#include <unordered_map>
-
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/ticket_impl.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/net/listen.h"
@@ -89,6 +88,8 @@ public:
     void shutdown() override;
 
 private:
+    void _destroy(Session& session) override;
+
     void _handleNewConnection(std::unique_ptr<AbstractMessagingPort> amp);
 
     Status _runTicket(Ticket ticket);
@@ -140,11 +141,7 @@ private:
      */
     struct Connection {
         Connection(std::unique_ptr<AbstractMessagingPort> port, bool ended, Session::TagMask tags)
-            : amp(std::move(port)),
-              connectionId(amp->connectionId()),
-              tags(tags),
-              inUse(false),
-              ended(false) {}
+            : amp(std::move(port)), connectionId(amp->connectionId()), tags(tags) {}
 
         std::unique_ptr<AbstractMessagingPort> amp;
 
@@ -152,8 +149,8 @@ private:
 
         boost::optional<SSLPeerInfo> sslPeerInfo;
         Session::TagMask tags;
-        bool inUse;
-        bool ended;
+        bool inUse = false;
+        bool ended = false;
     };
 
     ServiceEntryPoint* _sep;
@@ -162,7 +159,7 @@ private:
     stdx::thread _listenerThread;
 
     mutable stdx::mutex _connectionsMutex;
-    std::unordered_map<Session::Id, Connection> _connections;
+    stdx::unordered_map<Session::Id, Connection> _connections;
 
     void _endSession_inlock(decltype(_connections.begin()) conn);
 

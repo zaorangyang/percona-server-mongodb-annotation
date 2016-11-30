@@ -31,6 +31,7 @@
 #include "mongo/db/query/query_solution.h"
 
 #include "mongo/bson/bsontypes.h"
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/query/collation/collation_index_key.h"
@@ -51,31 +52,33 @@ OrderedIntervalList buildStringBoundsOil(const std::string& keyName) {
     BSONObjBuilder strBob;
     strBob.appendMinForType("", BSONType::String);
     strBob.appendMaxForType("", BSONType::String);
-    ret.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(strBob.obj(), true, false));
+    ret.intervals.push_back(
+        IndexBoundsBuilder::makeRangeInterval(strBob.obj(), BoundInclusion::kIncludeStartKeyOnly));
 
     BSONObjBuilder objBob;
     objBob.appendMinForType("", BSONType::Object);
     objBob.appendMaxForType("", BSONType::Object);
-    ret.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(objBob.obj(), true, false));
+    ret.intervals.push_back(
+        IndexBoundsBuilder::makeRangeInterval(objBob.obj(), BoundInclusion::kIncludeStartKeyOnly));
 
     BSONObjBuilder arrBob;
     arrBob.appendMinForType("", BSONType::Array);
     arrBob.appendMaxForType("", BSONType::Array);
-    ret.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(arrBob.obj(), true, false));
+    ret.intervals.push_back(
+        IndexBoundsBuilder::makeRangeInterval(arrBob.obj(), BoundInclusion::kIncludeStartKeyOnly));
 
     return ret;
 }
 
 bool rangeCanContainString(const BSONElement& startKey,
                            const BSONElement& endKey,
-                           bool endKeyInclusive) {
+                           BoundInclusion boundInclusion) {
     OrderedIntervalList stringBoundsOil = buildStringBoundsOil("");
     OrderedIntervalList rangeOil;
     BSONObjBuilder bob;
     bob.appendAs(startKey, "");
     bob.appendAs(endKey, "");
-    rangeOil.intervals.push_back(
-        IndexBoundsBuilder::makeRangeInterval(bob.obj(), true, endKeyInclusive));
+    rangeOil.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(bob.obj(), boundInclusion));
 
     IndexBoundsBuilder::intersectize(rangeOil, &stringBoundsOil);
     return !stringBoundsOil.intervals.empty();
@@ -603,9 +606,13 @@ std::set<StringData> IndexScanNode::getFieldsWithStringBounds(const IndexBounds&
         while (keyPatternIterator.more() && startKeyIterator.more() && endKeyIterator.more()) {
             BSONElement startKey = startKeyIterator.next();
             BSONElement endKey = endKeyIterator.next();
-            if (startKey != endKey || CollationIndexKey::isCollatableType(startKey.type())) {
-                if (!rangeCanContainString(
-                        startKey, endKey, (startKeyIterator.more() || bounds.endKeyInclusive))) {
+            if (SimpleBSONElementComparator::kInstance.evaluate(startKey != endKey) ||
+                CollationIndexKey::isCollatableType(startKey.type())) {
+                BoundInclusion boundInclusion = bounds.boundInclusion;
+                if (startKeyIterator.more()) {
+                    boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
+                }
+                if (!rangeCanContainString(startKey, endKey, boundInclusion)) {
                     // If the first non-point range cannot contain strings, we don't need to
                     // add it to the return set.
                     keyPatternIterator.next();
@@ -689,7 +696,8 @@ void IndexScanNode::computeProperties() {
         BSONObjIterator endIter(bounds.endKey);
         while (keyIter.more() && startIter.more() && endIter.more()) {
             BSONElement key = keyIter.next();
-            if (startIter.next() == endIter.next()) {
+            if (SimpleBSONElementComparator::kInstance.evaluate(startIter.next() ==
+                                                                endIter.next())) {
                 equalityFields.insert(key.fieldName());
             }
         }

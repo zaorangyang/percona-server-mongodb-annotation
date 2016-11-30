@@ -72,6 +72,8 @@ namespace {
 using std::list;
 using std::string;
 
+const auto kInitialSyncMaxConnectRetries = 10;
+
 /**
  * Truncates the oplog (removes any documents) and resets internal variables that were
  * originally initialized or affected by using values from the oplog at startup time.  These
@@ -144,7 +146,7 @@ bool _initialSyncClone(OperationContext* txn,
     Status status = cloner.copyDb(txn, db, host, options, nullptr, collections);
     if (!status.isOK()) {
         log() << "initial sync: error while " << (dataPass ? "cloning " : "indexing ") << db
-              << ".  " << status.toString();
+              << ".  " << redact(status);
         return false;
     }
 
@@ -291,7 +293,7 @@ Status _initialSync(BackgroundSync* bgsync) {
         }
     }
 
-    InitialSync init(bgsync, multiInitialSyncApply);
+    InitialSync init(bgsync, multiInitialSyncApply_abortOnFailure);
     init.setHostname(r.getHost().toString());
 
     BSONObj lastOp = r.getLastOp(rsOplogName);
@@ -532,7 +534,7 @@ void syncDoInitialSync(ReplicationCoordinatorExternalState* replicationCoordinat
                 error() << status;
             }
         } catch (const DBException& e) {
-            error() << e;
+            error() << redact(e);
             // Return if in shutdown
             if (inShutdown()) {
                 return;

@@ -53,10 +53,12 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view.h"
@@ -259,14 +261,49 @@ boost::intrusive_ptr<Pipeline> reparsePipeline(
     if (!reparsedPipeline.isOK()) {
         error() << "Aggregation command did not round trip through parsing and serialization "
                    "correctly. Input pipeline: "
-                << Value(request.getPipeline()).toString()
-                << ", serialized pipeline: " << Value(serialized).toString();
+                << Value(request.getPipeline()) << ", serialized pipeline: " << Value(serialized);
         fassertFailedWithStatusNoTrace(40175, reparsedPipeline.getStatus());
     }
 
     reparsedPipeline.getValue()->injectExpressionContext(expCtx);
     reparsedPipeline.getValue()->optimizePipeline();
     return reparsedPipeline.getValue();
+}
+
+/**
+ * Returns Status::OK if each view namespace in 'pipeline' has a default collator equivalent to
+ * 'collator'. Otherwise, returns ErrorCodes::OptionNotSupportedOnView.
+ */
+Status collatorCompatibleWithPipeline(OperationContext* txn,
+                                      Database* db,
+                                      const CollatorInterface* collator,
+                                      const intrusive_ptr<Pipeline> pipeline) {
+    if (!db || !pipeline) {
+        return Status::OK();
+    }
+    for (auto&& potentialViewNs : pipeline->getInvolvedCollections()) {
+        if (db->getCollection(potentialViewNs.ns())) {
+            continue;
+        }
+
+        auto view = db->getViewCatalog()->lookup(txn, potentialViewNs.ns());
+        if (!view) {
+            continue;
+        }
+        if (!CollatorInterface::collatorsMatch(view->defaultCollator(), collator)) {
+            return {ErrorCodes::OptionNotSupportedOnView,
+                    str::stream() << "Cannot override default collation of view "
+                                  << potentialViewNs.ns()};
+        }
+    }
+    return Status::OK();
+}
+
+bool isMergePipeline(const std::vector<BSONObj>& pipeline) {
+    if (pipeline.empty()) {
+        return false;
+    }
+    return pipeline[0].hasField("$mergeCursors");
 }
 
 class PipelineCommand : public Command {
@@ -364,10 +401,26 @@ public:
             // recursively calling run, which will re-acquire locks on the underlying collection.
             // (The lock must be released because recursively acquiring locks on the database will
             // prohibit yielding.)
-            auto view = ctx.getView();
-            if (view && !startsWithCollStats()) {
+            if (ctx.getView() && !startsWithCollStats()) {
+                // Check that the default collation of 'view' is compatible with the
+                // operation's collation. The check is skipped if the 'request' has the empty
+                // collation, which means that no collation was specified.
+                if (!request.getCollation().isEmpty()) {
+                    auto operationCollator = CollatorFactoryInterface::get(txn->getServiceContext())
+                                                 ->makeFromBSON(request.getCollation());
+                    if (!operationCollator.isOK()) {
+                        return appendCommandStatus(result, operationCollator.getStatus());
+                    }
+                    if (!CollatorInterface::collatorsMatch(ctx.getView()->defaultCollator(),
+                                                           operationCollator.getValue().get())) {
+                        return appendCommandStatus(result,
+                                                   {ErrorCodes::OptionNotSupportedOnView,
+                                                    "Cannot override a view's default collation"});
+                    }
+                }
+
                 auto viewDefinition =
-                    ViewShardingCheck::getResolvedViewIfSharded(txn, ctx.getDb(), view);
+                    ViewShardingCheck::getResolvedViewIfSharded(txn, ctx.getDb(), ctx.getView());
                 if (!viewDefinition.isOK()) {
                     return appendCommandStatus(result, viewDefinition.getStatus());
                 }
@@ -382,7 +435,11 @@ public:
                     return appendCommandStatus(result, resolvedView.getStatus());
                 }
 
-                // With the view resolved, we can relinquish locks.
+                auto collationSpec = ctx.getView()->defaultCollator()
+                    ? ctx.getView()->defaultCollator()->getSpec().toBSON().getOwned()
+                    : CollationSpec::kSimpleSpec;
+
+                // With the view & collation resolved, we can relinquish locks.
                 ctx.releaseLocksForView();
 
                 // Parse the resolved view into a new aggregation request.
@@ -395,6 +452,7 @@ public:
                 if (!newRequest.isOK()) {
                     return appendCommandStatus(result, newRequest.getStatus());
                 }
+                newRequest.getValue().setCollation(collationSpec);
 
                 bool status = runParsed(
                     txn, origNss, newRequest.getValue(), newCmd.getValue(), errmsg, result);
@@ -413,6 +471,14 @@ public:
                 collection->getDefaultCollator()) {
                 invariant(!expCtx->getCollator());
                 expCtx->setCollator(collection->getDefaultCollator()->clone());
+            }
+
+            // Check that the view's collation matches the collation of any views involved
+            // in the pipeline.
+            auto pipelineCollationStatus =
+                collatorCompatibleWithPipeline(txn, ctx.getDb(), expCtx->getCollator(), pipeline);
+            if (!pipelineCollationStatus.isOK()) {
+                return appendCommandStatus(result, pipelineCollationStatus);
             }
 
             // Propagate the ExpressionContext throughout all of the pipeline's stages and
@@ -570,6 +636,22 @@ public:
         auto request = AggregationRequest::parseFromBSON(nss, cmdObj);
         if (!request.isOK()) {
             return appendCommandStatus(result, request.getStatus());
+        }
+
+        // If the featureCompatibilityVersion is 3.2, we disallow collation from the user. However,
+        // operations should still respect the collection default collation. The mongos attaches the
+        // collection default collation to the merger pipeline, since the merger may not have the
+        // collection metadata. So the merger needs to accept a collation, and we rely on the shards
+        // to reject collations from the user.
+        if (!request.getValue().getCollation().isEmpty() &&
+            serverGlobalParams.featureCompatibility.version.load() ==
+                ServerGlobalParams::FeatureCompatibility::Version::k32 &&
+            !isMergePipeline(request.getValue().getPipeline())) {
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::InvalidOptions,
+                       "The featureCompatibilityVersion must be 3.4 to use collation. See "
+                       "http://dochub.mongodb.org/core/3.4-feature-compatibility."));
         }
 
         return runParsed(txn, nss, request.getValue(), cmdObj, errmsg, result);

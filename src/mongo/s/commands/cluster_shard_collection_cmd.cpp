@@ -34,6 +34,7 @@
 #include <set>
 #include <vector>
 
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
@@ -349,7 +350,7 @@ public:
             BSONObj currentKey = idx["key"].embeddedObject();
             // Check 2.i. and 2.ii.
             if (!idx["sparse"].trueValue() && idx["filter"].eoo() && idx["collation"].eoo() &&
-                proposedKey.isPrefixOf(currentKey)) {
+                proposedKey.isPrefixOf(currentKey, SimpleBSONElementComparator::kInstance)) {
                 // We can't currently use hashed indexes with a non-default hash seed
                 // Check v.
                 // Note that this means that, for sharding, we only support one hashed index
@@ -425,8 +426,12 @@ public:
             // 5. If no useful index exists, and collection empty, create one on proposedKey.
             //    Only need to call ensureIndex on primary shard, since indexes get copied to
             //    receiving shard whenever a migrate occurs.
-            Status status = clusterCreateIndex(
-                txn, nss.ns(), proposedKey, CollationSpec::kSimpleSpec, careAboutUnique);
+            //    If the collection has a default collation, explicitly send the simple
+            //    collation as part of the createIndex request.
+            BSONObj collationArg =
+                !defaultCollation.isEmpty() ? CollationSpec::kSimpleSpec : BSONObj();
+            Status status =
+                clusterCreateIndex(txn, nss.ns(), proposedKey, collationArg, careAboutUnique);
             if (!status.isOK()) {
                 errmsg = str::stream() << "ensureIndex failed to create index on "
                                        << "primary shard: " << status.reason();

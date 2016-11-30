@@ -48,6 +48,7 @@
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/s/sharding_raii.h"
@@ -171,60 +172,60 @@ Balancer* Balancer::get(OperationContext* operationContext) {
     return get(operationContext->getServiceContext());
 }
 
-Status Balancer::startThread(OperationContext* txn) {
+void Balancer::onTransitionToPrimary(OperationContext* txn) {
     stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
-    switch (_state) {
-        case kStopping:
-            return {ErrorCodes::ConflictingOperationInProgress,
-                    "Sharding balancer is in currently being shut down"};
-        case kStopped:
-            invariant(!_thread.joinable());
-            _state = kRunning;
+    invariant(_state == kStopped);
+    _state = kRunning;
 
-            // Allow new migrations to be scheduled
-            _migrationManager.enableMigrations();
+    _migrationManager.startRecoveryAndAcquireDistLocks(txn);
 
-            _thread = stdx::thread([this] { _mainThread(); });
-        // Intentional fall through
-        case kRunning:
-            return Status::OK();
-        default:
-            MONGO_UNREACHABLE;
-    }
+    invariant(!_thread.joinable());
+    invariant(!_threadOperationContext);
+    _thread = stdx::thread([this] { _mainThread(); });
 }
 
-void Balancer::stopThread() {
+void Balancer::onStepDownFromPrimary() {
     stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
-    if (_state == kRunning) {
-        // Stop any active migrations and prevent any new migrations from getting scheduled
-        _migrationManager.interruptAndDisableMigrations();
+    if (_state != kRunning)
+        return;
 
-        // Request the balancer thread to stop
-        _state = kStopping;
-        _condVar.notify_all();
+    _state = kStopping;
+
+    // Interrupt the balancer thread if it has been started. We are guaranteed that the operation
+    // context of that thread is still alive, because we hold the balancer mutex.
+    if (_threadOperationContext) {
+        stdx::lock_guard<Client> scopedClientLock(*_threadOperationContext->getClient());
+        _threadOperationContext->markKilled(ErrorCodes::InterruptedDueToReplStateChange);
     }
+
+    // Schedule a separate thread to shutdown the migration manager in order to avoid deadlock with
+    // replication step down
+    invariant(!_migrationManagerInterruptThread.joinable());
+    _migrationManagerInterruptThread =
+        stdx::thread([this] { _migrationManager.interruptAndDisableMigrations(); });
+
+    _condVar.notify_all();
 }
 
-void Balancer::joinThread() {
+void Balancer::onDrainComplete(OperationContext* txn) {
+    invariant(!txn->lockState()->isLocked());
+
     {
         stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
-        if (_state == kStopped) {
+        if (_state == kStopped)
             return;
-        }
 
         invariant(_state == kStopping);
+        invariant(_thread.joinable());
     }
 
-    if (_thread.joinable()) {
-        _thread.join();
+    _thread.join();
 
-        // Wait for any scheduled migrations to finish draining
-        _migrationManager.drainActiveMigrations();
+    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    _state = kStopped;
+    _thread = {};
 
-        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
-        _state = kStopped;
-        _thread = {};
-    }
+    LOG(1) << "Balancer thread terminated";
 }
 
 void Balancer::joinCurrentRound(OperationContext* txn) {
@@ -291,36 +292,52 @@ void Balancer::report(OperationContext* txn, BSONObjBuilder* builder) {
 
 void Balancer::_mainThread() {
     Client::initThread("Balancer");
+    auto txn = cc().makeOperationContext();
+    auto shardingContext = Grid::get(txn.get());
 
     log() << "CSRS balancer is starting";
 
-    const Seconds kInitBackoffInterval(60);
-
-    // Take the balancer distributed lock and hold it permanently
-    while (!_stopRequested()) {
-        auto txn = cc().makeOperationContext();
-        auto shardingContext = Grid::get(txn.get());
-
-        auto distLockHandleStatus =
-            shardingContext->catalogClient(txn.get())->getDistLockManager()->lockWithSessionID(
-                txn.get(), "balancer", "CSRS Balancer", OID::gen());
-        if (distLockHandleStatus.isOK()) {
-            break;
-        }
-
-        warning() << "Balancer distributed lock could not be acquired and will be retried in "
-                  << durationCount<Seconds>(kInitBackoffInterval) << " seconds"
-                  << causedBy(distLockHandleStatus.getStatus());
-
-        _sleepFor(txn.get(), kInitBackoffInterval);
+    {
+        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+        _threadOperationContext = txn.get();
     }
 
-    log() << "CSRS balancer thread is now running";
+    const Seconds kInitBackoffInterval(10);
+
+    // Take the balancer distributed lock and hold it permanently. Do the attempts with single
+    // attempts in order to not block the thread and be able to check for interrupt more frequently.
+    while (!_stopRequested()) {
+        auto distLockHandleStatus =
+            shardingContext->catalogClient(txn.get())->getDistLockManager()->lockWithSessionID(
+                txn.get(),
+                "balancer",
+                "CSRS Balancer",
+                OID::gen(),
+                DistLockManager::kSingleLockAttemptTimeout);
+        if (!distLockHandleStatus.isOK()) {
+            warning() << "Balancer distributed lock could not be acquired and will be retried in "
+                      << durationCount<Seconds>(kInitBackoffInterval) << " seconds"
+                      << causedBy(distLockHandleStatus.getStatus());
+
+            _sleepFor(txn.get(), kInitBackoffInterval);
+            continue;
+        }
+
+        break;
+    }
+
+    log() << "CSRS balancer thread is recovering";
+
+    auto balancerConfig = Grid::get(txn.get())->getBalancerConfiguration();
+    _migrationManager.finishRecovery(txn.get(),
+                                     balancerConfig->getMaxChunkSizeBytes(),
+                                     balancerConfig->getSecondaryThrottle(),
+                                     balancerConfig->waitForDelete());
+
+    log() << "CSRS balancer thread is recovered";
 
     // Main balancer loop
     while (!_stopRequested()) {
-        auto txn = cc().makeOperationContext();
-        auto shardingContext = Grid::get(txn.get());
         auto balancerConfig = shardingContext->getBalancerConfiguration();
 
         BalanceRoundDetails roundDetails;
@@ -398,6 +415,21 @@ void Balancer::_mainThread() {
             // Sleep a fair amount before retrying because of the error
             _endRound(txn.get(), kBalanceRoundDefaultInterval);
         }
+    }
+
+    {
+        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+        invariant(_state == kStopping);
+        invariant(_migrationManagerInterruptThread.joinable());
+    }
+
+    _migrationManagerInterruptThread.join();
+    _migrationManager.drainActiveMigrations();
+
+    {
+        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+        _migrationManagerInterruptThread = {};
+        _threadOperationContext = nullptr;
     }
 
     log() << "CSRS balancer is now stopped";

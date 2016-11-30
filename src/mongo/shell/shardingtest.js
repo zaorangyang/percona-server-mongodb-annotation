@@ -110,6 +110,10 @@ var ShardingTest = function(params) {
     // cleaning up the data files on shutdown
     var _alldbpaths = [];
 
+    // Timeout to be used for operations scheduled by the sharding test, which must wait for write
+    // concern (5 minutes)
+    var kDefaultWTimeoutMs = 5 * 60 * 1000;
+
     // Publicly exposed variables
 
     /**
@@ -570,10 +574,15 @@ var ShardingTest = function(params) {
 
         var initialStatus = getBalancerStatus();
         var currentStatus;
-        assert.soon(function() {
-            currentStatus = getBalancerStatus();
-            return (currentStatus.numBalancerRounds - initialStatus.numBalancerRounds) != 0;
-        }, 'Latest balancer status' + currentStatus, timeoutMs);
+        assert.soon(
+            function() {
+                currentStatus = getBalancerStatus();
+                return (currentStatus.numBalancerRounds - initialStatus.numBalancerRounds) != 0;
+            },
+            function() {
+                return 'Latest balancer status: ' + tojson(currentStatus);
+            },
+            timeoutMs);
     };
 
     /**
@@ -1217,29 +1226,29 @@ var ShardingTest = function(params) {
      */
     function shouldSetFeatureCompatibilityVersion32() {
         if (otherParams.configOptions && otherParams.configOptions.binVersion &&
-            otherParams.configOptions.binVersion === '3.2') {
+            MongoRunner.getBinVersionFor(otherParams.configOptions.binVersion) === '3.2') {
             return false;
         }
         if (jsTestOptions().shardMixedBinVersions) {
             return true;
         }
         if (otherParams.shardOptions && otherParams.shardOptions.binVersion &&
-            otherParams.shardOptions.binVersion === '3.2') {
+            MongoRunner.getBinVersionFor(otherParams.shardOptions.binVersion) === '3.2') {
             return true;
         }
         for (var i = 0; i < numShards; i++) {
             if (otherParams['d' + i] && otherParams['d' + i].binVersion &&
-                otherParams['d' + i].binVersion === '3.2') {
+                MongoRunner.getBinVersionFor(otherParams['d' + i].binVersion) === '3.2') {
                 return true;
             }
         }
         if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion &&
-            otherParams.mongosOptions.binVersion === '3.2') {
+            MongoRunner.getBinVersionFor(otherParams.mongosOptions.binVersion) === '3.2') {
             return true;
         }
         for (var i = 0; i < numMongos; i++) {
             if (otherParams['s' + i] && otherParams['s' + i].binVersion &&
-                otherParams['s' + i].binVersion === '3.2') {
+                MongoRunner.getBinVersionFor(otherParams['s' + i].binVersion) === '3.2') {
                 return true;
             }
         }
@@ -1263,7 +1272,7 @@ var ShardingTest = function(params) {
             assert.writeOK(csrsPrimary.getDB('config').settings.update(
                 {_id: 'chunksize'},
                 {$set: {value: otherParams.chunkSize}},
-                {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
+                {upsert: true, writeConcern: {w: 'majority', wtimeout: kDefaultWTimeoutMs}}));
         }
 
         if (keyFile) {

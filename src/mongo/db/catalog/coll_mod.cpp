@@ -31,7 +31,9 @@
 #include "mongo/db/catalog/coll_mod.h"
 
 #include <boost/optional.hpp>
+#include <memory>
 
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
@@ -58,8 +60,9 @@ Status collMod(OperationContext* txn,
     // May also modify a view instead of a collection.
     boost::optional<ViewDefinition> view;
     if (db && !coll) {
-        auto sharedView = db->getViewCatalog()->lookup(txn, nss.ns());
+        const auto sharedView = db->getViewCatalog()->lookup(txn, nss.ns());
         if (sharedView) {
+            // We copy the ViewDefinition as it is modified below to represent the requested state.
             view = {*sharedView};
         }
     }
@@ -198,7 +201,7 @@ Status collMod(OperationContext* txn,
                 continue;
             }
 
-            if (oldExpireSecs != newExpireSecs) {
+            if (SimpleBSONElementComparator::kInstance.evaluate(oldExpireSecs != newExpireSecs)) {
                 result->appendAs(oldExpireSecs, "expireAfterSeconds_old");
                 // Change the value of "expireAfterSeconds" on disk.
                 coll->getCatalogEntry()->updateTTLSetting(
@@ -243,7 +246,7 @@ Status collMod(OperationContext* txn,
                                      "'pipeline' option only supported on a view");
                 continue;
             }
-            if (!e.isABSONObj()) {
+            if (e.type() != mongo::Array) {
                 errorStatus =
                     Status(ErrorCodes::InvalidOptions, "not a valid aggregation pipeline");
                 continue;

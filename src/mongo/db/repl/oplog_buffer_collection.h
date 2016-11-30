@@ -77,7 +77,7 @@ public:
      * Pushing documents with 'pushAllNonBlocking' will not handle sentinel documents properly. If
      * pushing sentinel documents is required, use 'push' or 'pushEvenIfFull'.
      */
-    bool pushAllNonBlocking(OperationContext* txn,
+    void pushAllNonBlocking(OperationContext* txn,
                             Batch::const_iterator begin,
                             Batch::const_iterator end) override;
     void waitForSpace(OperationContext* txn, std::size_t size) override;
@@ -87,8 +87,7 @@ public:
     std::size_t getCount() const override;
     void clear(OperationContext* txn) override;
     bool tryPop(OperationContext* txn, Value* value) override;
-    Value blockingPop(OperationContext* txn) override;
-    bool blockingPeek(OperationContext* txn, Value* value, Seconds waitDuration) override;
+    bool waitForData(Seconds waitDuration) override;
     bool peek(OperationContext* txn, Value* value) override;
     boost::optional<Value> lastObjectPushed(OperationContext* txn) const override;
 
@@ -120,7 +119,7 @@ private:
     /**
      * Pops an entry off the buffer in a lock.
      */
-    bool _doPop_inlock(OperationContext* txn, Value* value);
+    bool _pop_inlock(OperationContext* txn, Value* value);
 
     // The namespace for the oplog buffer collection.
     const NamespaceString _nss;

@@ -194,10 +194,16 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
     // Indexes need to store the metadata for collation to work as expected.
     ss << ",key_format=u,value_format=u";
 
+    // We build v=2 indexes when the featureCompatibilityVersion is 3.4. This means that the server
+    // supports new index features and we can therefore use KeyString::Version::V1.
+    const int keyStringVersion = desc.version() >= IndexDescriptor::IndexVersion::kV2
+        ? kKeyStringV1Version
+        : kKeyStringV0Version;
+
     // Index metadata
     ss << ",app_metadata=("
-       << "formatVersion=" << (enableBSON1_1 ? kKeyStringV1Version : kKeyStringV0Version) << ','
-       << "infoObj=" << desc.infoObj().jsonString() << "),";
+       << "formatVersion=" << keyStringVersion << ',' << "infoObj=" << desc.infoObj().jsonString()
+       << "),";
 
     LOG(3) << "index create string: " << ss.ss.str();
     return StatusWith<std::string>(ss);
@@ -485,9 +491,13 @@ protected:
 
         // Not using cursor cache since we need to set "bulk".
         WT_CURSOR* cursor;
-        // We use our own session to ensure we aren't in a transaction.
+        // Use a different session to ensure we don't hijack an existing transaction.
+        // Configure the bulk cursor open to fail quickly if it would wait on a checkpoint
+        // completing - since checkpoints can take a long time, and waiting can result in
+        // an unexpected pause in building an index.
         WT_SESSION* session = _session->getSession();
-        int err = session->open_cursor(session, idx->uri().c_str(), NULL, "bulk", &cursor);
+        int err = session->open_cursor(
+            session, idx->uri().c_str(), NULL, "bulk,checkpoint_wait=false", &cursor);
         if (!err)
             return cursor;
 

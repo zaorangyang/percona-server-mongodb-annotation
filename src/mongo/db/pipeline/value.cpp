@@ -37,6 +37,7 @@
 #include "mongo/base/compare_numbers.h"
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/platform/decimal128.h"
@@ -181,8 +182,7 @@ Value::Value(const BSONElement& elem) : _storage(elem.type()) {
         }
 
         case jstOID:
-            static_assert(sizeof(_storage.oid) == OID::kOIDSize,
-                          "sizeof(_storage.oid) == OID::kOIDSize");
+            MONGO_STATIC_ASSERT(sizeof(_storage.oid) == OID::kOIDSize);
             memcpy(_storage.oid, elem.OID().view().view(), OID::kOIDSize);
             break;
 
@@ -836,8 +836,7 @@ void Value::hash_combine(size_t& seed,
 
         case bsonTimestamp:
         case Date:
-            static_assert(sizeof(_storage.dateValue) == sizeof(_storage.timestampValue),
-                          "sizeof(_storage.dateValue) == sizeof(_storage.timestampValue)");
+            MONGO_STATIC_ASSERT(sizeof(_storage.dateValue) == sizeof(_storage.timestampValue));
             boost::hash_combine(seed, _storage.dateValue);
             break;
 
@@ -930,8 +929,8 @@ void Value::hash_combine(size_t& seed,
 
         case CodeWScope: {
             intrusive_ptr<const RCCodeWScope> cws = _storage.getCodeWScope();
-            boost::hash_combine(seed, SimpleStringDataComparator::kInstance.hash(cws->code));
-            boost::hash_combine(seed, BSONObj::Hasher()(cws->scope));
+            SimpleStringDataComparator::kInstance.hash_combine(seed, cws->code);
+            SimpleBSONObjComparator::kInstance.hash_combine(seed, cws->scope);
             break;
         }
     }
@@ -1015,7 +1014,7 @@ bool Value::integral() const {
             // If we are able to convert the decimal to an int32_t without an rounding errors,
             // then it is integral.
             uint32_t signalingFlags = Decimal128::kNoFlag;
-            (void)_storage.getDecimal().toInt(&signalingFlags);
+            (void)_storage.getDecimal().toIntExact(&signalingFlags);
             return signalingFlags == Decimal128::kNoFlag;
         }
         default:

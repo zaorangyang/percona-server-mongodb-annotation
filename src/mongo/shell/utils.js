@@ -156,6 +156,31 @@ if (typeof TestData == "undefined") {
     TestData = undefined;
 }
 
+function __sanitizeMatch(flag) {
+    var sanitizeMatch = /-fsanitize=([^\s]+) /.exec(getBuildInfo()["buildEnvironment"]["ccflags"]);
+    if (flag && sanitizeMatch && RegExp(flag).exec(sanitizeMatch[1])) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+function _isAddressSanitizerActive() {
+    return __sanitizeMatch("address");
+}
+
+function _isLeakSanitizerActive() {
+    return __sanitizeMatch("leak");
+}
+
+function _isThreadSanitizerActive() {
+    return __sanitizeMatch("thread");
+}
+
+function _isUndefinedBehaviorSanitizerActive() {
+    return __sanitizeMatch("undefined");
+}
+
 jsTestName = function() {
     if (TestData)
         return TestData.testName;
@@ -197,7 +222,9 @@ jsTestOptions = function() {
             mongosBinVersion: TestData.mongosBinVersion || "",
             shardMixedBinVersions: TestData.shardMixedBinVersions || false,
             networkMessageCompressors: TestData.networkMessageCompressors,
-            skipValidationOnInvalidViewDefinitions: TestData.skipValidationOnInvalidViewDefinitions
+            skipValidationOnInvalidViewDefinitions: TestData.skipValidationOnInvalidViewDefinitions,
+            forceValidationWithFeatureCompatibilityVersion:
+                TestData.forceValidationWithFeatureCompatibilityVersion
         });
     }
     return _jsTestOptions;

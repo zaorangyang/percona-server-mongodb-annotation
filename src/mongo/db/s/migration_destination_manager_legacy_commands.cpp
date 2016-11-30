@@ -93,12 +93,6 @@ public:
              BSONObjBuilder& result) {
         ShardingState* const shardingState = ShardingState::get(txn);
 
-        // Active state of TO-side migrations (MigrateStatus) is serialized by distributed
-        // collection lock.
-        uassert(ErrorCodes::ConflictingOperationInProgress,
-                "Shard is already serving as a destination for migration",
-                !shardingState->migrationDestinationManager()->isActive());
-
         // Pending deletes (for migrations) are serialized by the distributed collection lock,
         // we are sure we registered a delete for a range *before* we can migrate-in a
         // subrange.
@@ -144,7 +138,7 @@ public:
         if (!status.isOK()) {
             errmsg = str::stream() << "cannot start recv'ing chunk "
                                    << "[" << redact(min) << "," << redact(max) << ")"
-                                   << redact(status);
+                                   << causedBy(redact(status));
 
             warning() << errmsg;
             return false;
@@ -160,9 +154,10 @@ public:
 
         auto statusWithFromShardConnectionString = ConnectionString::parse(cmdObj["from"].String());
         if (!statusWithFromShardConnectionString.isOK()) {
-            errmsg = str::stream() << "cannot start recv'ing chunk "
-                                   << "[" << redact(min) << "," << redact(max) << ")"
-                                   << redact(statusWithFromShardConnectionString.getStatus());
+            errmsg = str::stream()
+                << "cannot start recv'ing chunk "
+                << "[" << redact(min) << "," << redact(max) << ")"
+                << causedBy(redact(statusWithFromShardConnectionString.getStatus()));
 
             warning() << errmsg;
             return false;
@@ -313,9 +308,22 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        ShardingState::get(txn)->migrationDestinationManager()->abort();
-        ShardingState::get(txn)->migrationDestinationManager()->report(result);
-        return true;
+        auto const mdm = ShardingState::get(txn)->migrationDestinationManager();
+
+        auto migrationSessionIdStatus(MigrationSessionId::extractFromBSON(cmdObj));
+
+        if (migrationSessionIdStatus.isOK()) {
+            const bool ok = mdm->abort(migrationSessionIdStatus.getValue());
+            mdm->report(result);
+            return ok;
+        } else if (migrationSessionIdStatus == ErrorCodes::NoSuchKey) {
+            mdm->abortWithoutSessionIdCheck();
+            mdm->report(result);
+            return true;
+        }
+
+        uassertStatusOK(migrationSessionIdStatus.getStatus());
+        MONGO_UNREACHABLE;
     }
 
 } recvChunkAbortCommand;

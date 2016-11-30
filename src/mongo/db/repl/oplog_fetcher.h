@@ -28,6 +28,9 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/timestamp.h"
@@ -121,16 +124,17 @@ public:
      *
      * Throws a UserException if validation fails on any of the provided arguments.
      */
-    OplogFetcher(executor::TaskExecutor* exec,
+    OplogFetcher(executor::TaskExecutor* executor,
                  OpTimeWithHash lastFetched,
                  HostAndPort source,
                  NamespaceString nss,
                  ReplicaSetConfig config,
+                 std::size_t maxFetcherRestarts,
                  DataReplicatorExternalState* dataReplicatorExternalState,
                  EnqueueDocumentsFn enqueueDocumentsFn,
                  OnShutdownCallbackFn onShutdownCallbackFn);
 
-    virtual ~OplogFetcher() = default;
+    virtual ~OplogFetcher();
 
     std::string toString() const;
 
@@ -201,19 +205,34 @@ private:
     void _onShutdown(Status status);
     void _onShutdown(Status status, OpTimeWithHash opTimeWithHash);
 
-    DataReplicatorExternalState* _dataReplicatorExternalState;
-    Fetcher _fetcher;
+    /**
+     * Creates a new instance of the fetcher to tail the remote oplog starting at the given optime.
+     */
+    std::unique_ptr<Fetcher> _makeFetcher(OpTime lastFetchedOpTime);
+
+    // Protects member data of this OplogFetcher.
+    mutable stdx::mutex _mutex;
+
+    executor::TaskExecutor* const _executor;
+    const HostAndPort _source;
+    const NamespaceString _nss;
+    const BSONObj _metadataObject;
+    const Milliseconds _remoteCommandTimeout;
+
+    // Maximum number of times to consecutively restart the fetcher on non-cancellation errors.
+    const std::size_t _maxFetcherRestarts;
+
+    DataReplicatorExternalState* const _dataReplicatorExternalState;
     const EnqueueDocumentsFn _enqueueDocumentsFn;
     const Milliseconds _awaitDataTimeout;
     const OnShutdownCallbackFn _onShutdownCallbackFn;
-
-    // Protects member data of this Fetcher.
-    mutable stdx::mutex _mutex;
 
     // Used to validate start of first batch of results from the remote oplog
     // tailing query and to keep track of the last known operation consumed via
     // "_enqueueDocumentsFn".
     OpTimeWithHash _lastFetched;
+
+    std::unique_ptr<Fetcher> _fetcher;
 };
 
 }  // namespace repl

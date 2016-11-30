@@ -83,7 +83,7 @@ void IndexBuilder::run() {
 
     const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
     OperationContext& txn = *txnPtr;
-    txn.lockState()->setIsBatchWriter(true);
+    txn.lockState()->setShouldConflictWithSecondaryBatchApplication(false);
 
     AuthorizationSession::get(txn.getClient())->grantInternalAuthorization();
 
@@ -101,7 +101,7 @@ void IndexBuilder::run() {
 
     Status status = _build(&txn, db, true, &dlk);
     if (!status.isOK()) {
-        error() << "IndexBuilder could not build index: " << status.toString();
+        error() << "IndexBuilder could not build index: " << redact(status);
         fassert(28555, ErrorCodes::isInterruption(status.code()));
     }
 }
@@ -161,7 +161,7 @@ Status IndexBuilder::_build(OperationContext* txn,
 
 
             try {
-                status = indexer.init(_index);
+                status = indexer.init(_index).getStatus();
                 if (status.code() == ErrorCodes::IndexAlreadyExists) {
                     if (allowBackgroundBuilding) {
                         // Must set this in case anyone is waiting for this build.
@@ -193,7 +193,7 @@ Status IndexBuilder::_build(OperationContext* txn,
                     wunit.commit();
                 }
                 if (!status.isOK()) {
-                    error() << "bad status from index build: " << status;
+                    error() << "bad status from index build: " << redact(status);
                 }
             } catch (const DBException& e) {
                 status = e.toStatus();

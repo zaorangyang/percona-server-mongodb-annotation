@@ -74,17 +74,18 @@ public:
 
     /**
      * Create a new view 'viewName' with contents defined by running the specified aggregation
-     * 'pipeline' on a collection or view 'viewOn'. This method will check correctness with
-     * respect to the view catalog, but will not check for conflicts with the database's catalog,
-     * so the check for an existing collection with the same name must be done before calling
-     * createView.
+     * 'pipeline' with collation 'collation' on a collection or view 'viewOn'. This method will
+     * check correctness with respect to the view catalog, but will not check for conflicts with the
+     * database's catalog, so the check for an existing collection with the same name must be done
+     * before calling createView.
      *
      * Must be in WriteUnitOfWork. View creation rolls back if the unit of work aborts.
      */
     Status createView(OperationContext* txn,
                       const NamespaceString& viewName,
                       const NamespaceString& viewOn,
-                      const BSONArray& pipeline);
+                      const BSONArray& pipeline,
+                      const BSONObj& collation);
 
     /**
      * Drop the view named 'viewName'.
@@ -103,7 +104,6 @@ public:
                       const NamespaceString& viewOn,
                       const BSONArray& pipeline);
 
-
     /**
      * Look up the 'nss' in the view catalog, returning a shared pointer to a View definition, or
      * nullptr if it doesn't exist.
@@ -111,11 +111,9 @@ public:
     std::shared_ptr<ViewDefinition> lookup(OperationContext* txn, StringData nss);
 
     /**
-     * Resolve the views on 'ns', transforming the pipeline appropriately. This function returns a
-     * pair containing the fully-qualified namespace of the backing collection and the raw pipeline
-     * for an aggregation.
-     *
-     * It is illegal to call this function on a namespace that is not a view.
+     * Resolve the views on 'nss', transforming the pipeline appropriately. This function returns a
+     * fully-resolved view definition containing the backing namespace, the resolved pipeline and
+     * the collation to use for the operation.
      */
     StatusWith<ResolvedView> resolveView(OperationContext* txn, const NamespaceString& nss);
 
@@ -141,12 +139,21 @@ private:
     Status _createOrUpdateView_inlock(OperationContext* txn,
                                       const NamespaceString& viewName,
                                       const NamespaceString& viewOn,
-                                      const BSONArray& pipeline);
+                                      const BSONArray& pipeline,
+                                      std::unique_ptr<CollatorInterface> collator);
     /**
      * Parses the view definition pipeline, attempts to upsert into the view graph, and refreshes
      * the graph if necessary. Returns an error status if the resulting graph would be invalid.
      */
     Status _upsertIntoGraph(OperationContext* txn, const ViewDefinition& viewDef);
+
+    /**
+     * Returns Status::OK if each view namespace in 'refs' has the same default collation as 'view'.
+     * Otherwise, returns ErrorCodes::OptionNotSupportedOnView.
+     */
+    Status _validateCollation_inlock(OperationContext* txn,
+                                     const ViewDefinition& view,
+                                     const std::vector<NamespaceString>& refs);
 
     std::shared_ptr<ViewDefinition> _lookup_inlock(OperationContext* txn, StringData ns);
     Status _reloadIfNeeded_inlock(OperationContext* txn);
