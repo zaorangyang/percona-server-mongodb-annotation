@@ -1282,8 +1282,8 @@ var ShardingTest = function(params) {
         return false;
     }
 
+    const configRS = this.configRS;
     if (shouldSetFeatureCompatibilityVersion32()) {
-        const configRS = this.configRS;
         function setFeatureCompatibilityVersion() {
             assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: '3.2'}));
 
@@ -1305,6 +1305,8 @@ var ShardingTest = function(params) {
                 {_id: 'chunksize'},
                 {$set: {value: otherParams.chunkSize}},
                 {upsert: true, writeConcern: {w: 'majority', wtimeout: kDefaultWTimeoutMs}}));
+
+            configRS.awaitLastOpCommitted();
         }
 
         if (keyFile) {
@@ -1409,21 +1411,16 @@ var ShardingTest = function(params) {
 
     try {
         if (!otherParams.manualAddShard) {
-            this._shardNames = [];
-
             var testName = this._testName;
             var admin = this.admin;
-            var shardNames = this._shardNames;
 
             this._connections.forEach(function(z) {
                 var n = z.name || z.host || z;
 
                 print("ShardingTest " + testName + " going to add shard : " + n);
 
-                var result = admin.runCommand({addshard: n});
-                assert.commandWorked(result, "Failed to add shard " + n);
-
-                shardNames.push(result.shardAdded);
+                var result = assert.commandWorked(admin.runCommand({addshard: n}),
+                                                  "Failed to add shard " + n);
                 z.shardName = result.shardAdded;
             });
         }

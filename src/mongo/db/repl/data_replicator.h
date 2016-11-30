@@ -193,6 +193,8 @@ public:
         size_t maxFailedInitialSyncAttempts{0};
         Date_t initialSyncStart;
         Date_t initialSyncEnd;
+        Timestamp initialSyncOplogStart;
+        Timestamp initialSyncOplogEnd;
         std::vector<DataReplicator::InitialSyncAttemptInfo> initialSyncAttemptInfos;
 
         std::string toString() const;
@@ -370,6 +372,7 @@ private:
     OpTimeWithHash _lastFetched;                                                // (MX)
     OpTimeWithHash _lastApplied;                                                // (MX)
     std::unique_ptr<OplogBuffer> _oplogBuffer;                                  // (M)
+    bool _inShutdown = false;                                                   // (M)
     Event _onShutdown;                                                          // (M)
     Timestamp _rollbackCommonOptime;                                            // (MX)
     CollectionCloner::ScheduleDbWorkFn _scheduleDbWorkFn;                       // (M)

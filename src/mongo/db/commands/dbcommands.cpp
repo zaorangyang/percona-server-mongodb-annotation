@@ -96,6 +96,7 @@
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
+#include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/rpc/request_interface.h"
 #include "mongo/s/chunk_version.h"
@@ -552,8 +553,10 @@ public:
         }
 
         auto featureCompatibilityVersion = serverGlobalParams.featureCompatibility.version.load();
+        auto validateFeaturesAsMaster =
+            serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.load();
         if (ServerGlobalParams::FeatureCompatibility::Version::k32 == featureCompatibilityVersion &&
-            cmdObj.hasField("collation")) {
+            validateFeaturesAsMaster && cmdObj.hasField("collation")) {
             return appendCommandStatus(
                 result,
                 {ErrorCodes::InvalidOptions,
@@ -1222,6 +1225,7 @@ void Command::execCommand(OperationContext* txn,
         // TODO: move this back to runCommands when mongos supports OperationContext
         // see SERVER-18515 for details.
         uassertStatusOK(rpc::readRequestMetadata(txn, request.getMetadata()));
+        rpc::TrackingMetadata::get(txn).initWithOperName(command->getName());
 
         dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kCommandReply);
 
@@ -1360,6 +1364,13 @@ void Command::execCommand(OperationContext* txn,
 
         command->_commandsExecuted.increment();
 
+        if (logger::globalLogDomain()->shouldLog(logger::LogComponent::kTracking,
+                                                 logger::LogSeverity::Debug(1)) &&
+            rpc::TrackingMetadata::get(txn).getParentOperId()) {
+            MONGO_LOG_COMPONENT(1, logger::LogComponent::kTracking)
+                << rpc::TrackingMetadata::get(txn).toString();
+            rpc::TrackingMetadata::get(txn).setIsLogged(true);
+        }
         retval = command->run(txn, request, replyBuilder);
 
         dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kOutputDocs);
@@ -1414,22 +1425,6 @@ bool Command::run(OperationContext* txn,
         replyBuilder->setMetadata(rpc::makeEmptyMetadata());
         return result;
     }
-
-    if (readConcernArgsStatus.getValue().getLevel() ==
-        repl::ReadConcernLevel::kLinearizableReadConcern) {
-        auto replCoord = repl::ReplicationCoordinator::get(txn);
-        if (!replCoord->isLinearizableReadConcernEnabled()) {
-            Status status(ErrorCodes::LinearizableReadConcernNotEnabled,
-                          "Linearizable read concern requested, but server was not started with "
-                          "--setParameter enableLinearizableReadConcern=true");
-            inPlaceReplyBob.resetToEmpty();
-            auto result = appendCommandStatus(inPlaceReplyBob, status);
-            inPlaceReplyBob.doneFast();
-            replyBuilder->setMetadata(rpc::makeEmptyMetadata());
-            return result;
-        }
-    }
-
 
     Status rcStatus = waitForReadConcern(txn, readConcernArgsStatus.getValue());
     if (!rcStatus.isOK()) {

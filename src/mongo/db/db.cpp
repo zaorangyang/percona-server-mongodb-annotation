@@ -89,6 +89,7 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/restapi.h"
+#include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
@@ -110,7 +111,6 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/s/balancer/balancer.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/sharding_initialization.h"
@@ -798,7 +798,8 @@ ExitCode _initAndListen(int listenPort) {
                 startupOpCtx.get(), repl::StorageInterface::get(getGlobalServiceContext()));
         }
 
-        if (replSettings.usingReplSets() || (!replSettings.isMaster() && replSettings.isSlave())) {
+        if (replSettings.usingReplSets() || (!replSettings.isMaster() && replSettings.isSlave()) ||
+            !internalValidateFeaturesAsMaster) {
             serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.store(false);
         }
     }
@@ -985,7 +986,6 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
         new repl::TopologyCoordinatorImpl(topoCoordOptions),
         storageInterface,
         static_cast<int64_t>(curTimeMillis64()));
-    serviceContext->registerKillOpListener(replCoord.get());
     repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
     repl::setOplogCollectionName();
     return Status::OK();

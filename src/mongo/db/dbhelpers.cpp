@@ -358,7 +358,7 @@ long long Helpers::removeRange(OperationContext* txn,
     while (1) {
         // Scoping for write lock.
         {
-            OldClientWriteContext ctx(txn, ns);
+            AutoGetCollection ctx(txn, NamespaceString(ns), MODE_IX, MODE_IX);
             Collection* collection = ctx.getCollection();
             if (!collection)
                 break;
@@ -558,6 +558,9 @@ Helpers::RemoveSaver::~RemoveSaver() {
 
 Status Helpers::RemoveSaver::goingToDelete(const BSONObj& o) {
     if (!_out) {
+        // We don't expect to ever pass "" to create_directories below, but catch
+        // this anyway as per SERVER-26412.
+        invariant(!_root.empty());
         boost::filesystem::create_directories(_root);
         _out.reset(new ofstream(_file.string().c_str(), ios_base::out | ios_base::binary));
         if (_out->fail()) {

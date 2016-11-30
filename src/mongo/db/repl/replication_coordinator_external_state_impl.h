@@ -113,7 +113,6 @@ public:
         OperationContext* txn) const override;
     virtual bool shouldUseDataReplicatorInitialSync() const override;
     virtual std::size_t getOplogFetcherMaxFetcherRestarts() const override;
-    virtual bool isLinearizableReadConcernEnabled() const override;
 
     // Methods from JournalListener.
     virtual JournalListener::Token getToken();
@@ -147,6 +146,10 @@ private:
 
     // Guards starting threads and setting _startedThreads
     stdx::mutex _threadMutex;
+
+    // Flag for guarding against concurrent data replication stopping.
+    bool _stoppingDataReplication = false;
+    stdx::condition_variable _dataReplicationStopped;
 
     StorageInterface* _storageInterface;
     // True when the threads have been started

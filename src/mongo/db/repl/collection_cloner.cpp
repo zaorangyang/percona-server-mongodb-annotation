@@ -32,12 +32,15 @@
 
 #include "mongo/db/repl/collection_cloner.h"
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/log.h"
@@ -50,9 +53,16 @@ namespace {
 using LockGuard = stdx::lock_guard<stdx::mutex>;
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
 
+constexpr auto kCountResponseDocumentCountFieldName = "n"_sd;
+
+const int kProgressMeterSecondsBetween = 60;
+const int kProgressMeterCheckInterval = 128;
+
 // The batchSize to use for the query to get all documents from the collection.
 // 16MB max batch size / 12 byte min doc size * 10 (for good measure) = batchSize to use.
 const auto batchSize = (16 * 1024 * 1024) / 12 * 10;
+// The number of attempts for the count command, which gets the document count.
+MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncCollectionCountAttempts, int, 3);
 // The number of attempts for the listIndexes commands.
 MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncListIndexesAttempts, int, 3);
 // The number of attempts for the find command, which gets the data.
@@ -75,6 +85,18 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
       _onCompletion(onCompletion),
       _storageInterface(storageInterface),
       _active(false),
+      _countScheduler(_executor,
+                      RemoteCommandRequest(_source,
+                                           _sourceNss.db().toString(),
+                                           BSON("count" << _sourceNss.coll()),
+                                           rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                                           nullptr,
+                                           RemoteCommandRequest::kNoTimeout),
+                      stdx::bind(&CollectionCloner::_countCallback, this, stdx::placeholders::_1),
+                      RemoteCommandRetryScheduler::makeRetryPolicy(
+                          numInitialSyncCollectionCountAttempts,
+                          executor::RemoteCommandRequest::kNoTimeout,
+                          RemoteCommandRetryScheduler::kAllRetriableErrors)),
       _listIndexesFetcher(_executor,
                           _source,
                           _sourceNss.db().toString(),
@@ -120,7 +142,12 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
           };
           _dbWorkTaskRunner.schedule(task);
           return executor::TaskExecutor::CallbackHandle();
-      }) {
+      }),
+      _progressMeter(1U,  // total will be replaced with count command result.
+                     kProgressMeterSecondsBetween,
+                     kProgressMeterCheckInterval,
+                     "documents copied",
+                     str::stream() << _sourceNss.toString() << " collection clone progress") {
     // Fetcher throws an exception on null executor.
     invariant(executor);
     uassert(ErrorCodes::BadValue,
@@ -169,7 +196,7 @@ Status CollectionCloner::startup() {
     }
 
     _stats.start = _executor->now();
-    Status scheduleResult = _listIndexesFetcher.schedule();
+    Status scheduleResult = _countScheduler.startup();
     if (!scheduleResult.isOK()) {
         return scheduleResult;
     }
@@ -184,6 +211,7 @@ void CollectionCloner::shutdown() {
         return;
     }
 
+    _countScheduler.shutdown();
     _listIndexesFetcher.shutdown();
     _findFetcher.shutdown();
     _dbWorkTaskRunner.cancel();
@@ -209,6 +237,75 @@ void CollectionCloner::waitForDbWorker() {
 void CollectionCloner::setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& scheduleDbWorkFn) {
     LockGuard lk(_mutex);
     _scheduleDbWorkFn = scheduleDbWorkFn;
+}
+
+void CollectionCloner::_countCallback(
+    const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
+
+    // No need to reword status reason in the case of cancellation.
+    if (ErrorCodes::CallbackCanceled == args.response.status) {
+        _finishCallback(args.response.status);
+        return;
+    }
+
+    if (!args.response.status.isOK()) {
+        _finishCallback({args.response.status.code(),
+                         str::stream() << "During count call on collection '" << _sourceNss.ns()
+                                       << "' from "
+                                       << _source.toString()
+                                       << ", there was an error '"
+                                       << args.response.status.reason()
+                                       << "'"});
+        return;
+    }
+
+    Status commandStatus = getStatusFromCommandResult(args.response.data);
+    if (!commandStatus.isOK()) {
+        _finishCallback({commandStatus.code(),
+                         str::stream() << "During count call on collection '" << _sourceNss.ns()
+                                       << "' from "
+                                       << _source.toString()
+                                       << ", there was a command error '"
+                                       << commandStatus.reason()
+                                       << "'"});
+        return;
+    }
+
+    long long count = 0;
+    auto countStatus =
+        bsonExtractIntegerField(args.response.data, kCountResponseDocumentCountFieldName, &count);
+    if (!countStatus.isOK()) {
+        _finishCallback({countStatus.code(),
+                         str::stream() << "There was an error parsing document count from count "
+                                          "command result on collection "
+                                       << _sourceNss.ns()
+                                       << " from "
+                                       << _source.toString()
+                                       << ": "
+                                       << countStatus.reason()});
+        return;
+    }
+
+    if (count < 0) {
+        _finishCallback({ErrorCodes::BadValue,
+                         str::stream() << "Count call on collection " << _sourceNss.ns() << " from "
+                                       << _source.toString()
+                                       << " returned negative document count: "
+                                       << count});
+        return;
+    }
+
+    {
+        LockGuard lk(_mutex);
+        _stats.documentToCopy = count;
+        _progressMeter.setTotalWhileRunning(static_cast<unsigned long long>(count));
+    }
+
+    auto scheduleStatus = _listIndexesFetcher.schedule();
+    if (!scheduleStatus.isOK()) {
+        _finishCallback(scheduleStatus);
+        return;
+    }
 }
 
 void CollectionCloner::_listIndexesCallback(const Fetcher::QueryResponseStatus& fetchResult,
@@ -382,8 +479,9 @@ void CollectionCloner::_insertDocumentsCallback(const executor::TaskExecutor::Ca
     }
 
     _documents.swap(docs);
-    _stats.documents += docs.size();
+    _stats.documentsCopied += docs.size();
     ++_stats.fetchBatches;
+    _progressMeter.hit(int(docs.size()));
     invariant(_collLoader);
     const auto status = _collLoader->insertDocuments(docs.cbegin(), docs.cend());
     lk.unlock();
@@ -425,11 +523,14 @@ void CollectionCloner::_finishCallback(const Status& status) {
     _onCompletion(finalStatus);
     lk.lock();
     _stats.end = _executor->now();
+    _progressMeter.finished();
     _active = false;
     _condition.notify_all();
     LOG(1) << "    collection: " << _destNss << ", stats: " << _stats.toString();
 }
 
+constexpr StringData CollectionCloner::Stats::kDocumentsToCopyFieldName;
+constexpr StringData CollectionCloner::Stats::kDocumentsCopiedFieldName;
 
 std::string CollectionCloner::Stats::toString() const {
     return toBSON().toString();
@@ -443,7 +544,8 @@ BSONObj CollectionCloner::Stats::toBSON() const {
 }
 
 void CollectionCloner::Stats::append(BSONObjBuilder* builder) const {
-    builder->appendNumber("documents", documents);
+    builder->appendNumber(kDocumentsToCopyFieldName, documentToCopy);
+    builder->appendNumber(kDocumentsCopiedFieldName, documentsCopied);
     builder->appendNumber("indexes", indexes);
     builder->appendNumber("fetchedBatches", fetchBatches);
     if (start != Date_t()) {

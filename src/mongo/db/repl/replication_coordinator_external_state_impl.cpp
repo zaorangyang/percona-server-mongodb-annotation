@@ -65,6 +65,7 @@
 #include "mongo/db/repl/snapshot_thread.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_tail.h"
+#include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/server_options.h"
@@ -74,7 +75,6 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
-#include "mongo/s/balancer/balancer.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
@@ -117,8 +117,6 @@ const char kBlockingQueueOplogBufferName[] = "inMemoryBlockingQueue";
 // isn't specified. This can be used for A-B benchmarking to find how much overhead
 // repl::SnapshotThread introduces.
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(enableReplSnapshotThread, bool, false);
-
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(enableLinearizableReadConcern, bool, false);
 
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(use3dot2InitialSync, bool, false);
 
@@ -251,6 +249,10 @@ void ReplicationCoordinatorExternalStateImpl::stopDataReplication(OperationConte
 
 void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(OperationContext* txn,
                                                                           UniqueLock* lock) {
+    // Make sue no other _stopDataReplication calls are in progress.
+    _dataReplicationStopped.wait(*lock, [this]() { return !_stoppingDataReplication; });
+    _stoppingDataReplication = true;
+
     auto oldSSF = std::move(_syncSourceFeedbackThread);
     auto oldBgSync = std::move(_bgSync);
     auto oldApplier = std::move(_applierThread);
@@ -282,6 +284,8 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(Operat
     _initialSyncRunner.join();
 
     lock->lock();
+    _stoppingDataReplication = false;
+    _dataReplicationStopped.notify_all();
 }
 
 
@@ -899,10 +903,6 @@ bool ReplicationCoordinatorExternalStateImpl::shouldUseDataReplicatorInitialSync
 
 std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherMaxFetcherRestarts() const {
     return oplogFetcherMaxFetcherRestarts;
-}
-
-bool ReplicationCoordinatorExternalStateImpl::isLinearizableReadConcernEnabled() const {
-    return enableLinearizableReadConcern;
 }
 
 JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken() {

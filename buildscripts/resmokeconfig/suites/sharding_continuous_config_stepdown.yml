@@ -16,8 +16,6 @@ selector:
     - jstests/sharding/auto_rebalance_parallel.js
     - jstests/sharding/auto_rebalance_parallel_replica_sets.js
     - jstests/sharding/autosplit_heuristics.js
-    - jstests/sharding/balance_tags1.js
-    - jstests/sharding/balance_tags2.js
     - jstests/sharding/basic_drop_coll.js
     - jstests/sharding/basic_merge.js
     - jstests/sharding/count1.js
@@ -57,8 +55,6 @@ selector:
     - jstests/sharding/sharding_balance3.js
     - jstests/sharding/sharding_balance4.js
     - jstests/sharding/sharding_migrate_cursor1.js
-    - jstests/sharding/tag_auto_split.js
-    - jstests/sharding/tag_auto_split_partial_key.js
     - jstests/sharding/tag_range.js
     - jstests/sharding/top_chunk_autosplit.js
     - jstests/sharding/count_config_servers.js
@@ -70,7 +66,6 @@ selector:
     - jstests/sharding/listDatabases.js
     - jstests/sharding/bulk_insert.js
     - jstests/sharding/printShardingStatus.js
-    - jstests/sharding/shard_aware_on_set_shard_version.js
     # Balancer writes (direct write to config database with no retries)
     - jstests/sharding/convert_to_and_from_sharded.js
     - jstests/sharding/remove2.js
@@ -121,6 +116,12 @@ selector:
     - jstests/sharding/move_chunk_wc.js
     # Expects that connections to all shards/config servers will never close
     - jstests/sharding/shard6.js
+    # Stepping down the primary can make the balancer rerun a migration that was designed to fail
+    # earlier, but can potentially pass on the second try.
+    - jstests/sharding/migration_ignore_interrupts_1.js
+    # Stepping down the config can cause moveChunks stopped on shards via killOp to be restarted.
+    - jstests/sharding/migration_ignore_interrupts_3.js
+    - jstests/sharding/migration_ignore_interrupts_4.js
 
 executor:
   js_test:

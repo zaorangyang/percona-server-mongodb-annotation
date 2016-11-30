@@ -28,10 +28,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/pipeline/document_source.h"
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/value.h"
 
 namespace mongo {
@@ -163,7 +165,9 @@ DocumentSourceUnwind::DocumentSourceUnwind(const intrusive_ptr<ExpressionContext
       _indexPath(indexPath),
       _unwinder(new Unwinder(fieldPath, preserveNullAndEmptyArrays, indexPath)) {}
 
-REGISTER_DOCUMENT_SOURCE(unwind, DocumentSourceUnwind::createFromBson);
+REGISTER_DOCUMENT_SOURCE(unwind,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceUnwind::createFromBson);
 
 const char* DocumentSourceUnwind::getSourceName() const {
     return "$unwind";
@@ -228,43 +232,12 @@ BSONObjSet DocumentSourceUnwind::getOutputSorts() {
     return out;
 }
 
-Pipeline::SourceContainer::iterator DocumentSourceUnwind::optimizeAt(
-    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
-    invariant(*itr == this);
-
-    if (auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get())) {
-        std::set<std::string> fields = {_unwindPath.fullPath()};
-
-        if (_indexPath) {
-            fields.insert((*_indexPath).fullPath());
-        }
-
-        auto splitMatch = nextMatch->splitSourceBy(fields);
-
-        invariant(splitMatch.first || splitMatch.second);
-
-        if (!splitMatch.first && splitMatch.second) {
-            // No optimization was possible.
-            return std::next(itr);
-        }
-
-        container->erase(std::next(itr));
-
-        // If splitMatch.second is not null, then there is a new $match stage to insert after
-        // ourselves.
-        if (splitMatch.second) {
-            container->insert(std::next(itr), std::move(splitMatch.second));
-        }
-
-        if (splitMatch.first) {
-            container->insert(itr, std::move(splitMatch.first));
-            if (std::prev(itr) == container->begin()) {
-                return std::prev(itr);
-            }
-            return std::prev(std::prev(itr));
-        }
+DocumentSource::GetModPathsReturn DocumentSourceUnwind::getModifiedPaths() const {
+    std::set<std::string> modifiedFields{_unwindPath.fullPath()};
+    if (_indexPath) {
+        modifiedFields.insert(_indexPath->fullPath());
     }
-    return std::next(itr);
+    return {GetModPathsReturn::Type::kFiniteSet, std::move(modifiedFields)};
 }
 
 Value DocumentSourceUnwind::serialize(bool explain) const {
