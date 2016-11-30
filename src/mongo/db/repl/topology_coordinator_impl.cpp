@@ -149,7 +149,8 @@ HostAndPort TopologyCoordinatorImpl::getSyncSourceAddress() const {
 }
 
 HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
-                                                         const Timestamp& lastTimestampApplied) {
+                                                         const Timestamp& lastTimestampApplied,
+                                                         ChainingPreference chainingPreference) {
     // If we are not a member of the current replica set configuration, no sync source is valid.
     if (_selfIndex == -1) {
         LOG(1) << "Cannot sync from any members because we are not in the replica set config";
@@ -179,7 +180,8 @@ HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
     }
 
     // If we are only allowed to sync from the primary, set that
-    if (!_rsConfig.isChainingAllowed()) {
+    if (chainingPreference == ChainingPreference::kUseConfiguration &&
+        !_rsConfig.isChainingAllowed()) {
         if (_currentPrimaryIndex == -1) {
             LOG(1) << "Cannot select a sync source because chaining is"
                       " not allowed and primary is unknown/down";
@@ -188,6 +190,11 @@ HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
         } else if (_memberIsBlacklisted(*_currentPrimaryMember(), now)) {
             LOG(1) << "Cannot select primary member as sync source because they are blacklisted:"
                    << _currentPrimaryMember()->getHostAndPort();
+            _syncSource = HostAndPort();
+            return _syncSource;
+        } else if (_currentPrimaryIndex == _selfIndex) {
+            LOG(1)
+                << "Cannot select a sync source because chaining is not allowed and we are primary";
             _syncSource = HostAndPort();
             return _syncSource;
         } else {

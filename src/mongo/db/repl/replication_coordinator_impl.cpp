@@ -621,7 +621,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* txn,
             drCopy.reset();
             lk.lock();
             if (!_inShutdown) {
-                fassertStatusOK(40088, status);
+                fassertNoTrace(40088, status.getStatus());
             } else if (!status.isOK()) {
                 log() << "Initial Sync failed during shutdown due to " << status.getStatus();
                 return;
@@ -705,6 +705,8 @@ void ReplicationCoordinatorImpl::shutdown(OperationContext* txn) {
     if (!_settings.usingReplSets()) {
         return;
     }
+
+    log() << "shutting down replication subsystems";
 
     // Used to shut down outside of the lock.
     std::shared_ptr<DataReplicator> drCopy;
@@ -3148,8 +3150,11 @@ HostAndPort ReplicationCoordinatorImpl::chooseNewSyncSource(const Timestamp& las
     LockGuard topoLock(_topoMutex);
 
     HostAndPort oldSyncSource = _topCoord->getSyncSourceAddress();
-    HostAndPort newSyncSource =
-        _topCoord->chooseNewSyncSource(_replExecutor.now(), lastTimestampFetched);
+    auto chainingPreference = isCatchingUp()
+        ? TopologyCoordinator::ChainingPreference::kAllowChaining
+        : TopologyCoordinator::ChainingPreference::kUseConfiguration;
+    HostAndPort newSyncSource = _topCoord->chooseNewSyncSource(
+        _replExecutor.now(), lastTimestampFetched, chainingPreference);
 
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     // If we lost our sync source, schedule new heartbeats immediately to update our knowledge
@@ -3876,6 +3881,9 @@ void ReplicationCoordinatorImpl::setIndexPrefetchConfig(
     _indexPrefetchConfig = cfg;
 }
 
+bool ReplicationCoordinatorImpl::isLinearizableReadConcernEnabled() const {
+    return _externalState->isLinearizableReadConcernEnabled();
+}
 
 }  // namespace repl
 }  // namespace mongo

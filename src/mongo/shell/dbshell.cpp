@@ -708,14 +708,15 @@ int _main(int argc, char* argv[], char** envp) {
 
     mongo::ScriptEngine::setConnectCallback(mongo::shell_utils::onConnect);
     mongo::ScriptEngine::setup();
-    mongo::globalScriptEngine->setJSHeapLimitMB(shellGlobalParams.jsHeapLimitMB);
-    mongo::globalScriptEngine->setScopeInitCallback(mongo::shell_utils::initScope);
-    mongo::globalScriptEngine->enableJIT(!shellGlobalParams.nojit);
-    mongo::globalScriptEngine->enableJavaScriptProtection(shellGlobalParams.javascriptProtection);
+    mongo::getGlobalScriptEngine()->setJSHeapLimitMB(shellGlobalParams.jsHeapLimitMB);
+    mongo::getGlobalScriptEngine()->setScopeInitCallback(mongo::shell_utils::initScope);
+    mongo::getGlobalScriptEngine()->enableJIT(!shellGlobalParams.nojit);
+    mongo::getGlobalScriptEngine()->enableJavaScriptProtection(
+        shellGlobalParams.javascriptProtection);
 
     auto poolGuard = MakeGuard([] { ScriptEngine::dropScopeCache(); });
 
-    unique_ptr<mongo::Scope> scope(mongo::globalScriptEngine->newScope());
+    unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
     shellMainScope = scope.get();
 
     if (shellGlobalParams.runShell)
@@ -753,6 +754,9 @@ int _main(int argc, char* argv[], char** envp) {
 
         if (!scope->execFile(shellGlobalParams.files[i], false, true)) {
             cout << "failed to load: " << shellGlobalParams.files[i] << endl;
+            return -3;
+        }
+        if (mongo::shell_utils::KillMongoProgramInstances() != EXIT_SUCCESS) {
             return -3;
         }
     }
