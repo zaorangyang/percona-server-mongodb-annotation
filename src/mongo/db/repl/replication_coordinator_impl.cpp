@@ -278,21 +278,10 @@ ReplicationCoordinator::Mode getReplicationModeFromSettings(const ReplSettings& 
 DataReplicatorOptions createDataReplicatorOptions(
     ReplicationCoordinator* replCoord, ReplicationCoordinatorExternalState* externalState) {
     DataReplicatorOptions options;
-    options.rollbackFn = [](OperationContext*, const OpTime&, const HostAndPort&) -> Status {
-        return Status::OK();
-    };
-    options.prepareReplSetUpdatePositionCommandFn =
-        [replCoord](ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle)
-        -> StatusWith<BSONObj> {
-            return replCoord->prepareReplSetUpdatePositionCommand(commandStyle);
-        };
     options.getMyLastOptime = [replCoord]() { return replCoord->getMyLastAppliedOpTime(); };
     options.setMyLastOptime = [replCoord, externalState](const OpTime& opTime) {
         replCoord->setMyLastAppliedOpTime(opTime);
         externalState->setGlobalTimestamp(opTime.getTimestamp());
-    };
-    options.setFollowerMode = [replCoord](const MemberState& newState) {
-        return replCoord->setFollowerMode(newState);
     };
     options.getSlaveDelay = [replCoord]() { return replCoord->getSlaveDelaySecs(); };
     options.syncSourceSelector = replCoord;
@@ -1844,6 +1833,9 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor(OperationContext* txn,
                                                          const NamespaceString& ns,
                                                          bool slaveOk) {
     auto client = txn->getClient();
+    // Oplog reads are not allowed during STARTUP state, but we make an exception for internal
+    // reads and master-slave replication. Internel reads are required for cleaning up unfinished
+    // apply batches. Master-slave never sets the state so we make an exception for it as well.
     if (((_memberState.startup() && client->isFromUserConnection() &&
           getReplicationMode() == modeReplSet) ||
          _memberState.startup2() || _memberState.rollback()) &&
@@ -1874,33 +1866,8 @@ bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState() const {
     return _canServeNonLocalReads.loadRelaxed();
 }
 
-bool ReplicationCoordinatorImpl::shouldIgnoreUniqueIndex(const IndexDescriptor* idx) {
-    if (!idx->unique()) {
-        return false;
-    }
-    // Never ignore _id index
-    if (idx->isIdIndex()) {
-        return false;
-    }
-    if (nsToDatabaseSubstring(idx->parentNS()) == kLocalDB) {
-        // always enforce on local
-        return false;
-    }
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
-    if (getReplicationMode() != modeReplSet) {
-        return false;
-    }
-    // see SERVER-6671
-    MemberState ms = _getMemberState_inlock();
-    switch (ms.s) {
-        case MemberState::RS_SECONDARY:
-        case MemberState::RS_RECOVERING:
-        case MemberState::RS_ROLLBACK:
-        case MemberState::RS_STARTUP2:
-            return true;
-        default:
-            return false;
-    }
+bool ReplicationCoordinatorImpl::shouldRelaxIndexConstraints(const NamespaceString& ns) {
+    return !canAcceptWritesFor(ns);
 }
 
 OID ReplicationCoordinatorImpl::getElectionId() {
@@ -2626,7 +2593,6 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
             break;
         case kActionFollowerModeStateChange:
             // In follower mode, or sub-mode so ensure replication is active
-            // TODO: _dr->resume();
             _externalState->signalApplierToChooseNewSyncSource();
             break;
         case kActionCloseAllConnections:
@@ -2876,8 +2842,6 @@ Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(
     if (somethingChanged && !_getMemberState_inlock().primary()) {
         lock.unlock();
         // Must do this outside _mutex
-        // TODO: enable _dr, remove _externalState when DataReplicator is used excl.
-        //_dr->slavesHaveProgressed();
         _externalState->forwardSlaveProgress();
     }
     return status;
@@ -2901,8 +2865,6 @@ Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(const UpdatePosi
     if (somethingChanged && !_getMemberState_inlock().primary()) {
         lock.unlock();
         // Must do this outside _mutex
-        // TODO: enable _dr, remove _externalState when DataReplicator is used excl.
-        //_dr->slavesHaveProgressed();
         _externalState->forwardSlaveProgress();
     }
     return status;
@@ -3103,117 +3065,6 @@ bool ReplicationCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& curre
     LockGuard topoLock(_topoMutex);
     return _topCoord->shouldChangeSyncSource(
         currentSource, getMyLastAppliedOpTime(), metadata, _replExecutor.now());
-}
-
-SyncSourceResolverResponse ReplicationCoordinatorImpl::selectSyncSource(
-    OperationContext* txn, const OpTime& lastOpTimeFetched) {
-    const Timestamp sentinelTimestamp(duration_cast<Seconds>(Date_t::now().toDurationSinceEpoch()),
-                                      0);
-    const OpTime sentinel(sentinelTimestamp, std::numeric_limits<long long>::max());
-    OpTime earliestOpTimeSeen = sentinel;
-    SyncSourceResolverResponse resp;
-    while (true) {
-        HostAndPort candidate = chooseNewSyncSource(lastOpTimeFetched.getTimestamp());
-
-        if (candidate.empty()) {
-            if (earliestOpTimeSeen == sentinel) {
-                // If, in this invocation of selectSyncSource(), we did not successfully connect
-                // to any node ahead of us, we apparently have no sync sources to connect to.
-                // This situation is common; e.g. if there are no writes to the primary at
-                // the moment.
-                resp.syncSourceStatus = HostAndPort();
-                return resp;
-            }
-
-            resp.syncSourceStatus = {ErrorCodes::OplogStartMissing, "too stale to catch up"};
-            resp.earliestOpTimeSeen = earliestOpTimeSeen;
-            return resp;
-        }
-
-        // Candidate found.
-        Status queryStatus(ErrorCodes::NotYetInitialized, "not mutated");
-        BSONObj firstObjFound;
-        auto work = [&firstObjFound,
-                     &queryStatus](const StatusWith<Fetcher::QueryResponse>& queryResult,
-                                   NextAction* nextActiion,
-                                   BSONObjBuilder* bob) {
-            queryStatus = queryResult.getStatus();
-            if (queryResult.isOK() && !queryResult.getValue().documents.empty()) {
-                firstObjFound = queryResult.getValue().documents.front();
-            }
-        };
-        Fetcher candidateProber(&_replExecutor,
-                                candidate,
-                                kLocalDB,
-                                BSON("find"
-                                     << "oplog.rs"
-                                     << "limit"
-                                     << 1
-                                     << "sort"
-                                     << BSON("$natural" << 1)),
-                                work,
-                                rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
-                                Milliseconds(30000));
-        Status scheduleStatus = candidateProber.schedule();
-
-        if (!scheduleStatus.isOK()) {
-            error() << "Error scheduling fetcher to evaluate host as sync source, host:"
-                    << candidate << ", error: " << scheduleStatus;
-            continue;
-        }
-
-        candidateProber.join();
-
-        if (!queryStatus.isOK()) {
-            // We got an error.
-            const auto blacklistDuration = Seconds{10};
-            const auto until = Date_t::now() + blacklistDuration;
-            log() << "Blacklisting " << candidate << " due to error: '" << queryStatus << "' for "
-                  << blacklistDuration << " until: " << until;
-            blacklistSyncSource(candidate, until);
-            continue;
-        }
-
-        if (firstObjFound.isEmpty()) {
-            // Remote oplog is empty.
-            const auto blacklistDuration = Seconds{10};
-            const auto until = Date_t::now() + blacklistDuration;
-            log() << "Blacklisting due to empty first document from host " << candidate << " for "
-                  << blacklistDuration << " until: " << until;
-            blacklistSyncSource(candidate, until);
-            continue;
-        }
-
-        OpTime remoteEarliestOpTime =
-            fassertStatusOK(34432, OpTime::parseFromOplogEntry(firstObjFound));
-
-        // remoteEarliestOpTime may come from a very old config, so we cannot compare their terms.
-        if (!lastOpTimeFetched.isNull() &&
-            lastOpTimeFetched.getTimestamp() < remoteEarliestOpTime.getTimestamp()) {
-            // We're too stale to use this sync source.
-            const auto blacklistDuration = Minutes{1};
-            const auto until = Date_t::now() + Minutes(1);
-
-            log() << "Blacklisting " << candidate
-                  << " because our last fetched optime: " << lastOpTimeFetched
-                  << " is before their earliest optime: " << remoteEarliestOpTime << " for "
-                  << blacklistDuration << " until: " << until;
-
-            blacklistSyncSource(candidate, until);
-            if (earliestOpTimeSeen.getTimestamp() > remoteEarliestOpTime.getTimestamp()) {
-                log() << "we are too stale to use " << candidate
-                      << " as a sync source since our last fetcher optime: " << lastOpTimeFetched
-                      << " is less than " << remoteEarliestOpTime << " which is greater than "
-                      << earliestOpTimeSeen;
-                earliestOpTimeSeen = remoteEarliestOpTime;
-            }
-            continue;
-        }
-
-        // Got a valid sync source.
-        resp.syncSourceStatus = candidate;
-        return resp;
-    }
 }
 
 void ReplicationCoordinatorImpl::_updateLastCommittedOpTime_inlock() {

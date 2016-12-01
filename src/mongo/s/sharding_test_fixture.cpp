@@ -68,6 +68,7 @@
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/transport/mock_session.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/util/clock_source_mock.h"
@@ -101,9 +102,8 @@ void ShardingTestFixture::setUp() {
     _transportLayer = tlMock.get();
     _service->addAndStartTransportLayer(std::move(tlMock));
     CollatorFactoryInterface::set(_service.get(), stdx::make_unique<CollatorFactoryMock>());
-    _transportSession =
-        stdx::make_unique<transport::Session>(HostAndPort{}, HostAndPort{}, _transportLayer);
-    _client = _service->makeClient("ShardingTestFixture", _transportSession.get());
+    _transportSession = transport::MockSession::create(_transportLayer);
+    _client = _service->makeClient("ShardingTestFixture", _transportSession);
     _opCtx = _client->makeOperationContext();
 
     // Set up executor pool used for most operations.
@@ -495,7 +495,7 @@ void ShardingTestFixture::expectCount(const HostAndPort& configHost,
 }
 
 void ShardingTestFixture::setRemote(const HostAndPort& remote) {
-    *_transportSession = transport::Session{remote, HostAndPort{}, _transportLayer};
+    _transportSession = transport::MockSession::create(remote, HostAndPort{}, _transportLayer);
 }
 
 void ShardingTestFixture::checkReadConcern(const BSONObj& cmdObj,

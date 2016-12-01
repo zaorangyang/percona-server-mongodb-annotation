@@ -100,7 +100,7 @@ public:
                                          const NamespaceString& ns,
                                          bool slaveOk);
 
-    virtual bool shouldIgnoreUniqueIndex(const IndexDescriptor* idx);
+    virtual bool shouldRelaxIndexConstraints(const NamespaceString& ns);
 
     virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
 
@@ -209,9 +209,6 @@ public:
 
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
 
-    virtual SyncSourceResolverResponse selectSyncSource(OperationContext* txn,
-                                                        const OpTime& lastOpTimeFetched);
-
     virtual void resetLastOpTimesFromOplog(OperationContext* txn);
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
@@ -267,6 +264,11 @@ public:
      */
     void setGetConfigReturnValue(ReplicaSetConfig returnValue);
 
+    /**
+     * Always allow writes even if this node is not master. Used by sharding unit tests.
+     */
+    void alwaysAllowWrites(bool allowWrites);
+
 private:
     AtomicUInt64 _snapshotNameGenerator;
     const ReplSettings _settings;
@@ -274,6 +276,7 @@ private:
     OpTime _myLastDurableOpTime;
     OpTime _myLastAppliedOpTime;
     ReplicaSetConfig _getConfigReturnValue;
+    bool _alwaysAllowWrites = false;
 };
 
 }  // namespace repl

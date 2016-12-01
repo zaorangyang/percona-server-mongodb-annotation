@@ -593,10 +593,12 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
           return createCollection(txn, nss.db().toString(), cmd, idIndexSpecBuilder.done());
       },
       {ErrorCodes::NamespaceExists}}},
-    {"collMod", {[](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
-         BSONObjBuilder resultWeDontCareAbout;
-         return collMod(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
-     }}},
+    {"collMod",
+     {[](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+          BSONObjBuilder resultWeDontCareAbout;
+          return collMod(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+      },
+      {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
     {"dropDatabase",
      {[](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
           return dropDatabase(txn, NamespaceString(ns).db().toString());
@@ -753,17 +755,19 @@ Status applyOperation_inlock(OperationContext* txn,
                 indexSpec = bob.obj();
             }
 
+            bool relaxIndexConstraints =
+                ReplicationCoordinator::get(txn)->shouldRelaxIndexConstraints(indexNss);
             if (indexSpec["background"].trueValue()) {
                 Lock::TempRelease release(txn->lockState());
                 if (txn->lockState()->isLocked()) {
                     // If TempRelease fails, background index build will deadlock.
                     LOG(3) << "apply op: building background index " << indexSpec
                            << " in the foreground because temp release failed";
-                    IndexBuilder builder(indexSpec);
+                    IndexBuilder builder(indexSpec, relaxIndexConstraints);
                     Status status = builder.buildInForeground(txn, db);
                     uassertStatusOK(status);
                 } else {
-                    IndexBuilder* builder = new IndexBuilder(indexSpec);
+                    IndexBuilder* builder = new IndexBuilder(indexSpec, relaxIndexConstraints);
                     // This spawns a new thread and returns immediately.
                     builder->go();
                     // Wait for thread to start and register itself
@@ -771,7 +775,7 @@ Status applyOperation_inlock(OperationContext* txn,
                 }
                 txn->recoveryUnit()->abandonSnapshot();
             } else {
-                IndexBuilder builder(indexSpec);
+                IndexBuilder builder(indexSpec, relaxIndexConstraints);
                 Status status = builder.buildInForeground(txn, db);
                 uassertStatusOK(status);
             }

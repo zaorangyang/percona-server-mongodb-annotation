@@ -392,16 +392,7 @@ Status Database::dropCollection(OperationContext* txn, StringData fullns) {
                 if (_profile != 0)
                     return Status(ErrorCodes::IllegalOperation,
                                   "turn off profiling before dropping system.profile collection");
-            } else if (nss.isSystemDotViews()) {
-                if (serverGlobalParams.featureCompatibility.version.load() !=
-                        ServerGlobalParams::FeatureCompatibility::Version::k32 &&
-                    serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.load()) {
-                    return Status(ErrorCodes::IllegalOperation,
-                                  "The featureCompatibilityVersion must be 3.2 to drop the "
-                                  "system.views collection. See "
-                                  "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
-                }
-            } else {
+            } else if (!nss.isSystemDotViews()) {
                 return Status(ErrorCodes::IllegalOperation, "can't drop system ns");
             }
         }
@@ -423,10 +414,11 @@ Status Database::dropCollection(OperationContext* txn, StringData fullns) {
 
     Top::get(txn->getClient()->getServiceContext()).collectionDropped(fullns);
 
-    s = _dbEntry->dropCollection(txn, fullns);
-
-    // we want to do this always
+    // We want to destroy the Collection object before telling the StorageEngine to destroy the
+    // RecordStore.
     _clearCollectionCache(txn, fullns, "collection dropped");
+
+    s = _dbEntry->dropCollection(txn, fullns);
 
     if (!s.isOK())
         return s;
@@ -569,12 +561,10 @@ Collection* Database::createCollection(OperationContext* txn,
     _checkCanCreateCollection(nss, options);
     audit::logCreateCollection(&cc(), ns);
 
-    txn->recoveryUnit()->registerChange(new AddCollectionChange(txn, this, ns));
-
     Status status = _dbEntry->createCollection(txn, ns, options, true /*allocateDefaultSpace*/);
     massertNoTraceStatusOK(status);
 
-
+    txn->recoveryUnit()->registerChange(new AddCollectionChange(txn, this, ns));
     Collection* collection = _getOrCreateCollectionInstance(txn, ns);
     invariant(collection);
     _collections[ns] = collection;
@@ -664,7 +654,7 @@ void Database::dropDatabase(OperationContext* txn, Database* db) {
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         getGlobalServiceContext()->getGlobalStorageEngine()->dropDatabase(txn, name);
     }
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "dropDatabase", db->name());
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "dropDatabase", name);
 }
 
 Status userCreateNS(OperationContext* txn,
