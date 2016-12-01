@@ -301,7 +301,9 @@ namespace mongo {
 
         LOG(1) << "PerconaFT: shutdown";
 
-        _durableJournal->stop();
+        if (_durable) {
+            _durableJournal->stop();
+        }
         _durableJournal.reset();
         _internalMetadataDict.reset();
         _metadataDict.reset();
