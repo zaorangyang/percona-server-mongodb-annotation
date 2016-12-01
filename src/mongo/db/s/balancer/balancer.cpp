@@ -327,20 +327,30 @@ void Balancer::_mainThread() {
         break;
     }
 
+    auto balancerConfig = shardingContext->getBalancerConfiguration();
+    while (!_stopRequested()) {
+        Status refreshStatus = balancerConfig->refreshAndCheck(txn.get());
+        if (!refreshStatus.isOK()) {
+            warning() << "Balancer settings could not be loaded and will be retried in "
+                      << durationCount<Seconds>(kInitBackoffInterval) << " seconds"
+                      << causedBy(refreshStatus);
+
+            _sleepFor(txn.get(), kInitBackoffInterval);
+            continue;
+        }
+
+        break;
+    }
+
     log() << "CSRS balancer thread is recovering";
 
-    auto balancerConfig = Grid::get(txn.get())->getBalancerConfiguration();
-    _migrationManager.finishRecovery(txn.get(),
-                                     balancerConfig->getMaxChunkSizeBytes(),
-                                     balancerConfig->getSecondaryThrottle(),
-                                     balancerConfig->waitForDelete());
+    _migrationManager.finishRecovery(
+        txn.get(), balancerConfig->getMaxChunkSizeBytes(), balancerConfig->getSecondaryThrottle());
 
     log() << "CSRS balancer thread is recovered";
 
     // Main balancer loop
     while (!_stopRequested()) {
-        auto balancerConfig = shardingContext->getBalancerConfiguration();
-
         BalanceRoundDetails roundDetails;
 
         _beginRound(txn.get());
@@ -591,24 +601,25 @@ int Balancer::_moveChunks(OperationContext* txn,
 
         const MigrationIdentifier& migrationId = migrationStatusEntry.first;
 
+        const auto requestIt = std::find_if(candidateChunks.begin(),
+                                            candidateChunks.end(),
+                                            [&migrationId](const MigrateInfo& migrateInfo) {
+                                                return migrateInfo.getName() == migrationId;
+                                            });
+        invariant(requestIt != candidateChunks.end());
+
         if (status == ErrorCodes::ChunkTooBig) {
             numChunksProcessed++;
 
-            auto failedRequestIt = std::find_if(candidateChunks.begin(),
-                                                candidateChunks.end(),
-                                                [&migrationId](const MigrateInfo& migrateInfo) {
-                                                    return migrateInfo.getName() == migrationId;
-                                                });
-            invariant(failedRequestIt != candidateChunks.end());
+            log() << "Performing a split because migration " << redact(requestIt->toString())
+                  << " failed for size reasons" << causedBy(redact(status));
 
-            log() << "Performing a split because migration " << failedRequestIt->toString()
-                  << " failed for size reasons" << causedBy(status);
-
-            _splitOrMarkJumbo(txn, NamespaceString(failedRequestIt->ns), failedRequestIt->minKey);
+            _splitOrMarkJumbo(txn, NamespaceString(requestIt->ns), requestIt->minKey);
             continue;
         }
 
-        log() << "Balancer move " << migrationId << " failed" << causedBy(status);
+        log() << "Balancer move " << redact(requestIt->toString()) << " failed"
+              << causedBy(redact(status));
     }
 
     return numChunksProcessed;

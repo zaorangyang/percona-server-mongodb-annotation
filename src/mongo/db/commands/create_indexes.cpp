@@ -51,7 +51,6 @@
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/scopeguard.h"
@@ -99,11 +98,27 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
                                           << typeName(indexesElem.type())};
                 }
 
-                auto indexSpec = validateIndexSpec(indexesElem.Obj(), ns, featureCompatibility);
-                if (!indexSpec.isOK()) {
-                    return indexSpec.getStatus();
+                auto indexSpecStatus = index_key_validate::validateIndexSpec(
+                    indexesElem.Obj(), ns, featureCompatibility);
+                if (!indexSpecStatus.isOK()) {
+                    return indexSpecStatus.getStatus();
                 }
-                indexSpecs.push_back(std::move(indexSpec.getValue()));
+                auto indexSpec = indexSpecStatus.getValue();
+
+                if (IndexDescriptor::isIdIndexPattern(
+                        indexSpec[IndexDescriptor::kKeyPatternFieldName].Obj())) {
+                    auto status = index_key_validate::validateIdIndexSpec(indexSpec);
+                    if (!status.isOK()) {
+                        return status;
+                    }
+                } else if (indexSpec[IndexDescriptor::kIndexNameFieldName].String() == "_id_"_sd) {
+                    return {ErrorCodes::BadValue,
+                            str::stream() << "The index name '_id_' is reserved for the _id index, "
+                                             "which must have key pattern {_id: 1}, found "
+                                          << indexSpec[IndexDescriptor::kKeyPatternFieldName]};
+                }
+
+                indexSpecs.push_back(std::move(indexSpec));
             }
 
             hasIndexesField = true;
@@ -145,61 +160,39 @@ StatusWith<std::vector<BSONObj>> resolveCollectionDefaultProperties(
     std::vector<BSONObj> indexSpecsWithDefaults = std::move(indexSpecs);
 
     for (size_t i = 0, numIndexSpecs = indexSpecsWithDefaults.size(); i < numIndexSpecs; ++i) {
-        const BSONObj& indexSpec = indexSpecsWithDefaults[i];
-        if (auto collationElem = indexSpec[IndexDescriptor::kCollationFieldName]) {
-            // validateIndexSpec() should have already verified that 'collationElem' is an object.
-            invariant(collationElem.type() == BSONType::Object);
+        auto indexSpecStatus = index_key_validate::validateIndexSpecCollation(
+            txn, indexSpecsWithDefaults[i], collection->getDefaultCollator());
+        if (!indexSpecStatus.isOK()) {
+            return indexSpecStatus.getStatus();
+        }
+        auto indexSpec = indexSpecStatus.getValue();
 
-            auto collator = CollatorFactoryInterface::get(txn->getServiceContext())
-                                ->makeFromBSON(collationElem.Obj());
-            if (!collator.isOK()) {
-                return collator.getStatus();
+        if (IndexDescriptor::isIdIndexPattern(
+                indexSpec[IndexDescriptor::kKeyPatternFieldName].Obj())) {
+            std::unique_ptr<CollatorInterface> indexCollator;
+            if (auto collationElem = indexSpec[IndexDescriptor::kCollationFieldName]) {
+                auto collatorStatus = CollatorFactoryInterface::get(txn->getServiceContext())
+                                          ->makeFromBSON(collationElem.Obj());
+                // validateIndexSpecCollation() should have checked that the index collation spec is
+                // valid.
+                invariantOK(collatorStatus.getStatus());
+                indexCollator = std::move(collatorStatus.getValue());
             }
-
-            if (collator.getValue()) {
-                // If the collator factory returned a non-null collator, then inject the entire
-                // collation specification into the index specification. This is necessary to fill
-                // in any options that the user omitted.
-                BSONObjBuilder bob;
-
-                for (auto&& indexSpecElem : indexSpec) {
-                    if (IndexDescriptor::kCollationFieldName !=
-                        indexSpecElem.fieldNameStringData()) {
-                        bob.append(indexSpecElem);
-                    }
-                }
-                bob.append(IndexDescriptor::kCollationFieldName,
-                           collator.getValue()->getSpec().toBSON());
-
-                indexSpecsWithDefaults[i] = bob.obj();
-            } else {
-                // If the collator factory returned a null collator (representing the "simple"
-                // collation), then we simply omit the "collation" from the index specification.
-                // This is desirable to make the representation for the "simple" collation
-                // consistent between v=1 and v=2 indexes.
-                indexSpecsWithDefaults[i] =
-                    indexSpec.removeField(IndexDescriptor::kCollationFieldName);
-            }
-        } else if (collection->getDefaultCollator()) {
-            // validateIndexSpec() should have added the "v" field if it was not present and
-            // verified that 'versionElem' is a number.
-            auto versionElem = indexSpec[IndexDescriptor::kIndexVersionFieldName];
-            invariant(versionElem.isNumber());
-
-            if (IndexVersion::kV2 <= static_cast<IndexVersion>(versionElem.numberInt())) {
-                // The user did not specify an explicit collation for this index and the collection
-                // has a default collator. If we're building a v=2 index, then we should inherit the
-                // collection default. However, if we're building a v=1 index, then we're implicitly
-                // building an index that's using the "simple" collation.
-                BSONObjBuilder bob;
-
-                bob.appendElements(indexSpec);
-                bob.append(IndexDescriptor::kCollationFieldName,
-                           collection->getDefaultCollator()->getSpec().toBSON());
-
-                indexSpecsWithDefaults[i] = bob.obj();
+            if (!CollatorInterface::collatorsMatch(collection->getDefaultCollator(),
+                                                   indexCollator.get())) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "The _id index must have the same collation as the "
+                                         "collection. Index collation: "
+                                      << (indexCollator.get() ? indexCollator->getSpec().toBSON()
+                                                              : CollationSpec::kSimpleSpec)
+                                      << ", collection collation: "
+                                      << (collection->getDefaultCollator()
+                                              ? collection->getDefaultCollator()->getSpec().toBSON()
+                                              : CollationSpec::kSimpleSpec)};
             }
         }
+
+        indexSpecsWithDefaults[i] = indexSpec;
     }
 
     return indexSpecsWithDefaults;

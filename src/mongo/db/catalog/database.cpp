@@ -560,7 +560,8 @@ Status Database::createView(OperationContext* txn,
 Collection* Database::createCollection(OperationContext* txn,
                                        StringData ns,
                                        const CollectionOptions& options,
-                                       bool createIdIndex) {
+                                       bool createIdIndex,
+                                       const BSONObj& idIndex) {
     invariant(txn->lockState()->isDbLockedForMode(name(), MODE_X));
     invariant(!options.isView());
 
@@ -578,23 +579,19 @@ Collection* Database::createCollection(OperationContext* txn,
     invariant(collection);
     _collections[ns] = collection;
 
+    BSONObj fullIdIndexSpec;
+
     if (createIdIndex) {
         if (collection->requiresIdIndex()) {
             if (options.autoIndexId == CollectionOptions::YES ||
                 options.autoIndexId == CollectionOptions::DEFAULT) {
-                // The creation of the _id index isn't replicated and is instead implicit in the
-                // creation of the collection. This means that the version of the _id index to build
-                // is technically unspecified. However, we're able to use the
-                // featureCompatibilityVersion of this server to determine the default index version
-                // to use because we apply commands (opType == 'c') in their own batch. This
-                // guarantees the write to the admin.system.version collection from the
-                // "setFeatureCompatibilityVersion" command either happens entirely before the
-                // collection creation or it happens entirely after.
                 const auto featureCompatibilityVersion =
                     serverGlobalParams.featureCompatibility.version.load();
                 IndexCatalog* ic = collection->getIndexCatalog();
-                uassertStatusOK(ic->createIndexOnEmptyCollection(
-                    txn, ic->getDefaultIdIndexSpec(featureCompatibilityVersion)));
+                fullIdIndexSpec = uassertStatusOK(ic->createIndexOnEmptyCollection(
+                    txn,
+                    !idIndex.isEmpty() ? idIndex
+                                       : ic->getDefaultIdIndexSpec(featureCompatibilityVersion)));
             }
         }
 
@@ -605,7 +602,7 @@ Collection* Database::createCollection(OperationContext* txn,
 
     auto opObserver = getGlobalServiceContext()->getOpObserver();
     if (opObserver)
-        opObserver->onCreateCollection(txn, nss, options);
+        opObserver->onCreateCollection(txn, nss, options, fullIdIndexSpec);
 
     return collection;
 }
@@ -664,18 +661,18 @@ void Database::dropDatabase(OperationContext* txn, Database* db) {
     dbHolder().close(txn, name);
     db = NULL;  // d is now deleted
 
-    getGlobalServiceContext()->getGlobalStorageEngine()->dropDatabase(txn, name);
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        getGlobalServiceContext()->getGlobalStorageEngine()->dropDatabase(txn, name);
+    }
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "dropDatabase", db->name());
 }
 
-/** { ..., capped: true, size: ..., max: ... }
- * @param createDefaultIndexes - if false, defers id (and other) index creation.
- * @return true if successful
-*/
 Status userCreateNS(OperationContext* txn,
                     Database* db,
                     StringData ns,
                     BSONObj options,
-                    bool createDefaultIndexes) {
+                    bool createDefaultIndexes,
+                    const BSONObj& idIndex) {
     invariant(db);
 
     LOG(1) << "create collection " << ns << ' ' << options;
@@ -740,7 +737,7 @@ Status userCreateNS(OperationContext* txn,
     if (collectionOptions.isView()) {
         uassertStatusOK(db->createView(txn, ns, collectionOptions));
     } else {
-        invariant(db->createCollection(txn, ns, collectionOptions, createDefaultIndexes));
+        invariant(db->createCollection(txn, ns, collectionOptions, createDefaultIndexes, idIndex));
     }
 
     return Status::OK();

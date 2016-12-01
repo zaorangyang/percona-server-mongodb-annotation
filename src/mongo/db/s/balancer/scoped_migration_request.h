@@ -67,7 +67,8 @@ public:
      * The destructor will handle removing the document when it is no longer needed.
      */
     static StatusWith<ScopedMigrationRequest> writeMigration(OperationContext* txn,
-                                                             const MigrateInfo& migrate);
+                                                             const MigrateInfo& migrate,
+                                                             bool waitForDelete);
 
     /**
      * Creates a ScopedMigrationRequest object without inserting a document into config.migrations.
@@ -81,6 +82,17 @@ public:
                                                     const BSONObj& minKey);
 
     /**
+     * Do not call if keepDocumentOnDestruct has been called previously: it will invariant.
+     *
+     * Attempts to delete this migration's entry in the config.migrations collection using majority
+     * write concern. If successful, clears the operation context so that the destructor will not
+     * redundantly try to remove an already successfully deleted document.
+     */
+    Status tryToRemoveMigration();
+
+    /**
+     * Do not call if tryToRemoveMigration has been called previously: it may invariant.
+     *
      * Clears the operation context so that the destructor will not remove the config.migrations
      * document for the migration.
      *

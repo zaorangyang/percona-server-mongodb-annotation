@@ -87,7 +87,6 @@ public:
     void clearSyncSourceBlacklist() override {}
     HostAndPort chooseNewSyncSource(const Timestamp& ts) override {
         HostAndPort result = _syncSource;
-        _syncSource = HostAndPort();
         return result;
     }
     void blacklistSyncSource(const HostAndPort& host, Date_t until) override {
@@ -1365,9 +1364,9 @@ TEST_F(InitialSyncTest, GetInitialSyncProgressReturnsCorrectProgress) {
     playResponses();
     log() << "Done playing failed responses";
 
-    // Play the first 2 responses of the successful round of responses to ensure that the
+    // Play the first 3 responses of the successful round of responses to ensure that the
     // data replicator starts the oplog fetcher.
-    setResponses({successfulResponses.begin(), successfulResponses.begin() + 2});
+    setResponses({successfulResponses.begin(), successfulResponses.begin() + 3});
     numGetMoreOplogEntries = 0;
     playResponses();
     log() << "Done playing first successful response";
@@ -1395,7 +1394,7 @@ TEST_F(InitialSyncTest, GetInitialSyncProgressReturnsCorrectProgress) {
         << attempt0;
 
     // Play all but last of the successful round of responses.
-    setResponses({successfulResponses.begin() + 2, successfulResponses.end() - 1});
+    setResponses({successfulResponses.begin() + 3, successfulResponses.end() - 1});
     // Reset getMore counter because the data replicator starts a new oplog tailing query.
     numGetMoreOplogEntries = 0;
     playResponses();

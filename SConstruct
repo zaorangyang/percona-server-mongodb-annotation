@@ -423,10 +423,10 @@ add_option('use-cpu-profiler',
 )
 
 add_option('build-fast-and-loose',
-    choices=['on', 'off'],
+    choices=['on', 'off', 'auto'],
     const='on',
-    default='on',
-    help='looser dependency checking, ignored for --release builds',
+    default='auto',
+    help='looser dependency checking',
     nargs='?',
     type='choice',
 )
@@ -523,6 +523,15 @@ add_option('use-s390x-crc32',
     default="on",
     help="Enable CRC32 hardware accelaration on s390x",
     type='choice',
+)
+
+add_option('git-decider',
+    choices=["on", "off"],
+    const='on',
+    default="off",
+    help="Use git metadata for out-of-date detection for source files",
+    nargs='?',
+    type="choice",
 )
 
 try:
@@ -1320,13 +1329,22 @@ if link_model.startswith("dynamic"):
 if optBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")
 
-# Ignore requests to build fast and loose for release builds.
-# Also ignore fast-and-loose option if the scons cache is enabled (see SERVER-19088)
-if get_option('build-fast-and-loose') == "on" and \
-    not has_option('release') and not has_option('cache'):
+# Enable the fast decider if exlicltly requested or if in 'auto' mode and not in conflict with other
+# options.
+if get_option('build-fast-and-loose') == 'on' or \
+   (get_option('build-fast-and-loose') == 'auto' and \
+    not has_option('release') and \
+    not has_option('cache')):
     # See http://www.scons.org/wiki/GoFastButton for details
     env.Decider('MD5-timestamp')
     env.SetOption('max_drift', 1)
+
+# If the user has requested the git decider, enable it if it is available. We want to do this after
+# we set the basic decider above, so that we 'chain' to that one.
+if get_option('git-decider') == 'on':
+    git_decider = Tool('git_decider')
+    if git_decider.exists(env):
+        git_decider(env)
 
 # On non-windows platforms, we may need to differentiate between flags being used to target an
 # executable (like -fPIE), vs those being used to target a (shared) library (like -fPIC). To do so,
@@ -2990,7 +3008,15 @@ def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
 env.AddMethod(injectMongoIncludePaths, 'InjectMongoIncludePaths')
 
-compileDb = env.Alias("compiledb", env.CompilationDatabase('compile_commands.json'))
+compileCommands = env.CompilationDatabase('compile_commands.json')
+compileDb = env.Alias("compiledb", compileCommands)
+
+# Microsoft Visual Studio Project generation for code browsing
+vcxprojFile = env.Command(
+    "mongodb.vcxproj",
+    compileCommands,
+    r"$PYTHON buildscripts\make_vcxproj.py mongodb")
+vcxproj = env.Alias("vcxproj", vcxprojFile)
 
 env.Alias("distsrc-tar", env.DistSrc("mongodb-src-${MONGO_VERSION}.tar"))
 env.Alias("distsrc-tgz", env.GZip(

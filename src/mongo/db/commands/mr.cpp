@@ -424,8 +424,9 @@ void State::prepTempCollection() {
                                            << "_temp_0"
                                            << "v"
                                            << static_cast<int>(IndexVersion::kV2));
-            Status status =
-                incColl->getIndexCatalog()->createIndexOnEmptyCollection(_txn, indexSpec);
+            Status status = incColl->getIndexCatalog()
+                                ->createIndexOnEmptyCollection(_txn, indexSpec)
+                                .getStatus();
             if (!status.isOK()) {
                 uasserted(17305,
                           str::stream() << "createIndex failed for mr incLong ns: "
@@ -486,7 +487,8 @@ void State::prepTempCollection() {
 
         for (vector<BSONObj>::iterator it = indexesToInsert.begin(); it != indexesToInsert.end();
              ++it) {
-            Status status = tempColl->getIndexCatalog()->createIndexOnEmptyCollection(_txn, *it);
+            Status status =
+                tempColl->getIndexCatalog()->createIndexOnEmptyCollection(_txn, *it).getStatus();
             if (!status.isOK()) {
                 if (status.code() == ErrorCodes::IndexAlreadyExists) {
                     continue;
@@ -1582,7 +1584,7 @@ public:
                 invariant(coll);  // 'exec' hasn't been killed, so collection must be alive.
                 coll->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
 
-                if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+                if (curOp->shouldDBProfile()) {
                     BSONObjBuilder execStatsBob;
                     Explain::getWinningPlanStats(exec.get(), &execStatsBob);
                     curOp->debug().execStats = execStatsBob.obj();

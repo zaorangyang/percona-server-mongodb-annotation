@@ -432,7 +432,7 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsWithInvalidShard) {
         auto status = catalogClient()->getAllShards(operationContext(),
                                                     repl::ReadConcernLevel::kMajorityReadConcern);
 
-        ASSERT_EQ(ErrorCodes::FailedToParse, status.getStatus());
+        ASSERT_EQ(ErrorCodes::NoSuchKey, status.getStatus());
     });
 
     onFindCommand([](const RemoteCommandRequest& request) {
@@ -591,7 +591,7 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSInvalidChunk) {
                                                    nullptr,
                                                    repl::ReadConcernLevel::kMajorityReadConcern);
 
-        ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
+        ASSERT_EQUALS(ErrorCodes::NoSuchKey, status);
         ASSERT_EQ(0U, chunks.size());
     });
 
@@ -1183,7 +1183,7 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollectionInvalidTag) {
         Status status =
             catalogClient()->getTagsForCollection(operationContext(), "TestDB.TestColl", &tags);
 
-        ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
+        ASSERT_EQUALS(ErrorCodes::NoSuchKey, status);
         ASSERT_EQ(0U, tags.size());
     });
 
@@ -1201,136 +1201,6 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollectionInvalidTag) {
         // Missing maxKey
 
         return vector<BSONObj>{tagA.toBSON(), tagB.toBSON()};
-    });
-
-    future.timed_get(kFutureTimeout);
-}
-
-TEST_F(ShardingCatalogClientTest, GetTagForChunkOneTagFound) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    ChunkType chunk;
-    chunk.setNS("test.coll");
-    chunk.setMin(BSON("a" << 1));
-    chunk.setMax(BSON("a" << 100));
-    chunk.setVersion({1, 2, OID::gen()});
-    chunk.setShard(ShardId("shard0000"));
-    ASSERT_OK(chunk.validate());
-
-    auto future = launchAsync([this, chunk] {
-        return assertGet(catalogClient()->getTagForChunk(operationContext(), "test.coll", chunk));
-    });
-
-    onFindCommand([this, chunk](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata,
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
-
-        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
-
-        ASSERT_EQ(query->ns(), TagsType::ConfigNS);
-        ASSERT_BSONOBJ_EQ(query->getFilter(),
-                          BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
-                                                           << BSON("$lte" << chunk.getMin())
-                                                           << TagsType::max()
-                                                           << BSON("$gte" << chunk.getMax())));
-
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
-
-        TagsType tt;
-        tt.setNS("test.coll");
-        tt.setTag("tag");
-        tt.setMinKey(BSON("a" << 1));
-        tt.setMaxKey(BSON("a" << 100));
-
-        return vector<BSONObj>{tt.toBSON()};
-    });
-
-    const string& tagStr = future.timed_get(kFutureTimeout);
-    ASSERT_EQ("tag", tagStr);
-}
-
-TEST_F(ShardingCatalogClientTest, GetTagForChunkNoTagFound) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    ChunkType chunk;
-    chunk.setNS("test.coll");
-    chunk.setMin(BSON("a" << 1));
-    chunk.setMax(BSON("a" << 100));
-    chunk.setVersion({1, 2, OID::gen()});
-    chunk.setShard(ShardId("shard0000"));
-    ASSERT_OK(chunk.validate());
-
-    auto future = launchAsync([this, chunk] {
-        return assertGet(catalogClient()->getTagForChunk(operationContext(), "test.coll", chunk));
-    });
-
-    onFindCommand([this, chunk](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata,
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
-
-        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
-
-        ASSERT_EQ(query->ns(), TagsType::ConfigNS);
-        ASSERT_BSONOBJ_EQ(query->getFilter(),
-                          BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
-                                                           << BSON("$lte" << chunk.getMin())
-                                                           << TagsType::max()
-                                                           << BSON("$gte" << chunk.getMax())));
-
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
-
-        return vector<BSONObj>{};
-    });
-
-    const string& tagStr = future.timed_get(kFutureTimeout);
-    ASSERT_EQ("", tagStr);  // empty string returned when tag document not found
-}
-
-TEST_F(ShardingCatalogClientTest, GetTagForChunkInvalidTagDoc) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    ChunkType chunk;
-    chunk.setNS("test.coll");
-    chunk.setMin(BSON("a" << 1));
-    chunk.setMax(BSON("a" << 100));
-    chunk.setVersion({1, 2, OID::gen()});
-    chunk.setShard(ShardId("shard0000"));
-    ASSERT_OK(chunk.validate());
-
-    auto future = launchAsync([this, chunk] {
-        const auto tagResult =
-            catalogClient()->getTagForChunk(operationContext(), "test.coll", chunk);
-
-        ASSERT_EQ(ErrorCodes::FailedToParse, tagResult.getStatus());
-    });
-
-    onFindCommand([this, chunk](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata,
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
-        ASSERT_EQ(nss.ns(), TagsType::ConfigNS);
-
-        auto query = assertGet(QueryRequest::makeFromFindCommand(nss, request.cmdObj, false));
-
-        ASSERT_EQ(query->ns(), TagsType::ConfigNS);
-        ASSERT_BSONOBJ_EQ(query->getFilter(),
-                          BSON(TagsType::ns(chunk.getNS()) << TagsType::min()
-                                                           << BSON("$lte" << chunk.getMin())
-                                                           << TagsType::max()
-                                                           << BSON("$gte" << chunk.getMax())));
-
-        checkReadConcern(request.cmdObj, Timestamp(0, 0), repl::OpTime::kUninitializedTerm);
-
-        // Return a tag document missing the min key
-        return vector<BSONObj>{BSON(TagsType::ns("test.mycol") << TagsType::tag("tag")
-                                                               << TagsType::max(BSON("a" << 20)))};
     });
 
     future.timed_get(kFutureTimeout);

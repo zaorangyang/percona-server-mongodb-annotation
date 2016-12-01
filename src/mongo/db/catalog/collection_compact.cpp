@@ -45,7 +45,6 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/log.h"
-#include "mongo/util/touch_pages.h"
 
 namespace mongo {
 
@@ -155,7 +154,8 @@ StatusWith<CompactStats> Collection::compact(OperationContext* txn,
 
             const BSONObj spec = _compactAdjustIndexSpec(descriptor->infoObj());
             const BSONObj key = spec.getObjectField("key");
-            const Status keyStatus = validateKeyPattern(key);
+            const Status keyStatus =
+                index_key_validate::validateKeyPattern(key, descriptor->version());
             if (!keyStatus.isOK()) {
                 return StatusWith<CompactStats>(
                     ErrorCodes::CannotCreateIndex,

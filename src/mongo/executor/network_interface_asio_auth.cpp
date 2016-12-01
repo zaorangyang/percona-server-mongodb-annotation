@@ -80,6 +80,10 @@ void NetworkInterfaceASIO::_runIsMaster(AsyncOp* op) {
 
     op->connection().getCompressorManager().clientBegin(&bob);
 
+    if (WireSpec::instance().isInternalClient) {
+        WireSpec::appendInternalClientWireVersion(WireSpec::instance().outgoing, &bob);
+    }
+
     requestBuilder.setCommandArgs(bob.done());
     requestBuilder.setMetadata(rpc::makeEmptyMetadata());
 

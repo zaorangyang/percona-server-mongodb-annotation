@@ -51,7 +51,6 @@ variables:
     vars:
       resmoke_args: --help
       run_multiple_jobs: false
-      enable_coredumps: false
       max_jobs: 0  # If set in combination with run_multiple_jobs, will cap the number of jobs used.
 
 - &jepsen_config_vars
@@ -407,9 +406,16 @@ functions:
           # Set the shell process (and its children processes) to dump ELF headers (bit 4),
           # anonymous shared mappings (bit 1), and anonymous private mappings (bit 0).
           echo 0x13 > /proc/self/coredump_filter
-
-          if [ ${build_variant} = ubuntu1604 ] && [ ${enable_coredumps|false} = true ]; then
-            ulimit -c unlimited
+        
+          if [ -f /sbin/sysctl ]; then
+            # Check that the core pattern is set explicitly on our distro image instead
+            # of being the OS's default value. This ensures that coredump names are consistent
+            # across distros and can be picked up by Evergreen.
+            core_pattern=$(/sbin/sysctl -n "kernel.core_pattern")
+            if [ "$core_pattern" = "dump_%e.%p.core" ]; then
+              echo "Enabling coredumps"
+              ulimit -c unlimited
+            fi
           fi
         fi
 
@@ -500,6 +506,9 @@ functions:
               echo "Copy to host $hostn failed!"
               $sudo tail -n 100 $hostn_log
               exit_failure_code=$exit_code
+            else
+              # Cleanup any existing logs from previous runs.
+              ssh root@$hostn "rm -f /root/mongod.log /root/stdout.log /opt/mongod/mongod.log /opt/mongod/stdout.log"
             fi
           done
           exit $exit_failure_code
@@ -514,15 +523,19 @@ functions:
           set -o verbose
           start_time=$(date +%s)
           lein run --tarball "file:///root/mongo-binaries.tgz" ${jepsen_key_time_limit} ${jepsen_protocol_version} ${jepsen_read_concern} ${jepsen_read_with_find_and_modify} ${jepsen_storage_engine} ${jepsen_time_limit} ${jepsen_write_concern} 2>&1 | tee jepsen_${task_name}_${execution}.log
-          exit_code=$?
           end_time=$(date +%s)
           elapsed_secs=$((end_time-start_time))
+          # Since we cannot use PIPESTATUS to get the exit code from the "lein run ..." pipe in dash shell,
+          # we will check the output for success, failure or setup error.
+          grep -q "Everything looks good" jepsen_${task_name}_${execution}.log
+          exit_code=$?
           if [ $exit_code -eq 0 ]; then
             status='"pass"'
             failures=0
           else
             grep -q "Analysis invalid" jepsen_${task_name}_${execution}.log
-            if [ $? -eq 0 ]; then
+            exit_code=$?
+            if [ $exit_code -eq 0 ]; then
               status='"fail"'
               failures=1
             else
@@ -540,7 +553,7 @@ functions:
         script: |
           set -o verbose
           # Jepsen system failure if file exists.
-          if [ -f jepsen_systemfailure_${task_name}_${execution} ]; then
+          if [ -f jepsen_system_failure_${task_name}_${execution} ]; then
             exit $(cat jepsen_system_failure_${task_name}_${execution})
           fi
 
@@ -1391,6 +1404,18 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: aggregation_read_concern_majority_passthrough_pv0_WT
+  depends_on:
+  - name: aggregation_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=aggregation_read_concern_majority_passthrough_pv0 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+
+- <<: *task_template
   name: aggregation_sharded_collections_passthrough_WT
   depends_on:
   - name: aggregation_WT
@@ -1722,7 +1747,6 @@ tasks:
     vars:
       resmoke_args: --suites=core --storageEngine=wiredTiger
       run_multiple_jobs: true
-      enable_coredumps: true
 
 - <<: *task_template
   name: jsCore_WT_ese
@@ -2228,6 +2252,17 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=read_concern_majority_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: read_concern_majority_passthrough_pv0_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=read_concern_majority_passthrough_pv0 --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -3828,6 +3863,7 @@ buildvariants:
   - enterprise
   run_on:
   - ubuntu1604-arm64-small
+  - ubuntu1604-arm64-large
   batchtime: 1440 # 1 day
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
@@ -3903,6 +3939,7 @@ buildvariants:
   display_name: SSL Ubuntu 16.04 arm64
   run_on:
   - ubuntu1604-arm64-small
+  - ubuntu1604-arm64-large
   batchtime: 1440 # 1 day
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
@@ -4604,6 +4641,7 @@ buildvariants:
   - name: aggregation_WT
   - name: aggregation_facet_unwind_passthrough_WT
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: auth
   - name: auth_WT
@@ -4681,6 +4719,9 @@ buildvariants:
     distros:
     - windows-64-vs2015-large
   - name: read_concern_majority_passthrough_WT
+    distros:
+    - windows-64-vs2015-large
+  - name: read_concern_majority_passthrough_pv0_WT
     distros:
     - windows-64-vs2015-large
   - name: read_only
@@ -5081,6 +5122,7 @@ buildvariants:
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: auth
   - name: auth_WT
@@ -5141,6 +5183,7 @@ buildvariants:
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: read_concern_majority_passthrough_WT
+  - name: read_concern_majority_passthrough_pv0_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replication
@@ -5296,6 +5339,7 @@ buildvariants:
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough_WT
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: audit
   - name: audit_WT
@@ -5387,6 +5431,9 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: read_concern_majority_passthrough_pv0_WT
     distros:
     - rhel62-large
   - name: read_only
@@ -7454,6 +7501,7 @@ buildvariants:
   - name: aggregation_WT
   - name: aggregation_auth
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: audit
   - name: auth
@@ -7493,6 +7541,7 @@ buildvariants:
   - name: parallel
   - name: parallel_compatibility
   - name: read_concern_majority_passthrough_WT
+  - name: read_concern_majority_passthrough_pv0_WT
   - name: replicasets_WT
   - name: replicasets_auth
   - name: replicasets_legacy
@@ -7859,6 +7908,7 @@ buildvariants:
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough_WT
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: audit
   - name: audit_WT
@@ -7930,6 +7980,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
+  - name: read_concern_majority_passthrough_pv0_WT
   - name: read_only
   - name: read_only_WT
   - name: read_only_sharded
@@ -8030,6 +8081,7 @@ buildvariants:
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough_WT
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: audit
   - name: audit_WT
@@ -8101,6 +8153,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
+  - name: read_concern_majority_passthrough_pv0_WT
   - name: read_only
   - name: read_only_WT
   - name: read_only_sharded

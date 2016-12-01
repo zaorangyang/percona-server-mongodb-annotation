@@ -272,7 +272,7 @@ Status ReplicationCoordinatorExternalStateMock::multiSyncApply(MultiApplier::Ope
 }
 
 Status ReplicationCoordinatorExternalStateMock::multiInitialSyncApply(
-    MultiApplier::OperationPtrs* ops, const HostAndPort& source) {
+    MultiApplier::OperationPtrs* ops, const HostAndPort& source, AtomicUInt32* fetchCount) {
     return Status::OK();
 }
 

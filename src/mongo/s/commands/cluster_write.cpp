@@ -30,7 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/s/cluster_write.h"
+#include "mongo/s/commands/cluster_write.h"
 
 #include <string>
 #include <vector>
@@ -104,7 +104,7 @@ BSONObj createIndexDoc(const string& ns,
         indexDoc.append("collation", collation);
     }
 
-    if (unique) {
+    if (unique && !IndexDescriptor::isIdIndexPattern(keys)) {
         indexDoc.appendBool("unique", unique);
     }
 

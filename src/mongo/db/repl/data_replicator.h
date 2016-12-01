@@ -193,8 +193,6 @@ public:
         size_t maxFailedInitialSyncAttempts{0};
         Date_t initialSyncStart;
         Date_t initialSyncEnd;
-        Timestamp initialSyncOplogStart;
-        Timestamp initialSyncOplogEnd;
         std::vector<DataReplicator::InitialSyncAttemptInfo> initialSyncAttemptInfos;
 
         std::string toString() const;
@@ -324,6 +322,10 @@ private:
     void _onDataClonerFinish(const Status& status, HostAndPort syncSource);
     // Called after _onDataClonerFinish when the new Timestamp is avail, to use for minvalid.
     void _onApplierReadyStart(const QueryResponseStatus& fetchResult);
+    // Called during _onApplyBatchFinish when we fetched a missing document and must reset minValid.
+    void _onFetchMissingDocument_inlock(OpTimeWithHash lastApplied, std::size_t numApplied);
+    // Schedules a fetcher to get the last oplog entry from the sync source.
+    void _scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn callback);
 
     Status _scheduleDoNextActions();
     Status _scheduleApplyBatch();
@@ -339,6 +341,9 @@ private:
 
     Status _shutdown(OperationContext* txn);
     void _changeStateIfNeeded();
+
+    // Counts how many documents have been refetched from the source in the current batch.
+    AtomicUInt32 _fetchCount;
 
     //
     // All member variables are labeled with one of the following codes indicating the

@@ -1161,18 +1161,22 @@ Status multiSyncApply_noAbort(OperationContext* txn,
 void multiInitialSyncApply_abortOnFailure(MultiApplier::OperationPtrs* ops, SyncTail* st) {
     initializeWriterThread();
     auto txn = cc().makeOperationContext();
-    fassertNoTrace(15915, multiInitialSyncApply_noAbort(txn.get(), ops, st));
+    AtomicUInt32 fetchCount(0);
+    fassertNoTrace(15915, multiInitialSyncApply_noAbort(txn.get(), ops, st, &fetchCount));
 }
 
-Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops, SyncTail* st) {
+Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+                             SyncTail* st,
+                             AtomicUInt32* fetchCount) {
     initializeWriterThread();
     auto txn = cc().makeOperationContext();
-    return multiInitialSyncApply_noAbort(txn.get(), ops, st);
+    return multiInitialSyncApply_noAbort(txn.get(), ops, st, fetchCount);
 }
 
 Status multiInitialSyncApply_noAbort(OperationContext* txn,
                                      MultiApplier::OperationPtrs* ops,
-                                     SyncTail* st) {
+                                     SyncTail* st,
+                                     AtomicUInt32* fetchCount) {
     txn->setReplicatedWrites(false);
     DisableDocumentValidation validationDisabler(txn);
 
@@ -1195,6 +1199,7 @@ Status multiInitialSyncApply_noAbort(OperationContext* txn,
                 }
 
                 // We might need to fetch the missing docs from the sync source.
+                fetchCount->fetchAndAdd(1);
                 if (st->shouldRetry(txn, entry.raw)) {
                     const Status s2 = SyncTail::syncApply(txn, entry.raw, inSteadyStateReplication);
                     if (!s2.isOK()) {

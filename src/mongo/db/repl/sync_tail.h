@@ -214,7 +214,7 @@ public:
      */
     OldThreadPool* getWriterPool();
 
-    static std::atomic<int> replBatchLimitOperations;  // NOLINT (sever params must use std::atomic)
+    static std::atomic<int> replBatchLimitOperations;  // NOLINT (server param must use std::atomic)
 
 protected:
     static const unsigned int replBatchLimitBytes = 100 * 1024 * 1024;
@@ -262,7 +262,9 @@ void multiSyncApply(MultiApplier::OperationPtrs* ops, SyncTail* st);
 void multiInitialSyncApply_abortOnFailure(MultiApplier::OperationPtrs* ops, SyncTail* st);
 
 // Used by 3.4 initial sync.
-Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops, SyncTail* st);
+Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+                             SyncTail* st,
+                             AtomicUInt32* fetchCount);
 
 /**
  * Testing-only version of multiSyncApply that returns an error instead of aborting.
@@ -281,7 +283,8 @@ Status multiSyncApply_noAbort(OperationContext* txn,
  */
 Status multiInitialSyncApply_noAbort(OperationContext* txn,
                                      MultiApplier::OperationPtrs* ops,
-                                     SyncTail* st);
+                                     SyncTail* st,
+                                     AtomicUInt32* fetchCount);
 
 }  // namespace repl
 }  // namespace mongo
