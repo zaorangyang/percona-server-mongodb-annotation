@@ -70,9 +70,9 @@ private:
 class SyncSourceSelectorMock : public SyncSourceSelector {
 public:
     void clearSyncSourceBlacklist() override {}
-    HostAndPort chooseNewSyncSource(const Timestamp& ts) override {
+    HostAndPort chooseNewSyncSource(const OpTime& ot) override {
         chooseNewSyncSourceHook();
-        lastTimestampFetched = ts;
+        lastOpTimeFetched = ot;
         return syncSource;
     }
     void blacklistSyncSource(const HostAndPort& host, Date_t until) override {
@@ -84,7 +84,7 @@ public:
     }
 
     HostAndPort syncSource = HostAndPort("host1", 1234);
-    Timestamp lastTimestampFetched;
+    OpTime lastOpTimeFetched;
     stdx::function<void()> chooseNewSyncSourceHook = []() {};
 
     HostAndPort blacklistHost;
@@ -240,6 +240,15 @@ TEST_F(SyncSourceResolverTest, StartupReturnsIllegalOperationIfAlreadyActive) {
     ASSERT_TRUE(_resolver->isActive());
 }
 
+TEST_F(SyncSourceResolverTest, StartupReturnsShutdownInProgressIfResolverIsShuttingDown) {
+    _selector->syncSource = HostAndPort("node1", 12345);
+    ASSERT_OK(_resolver->startup());
+    ASSERT_TRUE(executor::NetworkInterfaceMock::InNetworkGuard(getNet())->hasReadyRequests());
+    _resolver->shutdown();
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, _resolver->startup());
+    ASSERT_TRUE(_resolver->isActive());
+}
+
 TEST_F(SyncSourceResolverTest, StartupReturnsShutdownInProgressIfExecutorIsShutdown) {
     ASSERT_FALSE(_resolver->isActive());
     getExecutor().shutdown();
@@ -255,10 +264,10 @@ TEST_F(SyncSourceResolverTest,
     // Resolver invokes callback with empty host and becomes inactive immediately.
     ASSERT_FALSE(_resolver->isActive());
     ASSERT_EQUALS(HostAndPort(), unittest::assertGet(_response.syncSourceStatus));
-    ASSERT_EQUALS(lastOpTimeFetched.getTimestamp(), _selector->lastTimestampFetched);
+    ASSERT_EQUALS(lastOpTimeFetched, _selector->lastOpTimeFetched);
 
     // Cannot restart a completed resolver.
-    ASSERT_EQUALS(ErrorCodes::IllegalOperation, _resolver->startup());
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, _resolver->startup());
 }
 
 TEST_F(

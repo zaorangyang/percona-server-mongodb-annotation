@@ -85,7 +85,7 @@ class SyncSourceSelectorMock : public SyncSourceSelector {
 public:
     SyncSourceSelectorMock(const HostAndPort& syncSource) : _syncSource(syncSource) {}
     void clearSyncSourceBlacklist() override {}
-    HostAndPort chooseNewSyncSource(const Timestamp& ts) override {
+    HostAndPort chooseNewSyncSource(const OpTime& ot) override {
         HostAndPort result = _syncSource;
         return result;
     }
@@ -120,8 +120,8 @@ public:
     void clearSyncSourceBlacklist() override {
         _syncSourceSelector->clearSyncSourceBlacklist();
     }
-    HostAndPort chooseNewSyncSource(const Timestamp& ts) override {
-        return _syncSourceSelector->chooseNewSyncSource(ts);
+    HostAndPort chooseNewSyncSource(const OpTime& ot) override {
+        return _syncSourceSelector->chooseNewSyncSource(ot);
     }
     void blacklistSyncSource(const HostAndPort& host, Date_t until) override {
         _syncSourceSelector->blacklistSyncSource(host, until);
@@ -640,7 +640,7 @@ void InitialSyncTest::tearDown() {
 TEST_F(InitialSyncTest, ShutdownImmediatelyAfterStartup) {
     startSync(1);
     auto txn = makeOpCtx();
-    ASSERT_OK(getDR().shutdown(txn.get()));
+    ASSERT_OK(getDR().shutdown());
     getExecutor().shutdown();
     verifySync(getNet(), ErrorCodes::ShutdownInProgress);
 }
