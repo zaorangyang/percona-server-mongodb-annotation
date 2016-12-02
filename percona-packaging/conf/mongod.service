@@ -14,7 +14,7 @@ LimitNOFILE=64000
 LimitNPROC=64000
 EnvironmentFile=/etc/@@LOCATION@@/mongod
 ExecStartPre=/usr/bin/percona-server-mongodb-helper.sh
-ExecStart=/usr/bin/env bash -c "/usr/bin/mongod $OPTIONS > ${STDOUT} 2> ${STDERR}"
+ExecStart=/usr/bin/env bash -c "${NUMACTL} /usr/bin/mongod $OPTIONS > ${STDOUT} 2> ${STDERR}"
 PIDFile=/var/run/mongod.pid
 
 [Install]
