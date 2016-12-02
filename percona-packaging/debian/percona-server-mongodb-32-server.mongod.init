@@ -72,7 +72,6 @@ DIETIME=10
 if [ -f /etc/default/$NAME ] ; then
 	. /etc/default/$NAME
 fi
-DAEMON_OPTS="${OPTIONS}"
 
 if test ! -x $DAEMON; then
   echo "Could not find $DAEMON"

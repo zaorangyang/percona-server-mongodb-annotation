@@ -17,6 +17,7 @@ print_error(){
 }
 #
 . /etc/@@LOCATION@@/mongod
+DAEMON_OPTS="${OPTIONS}"
 #
 # Handle NUMA access to CPUs (SERVER-3574)
 # This verifies the existence of numactl as well as testing that the command works
@@ -24,8 +25,10 @@ NUMACTL_ARGS="--interleave=all"
 if which numactl >/dev/null 2>/dev/null && numactl $NUMACTL_ARGS ls / >/dev/null 2>/dev/null
 then
     NUMACTL="numactl $NUMACTL_ARGS"
+    DAEMON_OPTS=${DAEMON_OPTS:-"--config $CONF"}
 else
     NUMACTL=""
+    DAEMON_OPTS=${DAEMON_OPTS:-"--config $CONF"}
 fi
 #
 # checking if PerconaFT is used looking at defaults file and daemon config
