@@ -39,6 +39,7 @@ Requires: %{name}-mongos = %{version}-%{release}
 Requires: %{name}-server = %{version}-%{release}
 Requires: %{name}-shell = %{version}-%{release}
 Requires: %{name}-tools = %{version}-%{release}
+Requires: numactl
 
 Conflicts: Percona-Server-MongoDB
 
