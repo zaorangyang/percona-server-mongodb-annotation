@@ -49,7 +49,7 @@
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -417,7 +417,7 @@ void ChunkManager::calcInitSplitsAndShards(OperationContext* txn,
             BSONObj pt = (*initPoints)[i];
             orderedPts.insert(pt);
         }
-        for (set<BSONObj>::iterator it = orderedPts.begin(); it != orderedPts.end(); ++it) {
+        for (auto it = orderedPts.begin(); it != orderedPts.end(); ++it) {
             splitPoints->push_back(*it);
         }
 

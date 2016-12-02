@@ -254,6 +254,13 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
                                "Desired format for timestamps in log messages. One of ctime, "
                                "iso8601-utc or iso8601-local");
 
+#if MONGO_ENTERPRISE_VERSION
+    options->addOptionChaining("security.redactClientLogData",
+                               "redactClientLogData",
+                               moe::Switch,
+                               "Redact client data written to the diagnostics log");
+#endif
+
     options->addOptionChaining("processManagement.pidFilePath",
                                "pidfilepath",
                                moe::String,
@@ -568,6 +575,19 @@ Status validateServerOptions(const moe::Environment& params) {
         if (enableTestCommandsParameter != parameters.end() &&
             enableTestCommandsParameter->second.compare("1") == 0) {
             getGlobalFailPointRegistry()->registerAllFailPointsAsServerParameters();
+        }
+
+        if (parameters.find("internalValidateFeaturesAsMaster") != parameters.end()) {
+            // Command line options that are disallowed when internalValidateFeaturesAsMaster is
+            // specified.
+            for (const auto& disallowedOption : {"replication.replSet", "master", "slave"}) {
+                if (params.count(disallowedOption)) {
+                    return Status(ErrorCodes::BadValue,
+                                  str::stream()
+                                      << "Cannot specify both internalValidateFeaturesAsMaster and "
+                                      << disallowedOption);
+                }
+            }
         }
     }
     if ((params.count("security.authorization") &&

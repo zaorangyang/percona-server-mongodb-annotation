@@ -30,11 +30,11 @@
 
 #include "mongo/db/pipeline/document_source.h"
 
-
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/value.h"
 
 namespace mongo {
@@ -48,7 +48,9 @@ using std::vector;
 DocumentSourceSort::DocumentSourceSort(const intrusive_ptr<ExpressionContext>& pExpCtx)
     : DocumentSource(pExpCtx), _mergingPresorted(false) {}
 
-REGISTER_DOCUMENT_SOURCE(sort, DocumentSourceSort::createFromBson);
+REGISTER_DOCUMENT_SOURCE(sort,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceSort::createFromBson);
 
 const char* DocumentSourceSort::getSourceName() const {
     return "$sort";
@@ -136,11 +138,10 @@ Document DocumentSourceSort::serializeSortKey(bool explain) const {
     return keyObj.freeze();
 }
 
-Pipeline::SourceContainer::iterator DocumentSourceSort::optimizeAt(
+Pipeline::SourceContainer::iterator DocumentSourceSort::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
 
-    auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
     auto nextLimit = dynamic_cast<DocumentSourceLimit*>((*std::next(itr)).get());
 
     if (nextLimit) {
@@ -148,11 +149,6 @@ Pipeline::SourceContainer::iterator DocumentSourceSort::optimizeAt(
         setLimitSrc(nextLimit);
         container->erase(std::next(itr));
         return itr;
-    } else if (nextMatch && !nextMatch->isTextQuery()) {
-        // Swap the $match before the $sort, thus reducing the number of documents that pass into
-        // this stage.
-        std::swap(*itr, *std::next(itr));
-        return itr == container->begin() ? itr : std::prev(itr);
     }
     return std::next(itr);
 }

@@ -63,6 +63,7 @@ selector:
     - jstests/sharding/cleanup_orphaned_cmd_during_movechunk_hashed.js
     - jstests/sharding/migration_failure.js
     - jstests/sharding/migration_with_source_ops.js
+    - jstests/sharding/migration_move_chunk_after_receive.js
     # Testing features that do not exist on v3.2 shards.
     - jstests/sharding/migration_server_status.js
     - jstests/sharding/movechunk_parallel.js
@@ -71,6 +72,13 @@ selector:
     - jstests/sharding/autodiscover_config_rs_from_secondary.js
     - jstests/sharding/config_rs_change.js
     - jstests/sharding/mongos_wait_csrs_initiate.js
+    # v3.2 cluster does not support parallel migrations.
+    - jstests/sharding/migration_ignore_interrupts_1.js
+    # Temporarily blacklisted (see SERVER-26615).
+    - jstests/sharding/addshard2.js
+    # This test checks the behavior of a singleBatch fix for mongos that does not exist in 3.2.
+    # Enable when 3.4 becomes last-stable or after backporting SERVER-26112 to the 3.2 branch.
+    - jstests/sharding/sharded_limit_batchsize.js
 
 executor:
   js_test:

@@ -28,11 +28,13 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/pipeline/document_source.h"
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/value.h"
 
 namespace mongo {
@@ -43,13 +45,15 @@ DocumentSourceLimit::DocumentSourceLimit(const intrusive_ptr<ExpressionContext>&
                                          long long limit)
     : DocumentSource(pExpCtx), _limit(limit) {}
 
-REGISTER_DOCUMENT_SOURCE(limit, DocumentSourceLimit::createFromBson);
+REGISTER_DOCUMENT_SOURCE(limit,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceLimit::createFromBson);
 
 const char* DocumentSourceLimit::getSourceName() const {
     return "$limit";
 }
 
-Pipeline::SourceContainer::iterator DocumentSourceLimit::optimizeAt(
+Pipeline::SourceContainer::iterator DocumentSourceLimit::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
 

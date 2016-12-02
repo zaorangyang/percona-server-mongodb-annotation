@@ -50,14 +50,14 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/balancer/balancer_policy.h"
+#include "mongo/db/s/balancer/type_migration.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/balancer/balancer_policy.h"
-#include "mongo/s/balancer/type_migration.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -232,8 +232,8 @@ StatusWith<ChunkRange> includeFullShardKey(OperationContext* txn,
                       shardKeyPattern.extendRangeBound(range.getMax(), false));
 }
 
-BSONArray _buildMergeChunksApplyOpsUpdates(const std::vector<ChunkType>& chunksToMerge,
-                                           const ChunkVersion& mergeVersion) {
+BSONArray buildMergeChunksApplyOpsUpdates(const std::vector<ChunkType>& chunksToMerge,
+                                          const ChunkVersion& mergeVersion) {
     BSONArrayBuilder updates;
 
     // Build an update operation to expand the first chunk into the newly merged chunk
@@ -274,8 +274,8 @@ BSONArray _buildMergeChunksApplyOpsUpdates(const std::vector<ChunkType>& chunksT
     return updates.arr();
 }
 
-BSONArray _buildMergeChunksApplyOpsPrecond(const std::vector<ChunkType>& chunksToMerge,
-                                           const ChunkVersion& collVersion) {
+BSONArray buildMergeChunksApplyOpsPrecond(const std::vector<ChunkType>& chunksToMerge,
+                                          const ChunkVersion& collVersion) {
     BSONArrayBuilder preCond;
 
     for (auto chunk : chunksToMerge) {
@@ -1176,25 +1176,38 @@ Status ShardingCatalogManagerImpl::commitChunkSplit(OperationContext* txn,
 
     std::vector<ChunkType> newChunks;
 
-    auto newChunkBounds(splitPoints);
     ChunkVersion currentMaxVersion = collVersion;
+
     auto startKey = range.getMin();
-    newChunkBounds.push_back(
-        range.getMax());  // makes it easier to have 'max' in the next loop. remove later.
+    auto newChunkBounds(splitPoints);
+    newChunkBounds.push_back(range.getMax());
 
     BSONArrayBuilder updates;
 
     for (const auto& endKey : newChunkBounds) {
-        // verify that splitPoints are non-equivalent
+        // Verify the split points are all within the chunk
+        if (endKey.woCompare(range.getMax()) != 0 && !range.containsKey(endKey)) {
+            return {ErrorCodes::InvalidOptions,
+                    str::stream() << "Split key " << endKey << " not contained within chunk "
+                                  << range.toString()};
+        }
+
+        // Verify the split points came in increasing order
+        if (endKey.woCompare(startKey) < 0) {
+            return {
+                ErrorCodes::InvalidOptions,
+                str::stream() << "Split keys must be specified in strictly increasing order. Key "
+                              << endKey
+                              << " was specified after "
+                              << startKey
+                              << "."};
+        }
+
+        // Verify that splitPoints are not repeated
         if (endKey.woCompare(startKey) == 0) {
             return {ErrorCodes::InvalidOptions,
-                    str::stream() << "split on lower bound "
-                                     " of chunk "
-                                  << "["
-                                  << startKey
-                                  << ","
-                                  << endKey
-                                  << ")"
+                    str::stream() << "Split on lower bound of chunk "
+                                  << ChunkRange(startKey, endKey).toString()
                                   << "is not allowed"};
         }
 
@@ -1241,8 +1254,6 @@ Status ShardingCatalogManagerImpl::commitChunkSplit(OperationContext* txn,
 
         startKey = endKey;
     }
-
-    newChunkBounds.pop_back();  // 'max' was used as sentinel
 
     BSONArrayBuilder preCond;
     {
@@ -1315,6 +1326,9 @@ Status ShardingCatalogManagerImpl::commitChunkMerge(OperationContext* txn,
                                                     const OID& requestEpoch,
                                                     const std::vector<BSONObj>& chunkBoundaries,
                                                     const std::string& shardName) {
+    // This method must never be called with empty chunks to merge
+    invariant(!chunkBoundaries.empty());
+
     // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk splits, merges, and
     // migrations
     // TODO(SERVER-25359): Replace with a collection-specific lock map to allow splits/merges/
@@ -1371,6 +1385,19 @@ Status ShardingCatalogManagerImpl::commitChunkMerge(OperationContext* txn,
     // Do not use the first chunk boundary as a max bound while building chunks
     for (size_t i = 1; i < chunkBoundaries.size(); ++i) {
         itChunk.setMin(itChunk.getMax());
+
+        // Ensure the chunk boundaries are strictly increasing
+        if (chunkBoundaries[i].woCompare(itChunk.getMin()) <= 0) {
+            return {
+                ErrorCodes::InvalidOptions,
+                str::stream()
+                    << "Chunk boundaries must be specified in strictly increasing order. Boundary "
+                    << chunkBoundaries[i]
+                    << " was specified after "
+                    << itChunk.getMin()
+                    << "."};
+        }
+
         itChunk.setMax(chunkBoundaries[i]);
         chunksToMerge.push_back(itChunk);
     }
@@ -1378,8 +1405,8 @@ Status ShardingCatalogManagerImpl::commitChunkMerge(OperationContext* txn,
     ChunkVersion mergeVersion = collVersion;
     mergeVersion.incMinor();
 
-    auto updates = _buildMergeChunksApplyOpsUpdates(chunksToMerge, mergeVersion);
-    auto preCond = _buildMergeChunksApplyOpsPrecond(chunksToMerge, collVersion);
+    auto updates = buildMergeChunksApplyOpsUpdates(chunksToMerge, mergeVersion);
+    auto preCond = buildMergeChunksApplyOpsPrecond(chunksToMerge, collVersion);
 
     // apply the batch of updates to remote and local metadata
     Status applyOpsStatus =
@@ -1768,8 +1795,17 @@ void ShardingCatalogManagerImpl::_handleAddShardTaskResponse(
     std::shared_ptr<RemoteCommandTargeter> targeter) {
     stdx::unique_lock<stdx::mutex> lk(_addShardHandlesMutex);
 
+    // If the callback has been canceled (either due to shutdown or the shard being removed), we
+    // do not need to reschedule the task or update config.shards.
     Status responseStatus = cbArgs.response.status;
     if (responseStatus == ErrorCodes::CallbackCanceled) {
+        return;
+    }
+
+    // If the handle no longer exists, the shard must have been removed, but the callback must not
+    // have been canceled until after the task had completed. In this case as well, we do not need
+    // to reschedule the task or update config.shards.
+    if (!_hasAddShardHandle_inlock(shardType.getName())) {
         return;
     }
 

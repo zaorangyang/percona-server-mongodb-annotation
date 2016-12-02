@@ -443,24 +443,26 @@ namespace {
 /**
  * Returns DeleteStageParams for deleteOne with fetch.
  */
-DeleteStageParams makeDeleteStageParamsForDeleteOne() {
+DeleteStageParams makeDeleteStageParamsForDeleteDocuments() {
     DeleteStageParams deleteStageParams;
-    invariant(!deleteStageParams.isMulti);
+    deleteStageParams.isMulti = true;
     deleteStageParams.returnDeleted = true;
     return deleteStageParams;
 }
 
 /**
- * Shared implementation between findOne and deleteOne.
+ * Shared implementation between findDocuments and deleteDocuments.
  */
 enum class FindDeleteMode { kFind, kDelete };
-StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
-                                     const NamespaceString& nss,
-                                     boost::optional<StringData> indexName,
-                                     StorageInterface::ScanDirection scanDirection,
-                                     const BSONObj& startKey,
-                                     BoundInclusion boundInclusion,
-                                     FindDeleteMode mode) {
+StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
+    OperationContext* txn,
+    const NamespaceString& nss,
+    boost::optional<StringData> indexName,
+    StorageInterface::ScanDirection scanDirection,
+    const BSONObj& startKey,
+    BoundInclusion boundInclusion,
+    std::size_t limit,
+    FindDeleteMode mode) {
     auto isFind = mode == FindDeleteMode::kFind;
     auto opStr = isFind ? "StorageInterfaceImpl::findOne" : "StorageInterfaceImpl::deleteOne";
 
@@ -492,11 +494,12 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
             planExecutor = isFind
                 ? InternalPlanner::collectionScan(
                       txn, nss.ns(), collection, PlanExecutor::YIELD_MANUAL, direction)
-                : InternalPlanner::deleteWithCollectionScan(txn,
-                                                            collection,
-                                                            makeDeleteStageParamsForDeleteOne(),
-                                                            PlanExecutor::YIELD_MANUAL,
-                                                            direction);
+                : InternalPlanner::deleteWithCollectionScan(
+                      txn,
+                      collection,
+                      makeDeleteStageParamsForDeleteDocuments(),
+                      PlanExecutor::YIELD_MANUAL,
+                      direction);
         } else {
             // Use index scan.
             auto indexCatalog = collection->getIndexCatalog();
@@ -537,7 +540,7 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
                                              InternalPlanner::IXSCAN_FETCH)
                 : InternalPlanner::deleteWithIndexScan(txn,
                                                        collection,
-                                                       makeDeleteStageParamsForDeleteOne(),
+                                                       makeDeleteStageParamsForDeleteDocuments(),
                                                        indexDescriptor,
                                                        bounds.first,
                                                        bounds.second,
@@ -546,14 +549,18 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
                                                        direction);
         }
 
-        BSONObj doc;
-        auto state = planExecutor->getNext(&doc, nullptr);
-        if (PlanExecutor::IS_EOF == state) {
-            return {ErrorCodes::CollectionIsEmpty,
-                    str::stream() << "Collection is empty, ns: " << nss.ns()};
+        std::vector<BSONObj> docs;
+        while (docs.size() < limit) {
+            BSONObj doc;
+            auto state = planExecutor->getNext(&doc, nullptr);
+            if (PlanExecutor::ADVANCED == state) {
+                docs.push_back(doc.getOwned());
+            } else {
+                invariant(PlanExecutor::IS_EOF == state);
+                break;
+            }
         }
-        invariant(PlanExecutor::ADVANCED == state);
-        return doc.getOwned();
+        return docs;
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, opStr, nss.ns());
     MONGO_UNREACHABLE;
@@ -561,24 +568,34 @@ StatusWith<BSONObj> _findOrDeleteOne(OperationContext* txn,
 
 }  // namespace
 
-StatusWith<BSONObj> StorageInterfaceImpl::findOne(OperationContext* txn,
-                                                  const NamespaceString& nss,
-                                                  boost::optional<StringData> indexName,
-                                                  ScanDirection scanDirection,
-                                                  const BSONObj& startKey,
-                                                  BoundInclusion boundInclusion) {
-    return _findOrDeleteOne(
-        txn, nss, indexName, scanDirection, startKey, boundInclusion, FindDeleteMode::kFind);
+StatusWith<std::vector<BSONObj>> StorageInterfaceImpl::findDocuments(
+    OperationContext* txn,
+    const NamespaceString& nss,
+    boost::optional<StringData> indexName,
+    ScanDirection scanDirection,
+    const BSONObj& startKey,
+    BoundInclusion boundInclusion,
+    std::size_t limit) {
+    return _findOrDeleteDocuments(
+        txn, nss, indexName, scanDirection, startKey, boundInclusion, limit, FindDeleteMode::kFind);
 }
 
-StatusWith<BSONObj> StorageInterfaceImpl::deleteOne(OperationContext* txn,
-                                                    const NamespaceString& nss,
-                                                    boost::optional<StringData> indexName,
-                                                    ScanDirection scanDirection,
-                                                    const BSONObj& startKey,
-                                                    BoundInclusion boundInclusion) {
-    return _findOrDeleteOne(
-        txn, nss, indexName, scanDirection, startKey, boundInclusion, FindDeleteMode::kDelete);
+StatusWith<std::vector<BSONObj>> StorageInterfaceImpl::deleteDocuments(
+    OperationContext* txn,
+    const NamespaceString& nss,
+    boost::optional<StringData> indexName,
+    ScanDirection scanDirection,
+    const BSONObj& startKey,
+    BoundInclusion boundInclusion,
+    std::size_t limit) {
+    return _findOrDeleteDocuments(txn,
+                                  nss,
+                                  indexName,
+                                  scanDirection,
+                                  startKey,
+                                  boundInclusion,
+                                  limit,
+                                  FindDeleteMode::kDelete);
 }
 
 Status StorageInterfaceImpl::isAdminDbValid(OperationContext* txn) {

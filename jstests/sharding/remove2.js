@@ -1,5 +1,7 @@
 // Test that removing and re-adding shard works correctly.
 
+load("jstests/replsets/rslib.js");
+
 seedString = function(replTest) {
     members = replTest.getReplSetConfig().members.map(function(elem) {
         return elem.host;
@@ -8,29 +10,18 @@ seedString = function(replTest) {
 };
 
 removeShard = function(st, replTest) {
-    print("Removing shard with name: " + replTest.name);
-    res = st.admin.runCommand({removeshard: replTest.name});
-    printjson(res);
-    assert(res.ok, "failed to start draining shard");
-
-    checkRemoveShard = function() {
-        res = st.admin.runCommand({removeshard: replTest.name});
-        printjson(res);
-        return res.ok && res.msg == 'removeshard completed successfully';
-    };
-    assert.soon(checkRemoveShard, "failed to remove shard", 5 * 60000);
-
-    sleep(2000);
-
-    var directdb = replTest.getPrimary().getDB("admin");
+    jsTest.log("Removing shard with name: " + replTest.name);
+    var res = st.s.adminCommand({removeShard: replTest.name});
+    assert.commandWorked(res);
+    assert.eq('started', res.state);
     assert.soon(function() {
-        var res = directdb.currentOp({desc: /^clean/});
-        print("eliot: " + replTest.getPrimary() + "\t" + tojson(res));
-        return res.inprog.length == 0;
-    }, "never clean", 5 * 60 * 1000, 1000);
+        res = st.s.adminCommand({removeShard: replTest.name});
+        assert.commandWorked(res);
+        return ('completed' === res.state);
+    }, "failed to remove shard: " + tojson(res));
 
-    replTest.getPrimary().getDB(coll.getDB().getName()).dropDatabase();
-    print("Shard removed successfully");
+    // Drop the database so the shard can be re-added.
+    assert.commandWorked(replTest.getPrimary().getDB(coll.getDB().getName()).dropDatabase());
 };
 
 addShard = function(st, replTest) {
@@ -43,7 +34,7 @@ addShard = function(st, replTest) {
         // transport error on first attempt is expected.  Make sure second attempt goes through
         assert.eq(true, st.adminCommand({addshard: seed}));
     }
-    ReplSetTest.awaitRSClientHosts(
+    awaitRSClientHosts(
         new Mongo(st.s.host), replTest.getSecondaries(), {ok: true, secondary: true});
 
     assert.soon(function() {

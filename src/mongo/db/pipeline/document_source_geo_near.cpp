@@ -30,15 +30,19 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
+
+#include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
-REGISTER_DOCUMENT_SOURCE(geoNear, DocumentSourceGeoNear::createFromBson);
+REGISTER_DOCUMENT_SOURCE(geoNear,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceGeoNear::createFromBson);
 
 const long long DocumentSourceGeoNear::kDefaultLimit = 100;
 
@@ -67,7 +71,7 @@ DocumentSource::GetNextResult DocumentSourceGeoNear::getNext() {
     return output.freeze();
 }
 
-Pipeline::SourceContainer::iterator DocumentSourceGeoNear::optimizeAt(
+Pipeline::SourceContainer::iterator DocumentSourceGeoNear::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
 

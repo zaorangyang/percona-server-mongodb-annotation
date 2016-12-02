@@ -38,7 +38,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/chunk_manager.h"
@@ -140,9 +140,7 @@ void splitIfNeeded(OperationContext* txn, const NamespaceString& nss, const Targ
         return;
     }
 
-    for (map<BSONObj, int>::const_iterator it = stats.chunkSizeDelta.begin();
-         it != stats.chunkSizeDelta.end();
-         ++it) {
+    for (auto it = stats.chunkSizeDelta.cbegin(); it != stats.chunkSizeDelta.cend(); ++it) {
         shared_ptr<Chunk> chunk;
         try {
             chunk = chunkManager->findIntersectingChunkWithSimpleCollation(txn, it->first);
