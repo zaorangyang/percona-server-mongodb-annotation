@@ -540,7 +540,7 @@ string OpDebug::report(Client* client,
         s << " protocol:" << getProtoString(networkOp);
     }
 
-    s << " " << executionTime << "ms";
+    s << " " << (executionTimeMicros / 1000) << "ms";
 
     return s.str();
 }
@@ -637,9 +637,9 @@ void OpDebug::append(const CurOp& curop,
     if (iscommand) {
         b.append("protocol", getProtoString(networkOp));
     }
-    b.append("millis", executionTime);
+    b.appendIntOrLL("millis", executionTimeMicros / 1000);
     b.append("rateLimit",
-             executionTime >= serverGlobalParams.slowMS ? 1 : serverGlobalParams.rateLimit);
+             executionTimeMicros >= serverGlobalParams.slowMS * 1000LL ? 1 : serverGlobalParams.rateLimit);
 
     if (!curop.getPlanSummary().empty()) {
         b.append("planSummary", curop.getPlanSummary());

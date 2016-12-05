@@ -105,8 +105,9 @@ Status DataReplicatorExternalStateImpl::_multiSyncApply(MultiApplier::OperationP
 }
 
 Status DataReplicatorExternalStateImpl::_multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                                               const HostAndPort& source) {
-    return _replicationCoordinatorExternalState->multiInitialSyncApply(ops, source);
+                                                               const HostAndPort& source,
+                                                               AtomicUInt32* fetchCount) {
+    return _replicationCoordinatorExternalState->multiInitialSyncApply(ops, source, fetchCount);
 }
 
 ReplicationCoordinator* DataReplicatorExternalStateImpl::getReplicationCoordinator() const {

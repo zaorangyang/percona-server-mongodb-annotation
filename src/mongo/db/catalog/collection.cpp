@@ -242,10 +242,11 @@ Collection::Collection(OperationContext* txn,
 
 Collection::~Collection() {
     verify(ok());
-    _magic = 0;
-    if (_cappedNotifier) {
+    if (isCapped()) {
+        _recordStore->setCappedCallback(nullptr);
         _cappedNotifier->kill();
     }
+    _magic = 0;
 }
 
 bool Collection::requiresIdIndex() const {
@@ -673,10 +674,7 @@ StatusWith<RecordId> Collection::updateDocument(OperationContext* txn,
             IndexAccessMethod* iam = ii.accessMethod(descriptor);
 
             InsertDeleteOptions options;
-            options.logIfError = false;
-            options.dupsAllowed =
-                !(KeyPattern::isIdKeyPattern(descriptor->keyPattern()) || descriptor->unique()) ||
-                repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(descriptor);
+            IndexCatalog::prepareInsertDeleteOptions(txn, descriptor, &options);
             UpdateTicket* updateTicket = new UpdateTicket();
             updateTickets.mutableMap()[descriptor] = updateTicket;
             Status ret = iam->validateUpdate(txn,
@@ -918,7 +916,7 @@ Status Collection::truncate(OperationContext* txn) {
 
     // 4) re-create indexes
     for (size_t i = 0; i < indexSpecs.size(); i++) {
-        status = _indexCatalog.createIndexOnEmptyCollection(txn, indexSpecs[i]);
+        status = _indexCatalog.createIndexOnEmptyCollection(txn, indexSpecs[i]).getStatus();
         if (!status.isOK())
             return status;
     }
@@ -1059,8 +1057,17 @@ public:
 
     virtual Status validate(const RecordId& recordId, const RecordData& record, size_t* dataSize) {
         BSONObj recordBson = record.toBson();
-        const Status status = validateBSON(
-            recordBson.objdata(), recordBson.objsize(), Validator<BSONObj>::enabledBSONVersion());
+
+        // Secondaries are configured to always validate using the latest enabled BSON version. But
+        // users should be able to run collection validation on a secondary in "3.2"
+        // featureCompatibilityVersion in order to be alerted to the presence of NumberDecimal.
+        auto bsonValidationVersion = (serverGlobalParams.featureCompatibility.version.load() ==
+                                      ServerGlobalParams::FeatureCompatibility::Version::k32)
+            ? BSONVersion::kV1_0
+            : Validator<BSONObj>::enabledBSONVersion();
+
+        const Status status =
+            validateBSON(recordBson.objdata(), recordBson.objsize(), bsonValidationVersion);
         if (status.isOK()) {
             *dataSize = recordBson.objsize();
         } else {
@@ -1095,7 +1102,10 @@ public:
             // There's no need to compute the prefixes of the indexed fields that cause the
             // index to be multikey when validating the index keys.
             MultikeyPaths* multikeyPaths = nullptr;
-            iam->getKeys(recordBson, &documentKeySet, multikeyPaths);
+            iam->getKeys(recordBson,
+                         IndexAccessMethod::GetKeysMode::kEnforceConstraints,
+                         &documentKeySet,
+                         multikeyPaths);
 
             if (!descriptor->isMultikey(_txn) && documentKeySet.size() > 1) {
                 string msg = str::stream() << "Index " << descriptor->indexName()

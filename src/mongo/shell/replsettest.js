@@ -85,7 +85,7 @@ var ReplSetTest = function(opts) {
     var _unbridgedPorts;
     var _unbridgedNodes;
 
-    this.kDefaultTimeoutMs = 10 * 60 * 1000;
+    this.kDefaultTimeoutMS = 10 * 60 * 1000;
     var oplogName = 'oplog.rs';
 
     // Publicly exposed variables
@@ -272,19 +272,6 @@ var ReplSetTest = function(opts) {
     }
 
     /**
-     * Returns the OpTime timestamp for the specified host by issuing replSetGetStatus.
-     */
-    function _getLastOpTimeTimestamp(conn) {
-        var myOpTime = _getLastOpTime(conn);
-        if (!myOpTime) {
-            // Must be an ARBITER
-            return undefined;
-        }
-
-        return myOpTime.ts ? myOpTime.ts : myOpTime;
-    }
-
-    /**
      * Returns the {readConcern: majority} OpTime for the host.
      * This is the OpTime of the host's "majority committed" snapshot.
      * This function may return an OpTime with Timestamp(0,0) and Term(0) if read concern majority
@@ -298,10 +285,10 @@ var ReplSetTest = function(opts) {
     }
 
     /**
-     * Returns the last durable OpTime timestamp for the host if running with journaling.
-     * Returns the last applied OpTime timestamp otherwise.
+     * Returns the last durable OpTime for the host if running with journaling.
+     * Returns the last applied OpTime otherwise.
      */
-    function _getDurableOpTimeTimestamp(conn) {
+    function _getDurableOpTime(conn) {
         var replSetStatus =
             assert.commandWorked(conn.getDB("admin").runCommand({replSetGetStatus: 1}));
 
@@ -311,30 +298,17 @@ var ReplSetTest = function(opts) {
         if (runningWithoutJournaling) {
             opTimeType = "appliedOpTime";
         }
-        return replSetStatus.optimes[opTimeType].ts;
+        return replSetStatus.optimes[opTimeType];
     }
 
+    /*
+     * Compares Timestamp objects. Returns true if ts1 is 'earlier' than ts2, else false.
+     */
     function _isEarlierTimestamp(ts1, ts2) {
         if (ts1.getTime() == ts2.getTime()) {
             return ts1.getInc() < ts2.getInc();
         }
         return ts1.getTime() < ts2.getTime();
-    }
-
-    function _isEarlierOpTime(ot1, ot2) {
-        // Make sure both optimes have a timestamp and a term.
-        ot1 = ot1.t ? ot1 : {ts: ot1, t: NumberLong(-1)};
-        ot2 = ot2.t ? ot2 : {ts: ot2, t: NumberLong(-1)};
-
-        // If both optimes have a term that's not -1 and one has a lower term, return that optime.
-        if (!friendlyEqual(ot1.t, NumberLong(-1)) && !friendlyEqual(ot2.t, NumberLong(-1))) {
-            if (!friendlyEqual(ot1.t, ot2.t)) {
-                return ot1.t < ot2.t;
-            }
-        }
-
-        // Otherwise, choose the optime with the lower timestamp.
-        return _isEarlierTimestamp(ot1.ts, ot2.ts);
     }
 
     /**
@@ -480,6 +454,26 @@ var ReplSetTest = function(opts) {
 
             return ready;
         }, "Awaiting secondaries", timeout);
+    };
+
+    /**
+     * Blocks until the specified node says it's syncing from the given upstream node.
+     */
+    this.awaitSyncSource = function(node, upstreamNode, timeout) {
+        print("Waiting for node " + node.name + " to start syncing from " + upstreamNode.name);
+        var status = null;
+        assert.soonNoExcept(
+            function() {
+                status = node.getDB("admin").runCommand({replSetGetStatus: 1});
+                for (var j = 0; j < status.members.length; j++) {
+                    if (status.members[j].self) {
+                        return status.members[j].syncingTo === upstreamNode.host;
+                    }
+                }
+                return false;
+            },
+            "Awaiting node " + node + " syncing from " + upstreamNode + ": " + tojson(status),
+            timeout);
     };
 
     /**
@@ -691,7 +685,7 @@ var ReplSetTest = function(opts) {
                 if (friendlyEqual(rcmOpTime, {ts: Timestamp(0, 0), t: NumberLong(0)})) {
                     return false;
                 }
-                if (_isEarlierOpTime(rcmOpTime, masterOpTime)) {
+                if (rs.compareOpTimes(rcmOpTime, masterOpTime) < 0) {
                     return false;
                 }
             }
@@ -714,7 +708,7 @@ var ReplSetTest = function(opts) {
             var master = self.getPrimary();
             assert.soonNoExcept(function() {
                 try {
-                    masterLatestOpTime = _getLastOpTimeTimestamp(master);
+                    masterLatestOpTime = _getLastOpTime(master);
                 } catch (e) {
                     print("ReplSetTest caught exception " + e);
                     return false;
@@ -726,33 +720,26 @@ var ReplSetTest = function(opts) {
 
         awaitLastOpTimeWrittenFn();
 
-        // get the latest config version from master. if there is a problem, grab master and try
-        // again
-        var configVersion;
-        var masterOpTime;
+        // get the latest config version from master (with a few retries in case of error)
+        var masterConfigVersion;
         var masterName;
         var master;
+        var num_attempts = 3;
 
-        try {
+        assert.retryNoExcept(() => {
             master = this.getPrimary();
-            configVersion = this.getReplSetConfigFromNode().version;
-            masterOpTime = _getLastOpTimeTimestamp(master);
+            masterConfigVersion = this.getReplSetConfigFromNode().version;
             masterName = master.toString().substr(14);  // strip "connection to "
-        } catch (e) {
-            master = this.getPrimary();
-            configVersion = this.getReplSetConfigFromNode().version;
-            masterOpTime = _getLastOpTimeTimestamp(master);
-            masterName = master.toString().substr(14);  // strip "connection to "
-        }
+            return true;
+        }, "ReplSetTest awaitReplication: couldnt get repl set config.", num_attempts, 1000);
 
-        print("ReplSetTest awaitReplication: starting: timestamp for primary, " + masterName +
-              ", is " + tojson(masterLatestOpTime) + ", last oplog entry is " +
-              tojsononeline(masterOpTime));
+        print("ReplSetTest awaitReplication: starting: optime for primary, " + masterName +
+              ", is " + tojson(masterLatestOpTime));
 
         assert.soonNoExcept(function() {
             try {
-                print("ReplSetTest awaitReplication: checking secondaries against timestamp " +
-                      tojson(masterLatestOpTime));
+                print("ReplSetTest awaitReplication: checking secondaries " +
+                      "against latest primary optime " + tojson(masterLatestOpTime));
                 var secondaryCount = 0;
                 for (var i = 0; i < self.liveNodes.slaves.length; i++) {
                     var slave = self.liveNodes.slaves[i];
@@ -761,21 +748,19 @@ var ReplSetTest = function(opts) {
                     var slaveConfigVersion =
                         slave.getDB("local")['system.replset'].findOne().version;
 
-                    if (configVersion != slaveConfigVersion) {
+                    if (masterConfigVersion != slaveConfigVersion) {
                         print("ReplSetTest awaitReplication: secondary #" + secondaryCount + ", " +
                               slaveName + ", has config version #" + slaveConfigVersion +
-                              ", but expected config version #" + configVersion);
+                              ", but expected config version #" + masterConfigVersion);
 
-                        if (slaveConfigVersion > configVersion) {
+                        if (slaveConfigVersion > masterConfigVersion) {
                             master = this.getPrimary();
-                            configVersion =
+                            masterConfigVersion =
                                 master.getDB("local")['system.replset'].findOne().version;
-                            masterOpTime = _getLastOpTimeTimestamp(master);
                             masterName = master.toString().substr(14);  // strip "connection to "
 
-                            print("ReplSetTest awaitReplication: timestamp for primary, " +
-                                  masterName + ", is " + tojson(masterLatestOpTime) +
-                                  ", last oplog entry is " + tojsononeline(masterOpTime));
+                            print("ReplSetTest awaitReplication: optime for primary, " +
+                                  masterName + ", is " + tojson(masterLatestOpTime));
                         }
 
                         return false;
@@ -793,23 +778,24 @@ var ReplSetTest = function(opts) {
 
                     slave.getDB("admin").getMongo().setSlaveOk();
 
-                    var getSecondaryTimestampFn = _getLastOpTimeTimestamp;
+                    var slaveOpTime;
                     if (secondaryOpTimeType == ReplSetTest.OpTimeType.LAST_DURABLE) {
-                        getSecondaryTimestampFn = _getDurableOpTimeTimestamp;
+                        slaveOpTime = _getDurableOpTime(slave);
+                    } else {
+                        slaveOpTime = _getLastOpTime(slave);
                     }
 
-                    var ts = getSecondaryTimestampFn(slave);
-                    if (masterLatestOpTime.t < ts.t ||
-                        (masterLatestOpTime.t == ts.t && masterLatestOpTime.i < ts.i)) {
-                        masterLatestOpTime = _getLastOpTimeTimestamp(master);
-                        print("ReplSetTest awaitReplication: timestamp for " + slaveName +
-                              " is newer, resetting latest to " + tojson(masterLatestOpTime));
+                    if (rs.compareOpTimes(masterLatestOpTime, slaveOpTime) < 0) {
+                        masterLatestOpTime = _getLastOpTime(master);
+                        print("ReplSetTest awaitReplication: optime for " + slaveName +
+                              " is newer, resetting latest primary optime to " +
+                              tojson(masterLatestOpTime));
                         return false;
                     }
 
-                    if (!friendlyEqual(masterLatestOpTime, ts)) {
-                        print("ReplSetTest awaitReplication: timestamp for secondary #" +
-                              secondaryCount + ", " + slaveName + ", is " + tojson(ts) +
+                    if (!friendlyEqual(masterLatestOpTime, slaveOpTime)) {
+                        print("ReplSetTest awaitReplication: optime for secondary #" +
+                              secondaryCount + ", " + slaveName + ", is " + tojson(slaveOpTime) +
                               " but latest is " + tojson(masterLatestOpTime));
                         print("ReplSetTest awaitReplication: secondary #" + secondaryCount + ", " +
                               slaveName + ", is NOT synced");
@@ -821,7 +807,7 @@ var ReplSetTest = function(opts) {
                 }
 
                 print("ReplSetTest awaitReplication: finished: all " + secondaryCount +
-                      " secondaries synced at timestamp " + tojson(masterLatestOpTime));
+                      " secondaries synced at optime " + tojson(masterLatestOpTime));
                 return true;
             } catch (e) {
                 print("ReplSetTest awaitReplication: caught exception " + e + ';\n' + e.stack);
@@ -829,7 +815,7 @@ var ReplSetTest = function(opts) {
                 // We might have a new master now
                 awaitLastOpTimeWrittenFn();
 
-                print("ReplSetTest awaitReplication: resetting: timestamp for primary " +
+                print("ReplSetTest awaitReplication: resetting: optime for primary " +
                       self.liveNodes.master + " is " + tojson(masterLatestOpTime));
 
                 return false;

@@ -64,7 +64,6 @@
 #include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/snapshot_thread.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
@@ -125,6 +124,9 @@ MONGO_EXPORT_STARTUP_SERVER_PARAMETER(use3dot2InitialSync, bool, false);
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(initialSyncOplogBuffer,
                                       std::string,
                                       kCollectionOplogBufferName);
+
+// Set this to specify size of read ahead buffer in the OplogBufferCollection.
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(initialSyncOplogBufferPeekCacheSize, int, 10000);
 
 // Set this to specify maximum number of times the oplog fetcher will consecutively restart the
 // oplog tailing query on non-cancellation errors.
@@ -871,22 +873,24 @@ Status ReplicationCoordinatorExternalStateImpl::multiSyncApply(MultiApplier::Ope
 }
 
 Status ReplicationCoordinatorExternalStateImpl::multiInitialSyncApply(
-    MultiApplier::OperationPtrs* ops, const HostAndPort& source) {
-
+    MultiApplier::OperationPtrs* ops, const HostAndPort& source, AtomicUInt32* fetchCount) {
     // repl::multiInitialSyncApply uses SyncTail::shouldRetry() (and implicitly getMissingDoc())
     // to fetch missing documents during initial sync. Therefore, it is fine to construct SyncTail
     // with invalid BackgroundSync, MultiSyncApplyFunc and writerPool arguments because we will not
     // be accessing any SyncTail functionality that require these constructor parameters.
     SyncTail syncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr);
     syncTail.setHostname(source.toString());
-    return repl::multiInitialSyncApply(ops, &syncTail);
+    return repl::multiInitialSyncApply(ops, &syncTail, fetchCount);
 }
 
 std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateImpl::makeInitialSyncOplogBuffer(
     OperationContext* txn) const {
     if (initialSyncOplogBuffer == kCollectionOplogBufferName) {
+        invariant(initialSyncOplogBufferPeekCacheSize >= 0);
+        OplogBufferCollection::Options options;
+        options.peekCacheSize = std::size_t(initialSyncOplogBufferPeekCacheSize);
         return stdx::make_unique<OplogBufferProxy>(
-            stdx::make_unique<OplogBufferCollection>(StorageInterface::get(txn)));
+            stdx::make_unique<OplogBufferCollection>(StorageInterface::get(txn), options));
     } else {
         return stdx::make_unique<OplogBufferBlockingQueue>();
     }

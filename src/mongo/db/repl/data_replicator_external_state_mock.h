@@ -94,7 +94,8 @@ private:
     Status _multiSyncApply(MultiApplier::OperationPtrs* ops) override;
 
     Status _multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                  const HostAndPort& source) override;
+                                  const HostAndPort& source,
+                                  AtomicUInt32* fetchCount) override;
 };
 
 

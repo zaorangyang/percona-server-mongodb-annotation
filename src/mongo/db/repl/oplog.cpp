@@ -575,13 +575,30 @@ struct ApplyOpMetadata {
 std::map<std::string, ApplyOpMetadata> opsMap = {
     {"create",
      {[](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
-          return createCollection(txn, NamespaceString(ns).db().toString(), cmd);
+          const NamespaceString nss(parseNs(ns, cmd));
+          if (auto idIndexElem = cmd["idIndex"]) {
+              // Remove "idIndex" field from command.
+              auto cmdWithoutIdIndex = cmd.removeField("idIndex");
+              return createCollection(
+                  txn, nss.db().toString(), cmdWithoutIdIndex, idIndexElem.Obj());
+          }
+
+          // No _id index spec was provided, so we should build a v:1 _id index.
+          BSONObjBuilder idIndexSpecBuilder;
+          idIndexSpecBuilder.append(IndexDescriptor::kIndexVersionFieldName,
+                                    static_cast<int>(IndexVersion::kV1));
+          idIndexSpecBuilder.append(IndexDescriptor::kIndexNameFieldName, "_id_");
+          idIndexSpecBuilder.append(IndexDescriptor::kNamespaceFieldName, nss.ns());
+          idIndexSpecBuilder.append(IndexDescriptor::kKeyPatternFieldName, BSON("_id" << 1));
+          return createCollection(txn, nss.db().toString(), cmd, idIndexSpecBuilder.done());
       },
       {ErrorCodes::NamespaceExists}}},
-    {"collMod", {[](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
-         BSONObjBuilder resultWeDontCareAbout;
-         return collMod(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
-     }}},
+    {"collMod",
+     {[](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+          BSONObjBuilder resultWeDontCareAbout;
+          return collMod(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+      },
+      {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
     {"dropDatabase",
      {[](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
           return dropDatabase(txn, NamespaceString(ns).db().toString());
@@ -738,17 +755,19 @@ Status applyOperation_inlock(OperationContext* txn,
                 indexSpec = bob.obj();
             }
 
+            bool relaxIndexConstraints =
+                ReplicationCoordinator::get(txn)->shouldRelaxIndexConstraints(indexNss);
             if (indexSpec["background"].trueValue()) {
                 Lock::TempRelease release(txn->lockState());
                 if (txn->lockState()->isLocked()) {
                     // If TempRelease fails, background index build will deadlock.
                     LOG(3) << "apply op: building background index " << indexSpec
                            << " in the foreground because temp release failed";
-                    IndexBuilder builder(indexSpec);
+                    IndexBuilder builder(indexSpec, relaxIndexConstraints);
                     Status status = builder.buildInForeground(txn, db);
                     uassertStatusOK(status);
                 } else {
-                    IndexBuilder* builder = new IndexBuilder(indexSpec);
+                    IndexBuilder* builder = new IndexBuilder(indexSpec, relaxIndexConstraints);
                     // This spawns a new thread and returns immediately.
                     builder->go();
                     // Wait for thread to start and register itself
@@ -756,7 +775,7 @@ Status applyOperation_inlock(OperationContext* txn,
                 }
                 txn->recoveryUnit()->abandonSnapshot();
             } else {
-                IndexBuilder builder(indexSpec);
+                IndexBuilder builder(indexSpec, relaxIndexConstraints);
                 Status status = builder.buildInForeground(txn, db);
                 uassertStatusOK(status);
             }

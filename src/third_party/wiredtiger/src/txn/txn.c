@@ -112,7 +112,6 @@ int
 __wt_txn_get_snapshot(WT_SESSION_IMPL *session)
 {
 	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
 	WT_TXN *txn;
 	WT_TXN_GLOBAL *txn_global;
 	WT_TXN_STATE *s, *txn_state;
@@ -126,14 +125,8 @@ __wt_txn_get_snapshot(WT_SESSION_IMPL *session)
 	txn_state = WT_SESSION_TXN_STATE(session);
 	n = 0;
 
-	/*
-	 * Spin waiting for the lock: the sleeps in our blocking readlock
-	 * implementation are too slow for scanning the transaction table.
-	 */
-	while ((ret =
-	    __wt_try_readlock(session, txn_global->scan_rwlock)) == EBUSY)
-		WT_PAUSE();
-	WT_RET(ret);
+	/* We're going to scan the table: wait for the lock. */
+	__wt_readlock_spin(session, txn_global->scan_rwlock);
 
 	current_id = pinned_id = txn_global->current;
 	prev_oldest_id = txn_global->oldest_id;
@@ -292,7 +285,7 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, uint32_t flags)
 
 	/* First do a read-only scan. */
 	if (wait)
-		__wt_readlock(session, txn_global->scan_rwlock);
+		__wt_readlock_spin(session, txn_global->scan_rwlock);
 	else if ((ret =
 	    __wt_try_readlock(session, txn_global->scan_rwlock)) != 0)
 		return (ret == EBUSY ? 0 : ret);
@@ -659,20 +652,20 @@ __wt_txn_rollback(WT_SESSION_IMPL *session, const char *cfg[])
  *	Initialize a session's transaction data.
  */
 int
-__wt_txn_init(WT_SESSION_IMPL *session)
+__wt_txn_init(WT_SESSION_IMPL *session, WT_SESSION_IMPL *session_ret)
 {
 	WT_TXN *txn;
 
-	txn = &session->txn;
+	txn = &session_ret->txn;
 	txn->id = WT_TXN_NONE;
 
 	WT_RET(__wt_calloc_def(session,
-	    S2C(session)->session_size, &txn->snapshot));
+	    S2C(session_ret)->session_size, &txn->snapshot));
 
 #ifdef HAVE_DIAGNOSTIC
-	if (S2C(session)->txn_global.states != NULL) {
+	if (S2C(session_ret)->txn_global.states != NULL) {
 		WT_TXN_STATE *txn_state;
-		txn_state = WT_SESSION_TXN_STATE(session);
+		txn_state = WT_SESSION_TXN_STATE(session_ret);
 		WT_ASSERT(session, txn_state->pinned_id == WT_TXN_NONE);
 	}
 #endif
@@ -683,7 +676,7 @@ __wt_txn_init(WT_SESSION_IMPL *session)
 	 */
 	txn->mod = NULL;
 
-	txn->isolation = session->isolation;
+	txn->isolation = session_ret->isolation;
 	return (0);
 }
 

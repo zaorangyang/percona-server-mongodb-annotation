@@ -100,7 +100,8 @@ public:
                                           MultiApplier::ApplyOperationFn applyOperation) override;
     virtual Status multiSyncApply(MultiApplier::OperationPtrs* ops) override;
     virtual Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                         const HostAndPort& source) override;
+                                         const HostAndPort& source,
+                                         AtomicUInt32* fetchCount) override;
     virtual std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(
         OperationContext* txn) const override;
     virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(

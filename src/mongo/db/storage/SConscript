@@ -1,3 +1,4 @@
+# -*- mode: python -*-
 Import("env")
 Import("rocksdb")
 
@@ -159,7 +160,6 @@ env.Library(
         'storage_engine_lock_file_${TARGET_OS_FAMILY}.cpp',
         ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/platform/platform',
         'paths',
         ]
     )

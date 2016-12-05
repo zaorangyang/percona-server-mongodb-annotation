@@ -174,10 +174,6 @@ private:
     // A pointer to the replication coordinator external state.
     ReplicationCoordinatorExternalState* _replicationCoordinatorExternalState;
 
-    // Used to determine sync source.
-    // TODO(dannenberg) move into DataReplicator.
-    SyncSourceResolver _syncSourceResolver;
-
     // _mutex protects all of the class variables declared below.
     mutable stdx::mutex _mutex;
 
@@ -197,6 +193,10 @@ private:
     bool _stopped = true;
 
     HostAndPort _syncSourceHost;
+
+    // Current sync source resolver validating sync source candidates.
+    // Owned by us.
+    std::unique_ptr<SyncSourceResolver> _syncSourceResolver;
 
     // Current oplog fetcher tailing the oplog on the sync source.
     // Owned by us.

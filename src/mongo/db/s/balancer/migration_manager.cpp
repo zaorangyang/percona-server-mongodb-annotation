@@ -44,7 +44,6 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/move_chunk_request.h"
 #include "mongo/s/sharding_raii.h"
@@ -157,7 +156,7 @@ MigrationStatuses MigrationManager::executeMigrationsForAutoBalance(
             // Write a document to the config.migrations collection, in case this migration must be
             // recovered by the Balancer. Fail if the chunk is already moving.
             auto statusWithScopedMigrationRequest =
-                ScopedMigrationRequest::writeMigration(txn, migrateInfo);
+                ScopedMigrationRequest::writeMigration(txn, migrateInfo, waitForDelete);
             if (!statusWithScopedMigrationRequest.isOK()) {
                 migrationStatuses.emplace(migrateInfo.getName(),
                                           std::move(statusWithScopedMigrationRequest.getStatus()));
@@ -201,7 +200,7 @@ MigrationStatuses MigrationManager::executeMigrationsForAutoBalance(
         // Write a document to the config.migrations collection, in case this migration must be
         // recovered by the Balancer. Fail if the chunk is already moving.
         auto statusWithScopedMigrationRequest =
-            ScopedMigrationRequest::writeMigration(txn, migrateInfo);
+            ScopedMigrationRequest::writeMigration(txn, migrateInfo, waitForDelete);
         if (!statusWithScopedMigrationRequest.isOK()) {
             migrationStatuses.emplace(migrateInfo.getName(),
                                       std::move(statusWithScopedMigrationRequest.getStatus()));
@@ -239,7 +238,7 @@ Status MigrationManager::executeManualMigration(
     // Write a document to the config.migrations collection, in case this migration must be
     // recovered by the Balancer. Fail if the chunk is already moving.
     auto statusWithScopedMigrationRequest =
-        ScopedMigrationRequest::writeMigration(txn, migrateInfo);
+        ScopedMigrationRequest::writeMigration(txn, migrateInfo, waitForDelete);
     if (!statusWithScopedMigrationRequest.isOK()) {
         return statusWithScopedMigrationRequest.getStatus();
     }
@@ -321,28 +320,28 @@ void MigrationManager::startRecoveryAndAcquireDistLocks(OperationContext* txn) {
                       << causedBy(redact(statusWithMigrationType.getStatus()));
             return;
         }
-        MigrateInfo migrateInfo = statusWithMigrationType.getValue().toMigrateInfo();
+        MigrationType migrateType = std::move(statusWithMigrationType.getValue());
 
-        auto it = _migrationRecoveryMap.find(NamespaceString(migrateInfo.ns));
+        auto it = _migrationRecoveryMap.find(NamespaceString(migrateType.getNss()));
         if (it == _migrationRecoveryMap.end()) {
-            std::list<MigrateInfo> list;
-            it = _migrationRecoveryMap.insert(std::make_pair(NamespaceString(migrateInfo.ns), list))
-                     .first;
+            std::list<MigrationType> list;
+            it = _migrationRecoveryMap.insert(std::make_pair(migrateType.getNss(), list)).first;
 
             // Reacquire the matching distributed lock for this namespace.
             const std::string whyMessage(stream() << "Migrating chunk(s) in collection "
-                                                  << redact(migrateInfo.ns));
+                                                  << migrateType.getNss().ns());
             auto statusWithDistLockHandle =
                 Grid::get(txn)
                     ->catalogClient(txn)
                     ->getDistLockManager()
-                    ->tryLockWithLocalWriteConcern(txn, migrateInfo.ns, whyMessage, _lockSessionID);
+                    ->tryLockWithLocalWriteConcern(
+                        txn, migrateType.getNss().ns(), whyMessage, _lockSessionID);
             if (!statusWithDistLockHandle.isOK() &&
                 statusWithDistLockHandle.getStatus() != ErrorCodes::LockBusy) {
                 // LockBusy is alright because that should mean a 3.2 shard has it for the active
                 // migration.
                 warning() << "Failed to acquire distributed lock for collection '"
-                          << redact(migrateInfo.ns)
+                          << migrateType.getNss().ns()
                           << "' during balancer recovery of an active migration. Abandoning"
                           << " balancer recovery."
                           << causedBy(redact(statusWithDistLockHandle.getStatus()));
@@ -350,7 +349,7 @@ void MigrationManager::startRecoveryAndAcquireDistLocks(OperationContext* txn) {
             }
         }
 
-        it->second.push_back(std::move(migrateInfo));
+        it->second.push_back(std::move(migrateType));
     }
 
     scopedGuard.Dismiss();
@@ -358,8 +357,7 @@ void MigrationManager::startRecoveryAndAcquireDistLocks(OperationContext* txn) {
 
 void MigrationManager::finishRecovery(OperationContext* txn,
                                       uint64_t maxChunkSizeBytes,
-                                      const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                                      bool waitForDelete) {
+                                      const MigrationSecondaryThrottleOptions& secondaryThrottle) {
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
         if (_state == State::kStopping) {
@@ -407,7 +405,9 @@ void MigrationManager::finishRecovery(OperationContext* txn,
         int scheduledMigrations = 0;
 
         while (!migrateInfos.empty()) {
-            const auto migrationInfo = std::move(migrateInfos.front());
+            auto migrationType = std::move(migrateInfos.front());
+            const auto migrationInfo = migrationType.toMigrateInfo();
+            auto waitForDelete = migrationType.getWaitForDelete();
             migrateInfos.pop_front();
 
             auto chunk = cm->findIntersectingChunkWithSimpleCollation(txn, migrationInfo.minKey);
@@ -756,13 +756,33 @@ Status MigrationManager::_processRemoteCommandResponse(
     if (isErrorDueToConfigStepdown(remoteCommandResponse.status,
                                    _state != State::kEnabled && _state != State::kRecovering)) {
         scopedMigrationRequest->keepDocumentOnDestruct();
-        commandStatus = Status(ErrorCodes::BalancerInterrupted,
-                               stream() << "Migration interrupted because the balancer is stopping."
-                                        << causedBy(remoteCommandResponse.status));
+        return {ErrorCodes::BalancerInterrupted,
+                stream() << "Migration interrupted because the balancer is stopping."
+                         << " Command status: "
+                         << remoteCommandResponse.status.toString()};
     } else if (!remoteCommandResponse.isOK()) {
         commandStatus = remoteCommandResponse.status;
     } else {
         commandStatus = extractMigrationStatusFromCommandResponse(remoteCommandResponse.data);
+        if (!Shard::shouldErrorBePropagated(commandStatus.code())) {
+            commandStatus = {ErrorCodes::OperationFailed,
+                             stream() << "moveChunk command failed on source shard."
+                                      << causedBy(commandStatus)};
+        }
+    }
+
+    // Any failure to remove the migration document should be because the config server is
+    // stepping/shutting down. In this case we must fail the moveChunk command with a retryable
+    // error so that the caller does not move on to other distlock requiring operations that could
+    // fail when the balancer recovers and takes distlocks for migration recovery.
+    Status status = scopedMigrationRequest->tryToRemoveMigration();
+    if (!status.isOK()) {
+        commandStatus = {
+            ErrorCodes::BalancerInterrupted,
+            stream() << "Migration interrupted because the balancer is stopping"
+                     << " and failed to remove the config.migrations document."
+                     << " Command status: "
+                     << (commandStatus.isOK() ? status.toString() : commandStatus.toString())};
     }
 
     return commandStatus;

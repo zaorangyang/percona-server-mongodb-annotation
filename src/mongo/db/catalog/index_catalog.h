@@ -48,6 +48,7 @@ class Collection;
 
 class IndexDescriptor;
 class IndexAccessMethod;
+struct InsertDeleteOptions;
 
 /**
  * how many: 1 per Collection
@@ -211,9 +212,10 @@ public:
 
     /**
      * Call this only on an empty collection from inside a WriteUnitOfWork. Index creation on an
-     * empty collection can be rolled back as part of a larger WUOW.
+     * empty collection can be rolled back as part of a larger WUOW. Returns the full specification
+     * of the created index, as it is stored in this index catalog.
      */
-    Status createIndexOnEmptyCollection(OperationContext* txn, BSONObj spec);
+    StatusWith<BSONObj> createIndexOnEmptyCollection(OperationContext* txn, BSONObj spec);
 
     StatusWith<BSONObj> prepareSpecForCreate(OperationContext* txn, const BSONObj& original) const;
 
@@ -335,6 +337,14 @@ public:
     // public static helpers
 
     static BSONObj fixIndexKey(const BSONObj& key);
+
+    /**
+     * Fills out 'options' in order to indicate whether to allow dups or relax
+     * index constraints, as needed by replication.
+     */
+    static void prepareInsertDeleteOptions(OperationContext* txn,
+                                           const IndexDescriptor* desc,
+                                           InsertDeleteOptions* options);
 
 private:
     static const BSONObj _idObj;  // { _id : 1 }

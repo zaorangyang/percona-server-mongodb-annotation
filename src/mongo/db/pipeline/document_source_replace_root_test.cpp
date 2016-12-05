@@ -35,7 +35,8 @@
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_mock.h"
+#include "mongo/db/pipeline/document_source_replace_root.h"
 #include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/unittest/unittest.h"
 
@@ -243,12 +244,12 @@ TEST_F(ReplaceRootBasics, ErrorsIfNewRootFieldPathDoesNotExist) {
 
     auto mock = DocumentSourceMock::create(Document());
     replaceRoot->setSource(mock.get());
-    ASSERT_THROWS_CODE(replaceRoot->getNext(), UserException, 40232);
+    ASSERT_THROWS_CODE(replaceRoot->getNext(), UserException, 40228);
     assertExhausted(replaceRoot);
 
     mock = DocumentSourceMock::create(Document{{"e", Document{{"b", Document{{"c", 3}}}}}});
     replaceRoot->setSource(mock.get());
-    ASSERT_THROWS_CODE(replaceRoot->getNext(), UserException, 40232);
+    ASSERT_THROWS_CODE(replaceRoot->getNext(), UserException, 40228);
     assertExhausted(replaceRoot);
 }
 

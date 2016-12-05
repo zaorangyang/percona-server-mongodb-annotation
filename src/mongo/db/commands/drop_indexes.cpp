@@ -178,7 +178,8 @@ public:
                 }
 
                 const BSONObj key = spec.getObjectField("key");
-                const Status keyStatus = validateKeyPattern(key);
+                const Status keyStatus =
+                    index_key_validate::validateKeyPattern(key, defaultIndexVersion);
                 if (!keyStatus.isOK()) {
                     errmsg = str::stream()
                         << "Cannot rebuild index " << spec << ": " << keyStatus.reason()

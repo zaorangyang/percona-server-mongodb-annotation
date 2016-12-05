@@ -41,6 +41,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -211,7 +212,14 @@ void FeatureCompatibilityVersion::set(OperationContext* txn, StringData version)
             ScopedTransaction transaction(txn, MODE_IX);
             AutoGetOrCreateDb autoDB(txn, nss.db(), MODE_X);
 
-            IndexBuilder builder(k32IncompatibleIndexSpec);
+            uassert(ErrorCodes::NotMaster,
+                    str::stream() << "Cannot set featureCompatibilityVersion to '" << version
+                                  << "'. Not primary while attempting to create index on: "
+                                  << nss.ns(),
+                    repl::ReplicationCoordinator::get(txn->getServiceContext())
+                        ->canAcceptWritesFor(nss));
+
+            IndexBuilder builder(k32IncompatibleIndexSpec, false);
             auto status = builder.buildInForeground(txn, autoDB.getDb());
             uassertStatusOK(status);
 
@@ -295,7 +303,7 @@ void FeatureCompatibilityVersion::setIfCleanStartup(OperationContext* txn,
             ScopedTransaction transaction(txn, MODE_IX);
             AutoGetOrCreateDb autoDB(txn, nss.db(), MODE_X);
 
-            IndexBuilder builder(k32IncompatibleIndexSpec);
+            IndexBuilder builder(k32IncompatibleIndexSpec, false);
             auto status = builder.buildInForeground(txn, autoDB.getDb());
             uassertStatusOK(status);
         }

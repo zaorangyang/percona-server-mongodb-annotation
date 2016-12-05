@@ -151,7 +151,7 @@ public:
     virtual UpdateTermResult updateTerm(long long term, Date_t now);
     virtual void setForceSyncSourceIndex(int index);
     virtual HostAndPort chooseNewSyncSource(Date_t now,
-                                            const Timestamp& lastTimestampApplied,
+                                            const Timestamp& lastTimestampFetched,
                                             ChainingPreference chainingPreference);
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
     virtual void unblacklistSyncSource(const HostAndPort& host, Date_t now);
@@ -276,7 +276,8 @@ private:
         NoData = 1 << 6,
         NotInitialized = 1 << 7,
         VotedTooRecently = 1 << 8,
-        RefusesToStand = 1 << 9
+        RefusesToStand = 1 << 9,
+        NotCloseEnoughToLatestForPriorityTakeover = 1 << 10,
     };
     typedef int UnelectableReasonMask;
 
@@ -304,6 +305,9 @@ private:
     // for an election
     bool _isOpTimeCloseEnoughToLatestToElect(const OpTime& otherOpTime,
                                              const OpTime& ourLastOpApplied) const;
+
+    // Is our optime close enough to the latest known optime to call for a priority takeover.
+    bool _amIFreshEnoughForPriorityTakeover(const OpTime& ourLastOpApplied) const;
 
     // Returns reason why "self" member is unelectable
     UnelectableReasonMask _getMyUnelectableReason(const Date_t now,

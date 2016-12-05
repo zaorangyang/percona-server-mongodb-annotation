@@ -75,12 +75,17 @@ void PoolForHost::done(DBConnectionPool* pool, DBClientBase* c) {
     --_checkedOut;
 
     // Remember that this host had a broken connection for later
-    if (isFailed)
+    if (isFailed) {
         reportBadConnectionAt(c->getSockCreationMicroSec());
+    }
 
-    if (isFailed ||
-        // Another (later) connection was reported as broken to this host
-        (c->getSockCreationMicroSec() < _minValidCreationTimeMicroSec) ||
+    // Another (later) connection was reported as broken to this host
+    bool isBroken = c->getSockCreationMicroSec() < _minValidCreationTimeMicroSec;
+    if (isFailed || isBroken) {
+        _badConns++;
+    }
+
+    if (isFailed || isBroken ||
         // We have a pool size that we need to enforce
         (_maxPoolSize >= 0 && static_cast<int>(_pool.size()) >= _maxPoolSize)) {
         pool->onDestroy(c);
@@ -108,13 +113,12 @@ bool PoolForHost::isBadSocketCreationTime(uint64_t microSec) {
 }
 
 DBClientBase* PoolForHost::get(DBConnectionPool* pool, double socketTimeout) {
-    time_t now = time(0);
-
     while (!_pool.empty()) {
         StoredConnection sc = _pool.top();
         _pool.pop();
 
-        if (!sc.ok(now)) {
+        if (!sc.ok()) {
+            _badConns++;
             pool->onDestroy(sc.conn);
             delete sc.conn;
             continue;
@@ -138,17 +142,17 @@ void PoolForHost::flush() {
 }
 
 void PoolForHost::getStaleConnections(vector<DBClientBase*>& stale) {
-    time_t now = time(0);
-
     vector<StoredConnection> all;
     while (!_pool.empty()) {
         StoredConnection c = _pool.top();
         _pool.pop();
 
-        if (c.ok(now))
+        if (c.ok()) {
             all.push_back(c);
-        else
+        } else {
+            _badConns++;
             stale.push_back(c.conn);
+        }
     }
 
     for (size_t i = 0; i < all.size(); i++) {
@@ -162,7 +166,7 @@ PoolForHost::StoredConnection::StoredConnection(DBClientBase* c) {
     when = time(0);
 }
 
-bool PoolForHost::StoredConnection::ok(time_t now) {
+bool PoolForHost::StoredConnection::ok() {
     // Poke the connection to see if we're still ok
     return conn->isStillConnected();
 }
@@ -200,14 +204,14 @@ DBClientBase* DBConnectionPool::_get(const string& ident, double socketTimeout) 
     return p.get(this, socketTimeout);
 }
 
-DBClientBase* DBConnectionPool::_finishCreate(const string& host,
+DBClientBase* DBConnectionPool::_finishCreate(const string& ident,
                                               double socketTimeout,
                                               DBClientBase* conn) {
     {
         stdx::lock_guard<stdx::mutex> L(_mutex);
-        PoolForHost& p = _pools[PoolKey(host, socketTimeout)];
+        PoolForHost& p = _pools[PoolKey(ident, socketTimeout)];
         p.setMaxPoolSize(_maxPoolSize);
-        p.initializeHostName(host);
+        p.initializeHostName(ident);
         p.createdOne(conn);
     }
 
@@ -263,6 +267,18 @@ DBClientBase* DBConnectionPool::get(const string& host, double socketTimeout) {
                               11002,
                               str::stream() << _name << " error: " << errmsg);
     return _finishCreate(host, socketTimeout, c);
+}
+
+int DBConnectionPool::getNumAvailableConns(const string& host, double socketTimeout) const {
+    stdx::lock_guard<stdx::mutex> L(_mutex);
+    auto it = _pools.find(PoolKey(host, socketTimeout));
+    return (it == _pools.end()) ? 0 : it->second.numAvailable();
+}
+
+int DBConnectionPool::getNumBadConns(const string& host, double socketTimeout) const {
+    stdx::lock_guard<stdx::mutex> L(_mutex);
+    auto it = _pools.find(PoolKey(host, socketTimeout));
+    return (it == _pools.end()) ? 0 : it->second.getNumBadConns();
 }
 
 void DBConnectionPool::onRelease(DBClientBase* conn) {

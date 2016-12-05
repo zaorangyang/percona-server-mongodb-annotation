@@ -469,14 +469,6 @@ void repairDatabasesAndCheckVersion(OperationContext* txn) {
                       << "http://dochub.mongodb.org/core/upgrade-2.4" << startupWarningsLog;
             }
 
-            const Status keyStatus = validateKeyPattern(key);
-            if (!keyStatus.isOK()) {
-                log() << "Problem with index " << index << ": " << redact(keyStatus)
-                      << " This index can still be used however it cannot be rebuilt."
-                      << " For more info see"
-                      << " http://dochub.mongodb.org/core/index-validation" << startupWarningsLog;
-            }
-
             if (index["v"].isNumber() && index["v"].numberInt() == 0) {
                 log() << "WARNING: The index: " << index << " was created with the deprecated"
                       << " v:0 format.  This format will not be supported in a future release."
@@ -515,12 +507,8 @@ void repairDatabasesAndCheckVersion(OperationContext* txn) {
 
 void _initWireSpec() {
     WireSpec& spec = WireSpec::instance();
-    // accept from any version
-    spec.incoming.minWireVersion = RELEASE_2_4_AND_BEFORE;
-    spec.incoming.maxWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
-    // connect to any version
-    spec.outgoing.minWireVersion = RELEASE_2_4_AND_BEFORE;
-    spec.outgoing.maxWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
+
+    spec.isInternalClient = true;
 }
 
 ExitCode _initAndListen(int listenPort) {
@@ -820,6 +808,11 @@ ExitCode _initAndListen(int listenPort) {
 
 #ifndef _WIN32
     mongo::signalForkSuccess();
+#else
+    if (ntservice::shouldStartService()) {
+        ntservice::reportStatus(SERVICE_RUNNING);
+        log() << "Service running";
+    }
 #endif
 
     return waitForShutdown();
@@ -847,8 +840,6 @@ ExitCode initAndListen(int listenPort) {
 
 #if defined(_WIN32)
 ExitCode initService() {
-    ntservice::reportStatus(SERVICE_RUNNING);
-    log() << "Service running";
     return initAndListen(serverGlobalParams.port);
 }
 #endif

@@ -36,6 +36,7 @@
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/sync_source_feedback.h"
+#include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/repl/task_runner.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/snapshot_manager.h"
@@ -106,7 +107,8 @@ public:
                                           MultiApplier::ApplyOperationFn applyOperation) override;
     virtual Status multiSyncApply(MultiApplier::OperationPtrs* ops) override;
     virtual Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                         const HostAndPort& source) override;
+                                         const HostAndPort& source,
+                                         AtomicUInt32* fetchCount) override;
     virtual std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(
         OperationContext* txn) const override;
     virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(

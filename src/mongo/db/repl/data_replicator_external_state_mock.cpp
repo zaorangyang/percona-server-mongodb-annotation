@@ -91,7 +91,8 @@ Status DataReplicatorExternalStateMock::_multiSyncApply(MultiApplier::OperationP
 }
 
 Status DataReplicatorExternalStateMock::_multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                                               const HostAndPort& source) {
+                                                               const HostAndPort& source,
+                                                               AtomicUInt32* fetchCount) {
     return Status::OK();
 }
 

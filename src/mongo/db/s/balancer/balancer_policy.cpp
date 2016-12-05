@@ -233,7 +233,7 @@ Status BalancerPolicy::isShardSuitableReceiver(const ClusterStatistics::ShardSta
 
     if (!chunkTag.empty() && !stat.shardTags.count(chunkTag)) {
         return {ErrorCodes::IllegalOperation,
-                str::stream() << stat.shardId << " doesn't have right tag"};
+                str::stream() << stat.shardId << " is not in the correct zone " << chunkTag};
     }
 
     return Status::OK();
@@ -369,7 +369,7 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
                     continue;
 
                 if (chunk.getJumbo()) {
-                    warning() << "chunk " << redact(chunk.toString()) << " violates tag "
+                    warning() << "Chunk " << redact(chunk.toString()) << " violates zone "
                               << redact(tag) << ", but it is jumbo and cannot be moved";
                     continue;
                 }
@@ -378,7 +378,7 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
                     _getLeastLoadedReceiverShard(shardStats, distribution, tag, usedShards);
                 if (!to.isValid()) {
                     if (migrations.empty()) {
-                        warning() << "chunk " << redact(chunk.toString()) << " violates tag "
+                        warning() << "Chunk " << redact(chunk.toString()) << " violates zone "
                                   << redact(tag) << ", but no appropriate recipient found";
                     }
                     continue;
@@ -402,8 +402,41 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
     tagsPlusEmpty.push_back("");
 
     for (const auto& tag : tagsPlusEmpty) {
-        while (_singleZoneBalance(
-            shardStats, distribution, tag, imbalanceThreshold, &migrations, &usedShards))
+        const size_t totalNumberOfChunksWithTag =
+            (tag.empty() ? distribution.totalChunks() : distribution.totalChunksWithTag(tag));
+
+        size_t totalNumberOfShardsWithTag = 0;
+
+        for (const auto& stat : shardStats) {
+            if (tag.empty() || stat.shardTags.count(tag)) {
+                totalNumberOfShardsWithTag++;
+            }
+        }
+
+        // Skip zones which have no shards assigned to them. This situation is not harmful, but
+        // should not be possible so warn the operator to correct it.
+        if (totalNumberOfShardsWithTag == 0) {
+            if (!tag.empty()) {
+                warning() << "Zone " << redact(tag) << " in collection " << distribution.nss()
+                          << " has no assigned shards and chunks which fall into it cannot be "
+                             "balanced. This should be corrected by either assigning shards to the "
+                             "zone or by deleting it.";
+            }
+            continue;
+        }
+
+        // Calculate the ceiling of the optimal number of chunks per shard
+        const size_t idealNumberOfChunksPerShardForTag =
+            (totalNumberOfChunksWithTag / totalNumberOfShardsWithTag) +
+            (totalNumberOfChunksWithTag % totalNumberOfShardsWithTag ? 1 : 0);
+
+        while (_singleZoneBalance(shardStats,
+                                  distribution,
+                                  tag,
+                                  idealNumberOfChunksPerShardForTag,
+                                  imbalanceThreshold,
+                                  &migrations,
+                                  &usedShards))
             ;
     }
 
@@ -428,6 +461,7 @@ boost::optional<MigrateInfo> BalancerPolicy::balanceSingleChunk(
 bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
                                         const DistributionStatus& distribution,
                                         const string& tag,
+                                        size_t idealNumberOfChunksPerShardForTag,
                                         size_t imbalanceThreshold,
                                         vector<MigrateInfo>* migrations,
                                         set<ShardId>* usedShards) {
@@ -436,52 +470,32 @@ bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
         return false;
 
     const size_t max = distribution.numberOfChunksInShardWithTag(from, tag);
-    if (max == 0)
+
+    // Do not use a shard if it already has less entries than the optimal per-shard chunk count
+    if (max <= idealNumberOfChunksPerShardForTag)
         return false;
 
     const ShardId to = _getLeastLoadedReceiverShard(shardStats, distribution, tag, *usedShards);
     if (!to.isValid()) {
         if (migrations->empty()) {
-            log() << "No available shards to take chunks for tag [" << tag << "]";
+            log() << "No available shards to take chunks for zone [" << tag << "]";
         }
         return false;
     }
 
     const size_t min = distribution.numberOfChunksInShardWithTag(to, tag);
-    if (min >= max)
-        return false;
-
-    const size_t totalNumberOfChunksWithTag =
-        (tag.empty() ? distribution.totalChunks() : distribution.totalChunksWithTag(tag));
-
-    size_t totalNumberOfShardsWithTag = 0;
-
-    for (const auto& stat : shardStats) {
-        if (tag.empty() || stat.shardTags.count(tag)) {
-            totalNumberOfShardsWithTag++;
-        }
-    }
-
-    // totalNumberOfShardsWithTag cannot be zero if the to shard is valid
-    invariant(totalNumberOfShardsWithTag);
-    invariant(totalNumberOfChunksWithTag >= max);
-
-    // Calculate the ceiling of the optimal number of chunks per shard
-    const size_t idealNumberOfChunksPerShardWithTag =
-        (totalNumberOfChunksWithTag / totalNumberOfShardsWithTag) +
-        (totalNumberOfChunksWithTag % totalNumberOfShardsWithTag ? 1 : 0);
 
     // Do not use a shard if it already has more entries than the optimal per-shard chunk count
-    if (min >= idealNumberOfChunksPerShardWithTag)
+    if (min >= idealNumberOfChunksPerShardForTag)
         return false;
 
-    const size_t imbalance = max - idealNumberOfChunksPerShardWithTag;
+    const size_t imbalance = max - idealNumberOfChunksPerShardForTag;
 
     LOG(1) << "collection : " << distribution.nss().ns();
     LOG(1) << "zone       : " << tag;
     LOG(1) << "donor      : " << from << " chunks on " << max;
     LOG(1) << "receiver   : " << to << " chunks on " << min;
-    LOG(1) << "ideal      : " << idealNumberOfChunksPerShardWithTag;
+    LOG(1) << "ideal      : " << idealNumberOfChunksPerShardForTag;
     LOG(1) << "threshold  : " << imbalanceThreshold;
 
     // Check whether it is necessary to balance within this zone

@@ -752,6 +752,10 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
 
         conn->getCompressorManager().clientBegin(&bob);
 
+        if (WireSpec::instance().isInternalClient) {
+            WireSpec::appendInternalClientWireVersion(WireSpec::instance().outgoing, &bob);
+        }
+
         Date_t start{Date_t::now()};
         auto result =
             conn->runCommandWithMetadata("admin", "isMaster", rpc::makeEmptyMetadata(), bob.done());
@@ -1430,12 +1434,13 @@ void DBClientConnection::handleNotMasterResponse(const BSONElement& elemToCheck)
         return;
     }
 
-    MONGO_LOG_COMPONENT(1, logger::LogComponent::kReplication)
-        << "got not master from: " << _serverAddress << " of repl set: " << _parentReplSetName;
-
     ReplicaSetMonitorPtr monitor = ReplicaSetMonitor::get(_parentReplSetName);
     if (monitor) {
-        monitor->failedHost(_serverAddress);
+        monitor->failedHost(_serverAddress,
+                            {ErrorCodes::NotMaster,
+                             str::stream() << "got not master from: " << _serverAddress
+                                           << " of repl set: "
+                                           << _parentReplSetName});
     }
 
     _failed = true;

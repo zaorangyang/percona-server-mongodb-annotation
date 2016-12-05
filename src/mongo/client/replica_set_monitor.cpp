@@ -233,6 +233,11 @@ void ReplicaSetMonitor::_refresh(const CallbackArgs& cbArgs) {
     {
         // reschedule itself
         invariant(_executor);
+        if (_isRemovedFromManager.load()) {  // already removed so no need to refresh
+            LOG(1) << "Stopping refresh for replica set " << getName() << " because its removed";
+            return;
+        }
+
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         std::weak_ptr<ReplicaSetMonitor> that(shared_from_this());
         auto status = _executor->scheduleWorkAt(_executor->now() + kRefreshPeriod,
@@ -260,6 +265,11 @@ void ReplicaSetMonitor::_refresh(const CallbackArgs& cbArgs) {
 
 StatusWith<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreferenceSetting& criteria,
                                                             Milliseconds maxWait) {
+    if (_isRemovedFromManager.load()) {
+        return Status(ErrorCodes::ReplicaSetMonitorRemoved,
+                      str::stream() << "ReplicaSetMonitor for set " << getName() << " is removed");
+    }
+
     {
         // Fast path, for the failure-free case
         stdx::lock_guard<stdx::mutex> lk(_state->mutex);
@@ -310,11 +320,11 @@ Refresher ReplicaSetMonitor::startOrContinueRefresh() {
     return out;
 }
 
-void ReplicaSetMonitor::failedHost(const HostAndPort& host) {
+void ReplicaSetMonitor::failedHost(const HostAndPort& host, const Status& status) {
     stdx::lock_guard<stdx::mutex> lk(_state->mutex);
     Node* node = _state->findNode(host);
     if (node)
-        node->markFailed();
+        node->markFailed(status);
     DEV _state->checkInvariants();
 }
 
@@ -453,6 +463,10 @@ bool ReplicaSetMonitor::isKnownToHaveGoodPrimary() const {
     return false;
 }
 
+void ReplicaSetMonitor::markAsRemoved() {
+    _isRemovedFromManager.store(true);
+}
+
 Refresher::Refresher(const SetStatePtr& setState)
     : _set(setState), _scan(setState->currentScan), _startedNewScan(false) {
     if (_scan)
@@ -545,9 +559,10 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
     _scan->waitingFor.erase(from);
 
     const IsMasterReply reply(from, latencyMicros, replyObj);
+
     // Handle various failure cases
     if (!reply.ok) {
-        failedHost(from);
+        failedHost(from, {ErrorCodes::CommandFailed, "Failed to execute 'ismaster' command"});
         return;
     }
 
@@ -565,17 +580,19 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
             warning() << "node: " << from << " isn't a part of set: " << _set->name
                       << " ismaster: " << replyObj;
         }
-        failedHost(from);
+
+        failedHost(from,
+                   {ErrorCodes::InconsistentReplicaSetNames,
+                    str::stream() << "Target replica set name " << reply.setName
+                                  << " does not match the monitored set name "
+                                  << _set->name});
         return;
     }
 
     if (reply.isMaster) {
-        if (!receivedIsMasterFromMaster(reply)) {
-            log() << "node " << from << " believes it is primary, but its election id of "
-                  << reply.electionId << " and config version of " << reply.configVersion
-                  << " is older than the most recent election id " << _set->maxElectionId
-                  << " and config version of " << _set->configVersion;
-            failedHost(from);
+        Status status = receivedIsMasterFromMaster(from, reply);
+        if (!status.isOK()) {
+            failedHost(from, status);
             return;
         }
     }
@@ -598,7 +615,7 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
     DEV _set->checkInvariants();
 }
 
-void Refresher::failedHost(const HostAndPort& host) {
+void Refresher::failedHost(const HostAndPort& host, const Status& status) {
     _scan->waitingFor.erase(host);
 
     // Failed hosts can't pass criteria, so the only way they'd effect the _refreshUntilMatches
@@ -608,7 +625,7 @@ void Refresher::failedHost(const HostAndPort& host) {
 
     Node* node = _set->findNode(host);
     if (node)
-        node->markFailed();
+        node->markFailed(status);
 }
 
 ScanStatePtr Refresher::startNewScan(const SetState* set) {
@@ -646,13 +663,18 @@ ScanStatePtr Refresher::startNewScan(const SetState* set) {
     return scan;
 }
 
-bool Refresher::receivedIsMasterFromMaster(const IsMasterReply& reply) {
+Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMasterReply& reply) {
     invariant(reply.isMaster);
 
     // Reject if config version is older. This is for backwards compatibility with nodes in pv0
     // since they don't have the same ordering with pv1 electionId.
     if (reply.configVersion < _set->configVersion) {
-        return false;
+        return {ErrorCodes::NotMaster,
+                str::stream() << "Node " << from
+                              << " believes it is primary, but its config version "
+                              << reply.configVersion
+                              << " is older than the most recent config version "
+                              << _set->configVersion};
     }
 
     if (reply.electionId.isSet()) {
@@ -661,7 +683,12 @@ bool Refresher::receivedIsMasterFromMaster(const IsMasterReply& reply) {
         // because configVersion needs to be incremented whenever the protocol version is changed.
         if (reply.configVersion == _set->configVersion && _set->maxElectionId.isSet() &&
             _set->maxElectionId.compare(reply.electionId) > 0) {
-            return false;
+            return {ErrorCodes::NotMaster,
+                    str::stream() << "Node " << from
+                                  << " believes it is primary, but its election id "
+                                  << reply.electionId
+                                  << " is older than the most recent election id "
+                                  << _set->maxElectionId};
         }
 
         _set->maxElectionId = reply.electionId;
@@ -744,7 +771,7 @@ bool Refresher::receivedIsMasterFromMaster(const IsMasterReply& reply) {
     _scan->foundUpMaster = true;
     _set->lastSeenMaster = reply.host;
 
-    return true;
+    return Status::OK();
 }
 
 void Refresher::receivedIsMasterBeforeFoundMaster(const IsMasterReply& reply) {
@@ -789,19 +816,23 @@ HostAndPort Refresher::_refreshUntilMatches(const ReadPreferenceSetting* criteri
                 continue;
 
             case NextStep::CONTACT_HOST: {
-                BSONObj reply;  // empty on error
+                StatusWith<BSONObj> isMasterReplyStatus{ErrorCodes::InternalError,
+                                                        "Uninitialized variable"};
                 int64_t pingMicros = 0;
 
-                lk.unlock();  // relocked after attempting to call isMaster
+                // Do not do network calls while holding a mutex
+                lk.unlock();
                 try {
                     ScopedDbConnection conn(ConnectionString(ns.host), socketTimeoutSecs);
                     bool ignoredOutParam = false;
                     Timer timer;
+                    BSONObj reply;
                     conn->isMaster(ignoredOutParam, &reply);
+                    isMasterReplyStatus = reply;
                     pingMicros = timer.micros();
                     conn.done();  // return to pool on success.
-                } catch (...) {
-                    reply = BSONObj();  // should be a no-op but want to be sure
+                } catch (const DBException& ex) {
+                    isMasterReplyStatus = ex.toStatus();
                 }
                 lk.lock();
 
@@ -810,10 +841,10 @@ HostAndPort Refresher::_refreshUntilMatches(const ReadPreferenceSetting* criteri
                 if (_scan != _set->currentScan)
                     return criteria ? _set->getMatchingHost(*criteria) : HostAndPort();
 
-                if (reply.isEmpty())
-                    failedHost(ns.host);
+                if (isMasterReplyStatus.isOK())
+                    receivedIsMaster(ns.host, pingMicros, isMasterReplyStatus.getValue());
                 else
-                    receivedIsMaster(ns.host, pingMicros, reply);
+                    failedHost(ns.host, isMasterReplyStatus.getStatus());
             }
         }
     }
@@ -872,10 +903,13 @@ void IsMasterReply::parse(const BSONObj& obj) {
 
 Node::Node(const HostAndPort& host) : host(host), latencyMicros(unknownLatency) {}
 
-void Node::markFailed() {
-    LOG(1) << "Marking host " << host << " as failed";
+void Node::markFailed(const Status& status) {
+    if (isUp) {
+        log() << "Marking host " << host << " as failed" << causedBy(redact(status));
 
-    isUp = false;
+        isUp = false;
+    }
+
     isMaster = false;
 }
 

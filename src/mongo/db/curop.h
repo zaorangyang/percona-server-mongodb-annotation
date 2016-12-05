@@ -124,7 +124,7 @@ public:
     ExceptionInfo exceptionInfo;
 
     // response info
-    int executionTime{0};
+    long long executionTimeMicros{0};
     long long nreturned{-1};
     int responseLength{-1};
 };
@@ -231,15 +231,23 @@ public:
         return _ns;
     }
 
-    bool shouldDBProfile(int ms) const {
+    /**
+     * Returns true iff the elapsed time of this operation is such that it should be profiled.
+     * Uses total time if the operation is done, current elapsed time otherwise.
+     */
+    bool shouldDBProfile() {
         if (_dbprofile <= 0)
             return false;
 
-        if (serverGlobalParams.rateLimit > 1 && _dbprofile >= 2 && ms < serverGlobalParams.slowMS) {
+        long long opMicros = isDone() ? totalTimeMicros() : elapsedMicros();
+        if (serverGlobalParams.rateLimit > 1 && _dbprofile >= 2 && opMicros < serverGlobalParams.slowMS * 1000LL) {
             return _shouldDBProfileWithRateLimit();
         }
 
-        return _dbprofile >= 2 || ms >= serverGlobalParams.slowMS;
+        if (_dbprofile >= 2)
+            return true;
+
+        return opMicros >= serverGlobalParams.slowMS * 1000LL;
     }
 
     /**
@@ -289,22 +297,21 @@ public:
     void done() {
         _end = curTimeMicros64();
     }
+    bool isDone() const {
+        return _end > 0;
+    }
 
     long long totalTimeMicros() {
         massert(12601, "CurOp not marked done yet", _end);
         return _end - startTime();
     }
-    int totalTimeMillis() {
-        return (int)(totalTimeMicros() / 1000);
-    }
+
     long long elapsedMicros() {
         return curTimeMicros64() - startTime();
     }
-    int elapsedMillis() {
-        return (int)(elapsedMicros() / 1000);
-    }
+
     int elapsedSeconds() {
-        return elapsedMillis() / 1000;
+        return static_cast<int>(elapsedMicros() / (1000 * 1000));
     }
 
     /**

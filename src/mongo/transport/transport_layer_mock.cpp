@@ -32,9 +32,8 @@
 
 #include "mongo/base/status.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/transport/session.h"
-#include "mongo/transport/ticket.h"
-#include "mongo/transport/ticket_impl.h"
+#include "mongo/transport/mock_session.h"
+#include "mongo/transport/mock_ticket.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/time_support.h"
@@ -42,53 +41,34 @@
 namespace mongo {
 namespace transport {
 
-TransportLayerMock::TicketMock::TicketMock(const Session* session,
-                                           Message* message,
-                                           Date_t expiration)
-    : _session(session), _message(message), _expiration(expiration) {}
-
-TransportLayerMock::TicketMock::TicketMock(const Session* session, Date_t expiration)
-    : _session(session), _expiration(expiration) {}
-
-Session::Id TransportLayerMock::TicketMock::sessionId() const {
-    return _session->id();
-}
-
-Date_t TransportLayerMock::TicketMock::expiration() const {
-    return _expiration;
-}
-
-boost::optional<Message*> TransportLayerMock::TicketMock::msg() const {
-    return _message;
-}
-
 TransportLayerMock::TransportLayerMock() : _shutdown(false) {}
 
-Ticket TransportLayerMock::sourceMessage(Session& session, Message* message, Date_t expiration) {
+Ticket TransportLayerMock::sourceMessage(const SessionHandle& session,
+                                         Message* message,
+                                         Date_t expiration) {
     if (inShutdown()) {
         return Ticket(TransportLayer::ShutdownStatus);
-    } else if (!owns(session.id())) {
+    } else if (!owns(session->id())) {
         return Ticket(TransportLayer::SessionUnknownStatus);
-    } else if (_sessions[session.id()].ended) {
+    } else if (_sessions[session->id()].ended) {
         return Ticket(TransportLayer::TicketSessionClosedStatus);
     }
 
-    return Ticket(this,
-                  stdx::make_unique<TransportLayerMock::TicketMock>(&session, message, expiration));
+    return Ticket(this, stdx::make_unique<transport::MockTicket>(session, message, expiration));
 }
 
-Ticket TransportLayerMock::sinkMessage(Session& session,
+Ticket TransportLayerMock::sinkMessage(const SessionHandle& session,
                                        const Message& message,
                                        Date_t expiration) {
     if (inShutdown()) {
         return Ticket(TransportLayer::ShutdownStatus);
-    } else if (!owns(session.id())) {
+    } else if (!owns(session->id())) {
         return Ticket(TransportLayer::SessionUnknownStatus);
-    } else if (_sessions[session.id()].ended) {
+    } else if (_sessions[session->id()].ended) {
         return Ticket(TransportLayer::TicketSessionClosedStatus);
     }
 
-    return Ticket(this, stdx::make_unique<TransportLayerMock::TicketMock>(&session, expiration));
+    return Ticket(this, stdx::make_unique<transport::MockTicket>(session, expiration));
 }
 
 Status TransportLayerMock::wait(Ticket&& ticket) {
@@ -109,52 +89,49 @@ void TransportLayerMock::asyncWait(Ticket&& ticket, TicketCallback callback) {
     callback(Status::OK());
 }
 
-SSLPeerInfo TransportLayerMock::getX509PeerInfo(const Session& session) const {
-    return _sessions.at(session.id()).peerInfo;
+SSLPeerInfo TransportLayerMock::getX509PeerInfo(const ConstSessionHandle& session) const {
+    return _sessions.at(session->id()).peerInfo;
 }
 
 
-void TransportLayerMock::setX509PeerInfo(const Session& session, SSLPeerInfo peerInfo) {
-    _sessions[session.id()].peerInfo = std::move(peerInfo);
+void TransportLayerMock::setX509PeerInfo(const SessionHandle& session, SSLPeerInfo peerInfo) {
+    _sessions[session->id()].peerInfo = std::move(peerInfo);
 }
 
 TransportLayer::Stats TransportLayerMock::sessionStats() {
     return Stats();
 }
 
-void TransportLayerMock::registerTags(const Session& session) {}
-
-Session* TransportLayerMock::createSession() {
-    std::unique_ptr<Session> session =
-        stdx::make_unique<Session>(HostAndPort(), HostAndPort(), this);
+SessionHandle TransportLayerMock::createSession() {
+    auto session = MockSession::create(this);
     Session::Id sessionId = session->id();
 
-    _sessions[sessionId] = Connection{false, std::move(session), SSLPeerInfo()};
+    _sessions[sessionId] = Connection{false, session, SSLPeerInfo()};
 
-    return _sessions[sessionId].session.get();
+    return _sessions[sessionId].session;
 }
 
-Session* TransportLayerMock::get(Session::Id id) {
+SessionHandle TransportLayerMock::get(Session::Id id) {
     if (!owns(id))
         return nullptr;
 
-    return _sessions[id].session.get();
+    return _sessions[id].session;
 }
 
 bool TransportLayerMock::owns(Session::Id id) {
     return _sessions.count(id) > 0;
 }
 
-void TransportLayerMock::end(Session& session) {
-    if (!owns(session.id()))
+void TransportLayerMock::end(const SessionHandle& session) {
+    if (!owns(session->id()))
         return;
-    _sessions[session.id()].ended = true;
+    _sessions[session->id()].ended = true;
 }
 
 void TransportLayerMock::endAllSessions(Session::TagMask tags) {
     auto it = _sessions.begin();
     while (it != _sessions.end()) {
-        end(*it->second.session.get());
+        end(it->second.session);
         it++;
     }
 }
@@ -177,8 +154,6 @@ bool TransportLayerMock::inShutdown() const {
 TransportLayerMock::~TransportLayerMock() {
     shutdown();
 }
-
-void TransportLayerMock::_destroy(Session& session) {}
 
 }  // namespace transport
 }  // namespace mongo

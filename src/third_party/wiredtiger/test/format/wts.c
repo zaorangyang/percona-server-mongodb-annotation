@@ -50,6 +50,8 @@ compressor(uint32_t compress_flag)
 		return ("zlib");
 	case COMPRESS_ZLIB_NO_RAW:
 		return ("zlib-noraw");
+	case COMPRESS_ZSTD:
+		return ("zstd");
 	default:
 		break;
 	}
@@ -155,8 +157,7 @@ wts_open(const char *home, bool set_api, WT_CONNECTION **connp)
 		    g.c_lsm_worker_threads);
 
 	if (DATASOURCE("lsm") || g.c_cache < 20) {
-		p += snprintf(p, REMAIN(p, end),
-		    ",eviction_dirty_target=80,eviction_dirty_trigger=95");
+		p += snprintf(p, REMAIN(p, end), ",eviction_dirty_trigger=95");
 	}
 
 	/* Eviction worker configuration. */
@@ -210,13 +211,14 @@ wts_open(const char *home, bool set_api, WT_CONNECTION **connp)
 	/* Extensions. */
 	p += snprintf(p, REMAIN(p, end),
 	    ",extensions=["
-	    "\"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\"],",
+	    "\"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\"],",
 	    g.c_reverse ? REVERSE_PATH : "",
 	    access(LZ4_PATH, R_OK) == 0 ? LZ4_PATH : "",
 	    access(LZO_PATH, R_OK) == 0 ? LZO_PATH : "",
 	    access(ROTN_PATH, R_OK) == 0 ? ROTN_PATH : "",
 	    access(SNAPPY_PATH, R_OK) == 0 ? SNAPPY_PATH : "",
 	    access(ZLIB_PATH, R_OK) == 0 ? ZLIB_PATH : "",
+	    access(ZSTD_PATH, R_OK) == 0 ? ZSTD_PATH : "",
 	    DATASOURCE("kvsbdb") ? KVS_BDB_PATH : "");
 
 	/*

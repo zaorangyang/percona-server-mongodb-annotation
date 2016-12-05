@@ -176,6 +176,12 @@ void WiredTigerSessionCache::shuttingDown() {
 }
 
 void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint) {
+    // For inMemory storage engines, the data is "as durable as it's going to get".
+    // That is, a restart is equivalent to a complete node failure.
+    if (isEphemeral()) {
+        return;
+    }
+
     const int shuttingDown = _shuttingDown.fetchAndAdd(1);
     ON_BLOCK_EXIT([this] { _shuttingDown.fetchAndSubtract(1); });
 
@@ -219,7 +225,7 @@ void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint) {
     JournalListener::Token token = _journalListener->getToken();
 
     // Use the journal when available, or a checkpoint otherwise.
-    if (_engine->isDurable()) {
+    if (_engine && _engine->isDurable()) {
         invariantWTOK(s->log_flush(s, "sync=on"));
         LOG(4) << "flushed journal";
     } else {

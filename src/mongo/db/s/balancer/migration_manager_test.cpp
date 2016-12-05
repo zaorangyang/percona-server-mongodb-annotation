@@ -162,7 +162,7 @@ void MigrationManagerTest::setUp() {
     ConfigServerTestFixture::setUp();
     _migrationManager = stdx::make_unique<MigrationManager>(getServiceContext());
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
-    _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle, false);
+    _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle);
 }
 
 void MigrationManagerTest::tearDown() {
@@ -745,8 +745,9 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
         // up a dummy host for kShardHost0.
         shardTargeterMock(txn.get(), kShardId0)->setFindHostReturnValue(kShardHost0);
 
-        ASSERT_NOT_OK(_migrationManager->executeManualMigration(
-            txn.get(), {kShardId1, chunk}, 0, kDefaultSecondaryThrottle, false));
+        ASSERT_EQ(ErrorCodes::BalancerInterrupted,
+                  _migrationManager->executeManualMigration(
+                      txn.get(), {kShardId1, chunk}, 0, kDefaultSecondaryThrottle, false));
     });
 
     // Wait till the move chunk request gets sent and pretend that it is stuck by never responding
@@ -768,8 +769,9 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
     future.timed_get(kFutureTimeout);
 
     // Ensure that no new migrations can be scheduled
-    ASSERT_NOT_OK(_migrationManager->executeManualMigration(
-        operationContext(), {kShardId1, chunk}, 0, kDefaultSecondaryThrottle, false));
+    ASSERT_EQ(ErrorCodes::BalancerInterrupted,
+              _migrationManager->executeManualMigration(
+                  operationContext(), {kShardId1, chunk}, 0, kDefaultSecondaryThrottle, false));
 
     // Ensure that the migration manager is no longer handling any migrations.
     _migrationManager->drainActiveMigrations();
@@ -797,7 +799,7 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
 
     // Restore the migration manager back to the started state, which is expected by tearDown
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
-    _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle, false);
+    _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle);
 }
 
 TEST_F(MigrationManagerTest, RestartMigrationManager) {
@@ -821,7 +823,7 @@ TEST_F(MigrationManagerTest, RestartMigrationManager) {
     _migrationManager->interruptAndDisableMigrations();
     _migrationManager->drainActiveMigrations();
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
-    _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle, false);
+    _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle);
 
     auto future = launchAsync([&] {
         Client::initThreadIfNotAlready("Test");
@@ -882,7 +884,7 @@ TEST_F(MigrationManagerTest, MigrationRecovery) {
         shardTargeterMock(txn.get(), kShardId0)->setFindHostReturnValue(kShardHost0);
         shardTargeterMock(txn.get(), kShardId2)->setFindHostReturnValue(kShardHost2);
 
-        _migrationManager->finishRecovery(txn.get(), 0, kDefaultSecondaryThrottle, false);
+        _migrationManager->finishRecovery(txn.get(), 0, kDefaultSecondaryThrottle);
     });
 
     // Expect two moveChunk commands.
@@ -943,10 +945,75 @@ TEST_F(MigrationManagerTest, FailMigrationRecovery) {
         DistLockManager::kSingleLockAttemptTimeout));
 
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
-    _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle, false);
+    _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle);
 
     // MigrationManagerTest::tearDown checks that the config.migrations collection is empty and all
     // distributed locks are unlocked.
+}
+
+// Check that retriable / replset monitor altering errors returned from remote moveChunk commands
+// sent to source shards are not returned to the caller (mongos), but instead converted into
+// OperationFailed errors.
+TEST_F(MigrationManagerTest, RemoteCallErrorConversionToOperationFailed) {
+    // Set up two shards in the metadata.
+    ASSERT_OK(catalogClient()->insertConfigDocument(
+        operationContext(), ShardType::ConfigNS, kShard0, kMajorityWriteConcern));
+    ASSERT_OK(catalogClient()->insertConfigDocument(
+        operationContext(), ShardType::ConfigNS, kShard2, kMajorityWriteConcern));
+
+    // Set up the database and collection as sharded in the metadata.
+    std::string dbName = "foo";
+    std::string collName = "foo.bar";
+    ChunkVersion version(1, 0, OID::gen());
+
+    setUpDatabase(dbName, kShardId0);
+    setUpCollection(collName, version);
+
+    // Set up two chunks in the metadata.
+    ChunkType chunk1 =
+        setUpChunk(collName, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
+    version.incMinor();
+    ChunkType chunk2 =
+        setUpChunk(collName, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
+
+    auto future = launchAsync([&] {
+        Client::initThreadIfNotAlready("Test");
+        auto txn = cc().makeOperationContext();
+
+        // Scheduling the moveChunk commands requires finding a host to which to send the command.
+        // Set up dummy hosts for the source shards.
+        shardTargeterMock(txn.get(), kShardId0)->setFindHostReturnValue(kShardHost0);
+        shardTargeterMock(txn.get(), kShardId2)->setFindHostReturnValue(kShardHost2);
+
+        MigrationStatuses migrationStatuses = _migrationManager->executeMigrationsForAutoBalance(
+            txn.get(),
+            {{kShardId1, chunk1}, {kShardId3, chunk2}},
+            0,
+            kDefaultSecondaryThrottle,
+            false);
+
+        ASSERT_EQ(ErrorCodes::OperationFailed, migrationStatuses.at(chunk1.getName()));
+        ASSERT_EQ(ErrorCodes::OperationFailed, migrationStatuses.at(chunk2.getName()));
+    });
+
+    // Expect a moveChunk command that will fail with a retriable error.
+    expectMoveChunkCommand(
+        chunk1,
+        kShardId1,
+        false,
+        Status(ErrorCodes::NotMasterOrSecondary,
+               "RemoteCallErrorConversionToOperationFailedCheck generated error."));
+
+    // Expect a moveChunk command that will fail with a replset monitor updating error.
+    expectMoveChunkCommand(
+        chunk2,
+        kShardId3,
+        false,
+        Status(ErrorCodes::ExceededTimeLimit,
+               "RemoteCallErrorConversionToOperationFailedCheck generated error."));
+
+    // Run the MigrationManager code.
+    future.timed_get(kFutureTimeout);
 }
 
 }  // namespace

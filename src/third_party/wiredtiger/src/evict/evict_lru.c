@@ -548,6 +548,7 @@ __evict_pass(WT_SESSION_IMPL *session)
 		 * does need to do some work.
 		 */
 		__wt_cache_read_gen_incr(session);
+		++cache->evict_pass_gen;
 
 		/*
 		 * Update the oldest ID: we use it to decide whether pages are
@@ -909,23 +910,6 @@ __evict_lru_walk(WT_SESSION_IMPL *session)
 	WT_RET_NOTFOUND_OK(ret);
 
 	/*
-	 * If we found no pages at all during the walk, something is wrong.
-	 * Be more aggressive next time.
-	 *
-	 * Continue on to sort the queue, in case there are pages left from a
-	 * previous walk.
-	 */
-	if (ret == WT_NOTFOUND) {
-		if (F_ISSET(cache,
-		    WT_CACHE_EVICT_CLEAN_HARD | WT_CACHE_EVICT_DIRTY_HARD))
-			cache->evict_aggressive_score = WT_MIN(
-			    cache->evict_aggressive_score + WT_EVICT_SCORE_BUMP,
-			    WT_EVICT_SCORE_MAX);
-		WT_STAT_CONN_SET(session, cache_eviction_aggressive_set,
-		    cache->evict_aggressive_score);
-	}
-
-	/*
 	 * If the queue we are filling is empty, pages are being requested
 	 * faster than they are being queued.
 	 */
@@ -1055,7 +1039,7 @@ __evict_walk(WT_SESSION_IMPL *session, WT_EVICT_QUEUE *queue)
 	WT_CONNECTION_IMPL *conn;
 	WT_DATA_HANDLE *dhandle;
 	WT_DECL_RET;
-	u_int max_entries, retries, slot, start_slot, spins;
+	u_int max_entries, retries, slot, spins, start_slot, total_candidates;
 	bool dhandle_locked, incr;
 
 	conn = S2C(session);
@@ -1076,12 +1060,9 @@ __evict_walk(WT_SESSION_IMPL *session, WT_EVICT_QUEUE *queue)
 	 * Another pathological case: if there are only a tiny number of
 	 * candidate pages in cache, don't put all of them on one queue.
 	 */
-	if (F_ISSET(cache, WT_CACHE_EVICT_CLEAN))
-		max_entries = WT_MIN(max_entries,
-		    1 + (uint32_t)(__wt_cache_pages_inuse(cache) / 2));
-	else
-		max_entries = WT_MIN(max_entries,
-		    1 + (uint32_t)(cache->pages_dirty_leaf / 2));
+	total_candidates = (u_int)(F_ISSET(cache, WT_CACHE_EVICT_CLEAN) ?
+	    __wt_cache_pages_inuse(cache) : cache->pages_dirty_leaf);
+	max_entries = WT_MIN(max_entries, 1 + total_candidates / 2);
 
 retry:	while (slot < max_entries) {
 		/*
@@ -1286,8 +1267,8 @@ __evict_push_candidate(WT_SESSION_IMPL *session,
  *	Get a few page eviction candidates from a single underlying file.
  */
 static int
-__evict_walk_file(WT_SESSION_IMPL *session,
-    WT_EVICT_QUEUE *queue, u_int max_entries, u_int *slotp)
+__evict_walk_file(WT_SESSION_IMPL *session, WT_EVICT_QUEUE *queue,
+    u_int max_entries, u_int *slotp)
 {
 	WT_BTREE *btree;
 	WT_CACHE *cache;
@@ -1298,7 +1279,7 @@ __evict_walk_file(WT_SESSION_IMPL *session,
 	WT_PAGE_MODIFY *mod;
 	WT_REF *ref;
 	WT_TXN_GLOBAL *txn_global;
-	uint64_t btree_inuse, bytes_per_slot, cache_inuse;
+	uint64_t btree_inuse, bytes_per_slot, cache_inuse, min_pages;
 	uint64_t pages_seen, pages_queued, refs_walked;
 	uint32_t remaining_slots, total_slots, walk_flags;
 	uint32_t target_pages_clean, target_pages_dirty, target_pages;
@@ -1371,6 +1352,16 @@ __evict_walk_file(WT_SESSION_IMPL *session,
 		FLD_SET(walk_flags, WT_READ_PREV);
 
 	/*
+	 * Examine at least a reasonable number of pages before deciding
+	 * whether to give up.  When we are only looking for dirty pages,
+	 * search the tree for longer.
+	 */
+	min_pages = 10 * target_pages;
+	if (F_ISSET(cache, WT_CACHE_EVICT_DIRTY) &&
+	    !F_ISSET(cache, WT_CACHE_EVICT_CLEAN))
+		min_pages *= 10;
+
+	/*
 	 * Get some more eviction candidate pages.
 	 *
 	 * !!! Take care terminating this loop.
@@ -1392,9 +1383,10 @@ __evict_walk_file(WT_SESSION_IMPL *session,
 		 * no good eviction candidates can be found.  Abandon the walk
 		 * if we get into that situation.
 		 */
-		give_up = !__wt_cache_aggressive(session) && pages_seen > 100 &&
+		give_up = !__wt_cache_aggressive(session) &&
+		    pages_seen > min_pages &&
 		    (pages_queued == 0 || (pages_seen / pages_queued) >
-		    (10 * total_slots / target_pages));
+		    (min_pages / target_pages));
 		if (give_up)
 			break;
 
@@ -1414,6 +1406,7 @@ __evict_walk_file(WT_SESSION_IMPL *session,
 
 		page = ref->page;
 		modified = __wt_page_is_modified(page);
+		page->evict_pass_gen = cache->evict_pass_gen;
 
 		/*
 		 * Use the EVICT_LRU flag to avoid putting pages onto the list
@@ -1454,14 +1447,14 @@ __evict_walk_file(WT_SESSION_IMPL *session,
 		if (modified && !F_ISSET(cache, WT_CACHE_EVICT_DIRTY))
 			continue;
 
-		/* If eviction gets aggressive, anything else is fair game. */
-		if (__wt_cache_aggressive(session))
-			goto fast;
-
 		/* Limit internal pages to 50% of the total. */
 		if (WT_PAGE_IS_INTERNAL(page) &&
 		    internal_pages >= (int)(evict - start) / 2)
 			continue;
+
+		/* If eviction gets aggressive, anything else is fair game. */
+		if (__wt_cache_aggressive(session))
+			goto fast;
 
 		/*
 		 * If the oldest transaction hasn't changed since the last time
@@ -1560,7 +1553,7 @@ __evict_get_ref(
 	server_only = is_server && !WT_EVICT_HAS_WORKERS(session);
 	urgent_ok = (!is_app && !is_server) ||
 	    !WT_EVICT_HAS_WORKERS(session) ||
-	    __wt_cache_aggressive(session);
+	    (is_app && __wt_cache_aggressive(session));
 	urgent_queue = cache->evict_urgent_queue;
 	*btreep = NULL;
 	*refp = NULL;

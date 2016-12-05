@@ -152,7 +152,7 @@ public:
                                          const NamespaceString& ns,
                                          bool slaveOk);
 
-    virtual bool shouldIgnoreUniqueIndex(const IndexDescriptor* idx);
+    virtual bool shouldRelaxIndexConstraints(const NamespaceString& ns);
 
     virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
 
@@ -269,9 +269,6 @@ public:
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const rpc::ReplSetMetadata& metadata) override;
-
-    virtual SyncSourceResolverResponse selectSyncSource(OperationContext* txn,
-                                                        const OpTime& lastOpTimeFetched) override;
 
     virtual OpTime getLastCommittedOpTime() const override;
 

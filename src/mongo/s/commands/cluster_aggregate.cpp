@@ -38,6 +38,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline.h"
@@ -102,7 +103,7 @@ Status ClusterAggregate::runAggregate(OperationContext* txn,
         return aggPassthrough(txn, namespaces, conf, cmdObj, result, options);
     }
 
-    ChunkManagerPtr chunkMgr = conf->getChunkManager(txn, namespaces.executionNss.ns());
+    auto chunkMgr = conf->getChunkManager(txn, namespaces.executionNss.ns());
 
     // If there was no collation specified, but there is a default collation for the collation,
     // use that.
@@ -232,8 +233,7 @@ Status ClusterAggregate::runAggregate(OperationContext* txn,
     }
 
     mergeCmd.setField("writeConcern", Value(cmdObj["writeConcern"]));
-
-    // Not propagating readConcern to merger since it doesn't do local reads.
+    mergeCmd.setField("readConcern", Value(cmdObj["readConcern"]));
 
     // If the user didn't specify a collation already, make sure there's a collation attached to
     // the merge command, since the merging shard may not have the collection metadata.

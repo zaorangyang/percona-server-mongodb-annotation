@@ -21,12 +21,13 @@
             rs: true,
             rsOptions: {nodes: 1},
             configOptions: {
-                setParameter: "failpoint.dontUpsertShardIdentityOnNewShards={'mode':'alwaysOn'}"
+                setParameter:
+                    {"failpoint.dontUpsertShardIdentityOnNewShards": "{'mode':'alwaysOn'}"}
             }
         }
     });
 
-    st.configRS.awaitReplication(60 * 1000);
+    st.configRS.awaitReplication();
     var configVersion = st.s.getDB('config').getCollection('version').findOne();
     assert.neq(null, configVersion);
     var clusterId = configVersion.clusterId;

@@ -149,11 +149,6 @@ void WiredTigerRecoveryUnit::_ensureSession() {
 
 bool WiredTigerRecoveryUnit::waitUntilDurable() {
     invariant(!_inUnitOfWork);
-    // For inMemory storage engines, the data is "as durable as it's going to get".
-    // That is, a restart is equivalent to a complete node failure.
-    if (_sessionCache->isEphemeral()) {
-        return true;
-    }
     // _session may be nullptr. We cannot _ensureSession() here as that needs shutdown protection.
     _sessionCache->waitUntilDurable(false);
     return true;
@@ -210,6 +205,7 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     }
     _active = false;
     _mySnapshotId = nextSnapshotId.fetchAndAdd(1);
+    _oplogReadTill = RecordId();
 }
 
 SnapshotId WiredTigerRecoveryUnit::getSnapshotId() const {

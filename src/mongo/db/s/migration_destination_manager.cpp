@@ -167,9 +167,9 @@ bool opReplicatedEnough(OperationContext* txn,
  *
  * 'sessionId' unique identifier for this migration.
  */
-BSONObj createMigrateCloneRequest(const MigrationSessionId& sessionId) {
+BSONObj createMigrateCloneRequest(const NamespaceString& nss, const MigrationSessionId& sessionId) {
     BSONObjBuilder builder;
-    builder.append("_migrateClone", 1);
+    builder.append("_migrateClone", nss.ns());
     sessionId.append(&builder);
     return builder.obj();
 }
@@ -180,9 +180,9 @@ BSONObj createMigrateCloneRequest(const MigrationSessionId& sessionId) {
  *
  * 'sessionId' unique identifier for this migration.
  */
-BSONObj createTransferModsRequest(const MigrationSessionId& sessionId) {
+BSONObj createTransferModsRequest(const NamespaceString& nss, const MigrationSessionId& sessionId) {
     BSONObjBuilder builder;
-    builder.append("_transferMods", 1);
+    builder.append("_transferMods", nss.ns());
     sessionId.append(&builder);
     return builder.obj();
 }
@@ -467,6 +467,21 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
 
     DisableDocumentValidation validationDisabler(txn);
 
+    std::vector<BSONObj> indexSpecs;
+    BSONObj idIndexSpec;
+    {
+        auto indexes = conn->getIndexSpecs(_nss.ns());
+        for (auto&& spec : indexes) {
+            indexSpecs.push_back(spec);
+            if (auto indexNameElem = spec[IndexDescriptor::kIndexNameFieldName]) {
+                if (indexNameElem.type() == BSONType::String &&
+                    indexNameElem.valueStringData() == "_id_"_sd) {
+                    idIndexSpec = spec;
+                }
+            }
+        }
+    }
+
     {
         // 0. copy system.namespaces entry if collection doesn't already exist
 
@@ -496,7 +511,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
             }
 
             WriteUnitOfWork wuow(txn);
-            Status status = userCreateNS(txn, db, _nss.ns(), options, false);
+            Status status = userCreateNS(txn, db, _nss.ns(), options, true, idIndexSpec);
             if (!status.isOK()) {
                 warning() << "failed to create collection [" << _nss << "] "
                           << " with options " << options << ": " << redact(status);
@@ -507,13 +522,6 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
 
     {
         // 1. copy indexes
-
-        std::vector<BSONObj> indexSpecs;
-
-        {
-            const std::list<BSONObj> indexes = conn->getIndexSpecs(_nss.ns());
-            indexSpecs.insert(indexSpecs.begin(), indexes.begin(), indexes.end());
-        }
 
         ScopedTransaction scopedXact(txn, MODE_IX);
         Lock::DBLock lk(txn->lockState(), _nss.db(), MODE_X);
@@ -618,7 +626,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
         // 3. Initial bulk clone
         setState(CLONE);
 
-        const BSONObj migrateCloneRequest = createMigrateCloneRequest(*_sessionId);
+        const BSONObj migrateCloneRequest = createMigrateCloneRequest(_nss, *_sessionId);
 
         while (true) {
             BSONObj res;
@@ -707,7 +715,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
     // secondaries
     repl::OpTime lastOpApplied = repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
 
-    const BSONObj xferModsRequest = createTransferModsRequest(*_sessionId);
+    const BSONObj xferModsRequest = createTransferModsRequest(_nss, *_sessionId);
 
     {
         // 4. Do bulk of mods

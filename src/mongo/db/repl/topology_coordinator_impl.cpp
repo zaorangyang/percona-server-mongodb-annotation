@@ -47,6 +47,7 @@
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/rslog.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
@@ -59,6 +60,10 @@ namespace repl {
 using std::vector;
 
 const Seconds TopologyCoordinatorImpl::VoteLease::leaseTime = Seconds(30);
+
+// Controls how caught up in replication a secondary with higher priority than the current primary
+// must be before it will call for a priority takeover election.
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(priorityTakeoverFreshnessWindowSeconds, int, 2);
 
 namespace {
 
@@ -149,7 +154,7 @@ HostAndPort TopologyCoordinatorImpl::getSyncSourceAddress() const {
 }
 
 HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
-                                                         const Timestamp& lastTimestampApplied,
+                                                         const Timestamp& lastTimestampFetched,
                                                          ChainingPreference chainingPreference) {
     // If we are not a member of the current replica set configuration, no sync source is valid.
     if (_selfIndex == -1) {
@@ -278,8 +283,10 @@ HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
                 }
                 // Candidates cannot be excessively behind.
                 if (it->getAppliedOpTime() < oldestSyncOpTime) {
-                    LOG(2) << "Cannot select sync source because it is too far behind: "
-                           << itMemberConfig.getHostAndPort();
+                    LOG(2) << "Cannot select sync source because it is too far behind."
+                           << "Latest optime of sync candidate " << itMemberConfig.getHostAndPort()
+                           << ": " << it->getAppliedOpTime()
+                           << ", oldest acceptable optime: " << oldestSyncOpTime;
                     continue;
                 }
                 // Candidate must not have a configured delay larger than ours.
@@ -294,14 +301,16 @@ HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
                 if (!itMemberConfig.shouldBuildIndexes()) {
                     LOG(2) << "Cannot select sync source with shouldBuildIndex differences: "
                            << itMemberConfig.getHostAndPort();
-
                     continue;
                 }
             }
             // only consider candidates that are ahead of where we are
-            if (it->getAppliedOpTime().getTimestamp() <= lastTimestampApplied) {
-                LOG(1) << "Cannot select sync source behind our last applied optime: "
-                       << itMemberConfig.getHostAndPort();
+            if (it->getAppliedOpTime().getTimestamp() <= lastTimestampFetched) {
+                LOG(1) << "Cannot select sync source equal to or behind our last fetched optime. "
+                       << "My last fetched oplog timestamp: " << lastTimestampFetched.toBSON()
+                       << ", latest oplog timestamp of sync candidate "
+                       << itMemberConfig.getHostAndPort() << ": "
+                       << it->getAppliedOpTime().getTimestamp().toBSON();
                 continue;
             }
             // Candidate cannot be more latent than anything we've already considered.
@@ -1402,6 +1411,34 @@ bool TopologyCoordinatorImpl::_isOpTimeCloseEnoughToLatestToElect(
     return otherOpTime.getSecs() + 10 >= (latestKnownOpTime.getSecs());
 }
 
+bool TopologyCoordinatorImpl::_amIFreshEnoughForPriorityTakeover(
+    const OpTime& ourLastOpApplied) const {
+    const OpTime latestKnownOpTime = _latestKnownOpTime(ourLastOpApplied);
+
+    // Rules are:
+    // - If the terms don't match, we don't call for priority takeover.
+    // - If our optime and the latest optime happen in different seconds, our optime must be within
+    // at least priorityTakeoverFreshnessWindowSeconds seconds of the latest optime.
+    // - If our optime and the latest optime happen in the same second, our optime must be within
+    // at least 1000 oplog entries of the latest optime (i.e. the increment portion of the timestamp
+    // must be within 1000).  This is to handle the case where a primary had its clock set far into
+    // the future, took some writes, then had its clock set back.  In that case the timestamp
+    // component of all future oplog entries generated will be the same, until real world time
+    // passes the timestamp component of the last oplog entry.
+
+    if (ourLastOpApplied.getTerm() != latestKnownOpTime.getTerm()) {
+        return false;
+    }
+
+    if (ourLastOpApplied.getTimestamp().getSecs() != latestKnownOpTime.getTimestamp().getSecs()) {
+        return ourLastOpApplied.getTimestamp().getSecs() + priorityTakeoverFreshnessWindowSeconds >=
+            latestKnownOpTime.getTimestamp().getSecs();
+    } else {
+        return ourLastOpApplied.getTimestamp().getInc() + 1000 >=
+            latestKnownOpTime.getTimestamp().getInc();
+    }
+}
+
 bool TopologyCoordinatorImpl::_iAmPrimary() const {
     if (_role == Role::leader) {
         invariant(_currentPrimaryIndex == _selfIndex);
@@ -2004,8 +2041,8 @@ TopologyCoordinatorImpl::UnelectableReasonMask TopologyCoordinatorImpl::_getMyUn
         result |= NotSecondary;
     }
 
-    // Election rules only for protocol version 0.
     if (_rsConfig.getProtocolVersion() == 0) {
+        // Election rules only for protocol version 0.
         if (_voteLease.whoId != -1 &&
             _voteLease.whoId != _rsConfig.getMemberAt(_selfIndex).getId() &&
             _voteLease.when + VoteLease::leaseTime >= now) {
@@ -2013,6 +2050,13 @@ TopologyCoordinatorImpl::UnelectableReasonMask TopologyCoordinatorImpl::_getMyUn
         }
         if (!_isOpTimeCloseEnoughToLatestToElect(lastApplied, lastApplied)) {
             result |= NotCloseEnoughToLatestOptime;
+        }
+    } else {
+        // Election rules only for protocol version 1.
+        invariant(_rsConfig.getProtocolVersion() == 1);
+        bool isPriorityTakeover = _currentPrimaryIndex != -1;
+        if (isPriorityTakeover && !_amIFreshEnoughForPriorityTakeover(lastApplied)) {
+            result |= NotCloseEnoughToLatestForPriorityTakeover;
         }
     }
     return result;
@@ -2076,6 +2120,15 @@ std::string TopologyCoordinatorImpl::_getUnelectableReasonString(
         }
         hasWrittenToStream = true;
         ss << "member is more than 10 seconds behind the most up-to-date member";
+    }
+    if (ur & NotCloseEnoughToLatestForPriorityTakeover) {
+        if (hasWrittenToStream) {
+            ss << "; ";
+        }
+        hasWrittenToStream = true;
+        ss << "member is not caught up enough to the most up-to-date member to call for priority "
+              "takeover - must be within "
+           << priorityTakeoverFreshnessWindowSeconds << " seconds";
     }
     if (ur & NotInitialized) {
         if (hasWrittenToStream) {
@@ -2327,6 +2380,7 @@ TopologyCoordinator::UpdateTermResult TopologyCoordinatorImpl::updateTerm(long l
     if (_iAmPrimary()) {
         return TopologyCoordinator::UpdateTermResult::kTriggerStepDown;
     }
+    LOG(1) << "Updating term from " << _term << " to " << term;
     _term = term;
     return TopologyCoordinator::UpdateTermResult::kUpdatedTerm;
 }
