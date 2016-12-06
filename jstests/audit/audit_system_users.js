@@ -21,7 +21,7 @@ auditTest(
         testDB.createUser(userObj);
 
         beforeLoad = Date.now();
-        var auditColl = getAuditEventsCollection(m);
+        var auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(1, auditColl.count({
             atype: "createUser",
             ts: withinFewSecondsBefore(beforeLoad),
@@ -37,7 +37,7 @@ auditTest(
         assert.eq(1, adminDB.system.users.count({ user: userObj.user, roles: updateObj.roles }),
                      "system.users update did not update role for user: " + userObj.user);
         beforeLoad = Date.now();
-        auditColl = getAuditEventsCollection(m);
+        auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(1, auditColl.count({
             atype: "updateUser",
             ts: withinFewSecondsBefore(beforeLoad),
@@ -53,7 +53,7 @@ auditTest(
         assert.eq(0, testDB.system.users.count({ user: userObj.user }),
                      "removeUser did not remove user:" + userObj.user);
         beforeLoad = Date.now();
-        auditColl = getAuditEventsCollection(m);
+        auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(1, auditColl.count({
             atype: "dropUser",
             ts: withinFewSecondsBefore(beforeLoad),

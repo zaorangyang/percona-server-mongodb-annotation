@@ -8,7 +8,7 @@ if (TestData.testData !== undefined) {
     load('jstests/replsets/rslib.js');
 }
 
-var testDBName = 'audit_create_collection';
+var testDBName = 'audit_replset_reconfig';
 
 auditTestRepl(
     'replSetReconfig',
@@ -33,7 +33,7 @@ auditTestRepl(
         replTest.nodes.forEach(function(m) { 
             print('audit check looking for old, new: ' +tojson(oldConfig)+', '+tojson(newConfig));
             // We need to import the audit events collection into the master node.
-            auditColl = getAuditEventsCollection(m, replTest.getPrimary());
+            auditColl = getAuditEventsCollection(m, testDBName, replTest.getPrimary());
             assert.eq(1, auditColl.count({
                 atype: "replSetReconfig",
                 // Allow timestamps up to 20 seconds old, since replSetReconfig may be slow

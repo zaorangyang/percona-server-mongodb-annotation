@@ -28,7 +28,7 @@ auditTest(
 
         // Verify that audit event was inserted.
         beforeLoad = Date.now();
-        auditColl = getAuditEventsCollection(m, undefined, true);
+        auditColl = getAuditEventsCollection(m, testDBName, undefined, true);
         assert.eq(1, auditColl.count({
             atype: "authCheck",
             ts: withinFewSecondsBefore(beforeLoad),
