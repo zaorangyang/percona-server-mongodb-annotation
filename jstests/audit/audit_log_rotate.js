@@ -34,15 +34,15 @@ auditTest(
         assert(testDB.getCollection('foo').drop());
 
         // There should be something in the audit log since we created 'test.foo'
-        assert.neq(0, getAuditEventsCollection(m).count(),
+        assert.neq(0, getAuditEventsCollection(m, testDBName).count(),
                    "strange: no audit events before rotate.");
 
         // Rotate the server log. The audit log rotates with it.
         // Once rotated, the audit log should be empty.
         assert.commandWorked(m.getDB('admin').runCommand({ logRotate: 1 }));
-        var auditLogAfterRotate = getAuditEventsCollection(m).find({ 
+        var auditLogAfterRotate = getAuditEventsCollection(m, testDBName).find({ 
             // skip audit events that will be triggered by getAuditEventsCollection itself
-            'params.ns': { $ne: 'local.auditCollection' }
+            'params.ns': { $ne: testDBName + '.auditCollection' }
         }).toArray();
         assert.eq(0, auditLogAfterRotate.length,
                   "Audit log has old events after rotate: " + tojson(auditLogAfterRotate));

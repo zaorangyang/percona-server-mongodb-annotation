@@ -18,7 +18,7 @@ auditTest(
         assert(coll.drop());
 
         beforeLoad = Date.now();
-        var auditColl = getAuditEventsCollection(m);
+        var auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(1, auditColl.count({
             atype: "dropCollection",
             ts: withinFewSecondsBefore(beforeLoad),

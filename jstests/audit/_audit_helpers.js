@@ -112,7 +112,7 @@ var auditTestShard = function(name, fn, serverParams) {
 
 // Drop the existing audit events collection, import
 // the audit json file, then return the new collection.
-var getAuditEventsCollection = function(m, primary, useAuth) {
+var getAuditEventsCollection = function(m, dbname, primary, useAuth) {
     var auth = ((useAuth !== undefined) && (useAuth != false)) ? true : false;
     if (auth) {
         var adminDB = m.getDB('admin');
@@ -124,7 +124,7 @@ var getAuditEventsCollection = function(m, primary, useAuth) {
     var auditOptions = m.getDB('admin').runCommand('auditGetOptions');
     var auditPath = auditOptions.path;
     var auditCollectionName = 'auditCollection';
-    return loadAuditEventsIntoCollection(m, auditPath, 'local', auditCollectionName, primary, auth);
+    return loadAuditEventsIntoCollection(m, auditPath, dbname, auditCollectionName, primary, auth);
 }
 
 // Load any file into a named collection.
