@@ -45,6 +45,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
@@ -354,13 +355,36 @@ StatusWith<Shard::CommandResponse> ShardingCatalogManagerImpl::_runCommandForAdd
         if (swResponse.status.compareCode(ErrorCodes::ExceededTimeLimit)) {
             LOG(0) << "Operation for addShard timed out with status " << swResponse.status;
         }
+        if (!Shard::shouldErrorBePropagated(swResponse.status.code())) {
+            swResponse.status = {ErrorCodes::OperationFailed,
+                                 stream() << "failed to run command " << cmdObj
+                                          << " when attempting to add shard "
+                                          << targeter->connectionString().toString()
+                                          << causedBy(swResponse.status)};
+        }
         return swResponse.status;
     }
 
     BSONObj responseObj = swResponse.data.getOwned();
     BSONObj responseMetadata = swResponse.metadata.getOwned();
+
     Status commandStatus = getStatusFromCommandResult(responseObj);
+    if (!Shard::shouldErrorBePropagated(commandStatus.code())) {
+        commandStatus = {ErrorCodes::OperationFailed,
+                         stream() << "failed to run command " << cmdObj
+                                  << " when attempting to add shard "
+                                  << targeter->connectionString().toString()
+                                  << causedBy(commandStatus)};
+    }
+
     Status writeConcernStatus = getWriteConcernStatusFromCommandResult(responseObj);
+    if (!Shard::shouldErrorBePropagated(writeConcernStatus.code())) {
+        writeConcernStatus = {ErrorCodes::OperationFailed,
+                              stream() << "failed to satisfy writeConcern for command " << cmdObj
+                                       << " when attempting to add shard "
+                                       << targeter->connectionString().toString()
+                                       << causedBy(writeConcernStatus)};
+    }
 
     return Shard::CommandResponse(std::move(responseObj),
                                   std::move(responseMetadata),
@@ -733,6 +757,22 @@ StatusWith<string> ShardingCatalogManagerImpl::addShard(
     // Only one addShard operation can be in progress at a time.
     Lock::ExclusiveLock lk(txn->lockState(), _kShardMembershipLock);
 
+    // Check if this shard has already been added (can happen in the case of a retry after a network
+    // error, for example) and thus this addShard request should be considered a no-op.
+    auto existingShard =
+        _checkIfShardExists(txn, shardConnectionString, shardProposedName, maxSize);
+    if (!existingShard.isOK()) {
+        return existingShard.getStatus();
+    }
+    if (existingShard.getValue()) {
+        // These hosts already belong to an existing shard, so report success and terminate the
+        // addShard request.  Make sure to set the last optime for the client to the system last
+        // optime so that we'll still wait for replication so that this state is visible in the
+        // committed snapshot.
+        repl::ReplClientInfo::forClient(txn->getClient()).setLastOpToSystemLastOpTime(txn);
+        return existingShard.getValue()->getName();
+    }
+
     // TODO: Don't create a detached Shard object, create a detached RemoteCommandTargeter instead.
     const std::shared_ptr<Shard> shard{
         Grid::get(txn)->shardRegistry()->createConnection(shardConnectionString)};
@@ -756,24 +796,6 @@ StatusWith<string> ShardingCatalogManagerImpl::addShard(
         return shardStatus.getStatus();
     }
     ShardType& shardType = shardStatus.getValue();
-
-
-    // Check if this shard has already been added (can happen in the case of a retry after a network
-    // error, for example) and thus this addShard request should be considered a no-op.
-    auto existingShard =
-        _checkIfShardExists(txn, shardConnectionString, shardProposedName, maxSize);
-    if (!existingShard.isOK()) {
-        return existingShard.getStatus();
-    }
-    if (existingShard.getValue()) {
-        // These hosts already belong to an existing shard, so report success and terminate the
-        // addShard request.  Make sure to set the last optime for the client to the system last
-        // optime so that we'll still wait for replication so that this state is visible in the
-        // committed snapshot.
-        repl::ReplClientInfo::forClient(txn->getClient()).setLastOpToSystemLastOpTime(txn);
-        return existingShard.getValue()->getName();
-    }
-
 
     // Check that none of the existing shard candidate's dbs exist already
     auto dbNamesStatus = _getDBNamesListFromShard(txn, targeter);
@@ -821,7 +843,7 @@ StatusWith<string> ShardingCatalogManagerImpl::addShard(
                                    targeter.get(),
                                    "admin",
                                    BSON(FeatureCompatibilityVersion::kCommandName
-                                        << FeatureCompatibilityVersion::kVersion34));
+                                        << FeatureCompatibilityVersionCommandParser::kVersion34));
         if (!versionResponse.isOK()) {
             return versionResponse.getStatus();
         }

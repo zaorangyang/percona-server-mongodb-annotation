@@ -19,7 +19,7 @@ auditTest(
         assert.commandWorked(testDB.coll.createIndex({ b: 1 }, { name: 'hot', background: true }));
 
         beforeLoad = Date.now();
-        auditColl = getAuditEventsCollection(m);
+        auditColl = getAuditEventsCollection(m, testDBName);
 
         assert.eq(1, auditColl.count({
             atype: "createIndex",

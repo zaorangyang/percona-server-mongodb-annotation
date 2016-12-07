@@ -151,8 +151,8 @@ public:
     virtual UpdateTermResult updateTerm(long long term, Date_t now);
     virtual void setForceSyncSourceIndex(int index);
     virtual HostAndPort chooseNewSyncSource(Date_t now,
-                                            const Timestamp& lastTimestampFetched,
-                                            ChainingPreference chainingPreference);
+                                            const OpTime& lastOpTimeFetched,
+                                            ChainingPreference chainingPreference) override;
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
     virtual void unblacklistSyncSource(const HostAndPort& host, Date_t now);
     virtual void clearSyncSourceBlacklist();
@@ -217,7 +217,10 @@ public:
     virtual void processLoseElection();
     virtual Status checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) const;
     virtual void setMyHeartbeatMessage(const Date_t now, const std::string& message);
-    virtual bool stepDown(Date_t until, bool force, const OpTime& lastOpApplied);
+    virtual bool stepDown(Date_t until,
+                          bool force,
+                          const OpTime& lastOpApplied,
+                          const OpTime& lastOpCommitted);
     virtual bool stepDownIfPending();
     virtual Date_t getStepDownTime() const;
     virtual void prepareReplMetadata(rpc::ReplSetMetadata* metadata,

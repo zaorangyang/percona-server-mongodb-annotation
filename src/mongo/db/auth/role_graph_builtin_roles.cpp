@@ -415,14 +415,17 @@ void addClusterMonitorPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forAnyNormalResource(), clusterMonitorRoleDatabaseActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forDatabaseName("config"), clusterMonitorRoleDatabaseActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forDatabaseName("local"), clusterMonitorRoleDatabaseActions));
+    addReadOnlyDbPrivileges(privileges, "local");
     addReadOnlyDbPrivileges(privileges, "config");
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local.system.replset")),
-                  ActionType::find));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local.sources")),
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "system.replset")),
                   ActionType::find));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
@@ -445,27 +448,25 @@ void addClusterManagerPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forAnyNormalResource(), clusterManagerRoleDatabaseActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forDatabaseName("config"), clusterManagerRoleDatabaseActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forDatabaseName("local"), clusterManagerRoleDatabaseActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "system.replset")),
+                  readRoleActions));
     addReadOnlyDbPrivileges(privileges, "config");
 
     ActionSet writeActions;
     writeActions << ActionType::insert << ActionType::update << ActionType::remove;
     Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString("config", "settings")),
-                  writeActions));
+        privileges, Privilege(ResourcePattern::forDatabaseName("config"), writeActions));
     Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "system.replset")),
-                  readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString("config", "tags")),
-                  writeActions));
-    // Primarily for zone commands
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString("config", "shards")),
-                  writeActions));
+        privileges, Privilege(ResourcePattern::forDatabaseName("local"), writeActions));
+
     // Fake collection used for setFeatureCompatibilityVersion permissions.
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
@@ -499,6 +500,12 @@ void addBackupPrivileges(PrivilegeVector* privileges) {
                    << ActionType::listDatabases << ActionType::appendOplogNote;  // For BRS
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forClusterResource(), clusterActions));
+
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forDatabaseName("config"), ActionType::find));
+
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forDatabaseName("local"), ActionType::find));
 
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
@@ -570,6 +577,12 @@ void addRestorePrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::listCollections));
 
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forDatabaseName("config"), actions));
+
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forDatabaseName("local"), actions));
+
     // Privileges for user/role management
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), userAdminRoleActions));
@@ -627,6 +640,7 @@ void addRootRolePrivileges(PrivilegeVector* privileges) {
     addUserAdminAnyDbPrivileges(privileges);
     addDbAdminAnyDbPrivileges(privileges);
     addReadWriteAnyDbPrivileges(privileges);
+    addBackupPrivileges(privileges);
     addRestorePrivileges(privileges);
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::validate));

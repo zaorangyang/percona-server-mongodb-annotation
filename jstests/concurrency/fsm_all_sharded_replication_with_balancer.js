@@ -89,6 +89,11 @@ var blacklist = [
     'rename_collection_dbname_droptarget.js',
     'rename_collection_droptarget.js',
 
+    // This workload assumes that the distributed lock can always be acquired when running the split
+    // command in its setup() function; however, a LockBusy error may be returned if the balancer is
+    // running.
+    'sharded_moveChunk_drop_shard_key_index.js',
+
     'update_simple_eval.js',           // eval doesn't work with sharded collections
     'update_simple_eval_nolock.js',    // eval doesn't work with sharded collections
     'update_upsert_multi.js',          // our update queries lack shard keys
@@ -100,7 +105,8 @@ var blacklist = [
     return dir + '/' + file;
 });
 
-runWorkloadsSerially(ls(dir).filter(function(file) {
-    return !Array.contains(blacklist, file);
-}),
-                     {sharded: true, replication: true, enableBalancer: true});
+runWorkloadsSerially(
+    ls(dir).filter(function(file) {
+        return !Array.contains(blacklist, file);
+    }),
+    {sharded: {enabled: true, enableBalancer: true}, replication: {enabled: true}});

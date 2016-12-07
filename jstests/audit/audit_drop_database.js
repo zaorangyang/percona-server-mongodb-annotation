@@ -16,7 +16,7 @@ auditTest(
         assert.commandWorked(testDB.dropDatabase());
 
         beforeLoad = Date.now();
-        var auditColl = getAuditEventsCollection(m);
+        var auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(1, auditColl.count({
             atype: "dropDatabase",
             ts: withinFewSecondsBefore(beforeLoad),

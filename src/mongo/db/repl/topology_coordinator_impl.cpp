@@ -154,7 +154,7 @@ HostAndPort TopologyCoordinatorImpl::getSyncSourceAddress() const {
 }
 
 HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
-                                                         const Timestamp& lastTimestampFetched,
+                                                         const OpTime& lastOpTimeFetched,
                                                          ChainingPreference chainingPreference) {
     // If we are not a member of the current replica set configuration, no sync source is valid.
     if (_selfIndex == -1) {
@@ -305,12 +305,12 @@ HostAndPort TopologyCoordinatorImpl::chooseNewSyncSource(Date_t now,
                 }
             }
             // only consider candidates that are ahead of where we are
-            if (it->getAppliedOpTime().getTimestamp() <= lastTimestampFetched) {
+            if (it->getAppliedOpTime() <= lastOpTimeFetched) {
                 LOG(1) << "Cannot select sync source equal to or behind our last fetched optime. "
-                       << "My last fetched oplog timestamp: " << lastTimestampFetched.toBSON()
-                       << ", latest oplog timestamp of sync candidate "
+                       << "My last fetched oplog optime: " << lastOpTimeFetched.toBSON()
+                       << ", latest oplog optime of sync candidate "
                        << itMemberConfig.getHostAndPort() << ": "
-                       << it->getAppliedOpTime().getTimestamp().toBSON();
+                       << it->getAppliedOpTime().toBSON();
                 continue;
             }
             // Candidate cannot be more latent than anything we've already considered.
@@ -2272,24 +2272,38 @@ void TopologyCoordinatorImpl::processLoseElection() {
     }
 }
 
-bool TopologyCoordinatorImpl::stepDown(Date_t until, bool force, const OpTime& lastOpApplied) {
-    bool canStepDown = force;
-    for (int i = 0; !canStepDown && i < _rsConfig.getNumMembers(); ++i) {
-        if (i == _selfIndex) {
-            continue;
-        }
-        UnelectableReasonMask reason = _getUnelectableReason(i, lastOpApplied);
-        if (!reason && _hbdata.at(i).getAppliedOpTime() >= lastOpApplied) {
-            canStepDown = true;
-        }
+bool TopologyCoordinatorImpl::stepDown(Date_t until,
+                                       bool force,
+                                       const OpTime& lastOpApplied,
+                                       const OpTime& lastOpCommitted) {
+
+    // force==true overrides all other checks.
+    if (force) {
+        _stepDownUntil = until;
+        _stepDownSelfAndReplaceWith(-1);
+        return true;
     }
 
-    if (!canStepDown) {
+    // Ensure a majority of caught up nodes.
+    if (lastOpCommitted < lastOpApplied) {
         return false;
     }
-    _stepDownUntil = until;
-    _stepDownSelfAndReplaceWith(-1);
-    return true;
+
+    // Now make sure we also have at least one caught up node that is also electable.
+    for (int memberIndex = 0; memberIndex < _rsConfig.getNumMembers(); memberIndex++) {
+        // ignore your self
+        if (memberIndex == _selfIndex) {
+            continue;
+        }
+        UnelectableReasonMask reason = _getUnelectableReason(memberIndex, lastOpApplied);
+        if (!reason && _hbdata.at(memberIndex).getAppliedOpTime() >= lastOpApplied) {
+            // Found a caught up and electable node, succeed with step down.
+            _stepDownUntil = until;
+            _stepDownSelfAndReplaceWith(-1);
+            return true;
+        }
+    }
+    return false;
 }
 
 void TopologyCoordinatorImpl::setFollowerMode(MemberState::MS newMode) {

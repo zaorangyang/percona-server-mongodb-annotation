@@ -21,7 +21,7 @@ auditTest(
         m = restartServer();
 
         beforeLoad = Date.now();
-        auditColl = getAuditEventsCollection(m);
+        auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(0, auditColl.count({
             atype: "createDatabase",
             ts: withinFewSecondsBefore(beforeLoad),

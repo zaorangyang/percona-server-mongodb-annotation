@@ -87,6 +87,14 @@ Status waitForReadConcern(OperationContext* txn, const repl::ReadConcernArgs& re
                     "node needs to be a replica set member to use read concern"};
         }
 
+        // Replica sets running pv0 do not support linearizable read concern until further testing
+        // is completed (SERVER-27025).
+        if (!replCoord->isV1ElectionProtocol()) {
+            return {
+                ErrorCodes::IncompatibleElectionProtocol,
+                "Replica sets running protocol version 0 do not support readConcern: linearizable"};
+        }
+
         if (!readConcernArgs.getOpTime().isNull()) {
             return {ErrorCodes::FailedToParse,
                     "afterOpTime not compatible with linearizable read concern"};
@@ -143,6 +151,12 @@ Status waitForLinearizableReadConcern(OperationContext* txn) {
         ScopedTransaction transaction(txn, MODE_IX);
         Lock::DBLock lk(txn->lockState(), "local", MODE_IX);
         Lock::CollectionLock lock(txn->lockState(), "local.oplog.rs", MODE_IX);
+
+        if (!replCoord->canAcceptWritesForDatabase("admin")) {
+            return {ErrorCodes::NotMaster,
+                    "No longer primary when waiting for linearizable read concern"};
+        }
+
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
 
             WriteUnitOfWork uow(txn);
