@@ -495,7 +495,11 @@
         updateZoneKeyRange: {skip: isUnrelated},
         usersInfo: {skip: isUnrelated},
         validate: {command: {validate: "view"}, expectFailure: true},
-        whatsmyuri: {skip: isUnrelated}
+        whatsmyuri: {skip: isUnrelated},
+
+        // Percona commands
+        auditGetOptions: {skip: isUnrelated},
+        createBackup: {skip: isUnrelated},
     };
 
     /**
