@@ -132,24 +132,30 @@ var loadAuditEventsIntoCollection = function(m, filename, dbname, collname, prim
     var db = primary !== undefined ? primary.getDB(dbname) : m.getDB(dbname);
     // the audit log is specifically parsable by mongoimport,
     // so we use that to conveniently read its contents.
+    var exitCode = -1;
     if (auth) {
-        runMongoProgram('mongoimport',
-                        '--username', 'admin',
-                        '--password', 'admin',
-                        '--authenticationDatabase', 'admin',
-                        '--db', dbname,
-                        '--collection', collname,
-                        '--drop',
-                        '--host', db.hostInfo().system.hostname,
-                        '--file', filename);
+        exitCode = MongoRunner.runMongoTool("mongoimport",
+                                            {
+                                                username: 'admin',
+                                                password: 'admin',
+                                                authenticationDatabase: 'admin',
+                                                db: dbname,
+                                                collection: collname,
+                                                drop: '',
+                                                host: db.hostInfo().system.hostname,
+                                                file: filename,
+                                            });
     } else {
-        runMongoProgram('mongoimport',
-                        '--db', dbname,
-                        '--collection', collname,
-                        '--drop',
-                        '--host', db.hostInfo().system.hostname,
-                        '--file', filename);
+        exitCode = MongoRunner.runMongoTool("mongoimport",
+                                            {
+                                                db: dbname,
+                                                collection: collname,
+                                                drop: '',
+                                                host: db.hostInfo().system.hostname,
+                                                file: filename,
+                                            });
     }
+    assert.eq(0, exitCode, "mongoimport failed to import '" + filename + "' into '" + dbname + "." + collname + "'");
 
     // should get as many entries back as there are non-empty
     // strings in the audit log
