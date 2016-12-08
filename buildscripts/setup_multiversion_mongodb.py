@@ -111,7 +111,8 @@ class MultiVersionDownloader :
 
     def download_links(self):
         temp_file = tempfile.mktemp()
-        download_file("https://downloads.mongodb.org/full.json", temp_file)
+        # the upstream file was at: https://downloads.mongodb.org/full.json
+        download_file("https://raw.githubusercontent.com/Percona-QA/psmdb-misc-scripts/master/psmdb_download_links.json", temp_file)
         with open(temp_file) as f:
             full_json = json.load(f)
         os.remove(temp_file)
@@ -190,7 +191,7 @@ class MultiVersionDownloader :
                     # versions such as "v3.2-latest" that instead contain the githash.
                     first_file = zf.namelist()[0]
                     zf.extractall(temp_dir)
-            elif file_suffix == ".tgz":
+            elif file_suffix == ".gz" or file_suffix == ".tgz":
                 # Support .tgz downloads, used for Linux binaries.
                 with closing(tarfile.open(temp_file, 'r:gz')) as tf:
                     # Use the name of the root directory in the archive as the name of the directory
