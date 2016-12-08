@@ -189,6 +189,8 @@ Status MmapV1ExtentManager::init(OperationContext* txn) {
         // Commit the journal and all changes to disk so that even if exceptions occur during
         // subsequent initialization, we won't have uncommited changes during file close.
         getDur().commitNow(txn);
+
+        audit::logCreateDatabase(&cc(), _dbname);
     }
 
     return Status::OK();
