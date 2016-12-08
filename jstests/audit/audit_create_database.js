@@ -15,10 +15,11 @@ auditTest(
         assert.commandWorked(testDB.dropDatabase());
         assert.commandWorked(testDB.createCollection('foo'));
 
+        beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({
             atype: "createDatabase",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.ns': testDBName,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));

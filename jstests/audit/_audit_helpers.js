@@ -173,11 +173,11 @@ var loadAuditEventsIntoCollection = function(m, filename, dbname, collname, prim
     return auditCollection;
 }
 
-// Get a query that matches any timestamp generated in the last few (or n) seconds
-var withinTheLastFewSeconds = function(n) {
-    now = Date.now();
-    fewSecondsAgo = now - ((n !== undefined ? n : 3) * 1000);
-    return { '$gte' : new Date(fewSecondsAgo), '$lte': new Date(now) };
+// Get a query that matches any timestamp generated in the interval
+// of (t - n) <= t <= now for some time t.
+var withinFewSecondsBefore = function(t, n) {
+    fewSecondsAgo = t - ((n !== undefined ? n : 3) * 1000);
+    return { '$gte' : new Date(fewSecondsAgo), '$lte': new Date() };
 }
 
 // Create Admin user.  Used for authz tests.

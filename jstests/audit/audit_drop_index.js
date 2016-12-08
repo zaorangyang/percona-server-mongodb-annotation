@@ -18,10 +18,11 @@ auditTest(
         assert.commandWorked(coll.createIndex({ a: 1 }, { name: idxName }));
         assert.commandWorked(coll.dropIndex({ a: 1 }));
 
+        beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m);
         assert.eq(1, auditColl.count({
             atype: "dropIndex",
-            ts: withinTheLastFewSeconds(),
+            ts: withinFewSecondsBefore(beforeLoad),
             'params.ns': testDBName + '.' + collName,
             'params.indexName': idxName,
             result: 0,
