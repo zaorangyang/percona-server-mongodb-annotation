@@ -8,6 +8,11 @@
 'use strict';
 
 (function() {
+    if (db.serverStatus().storageEngine.name === "mmapv1") {
+        print("Validate command cannot be interrupted on 'mmapv1' storage engine. Skipping test.");
+        return;
+    }
+
     var t = db.validate_interrupt;
     t.drop();
 
