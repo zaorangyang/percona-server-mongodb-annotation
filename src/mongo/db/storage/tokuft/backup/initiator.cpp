@@ -47,7 +47,12 @@ namespace mongo {
             BackupInitiator *initiator = static_cast<BackupInitiator *>(p);
             initiator->HandleErrorFromBackupProcess(i, c);
         };
-        
+
+        int c_exclude_copy_fun(const char *source_file,void *p) {
+            BackupInitiator *initiator = static_cast<BackupInitiator *>(p);
+            return initiator->ExcludeCopy(source_file);
+        }
+
         BackupInitiator::BackupInitiator() :
             _txn(NULL),
             _backupReturnValue(0),
@@ -108,6 +113,10 @@ namespace mongo {
             _error.parse(i, c);
         }
 
+        int BackupInitiator::ExcludeCopy(const char *source_file) const {
+            return _excludedPath == source_file ? 1 : 0;
+        }
+
         void BackupInitiator::LogAnyErrors() const {
             bool ok = this->IsOk();
             if (ok && !_error.empty()) {
@@ -150,6 +159,7 @@ namespace mongo {
                 source_dirs[i] = _sources[i].c_str();
                 dest_dirs[i] = _destinations[i].c_str();
             }
+            _excludedPath = (boost::filesystem::path(_sources.front()) / "diagnostic.data").generic_string();
 
             DEV {log() << "Creating backup in "
                         << _destinationDirectory
@@ -161,8 +171,8 @@ namespace mongo {
                                             this,
                                             c_error_fun,
                                             this,
-                                            NULL,
-                                            NULL);
+                                            c_exclude_copy_fun,
+                                            this);
         }
     }
 }
