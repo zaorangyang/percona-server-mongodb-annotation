@@ -6,7 +6,10 @@ Import([
     ])
 
 env = env.Clone()
-env.InjectThirdPartyIncludePaths(libraries=['zlib'])
+env.InjectThirdPartyIncludePaths(libraries=[
+    'zlib',
+    'lz4',
+])
 
 def removeIfPresent(lst, item):
     try:
@@ -129,6 +132,9 @@ sources.extend(Glob('platform/' + env["TARGET_ARCH"] + "/" + env["TARGET_OS"] + 
 env.Library(
     target="mozjs",
     source=sources,
+    LIBDEPS=[
+        '$BUILD_DIR/third_party/shim_lz4',
+    ],
     LIBDEPS_TAGS=[
         # Depends on allocation symbols defined elsewhere
         'incomplete'
