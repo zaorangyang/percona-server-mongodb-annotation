@@ -87,15 +87,7 @@ bool CreateBackupCommand::run(mongo::OperationContext* txn,
             return false;
         }
 
-        if (!fs::is_directory(destPath)) {
-            errmsg = "Destination directory doesn't exist";
-            return false;
-        }
-
-        if (!fs::is_empty(destPath)) {
-            errmsg = "Destination directory is not empty";
-            return false;
-        }
+        fs::create_directory(destPath);
     } catch (const fs::filesystem_error& ex) {
         errmsg = ex.what();
         return false;
