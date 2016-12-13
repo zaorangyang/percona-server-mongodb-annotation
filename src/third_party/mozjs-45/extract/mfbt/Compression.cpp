@@ -11,14 +11,9 @@
 // to convert `const void* const` to `void*` when calling memchr from
 // corecrt_memory.h.
 #include <string>
+#include <lz4.h>
 
 using namespace mozilla::Compression;
-
-namespace {
-
-#include "lz4.c"
-
-}/* anonymous namespace */
 
 /* Our wrappers */
 
