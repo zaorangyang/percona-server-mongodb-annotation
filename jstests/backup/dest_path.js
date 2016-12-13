@@ -17,7 +17,4 @@
 
     // Relative path
     assert.commandFailed(adminDB.runCommand({createBackup: 1, backupDir: '../usr'}));
-
-    // Non-empty backup folder
-    assert.commandFailed(adminDB.runCommand({createBackup: 1, backupDir: '/'}));
 })();

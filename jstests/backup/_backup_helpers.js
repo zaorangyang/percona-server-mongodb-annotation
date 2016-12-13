@@ -27,9 +27,10 @@ function computeHashes(conn) {
     return hashes;
 }
 
-function backup(conn) {
+function backup(conn, createDest = false) {
     var backupPath = MongoRunner.dataPath + 'backup';
-    mkdir(backupPath);
+    if (createDest)
+        mkdir(backupPath);
     var adminDB = conn.getDB('admin');
     assert.commandWorked(adminDB.runCommand({createBackup: 1, backupDir: backupPath}));
     return backupPath;

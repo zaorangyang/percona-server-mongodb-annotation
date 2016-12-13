@@ -39,7 +39,8 @@ struct Backupable {
      * @return Status code of the operation.
      */
     virtual mongo::Status hotBackup(const std::string& path) {
-        return mongo::Status::OK();
+        return mongo::Status(mongo::ErrorCodes::IllegalOperation,
+                             "This engine doesn't support hot backup.");
     }
 };
 
