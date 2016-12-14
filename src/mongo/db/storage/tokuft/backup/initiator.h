@@ -40,6 +40,7 @@ namespace mongo {
             bool GetResults(std::string &errmsg, BSONObjBuilder &result);
             bool UserWantsToCancelBackup() const;
             void HandleErrorFromBackupProcess(int i, const char *c);
+            int ExcludeCopy(const char *source_file) const;
         private:
             bool SetupDestinationDirectory();
             void HandleFileError(const char *);
@@ -62,6 +63,7 @@ namespace mongo {
             std::string _killedString;
             std::string _fileErrorMessage;
             bool _fileErrorOccurred;
+            std::string _excludedPath;
         };
     }
 }
