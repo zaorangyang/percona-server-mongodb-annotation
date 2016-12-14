@@ -179,7 +179,7 @@ Status addMongoShellOptions(moe::OptionSection* options) {
 
 std::string getMongoShellHelp(StringData name, const moe::OptionSection& options) {
     StringBuilder sb;
-    sb << "MongoDB shell version: " << mongo::versionString << "\n";
+    sb << "Percona Server for MongoDB shell version: " << mongo::versionString << "\n";
     sb << "usage: " << name << " [options] [db address] [file names (ending in .js)]\n"
        << "db address can be:\n"
        << "  foo                   foo database on local machine\n"
@@ -198,7 +198,7 @@ bool handlePreValidationMongoShellOptions(const moe::Environment& params,
         return false;
     }
     if (params.count("version")) {
-        cout << "MongoDB shell version: " << mongo::versionString << endl;
+        cout << "Percona Server for MongoDB shell version: " << mongo::versionString << endl;
         return false;
     }
     return true;
