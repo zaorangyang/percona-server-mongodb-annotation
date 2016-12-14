@@ -213,7 +213,7 @@ void VersionInfoInterface::logBuildInfo() const {
 
 std::string mongoShellVersion(const VersionInfoInterface& provider) {
     std::stringstream ss;
-    ss << "MongoDB shell version v" << provider.version();
+    ss << "Percona Server for MongoDB shell version v" << provider.version();
     return ss.str();
 }
 
