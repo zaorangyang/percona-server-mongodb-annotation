@@ -605,7 +605,7 @@ int _main(int argc, char* argv[], char** envp) {
     }
 
     if (!mongo::serverGlobalParams.quiet)
-        cout << "MongoDB shell version: " << mongo::versionString << endl;
+        cout << "Percona Server for MongoDB shell version: " << mongo::versionString << endl;
 
     mongo::StartupTest::runTests();
 
@@ -763,7 +763,7 @@ int _main(int argc, char* argv[], char** envp) {
 
         if (!hasMongoRC && isatty(fileno(stdin))) {
             cout
-                << "Welcome to the MongoDB shell.\n"
+                << "Welcome to the Percona Server for MongoDB shell.\n"
                    "For interactive help, type \"help\".\n"
                    "For more comprehensive documentation, see\n\thttp://docs.mongodb.org/\n"
                    "Questions? Try the support group\n\thttp://groups.google.com/group/mongodb-user"
