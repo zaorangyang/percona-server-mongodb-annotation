@@ -1,5 +1,5 @@
-percona-server-mongodb-32 (3.2.4) UNRELEASED; urgency=medium
+percona-server-mongodb-34 (3.4.0) UNRELEASED; urgency=medium
 
-  * Updated to next upstream release. (Closes: #RM-155)
+  * Updated to next upstream release. (Closes: #RM-564)
 
- -- Alexey Bychko <alexey.bychko@percona.com>  Fri, 08 Apr 2016 12:20:22 +0600
+ -- Evgeniy Patlan <evgeniy.Patlan@percona.com>  Wed, 14 Dec 2016 12:20:22 +0600

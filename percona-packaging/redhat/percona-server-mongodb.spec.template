@@ -1,7 +1,7 @@
 #
 %define         mongo_home /var/lib/mongo
 #
-Name:           Percona-Server-MongoDB-32
+Name:           Percona-Server-MongoDB-34
 Version:        @@VERSION@@
 Release:        @@RELEASE@@%{?dist}
 Summary:        High-performance MongoDB replacement from Percona (metapackage)
@@ -105,44 +105,21 @@ export INSTALLDIR=$RPM_BUILD_DIR/install
 export TOOLS_TAGS="ssl sasl"
 export PATH=/usr/local/go/bin:$PATH
 
-# TokuBackup
-pushd $RPM_BUILD_DIR/%{src_dir}/src/third_party/Percona-TokuBackup/backup
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/ -DBUILD_STATIC_LIBRARY=ON
-make -j4
-make install DESTDIR=${INSTALLDIR}
-popd
-
-# PerconaFT
-pushd $RPM_BUILD_DIR/%{src_dir}/src/third_party/PerconaFT
-cmake . -DCMAKE_BUILD_TYPE=Release -DUSE_VALGRIND=OFF -DTOKU_DEBUG_PARANOID=OFF \
--DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX=/ -DJEMALLOC_SOURCE_DIR=$RPM_BUILD_DIR/%{src_dir}/src/third_party/jemalloc
-%{__make} %{?_smp_mflags}
-%{__make} install DESTDIR=${INSTALLDIR}
-popd
-
 # RocksDB
 pushd $RPM_BUILD_DIR/%{src_dir}/src/third_party/rocksdb
-rm -rf lz4-r127 || true
-wget https://codeload.github.com/Cyan4973/lz4/tar.gz/r127
-mv r127 lz4-r127.tar.gz
-tar xvzf lz4-r127.tar.gz
-pushd lz4-r127/lib
-%{__make} CFLAGS=' -O3 -I. -std=c99 -Wall -Wextra -Wundef -Wshadow -Wcast-align -Wstrict-prototypes -pedantic -fPIC' all
-popd
-cp ./lz4-r127/lib/liblz4.a .
-cp ./lz4-r127/lib/lz4.h ${INSTALLDIR}/include
-cp ./lz4-r127/lib/lz4frame.h ${INSTALLDIR}/include
-cp ./lz4-r127/lib/lz4hc.h ${INSTALLDIR}/include
-cp ./lz4-r127/lib/liblz4.a ${INSTALLDIR}/lib
-%{__make} %{?_smp_mflags} static_lib
-%{__make} install-static INSTALL_PATH=${INSTALLDIR}
+make -j4 EXTRA_CFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3' EXTRA_CXXFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3' DISABLE_JEMALLOC=1 static_lib
+rm -rf ${INSTALLDIR}
+mkdir -p ${INSTALLDIR}/include
+mkdir -p ${INSTALLDIR}/bin
+mkdir -p ${INSTALLDIR}/lib
+make install-static INSTALL_PATH=${INSTALLDIR}
 popd
 
 # Build PSfMDB with SCons
 pushd $RPM_BUILD_DIR/%{src_dir}
-scons CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
+buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
 %{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib \
---PerconaFT --rocksdb --wiredtiger --inmemory --tokubackup --hotbackup ${PSM_TARGETS}
+--rocksdb --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
 popd
 
 # Mongo Tools compilation
@@ -151,7 +128,7 @@ pushd $RPM_BUILD_DIR/%{src_dir}/mongo-tools
 . ./set_tools_revision.sh
 rm -rf $RPM_BUILD_DIR/%{src_dir}/mongo-tools/vendor/pkg
 mkdir -p $RPM_BUILD_DIR/%{src_dir}/bin
-for tool in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog; do
+for tool in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog mongoreplay; do
   go build -a -x -o $RPM_BUILD_DIR/%{src_dir}/bin/${tool} -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec=${PSMDB_TOOLS_COMMIT_HASH} -X github.com/mongodb/mongo-tools/common/options.VersionStr=${PSMDB_TOOLS_REVISION}" -tags "${TOOLS_TAGS}" $RPM_BUILD_DIR/%{src_dir}/mongo-tools/${tool}/main/${tool}.go
 done
 popd
@@ -244,6 +221,7 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 %{_mandir}/man1/mongotop.1.gz
 %{_bindir}/mongooplog
 %{_mandir}/man1/mongooplog.1.gz
+%{_bindir}/mongoreplay
 
 %pre server
 if [ $1 == 1 ]; then

@@ -5,13 +5,13 @@ export DEB_BUILD_HARDENING=1
 export NJOBS=$(shell grep -c processor /proc/cpuinfo)
 export PSM_TARGETS=mongod mongos mongo
 export PSMSRC=$(CURDIR)
-export MONGOTOOLS=bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog
+export MONGOTOOLS=bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog mongoreplay
 export INSTALLDIR=$(PSMSRC)/install
 export PORTABLE=1
 export TOOLS_TAGS=ssl sasl
 export PATH := /usr/local/go/bin:$(PATH)
-CC = gcc-4.8
-CXX = g++-4.8
+CC = gcc-5
+CXX = g++-5
 #
 %:
 	dh $@
@@ -20,69 +20,53 @@ override_dh_auto_clean:
 	dh_auto_clean
 	rm -fr $(PSMSRC)/bin
 	rm -fr $(INSTALLDIR)
-	scons CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH=$(INSTALLDIR)/include \
-	LIBPATH=$(INSTALLDIR)/lib --PerconaFT --rocksdb --wiredtiger --inmemory --tokubackup --hotbackup $(PSM_TARGETS)
+	buildscripts/scons.py CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH=$(INSTALLDIR)/include \
+	LIBPATH=$(INSTALLDIR)/lib --rocksdb --wiredtiger --inmemory --hotbackup $(PSM_TARGETS)
 	rm -fr build
 	find $(PSMSRC) -name '*.pyc' -delete
 
-TokuBackup:
-	cd $(PSMSRC)/src/third_party/Percona-TokuBackup/backup; \
-	CC=$(CC) CXX=$(CXX) cmake . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/ -DBUILD_STATIC_LIBRARY=ON; \
-	make -j$(NJOBS); \
-	make install DESTDIR=$(INSTALLDIR)
-
-PerconaFT:
-	cd $(PSMSRC)/src/third_party/PerconaFT; \
-	CC=$(CC) CXX=$(CXX) cmake . -DCMAKE_BUILD_TYPE=Release -DUSE_VALGRIND=OFF -DTOKU_DEBUG_PARANOID=OFF -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX=/ -DJEMALLOC_SOURCE_DIR=$(PSMSRC)/src/third_party/jemalloc; \
-	make -j$(NJOBS); \
-	make install DESTDIR=$(INSTALLDIR)
-
 RocksDB:
+	rm -rf ${INSTALLDIR}; \
+	mkdir -p ${INSTALLDIR}/include; \
+	mkdir -p ${INSTALLDIR}/bin; \
+	mkdir -p ${INSTALLDIR}/lib; \
 	cd $(PSMSRC)/src/third_party/rocksdb; \
-	(rm -rf lz4-r127 || true); \
-	wget https://codeload.github.com/Cyan4973/lz4/tar.gz/r127 ; \
-	mv r127 lz4-r127.tar.gz; \
-	tar xvzf lz4-r127.tar.gz; \
-	cd lz4-r127/lib; \
-	make CFLAGS=' -O3 -I. -std=c99 -Wall -Wextra -Wundef -Wshadow -Wcast-align -Wstrict-prototypes -pedantic -fPIC' all; \
-	cd ../..; \
-	cp ./lz4-r127/lib/liblz4.a .; \
-	cp ./lz4-r127/lib/lz4.h $(INSTALLDIR)/include; \
-	cp ./lz4-r127/lib/lz4frame.h $(INSTALLDIR)/include; \
-	cp ./lz4-r127/lib/lz4hc.h $(INSTALLDIR)/include; \
-	cp ./lz4-r127/lib/liblz4.a $(INSTALLDIR)/lib; \
-	CC=$(CC) CXX=$(CXX) make -j$(NJOBS) static_lib; \
-	make install-static INSTALL_PATH=$(INSTALLDIR)
+	make -j4 EXTRA_CFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3' EXTRA_CXXFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3' DISABLE_JEMALLOC=1 static_lib; \
+	make install-static INSTALL_PATH=${INSTALLDIR}
 
 # Finally PSfMDB
 percona-server-mongodb:
-	scons CC=$(CC) CXX=$(CXX) --audit --release --ssl --opt=on -j$(NJOBS) \
-	--use-sasl-client CPPPATH=$(INSTALLDIR)/include LIBPATH=$(INSTALLDIR)/lib \
-	--PerconaFT --rocksdb --wiredtiger --inmemory --tokubackup --hotbackup $(PSM_TARGETS)
+	buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on -j$(NJOBS) \
+	--use-sasl-client --wiredtiger --rocksdb --inmemory --hotbackup \
+	CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
 
 compile-mongo-tools:
 	rm -rf $(PSMSRC)/mongo-tools/vendor/pkg
 	mkdir -p $(PSMSRC)/bin
 	for tool in $(MONGOTOOLS) ; do \
 		cd $(PSMSRC)/mongo-tools; \
+		export GOROOT="/usr/local/go1.7.4/"; \
+		export GOPATH=$(pwd)/; \
+		export PATH="/usr/local/go1.7.4/bin:$(PATH):$(GOPATH)"; \
+		export GOBINPATH="/usr/local/go1.7.4/bin"; \
 		. ./set_gopath.sh; \
 		. ./set_tools_revision.sh; \
-		go build -a -o $(PSMSRC)/bin/$$tool -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec=$$PSMDB_TOOLS_COMMIT_HASH -X github.com/mongodb/mongo-tools/common/options.VersionStr=$$PSMDB_TOOLS_REVISION" -tags "$(TOOLS_TAGS)" $(PSMSRC)/mongo-tools/$$tool/main/$$tool.go; \
+		go build -a -x -o $(PSMSRC)/bin/$$tool -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec=$$PSMDB_TOOLS_COMMIT_HASH -X github.com/mongodb/mongo-tools/common/options.VersionStr=$$PSMDB_TOOLS_REVISION" -tags "$(TOOLS_TAGS)" $(PSMSRC)/mongo-tools/$$tool/main/$$tool.go; \
 	done
 
-build: PerconaFT RocksDB TokuBackup percona-server-mongodb compile-mongo-tools
+build: RocksDB percona-server-mongodb compile-mongo-tools
 
 override_dh_auto_install:
 	dh_auto_install
-	cp -av mongos debian/percona-server-mongodb-32-mongos/usr/bin
-	cp -av mongo debian/percona-server-mongodb-32-shell/usr/bin
-	cp -av mongod debian/percona-server-mongodb-32-server/usr/bin
-	cp -av debian/percona-server-mongodb-helper.sh debian/percona-server-mongodb-32-server/usr/bin
-	cp -av debian/mongod.conf debian/percona-server-mongodb-32-server/etc/mongod.conf
-	cp -av $(PSMSRC)/bin/* debian/percona-server-mongodb-32-tools/usr/bin
+	cp -av mongos debian/percona-server-mongodb-34-mongos/usr/bin
+	cp -av mongo debian/percona-server-mongodb-34-shell/usr/bin
+	cp -av mongod debian/percona-server-mongodb-34-server/usr/bin
+	cp -av debian/percona-server-mongodb-helper.sh debian/percona-server-mongodb-34-server/usr/bin
+	cp -av debian/mongod.conf debian/percona-server-mongodb-34-server/etc/mongod.conf
+	cp -av $(PSMSRC)/bin/* debian/percona-server-mongodb-34-tools/usr/bin
 
 override_dh_strip:
-	dh_strip -a --dbg-package=percona-server-mongodb-32-dbg
+	dh_strip -a --dbg-package=percona-server-mongodb-34-dbg
 
 override_dh_installinit:
 	dh_installinit -a --name=mongod
