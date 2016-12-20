@@ -50,6 +50,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/paths.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/logger/auditlog.h"
@@ -68,6 +69,8 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 namespace mongo {
 
 namespace audit {
+
+    MONGO_EXPORT_SERVER_PARAMETER(auditAuthorizationSuccess, bool, false);
 
     NOINLINE_DECL void realexit( ExitCode rc ) {
 #ifdef _COVERAGE
@@ -477,7 +480,7 @@ namespace audit {
         _auditLog->append(builder.done());
     }
 
-    static void _auditAuthzFailure(ClientBasic* client,
+    static void _auditAuthz(ClientBasic* client,
                                  StringData ns,
                                  StringData command,
                                  const BSONObj& args,
@@ -511,8 +514,8 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, command->parseNs(dbname, cmdObj), cmdObj.firstElement().fieldName(), cmdObj, result);
+        if ((result != ErrorCodes::OK) || auditAuthorizationSuccess) {
+            _auditAuthz(client, command->parseNs(dbname, cmdObj), cmdObj.firstElement().fieldName(), cmdObj, result);
         }
     }
 
@@ -526,9 +529,10 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), "delete", BSON("pattern" << pattern), result);
-        } else if (ns.coll() == "system.users") {
+        if ((result != ErrorCodes::OK) || auditAuthorizationSuccess) {
+            _auditAuthz(client, nssToString(ns), "delete", BSON("pattern" << pattern), result);
+        }
+        if ((result == ErrorCodes::OK) && (ns.coll() == "system.users")) {
             _auditEvent(client, "dropUser", BSON("db" << ns.db() << "pattern" << pattern));
         }
     }
@@ -542,8 +546,8 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), "getMore", BSON("cursorId" << cursorId), result);
+        if ((result != ErrorCodes::OK) || auditAuthorizationSuccess) {
+            _auditAuthz(client, nssToString(ns), "getMore", BSON("cursorId" << cursorId), result);
         }
     }
 
@@ -556,9 +560,10 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), "insert", BSON("obj" << insertedObj), result);
-        } else if (ns.coll() == "system.users") {
+        if ((result != ErrorCodes::OK) || auditAuthorizationSuccess) {
+            _auditAuthz(client, nssToString(ns), "insert", BSON("obj" << insertedObj), result);
+        }
+        if ((result == ErrorCodes::OK) && (ns.coll() == "system.users")) {
             _auditEvent(client, "createUser", BSON("db" << ns.db() << "userObj" << insertedObj));
         }
     }
@@ -572,8 +577,8 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), "killCursors", BSON("cursorId" << cursorId), result);
+        if ((result != ErrorCodes::OK) || auditAuthorizationSuccess) {
+            _auditAuthz(client, nssToString(ns), "killCursors", BSON("cursorId" << cursorId), result);
         }
     }
 
@@ -586,8 +591,8 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), "query", BSON("query" << query), result);
+        if ((result != ErrorCodes::OK) || auditAuthorizationSuccess) {
+            _auditAuthz(client, nssToString(ns), "query", BSON("query" << query), result);
         }
     }
 
@@ -603,13 +608,14 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
+        if ((result != ErrorCodes::OK) || auditAuthorizationSuccess) {
             const BSONObj args = BSON("pattern" << query <<
                                       "updateObj" << updateObj <<
                                       "upsert" << isUpsert <<
                                       "multi" << isMulti); 
-            _auditAuthzFailure(client, nssToString(ns), "update", args, result);
-        } else if (ns.coll() == "system.users") {
+            _auditAuthz(client, nssToString(ns), "update", args, result);
+        }
+        if ((result == ErrorCodes::OK) && (ns.coll() == "system.users")) {
             const BSONObj params = BSON("db" << ns.db() <<
                                         "pattern" << query <<
                                         "updateObj" << updateObj <<
