@@ -428,6 +428,11 @@ void WiredTigerKVEngine::endBackup(OperationContext* txn) {
 }
 
 Status WiredTigerKVEngine::hotBackup(const std::string& path) {
+    // Nothing to backup for non-durable engine.
+    if (!_durable) {
+        return EngineExtension::hotBackup(path);
+    }
+
     // WT-999: Create journal folder.
     const char* journalDir = "journal";
     boost::filesystem::path destPath(path);
