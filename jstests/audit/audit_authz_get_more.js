@@ -30,10 +30,29 @@ auditTest(
 
         // Using the admin user, get a bunch of batches, but not all of them.
         var myCursor = testDB.foo.find().batchSize(100);
-	for (var i = 0; i < 100; i++) {
+
+        // Run getMore as admin with auditAuthorizationSuccess=false
+        for (var i = 0; i < 100; i++) {
             printjson(myCursor.next());
             assert.eq(null, testDB.getLastError());
-	}
+        }
+        myCursor.next();
+
+        // Run getMore as admin with auditAuthorizationSuccess=true, we should have only
+        // one audit event for user admin
+        for (i = 1; i < 100; i++) {
+            printjson(myCursor.next());
+            assert.eq(null, testDB.getLastError());
+        }
+        adminDB.runCommand({ setParameter: 1, 'auditAuthorizationSuccess': true });
+        myCursor.next();
+        adminDB.runCommand({ setParameter: 1, 'auditAuthorizationSuccess': false });
+
+        // prepare to run getMore as tom
+        for (i = 1; i < 100; i++) {
+            printjson(myCursor.next());
+            assert.eq(null, testDB.getLastError());
+        }
 
         adminDB.logout();
 
@@ -54,6 +73,8 @@ auditTest(
         // Verify that audit event was inserted.
         beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m, testDBName, undefined, true);
+
+        // Audit event for user tom
         assert.eq(1, auditColl.count({
             atype: "authCheck",
             ts: withinFewSecondsBefore(beforeLoad),
@@ -61,6 +82,16 @@ auditTest(
             'params.ns': testDBName + '.' + 'foo',
             'params.command': 'getMore',
             result: 13, // <-- Unauthorized error, see error_codes.err...
+        }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
+
+        // Audit event for user admin
+        assert.eq(1, auditColl.count({
+            atype: "authCheck",
+            ts: withinFewSecondsBefore(beforeLoad),
+            users: { $elemMatch: { user:'admin', db:'admin'} },
+            'params.ns': testDBName + '.' + 'foo',
+            'params.command': 'getMore',
+            result: 0, // <-- Authorization successful
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },
     { auth:"" }

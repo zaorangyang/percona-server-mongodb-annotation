@@ -82,6 +82,23 @@ $ mongod                                \
 --auditFilter '{ "users.user" : "tim" }'
 ```
 
+###auditAuthorizationSuccess parameter
+
+By default auditing in Percona Server for MongoDB logs `authCheck` events only for unauthorized operations.
+With `auditAuthorizationSuccess` parameter set to `true` both authorized and unauthorized operations will be logged.
+
+To set `auditAuthorizationSuccess` parameter at startup run server with following options:
+```
+mongod  --auditDestination=file --setParameter auditAuthorizationSuccess=true
+```
+
+You can also change `auditAuthorizationSuccess` parameter at runtime with command:
+```
+db.adminCommand({ setParameter: 1, 'auditAuthorizationSuccess': true });
+```
+
+**Note:** Setting this parameter to `true` may strongly affect performance.
+
 ## Testing
 
 There are dedicated audit JavaScript tests under the jstests/audit directory. To execute all of
