@@ -50,6 +50,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/paths.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/logger/auditlog.h"
@@ -68,6 +69,8 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 namespace mongo {
 
 namespace audit {
+
+    MONGO_EXPORT_SERVER_PARAMETER(auditAuthorizationSuccess, bool, false);
 
     NOINLINE_DECL void realexit( ExitCode rc ) {
 #ifdef _COVERAGE
@@ -477,15 +480,28 @@ namespace audit {
         _auditLog->append(builder.done());
     }
 
-    static void _auditAuthzFailure(ClientBasic* client,
+    static void _auditAuthz(ClientBasic* client,
                                  StringData ns,
                                  StringData command,
                                  const BSONObj& args,
                                  ErrorCodes::Error result) {
-        const BSONObj params = !ns.empty() ?
-            BSON("command" << command << "ns" << ns << "args" << args) :
-            BSON("command" << command << "args" << args);
-        _auditEvent(client, "authCheck", params, result);
+        if ((result != ErrorCodes::OK) || auditAuthorizationSuccess) {
+            const BSONObj params = !ns.empty() ?
+                BSON("command" << command << "ns" << ns << "args" << args) :
+                BSON("command" << command << "args" << args);
+            _auditEvent(client, "authCheck", params, result);
+        }
+    }
+
+    static void _auditSystemUsers(ClientBasic* client,
+                                  const NamespaceString& ns,
+                                  StringData atype,
+                                  const BSONObj& params,
+                                  ErrorCodes::Error result) {
+        if ((result == ErrorCodes::OK) && (ns.coll() == "system.users")) {
+            _auditEvent(client, atype, params);
+        }
+
     }
 
     void logAuthentication(ClientBasic* client,
@@ -511,9 +527,7 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, command->parseNs(dbname, cmdObj), cmdObj.firstElement().fieldName(), cmdObj, result);
-        }
+        _auditAuthz(client, command->parseNs(dbname, cmdObj), cmdObj.firstElement().fieldName(), cmdObj, result);
     }
 
 
@@ -526,11 +540,9 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), "delete", BSON("pattern" << pattern), result);
-        } else if (ns.coll() == "system.users") {
-            _auditEvent(client, "dropUser", BSON("db" << ns.db() << "pattern" << pattern));
-        }
+        _auditAuthz(client, nssToString(ns), "delete", BSON("pattern" << pattern), result);
+        _auditSystemUsers(client, ns, "dropUser",
+                          BSON("db" << ns.db() << "pattern" << pattern), result);
     }
 
     void logGetMoreAuthzCheck(
@@ -542,9 +554,7 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), "getMore", BSON("cursorId" << cursorId), result);
-        }
+        _auditAuthz(client, nssToString(ns), "getMore", BSON("cursorId" << cursorId), result);
     }
 
     void logInsertAuthzCheck(
@@ -556,11 +566,9 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), "insert", BSON("obj" << insertedObj), result);
-        } else if (ns.coll() == "system.users") {
-            _auditEvent(client, "createUser", BSON("db" << ns.db() << "userObj" << insertedObj));
-        }
+        _auditAuthz(client, nssToString(ns), "insert", BSON("obj" << insertedObj), result);
+        _auditSystemUsers(client, ns, "createUser",
+                          BSON("db" << ns.db() << "userObj" << insertedObj), result);
     }
 
     void logKillCursorsAuthzCheck(
@@ -572,9 +580,7 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), "killCursors", BSON("cursorId" << cursorId), result);
-        }
+        _auditAuthz(client, nssToString(ns), "killCursors", BSON("cursorId" << cursorId), result);
     }
 
     void logQueryAuthzCheck(
@@ -586,9 +592,7 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
-            _auditAuthzFailure(client, nssToString(ns), "query", BSON("query" << query), result);
-        }
+        _auditAuthz(client, nssToString(ns), "query", BSON("query" << query), result);
     }
 
     void logUpdateAuthzCheck(
@@ -603,19 +607,20 @@ namespace audit {
             return;
         }
 
-        if (result != ErrorCodes::OK) {
+        {
             const BSONObj args = BSON("pattern" << query <<
                                       "updateObj" << updateObj <<
                                       "upsert" << isUpsert <<
                                       "multi" << isMulti); 
-            _auditAuthzFailure(client, nssToString(ns), "update", args, result);
-        } else if (ns.coll() == "system.users") {
+            _auditAuthz(client, nssToString(ns), "update", args, result);
+        }
+        {
             const BSONObj params = BSON("db" << ns.db() <<
                                         "pattern" << query <<
                                         "updateObj" << updateObj <<
                                         "upsert" << isUpsert <<
                                         "multi" << isMulti); 
-            _auditEvent(client, "updateUser", params);
+            _auditSystemUsers(client, ns, "updateUser", params, result);
         }
     }
 

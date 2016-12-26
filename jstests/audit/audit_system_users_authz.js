@@ -6,7 +6,7 @@ if (TestData.testData !== undefined) {
     load('jstests/audit/_audit_helpers.js');
 }
 
-var testDBName = 'audit_create_drop_update_user';
+var testDBName = 'audit_system_users_authz';
 
 auditTest(
     '{create/drop/update}User',
@@ -16,6 +16,9 @@ auditTest(
         // use admin DB to count matching users in adminDB.system.users
         var adminDB = m.getDB('admin');
         adminDB.auth('admin','admin');
+
+        // enable 'auditAuthorizationSuccess' to check successful authorization events
+        adminDB.runCommand({ setParameter: 1, 'auditAuthorizationSuccess': true });
 
         var userObj = { user: 'john', pwd: 'john', roles: [ { role:'userAdmin', db:testDBName} ] };
         testDB.createUser(userObj);
@@ -28,6 +31,9 @@ auditTest(
         testDB.removeUser(userObj.user);
         assert.eq(0, testDB.system.users.count({ user: userObj.user }),
                      "removeUser did not remove user:" + userObj.user);
+
+        // disble 'auditAuthorizationSuccess' to prevent side effects of auditing getAuditEventsCollection()
+        adminDB.runCommand({ setParameter: 1, 'auditAuthorizationSuccess': false });
 
         beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m);
@@ -61,9 +67,9 @@ auditTest(
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
 
-        // We don't expect any successful authorization events because by default
-        // 'auditAuthorizationSuccess' is false
-        assert.eq(0, auditColl.count({
+        // Successful authorization events
+        // We expect events from 4 operations: insert, update, count, delete
+        assert.eq(4, auditColl.count({
             atype: "authCheck",
             ts: withinFewSecondsBefore(beforeLoad),
             'params.ns': 'admin.system.users',
