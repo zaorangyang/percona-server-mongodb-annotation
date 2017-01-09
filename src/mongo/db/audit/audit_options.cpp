@@ -125,26 +125,6 @@ namespace mongo {
             auditOptions.path =
                 params["auditLog.path"].as<std::string>();
         }
-        if (auditOptions.path != "") {
-            File auditFile;
-            auditFile.open(auditOptions.path.c_str(), false, false);
-            if (auditFile.bad()) {
-                return Status(ErrorCodes::BadValue,
-                              "Could not open a file for writing at the given auditPath: "
-                              + auditOptions.path);
-            }
-        } else if (!serverGlobalParams.logWithSyslog && !serverGlobalParams.logpath.empty()) {
-            auditOptions.path =
-                (boost::filesystem::path(serverGlobalParams.logpath).parent_path() / "auditLog.json").native();
-        // storageGlobalParams is not available in mongos    
-        //} else if (!storageGlobalParams.dbpath.empty()) {
-        //    auditOptions.path =
-        //        (boost::filesystem::path(storageGlobalParams.dbpath) / "auditLog.json").native();
-        //}
-        } else {
-            auditOptions.path =
-                (boost::filesystem::path(serverGlobalParams.cwd) / "auditLog.json").native();
-        }
 
         return Status::OK();
     }
@@ -157,4 +137,27 @@ namespace mongo {
         return storeAuditOptions(optionenvironment::startupOptionsParsed);
     }
 
+    // Can't use MONGO_STARTUP_OPTIONS_VALIDATE here as we need serverGlobalParams
+    // to be already initialized.
+    MONGO_INITIALIZER_GENERAL(AuditOptionsPath_Validate,
+                              ("EndStartupOptionHandling"),
+                              ("default"))(InitializerContext*) {
+        if (!auditOptions.path.empty()) {
+            File auditFile;
+            auditFile.open(auditOptions.path.c_str(), false, false);
+            if (auditFile.bad()) {
+                return Status(ErrorCodes::BadValue,
+                              "Could not open a file for writing at the given auditPath: " +
+                                  auditOptions.path);
+            }
+        } else if (!serverGlobalParams.logWithSyslog && !serverGlobalParams.logpath.empty()) {
+            auditOptions.path = (boost::filesystem::path(serverGlobalParams.logpath).parent_path() /
+                                 "auditLog.json")
+                                    .native();
+        } else {
+            auditOptions.path =
+                (boost::filesystem::path(serverGlobalParams.cwd) / "auditLog.json").native();
+        }
+        return Status::OK();
+    }
 } // namespace mongo
