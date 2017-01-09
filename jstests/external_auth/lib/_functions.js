@@ -3,7 +3,6 @@
 // random word
 
 // from linuxask.com
-
 Random.setRandomSeed();
 
 function randomString(len) { 
