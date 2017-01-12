@@ -340,6 +340,7 @@ env.Library(
     target="server_options",
     source=[
         "server_options_helpers.cpp",
+        "redaction_parameter.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
