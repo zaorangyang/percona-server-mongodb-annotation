@@ -172,12 +172,12 @@ namespace audit {
                 if (writeRet == 0) {
                     break;
                 } else if (!ioErrorShouldRetry(writeRet)) {
-                    error() << "Audit system cannot write event " << obj.jsonString() << " to log file " << _fileName << std::endl;
+                    error() << "Audit system cannot write event " << redact(obj) << " to log file " << _fileName << std::endl;
                     error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
                     error() << "As audit cannot make progress, the server will now shut down." << std::endl;
                     realexit(EXIT_AUDIT_ERROR);
                 }
-                warning() << "Audit system cannot write event " << obj.jsonString() << " to log file " << _fileName << std::endl;
+                warning() << "Audit system cannot write event " << redact(obj) << " to log file " << _fileName << std::endl;
                 warning() << "Write failed with retryable error " << errnoWithDescription(writeRet) << std::endl;
                 warning() << "Audit system will retry this write another " << retries - 1 << " times." << std::endl;
                 if (retries <= 7 && retries > 0) {
@@ -186,7 +186,7 @@ namespace audit {
             }
 
             if (writeRet != 0) {
-                error() << "Audit system cannot write event " << obj.jsonString() << " to log file " << _fileName << std::endl;
+                error() << "Audit system cannot write event " << redact(obj) << " to log file " << _fileName << std::endl;
                 error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
                 error() << "As audit cannot make progress, the server will now shut down." << std::endl;
                 realexit(EXIT_AUDIT_ERROR);
@@ -198,12 +198,12 @@ namespace audit {
                 if (fsyncRet == 0) {
                     break;
                 } else if (!ioErrorShouldRetry(fsyncRet)) {
-                    error() << "Audit system cannot fsync event " << obj.jsonString() << " to log file " << _fileName << std::endl;
+                    error() << "Audit system cannot fsync event " << redact(obj) << " to log file " << _fileName << std::endl;
                     error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
                     error() << "As audit cannot make progress, the server will now shut down." << std::endl;
                     realexit(EXIT_AUDIT_ERROR);
                 }
-                warning() << "Audit system cannot fsync event " << obj.jsonString() << " to log file " << _fileName << std::endl;
+                warning() << "Audit system cannot fsync event " << redact(obj) << " to log file " << _fileName << std::endl;
                 warning() << "Fsync failed with retryable error " << errnoWithDescription(fsyncRet) << std::endl;
                 warning() << "Audit system will retry this fsync another " << retries - 1 << " times." << std::endl;
                 if (retries <= 7 && retries > 0) {
@@ -212,7 +212,7 @@ namespace audit {
             }
 
             if (fsyncRet != 0) {
-                error() << "Audit system cannot fsync event " << obj.jsonString() << " to log file " << _fileName << std::endl;
+                error() << "Audit system cannot fsync event " << redact(obj) << " to log file " << _fileName << std::endl;
                 error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
                 error() << "As audit cannot make progress, the server will now shut down." << std::endl;
                 realexit(EXIT_AUDIT_ERROR);
