@@ -41,7 +41,7 @@ Description: This package contains mongos - the Percona Server for MongoDB shard
 Package: percona-server-mongodb-34-server
 Architecture: any
 Breaks: percona-server-mongodb-server
-Depends: ${shlibs:Depends}, ${misc:Depends}
+Depends: ${shlibs:Depends}, ${misc:Depends}, percona-server-mongodb-34-shell
 Description: This package contains the Percona Server for MongoDB server software, default configuration files and init.d scripts
  Percona Server for MongoDB is a drop-in high-performance replacement for MongoDB from Percona
 

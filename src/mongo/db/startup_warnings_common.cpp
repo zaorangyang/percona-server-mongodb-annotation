@@ -81,6 +81,9 @@ void logCommonStartupWarnings(const ServerGlobalParams& serverParams) {
         log() << "**          Read and write access to data and configuration is "
                  "unrestricted."
               << startupWarningsLog;
+        log() << "**          You can use /usr/bin/percona-server-mongodb-enable-auth.sh "
+                 "to fix it."
+              << startupWarningsLog;
         warned = true;
     }
 
