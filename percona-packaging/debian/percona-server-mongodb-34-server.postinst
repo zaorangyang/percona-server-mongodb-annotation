@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # postinst script for Percona Server for MongoDB
 #
 # see: dh_installdeb(1)
@@ -21,6 +21,52 @@ set -e
 # for details, see http://www.debian.org/doc/debian-policy/ or
 # the debian-policy package
 
+parse_yaml() {
+   local s='[[:space:]]*' w='[a-zA-Z0-9_]*' fs=$(echo @|tr @ '\034')
+   sed -ne "s|^\($s\)\($w\)$s:$s\"\(.*\)\"$s\$|\1$fs\2$fs\3|p" \
+        -e "s|^\($s\)\($w\)$s:$s\(.*\)$s\$|\1$fs\2$fs\3|p"  $1 |
+   awk -F$fs '{
+      indent = length($1)/2;
+      vname[indent] = $2;
+      for (i in vname) {if (i > indent) {delete vname[i]}}
+      if (length($3) > 0) {
+         vn=""; for (i=0; i<indent; i++) {vn=(vn)(vname[i])("_")}
+         printf("%s%s=\"%s\"\n", vn, $2, $3);
+      }
+   }'
+}
+
+array=$(parse_yaml /etc/mongod.conf)
+result=0
+AUTH_ENABLED=0
+while IFS=' ' read -ra VALUES; do
+    for value in "${VALUES[@]}"; do
+        if [[ $value =~ ([^,]+).*"="\"([^,]+)\" ]]; then
+            name=${BASH_REMATCH[1]}
+            val=${BASH_REMATCH[2]}
+        fi
+        if [[ $name =~ security && $name =~ auth ]]; then
+            result=$val
+            break
+        fi
+    done
+done <<< "$array"
+
+if [[ $result == enabled  ]]; then
+    AUTH_ENABLED=1
+elif [[ $result == disabled  ]]; then
+    AUTH_ENABLED=0
+elif [[ `egrep '^auth=1' /etc/mongod.conf` ]]; then
+    AUTH_ENABLED=1
+elif [[ `egrep '^auth=0' /etc/mongod.conf` ]]; then
+    AUTH_ENABLED=0
+fi
+
+if [[ $AUTH_ENABLED == 0 ]]; then
+    echo " ** WARNING: Access control is not enabled for the database."
+    echo " ** Read and write access to data and configuration is unrestricted."
+    echo " ** To fix this please use /usr/bin/percona-server-mongodb-enable-auth.sh "
+fi
 
 case "$1" in
     configure)
