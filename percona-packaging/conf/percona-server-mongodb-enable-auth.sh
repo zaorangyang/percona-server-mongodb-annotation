@@ -2,7 +2,11 @@
 #
 PATH="${PATH}:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin"
 #
-
+if [ -f /usr/sbin/service ]; then
+    SERVICE_COMMAND=/usr/sbin/service
+else
+    SERVICE_COMMAND=/sbin/service
+fi
 
 CONF_FORMAT="yaml"
 AUTH_SECTION_EXISTS=0
@@ -140,17 +144,17 @@ if [ ! -f /tmp/mongodb_create.lock ]; then
             touch /tmp/mongodb_create.lock
             started=$(ps wwaux | grep /usr/bin/mongod | grep -v grep | wc -l)
             if [[ $started == 0 ]]; then
-                /usr/sbin/service mongod start
+                $SERVICE_COMMAND mongod start
             fi
             add_user_to_mongo
             add_value_to_yaml security authentication true
-            /usr/sbin/service mongod stop
+            $SERVICE_COMMAND mongod stop
             if [ "$?" != 0 ]; then
                 PID=$(ps wwaux | grep /usr/bin/mongod | grep -v grep | awk '{print $2}')
                 kill -9 $PID
             fi
             rm -rf /tmp/mongodb_create.lock
-            /usr/sbin/service mongod start
+            $SERVICE_COMMAND mongod start
         fi
     else
         echo "Authentication is already enabled"
