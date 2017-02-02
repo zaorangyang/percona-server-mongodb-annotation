@@ -312,7 +312,7 @@ if [ $1 -gt 1 ]; then
     fi
     if [ $SERVER_TO_START == 1 ]; then
 %if 0%{?systemd}
-    %systemd_post_with_restart
+    %systemd_post_with_restart mongod.service
 %else
 if [ -x %{_sysconfdir}/init.d/mongod ] ; then
   %{_sysconfdir}/init.d/mongod restart
