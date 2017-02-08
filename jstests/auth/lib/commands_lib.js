@@ -75,6 +75,14 @@ The teardown function, if present, is called immediately after
 testint whether a particular role authorizes a command for a
 particular database.
 
+8) privileges
+
+An array of privileges used when testing user-defined roles. The test case tests that a user with
+the specified privileges is authorized to run the command, and that having only a subset of the
+privileges causes an authorization failure. If an individual privilege specifies
+"removeWhenTestingAuthzFailure: false", then that privilege will not be removed when testing for
+authorization failure.
+
 */
 
 // constants
@@ -176,8 +184,10 @@ var roles_clusterManager = {
 };
 var roles_all = {
     read: 1,
+    readLocal: 1,
     readAnyDatabase: 1,
     readWrite: 1,
+    readWriteLocal: 1,
     readWriteAnyDatabase: 1,
     userAdmin: 1,
     userAdminAnyDatabase: 1,
@@ -229,7 +239,7 @@ var authCommandsLib = {
           skipStandalone: true,
           testcases: [{
               runOnDb: "config",
-              roles: Object.extend({readWriteAnyDatabase: 1}, roles_clusterManager)
+              roles: roles_clusterManager,
           }]
         },
 
@@ -269,6 +279,8 @@ var authCommandsLib = {
               db.getSisterDB(firstDbName).x.drop();
           },
           testcases: [
+              // Tests that a user with read privileges on a view can aggregate it, even if they
+              // don't have read privileges on the underlying namespace.
               {
                 runOnDb: adminDbName,
                 privileges: [
@@ -335,6 +347,8 @@ var authCommandsLib = {
               db.getSisterDB(secondDbName).y.drop();
           },
           testcases: [
+              // Tests that a user with read privileges on a view can explain an aggregation on the
+              // view, even if they don't have read privileges on the underlying namespace.
               {
                 runOnDb: adminDbName,
                 roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
@@ -1276,6 +1290,174 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "find_config_changelog",
+          command: {find: "changelog"},
+          testcases: [
+              {
+                runOnDb: "config",
+                roles: {
+                    "clusterAdmin": 1,
+                    "clusterManager": 1,
+                    "clusterMonitor": 1,
+                    "backup": 1,
+                    "root": 1,
+                    "__system": 1
+                },
+                privileges:
+                    [{resource: {db: "config", collection: "changelog"}, actions: ["find"]}]
+              },
+          ]
+        },
+        {
+          testname: "find_local_me",
+          skipSharded: true,
+          command: {find: "me"},
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {
+                    "clusterAdmin": 1,
+                    "clusterMonitor": 1,
+                    "readLocal": 1,
+                    "readWriteLocal": 1,
+                    "backup": 1,
+                    "root": 1,
+                    "__system": 1
+                },
+                privileges: [{resource: {db: "local", collection: "me"}, actions: ["find"]}]
+              },
+          ]
+        },
+        {
+          testname: "find_oplog_main",
+          skipSharded: true,
+          command: {find: "oplog.$main"},
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {
+                    "clusterAdmin": 1,
+                    "clusterMonitor": 1,
+                    "readLocal": 1,
+                    "readWriteLocal": 1,
+                    "backup": 1,
+                    "root": 1,
+                    "__system": 1
+                },
+                privileges:
+                    [{resource: {db: "local", collection: "oplog.$main"}, actions: ["find"]}]
+              },
+          ]
+        },
+        {
+          testname: "find_oplog_rs",
+          skipSharded: true,
+          command: {find: "oplog.rs"},
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {
+                    "clusterAdmin": 1,
+                    "clusterMonitor": 1,
+                    "readLocal": 1,
+                    "readWriteLocal": 1,
+                    "backup": 1,
+                    "root": 1,
+                    "__system": 1
+                },
+                privileges:
+                    [{resource: {db: "local", collection: "oplog.rs"}, actions: ["find"]}]
+              },
+          ]
+        },
+        {
+          testname: "find_replset_election",
+          skipSharded: true,
+          command: {find: "replset.election"},
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {
+                    "clusterAdmin": 1,
+                    "clusterMonitor": 1,
+                    "readLocal": 1,
+                    "readWriteLocal": 1,
+                    "backup": 1,
+                    "root": 1,
+                    "__system": 1
+                },
+                privileges: [{
+                    resource: {db: "local", collection: "replset.election"},
+                    actions: ["find"]
+                }]
+              },
+          ]
+        },
+        {
+          testname: "find_replset_minvalid",
+          skipSharded: true,
+          command: {find: "replset.minvalid"},
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {
+                    "clusterAdmin": 1,
+                    "clusterMonitor": 1,
+                    "readLocal": 1,
+                    "readWriteLocal": 1,
+                    "backup": 1,
+                    "root": 1,
+                    "__system": 1
+                },
+                privileges: [{
+                    resource: {db: "local", collection: "replset.minvalid"},
+                    actions: ["find"]
+                }]
+              },
+          ]
+        },
+        {
+          testname: "find_sources",
+          skipSharded: true,
+          command: {find: "sources"},
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {
+                    "clusterAdmin": 1,
+                    "clusterMonitor": 1,
+                    "readLocal": 1,
+                    "readWriteLocal": 1,
+                    "backup": 1,
+                    "root": 1,
+                    "__system": 1
+                },
+                privileges: [{resource: {db: "local", collection: "sources"}, actions: ["find"]}]
+              },
+          ]
+        },
+        {
+          testname: "find_startup_log",
+          command: {find: "startup_log"},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {
+                    "clusterAdmin": 1,
+                    "clusterMonitor": 1,
+                    "readLocal": 1,
+                    "readWriteLocal": 1,
+                    "backup": 1,
+                    "root": 1,
+                    "__system": 1
+                },
+                privileges:
+                    [{resource: {db: "local", collection: "startup_log"}, actions: ["find"]}]
+              },
+          ]
+        },
+        {
           testname: "findWithTerm",
           command: {find: "foo", limit: -1, term: NumberLong(1)},
           testcases: [
@@ -1593,6 +1775,190 @@ var authCommandsLib = {
                 privileges: [{resource: {cluster: true}, actions: ["hostInfo"]}]
               }
           ]
+        },
+        {
+          testname: "insert",
+          command: {insert: "foo", documents: [{data: 5}]},
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_write,
+                privileges:
+                    [{resource: {db: firstDbName, collection: "foo"}, actions: ["insert"]}],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: {"readWriteAnyDatabase": 1, "root": 1, "__system": 1, "restore": 1},
+                privileges:
+                    [{resource: {db: secondDbName, collection: "foo"}, actions: ["insert"]}],
+              }
+
+          ]
+        },
+        {
+          testname: "insert_config_changelog",
+          command: {insert: "changelog", documents: [{data: 5}]},
+          testcases: [{
+              runOnDb: "config",
+              roles:
+                  {"clusterAdmin": 1, "clusterManager": 1, "root": 1, "__system": 1, "restore": 1},
+              privileges:
+                  [{resource: {db: "config", collection: "changelog"}, actions: ["insert"]}],
+          }]
+        },
+        {
+          testname: "insert_me",
+          command: {insert: "me", documents: [{data: 5}]},
+          skipSharded: true,
+          testcases: [{
+              runOnDb: "local",
+              roles: {
+                  "clusterAdmin": 1,
+                  "clusterManager": 1,
+                  "readWriteLocal": 1,
+                  "root": 1,
+                  "__system": 1,
+                  "restore": 1
+              },
+              privileges: [{resource: {db: "local", collection: "me"}, actions: ["insert"]}],
+          }]
+        },
+        /* Untestable, because insert to oplog.$main will always fail
+         {
+          testname: "insert_oplog_main",
+          command: {insert: "oplog.$main", documents: [{ts: Timestamp()}]},
+          skipSharded: true,
+          setup: function(db) {
+              db.createCollection("oplog.$main", {capped: true, size: 10000});
+          },
+          teardown: function(db) {
+              db.oplog.$main.drop();
+          },
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {"clusterAdmin": 1, "clusterMonitor": 1, "readWriteLocal": 1, "restore": 1,
+        "root": 1, "__system": 1},
+                privileges:
+                    [{resource: {db: "local", collection: "oplog.$main"}, actions: ["insert"]}],
+              },
+
+          ]
+        },*/
+        {
+          testname: "insert_oplog_rs",
+          command: {insert: "oplog.rs", documents: [{ts: Timestamp()}]},
+          skipSharded: true,
+          setup: function(db) {
+              db.createCollection("oplog.rs", {capped: true, size: 10000});
+          },
+          teardown: function(db) {
+              db.oplog.rs.drop();
+          },
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {
+                    "clusterAdmin": 1,
+                    "clusterManager": 1,
+                    "readWriteLocal": 1,
+                    "restore": 1,
+                    "root": 1,
+                    "__system": 1
+                },
+                privileges:
+                    [{resource: {db: "local", collection: "oplog.rs"}, actions: ["insert"]}],
+              },
+
+          ]
+        },
+
+        {
+          testname: "insert_replset_election",
+          command: {insert: "replset.election", documents: [{data: 5}]},
+          skipSharded: true,
+          testcases: [{
+              runOnDb: "local",
+              roles: {
+                  "clusterAdmin": 1,
+                  "clusterManager": 1,
+                  "readWriteLocal": 1,
+                  "root": 1,
+                  "__system": 1,
+                  "restore": 1
+              },
+              privileges:
+                  [{resource: {db: "local", collection: "replset.election"}, actions: ["insert"]}],
+          }
+
+]
+        },
+        {
+          testname: "insert_replset_minvalid",
+          command: {insert: "replset.minvalid", documents: [{data: 5}]},
+          skipSharded: true,
+          testcases: [{
+              runOnDb: "local",
+              roles: {
+                  "clusterAdmin": 1,
+                  "clusterManager": 1,
+                  "readWriteLocal": 1,
+                  "root": 1,
+                  "__system": 1,
+                  "restore": 1
+              },
+              privileges:
+                  [{resource: {db: "local", collection: "replset.minvalid"}, actions: ["insert"]}],
+          }
+
+]
+        },
+        {
+          testname: "insert_system_users",
+          command: {insert: "system.users", documents: [{data: 5}]},
+          testcases: [
+              {
+                runOnDb: "admin",
+                roles: {"root": 1, "__system": 1, "restore": 1},
+                privileges:
+                    [{resource: {db: "admin", collection: "system.users"}, actions: ["insert"]}],
+              },
+          ]
+        },
+        {
+          testname: "insert_sources",
+          command: {insert: "sources", documents: [{data: 5}]},
+          skipSharded: true,
+          testcases: [{
+              runOnDb: "local",
+              roles: {
+                  "clusterAdmin": 1,
+                  "clusterManager": 1,
+                  "readWriteLocal": 1,
+                  "root": 1,
+                  "__system": 1,
+                  "restore": 1
+              },
+              privileges: [{resource: {db: "local", collection: "sources"}, actions: ["insert"]}],
+          }]
+        },
+        {
+          testname: "insert_startup_log",
+          command: {insert: "startup_log", documents: [{data: 5}]},
+          skipSharded: true,
+          testcases: [{
+              runOnDb: "local",
+              roles: {
+                  "clusterAdmin": 1,
+                  "clusterManager": 1,
+                  "readWriteLocal": 1,
+                  "root": 1,
+                  "__system": 1,
+                  "restore": 1
+              },
+              privileges:
+                  [{resource: {db: "local", collection: "startup_log"}, actions: ["insert"]}],
+          }]
         },
         {
           testname: "isMaster",
@@ -2748,7 +3114,7 @@ var authCommandsLib = {
               {runOnDb: firstDbName, roles: roles_all, privileges: []},
               {runOnDb: secondDbName, roles: roles_all, privileges: []}
           ]
-        }
+        },
     ],
 
     /************* SHARED TEST LOGIC ****************/
