@@ -46,7 +46,6 @@
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/commands/strategy.h"
-#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/sharding_raii.h"
@@ -92,12 +91,12 @@ public:
         const NamespaceString nss = parseNsCollectionRequired(dbName, cmdObj);
 
         auto scopedDB = uassertStatusOK(ScopedShardDatabase::getExisting(txn, dbName));
-        DBConfig* conf = scopedDB.db();
+        const auto conf = scopedDB.db();
 
         shared_ptr<ChunkManager> chunkMgr;
         shared_ptr<Shard> shard;
 
-        if (!conf->isShardingEnabled() || !conf->isSharded(nss.ns())) {
+        if (!conf->isSharded(nss.ns())) {
             auto shardStatus = Grid::get(txn)->shardRegistry()->getShard(txn, conf->getPrimaryId());
             if (!shardStatus.isOK()) {
                 return shardStatus.getStatus();
@@ -181,9 +180,9 @@ public:
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
         auto scopedDb = uassertStatusOK(ScopedShardDatabase::getOrCreate(txn, dbName));
-        DBConfig* conf = scopedDb.db();
+        const auto conf = scopedDb.db();
 
-        if (!conf->isShardingEnabled() || !conf->isSharded(nss.ns())) {
+        if (!conf->isSharded(nss.ns())) {
             return _runCommand(txn, conf, nullptr, conf->getPrimaryId(), nss, cmdObj, result);
         }
 

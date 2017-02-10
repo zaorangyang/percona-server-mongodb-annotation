@@ -47,14 +47,6 @@ using boost::intrusive_ptr;
 using std::shared_ptr;
 using std::string;
 
-namespace {
-
-MONGO_EXPORT_SERVER_PARAMETER(internalDocumentSourceCursorBatchSizeBytes,
-                              int,
-                              FindCommon::kMaxBytesToReturnToClientAtOnce);
-
-}  // namespace
-
 const char* DocumentSourceCursor::getSourceName() const {
     return "$cursor";
 }
@@ -87,8 +79,7 @@ void DocumentSourceCursor::loadBatch() {
 
     // We have already validated the sharding version when we constructed the PlanExecutor
     // so we shouldn't check it again.
-    const NamespaceString nss(_ns);
-    AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
+    AutoGetCollectionForRead autoColl(pExpCtx->opCtx, _nss);
 
     _exec->restoreState();
 
@@ -192,8 +183,7 @@ Value DocumentSourceCursor::serialize(bool explain) const {
     // Get planner-level explain info from the underlying PlanExecutor.
     BSONObjBuilder explainBuilder;
     {
-        const NamespaceString nss(_ns);
-        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
+        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, _nss);
 
         massert(17392, "No _exec. Were we disposed before explained?", _exec);
 
@@ -224,12 +214,6 @@ Value DocumentSourceCursor::serialize(bool explain) const {
     return Value(DOC(getSourceName() << out.freezeToValue()));
 }
 
-void DocumentSourceCursor::doInjectExpressionContext() {
-    if (_limit) {
-        _limit->injectExpressionContext(pExpCtx);
-    }
-}
-
 void DocumentSourceCursor::detachFromOperationContext() {
     if (_exec) {
         _exec->detachFromOperationContext();
@@ -247,7 +231,7 @@ DocumentSourceCursor::DocumentSourceCursor(const string& ns,
                                            const intrusive_ptr<ExpressionContext>& pCtx)
     : DocumentSource(pCtx),
       _docsAddedToBatches(0),
-      _ns(ns),
+      _nss(ns),
       _exec(std::move(exec)),
       _outputSorts(_exec->getOutputSorts()) {
     recordPlanSummaryStr();
@@ -262,7 +246,6 @@ intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
     const intrusive_ptr<ExpressionContext>& pExpCtx) {
     intrusive_ptr<DocumentSourceCursor> source(
         new DocumentSourceCursor(ns, std::move(exec), pExpCtx));
-    source->injectExpressionContext(pExpCtx);
     return source;
 }
 

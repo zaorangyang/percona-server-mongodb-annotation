@@ -30,6 +30,7 @@
 
 #include <deque>
 
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -131,9 +132,6 @@ public:
 
     const PlanSummaryStats& getPlanSummaryStats() const;
 
-protected:
-    void doInjectExpressionContext() final;
-
 private:
     DocumentSourceCursor(const std::string& ns,
                          std::unique_ptr<PlanExecutor> exec,
@@ -156,7 +154,7 @@ private:
     boost::intrusive_ptr<DocumentSourceLimit> _limit;
     long long _docsAddedToBatches;  // for _limit enforcement
 
-    const std::string _ns;
+    const NamespaceString _nss;
     std::unique_ptr<PlanExecutor> _exec;
     BSONObjSet _outputSorts;
     std::string _planSummary;

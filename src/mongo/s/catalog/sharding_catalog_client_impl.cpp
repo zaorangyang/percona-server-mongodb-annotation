@@ -68,7 +68,6 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -320,7 +319,11 @@ StatusWith<ShardId> ShardingCatalogClientImpl::_selectShardForNewDatabase(
 Status ShardingCatalogClientImpl::enableSharding(OperationContext* txn, const std::string& dbName) {
     invariant(nsIsDbOnly(dbName));
 
-    DatabaseType db;
+    if (dbName == NamespaceString::kConfigDb || dbName == NamespaceString::kAdminDb) {
+        return {
+            ErrorCodes::IllegalOperation,
+            str::stream() << "Enabling sharding on system configuration databases is not allowed"};
+    }
 
     // Lock the database globally to prevent conflicts with simultaneous database
     // creation/modification.
@@ -331,6 +334,8 @@ Status ShardingCatalogClientImpl::enableSharding(OperationContext* txn, const st
     }
 
     // Check for case sensitivity violations
+    DatabaseType db;
+
     Status status = _checkDbDoesNotExist(txn, dbName, &db);
     if (status.isOK()) {
         // Database does not exist, create a new entry
@@ -485,9 +490,25 @@ Status ShardingCatalogClientImpl::shardCollection(OperationContext* txn,
     }
     manager->loadExistingRanges(txn, nullptr);
 
-    CollectionInfo collInfo;
-    collInfo.useChunkManager(manager);
-    collInfo.save(txn, ns);
+    {
+        CollectionType coll;
+        coll.setNs(NamespaceString(manager->getns()));
+        coll.setEpoch(manager->getVersion().epoch());
+
+        // TODO(schwerin): The following isn't really a date, but is stored as one in-memory and in
+        // config.collections, as a historical oddity.
+        coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(manager->getVersion().toLong()));
+        coll.setKeyPattern(manager->getShardKeyPattern().toBSON());
+        coll.setDefaultCollation(manager->getDefaultCollator()
+                                     ? manager->getDefaultCollator()->getSpec().toBSON()
+                                     : BSONObj());
+        coll.setUnique(manager->isUnique());
+
+        Status updateCollStatus = updateCollection(txn, ns, coll);
+        if (!updateCollStatus.isOK()) {
+            return updateCollStatus;
+        }
+    }
 
     // Tell the primary mongod to refresh its data
     // TODO:  Think the real fix here is for mongos to just
@@ -1662,14 +1683,14 @@ void ShardingCatalogClientImpl::_appendReadConcern(BSONObjBuilder* builder) {
     readConcern.appendInfo(builder);
 }
 
-Status ShardingCatalogClientImpl::appendInfoForConfigServerDatabases(OperationContext* txn,
-                                                                     BSONArrayBuilder* builder) {
+Status ShardingCatalogClientImpl::appendInfoForConfigServerDatabases(
+    OperationContext* txn, const BSONObj& listDatabasesCmd, BSONArrayBuilder* builder) {
     auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
     auto resultStatus =
         configShard->runCommandWithFixedRetryAttempts(txn,
                                                       kConfigPrimaryPreferredSelector,
                                                       "admin",
-                                                      BSON("listDatabases" << 1),
+                                                      listDatabasesCmd,
                                                       Shard::RetryPolicy::kIdempotent);
 
     if (!resultStatus.isOK()) {

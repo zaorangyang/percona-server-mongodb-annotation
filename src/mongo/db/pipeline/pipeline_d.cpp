@@ -48,6 +48,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/document_source_match.h"
@@ -95,7 +96,7 @@ public:
     }
 
     bool isSharded(const NamespaceString& nss) final {
-        AutoGetCollectionForRead autoColl(_ctx->opCtx, nss.ns());
+        AutoGetCollectionForRead autoColl(_ctx->opCtx, nss);
         auto css = CollectionShardingState::get(_ctx->opCtx, nss);
         return bool(css->getMetadata());
     }
@@ -188,7 +189,6 @@ public:
             return pipeline.getStatus();
         }
 
-        pipeline.getValue()->injectExpressionContext(expCtx);
         pipeline.getValue()->optimizePipeline();
 
         AutoGetCollectionForRead autoColl(expCtx->opCtx, expCtx->ns);
@@ -294,7 +294,8 @@ StatusWith<std::unique_ptr<PlanExecutor>> attemptToGetExecutor(
     // that the user omitted.
     //
     // If pipeline has a null collator (representing the "simple" collation), we simply set the
-    // collation option to the original user BSON.
+    // collation option to the original user BSON, which is either the empty object (unspecified),
+    // or the specification for the "simple" collation.
     qr->setCollation(pExpCtx->getCollator() ? pExpCtx->getCollator()->getSpec().toBSON()
                                             : pExpCtx->collation);
 

@@ -137,6 +137,14 @@ var ReplSetTest = function(opts) {
     }
 
     /**
+     * Returns 'true' if the test has been configured to run without journaling enabled.
+     */
+    function _isRunningWithoutJournaling() {
+        return jsTestOptions().noJournal || jsTestOptions().storageEngine == 'inMemory' ||
+            jsTestOptions().storageEngine == 'ephemeralForTest';
+    }
+
+    /**
      * Wait for a rs indicator to go to a particular state or states.
      *
      * @param node is a single node or list of nodes, by id or conn
@@ -292,10 +300,8 @@ var ReplSetTest = function(opts) {
         var replSetStatus =
             assert.commandWorked(conn.getDB("admin").runCommand({replSetGetStatus: 1}));
 
-        var runningWithoutJournaling = TestData.noJournal || "inMemory" == TestData.storageEngine ||
-            "ephemeralForTest" == TestData.storageEngine;
         var opTimeType = "durableOpTime";
-        if (runningWithoutJournaling) {
+        if (_isRunningWithoutJournaling()) {
             opTimeType = "appliedOpTime";
         }
         return replSetStatus.optimes[opTimeType];
@@ -620,11 +626,11 @@ var ReplSetTest = function(opts) {
         if (config.hasOwnProperty(wcMajorityJournalField)) {
             return config;
         }
-        var runningWithoutJournaling = TestData.noJournal || TestData.storageEngine == "inMemory" ||
-            TestData.storageEngine == "ephemeralForTest";
-        if (runningWithoutJournaling) {
+
+        if (_isRunningWithoutJournaling()) {
             config[wcMajorityJournalField] = false;
         }
+
         return config;
     };
 
@@ -690,6 +696,28 @@ var ReplSetTest = function(opts) {
                 throw e;
             }
         }
+    };
+
+    /**
+     * Blocks until all nodes in the replica set have the same config version as the primary.
+     **/
+    this.awaitNodesAgreeOnConfigVersion = function(timeout) {
+        timeout = timeout || this.kDefaultTimeoutMS;
+
+        assert.soonNoExcept(function() {
+            var primaryVersion = self.getPrimary().adminCommand({ismaster: 1}).setVersion;
+
+            for (var i = 0; i < self.nodes.length; i++) {
+                var version = self.nodes[i].adminCommand({ismaster: 1}).setVersion;
+                assert.eq(version,
+                          primaryVersion,
+                          "waiting for secondary node " + self.nodes[i].host +
+                              " with config version of " + version +
+                              " to match the version of the primary " + primaryVersion);
+            }
+
+            return true;
+        }, "Awaiting nodes to agree on config version", timeout);
     };
 
     /**
@@ -787,7 +815,7 @@ var ReplSetTest = function(opts) {
                               ", but expected config version #" + masterConfigVersion);
 
                         if (slaveConfigVersion > masterConfigVersion) {
-                            master = this.getPrimary();
+                            master = self.getPrimary();
                             masterConfigVersion =
                                 master.getDB("local")['system.replset'].findOne().version;
                             masterName = master.toString().substr(14);  // strip "connection to "

@@ -47,14 +47,15 @@
 #include "mongo/db/views/view.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query/cluster_query_knobs.h"
 #include "mongo/s/query/store_possible_cursor.h"
+#include "mongo/s/sharding_raii.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 
@@ -65,17 +66,11 @@ Status ClusterAggregate::runAggregate(OperationContext* txn,
                                       BSONObj cmdObj,
                                       int options,
                                       BSONObjBuilder* result) {
-    auto dbname = namespaces.executionNss.db().toString();
-    auto status = grid.catalogCache()->getDatabase(txn, dbname);
-    if (!status.isOK()) {
-        appendEmptyResultSet(*result, status.getStatus(), namespaces.requestedNss.ns());
+    auto scopedShardDbStatus = ScopedShardDatabase::getExisting(txn, namespaces.executionNss.db());
+    if (!scopedShardDbStatus.isOK()) {
+        appendEmptyResultSet(
+            *result, scopedShardDbStatus.getStatus(), namespaces.requestedNss.ns());
         return Status::OK();
-    }
-
-    std::shared_ptr<DBConfig> conf = status.getValue();
-
-    if (!conf->isShardingEnabled()) {
-        return aggPassthrough(txn, namespaces, conf, cmdObj, result, options);
     }
 
     auto request = AggregationRequest::parseFromBSON(namespaces.executionNss, cmdObj);
@@ -83,20 +78,21 @@ Status ClusterAggregate::runAggregate(OperationContext* txn,
         return request.getStatus();
     }
 
-    boost::intrusive_ptr<ExpressionContext> mergeCtx =
-        new ExpressionContext(txn, request.getValue());
-    mergeCtx->inRouter = true;
-    // explicitly *not* setting mergeCtx->tempDir
+    const auto conf = scopedShardDbStatus.getValue().db();
 
+    // Determine the appropriate collation and 'resolve' involved namespaces to make the
+    // ExpressionContext.
+
+    // We won't try to execute anything on a mongos, but we still have to populate this map so that
+    // any $lookups, etc. will be able to have a resolved view definition. It's okay that this is
+    // incorrect, we will repopulate the real resolved namespace map on the mongod. Note that we
+    // need to check if any involved collections are sharded before forwarding an aggregation
+    // command on an unsharded collection.
+    StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
     LiteParsedPipeline liteParsedPipeline(request.getValue());
-
     for (auto&& ns : liteParsedPipeline.getInvolvedNamespaces()) {
         uassert(28769, str::stream() << ns.ns() << " cannot be sharded", !conf->isSharded(ns.ns()));
-        // We won't try to execute anything on a mongos, but we still have to populate this map
-        // so that any $lookups etc will be able to have a resolved view definition. It's okay
-        // that this is incorrect, we will repopulate the real resolved namespace map on the
-        // mongod.
-        mergeCtx->resolvedNamespaces[ns.coll()] = {ns, std::vector<BSONObj>{}};
+        resolvedNamespaces[ns.coll()] = {ns, std::vector<BSONObj>{}};
     }
 
     if (!conf->isSharded(namespaces.executionNss.ns())) {
@@ -105,11 +101,18 @@ Status ClusterAggregate::runAggregate(OperationContext* txn,
 
     auto chunkMgr = conf->getChunkManager(txn, namespaces.executionNss.ns());
 
-    // If there was no collation specified, but there is a default collation for the collation,
-    // use that.
-    if (request.getValue().getCollation().isEmpty() && chunkMgr->getDefaultCollator()) {
-        mergeCtx->setCollator(chunkMgr->getDefaultCollator()->clone());
+    std::unique_ptr<CollatorInterface> collation;
+    if (!request.getValue().getCollation().isEmpty()) {
+        collation = uassertStatusOK(CollatorFactoryInterface::get(txn->getServiceContext())
+                                        ->makeFromBSON(request.getValue().getCollation()));
+    } else if (chunkMgr->getDefaultCollator()) {
+        collation = chunkMgr->getDefaultCollator()->clone();
     }
+
+    boost::intrusive_ptr<ExpressionContext> mergeCtx = new ExpressionContext(
+        txn, request.getValue(), std::move(collation), std::move(resolvedNamespaces));
+    mergeCtx->inRouter = true;
+    // explicitly *not* setting mergeCtx->tempDir
 
     // Parse and optimize the pipeline specification.
     auto pipeline = Pipeline::parse(request.getValue().getPipeline(), mergeCtx);
@@ -117,7 +120,6 @@ Status ClusterAggregate::runAggregate(OperationContext* txn,
         return pipeline.getStatus();
     }
 
-    pipeline.getValue()->injectExpressionContext(mergeCtx);
     pipeline.getValue()->optimizePipeline();
 
     // If the first $match stage is an exact match on the shard key (with a simple collation or
@@ -172,7 +174,7 @@ Status ClusterAggregate::runAggregate(OperationContext* txn,
     // TODO need to make sure cursors are killed if a retry is needed
     std::vector<Strategy::CommandResult> shardResults;
     Strategy::commandOp(txn,
-                        dbname,
+                        namespaces.executionNss.db().toString(),
                         shardedCommand,
                         options,
                         namespaces.executionNss.ns(),
@@ -205,13 +207,13 @@ Status ClusterAggregate::runAggregate(OperationContext* txn,
     if (!needSplit) {
         invariant(shardResults.size() == 1);
         invariant(shardResults[0].target.getServers().size() == 1);
-        auto executorPool = grid.getExecutorPool();
+        auto executorPool = Grid::get(txn)->getExecutorPool();
         const BSONObj reply =
             uassertStatusOK(storePossibleCursor(shardResults[0].target.getServers()[0],
                                                 shardResults[0].result,
                                                 namespaces.requestedNss,
                                                 executorPool->getArbitraryExecutor(),
-                                                grid.getCursorManager()));
+                                                Grid::get(txn)->getCursorManager()));
         result->appendElements(reply);
         return getStatusFromCommandResult(reply);
     }
@@ -253,14 +255,15 @@ Status ClusterAggregate::runAggregate(OperationContext* txn,
     // Run merging command on random shard, unless a stage needs the primary shard. Need to use
     // ShardConnection so that the merging mongod is sent the config servers on connection init.
     auto& prng = txn->getClient()->getPrng();
-    const auto& mergingShardId = needPrimaryShardMerger
+    const auto& mergingShardId = (needPrimaryShardMerger || internalQueryAlwaysMergeOnPrimaryShard)
         ? conf->getPrimaryId()
         : shardResults[prng.nextInt32(shardResults.size())].shardTargetId;
-    const auto mergingShard = uassertStatusOK(grid.shardRegistry()->getShard(txn, mergingShardId));
+    const auto mergingShard =
+        uassertStatusOK(Grid::get(txn)->shardRegistry()->getShard(txn, mergingShardId));
 
     ShardConnection conn(mergingShard->getConnString(), outputNsOrEmpty);
     BSONObj mergedResults =
-        aggRunCommand(conn.get(), namespaces, mergeCmd.freeze().toBson(), options);
+        aggRunCommand(txn, conn.get(), namespaces, mergeCmd.freeze().toBson(), options);
     conn.done();
 
     if (auto wcErrorElem = mergedResults["writeConcernError"]) {
@@ -377,7 +380,8 @@ void ClusterAggregate::killAllCursors(const std::vector<Strategy::CommandResult>
     }
 }
 
-BSONObj ClusterAggregate::aggRunCommand(DBClientBase* conn,
+BSONObj ClusterAggregate::aggRunCommand(OperationContext* txn,
+                                        DBClientBase* conn,
                                         const Namespaces& namespaces,
                                         BSONObj cmd,
                                         int queryOptions) {
@@ -404,29 +408,29 @@ BSONObj ClusterAggregate::aggRunCommand(DBClientBase* conn,
         throw RecvStaleConfigException("command failed because of stale config", result);
     }
 
-    auto executorPool = grid.getExecutorPool();
+    auto executorPool = Grid::get(txn)->getExecutorPool();
     result = uassertStatusOK(storePossibleCursor(HostAndPort(cursor->originalHost()),
                                                  result,
                                                  namespaces.requestedNss,
                                                  executorPool->getArbitraryExecutor(),
-                                                 grid.getCursorManager()));
+                                                 Grid::get(txn)->getCursorManager()));
     return result;
 }
 
 Status ClusterAggregate::aggPassthrough(OperationContext* txn,
                                         const Namespaces& namespaces,
-                                        std::shared_ptr<DBConfig> conf,
+                                        DBConfig* conf,
                                         BSONObj cmdObj,
                                         BSONObjBuilder* out,
                                         int queryOptions) {
     // Temporary hack. See comment on declaration for details.
-    auto shardStatus = grid.shardRegistry()->getShard(txn, conf->getPrimaryId());
+    auto shardStatus = Grid::get(txn)->shardRegistry()->getShard(txn, conf->getPrimaryId());
     if (!shardStatus.isOK()) {
         return shardStatus.getStatus();
     }
 
     ShardConnection conn(shardStatus.getValue()->getConnString(), "");
-    BSONObj result = aggRunCommand(conn.get(), namespaces, cmdObj, queryOptions);
+    BSONObj result = aggRunCommand(txn, conn.get(), namespaces, cmdObj, queryOptions);
     conn.done();
 
     // First append the properly constructed writeConcernError. It will then be skipped
