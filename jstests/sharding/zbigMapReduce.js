@@ -8,7 +8,7 @@ function setupTest() {
             rs: true,
             numReplicas: 2,
             chunkSize: 1,
-            rsOptions: {oplogSize: 100},
+            rsOptions: {oplogSize: 50},
             enableBalancer: true
         }
     });
