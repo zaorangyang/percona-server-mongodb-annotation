@@ -60,6 +60,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
+#include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
 
 #include "audit_options.h"
@@ -435,15 +436,38 @@ namespace audit {
         appendRoles(builder, makeRoleNameIterator(roles.begin(), roles.end()));
     }
 
+    static std::string getIpByHost(const std::string& host) {
+        if (host.empty()) {
+            return {};
+        }
+
+        static StringMap<std::string> hostToIpCache;
+        static stdx::mutex cacheMutex;
+
+        std::string ip;
+        {
+            stdx::lock_guard<stdx::mutex> lk(cacheMutex);
+            ip = hostToIpCache[host];
+        }
+        if (ip.empty()) {
+            ip = hostbyname(host.c_str());
+            stdx::lock_guard<stdx::mutex> lk(cacheMutex);
+            hostToIpCache[host] = ip;
+        }
+        return ip;
+    }
+
     static void appendCommonInfo(BSONObjBuilder &builder,
                                  StringData atype,
                                  Client* client) {
         builder << AuditFields::type(atype);
         builder << AuditFields::timestamp(BSON("$date" << jsTime().toString()));
-        builder << AuditFields::local(BSON("host" << getHostNameCached() << "port" << serverGlobalParams.port));
+        builder << AuditFields::local(
+            BSON("ip" << getIpByHost(getHostNameCached()) << "port" << serverGlobalParams.port));
         if (client->hasRemote()) {
             const HostAndPort hp = client->getRemote();
-            builder << AuditFields::remote(BSON("host" << hp.host() << "port" << hp.port()));
+            builder << AuditFields::remote(
+                BSON("ip" << getIpByHost(hp.host()) << "port" << hp.port()));
         } else {
             // It's not 100% clear that an empty obj here actually makes sense..
             builder << AuditFields::remote(BSONObj());
