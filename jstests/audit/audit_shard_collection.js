@@ -19,7 +19,7 @@ auditTestShard(
         assert.eq(1, auditColl.count({
             atype: "shardCollection",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.ns': jsTestName() + '.foo',
+            'param.ns': jsTestName() + '.foo',
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },

@@ -30,9 +30,9 @@ auditTest(
         assert.eq(1, auditColl.count({
             atype: 'authenticate',
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.user': 'john',
-            'params.mechanism': 'SCRAM-SHA-1',
-            'params.db': testDBName,
+            'param.user': 'john',
+            'param.mechanism': 'SCRAM-SHA-1',
+            'param.db': testDBName,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
 
@@ -46,9 +46,9 @@ auditTest(
         assert.eq(1, auditColl.count({
             atype: 'authenticate',
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.user': 'john',
-            'params.mechanism': 'SCRAM-SHA-1',
-            'params.db': testDBName,
+            'param.user': 'john',
+            'param.mechanism': 'SCRAM-SHA-1',
+            'param.db': testDBName,
             result: authenticationFailureCode,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },

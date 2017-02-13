@@ -20,7 +20,7 @@ auditTestShard(
         assert.eq(1, auditColl.count({
             atype: "addShard",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.connectionString': hostandport,
+            'param.connectionString': hostandport,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },

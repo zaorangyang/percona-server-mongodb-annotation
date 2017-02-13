@@ -20,7 +20,7 @@ auditTest(
         assert.eq(1, auditColl.count({
             atype: "createDatabase",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.ns': testDBName,
+            'param.ns': testDBName,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },

@@ -41,29 +41,29 @@ auditTest(
         assert.eq(1, auditColl.count({
             atype: "createUser",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.db': testDBName,
-            'params.user': userObj.user,
-            //'params.roles': userObj.roles,
-            'params.roles': { $elemMatch: userObj.roles[0] },
+            'param.db': testDBName,
+            'param.user': userObj.user,
+            //'param.roles': userObj.roles,
+            'param.roles': { $elemMatch: userObj.roles[0] },
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
 
         assert.eq(1, auditColl.count({
             atype: "updateUser",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.db': testDBName,
-            'params.user': userObj.user,
-            //'params.roles': updateObj.roles,
-            'params.roles': { $elemMatch: updateObj.roles[0] },
-            'params.roles': { $elemMatch: updateObj.roles[1] },
+            'param.db': testDBName,
+            'param.user': userObj.user,
+            //'param.roles': updateObj.roles,
+            'param.roles': { $elemMatch: updateObj.roles[0] },
+            'param.roles': { $elemMatch: updateObj.roles[1] },
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
 
         assert.eq(1, auditColl.count({
             atype: "dropUser",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.db': testDBName,
-            'params.user': userObj.user,
+            'param.db': testDBName,
+            'param.user': userObj.user,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
 
@@ -72,7 +72,7 @@ auditTest(
         assert.eq(4, auditColl.count({
             atype: "authCheck",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.ns': 'admin.system.users',
+            'param.ns': 'admin.system.users',
             result: 0, // <-- Authorization successful
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },
