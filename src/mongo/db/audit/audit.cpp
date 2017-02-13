@@ -401,7 +401,7 @@ namespace audit {
         BSONField<BSONObj> timestamp("ts");
         BSONField<BSONObj> local("local");
         BSONField<BSONObj> remote("remote");
-        BSONField<BSONObj> params("params");
+        BSONField<BSONObj> param("param");
         BSONField<int> result("result");
     }
 
@@ -476,7 +476,7 @@ namespace audit {
                             ErrorCodes::Error result = ErrorCodes::OK) {
         BSONObjBuilder builder;
         appendCommonInfo(builder, atype, client);
-        builder << AuditFields::params(params);
+        builder << AuditFields::param(params);
         builder << AuditFields::result(static_cast<int>(result));
         _auditLog->append(builder.done());
     }
