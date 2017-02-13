@@ -420,6 +420,21 @@ namespace audit {
         return ss.str();
     }
 
+    static void appendRoles(BSONObjBuilder& builder, RoleNameIterator it) {
+        BSONArrayBuilder rolebuilder(builder.subarrayStart("roles"));
+        for (; it.more(); it.next()) {
+            BSONObjBuilder r(rolebuilder.subobjStart());
+            r.append("role", it->getRole());
+            r.append("db", it->getDB());
+            r.doneFast();
+        }
+        rolebuilder.doneFast();
+    }
+
+    static void appendRoles(BSONObjBuilder& builder, const std::vector<RoleName>& roles) {
+        appendRoles(builder, makeRoleNameIterator(roles.begin(), roles.end()));
+    }
+
     static void appendCommonInfo(BSONObjBuilder &builder,
                                  StringData atype,
                                  Client* client) {
@@ -444,6 +459,7 @@ namespace audit {
                 user.doneFast();
             }
             users.doneFast();
+            appendRoles(builder, session->getAuthenticatedRoleNames());
         } else {
             // It's not 100% clear that an empty obj here actually makes sense..
             builder << "users" << BSONObj();
@@ -456,17 +472,6 @@ namespace audit {
             privbuilder.append(it->toBSON());
         }
         privbuilder.doneFast();
-    }
-
-    static void appendRoles(BSONObjBuilder &builder, const std::vector<RoleName>& roles) {
-        BSONArrayBuilder rolebuilder(builder.subarrayStart("roles"));
-        for (std::vector<RoleName>::const_iterator it = roles.begin(); it != roles.end(); ++it) {
-            BSONObjBuilder r(rolebuilder.subobjStart());
-            r.append("role", it->getRole());
-            r.append("db", it->getDB());
-            r.doneFast();
-        }
-        rolebuilder.doneFast();
     }
 
 
