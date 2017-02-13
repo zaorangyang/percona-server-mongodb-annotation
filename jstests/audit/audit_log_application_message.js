@@ -19,7 +19,7 @@ auditTest(
         assert.eq(1, auditColl.count({
             atype: "applicationMessage",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.msg': msg,
+            'param.msg': msg,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },
