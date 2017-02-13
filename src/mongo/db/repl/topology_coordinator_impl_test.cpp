@@ -5392,7 +5392,7 @@ TEST_F(HeartbeatResponseTest, ShouldNotChangeSyncSourceWhenNodeIsFreshByHeartbea
     ASSERT_FALSE(
         getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), OpTime(), metadata, now()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(0, countLogLinesContaining("re-evaluating sync source"));
+    ASSERT_EQUALS(0, countLogLinesContaining("Choosing new sync source"));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldNotChangeSyncSourceWhenNodeIsStaleByHeartbeatButNotMetadata) {
@@ -5426,7 +5426,7 @@ TEST_F(HeartbeatResponseTest, ShouldNotChangeSyncSourceWhenNodeIsStaleByHeartbea
     ASSERT_FALSE(
         getTopoCoord().shouldChangeSyncSource(HostAndPort("host2"), OpTime(), metadata, now()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(0, countLogLinesContaining("re-evaluating sync source"));
+    ASSERT_EQUALS(0, countLogLinesContaining("Choosing new sync source"));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceWhenFresherMemberExists) {
@@ -5458,7 +5458,7 @@ TEST_F(HeartbeatResponseTest, ShouldChangeSyncSourceWhenFresherMemberExists) {
     ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(
         HostAndPort("host2"), OpTime(), makeMetadata(), now()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("re-evaluating sync source"));
+    ASSERT_EQUALS(1, countLogLinesContaining("Choosing new sync source"));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldNotChangeSyncSourceWhileFresherMemberIsBlackListed) {
@@ -5503,7 +5503,7 @@ TEST_F(HeartbeatResponseTest, ShouldNotChangeSyncSourceWhileFresherMemberIsBlack
     ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(
         HostAndPort("host2"), OpTime(), makeMetadata(), now()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("re-evaluating sync source"));
+    ASSERT_EQUALS(1, countLogLinesContaining("Choosing new sync source"));
 }
 
 TEST_F(HeartbeatResponseTest, ShouldNotChangeSyncSourceWhenFresherMemberIsDown) {
@@ -5663,7 +5663,7 @@ TEST_F(HeartbeatResponseTest,
     ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(
         HostAndPort("host2"), OpTime(), makeMetadata(), now()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("re-evaluating sync source"));
+    ASSERT_EQUALS(1, countLogLinesContaining("Choosing new sync source"));
 }
 
 TEST_F(TopoCoordTest, ShouldNotStandForElectionWhileAwareOfPrimary) {
@@ -6032,6 +6032,53 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantVoteWhenConfigVersionDoesNotMatch) {
 
     getTopoCoord().processReplSetRequestVotes(args, &response, lastAppliedOpTime);
     ASSERT_EQUALS("candidate's config version differs from mine", response.getReason());
+    ASSERT_FALSE(response.getVoteGranted());
+}
+
+TEST_F(TopoCoordTest, ArbiterDoesNotGrantVoteWhenItCanSeeAHealthyPrimaryOfEqualOrGreaterPriority) {
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version"
+                      << 1
+                      << "members"
+                      << BSON_ARRAY(BSON("_id" << 10 << "host"
+                                               << "hself"
+                                               << "arbiterOnly"
+                                               << true)
+                                    << BSON("_id" << 20 << "host"
+                                                  << "h2"
+                                                  << "priority"
+                                                  << 5)
+                                    << BSON("_id" << 30 << "host"
+                                                  << "h3"))),
+                 0);
+    heartbeatFromMember(HostAndPort("h2"),
+                        "rs0",
+                        MemberState::RS_PRIMARY,
+                        OpTime(Timestamp(0, 0), 0),
+                        Milliseconds(300));
+    heartbeatFromMember(HostAndPort("h3"),
+                        "rs0",
+                        MemberState::RS_SECONDARY,
+                        OpTime(Timestamp(0, 0), 0),
+                        Milliseconds(300));
+
+    ReplSetRequestVotesArgs args;
+    args.initialize(BSON("replSetRequestVotes" << 1 << "setName"
+                                               << "rs0"
+                                               << "term"
+                                               << 1LL
+                                               << "candidateIndex"
+                                               << 2LL
+                                               << "configVersion"
+                                               << 1LL
+                                               << "lastCommittedOp"
+                                               << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)));
+    ReplSetRequestVotesResponse response;
+    OpTime lastAppliedOpTime;
+
+    getTopoCoord().processReplSetRequestVotes(args, &response, lastAppliedOpTime);
+    ASSERT_EQUALS("can see a healthy primary of equal or greater priority", response.getReason());
     ASSERT_FALSE(response.getVoteGranted());
 }
 

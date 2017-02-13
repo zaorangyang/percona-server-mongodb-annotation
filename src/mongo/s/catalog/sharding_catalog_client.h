@@ -93,6 +93,7 @@ class ShardingCatalogClient {
     MONGO_DISALLOW_COPYING(ShardingCatalogClient);
 
 public:
+    // Constant to use for configuration data majority writes
     static const WriteConcernOptions kMajorityWriteConcern;
 
     virtual ~ShardingCatalogClient() = default;
@@ -428,10 +429,12 @@ public:
                                          const WriteConcernOptions& writeConcern) = 0;
 
     /**
-     * Appends the information about the config and admin databases in the config server
-     * with the format for listDatabase.
+     * Appends the information about the config and admin databases in the config server with the
+     * format for listDatabases, based on the listDatabases command parameters in
+     * 'listDatabasesCmd'.
      */
     virtual Status appendInfoForConfigServerDatabases(OperationContext* txn,
+                                                      const BSONObj& listDatabasesCmd,
                                                       BSONArrayBuilder* builder) = 0;
 
     /**

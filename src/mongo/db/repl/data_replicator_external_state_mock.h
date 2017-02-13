@@ -72,6 +72,7 @@ public:
 
     // Set by processMetadata.
     rpc::ReplSetMetadata metadataProcessed;
+    bool metadataWasProcessed = false;
 
     // Set by shouldStopFetching.
     HostAndPort lastSyncSourceChecked;
@@ -84,7 +85,13 @@ public:
     // Override to change multiApply behavior.
     MultiApplier::MultiApplyFn multiApplyFn;
 
-    ReplicaSetConfig replSetConfig;
+    // Override to change _multiInitialSyncApply behavior.
+    using MultiInitialSyncApplyFn = stdx::function<Status(
+        MultiApplier::OperationPtrs* ops, const HostAndPort& source, AtomicUInt32* fetchCount)>;
+    MultiInitialSyncApplyFn multiInitialSyncApplyFn = [](
+        MultiApplier::OperationPtrs*, const HostAndPort&, AtomicUInt32*) { return Status::OK(); };
+
+    StatusWith<ReplicaSetConfig> replSetConfigResult = ReplicaSetConfig();
 
 private:
     StatusWith<OpTime> _multiApply(OperationContext* txn,

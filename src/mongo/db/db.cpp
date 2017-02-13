@@ -76,7 +76,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/mongod_options.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer_impl.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/range_deleter_service.h"
@@ -126,6 +126,7 @@
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/listen.h"
@@ -511,6 +512,8 @@ void _initWireSpec() {
     spec.isInternalClient = true;
 }
 
+MONGO_FP_DECLARE(shutdownAtStartup);
+
 ExitCode _initAndListen(int listenPort) {
     Client::initThread("initandlisten");
 
@@ -518,7 +521,7 @@ ExitCode _initAndListen(int listenPort) {
     auto globalServiceContext = getGlobalServiceContext();
 
     globalServiceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
-    globalServiceContext->setOpObserver(stdx::make_unique<OpObserver>());
+    globalServiceContext->setOpObserver(stdx::make_unique<OpObserverImpl>());
 
     DBDirectClientFactory::get(globalServiceContext)
         .registerImplementation([](OperationContext* txn) {
@@ -815,6 +818,10 @@ ExitCode _initAndListen(int listenPort) {
     }
 #endif
 
+    if (MONGO_FAIL_POINT(shutdownAtStartup)) {
+        log() << "starting clean exit via failpoint";
+        exitCleanly(EXIT_CLEAN);
+    }
     return waitForShutdown();
 }
 

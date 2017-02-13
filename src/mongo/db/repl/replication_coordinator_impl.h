@@ -206,7 +206,8 @@ public:
 
     virtual void processReplSetGetConfig(BSONObjBuilder* result) override;
 
-    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
+    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata,
+                                        bool advanceCommitPoint) override;
 
     virtual void cancelAndRescheduleElectionTimeout() override;
 
@@ -276,8 +277,8 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response) override;
 
-    void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
-                             BSONObjBuilder* builder) const override;
+    virtual void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+                                     BSONObjBuilder* builder) const override;
 
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response) override;
@@ -325,7 +326,7 @@ public:
      * If called after startReplication(), blocks until all asynchronous
      * activities associated with replication start-up complete.
      */
-    void waitForStartUpComplete();
+    void waitForStartUpComplete_forTest();
 
     /**
      * Gets the replica set configuration in use by the node.
@@ -983,11 +984,13 @@ private:
 
     /**
      * Callback that processes the ReplSetMetadata returned from a command run against another
-     * replica set member and updates protocol version 1 information (most recent optime that is
-     * committed, member id of the current PRIMARY, the current config version and the current term)
+     * replica set member and so long as the config version in the metadata matches the replica set
+     * config version this node currently has, updates the current term and optionally updates
+     * this node's notion of the commit point.
      * Returns the finish event which is invalid if the process has already finished.
      */
-    EventHandle _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata);
+    EventHandle _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata,
+                                                   bool advanceCommitPoint);
 
     /**
      * Blesses a snapshot to be used for new committed reads.
@@ -1122,6 +1125,12 @@ private:
      * mode.
      */
     void _finishCatchUpOplog_inlock(bool startToDrain);
+
+    /**
+     * Waits for the config state to leave kConfigStartingUp, which indicates that start() has
+     * finished.
+     */
+    void _waitForStartUpComplete();
 
     //
     // All member variables are labeled with one of the following codes indicating the
@@ -1339,9 +1348,8 @@ private:
     // Used for testing only.
     Date_t _priorityTakeoverWhen;  // (M)
 
-    // Callback handle used by waitForStartUpComplete() to block until configuration
+    // Callback handle used by _waitForStartUpComplete() to block until configuration
     // is loaded and external state threads have been started (unless this node is an arbiter).
-    // Used for testing only.
     CallbackHandle _finishLoadLocalConfigCbh;  // (M)
 
     // The id of the earliest member, for which the handleLivenessTimeout callback has been

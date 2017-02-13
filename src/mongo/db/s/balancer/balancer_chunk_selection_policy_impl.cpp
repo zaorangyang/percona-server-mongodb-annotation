@@ -209,6 +209,10 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToSpli
     SplitInfoVector splitCandidates;
 
     for (const auto& coll : collections) {
+        if (coll.getDropped()) {
+            continue;
+        }
+
         const NamespaceString nss(coll.getNs());
 
         auto candidatesStatus = _getSplitCandidatesForCollection(txn, nss, shardStats);
@@ -257,6 +261,10 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToMo
     MigrateInfoVector candidateChunks;
 
     for (const auto& coll : collections) {
+        if (coll.getDropped()) {
+            continue;
+        }
+
         const NamespaceString nss(coll.getNs());
 
         if (!coll.getAllowBalance()) {
@@ -295,7 +303,7 @@ BalancerChunkSelectionPolicyImpl::selectSpecificChunkToMove(OperationContext* tx
 
     const NamespaceString nss(chunk.getNS());
 
-    auto scopedCMStatus = ScopedChunkManager::getExisting(txn, nss);
+    auto scopedCMStatus = ScopedChunkManager::refreshAndGet(txn, nss);
     if (!scopedCMStatus.isOK()) {
         return scopedCMStatus.getStatus();
     }
@@ -325,7 +333,7 @@ Status BalancerChunkSelectionPolicyImpl::checkMoveAllowed(OperationContext* txn,
 
     const NamespaceString nss(chunk.getNS());
 
-    auto scopedCMStatus = ScopedChunkManager::getExisting(txn, nss);
+    auto scopedCMStatus = ScopedChunkManager::refreshAndGet(txn, nss);
     if (!scopedCMStatus.isOK()) {
         return scopedCMStatus.getStatus();
     }
@@ -358,7 +366,7 @@ Status BalancerChunkSelectionPolicyImpl::checkMoveAllowed(OperationContext* txn,
 
 StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::_getSplitCandidatesForCollection(
     OperationContext* txn, const NamespaceString& nss, const ShardStatisticsVector& shardStats) {
-    auto scopedCMStatus = ScopedChunkManager::getExisting(txn, nss);
+    auto scopedCMStatus = ScopedChunkManager::refreshAndGet(txn, nss);
     if (!scopedCMStatus.isOK()) {
         return scopedCMStatus.getStatus();
     }
@@ -412,7 +420,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
     const NamespaceString& nss,
     const ShardStatisticsVector& shardStats,
     bool aggressiveBalanceHint) {
-    auto scopedCMStatus = ScopedChunkManager::getExisting(txn, nss);
+    auto scopedCMStatus = ScopedChunkManager::refreshAndGet(txn, nss);
     if (!scopedCMStatus.isOK()) {
         return scopedCMStatus.getStatus();
     }

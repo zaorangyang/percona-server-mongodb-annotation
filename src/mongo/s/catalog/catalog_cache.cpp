@@ -30,7 +30,6 @@
 
 #include "mongo/s/catalog/catalog_cache.h"
 
-
 #include "mongo/base/status_with.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_database.h"
@@ -55,14 +54,13 @@ StatusWith<shared_ptr<DBConfig>> CatalogCache::getDatabase(OperationContext* txn
     }
 
     // Need to load from the store
-    auto status = grid.catalogClient(txn)->getDatabase(txn, dbName);
+    auto status = Grid::get(txn)->catalogClient(txn)->getDatabase(txn, dbName);
     if (!status.isOK()) {
         return status.getStatus();
     }
 
     const auto dbOpTimePair = status.getValue();
-    shared_ptr<DBConfig> db =
-        std::make_shared<DBConfig>(dbName, dbOpTimePair.value, dbOpTimePair.opTime);
+    shared_ptr<DBConfig> db = std::make_shared<DBConfig>(dbOpTimePair.value, dbOpTimePair.opTime);
     try {
         db->load(txn);
     } catch (const DBException& excep) {
