@@ -424,7 +424,7 @@ namespace audit {
                                  StringData atype,
                                  Client* client) {
         builder << AuditFields::type(atype);
-        builder << AuditFields::timestamp(BSON("$date" << static_cast<long long>(jsTime().toMillisSinceEpoch())));
+        builder << AuditFields::timestamp(BSON("$date" << jsTime().toString()));
         builder << AuditFields::local(BSON("host" << getHostNameCached() << "port" << serverGlobalParams.port));
         if (client->hasRemote()) {
             const HostAndPort hp = client->getRemote();
