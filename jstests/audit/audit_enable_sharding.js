@@ -18,7 +18,7 @@ auditTestShard(
         assert.eq(1, auditColl.count({
             atype: "enableSharding",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.ns': jsTestName(),
+            'param.ns': jsTestName(),
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },

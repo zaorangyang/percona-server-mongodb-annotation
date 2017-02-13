@@ -64,7 +64,7 @@ auditTest(
             atype: "authCheck",
             ts: withinFewSecondsBefore(beforeLoad),
             users: { $elemMatch: { user:'tom', db:testDBName} },
-            'params.command': 'killOp',
+            'param.command': 'killOp',
             result: 13, // <-- Unauthorized error, see error_codes.err...
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
 
@@ -73,7 +73,7 @@ auditTest(
             atype: "authCheck",
             ts: withinFewSecondsBefore(beforeLoad),
             users: { $elemMatch: { user:'admin', db:'admin'} },
-            'params.command': 'killOp',
+            'param.command': 'killOp',
             result: 0, // <-- Authorization successful
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },

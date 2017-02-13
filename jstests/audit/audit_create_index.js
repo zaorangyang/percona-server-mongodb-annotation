@@ -24,18 +24,18 @@ auditTest(
         assert.eq(1, auditColl.count({
             atype: "createIndex",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.ns': testDBName + '.coll',
-            'params.indexSpec.key': { a: 1 },
-            'params.indexName': 'cold',
+            'param.ns': testDBName + '.coll',
+            'param.indexSpec.key': { a: 1 },
+            'param.indexName': 'cold',
             result: 0,
         }), "FAILED background=false, audit log: " + tojson(auditColl.find().toArray()));
 
         assert.eq(1, auditColl.count({
             atype: "createIndex",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.ns': testDBName + '.coll' ,
-            'params.indexSpec.key': { b: 1 },
-            'params.indexName': 'hot',
+            'param.ns': testDBName + '.coll' ,
+            'param.indexSpec.key': { b: 1 },
+            'param.indexName': 'hot',
             result: 0,
         }), "FAILED background=true, audit log: " + tojson(auditColl.find().toArray()));
     },
