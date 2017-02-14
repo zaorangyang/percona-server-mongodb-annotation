@@ -257,7 +257,7 @@ namespace audit {
 
         public:
             Adapter(const BSONObj &obj)
-                : str(mongoutils::str::stream() << obj.jsonString() << "\n") {}
+                : str(obj.jsonString() + '\n') {}
 
             virtual const char *data() const override {
                 return str.c_str();
