@@ -399,7 +399,7 @@ namespace audit {
     namespace AuditFields {
         // Common fields
         BSONField<StringData> type("atype");
-        BSONField<BSONObj> timestamp("ts");
+        BSONField<Date_t> timestamp("ts");
         BSONField<BSONObj> local("local");
         BSONField<BSONObj> remote("remote");
         BSONField<BSONObj> param("param");
@@ -461,7 +461,7 @@ namespace audit {
                                  StringData atype,
                                  Client* client) {
         builder << AuditFields::type(atype);
-        builder << AuditFields::timestamp(BSON("$date" << jsTime().toString()));
+        builder << AuditFields::timestamp(jsTime());
         builder << AuditFields::local(
             BSON("ip" << getIpByHost(getHostNameCached()) << "port" << serverGlobalParams.port));
         if (client->hasRemote()) {
