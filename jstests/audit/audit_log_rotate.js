@@ -42,7 +42,7 @@ auditTest(
         assert.commandWorked(m.getDB('admin').runCommand({ logRotate: 1 }));
         var auditLogAfterRotate = getAuditEventsCollection(m, testDBName).find({ 
             // skip audit events that will be triggered by getAuditEventsCollection itself
-            'params.ns': { $ne: testDBName + '.auditCollection' }
+            'param.ns': { $ne: testDBName + '.auditCollection' }
         }).toArray();
         assert.eq(0, auditLogAfterRotate.length,
                   "Audit log has old events after rotate: " + tojson(auditLogAfterRotate));

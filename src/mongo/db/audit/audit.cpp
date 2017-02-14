@@ -60,6 +60,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
+#include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
 
 #include "audit_options.h"
@@ -401,7 +402,7 @@ namespace audit {
         BSONField<BSONObj> timestamp("ts");
         BSONField<BSONObj> local("local");
         BSONField<BSONObj> remote("remote");
-        BSONField<BSONObj> params("params");
+        BSONField<BSONObj> param("param");
         BSONField<int> result("result");
     }
 
@@ -420,15 +421,53 @@ namespace audit {
         return ss.str();
     }
 
+    static void appendRoles(BSONObjBuilder& builder, RoleNameIterator it) {
+        BSONArrayBuilder rolebuilder(builder.subarrayStart("roles"));
+        for (; it.more(); it.next()) {
+            BSONObjBuilder r(rolebuilder.subobjStart());
+            r.append("role", it->getRole());
+            r.append("db", it->getDB());
+            r.doneFast();
+        }
+        rolebuilder.doneFast();
+    }
+
+    static void appendRoles(BSONObjBuilder& builder, const std::vector<RoleName>& roles) {
+        appendRoles(builder, makeRoleNameIterator(roles.begin(), roles.end()));
+    }
+
+    static std::string getIpByHost(const std::string& host) {
+        if (host.empty()) {
+            return {};
+        }
+
+        static StringMap<std::string> hostToIpCache;
+        static stdx::mutex cacheMutex;
+
+        std::string ip;
+        {
+            stdx::lock_guard<stdx::mutex> lk(cacheMutex);
+            ip = hostToIpCache[host];
+        }
+        if (ip.empty()) {
+            ip = hostbyname(host.c_str());
+            stdx::lock_guard<stdx::mutex> lk(cacheMutex);
+            hostToIpCache[host] = ip;
+        }
+        return ip;
+    }
+
     static void appendCommonInfo(BSONObjBuilder &builder,
                                  StringData atype,
                                  Client* client) {
         builder << AuditFields::type(atype);
-        builder << AuditFields::timestamp(BSON("$date" << static_cast<long long>(jsTime().toMillisSinceEpoch())));
-        builder << AuditFields::local(BSON("host" << getHostNameCached() << "port" << serverGlobalParams.port));
+        builder << AuditFields::timestamp(BSON("$date" << jsTime().toString()));
+        builder << AuditFields::local(
+            BSON("ip" << getIpByHost(getHostNameCached()) << "port" << serverGlobalParams.port));
         if (client->hasRemote()) {
             const HostAndPort hp = client->getRemote();
-            builder << AuditFields::remote(BSON("host" << hp.host() << "port" << hp.port()));
+            builder << AuditFields::remote(
+                BSON("ip" << getIpByHost(hp.host()) << "port" << hp.port()));
         } else {
             // It's not 100% clear that an empty obj here actually makes sense..
             builder << AuditFields::remote(BSONObj());
@@ -444,6 +483,7 @@ namespace audit {
                 user.doneFast();
             }
             users.doneFast();
+            appendRoles(builder, session->getAuthenticatedRoleNames());
         } else {
             // It's not 100% clear that an empty obj here actually makes sense..
             builder << "users" << BSONObj();
@@ -458,17 +498,6 @@ namespace audit {
         privbuilder.doneFast();
     }
 
-    static void appendRoles(BSONObjBuilder &builder, const std::vector<RoleName>& roles) {
-        BSONArrayBuilder rolebuilder(builder.subarrayStart("roles"));
-        for (std::vector<RoleName>::const_iterator it = roles.begin(); it != roles.end(); ++it) {
-            BSONObjBuilder r(rolebuilder.subobjStart());
-            r.append("role", it->getRole());
-            r.append("db", it->getDB());
-            r.doneFast();
-        }
-        rolebuilder.doneFast();
-    }
-
 
     static void _auditEvent(Client* client,
                             StringData atype,
@@ -476,7 +505,7 @@ namespace audit {
                             ErrorCodes::Error result = ErrorCodes::OK) {
         BSONObjBuilder builder;
         appendCommonInfo(builder, atype, client);
-        builder << AuditFields::params(params);
+        builder << AuditFields::param(params);
         builder << AuditFields::result(static_cast<int>(result));
         _auditLog->append(builder.done());
     }

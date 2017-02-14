@@ -39,10 +39,10 @@ auditTestRepl(
                 // Allow timestamps up to 20 seconds old, since replSetReconfig may be slow
                 ts: withinTheLast20Seconds,
                 // old version is not set, so we do not query for it here
-                'params.old._id': oldConfig._id,
-                'params.old.version': 1,
-                'params.new._id': newConfig._id,
-                'params.new.version': 200,
+                'param.old._id': oldConfig._id,
+                'param.old.version': 1,
+                'param.new._id': newConfig._id,
+                'param.new.version': 200,
                 result: 0,
             }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
         });

@@ -26,7 +26,7 @@ auditTestShard(
         assert.eq(1, auditColl.count({
             atype: "removeShard",
             ts: withinFewSecondsBefore(beforeLoad),
-            'params.shard': 'removable',
+            'param.shard': 'removable',
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },

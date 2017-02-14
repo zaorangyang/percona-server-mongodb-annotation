@@ -48,8 +48,8 @@ auditTest(
             atype: "authCheck",
             ts: withinFewSecondsBefore(beforeLoad),
             users: { $elemMatch: { user:'tom', db:testDBName} },
-            'params.ns': testDBName + '.' + 'foo',
-            'params.command': 'update',
+            'param.ns': testDBName + '.' + 'foo',
+            'param.command': 'update',
             result: 13, // <-- Unauthorized error, see error_codes.err...
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
 
@@ -58,8 +58,8 @@ auditTest(
             atype: "authCheck",
             ts: withinFewSecondsBefore(beforeLoad),
             users: { $elemMatch: { user:'admin', db:'admin'} },
-            'params.ns': testDBName + '.' + 'foo',
-            'params.command': 'update',
+            'param.ns': testDBName + '.' + 'foo',
+            'param.command': 'update',
             result: 0, // <-- Authorization successful
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },

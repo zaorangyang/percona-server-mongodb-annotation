@@ -26,8 +26,8 @@ auditTest(
             assert.eq(1, auditColl.count({
                 atype: "renameCollection",
                 ts: withinFewSecondsBefore(beforeLoad),
-                'params.old': testDBName + '.' + oldName,
-                'params.new': testDBName + '.' + newName,
+                'param.old': testDBName + '.' + oldName,
+                'param.new': testDBName + '.' + newName,
                 result: 0,
             }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
         }
