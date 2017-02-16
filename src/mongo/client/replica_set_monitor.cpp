@@ -180,9 +180,6 @@ ReplicaSetMonitor::ReplicaSetMonitor(StringData name, const std::set<HostAndPort
     : _state(std::make_shared<SetState>(name, seeds)),
       _executor(globalRSMonitorManager.getExecutor()) {}
 
-ReplicaSetMonitor::ReplicaSetMonitor(const MongoURI& uri)
-    : _state(std::make_shared<SetState>(uri)), _executor(globalRSMonitorManager.getExecutor()) {}
-
 void ReplicaSetMonitor::init() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     invariant(_executor);
@@ -386,10 +383,6 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitor::createIfNeeded(const string& na
                                                                 const set<HostAndPort>& servers) {
     return globalRSMonitorManager.getOrCreateMonitor(
         ConnectionString::forReplicaSet(name, vector<HostAndPort>(servers.begin(), servers.end())));
-}
-
-shared_ptr<ReplicaSetMonitor> ReplicaSetMonitor::createIfNeeded(const MongoURI& uri) {
-    return globalRSMonitorManager.getOrCreateMonitor(uri);
 }
 
 shared_ptr<ReplicaSetMonitor> ReplicaSetMonitor::get(const std::string& name) {
@@ -826,18 +819,11 @@ HostAndPort Refresher::_refreshUntilMatches(const ReadPreferenceSetting* criteri
                 StatusWith<BSONObj> isMasterReplyStatus{ErrorCodes::InternalError,
                                                         "Uninitialized variable"};
                 int64_t pingMicros = 0;
-                MongoURI targetURI;
-
-                if (_set->setUri.isValid()) {
-                    targetURI = _set->setUri.cloneURIForServer(ns.host);
-                } else {
-                    targetURI = MongoURI(ConnectionString(ns.host));
-                }
 
                 // Do not do network calls while holding a mutex
                 lk.unlock();
                 try {
-                    ScopedDbConnection conn(targetURI, socketTimeoutSecs);
+                    ScopedDbConnection conn(ConnectionString(ns.host), socketTimeoutSecs);
                     bool ignoredOutParam = false;
                     Timer timer;
                     BSONObj reply;
@@ -1012,12 +998,6 @@ SetState::SetState(StringData name, const std::set<HostAndPort>& seedNodes)
     }
 
     DEV checkInvariants();
-}
-
-SetState::SetState(const MongoURI& uri)
-    : SetState(uri.getSetName(),
-               std::set<HostAndPort>(uri.getServers().begin(), uri.getServers().end())) {
-    setUri = uri;
 }
 
 HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) const {
