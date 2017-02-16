@@ -66,8 +66,6 @@ using CBHandle = ReplicationExecutor::CallbackHandle;
 using CBHStatus = StatusWith<CBHandle>;
 using LockGuard = stdx::lock_guard<stdx::mutex>;
 
-MONGO_FP_DECLARE(blockHeartbeatStepdown);
-
 }  // namespace
 
 using executor::RemoteCommandRequest;
@@ -215,7 +213,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     _scheduleHeartbeatToTarget(
         target, targetIndex, std::max(now, action.getNextHeartbeatStartDate()));
 
-    _handleHeartbeatResponseAction(action, hbStatusResponse, false /*we're not holding _mutex*/);
+    _handleHeartbeatResponseAction(action, hbStatusResponse);
 }
 
 void ReplicationCoordinatorImpl::_updateOpTimesFromHeartbeat_inlock(int targetIndex,
@@ -235,13 +233,11 @@ void ReplicationCoordinatorImpl::_updateOpTimesFromHeartbeat_inlock(int targetIn
 
 void ReplicationCoordinatorImpl::_handleHeartbeatResponseAction(
     const HeartbeatResponseAction& action,
-    const StatusWith<ReplSetHeartbeatResponse>& responseStatus,
-    bool hasMutex) {
+    const StatusWith<ReplSetHeartbeatResponse>& responseStatus) {
     switch (action.getAction()) {
         case HeartbeatResponseAction::NoAction:
             // Update the cached member state if different than the current topology member state
             if (_memberState != _topCoord->getMemberState()) {
-                invariant(!hasMutex);
                 stdx::unique_lock<stdx::mutex> lk(_mutex);
                 const PostMemberStateUpdateAction postUpdateAction =
                     _updateMemberStateFromTopologyCoordinator_inlock();
@@ -261,7 +257,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponseAction(
             log() << "Stepping down from primary in response to heartbeat";
             _topCoord->prepareForStepDown();
             // Don't need to wait for stepdown to finish.
-            _stepDownStart(hasMutex);
+            _stepDownStart();
             break;
         case HeartbeatResponseAction::StepDownRemotePrimary: {
             invariant(action.getPrimaryConfigIndex() != _selfIndex);
@@ -315,19 +311,11 @@ void ReplicationCoordinatorImpl::_requestRemotePrimaryStepdown(const HostAndPort
     }
 }
 
-ReplicationExecutor::EventHandle ReplicationCoordinatorImpl::_stepDownStart(bool hasMutex) {
-    {
-        boost::optional<stdx::lock_guard<stdx::mutex>> lk;
-        if (!hasMutex) {
-            lk.emplace(_mutex);
-        }
-        _stepDownPending = true;
-    }
+ReplicationExecutor::EventHandle ReplicationCoordinatorImpl::_stepDownStart() {
     auto finishEvent = _makeEvent();
     if (!finishEvent) {
         return finishEvent;
     }
-
     _replExecutor.scheduleWorkWithGlobalExclusiveLock(stdx::bind(
         &ReplicationCoordinatorImpl::_stepDownFinish, this, stdx::placeholders::_1, finishEvent));
     return finishEvent;
@@ -337,19 +325,6 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
     const ReplicationExecutor::CallbackArgs& cbData,
     const ReplicationExecutor::EventHandle& finishedEvent) {
     if (cbData.status == ErrorCodes::CallbackCanceled) {
-        return;
-    }
-
-    if (MONGO_FAIL_POINT(blockHeartbeatStepdown)) {
-        // Must reschedule rather than block so we don't take up threads in the replication
-        // executor.
-        sleepmillis(10);
-        _replExecutor.scheduleWorkWithGlobalExclusiveLock(
-            stdx::bind(&ReplicationCoordinatorImpl::_stepDownFinish,
-                       this,
-                       stdx::placeholders::_1,
-                       finishedEvent));
-
         return;
     }
 
@@ -693,9 +668,7 @@ void ReplicationCoordinatorImpl::_handleLivenessTimeout(
                     _topCoord->setMemberAsDown(now, memberIndex, _getMyLastDurableOpTime_inlock());
                 // Don't mind potential asynchronous stepdown as this is the last step of
                 // liveness check.
-                _handleHeartbeatResponseAction(action,
-                                               makeStatusWith<ReplSetHeartbeatResponse>(),
-                                               true /*we're holding _mutex*/);
+                _handleHeartbeatResponseAction(action, makeStatusWith<ReplSetHeartbeatResponse>());
             }
         }
     }
