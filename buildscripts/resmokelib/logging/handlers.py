@@ -43,12 +43,10 @@ class BufferedHandler(logging.Handler):
 
         self.capacity = capacity
         self.interval_secs = interval_secs
+        self.buffer = []
 
-        self.__emit_lock = threading.Lock()  # Prohibits concurrent access to 'self.__emit_buffer'.
-        self.__emit_buffer = []
-
-        self.__flush_lock = threading.Lock()  # Serializes callers of self.flush().
-        self.__timer = None  # Defer creation until we actually begin to log messages.
+        self._lock = threading.Lock()
+        self._timer = None  # Defer creation until actually begin to log messages.
 
     def _new_timer(self):
         """
@@ -56,7 +54,7 @@ class BufferedHandler(logging.Handler):
         flush() method after 'interval_secs' seconds.
         """
 
-        return timer.AlarmClock(self.interval_secs, self.flush)
+        return timer.AlarmClock(self.interval_secs, self.flush, args=[self])
 
     def process_record(self, record):
         """
@@ -81,45 +79,37 @@ class BufferedHandler(logging.Handler):
         will expire after another 'interval_secs' seconds.
         """
 
-        if self.__timer is None:
-            self.__timer = self._new_timer()
-            self.__timer.start()
+        with self._lock:
+            self.buffer.append(self.process_record(record))
+            if len(self.buffer) >= self.capacity:
+                if self._timer is not None:
+                    self._timer.snooze()
+                self.flush_with_lock(False)
+                if self._timer is not None:
+                    self._timer.reset()
 
-        with self.__emit_lock:
-            self.__emit_buffer.append(self.process_record(record))
-            if len(self.__emit_buffer) >= self.capacity:
-                # Trigger the timer thread to cause it to flush the buffer early.
-                self.__timer.trigger()
+        if self._timer is None:
+            self._timer = self._new_timer()
+            self._timer.start()
 
-    def flush(self):
+    def flush(self, close_called=False):
         """
         Ensures all logging output has been flushed.
         """
 
-        self.__flush(close_called=False)
+        with self._lock:
+            if self.buffer:
+                self.flush_with_lock(close_called)
 
-    def __flush(self, close_called):
+    def flush_with_lock(self, close_called):
         """
         Ensures all logging output has been flushed.
+
+        This version resets the buffers back to an empty list and is
+        intended to be overridden by subclasses.
         """
 
-        with self.__emit_lock:
-            buf = self.__emit_buffer
-            self.__emit_buffer = []
-
-        # The buffer 'buf' is flushed without holding 'self.__emit_lock' to avoid causing callers of
-        # self.emit() to block behind the completion of a potentially long-running flush operation.
-        if buf:
-            with self.__flush_lock:
-                self._flush_buffer_with_lock(buf, close_called)
-
-    def _flush_buffer_with_lock(self, buf, close_called):
-        """
-        Ensures all logging output has been flushed.
-        """
-
-        raise NotImplementedError("_flush_buffer_with_lock must be implemented by BufferedHandler"
-                                  " subclasses")
+        self.buffer = []
 
     def close(self):
         """
@@ -128,10 +118,9 @@ class BufferedHandler(logging.Handler):
         Stops the timer and flushes the buffer.
         """
 
-        if self.__timer is not None:
-            self.__timer.dismiss()
-
-        self.__flush(close_called=True)
+        if self._timer is not None:
+            self._timer.dismiss()
+        self.flush(close_called=True)
 
         logging.Handler.close(self)
 
