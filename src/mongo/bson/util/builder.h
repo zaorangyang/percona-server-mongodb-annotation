@@ -402,10 +402,6 @@ public:
             return SBNUM(x, MONGO_PTR_SIZE, "0x%lX");
         }
     }
-    StringBuilderImpl& operator<<(bool val) {
-        *_buf.grow(1) = val ? '1' : '0';
-        return *this;
-    }
     StringBuilderImpl& operator<<(char c) {
         _buf.grow(1)[0] = c;
         return *this;
