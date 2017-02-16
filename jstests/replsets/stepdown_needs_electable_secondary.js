@@ -40,8 +40,7 @@
             {"_id": 2, "host": nodes[2]},
             {"_id": 3, "host": nodes[3], "priority": 0},  // unelectable
             {"_id": 4, "host": nodes[4], "priority": 0}   // unelectable
-        ],
-        "settings": {"chainingAllowed": false}
+        ]
     });
 
     function assertStepDownFailsWithExceededTimeLimit(node) {

@@ -43,7 +43,7 @@
     // Test setup
     //
     var name = 'stepdown_needs_majority';
-    var replTest = new ReplSetTest({name: name, nodes: 5, settings: {chainingAllowed: false}});
+    var replTest = new ReplSetTest({name: name, nodes: 5});
 
     replTest.startSet();
     replTest.initiate();
