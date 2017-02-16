@@ -451,7 +451,7 @@ var Cluster = function(options) {
             } else {
                 // If the shard is a standalone mongod, the format of st.shard0.name in ShardingTest
                 // is "localhost:20006".
-                cluster.shards[shard.shardName] = [shard.name];
+                cluster.shards[i] = [shard.name];
             }
             ++i;
             shard = st['shard' + i];
