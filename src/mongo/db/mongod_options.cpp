@@ -358,12 +358,10 @@ Status addMongodOptions(moe::OptionSection* options) {
 
     // Deprecated option that we don't want people to use for performance reasons
     storage_options
-        .addOptionChaining("storage.mmapv1.journal.nopreallocj",
-                           "nopreallocj",
-                           moe::Switch,
-                           "don't preallocate journal files")
+        .addOptionChaining(
+            "nopreallocj", "nopreallocj", moe::Switch, "don't preallocate journal files")
         .hidden()
-        .setSources(moe::SourceAll);
+        .setSources(moe::SourceAllLegacy);
 
 #if defined(__linux__)
     general_options.addOptionChaining(
