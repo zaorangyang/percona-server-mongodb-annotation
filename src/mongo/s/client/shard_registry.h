@@ -97,6 +97,12 @@ public:
      */
     void rebuildShardIfExists(const ConnectionString& newConnString, ShardFactory* factory);
 
+    /**
+     * Rebuilds config shard. The result is to recreate a ReplicaSetMonitor in the case it does
+     * not exist.
+     */
+    void rebuildConfigShard(ShardFactory* factory);
+
 private:
     /**
      * Reads shards docs from the catalog client and fills in maps.
@@ -165,6 +171,14 @@ public:
      * returned false.
      */
     bool reload(OperationContext* txn);
+
+    /**
+     * Throws out and reconstructs the config shard.  This has the effect that if replica set
+     * monitoring of the config server replica set has stopped (because the set was down for too
+     * long), this will cause the ReplicaSetMonitor to be rebuilt, which will re-trigger monitoring
+     * of the config replica set to resume.
+     */
+    void rebuildConfigShard();
 
     /**
      * Takes a connection string describing either a shard or config server replica set, looks
