@@ -29,6 +29,7 @@ var (
 	authTestServerMode  bool
 	isMongosTestServer  bool
 	testCollectorOpts   = StatOptions{
+		Collect:  "format",
 		Buffered: true,
 	}
 )
@@ -180,7 +181,7 @@ func TestOpInsertLiveDB(t *testing.T) {
 		}
 	}()
 
-	statCollector, _ := newStatCollector(testCollectorOpts, "format", true, true)
+	statCollector, _ := newStatCollector(testCollectorOpts, true, true)
 	statRec := statCollector.StatRecorder.(*BufferedStatRecorder)
 	context := NewExecutionContext(statCollector)
 
@@ -296,7 +297,7 @@ func TestUpdateOpLiveDB(t *testing.T) {
 		}
 	}()
 
-	statCollector, _ := newStatCollector(testCollectorOpts, "format", true, true)
+	statCollector, _ := newStatCollector(testCollectorOpts, true, true)
 	statRec := statCollector.StatRecorder.(*BufferedStatRecorder)
 	context := NewExecutionContext(statCollector)
 
@@ -399,7 +400,7 @@ func TestQueryOpLiveDB(t *testing.T) {
 		}
 	}()
 
-	statCollector, _ := newStatCollector(testCollectorOpts, "format", true, true)
+	statCollector, _ := newStatCollector(testCollectorOpts, true, true)
 	statRec := statCollector.StatRecorder.(*BufferedStatRecorder)
 	context := NewExecutionContext(statCollector)
 
@@ -487,7 +488,7 @@ func TestOpGetMoreLiveDB(t *testing.T) {
 			}
 		}
 	}()
-	statCollector, _ := newStatCollector(testCollectorOpts, "format", true, true)
+	statCollector, _ := newStatCollector(testCollectorOpts, true, true)
 	statRec := statCollector.StatRecorder.(*BufferedStatRecorder)
 	context := NewExecutionContext(statCollector)
 
@@ -588,7 +589,7 @@ func TestOpGetMoreMultiCursorLiveDB(t *testing.T) {
 			}
 		}
 	}()
-	statCollector, _ := newStatCollector(testCollectorOpts, "format", true, true)
+	statCollector, _ := newStatCollector(testCollectorOpts, true, true)
 	statRec := statCollector.StatRecorder.(*BufferedStatRecorder)
 	context := NewExecutionContext(statCollector)
 
@@ -709,7 +710,7 @@ func TestOpKillCursorsLiveDB(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	statCollector, _ := newStatCollector(testCollectorOpts, "format", true, true)
+	statCollector, _ := newStatCollector(testCollectorOpts, true, true)
 	statRec := statCollector.StatRecorder.(*BufferedStatRecorder)
 	context := NewExecutionContext(statCollector)
 
@@ -775,7 +776,7 @@ func TestCommandOpInsertLiveDB(t *testing.T) {
 		}
 	}()
 
-	statCollector, _ := newStatCollector(testCollectorOpts, "format", true, true)
+	statCollector, _ := newStatCollector(testCollectorOpts, true, true)
 	statRec := statCollector.StatRecorder.(*BufferedStatRecorder)
 	context := NewExecutionContext(statCollector)
 
@@ -875,7 +876,7 @@ func TestCommandOpFindLiveDB(t *testing.T) {
 		}
 	}()
 
-	statCollector, _ := newStatCollector(testCollectorOpts, "format", true, true)
+	statCollector, _ := newStatCollector(testCollectorOpts, true, true)
 	statRec := statCollector.StatRecorder.(*BufferedStatRecorder)
 	context := NewExecutionContext(statCollector)
 
@@ -967,7 +968,7 @@ func TestCommandOpGetMoreLiveDB(t *testing.T) {
 			}
 		}
 	}()
-	statCollector, _ := newStatCollector(testCollectorOpts, "format", true, true)
+	statCollector, _ := newStatCollector(testCollectorOpts, true, true)
 	statRec := statCollector.StatRecorder.(*BufferedStatRecorder)
 	context := NewExecutionContext(statCollector)
 
