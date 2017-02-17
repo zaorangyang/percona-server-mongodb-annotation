@@ -23,7 +23,7 @@ if [ "$1" == "-h" -o "$1" == "--help" ] ; then
 fi
 
 QUIET=0
-if [ $1 == "-q" ]; then
+if [ "$1" == "-q" ]; then
     QUIET=1
 elif [ $# -gt 0  ]; then
     echo "Incorrect parameter"
