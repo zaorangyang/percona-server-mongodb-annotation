@@ -267,9 +267,12 @@ fi
 echo " * To start the service, configure your engine and start mongod"
 
 %preun server
-#
 %if 0%{?rhel} >= 7
 %systemd_preun mongod.service
+%else
+if [ -x %{_sysconfdir}/init.d/mongod ] ; then
+  %{_sysconfdir}/init.d/mongod stop
+fi
 %endif
 
 %postun server
