@@ -464,7 +464,7 @@ void MigrationSourceManager::cleanupOnError(OperationContext* txn) {
 void MigrationSourceManager::_cleanup(OperationContext* txn) {
     invariant(_state != kDone);
 
-    auto cloneDriver = [&]() {
+    {
         // Unregister from the collection's sharding state
         ScopedTransaction scopedXact(txn, MODE_IX);
         AutoGetCollection autoColl(txn, getNss(), MODE_IX, MODE_X);
@@ -479,9 +479,7 @@ void MigrationSourceManager::_cleanup(OperationContext* txn) {
         if (_critSecSignal) {
             _critSecSignal->set();
         }
-
-        return std::move(_cloneDriver);
-    }();
+    }
 
     // Decrement the metadata op counter outside of the collection lock in order to hold it for as
     // short as possible.
@@ -489,8 +487,9 @@ void MigrationSourceManager::_cleanup(OperationContext* txn) {
         ShardingStateRecovery::endMetadataOp(txn);
     }
 
-    if (cloneDriver) {
-        cloneDriver->cancelClone(txn);
+    if (_cloneDriver) {
+        _cloneDriver->cancelClone(txn);
+        _cloneDriver.reset();
     }
 
     _state = kDone;

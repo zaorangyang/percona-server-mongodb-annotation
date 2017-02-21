@@ -28,8 +28,6 @@
 
 #pragma once
 
-#include <vector>
-
 #include "mongo/stdx/list.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -103,8 +101,6 @@ private:
     using NewConnectionCb = stdx::function<void(std::unique_ptr<AbstractMessagingPort>)>;
     using WorkHandle = stdx::function<Status(AbstractMessagingPort*)>;
 
-    std::vector<LegacySessionHandle> lockAllSessions(const stdx::unique_lock<stdx::mutex>&) const;
-
     /**
      * Connection object, to associate Sessions with AbstractMessagingPorts.
      */
@@ -131,8 +127,8 @@ private:
     public:
         ~LegacySession();
 
-        static LegacySessionHandle create(std::unique_ptr<AbstractMessagingPort> amp,
-                                          TransportLayerLegacy* tl);
+        static std::shared_ptr<LegacySession> create(std::unique_ptr<AbstractMessagingPort> amp,
+                                                     TransportLayerLegacy* tl);
 
         TransportLayer* getTransportLayer() const override {
             return _tl;

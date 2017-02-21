@@ -602,11 +602,6 @@ public:
 
     explicit ExpressionCompare(CmpOp cmpOp);
 
-    static boost::intrusive_ptr<ExpressionCompare> create(
-        CmpOp cmpOp,
-        const boost::intrusive_ptr<Expression>& exprLeft,
-        const boost::intrusive_ptr<Expression>& exprRight);
-
 private:
     CmpOp cmpOp;
 };

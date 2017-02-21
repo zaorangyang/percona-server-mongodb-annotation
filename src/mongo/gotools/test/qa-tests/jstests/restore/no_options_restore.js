@@ -89,10 +89,6 @@
 
   // make sure the options were restored correctly
   var cappedOptionsFromDB = extractCollectionOptions(testDB, 'capped');
-  // Restore no longer honors autoIndexId.
-  if (!cappedOptionsFromDB.hasOwnProperty('autoIndexId')) {
-    cappedOptionsFromDB.autoIndexId = true;
-  }
   assert.eq(baseCappedOptionsFromDB, cappedOptionsFromDB);
   var withOptionsFromDB = extractCollectionOptions(testDB, 'withOptions');
   assert.eq(baseWithOptionsFromDB, withOptionsFromDB);

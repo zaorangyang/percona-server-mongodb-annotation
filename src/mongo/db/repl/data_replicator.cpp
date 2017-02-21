@@ -594,13 +594,6 @@ StatusWith<OpTimeWithHash> DataReplicator::doInitialSync(OperationContext* txn,
     LOG(1) << "Creating oplogBuffer.";
     _oplogBuffer = _dataReplicatorExternalState->makeInitialSyncOplogBuffer(txn);
     _oplogBuffer->startup(txn);
-    ON_BLOCK_EXIT([this, txn, &lk]() {
-        if (!lk.owns_lock()) {
-            lk.lock();
-        }
-        invariant(_oplogBuffer);
-        _oplogBuffer->shutdown(txn);
-    });
 
     lk.unlock();
     // This will call through to the storageInterfaceImpl to ReplicationCoordinatorImpl.
@@ -1214,7 +1207,8 @@ void DataReplicator::_setState_inlock(const DataReplicatorState& newState) {
 }
 
 StatusWith<HostAndPort> DataReplicator::_chooseSyncSource_inlock() {
-    auto syncSource = _opts.syncSourceSelector->chooseNewSyncSource(_lastFetched.opTime);
+    auto syncSource =
+        _opts.syncSourceSelector->chooseNewSyncSource(_lastFetched.opTime.getTimestamp());
     if (syncSource.empty()) {
         return Status{ErrorCodes::InvalidSyncSource,
                       str::stream() << "No valid sync source available. Our last fetched optime: "

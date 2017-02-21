@@ -41,7 +41,6 @@ namespace mongo {
 class BSONObjBuilder;
 class ConnectionString;
 class ReplicaSetMonitor;
-class MongoURI;
 
 /**
  * Manages the lifetime of a set of replica set monitors.
@@ -59,7 +58,6 @@ public:
      */
     std::shared_ptr<ReplicaSetMonitor> getMonitor(StringData setName);
     std::shared_ptr<ReplicaSetMonitor> getOrCreateMonitor(const ConnectionString& connStr);
-    std::shared_ptr<ReplicaSetMonitor> getOrCreateMonitor(const MongoURI& uri);
 
     /**
      * Retrieves the names of all sets tracked by this manager.
@@ -102,8 +100,6 @@ private:
 
     // Executor for monitoring replica sets.
     std::unique_ptr<executor::TaskExecutor> _taskExecutor;
-
-    void _setupTaskExecutorInLock(const std::string& name);
 
     // set to true when shutdown has been called.
     bool _isShutdown{false};

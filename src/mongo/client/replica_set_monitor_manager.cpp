@@ -34,7 +34,6 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/client/mongo_uri.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
@@ -75,7 +74,11 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getMonitor(StringData se
     }
 }
 
-void ReplicaSetMonitorManager::_setupTaskExecutorInLock(const std::string& name) {
+shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(
+    const ConnectionString& connStr) {
+    invariant(connStr.type() == ConnectionString::SET);
+
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     // do not restart taskExecutor if is in shutdown
     if (!_taskExecutor && !_isShutdown) {
         // construct task executor
@@ -85,17 +88,10 @@ void ReplicaSetMonitorManager::_setupTaskExecutorInLock(const std::string& name)
             stdx::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
         LOG(1) << "Starting up task executor for monitoring replica sets in response to request to "
                   "monitor set: "
-               << redact(name);
+               << connStr.toString();
         _taskExecutor->startup();
     }
-}
 
-shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(
-    const ConnectionString& connStr) {
-    invariant(connStr.type() == ConnectionString::SET);
-
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _setupTaskExecutorInLock(connStr.toString());
     auto setName = connStr.getSetName();
     auto monitor = _monitors[setName].lock();
     if (monitor) {
@@ -107,25 +103,6 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(
     log() << "Starting new replica set monitor for " << connStr.toString();
 
     auto newMonitor = std::make_shared<ReplicaSetMonitor>(setName, servers);
-    _monitors[setName] = newMonitor;
-    newMonitor->init();
-    return newMonitor;
-}
-
-shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(const MongoURI& uri) {
-    invariant(uri.type() == ConnectionString::SET);
-
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _setupTaskExecutorInLock(uri.toString());
-    const auto& setName = uri.getSetName();
-    auto monitor = _monitors[setName].lock();
-    if (monitor) {
-        return monitor;
-    }
-
-    log() << "Starting new replica set monitor for " << uri.toString();
-
-    auto newMonitor = std::make_shared<ReplicaSetMonitor>(uri);
     _monitors[setName] = newMonitor;
     newMonitor->init();
     return newMonitor;

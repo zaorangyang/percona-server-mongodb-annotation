@@ -360,8 +360,6 @@ void DocumentSourceMatch::joinMatchWith(intrusive_ptr<DocumentSourceMatch> other
     StatusWithMatchExpression status = uassertStatusOK(
         MatchExpressionParser::parse(_predicate, ExtensionsCallbackNoop(), pExpCtx->getCollator()));
     _expression = std::move(status.getValue());
-    _dependencies = DepsTracker(_dependencies.getMetadataAvailable());
-    getDependencies(&_dependencies);
 }
 
 pair<intrusive_ptr<DocumentSourceMatch>, intrusive_ptr<DocumentSourceMatch>>
@@ -372,7 +370,7 @@ DocumentSourceMatch::splitSourceBy(const std::set<std::string>& fields) {
     invariant(newExpr.first || newExpr.second);
 
     if (!newExpr.first) {
-        // The entire $match depends on 'fields'.
+        // The entire $match dependends on 'fields'.
         _expression = std::move(newExpr.second);
         return {nullptr, this};
     } else if (!newExpr.second) {

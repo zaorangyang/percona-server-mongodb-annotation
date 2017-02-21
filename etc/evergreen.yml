@@ -152,7 +152,7 @@ functions:
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/artifacts/${build_id}.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/artifacts/${build_id}.tgz
       bucket: mciuploads
       extract_to: src
 
@@ -161,7 +161,7 @@ functions:
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/binaries/mongo-${build_id}.${ext|tgz}
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/binaries/mongo-${build_id}.${ext|tgz}
       bucket: mciuploads
       local_file: src/mongo-binaries.tgz
 
@@ -196,7 +196,7 @@ functions:
   "get buildnumber" : &get_buildnumber
     command: keyval.inc
     params:
-      key: "${build_variant}_v3.4"
+      key: "${build_variant}_master"
       destination: "builder_num"
 
   "run diskstats": &run_diskstats
@@ -297,7 +297,7 @@ functions:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: src/mongo-debugsymbols.tgz
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/debugsymbols/debugsymbols-${build_id}.${ext|tgz}
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/debugsymbols/debugsymbols-${build_id}.${ext|tgz}
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
@@ -309,7 +309,7 @@ functions:
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/debugsymbols/debugsymbols-${build_id}.${ext|tgz}
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/debugsymbols/debugsymbols-${build_id}.${ext|tgz}
       bucket: mciuploads
       local_file: src/mongo-debugsymbols.tgz
       build_variants:
@@ -622,7 +622,7 @@ functions:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: jstests.tgz
-        remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/jstestfuzz/${task_id}-${execution}.tgz
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/jstestfuzz/${task_id}-${execution}.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
@@ -803,7 +803,7 @@ post:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: src/diagnostic-data.tgz
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/ftdc/mongo-diagnostic-data-${task_id}-${execution}.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/ftdc/mongo-diagnostic-data-${task_id}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
@@ -834,7 +834,7 @@ post:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: "src/gcov-intermediate-files.tgz"
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/gcov/gcov-intermediate-files-${task_id}-${execution}.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/gcov/gcov-intermediate-files-${task_id}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
@@ -884,7 +884,7 @@ post:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: src/jepsen-mongod-logs.tgz
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/jepsen/jepsen-mongod-logs-${task_id}-${execution}.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/jepsen/jepsen-mongod-logs-${task_id}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
@@ -903,7 +903,7 @@ post:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: src/jepsen-results.tgz
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/jepsen/jepsen-results-${task_id}-${execution}.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/jepsen/jepsen-results-${task_id}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
@@ -923,7 +923,7 @@ post:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: mongo-coredumps.tgz
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/coredumps/mongo-coredumps-${build_id}-${task_name}-${execution}.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/coredumps/mongo-coredumps-${build_id}-${task_name}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
@@ -943,7 +943,7 @@ post:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: diskstats.tgz
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/diskstats/mongo-diskstats-${task_id}-${execution}.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/diskstats/mongo-diskstats-${task_id}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
@@ -1102,7 +1102,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: src/mongodb-binaries.tgz
-        remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/binaries/mongo-${build_id}.${ext|tgz}
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/binaries/mongo-${build_id}.${ext|tgz}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
@@ -1112,7 +1112,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: artifacts.tgz
-        remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/artifacts/${build_id}.tgz
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/artifacts/${build_id}.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: application/tar
@@ -1122,7 +1122,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: src/mongodb-unittests.tgz
-        remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/unittests/${build_id}.tgz
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/unittests/${build_id}.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
@@ -1133,7 +1133,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: src/distsrc.${ext|tgz}
-        remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
@@ -1331,7 +1331,7 @@ tasks:
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/unittests/${build_id}.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/unittests/${build_id}.tgz
       bucket: mciuploads
       extract_to: src
   - func: "run tests"
@@ -1402,6 +1402,18 @@ tasks:
     vars:
       resmoke_args: --suites=aggregation_read_concern_majority_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
+
+- <<: *task_template
+  name: aggregation_read_concern_majority_passthrough_pv0_WT
+  depends_on:
+  - name: aggregation_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=aggregation_read_concern_majority_passthrough_pv0 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
 
 - <<: *task_template
   name: aggregation_sharded_collections_passthrough_WT
@@ -2243,6 +2255,17 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: read_concern_majority_passthrough_pv0_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=read_concern_majority_passthrough_pv0 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: replicasets
   commands:
   - func: "do setup"
@@ -2591,7 +2614,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
         bucket: mciuploads
         local_file: src/distsrc.${ext|tgz}
         build_variants: [ linux-64, windows-64-2k8 ]
@@ -2650,7 +2673,7 @@ tasks:
           /usr/local/bin/notary-client.py --key-name "server-3.4" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
           if [ "${has_packages|}" = "true" ]; then
-             CURATOR_RELEASE="88f34a9f1c79db7ea9597b6e85eb5995d03714ba"
+             CURATOR_RELEASE="fab90fac3cb45c0ef411e647b3d621cbe053fe19"
              curl -L -O http://boxes.10gen.com/build/curator/curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
              tar -zxvf curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
              ./curator repo --config ./etc/repo_config.yaml --distro ${packager_distro} --edition ${repo_edition} --version ${version} --arch ${packager_arch} --packages repo
@@ -3064,12 +3087,12 @@ modules:
 - name: enterprise
   repo: git@github.com:10gen/mongo-enterprise-modules.git
   prefix: src/mongo/db/modules
-  branch: v3.4
+  branch: master
 
 - name: rocksdb
   repo: git@github.com:mongodb-partners/mongo-rocks.git
   prefix: src/mongo/db/modules
-  branch: v3.4
+  branch: master
 
 #######################################
 #            Buildvariants            #
@@ -4626,6 +4649,7 @@ buildvariants:
   - name: aggregation_WT
   - name: aggregation_facet_unwind_passthrough_WT
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: auth
   - name: auth_WT
@@ -4703,6 +4727,9 @@ buildvariants:
     distros:
     - windows-64-vs2015-large
   - name: read_concern_majority_passthrough_WT
+    distros:
+    - windows-64-vs2015-large
+  - name: read_concern_majority_passthrough_pv0_WT
     distros:
     - windows-64-vs2015-large
   - name: read_only
@@ -5103,6 +5130,7 @@ buildvariants:
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: auth
   - name: auth_WT
@@ -5163,6 +5191,7 @@ buildvariants:
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: read_concern_majority_passthrough_WT
+  - name: read_concern_majority_passthrough_pv0_WT
   - name: replicasets
   - name: replicasets_WT
   - name: replication
@@ -5320,6 +5349,7 @@ buildvariants:
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough_WT
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: audit
   - name: audit_WT
@@ -5411,6 +5441,9 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: read_concern_majority_passthrough_pv0_WT
     distros:
     - rhel62-large
   - name: read_only
@@ -7492,6 +7525,7 @@ buildvariants:
   - name: aggregation_WT
   - name: aggregation_auth
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: audit
   - name: auth
@@ -7531,6 +7565,7 @@ buildvariants:
   - name: parallel
   - name: parallel_compatibility
   - name: read_concern_majority_passthrough_WT
+  - name: read_concern_majority_passthrough_pv0_WT
   - name: replicasets_WT
   - name: replicasets_auth
   - name: replicasets_legacy
@@ -7899,6 +7934,7 @@ buildvariants:
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough_WT
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: audit
   - name: audit_WT
@@ -7970,6 +8006,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
+  - name: read_concern_majority_passthrough_pv0_WT
   - name: read_only
   - name: read_only_WT
   - name: read_only_sharded
@@ -8072,6 +8109,7 @@ buildvariants:
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough_WT
   - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_pv0_WT
   - name: aggregation_sharded_collections_passthrough_WT
   - name: audit
   - name: audit_WT
@@ -8143,6 +8181,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
+  - name: read_concern_majority_passthrough_pv0_WT
   - name: read_only
   - name: read_only_WT
   - name: read_only_sharded

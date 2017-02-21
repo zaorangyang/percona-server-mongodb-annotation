@@ -45,7 +45,6 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/rpc/protocol.h"
-#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -60,15 +59,10 @@ static Counter64 gleWtimeouts;
 static ServerStatusMetricField<Counter64> gleWtimeoutsDisplay("getLastError.wtimeouts",
                                                               &gleWtimeouts);
 
-MONGO_FP_DECLARE(hangBeforeWaitingForWriteConcern);
-
-bool commandSpecifiesWriteConcern(const BSONObj& cmdObj) {
-    return cmdObj.hasField(WriteConcernOptions::kWriteConcernField);
-}
-
 StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* txn,
                                                     const BSONObj& cmdObj,
-                                                    const std::string& dbName) {
+                                                    const std::string& dbName,
+                                                    const bool supportsWriteConcern) {
     // The default write concern if empty is {w:1}. Specifying {w:0} is/was allowed, but is
     // interpreted identically to {w:1}.
     auto wcResult = WriteConcernOptions::extractWCFromCommand(
@@ -87,11 +81,16 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* txn,
             writeConcern = {
                 WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, Seconds(30)};
         }
-    } else {
+    } else if (supportsWriteConcern) {
+        // If it supports writeConcern and does not use the default, validate the writeConcern.
         Status wcStatus = validateWriteConcern(txn, writeConcern, dbName);
         if (!wcStatus.isOK()) {
             return wcStatus;
         }
+    } else {
+        // This command doesn't do writes so it should not be passed a writeConcern. If we did not
+        // use the default writeConcern, one was provided when it shouldn't have been by the user.
+        return {ErrorCodes::InvalidOptions, "Command does not support writeConcern"};
     }
 
     return writeConcern;
@@ -182,8 +181,6 @@ Status waitForWriteConcern(OperationContext* txn,
     LOG(2) << "Waiting for write concern. OpTime: " << replOpTime
            << ", write concern: " << writeConcern.toBSON();
     auto replCoord = repl::ReplicationCoordinator::get(txn);
-
-    MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangBeforeWaitingForWriteConcern);
 
     // Next handle blocking on disk
     Timer syncTimer;

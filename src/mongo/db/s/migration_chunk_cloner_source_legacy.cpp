@@ -142,14 +142,16 @@ public:
                 stdx::lock_guard<stdx::mutex> sl(_cloner->_mutex);
                 _cloner->_deleted.push_back(_idObj);
                 _cloner->_memoryUsed += _idObj.firstElement().size() + 5;
-            } break;
+                break;
+            }
 
             case 'i':
             case 'u': {
                 stdx::lock_guard<stdx::mutex> sl(_cloner->_mutex);
                 _cloner->_reload.push_back(_idObj);
                 _cloner->_memoryUsed += _idObj.firstElement().size() + 5;
-            } break;
+                break;
+            }
 
             default:
                 MONGO_UNREACHABLE;
@@ -176,18 +178,23 @@ MigrationChunkClonerSourceLegacy::MigrationChunkClonerSourceLegacy(MoveChunkRequ
       _recipientHost(std::move(recipientHost)) {}
 
 MigrationChunkClonerSourceLegacy::~MigrationChunkClonerSourceLegacy() {
-    invariant(_state == kDone);
     invariant(!_deleteNotifyExec);
 }
 
 Status MigrationChunkClonerSourceLegacy::startClone(OperationContext* txn) {
-    invariant(_state == kNew);
     invariant(!txn->lockState()->isLocked());
 
-    // Load the ids of the currently available documents
-    auto storeCurrentLocsStatus = _storeCurrentLocs(txn);
-    if (!storeCurrentLocsStatus.isOK()) {
-        return storeCurrentLocsStatus;
+    // TODO (Kal): This can be changed to cancelClone after 3.4 is released. The reason to only do
+    // internal cleanup in 3.4 is for backwards compatibility with 3.2 nodes, which cannot
+    // differentiate between cancellations for different migration sessions. It is thus possible
+    // that a second migration from different donor, but the same recipient would certainly abort an
+    // already running migration.
+    auto scopedGuard = MakeGuard([&] { _cleanup(txn); });
+
+    // Prepare the currently available documents
+    Status status = _storeCurrentLocs(txn);
+    if (!status.isOK()) {
+        return status;
     }
 
     // Tell the recipient shard to start cloning
@@ -209,22 +216,14 @@ Status MigrationChunkClonerSourceLegacy::startClone(OperationContext* txn) {
         return startChunkCloneResponseStatus.getStatus();
     }
 
-    // TODO (Kal): Setting the state to kCloning below means that if cancelClone was called we will
-    // send a cancellation command to the recipient. The reason to limit the cases when we send
-    // cancellation is for backwards compatibility with 3.2 nodes, which cannot differentiate
-    // between cancellations for different migration sessions. It is thus possible that a second
-    // migration from different donor, but the same recipient would certainly abort an already
-    // running migration.
-    stdx::lock_guard<stdx::mutex> sl(_mutex);
-    _state = kCloning;
-
+    scopedGuard.Dismiss();
     return Status::OK();
 }
 
 Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
     OperationContext* txn, Milliseconds maxTimeToWait) {
-    invariant(_state == kCloning);
     invariant(!txn->lockState()->isLocked());
+    auto scopedGuard = MakeGuard([&] { cancelClone(txn); });
 
     const auto startTime = Date_t::now();
 
@@ -262,6 +261,7 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
                                       << " documents remaining"};
             }
 
+            scopedGuard.Dismiss();
             return Status::OK();
         }
 
@@ -302,12 +302,17 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
         }
     }
 
+    scopedGuard.Dismiss();
     return {ErrorCodes::ExceededTimeLimit, "Timed out waiting for the cloner to catch up"};
 }
 
 Status MigrationChunkClonerSourceLegacy::commitClone(OperationContext* txn) {
-    invariant(_state == kCloning);
     invariant(!txn->lockState()->isLocked());
+
+    {
+        stdx::lock_guard<stdx::mutex> sl(_mutex);
+        invariant(!_cloneCompleted);
+    }
 
     auto responseStatus =
         _callRecipient(createRequestWithSessionId(kRecvChunkCommit, _args.getNss(), _sessionId));
@@ -323,18 +328,14 @@ Status MigrationChunkClonerSourceLegacy::commitClone(OperationContext* txn) {
 void MigrationChunkClonerSourceLegacy::cancelClone(OperationContext* txn) {
     invariant(!txn->lockState()->isLocked());
 
-    switch (_state) {
-        case kDone:
-            break;
-        case kCloning:
-            _callRecipient(createRequestWithSessionId(kRecvChunkAbort, _args.getNss(), _sessionId));
-        // Intentional fall through
-        case kNew:
-            _cleanup(txn);
-            break;
-        default:
-            MONGO_UNREACHABLE;
+    {
+        stdx::lock_guard<stdx::mutex> sl(_mutex);
+        if (_cloneCompleted)
+            return;
     }
+
+    _callRecipient(createRequestWithSessionId(kRecvChunkAbort, _args.getNss(), _sessionId));
+    _cleanup(txn);
 }
 
 bool MigrationChunkClonerSourceLegacy::isDocumentInMigratingChunk(OperationContext* txn,
@@ -434,12 +435,6 @@ Status MigrationChunkClonerSourceLegacy::nextCloneBatch(OperationContext* txn,
 
     _cloneLocs.erase(_cloneLocs.begin(), it);
 
-    // If we have drained all the cloned data, there is no need to keep the delete notify executor
-    // around
-    if (_cloneLocs.empty()) {
-        _deleteNotifyExec.reset();
-    }
-
     return Status::OK();
 }
 
@@ -466,15 +461,13 @@ Status MigrationChunkClonerSourceLegacy::nextModsBatch(OperationContext* txn,
 void MigrationChunkClonerSourceLegacy::_cleanup(OperationContext* txn) {
     {
         stdx::lock_guard<stdx::mutex> sl(_mutex);
-        _state = kDone;
-        _reload.clear();
-        _deleted.clear();
+        _cloneCompleted = true;
     }
 
-    if (_deleteNotifyExec) {
-        ScopedTransaction scopedXact(txn, MODE_IS);
-        AutoGetCollection autoColl(txn, _args.getNss(), MODE_IS);
+    ScopedTransaction scopedXact(txn, MODE_IS);
+    AutoGetCollection autoColl(txn, _args.getNss(), MODE_IS);
 
+    if (_deleteNotifyExec) {
         _deleteNotifyExec.reset();
     }
 }
@@ -483,7 +476,7 @@ StatusWith<BSONObj> MigrationChunkClonerSourceLegacy::_callRecipient(const BSONO
     executor::RemoteCommandResponse responseStatus(
         Status{ErrorCodes::InternalError, "Uninitialized value"});
 
-    auto executor = grid.getExecutorPool()->getFixedExecutor();
+    auto executor = grid.getExecutorPool()->getArbitraryExecutor();
     auto scheduleStatus = executor->scheduleRemoteCommand(
         executor::RemoteCommandRequest(_recipientHost, "admin", cmdObj, nullptr),
         [&responseStatus](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
@@ -521,7 +514,7 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* txn
 
     // Allow multiKey based on the invariant that shard keys must be single-valued. Therefore, any
     // multi-key index prefixed by shard key cannot be multikey over the shard key fields.
-    IndexDescriptor* const idx =
+    IndexDescriptor* idx =
         collection->getIndexCatalog()->findShardKeyPrefixedIndex(txn,
                                                                  _shardKeyPattern.toBSON(),
                                                                  false);  // requireSingleKey
@@ -533,18 +526,23 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* txn
     }
 
     // Install the stage, which will listen for notifications on the collection
-    auto statusWithDeleteNotificationPlanExecutor =
-        PlanExecutor::make(txn,
-                           stdx::make_unique<WorkingSet>(),
-                           stdx::make_unique<DeleteNotificationStage>(this, txn),
-                           collection,
-                           PlanExecutor::YIELD_MANUAL);
-    if (!statusWithDeleteNotificationPlanExecutor.isOK()) {
-        return statusWithDeleteNotificationPlanExecutor.getStatus();
-    }
+    {
+        stdx::lock_guard<stdx::mutex> sl(_mutex);
 
-    _deleteNotifyExec = std::move(statusWithDeleteNotificationPlanExecutor.getValue());
-    _deleteNotifyExec->registerExec(collection);
+        invariant(!_deleteNotifyExec);
+
+        // Takes ownership of 'ws' and 'dns'.
+        auto statusWithPlanExecutor =
+            PlanExecutor::make(txn,
+                               stdx::make_unique<WorkingSet>(),
+                               stdx::make_unique<DeleteNotificationStage>(this, txn),
+                               collection,
+                               PlanExecutor::YIELD_MANUAL);
+        invariant(statusWithPlanExecutor.isOK());
+
+        _deleteNotifyExec = std::move(statusWithPlanExecutor.getValue());
+        _deleteNotifyExec->registerExec(collection);
+    }
 
     // Assume both min and max non-empty, append MinKey's to make them fit chosen index
     const KeyPattern kp(idx->keyPattern());
@@ -609,7 +607,7 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* txn
                               << WorkingSetCommon::toStatusString(obj)};
     }
 
-    const uint64_t collectionAverageObjectSize = collection->averageObjectSize(txn);
+    exec.reset();
 
     if (isLargeChunk) {
         return {
@@ -631,8 +629,7 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* txn
                           << _args.getMaxKey()};
     }
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _averageObjectSizeForCloneLocs = collectionAverageObjectSize + 12;
+    _averageObjectSizeForCloneLocs = static_cast<uint64_t>(collection->averageObjectSize(txn) + 12);
 
     return Status::OK();
 }

@@ -164,7 +164,7 @@ void OplogReader::connectToSyncSource(OperationContext* txn,
     invariant(conn() == NULL);
 
     while (true) {
-        HostAndPort candidate = replCoord->chooseNewSyncSource(lastOpTimeFetched);
+        HostAndPort candidate = replCoord->chooseNewSyncSource(lastOpTimeFetched.getTimestamp());
 
         if (candidate.empty()) {
             if (oldestOpTimeSeen == sentinel) {

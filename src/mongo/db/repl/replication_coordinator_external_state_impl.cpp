@@ -87,7 +87,6 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
@@ -96,8 +95,6 @@
 
 namespace mongo {
 namespace repl {
-
-MONGO_FP_DECLARE(transitionToPrimaryHangBeforeInitializingConfigDatabase);
 
 namespace {
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
@@ -415,11 +412,11 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
 void ReplicationCoordinatorExternalStateImpl::onDrainComplete(OperationContext* txn) {
     invariant(!txn->lockState()->isLocked());
 
-    // If this is a config server node becoming a primary, ensure the balancer is ready to start.
+    // If this is a config server node becoming a primary, start the balancer
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        // We must ensure the balancer has stopped because it may still be in the process of
-        // stopping if this node was previously primary.
-        Balancer::get(txn)->waitForBalancerToStop();
+        // We need to join the balancer here, because it might have been running at a previous time
+        // when this node was a primary.
+        Balancer::get(txn)->onDrainComplete(txn);
     }
 }
 
@@ -710,7 +707,7 @@ void ReplicationCoordinatorExternalStateImpl::killAllUserOperations(OperationCon
 
 void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        Balancer::get(getGlobalServiceContext())->interruptBalancer();
+        Balancer::get(getGlobalServiceContext())->onStepDownFromPrimary();
     }
 
     ShardingState::get(getGlobalServiceContext())->markCollectionsNotShardedAtStepdown();
@@ -729,18 +726,6 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
     fassertStatusOK(40107, status);
 
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        if (MONGO_FAIL_POINT(transitionToPrimaryHangBeforeInitializingConfigDatabase)) {
-            log() << "transition to primary - "
-                     "transitionToPrimaryHangBeforeInitializingConfigDatabase fail point enabled. "
-                     "Blocking until fail point is disabled.";
-            while (MONGO_FAIL_POINT(transitionToPrimaryHangBeforeInitializingConfigDatabase)) {
-                mongo::sleepsecs(1);
-                if (inShutdown()) {
-                    break;
-                }
-            }
-        }
-
         status = Grid::get(txn)->catalogManager()->initializeConfigDatabaseIfNeeded(txn);
         if (!status.isOK() && status != ErrorCodes::AlreadyInitialized) {
             if (ErrorCodes::isShutdownError(status.code())) {
@@ -790,7 +775,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         distLockManager->unlockAll(txn, distLockManager->getProcessID());
 
         // If this is a config server node becoming a primary, start the balancer
-        Balancer::get(txn)->initiateBalancer(txn);
+        Balancer::get(txn)->onTransitionToPrimary(txn);
     } else if (ShardingState::get(txn)->enabled()) {
         const auto configsvrConnStr =
             Grid::get(txn)->shardRegistry()->getConfigShard()->getConnString();
