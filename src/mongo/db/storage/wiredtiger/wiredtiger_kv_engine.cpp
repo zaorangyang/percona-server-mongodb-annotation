@@ -432,11 +432,20 @@ Status WiredTigerKVEngine::hotBackup(const std::string& path) {
 
     // Copy the list of files.
     boost::filesystem::path srcPath(_path);
+    std::set<boost::filesystem::path> existDirs{destPath};
     const char* filename = NULL;
     while ((ret = c->next(c)) == 0 && (ret = c->get_key(c, &filename)) == 0) {
+        const boost::filesystem::path destFile(destPath / filename);
+        const boost::filesystem::path destDir(destFile.parent_path());
+
         try {
+            // Try creating destination directories if needed.
+            if (!existDirs.count(destDir)) {
+                existDirs.insert(destDir);
+                boost::filesystem::create_directories(destDir);
+            }
             boost::filesystem::copy_file(
-                srcPath / filename, destPath / filename, boost::filesystem::copy_option::none);
+                srcPath / filename, destFile, boost::filesystem::copy_option::none);
         } catch (const boost::filesystem::filesystem_error& ex) {
             // WT-999: Try copying to journal folder.
             const std::string& errmsg = str::stream() << ex.what();
