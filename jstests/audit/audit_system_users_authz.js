@@ -36,7 +36,7 @@ auditTest(
         adminDB.runCommand({ setParameter: 1, 'auditAuthorizationSuccess': false });
 
         beforeLoad = Date.now();
-        var auditColl = getAuditEventsCollection(m);
+        var auditColl = getAuditEventsCollection(m, testDBName);
 
         assert.eq(1, auditColl.count({
             atype: "createUser",

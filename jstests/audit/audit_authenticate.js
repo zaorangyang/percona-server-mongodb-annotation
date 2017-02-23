@@ -26,7 +26,7 @@ auditTest(
         assert(testDB.auth('john', 'john'), "could not auth as john (pwd john)");
 
         beforeLoad = Date.now();
-        var auditColl = getAuditEventsCollection(m, undefined, true);
+        var auditColl = getAuditEventsCollection(m, testDBName, undefined, true);
         assert.eq(1, auditColl.count({
             atype: 'authenticate',
             ts: withinFewSecondsBefore(beforeLoad),
@@ -42,7 +42,7 @@ auditTest(
         var authenticationFailureCode = 18;
 
         beforeLoad = Date.now();
-        var auditColl = getAuditEventsCollection(m, undefined, true);
+        var auditColl = getAuditEventsCollection(m, testDBName, undefined, true);
         assert.eq(1, auditColl.count({
             atype: 'authenticate',
             ts: withinFewSecondsBefore(beforeLoad),
