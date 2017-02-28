@@ -358,10 +358,12 @@ Status addMongodOptions(moe::OptionSection* options) {
 
     // Deprecated option that we don't want people to use for performance reasons
     storage_options
-        .addOptionChaining(
-            "nopreallocj", "nopreallocj", moe::Switch, "don't preallocate journal files")
+        .addOptionChaining("storage.mmapv1.journal.nopreallocj",
+                           "nopreallocj",
+                           moe::Switch,
+                           "don't preallocate journal files")
         .hidden()
-        .setSources(moe::SourceAllLegacy);
+        .setSources(moe::SourceAll);
 
 #if defined(__linux__)
     general_options.addOptionChaining(
@@ -1062,6 +1064,13 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     if (params.count("storage.syncPeriodSecs")) {
         storageGlobalParams.syncdelay = params["storage.syncPeriodSecs"].as<double>();
+        if (storageGlobalParams.syncdelay < 0 ||
+            storageGlobalParams.syncdelay > StorageGlobalParams::kMaxSyncdelaySecs) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "syncdelay out of allowed range (0-"
+                                        << StorageGlobalParams::kMaxSyncdelaySecs
+                                        << "s)");
+        }
     }
 
     if (params.count("storage.directoryPerDB")) {
@@ -1107,8 +1116,8 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (params.count("storage.mmapv1.journal.debugFlags")) {
         mmapv1GlobalOptions.journalOptions = params["storage.mmapv1.journal.debugFlags"].as<int>();
     }
-    if (params.count("nopreallocj")) {
-        mmapv1GlobalOptions.preallocj = !params["nopreallocj"].as<bool>();
+    if (params.count("storage.mmapv1.journal.nopreallocj")) {
+        mmapv1GlobalOptions.preallocj = !params["storage.mmapv1.journal.nopreallocj"].as<bool>();
     }
 
     if (params.count("net.http.RESTInterfaceEnabled")) {

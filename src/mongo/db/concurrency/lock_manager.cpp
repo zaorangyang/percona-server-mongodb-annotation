@@ -32,10 +32,13 @@
 
 #include "mongo/db/concurrency/lock_manager.h"
 
+#include <sstream>
+
 #include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -781,8 +784,8 @@ void LockManager::_onLockModeChanged(LockHead* lock, bool checkConflictQueue) {
 
         iter->notify->notify(lock->resourceId, LOCK_OK);
 
-        // Small optimization - nothing is compatible with MODE_X, so no point in looking
-        // further in the conflict queue.
+        // Small optimization - nothing is compatible with a newly granted MODE_X, so no point in
+        // looking further in the conflict queue. Conflicting MODE_X requests are skipped above.
         if (iter->mode == MODE_X) {
             break;
         }
@@ -895,8 +898,11 @@ void LockManager::_dumpBucket(const LockBucket* bucket) const {
         sb << "GRANTED:\n";
         for (const LockRequest* iter = lock->grantedList._front; iter != nullptr;
              iter = iter->next) {
+            std::stringstream threadId;
+            threadId << iter->locker->getThreadId();
             sb << '\t' << "LockRequest " << iter->locker->getId() << " @ " << iter->locker << ": "
                << "Mode = " << modeName(iter->mode) << "; "
+               << "Thread = " << threadId.str() << "; "
                << "ConvertMode = " << modeName(iter->convertMode) << "; "
                << "EnqueueAtFront = " << iter->enqueueAtFront << "; "
                << "CompatibleFirst = " << iter->compatibleFirst << "; " << '\n';
@@ -905,8 +911,11 @@ void LockManager::_dumpBucket(const LockBucket* bucket) const {
         sb << "PENDING:\n";
         for (const LockRequest* iter = lock->conflictList._front; iter != nullptr;
              iter = iter->next) {
+            std::stringstream threadId;
+            threadId << iter->locker->getThreadId();
             sb << '\t' << "LockRequest " << iter->locker->getId() << " @ " << iter->locker << ": "
                << "Mode = " << modeName(iter->mode) << "; "
+               << "Thread = " << threadId.str() << "; "
                << "ConvertMode = " << modeName(iter->convertMode) << "; "
                << "EnqueueAtFront = " << iter->enqueueAtFront << "; "
                << "CompatibleFirst = " << iter->compatibleFirst << "; " << '\n';
@@ -1123,6 +1132,9 @@ ResourceId::ResourceId(ResourceType type, uint64_t hashId) : _fullHash(fullHash(
 std::string ResourceId::toString() const {
     StringBuilder ss;
     ss << "{" << _fullHash << ": " << resourceTypeName(getType()) << ", " << getHashId();
+    if (getType() == RESOURCE_MUTEX) {
+        ss << ", " << Lock::ResourceMutex::getName(*this);
+    }
 
 #ifdef MONGO_CONFIG_DEBUG_BUILD
     ss << ", " << _nsCopy;

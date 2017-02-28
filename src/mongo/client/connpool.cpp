@@ -62,15 +62,12 @@ PoolForHost::~PoolForHost() {
 }
 
 void PoolForHost::clear() {
-    while (!_pool.empty()) {
-        StoredConnection sc = _pool.top();
-        delete sc.conn;
-        _pool.pop();
-    }
+    _pool = decltype(_pool){};
 }
 
-void PoolForHost::done(DBConnectionPool* pool, DBClientBase* c) {
-    bool isFailed = c->isFailed();
+void PoolForHost::done(DBConnectionPool* pool, DBClientBase* c_raw) {
+    std::unique_ptr<DBClientBase> c{c_raw};
+    const bool isFailed = c->isFailed();
 
     --_checkedOut;
 
@@ -88,11 +85,10 @@ void PoolForHost::done(DBConnectionPool* pool, DBClientBase* c) {
     if (isFailed || isBroken ||
         // We have a pool size that we need to enforce
         (_maxPoolSize >= 0 && static_cast<int>(_pool.size()) >= _maxPoolSize)) {
-        pool->onDestroy(c);
-        delete c;
+        pool->onDestroy(c.get());
     } else {
         // The connection is probably fine, save for later
-        _pool.push(c);
+        _pool.push(std::move(c));
     }
 }
 
@@ -114,57 +110,50 @@ bool PoolForHost::isBadSocketCreationTime(uint64_t microSec) {
 
 DBClientBase* PoolForHost::get(DBConnectionPool* pool, double socketTimeout) {
     while (!_pool.empty()) {
-        StoredConnection sc = _pool.top();
+        auto sc = std::move(_pool.top());
         _pool.pop();
 
         if (!sc.ok()) {
             _badConns++;
-            pool->onDestroy(sc.conn);
-            delete sc.conn;
+            pool->onDestroy(sc.conn.get());
             continue;
         }
 
         verify(sc.conn->getSoTimeout() == socketTimeout);
 
         ++_checkedOut;
-        return sc.conn;
+        return sc.conn.release();
     }
 
-    return NULL;
+    return nullptr;
 }
 
 void PoolForHost::flush() {
-    while (!_pool.empty()) {
-        StoredConnection c = _pool.top();
-        _pool.pop();
-        delete c.conn;
-    }
+    clear();
 }
 
 void PoolForHost::getStaleConnections(vector<DBClientBase*>& stale) {
     vector<StoredConnection> all;
     while (!_pool.empty()) {
-        StoredConnection c = _pool.top();
+        StoredConnection c = std::move(_pool.top());
         _pool.pop();
 
         if (c.ok()) {
-            all.push_back(c);
+            all.push_back(std::move(c));
         } else {
             _badConns++;
-            stale.push_back(c.conn);
+            stale.emplace_back(c.conn.release());
         }
     }
 
-    for (size_t i = 0; i < all.size(); i++) {
-        _pool.push(all[i]);
+    for (auto& conn : all) {
+        _pool.push(std::move(conn));
     }
 }
 
 
-PoolForHost::StoredConnection::StoredConnection(DBClientBase* c) {
-    conn = c;
-    when = time(0);
-}
+PoolForHost::StoredConnection::StoredConnection(std::unique_ptr<DBClientBase> c)
+    : conn(std::move(c)), when(time(nullptr)) {}
 
 bool PoolForHost::StoredConnection::ok() {
     // Poke the connection to see if we're still ok
@@ -267,6 +256,20 @@ DBClientBase* DBConnectionPool::get(const string& host, double socketTimeout) {
                               11002,
                               str::stream() << _name << " error: " << errmsg);
     return _finishCreate(host, socketTimeout, c);
+}
+
+DBClientBase* DBConnectionPool::get(const MongoURI& uri, double socketTimeout) {
+    std::unique_ptr<DBClientBase> c(_get(uri.toString(), socketTimeout));
+    if (c) {
+        onHandedOut(c.get());
+        return c.release();
+    }
+
+    string errmsg;
+    c = std::unique_ptr<DBClientBase>(uri.connect(StringData(), errmsg, socketTimeout));
+    uassert(40356, _name + ": connect failed " + uri.toString() + " : " + errmsg, c);
+
+    return _finishCreate(uri.toString(), socketTimeout, c.release());
 }
 
 int DBConnectionPool::getNumAvailableConns(const string& host, double socketTimeout) const {
@@ -474,6 +477,13 @@ ScopedDbConnection::ScopedDbConnection(const std::string& host, double socketTim
 ScopedDbConnection::ScopedDbConnection(const ConnectionString& host, double socketTimeout)
     : _host(host.toString()),
       _conn(globalConnPool.get(host, socketTimeout)),
+      _socketTimeout(socketTimeout) {
+    _setSocketTimeout();
+}
+
+ScopedDbConnection::ScopedDbConnection(const MongoURI& uri, double socketTimeout)
+    : _host(uri.toString()),
+      _conn(globalConnPool.get(uri, socketTimeout)),
       _socketTimeout(socketTimeout) {
     _setSocketTimeout();
 }

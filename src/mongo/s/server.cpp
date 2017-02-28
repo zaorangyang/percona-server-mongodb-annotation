@@ -73,6 +73,7 @@
 #include "mongo/s/commands/request.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/is_mongos.h"
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
@@ -333,11 +334,13 @@ static ExitCode runMongosServer() {
     return waitForShutdown();
 }
 
+namespace {
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     mongo::forkServerOrDie();
     return Status::OK();
 }
+}  // namespace
 
 // We set the featureCompatibilityVersion to 3.4 in the mongos so that BSON validation always uses
 // BSONVersion::kLatest.
@@ -433,6 +436,7 @@ MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManage
 #endif
 
 int mongoSMain(int argc, char* argv[], char** envp) {
+    mongo::setMongos();
     static StaticObserver staticObserver;
     if (argc < 1)
         return EXIT_FAILURE;

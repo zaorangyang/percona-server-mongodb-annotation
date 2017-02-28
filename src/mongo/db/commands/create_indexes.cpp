@@ -231,7 +231,7 @@ public:
                      int options,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        const NamespaceString ns(parseNs(dbname, cmdObj));
+        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
 
         Status status = userAllowedWriteNS(ns);
         if (!status.isOK())
@@ -392,10 +392,8 @@ public:
 
             for (auto&& infoObj : indexInfoObjs) {
                 std::string systemIndexes = ns.getSystemIndexesCollection();
-                auto opObserver = getGlobalServiceContext()->getOpObserver();
-                if (opObserver) {
-                    opObserver->onCreateIndex(txn, systemIndexes, infoObj);
-                }
+                getGlobalServiceContext()->getOpObserver()->onCreateIndex(
+                    txn, systemIndexes, infoObj, false);
             }
 
             wunit.commit();

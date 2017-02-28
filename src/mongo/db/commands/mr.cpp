@@ -279,7 +279,14 @@ void JSReducer::_reduce(const BSONList& tuples, BSONObj& key, int& endSizeEstima
 
 Config::Config(const string& _dbname, const BSONObj& cmdObj) {
     dbname = _dbname;
-    ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "'mapReduce' must be of type String",
+            cmdObj.firstElement().type() == BSONType::String);
+    const NamespaceString nss(dbname, cmdObj.firstElement().valueStringData());
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid namespace: " << nss.ns(),
+            nss.isValid());
+    ns = nss.ns();
 
     verbose = cmdObj["verbose"].trueValue();
     jsMode = cmdObj["jsMode"].trueValue();
@@ -306,9 +313,12 @@ Config::Config(const string& _dbname, const BSONObj& cmdObj) {
     }
 
     if (outputOptions.outType != INMEMORY) {  // setup temp collection name
-        tempNamespace = str::stream()
-            << (outputOptions.outDB.empty() ? dbname : outputOptions.outDB) << ".tmp.mr."
-            << cmdObj.firstElement().String() << "_" << JOB_NUMBER.fetchAndAdd(1);
+        tempNamespace =
+            NamespaceString(outputOptions.outDB.empty() ? dbname : outputOptions.outDB,
+                            str::stream() << "tmp.mr." << cmdObj.firstElement().valueStringData()
+                                          << "_"
+                                          << JOB_NUMBER.fetchAndAdd(1))
+                .ns();
         incLong = tempNamespace + "_inc";
     }
 
@@ -364,10 +374,25 @@ Config::Config(const string& _dbname, const BSONObj& cmdObj) {
  * Clean up the temporary and incremental collections
  */
 void State::dropTempCollections() {
-    _db.dropCollection(_config.tempNamespace);
-    // Always forget about temporary namespaces, so we don't cache lots of them
-    ShardConnection::forgetNS(_config.tempNamespace);
-    if (_useIncremental) {
+    if (!_config.tempNamespace.empty()) {
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            ScopedTransaction scopedXact(_txn, MODE_IX);
+            AutoGetDb autoDb(_txn, nsToDatabaseSubstring(_config.tempNamespace), MODE_X);
+            if (auto db = autoDb.getDb()) {
+                WriteUnitOfWork wunit(_txn);
+                NamespaceString tempNss(_config.tempNamespace);
+                uassert(ErrorCodes::PrimarySteppedDown,
+                        "no longer primary",
+                        repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(tempNss));
+                db->dropCollection(_txn, _config.tempNamespace);
+                wunit.commit();
+            }
+        }
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "M/R dropTempCollections", _config.tempNamespace)
+        // Always forget about temporary namespaces, so we don't cache lots of them
+        ShardConnection::forgetNS(_config.tempNamespace);
+    }
+    if (_useIncremental && !_config.incLong.empty()) {
         // We don't want to log the deletion of incLong as it isn't replicated. While
         // harmless, this would lead to a scary looking warning on the secondaries.
         bool shouldReplicateWrites = _txn->writesAreReplicated();
@@ -497,7 +522,7 @@ void State::prepTempCollection() {
             }
             // Log the createIndex operation.
             string logNs = nsToDatabase(_config.tempNamespace) + ".system.indexes";
-            getGlobalServiceContext()->getOpObserver()->onCreateIndex(_txn, logNs, *it);
+            getGlobalServiceContext()->getOpObserver()->onCreateIndex(_txn, logNs, *it, false);
         }
         wuow.commit();
     }
@@ -608,14 +633,16 @@ namespace {
 unsigned long long _collectionCount(OperationContext* txn,
                                     const string& ns,
                                     bool callerHoldsGlobalLock) {
-    Collection* coll;
+    Collection* coll = nullptr;
     boost::optional<AutoGetCollectionForRead> ctx;
 
     // If the global write lock is held, we must avoid using AutoGetCollectionForRead as it may lead
     // to deadlock when waiting for a majority snapshot to be committed. See SERVER-24596.
     if (callerHoldsGlobalLock) {
         Database* db = dbHolder().get(txn, ns);
-        coll = db->getCollection(ns);
+        if (db) {
+            coll = db->getCollection(ns);
+        }
     } else {
         ctx.emplace(txn, NamespaceString(ns));
         coll = ctx->getCollection();
@@ -1708,13 +1735,19 @@ public:
         ShardedConnectionInfo::addHook();
 
         // legacy name
-        string shardedOutputCollection = cmdObj["shardedOutputCollection"].valuestrsafe();
+        const auto shardedOutputCollectionElt = cmdObj["shardedOutputCollection"];
+        uassert(ErrorCodes::InvalidNamespace,
+                "'shardedOutputCollection' must be of type String",
+                shardedOutputCollectionElt.type() == BSONType::String);
+        const std::string shardedOutputCollection = shardedOutputCollectionElt.str();
         verify(shardedOutputCollection.size() > 0);
-        string inputNS;
+
+        std::string inputNS;
         if (cmdObj["inputDB"].type() == String) {
-            inputNS = cmdObj["inputDB"].String() + "." + shardedOutputCollection;
+            inputNS =
+                NamespaceString(cmdObj["inputDB"].valueStringData(), shardedOutputCollection).ns();
         } else {
-            inputNS = dbname + "." + shardedOutputCollection;
+            inputNS = NamespaceString(dbname, shardedOutputCollection).ns();
         }
 
         CurOp* curOp = CurOp::get(txn);
