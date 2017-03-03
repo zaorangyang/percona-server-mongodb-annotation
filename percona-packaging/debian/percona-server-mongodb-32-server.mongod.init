@@ -132,7 +132,7 @@ start_server() {
   /usr/bin/percona-server-mongodb-helper.sh
   start-stop-daemon --background --start --quiet --pidfile $PIDFILEPATH \
   --make-pidfile --chuid ${MONGO_USER} \
-  --exec ${NUMACTL} ${DAEMON} ${DAEMON_OPTS} > ${STDOUT} 2> ${STDERR}
+  --exec ${NUMACTL} ${DAEMON} -- ${OPTIONS} > ${STDOUT} 2> ${STDERR}
   errcode=$?
 	return $errcode
 }
