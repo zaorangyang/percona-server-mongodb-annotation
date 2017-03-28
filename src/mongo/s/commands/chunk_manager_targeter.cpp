@@ -30,7 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/s/chunk_manager_targeter.h"
+#include "mongo/s/commands/chunk_manager_targeter.h"
 
 #include <boost/thread/tss.hpp>
 
@@ -38,9 +38,9 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collation_index_key.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/sharding_raii.h"
@@ -289,13 +289,14 @@ ChunkManagerTargeter::ChunkManagerTargeter(const NamespaceString& nss, TargeterS
 
 
 Status ChunkManagerTargeter::init(OperationContext* txn) {
-    auto dbStatus = ScopedShardDatabase::getOrCreate(txn, _nss.db());
-    if (!dbStatus.isOK()) {
-        return dbStatus.getStatus();
+    auto scopedCMStatus = ScopedChunkManager::getOrCreate(txn, _nss);
+    if (!scopedCMStatus.isOK()) {
+        return scopedCMStatus.getStatus();
     }
 
-    auto scopedDb = std::move(dbStatus.getValue());
-    scopedDb.db()->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
+    const auto& scopedCM = scopedCMStatus.getValue();
+    _manager = scopedCM.cm();
+    _primary = scopedCM.primary();
 
     return Status::OK();
 }
@@ -334,7 +335,7 @@ Status ChunkManagerTargeter::targetInsert(OperationContext* txn,
 
     // Target the shard key or database primary
     if (!shardKey.isEmpty()) {
-        return targetShardKey(txn, shardKey, CollationSpec::kSimpleSpec, doc.objsize(), endpoint);
+        *endpoint = targetShardKey(shardKey, CollationSpec::kSimpleSpec, doc.objsize()).release();
     } else {
         if (!_primary) {
             return Status(ErrorCodes::NamespaceNotFound,
@@ -343,8 +344,9 @@ Status ChunkManagerTargeter::targetInsert(OperationContext* txn,
         }
 
         *endpoint = new ShardEndpoint(_primary->getId(), ChunkVersion::UNSHARDED());
-        return Status::OK();
     }
+
+    return Status::OK();
 }
 
 Status ChunkManagerTargeter::targetUpdate(OperationContext* txn,
@@ -415,13 +417,13 @@ Status ChunkManagerTargeter::targetUpdate(OperationContext* txn,
 
     // Target the shard key, query, or replacement doc
     if (!shardKey.isEmpty()) {
-        // We can't rely on our query targeting to be exact
-        ShardEndpoint* endpoint = NULL;
-        Status result = targetShardKey(
-            txn, shardKey, collation, (query.objsize() + updateExpr.objsize()), &endpoint);
-        if (result.isOK()) {
-            endpoints->push_back(endpoint);
-            return result;
+        try {
+            endpoints->push_back(
+                targetShardKey(shardKey, collation, (query.objsize() + updateExpr.objsize()))
+                    .release());
+            return Status::OK();
+        } catch (const DBException&) {
+            // This update is potentially not constrained to a single shard
         }
     }
 
@@ -498,12 +500,11 @@ Status ChunkManagerTargeter::targetDelete(OperationContext* txn,
 
     // Target the shard key or delete query
     if (!shardKey.isEmpty()) {
-        // We can't rely on our query targeting to be exact
-        ShardEndpoint* endpoint = NULL;
-        Status result = targetShardKey(txn, shardKey, collation, 0, &endpoint);
-        if (result.isOK()) {
-            endpoints->push_back(endpoint);
-            return result;
+        try {
+            endpoints->push_back(targetShardKey(shardKey, collation, 0).release());
+            return Status::OK();
+        } catch (const DBException&) {
+            // This delete is potentially not constrained to a single shard
         }
     }
 
@@ -577,28 +578,19 @@ Status ChunkManagerTargeter::targetQuery(OperationContext* txn,
     return Status::OK();
 }
 
-Status ChunkManagerTargeter::targetShardKey(OperationContext* txn,
-                                            const BSONObj& shardKey,
-                                            const BSONObj& collation,
-                                            long long estDataSize,
-                                            ShardEndpoint** endpoint) const {
-    invariant(NULL != _manager);
-
-    auto chunk = _manager->findIntersectingChunk(txn, shardKey, collation);
-    if (!chunk.isOK()) {
-        return chunk.getStatus();
-    }
+std::unique_ptr<ShardEndpoint> ChunkManagerTargeter::targetShardKey(const BSONObj& shardKey,
+                                                                    const BSONObj& collation,
+                                                                    long long estDataSize) const {
+    auto chunk = _manager->findIntersectingChunk(shardKey, collation);
 
     // Track autosplit stats for sharded collections
     // Note: this is only best effort accounting and is not accurate.
     if (estDataSize > 0) {
-        _stats->chunkSizeDelta[chunk.getValue()->getMin()] += estDataSize;
+        _stats->chunkSizeDelta[chunk->getMin()] += estDataSize;
     }
 
-    *endpoint = new ShardEndpoint(chunk.getValue()->getShardId(),
-                                  _manager->getVersion(chunk.getValue()->getShardId()));
-
-    return Status::OK();
+    return stdx::make_unique<ShardEndpoint>(chunk->getShardId(),
+                                            _manager->getVersion(chunk->getShardId()));
 }
 
 Status ChunkManagerTargeter::targetCollection(vector<ShardEndpoint*>* endpoints) const {
@@ -702,13 +694,14 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* txn, bool* wasCha
     shared_ptr<ChunkManager> lastManager = _manager;
     shared_ptr<Shard> lastPrimary = _primary;
 
-    auto dbStatus = ScopedShardDatabase::getOrCreate(txn, _nss.db());
-    if (!dbStatus.isOK()) {
-        return dbStatus.getStatus();
+    auto scopedCMStatus = ScopedChunkManager::getOrCreate(txn, _nss);
+    if (!scopedCMStatus.isOK()) {
+        return scopedCMStatus.getStatus();
     }
 
-    auto scopedDb = std::move(dbStatus.getValue());
-    scopedDb.db()->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
+    const auto& scopedCM = scopedCMStatus.getValue();
+    _manager = scopedCM.cm();
+    _primary = scopedCM.primary();
 
     // We now have the latest metadata from the cache.
 
@@ -763,37 +756,24 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* txn, bool* wasCha
 }
 
 Status ChunkManagerTargeter::refreshNow(OperationContext* txn, RefreshType refreshType) {
-    auto dbStatus = ScopedShardDatabase::getOrCreate(txn, _nss.db());
-    if (!dbStatus.isOK()) {
-        return dbStatus.getStatus();
+    if (refreshType == RefreshType_ReloadDatabase) {
+        Grid::get(txn)->catalogCache()->invalidate(_nss.db().toString());
     }
-
-    auto scopedDb = std::move(dbStatus.getValue());
 
     // Try not to spam the configs
     refreshBackoff();
 
-    // TODO: Improve synchronization and make more explicit
-    if (refreshType == RefreshType_RefreshChunkManager) {
-        try {
-            // Forces a remote check of the collection info, synchronization between threads happens
-            // internally
-            scopedDb.db()->getChunkManagerIfExists(txn, _nss.ns(), true);
-        } catch (const DBException& ex) {
-            return Status(ErrorCodes::UnknownError, ex.toString());
-        }
+    ScopedChunkManager::refreshAndGet(txn, _nss);
 
-        scopedDb.db()->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
-    } else if (refreshType == RefreshType_ReloadDatabase) {
-        try {
-            // Dumps the db info, reloads it all, synchronization between threads happens internally
-            scopedDb.db()->reload(txn);
-        } catch (const DBException& ex) {
-            return Status(ErrorCodes::UnknownError, ex.toString());
-        }
-
-        scopedDb.db()->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
+    auto scopedCMStatus = ScopedChunkManager::get(txn, _nss);
+    if (!scopedCMStatus.isOK()) {
+        return scopedCMStatus.getStatus();
     }
+
+    const auto& scopedCM = scopedCMStatus.getValue();
+
+    _manager = scopedCM.cm();
+    _primary = scopedCM.primary();
 
     return Status::OK();
 }

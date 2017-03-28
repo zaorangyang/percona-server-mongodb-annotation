@@ -107,6 +107,7 @@ variables:
   - enterprise-osx-107
   - enterprise-rhel-62-64-bit
   - enterprise-rhel-62-64-bit-coverage
+  - enterprise-rhel-67-s390x  
   - enterprise-rhel-70-64-bit
   - enterprise-rhel-71-ppc64le
   - enterprise-rhel-72-s390x
@@ -212,12 +213,29 @@ functions:
         if [ "Windows_NT" = "$OS" ]; then
             typeperf -qx PhysicalDisk | grep Disk | grep -v _Total > disk_counters.txt
             typeperf -cf disk_counters.txt -si 5 -o mongo-diskstats
-        # See if iostat is available.
-        elif which iostat 2>&1 > /dev/null; then
-            iostat -d 5 > mongo-diskstats
-        # Fall back to vmstat if iostat is not available.
+        # Solaris: iostat -T d option for timestamp.
+        elif iostat -T d -Mx > /dev/null 2>&1; then
+            iostat -T d -Mx 5 > mongo-diskstats
+        # Linux: iostat -t option for timestamp.
+        elif iostat -tdmx > /dev/null 2>&1; then
+            iostat -tdmx 5 > mongo-diskstats
+        # OSX: Simulate the iostat timestamp.
+        elif iostat -d > /dev/null 2>&1; then
+            while [ 1 ]
+            do
+                date +'%m/%d/%Y %I:%M:%S %p' >> mongo-diskstats
+                iostat -d >> mongo-diskstats
+                printf "\n" >> mongo-diskstats
+                sleep 5
+            done
+        # Check if vmstat -t is available.
+        elif vmstat -td  > /dev/null 2>&1; then
+            vmstat -td 5 > mongo-diskstats
+        # Check if vmstat -T d is available.
+        elif vmstat -T d > /dev/null 2>&1; then
+            vmstat -T d 5 > mongo-diskstats
         else
-            vmstat -d 5 > mongo-diskstats
+            printf "Cannot collect mongo-diskstats on this platform\n"
         fi
 
   # Run a monitor process as a background, system task to periodically
@@ -423,14 +441,14 @@ functions:
         if [ ${run_multiple_jobs|false} = true ]; then
           processor_architecture=$(uname -m)
           num_jobs_available=${num_jobs_available|1}
-          # Reduce the number of available jobs by half when running any sharding*, replicasets*
-          # and select jsCore_small_oplog tasks on Windows and ARM to avoid overwhelming test hosts.
+          # Reduce the number of available jobs by half when running any sharding*, replica_sets*
+          # and select jsCore passthrough tasks on Windows and ARM to avoid overwhelming test hosts.
           if [ "Windows_NT" = "$OS" ] || [ "aarch64" = $processor_architecture ]; then
             case "${task_name}" in
-            jsCore_small_oplog_rs_initsync          \
-            |jsCore_small_oplog_rs_initsync_static  \
-            |jsCore_small_oplog_rs_resync_static    \
-            |replicasets*                           \
+            replica_sets_initsync_jscore_passthrough          \
+            |replica_sets_initsync_static_jscore_passthrough  \
+            |replica_sets_resync_static_jscore_passthrough    \
+            |replica_sets*                           \
             |sharding*                              \
             )
               num_jobs_available=$((${num_jobs_available|2} / 2))
@@ -661,13 +679,13 @@ functions:
         ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion ${multiversion_edition|"base"} ${multiversion_platform_arch|"linux/x86_64"} "2.6" "3.0" "3.2" "3.2.1"
 
   "cleanup environment" :
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
+    command: shell.exec
+    params:
+      script: |
+        set -o errexit
+        set -o verbose
 
-          rm -rf src /data/db/* mongo-coredumps.tgz ~/.aws
+        rm -rf src /data/db/* mongo-diskstats* mongo-coredumps.tgz ~/.aws
 
   "kill processes" :
     command: shell.exec
@@ -767,23 +785,18 @@ functions:
 
         for i in {1..3}
         do
-          if ! kitchen converge "${packager_distro}"; then
-            converged="false"
+          if ! kitchen verify "${packager_distro}"; then
+            verified="false"
             kitchen destroy "${packager_distro}" || true
             sleep 30
           else
+            verified="true"
             break
           fi
         done
 
-        test "$converged" != "false"
-
-        if ! kitchen verify "${packager_distro}"; then
-          verified="false"
-        fi
-
         kitchen destroy "${packager_distro}" || true
-        test "$verified" != "false"
+        test "$verified" = "true"
 
 pre:
   - command: shell.track
@@ -1900,135 +1913,135 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog
+  name: master_slave_jscore_passthrough
   depends_on:
   - name: jsCore
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog --storageEngine=mmapv1
+      resmoke_args: --suites=master_slave_jscore_passthrough --storageEngine=mmapv1
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_WT
+  name: master_slave_jscore_passthrough_WT
   depends_on:
   - name: jsCore_WT
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog --storageEngine=wiredTiger
+      resmoke_args: --suites=master_slave_jscore_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_rs
+  name: replica_sets_jscore_passthrough
   depends_on:
   - name: jsCore
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog_rs --storageEngine=mmapv1
+      resmoke_args: --suites=replica_sets_jscore_passthrough --storageEngine=mmapv1
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_rs_WT
+  name: replica_sets_jscore_passthrough_WT
   depends_on:
   - name: jsCore_WT
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog_rs --storageEngine=wiredTiger
+      resmoke_args: --suites=replica_sets_jscore_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_rs_initsync
+  name: replica_sets_initsync_jscore_passthrough
   depends_on:
   - name: jsCore
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog_rs_initsync --storageEngine=mmapv1
+      resmoke_args: --suites=replica_sets_initsync_jscore_passthrough --storageEngine=mmapv1
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_rs_initsync_WT
+  name: replica_sets_initsync_jscore_passthrough_WT
   depends_on:
   - name: jsCore_WT
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog_rs_initsync --storageEngine=wiredTiger
+      resmoke_args: --suites=replica_sets_initsync_jscore_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_rs_resync
+  name: replica_sets_resync_jscore_passthrough
   depends_on:
   - name: jsCore
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog_rs_resync --storageEngine=mmapv1
+      resmoke_args: --suites=replica_sets_resync_jscore_passthrough --storageEngine=mmapv1
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_rs_resync_WT
+  name: replica_sets_resync_jscore_passthrough_WT
   depends_on:
   - name: jsCore_WT
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog_rs_resync --storageEngine=wiredTiger
+      resmoke_args: --suites=replica_sets_resync_jscore_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_rs_initsync_static
+  name: replica_sets_initsync_static_jscore_passthrough
   depends_on:
   - name: jsCore
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog_rs_initsync_static --storageEngine=mmapv1
+      resmoke_args: --suites=replica_sets_initsync_static_jscore_passthrough --storageEngine=mmapv1
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_rs_initsync_static_WT
+  name: replica_sets_initsync_static_jscore_passthrough_WT
   depends_on:
   - name: jsCore_WT
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog_rs_initsync_static --storageEngine=wiredTiger
+      resmoke_args: --suites=replica_sets_initsync_static_jscore_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_rs_resync_static
+  name: replica_sets_resync_static_jscore_passthrough
   depends_on:
   - name: jsCore
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog_rs_resync_static --storageEngine=mmapv1
+      resmoke_args: --suites=replica_sets_resync_static_jscore_passthrough --storageEngine=mmapv1
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: jsCore_small_oplog_rs_resync_static_WT
+  name: replica_sets_resync_static_jscore_passthrough_WT
   depends_on:
   - name: jsCore_WT
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_small_oplog_rs_resync_static --storageEngine=wiredTiger
+      resmoke_args: --suites=replica_sets_resync_static_jscore_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -2272,6 +2285,7 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run tests"
+    timeout_secs: 21600 # 6 hour timeout
     vars:
       resmoke_args: --suites=concurrency --storageEngine=mmapv1
 
@@ -2280,6 +2294,7 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run tests"
+    timeout_secs: 21600 # 6 hour timeout
     vars:
       resmoke_args: --suites=concurrency --storageEngine=wiredTiger
 
@@ -2288,6 +2303,7 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run tests"
+    timeout_secs: 21600 # 6 hour timeout
     vars:
       resmoke_args: --suites=concurrency_replication --storageEngine=mmapv1
 
@@ -2296,22 +2312,27 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run tests"
+    timeout_secs: 21600 # 6 hour timeout
     vars:
       resmoke_args: --suites=concurrency_replication --storageEngine=wiredTiger
 
 - <<: *task_template
   name: concurrency_sharded
+  exec_timeout_secs: 43200 # 12 hour timeout for the task overall
   commands:
   - func: "do setup"
   - func: "run tests"
+    timeout_secs: 21600 # 6 hour timeout for each test
     vars:
       resmoke_args: --suites=concurrency_sharded --storageEngine=mmapv1
 
 - <<: *task_template
   name: concurrency_sharded_WT
+  exec_timeout_secs: 43200 # 12 hour timeout for the task overall
   commands:
   - func: "do setup"
   - func: "run tests"
+    timeout_secs: 21600 # 6 hour timeout for each test
     vars:
       resmoke_args: --suites=concurrency_sharded --storageEngine=wiredTiger
 
@@ -2320,7 +2341,7 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run tests"
-    timeout_secs: 10800 # 3 hour timeout
+    timeout_secs: 21600 # 6 hour timeout
     vars:
       resmoke_args: --executor=concurrency jstests/concurrency/fsm_all_simultaneous.js --storageEngine=mmapv1
 
@@ -2329,6 +2350,7 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run tests"
+    timeout_secs: 21600 # 6 hour timeout
     vars:
       resmoke_args: --executor=concurrency jstests/concurrency/fsm_all_simultaneous.js --storageEngine=wiredTiger
 
@@ -2362,7 +2384,7 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: replicasets
+  name: replica_sets
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -2371,7 +2393,7 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: replicasets_WT
+  name: replica_sets_WT
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -2380,7 +2402,7 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: replicasets_WT_ese
+  name: replica_sets_WT_ese
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -2389,7 +2411,7 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: replicasets_auth
+  name: replica_sets_auth
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -2398,7 +2420,7 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: replicasets_compression
+  name: replica_sets_compression
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -2407,41 +2429,41 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: replicasets_legacy
+  name: replica_sets_pv0
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=replica_sets_legacy
+      resmoke_args: --suites=replica_sets_pv0
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: replication
+  name: master_slave
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=replication --storageEngine=mmapv1
+      resmoke_args: --suites=master_slave --storageEngine=mmapv1
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: replication_WT
+  name: master_slave_WT
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=replication --storageEngine=wiredTiger
+      resmoke_args: --suites=master_slave --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: replication_auth
+  name: master_slave_auth
   depends_on:
-  - name: replication_WT
+  - name: master_slave_WT
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=replication_auth
+      resmoke_args: --suites=master_slave_auth
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -3264,10 +3286,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -3305,13 +3323,17 @@ buildvariants:
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -3403,10 +3425,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: mmap
   - name: mongosTest
   - name: noPassthrough
@@ -3446,13 +3464,17 @@ buildvariants:
     distros:
     - rhel62-large
   - name: read_concern_majority_passthrough_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -3505,8 +3527,6 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_rs
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -3527,11 +3547,13 @@ buildvariants:
   - name: concurrency_replication
   - name: concurrency_sharded
   - name: concurrency_simultaneous
-  - name: replicasets
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
   - name: sharding
   - name: sharding_auth
   - name: slow1
@@ -3571,8 +3593,6 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -3588,8 +3608,10 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous_WT
-  - name: replicasets_WT
-  - name: replication_WT
+  - name: replica_sets_WT
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave_WT
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding_WT
   - name: slow1_WT
   - name: serial_run_WT
@@ -3658,10 +3680,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -3693,12 +3711,16 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -3789,10 +3811,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -3824,12 +3842,16 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -3911,10 +3933,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -3946,12 +3964,16 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -4019,8 +4041,6 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -4034,13 +4054,26 @@ buildvariants:
   - name: parallel_WT
   - name: parallel_compatibility_WT
   - name: concurrency_WT
+    distros:
+    # There is a known performance issue with the ubuntu1604-arm64-1.linaro.build.10gen.cc host
+    # that's part of the ubuntu1604-arm64-large pool. We run the concurrency tests only on the
+    # hosts from the ubuntu1604-arm64-small pool to work around this issue.
+    - ubuntu1604-arm64-small
   - name: concurrency_replication_WT
+    distros:
+    - ubuntu1604-arm64-small
   - name: concurrency_sharded_WT
+    distros:
+    - ubuntu1604-arm64-small
   - name: concurrency_simultaneous_WT
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication_WT
-  - name: replication_auth
+    distros:
+    - ubuntu1604-arm64-small
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding_WT
   - name: sharding_auth
   - name: slow1_WT
@@ -4095,8 +4128,6 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -4110,13 +4141,26 @@ buildvariants:
   - name: parallel_WT
   - name: parallel_compatibility_WT
   - name: concurrency_WT
+    distros:
+    # There is a known performance issue with the ubuntu1604-arm64-1.linaro.build.10gen.cc host
+    # that's part of the ubuntu1604-arm64-large pool. We run the concurrency tests only on the
+    # hosts from the ubuntu1604-arm64-small pool to work around this issue.
+    - ubuntu1604-arm64-small
   - name: concurrency_replication_WT
+    distros:
+    - ubuntu1604-arm64-small
   - name: concurrency_sharded_WT
+    distros:
+    - ubuntu1604-arm64-small
   - name: concurrency_simultaneous_WT
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication_WT
-  - name: replication_auth
+    distros:
+    - ubuntu1604-arm64-small
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding_WT
   - name: sharding_auth
   - name: slow1_WT
@@ -4174,8 +4218,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_compression
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -4192,10 +4234,12 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous_WT
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding_WT
   - name: sharding_auth
   - name: slow1_WT
@@ -4224,7 +4268,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: s390x-enterprise-ubuntu1604
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
     num_jobs_available: 2
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
@@ -4267,21 +4311,21 @@ buildvariants:
   - name: jsCore_compression
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs_WT
   - name: mongosTest
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
   - name: parallel_WT
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
-  - name: replicasets_WT
-  - name: replicasets_WT_ese
-  - name: replicasets_auth
-  - name: replicasets_compression
-  - name: replicasets_legacy
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets_WT
+  - name: replica_sets_WT_ese
+  - name: replica_sets_auth
+  - name: replica_sets_compression
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough_WT
   - name: sasl
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_WT
@@ -4365,10 +4409,10 @@ buildvariants:
   - name: noPassthroughWithMongod_WT
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
-  - name: replicasets_auth
-  - name: replicasets_WT_ese
-  - name: replication_auth
-  - name: replication_WT
+  - name: replica_sets_auth
+  - name: replica_sets_WT_ese
+  - name: master_slave_auth
+  - name: master_slave_WT
   - name: sasl
   - name: sharding_auth
   - name: sharding_auth_audit_WT
@@ -4453,10 +4497,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -4488,12 +4528,16 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -4574,10 +4618,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -4607,10 +4647,14 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replication
-  - name: replication_WT
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: slow1
@@ -4682,10 +4726,6 @@ buildvariants:
   - name: jsCore_compression
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -4719,11 +4759,15 @@ buildvariants:
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: read_concern_majority_passthrough_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_compression
-  - name: replication
-  - name: replication_WT
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_compression
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_compression
@@ -4786,32 +4830,6 @@ buildvariants:
   - name: jsCore_compression
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-    distros:
-    - windows-64-vs2015-large
-  - name: jsCore_small_oplog_rs_WT
-    distros:
-    - windows-64-vs2015-large
-  - name: jsCore_small_oplog_rs_initsync
-    distros:
-    - windows-64-vs2015-large
-  - name: jsCore_small_oplog_rs_initsync_WT
-    distros:
-    - windows-64-vs2015-large
-  - name: jsCore_small_oplog_rs_initsync_static
-    distros:
-    - windows-64-vs2015-large
-  - name: jsCore_small_oplog_rs_initsync_static_WT
-    distros:
-    - windows-64-vs2015-large
-  - name: jsCore_small_oplog_rs_resync_static
-    distros:
-    - windows-64-vs2015-large
-  - name: jsCore_small_oplog_rs_resync_static_WT
-    distros:
-    - windows-64-vs2015-large
   - name: mmap
   - name: mongosTest
   - name: noPassthrough
@@ -4857,14 +4875,40 @@ buildvariants:
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
-  - name: replicasets
+  - name: replica_sets
     distros:
     - windows-64-vs2015-large
-  - name: replicasets_WT
+  - name: replica_sets_WT
     distros:
     - windows-64-vs2015-large
-  - name: replication
-  - name: replication_WT
+  - name: replica_sets_jscore_passthrough
+    distros:
+    - windows-64-vs2015-large
+  - name: replica_sets_jscore_passthrough_WT
+    distros:
+    - windows-64-vs2015-large
+  - name: replica_sets_initsync_jscore_passthrough
+    distros:
+    - windows-64-vs2015-large
+  - name: replica_sets_initsync_jscore_passthrough_WT
+    distros:
+    - windows-64-vs2015-large
+  - name: replica_sets_initsync_static_jscore_passthrough
+    distros:
+    - windows-64-vs2015-large
+  - name: replica_sets_initsync_static_jscore_passthrough_WT
+    distros:
+    - windows-64-vs2015-large
+  - name: replica_sets_resync_static_jscore_passthrough
+    distros:
+    - windows-64-vs2015-large
+  - name: replica_sets_resync_static_jscore_passthrough_WT
+    distros:
+    - windows-64-vs2015-large
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
     distros:
     - windows-64-vs2015-large
@@ -4929,8 +4973,8 @@ buildvariants:
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
-  - name: replicasets_auth
-  - name: replicasets_WT_ese
+  - name: replica_sets_auth
+  - name: replica_sets_WT_ese
   - name: sasl
   - name: sharding_auth
   - name: sharding_auth_audit_WT
@@ -4986,15 +5030,15 @@ buildvariants:
   - name: concurrency_simultaneous
   - name: jsCore
   - name: jsCore_auth
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_rs
   - name: jstestfuzz
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
-  - name: replicasets_auth
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: master_slave_jscore_passthrough
   - name: sasl
   - name: sharding_auth
   - name: sharding_auth_audit_WT
@@ -5042,10 +5086,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -5075,10 +5115,14 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replication
-  - name: replication_WT
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: slow1
@@ -5174,10 +5218,6 @@ buildvariants:
   - name: jsCore_compression
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -5207,11 +5247,15 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_compression
-  - name: replication
-  - name: replication_WT
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_compression
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: slow1
   - name: slow1_WT
   - name: serial_run
@@ -5277,10 +5321,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -5311,10 +5351,14 @@ buildvariants:
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
   - name: read_concern_majority_passthrough_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replication
-  - name: replication_WT
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: slow1
   - name: slow1_WT
   - name: serial_run
@@ -5361,10 +5405,10 @@ buildvariants:
   - name: jsCore_decimal_WT
   - name: mmap
   - name: mongosTest
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replication
-  - name: replication_WT
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: master_slave
+  - name: master_slave_WT
   - name: tool
   - name: tool_WT
   - name: unittests
@@ -5410,7 +5454,7 @@ buildvariants:
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
-  - name: replicasets_auth
+  - name: replica_sets_auth
   - name: sasl
   - name: snmp
   - name: snmp_WT
@@ -5516,32 +5560,6 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query
   - name: jsCore_op_query_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_WT
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync_WT
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync_static
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync_static_WT
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_resync_static
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_resync_static_WT
-    distros:
-    - rhel62-large
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -5571,27 +5589,53 @@ buildvariants:
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
-  - name: replicasets
+  - name: replica_sets
     distros:
     - rhel62-large
-  - name: replicasets_WT
+  - name: replica_sets_WT
     distros:
     - rhel62-large
-  - name: replicasets_WT_ese
+  - name: replica_sets_WT_ese
     distros:
     - rhel62-large
-  - name: replicasets_auth
+  - name: replica_sets_auth
     distros:
     - rhel62-large
-  - name: replicasets_compression
+  - name: replica_sets_compression
     distros:
     - rhel62-large
-  - name: replicasets_legacy
+  - name: replica_sets_pv0
     distros:
     - rhel62-large
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_static_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_static_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_resync_static_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_resync_static_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: rlp
   - name: rlp_WT
   - name: sasl
@@ -5749,32 +5793,6 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query
   - name: jsCore_op_query_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_WT
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync_WT
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync_static
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync_static_WT
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_resync_static
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_resync_static_WT
-    distros:
-    - rhel62-large
   - name: mmap
   - name: mongosTest
   - name: multiversion
@@ -5795,27 +5813,53 @@ buildvariants:
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
-  - name: replicasets
+  - name: replica_sets
     distros:
     - rhel62-large
-  - name: replicasets_WT
+  - name: replica_sets_WT
     distros:
     - rhel62-large
-  - name: replicasets_WT_ese
+  - name: replica_sets_WT_ese
     distros:
     - rhel62-large
-  - name: replicasets_auth
+  - name: replica_sets_auth
     distros:
     - rhel62-large
-  - name: replicasets_compression
+  - name: replica_sets_compression
     distros:
     - rhel62-large
-  - name: replicasets_legacy
+  - name: replica_sets_pv0
     distros:
     - rhel62-large
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_static_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_static_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_resync_static_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_resync_static_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: rlp
   - name: rlp_WT
   - name: sasl
@@ -5914,7 +5958,7 @@ buildvariants:
   - name: jstestfuzz_sharded_WT
   - name: external_auth_WT
   - name: mmap
-  - name: replicasets_auth
+  - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -5986,10 +6030,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -6021,12 +6061,16 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -6109,10 +6153,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -6160,12 +6200,16 @@ buildvariants:
   - name: concurrency_simultaneous_WT
     distros:
     - rhel70
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -6271,10 +6315,6 @@ buildvariants:
   # - name: jsCore_minimum_batch_size_WT
   # - name: jsCore_op_query
   - name: jsCore_op_query_WT
-  # - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  # - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   # - name: mmap
   - name: mongosTest
   # - name: noPassthrough
@@ -6286,14 +6326,18 @@ buildvariants:
   # - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
-  # - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_WT_ese
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  # - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  # - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_WT_ese
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  # - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  # - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  # - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sasl
   # - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
@@ -6340,7 +6384,7 @@ buildvariants:
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
-    compile_flags: --ssl MONGO_DISTMOD=rhel72 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
+    compile_flags: --ssl MONGO_DISTMOD=rhel72 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
     num_jobs_available: 2
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
@@ -6408,10 +6452,6 @@ buildvariants:
   # - name: jsCore_minimum_batch_size_WT
   # - name: jsCore_op_query
   - name: jsCore_op_query_WT
-  # - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  # - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   # - name: mmap
   - name: mongosTest
   # - name: noPassthrough
@@ -6423,14 +6463,18 @@ buildvariants:
   # - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
-  # - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_WT_ese
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  # - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  # - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_WT_ese
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  # - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  # - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  # - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sasl
   # - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
@@ -6464,6 +6508,143 @@ buildvariants:
   - name: push
     distros:
     - rhel70-small
+
+- name: enterprise-rhel-67-s390x
+  display_name: Enterprise RHEL 6.7 s390x
+  modules:
+  - enterprise
+  run_on:
+  - rhel67-zseries-build
+  - rhel67-zseries-test
+  batchtime: 1440 # 1 day
+  stepback: false
+  expansions:
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
+    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto) -lsasl2" -tags 'sasl ssl'
+    compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    test_flags: --excludeWithAnyTags=requires_mmapv1
+    has_packages: true
+    packager_script: packager-enterprise.py
+    packager_arch: s390x
+    packager_distro: rhel67
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: s390x-enterprise-rhel67
+    repo_edition: enterprise
+    build_mongoreplay: true
+  tasks:
+  - name: compile
+    distros:
+    - rhel67-zseries-build
+  # - name: aggregation
+  - name: aggregation_WT
+  - name: aggregation_WT_ese
+  - name: aggregation_auth
+  - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_sharded_collections_passthrough_WT
+  # - name: audit
+  - name: audit_WT
+  # - name: auth
+  - name: auth_WT
+  # - name: auth_audit
+  - name: auth_audit_WT
+  # - name: bulk_gle_passthrough
+  - name: bulk_gle_passthrough_WT
+  # - name: concurrency
+  - name: concurrency_WT
+  # - name: concurrency_replication
+  - name: concurrency_replication_WT
+  # - name: concurrency_sharded
+  - name: concurrency_sharded_WT
+  # - name: concurrency_simultaneous
+  - name: concurrency_simultaneous_WT
+  # - name: dbtest
+  - name: dbtest_WT
+  # - name: disk
+  # - name: dur_jscore_passthrough
+  # - name: durability
+  - name: ese_WT
+  - name: failpoints
+  - name: failpoints_auth
+  # - name: gle_auth
+  - name: gle_auth_WT
+  # - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_WT
+  # - name: gle_auth_basics_passthrough_write_cmd
+  - name: gle_auth_basics_passthrough_write_cmd_WT
+  # - name: gle_auth_write_cmd
+  - name: gle_auth_write_cmd_WT
+  - name: httpinterface
+  - name: integration_tests_replset
+  - name: integration_tests_standalone
+  # - name: jsCore
+  - name: jsCore_WT
+  - name: jsCore_WT_ese
+  # - name: jsCore_auth
+  # - name: jsCore_compatibility
+  - name: jsCore_compatibility_WT
+  - name: jsCore_decimal_WT
+  # - name: jsCore_minimum_batch_size_WT
+  # - name: jsCore_op_query
+  - name: jsCore_op_query_WT
+  # - name: mmap
+  - name: mongosTest
+  # - name: noPassthrough
+  # - name: noPassthroughWithMongod
+  - name: noPassthroughWithMongod_WT
+  - name: noPassthrough_WT
+  # - name: parallel
+  - name: parallel_WT
+  # - name: parallel_compatibility
+  - name: parallel_compatibility_WT
+  - name: read_concern_majority_passthrough_WT
+  # - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_WT_ese
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  # - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  # - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  # - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
+  - name: sasl
+  # - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
+  # - name: sharding
+  - name: sharding_WT
+  - name: sharding_WT_ese
+  - name: sharding_auth
+  - name: sharding_auth_audit_WT
+  - name: sharding_csrs_continuous_config_stepdown_WT
+  # - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_WT
+  # - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  # - name: sharding_jscore_passthrough
+  - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_passthrough_wire_ops_WT
+  - name: sharding_op_query_WT
+  # - name: slow1
+  - name: slow1_WT
+  # - name: serial_run
+  - name: serial_run_WT
+  # - name: snmp
+  - name: snmp_WT
+  - name: ssl
+  - name: sslSpecial
+  # - name: tool
+  - name: tool_WT
+  - name: unittests
+  - name: views_WT
+  - name: views_rs_WT
+  - name: push      
+    distros:
+    - rhel62-small
 
 ###########################################
 #          Ubuntu buildvariants           #
@@ -6513,7 +6694,7 @@ buildvariants:
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
-  - name: replicasets_auth
+  - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -6580,7 +6761,7 @@ buildvariants:
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
-  - name: replicasets_auth
+  - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -6638,7 +6819,7 @@ buildvariants:
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
-  - name: replicasets_auth
+  - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -6716,7 +6897,7 @@ buildvariants:
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
-  - name: replicasets_auth
+  - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
   - name: mmap
@@ -6746,7 +6927,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: s390x-enterprise-suse12
-    compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
+    compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
@@ -6788,20 +6969,20 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs_WT
   - name: mongosTest
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
   - name: parallel_WT
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
-  - name: replicasets_WT
-  - name: replicasets_WT_ese
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets_WT
+  - name: replica_sets_WT_ese
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough_WT
   - name: sasl
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_WT
@@ -6881,10 +7062,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -6916,12 +7093,16 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -6989,7 +7170,7 @@ buildvariants:
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
-  - name: replicasets_auth
+  - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
   - name: mmap
@@ -7017,7 +7198,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: s390x-enterprise-suse11
-    compile_flags: --ssl MONGO_DISTMOD=suse11 --release -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
+    compile_flags: --ssl MONGO_DISTMOD=suse11 --release -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z9-109 -mtune=z10" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
@@ -7056,20 +7237,20 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs_WT
   - name: mongosTest
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
   - name: parallel_WT
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
-  - name: replicasets_WT
-  - name: replicasets_WT_ese
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets_WT
+  - name: replica_sets_WT_ese
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough_WT
   - name: sasl
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_WT
@@ -7148,10 +7329,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -7183,12 +7360,16 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -7259,10 +7440,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
-  - name: jsCore_small_oplog_WT
   - name: jsCore_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
@@ -7280,10 +7457,14 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: parallel_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replication
-  - name: replication_WT
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
@@ -7354,7 +7535,7 @@ buildvariants:
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
-  - name: replicasets_auth
+  - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -7412,7 +7593,7 @@ buildvariants:
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
   - name: mmap
-  - name: replicasets_auth
+  - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -7482,10 +7663,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -7517,12 +7694,16 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -7607,10 +7788,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
@@ -7642,12 +7819,16 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sharding
   - name: sharding_WT
   - name: sharding_auth
@@ -7728,8 +7909,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_rs
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7742,11 +7921,13 @@ buildvariants:
   - name: parallel
   - name: parallel_compatibility
   - name: read_concern_majority_passthrough_WT
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
   - name: rlp
   - name: sasl
   - name: sharded_collections_jscore_passthrough
@@ -7810,8 +7991,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_op_query
   - name: jsCore_compatibility
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_rs
   # Disabled due to SERVER-21965
   # - name: jstestfuzz_WT
   # - name: jstestfuzz_concurrent_WT
@@ -7827,11 +8006,13 @@ buildvariants:
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
   - name: sharding
   - name: sharding_auth
   - name: sharding_op_query_WT
@@ -7892,19 +8073,19 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_rs
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
   - name: read_concern_majority_passthrough_WT
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
   - name: sasl
   - name: sharded_collections_jscore_passthrough
   - name: sharding
@@ -7936,7 +8117,7 @@ buildvariants:
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
-    compile_flags: --dbg=on --opt=on --ssl --link-model=static MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
+    compile_flags: --dbg=on --opt=on --ssl --link-model=static MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
     num_jobs_available: 2
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_mmapv1,requires_journaling
     build_mongoreplay: true
@@ -7978,19 +8159,19 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_rs
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
   - name: read_concern_majority_passthrough_WT
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
   - name: sasl
   - name: sharded_collections_jscore_passthrough
   - name: sharding
@@ -8047,8 +8228,6 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_rs
   - name: jstestfuzz
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8067,11 +8246,13 @@ buildvariants:
     distros:
     - ubuntu1404-build
   - name: concurrency_simultaneous
-  - name: replicasets
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
   - name: sharding
   - name: sharding_auth
   - name: slow1
@@ -8159,16 +8340,6 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query
   - name: jsCore_op_query_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
-  - name: jsCore_small_oplog_rs_initsync
-  - name: jsCore_small_oplog_rs_initsync_WT
-  - name: jsCore_small_oplog_rs_initsync_static
-  - name: jsCore_small_oplog_rs_initsync_static_WT
-  - name: jsCore_small_oplog_rs_resync_static
-  - name: jsCore_small_oplog_rs_resync_static_WT
   - name: mmap
   - name: mongosTest
   - name: multiversion
@@ -8187,15 +8358,25 @@ buildvariants:
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_WT_ese
-  - name: replicasets_auth
-  - name: replicasets_compression
-  - name: replicasets_legacy
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_WT_ese
+  - name: replica_sets_auth
+  - name: replica_sets_compression
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: replica_sets_initsync_jscore_passthrough
+  - name: replica_sets_initsync_jscore_passthrough_WT
+  - name: replica_sets_initsync_static_jscore_passthrough
+  - name: replica_sets_initsync_static_jscore_passthrough_WT
+  - name: replica_sets_resync_static_jscore_passthrough
+  - name: replica_sets_resync_static_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sasl
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
@@ -8334,16 +8515,6 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query
   - name: jsCore_op_query_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
-  - name: jsCore_small_oplog_rs_initsync
-  - name: jsCore_small_oplog_rs_initsync_WT
-  - name: jsCore_small_oplog_rs_initsync_static
-  - name: jsCore_small_oplog_rs_initsync_static_WT
-  - name: jsCore_small_oplog_rs_resync_static
-  - name: jsCore_small_oplog_rs_resync_static_WT
   - name: mmap
   - name: mongosTest
   - name: multiversion
@@ -8362,15 +8533,25 @@ buildvariants:
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_WT_ese
-  - name: replicasets_auth
-  - name: replicasets_compression
-  - name: replicasets_legacy
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_WT_ese
+  - name: replica_sets_auth
+  - name: replica_sets_compression
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: replica_sets_initsync_jscore_passthrough
+  - name: replica_sets_initsync_jscore_passthrough_WT
+  - name: replica_sets_initsync_static_jscore_passthrough
+  - name: replica_sets_initsync_static_jscore_passthrough_WT
+  - name: replica_sets_resync_static_jscore_passthrough
+  - name: replica_sets_resync_static_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: sasl
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
@@ -8492,10 +8673,6 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query
   - name: jsCore_op_query_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
   - name: mmap
   - name: mongosTest
   - name: multiversion
@@ -8513,14 +8690,18 @@ buildvariants:
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_WT_ese
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_WT_ese
+  - name: replica_sets_auth
+  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
   - name: rlp
   - name: rlp_WT
   - name: sasl
@@ -8604,24 +8785,6 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: jsCore
   - name: jsCore_WT
-  - name: jsCore_small_oplog_rs
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_WT
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync_static
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync_static_WT
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_resync_static
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_resync_static_WT
-    distros:
-    - rhel62-large
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: noPassthroughWithMongod_WT
@@ -8629,19 +8792,37 @@ buildvariants:
   - name: read_concern_majority_passthrough_WT
     distros:
     - rhel62-large
-  - name: replicasets
+  - name: replica_sets
     distros:
     - rhel62-large
-  - name: replicasets_WT
+  - name: replica_sets_WT
     distros:
     - rhel62-large
-  - name: replicasets_WT_ese
+  - name: replica_sets_WT_ese
     distros:
     - rhel62-large
-  - name: replicasets_auth
+  - name: replica_sets_auth
     distros:
     - rhel62-large
-  - name: replicasets_legacy
+  - name: replica_sets_pv0
+    distros:
+    - rhel62-large
+  - name: replica_sets_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_static_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_static_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_resync_static_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_resync_static_jscore_passthrough_WT
     distros:
     - rhel62-large
   - name: sharded_collections_jscore_passthrough

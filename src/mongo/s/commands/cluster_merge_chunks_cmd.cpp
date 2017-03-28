@@ -35,8 +35,8 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
@@ -151,7 +151,7 @@ public:
         minKey = cm->getShardKeyPattern().normalizeShardKey(minKey);
         maxKey = cm->getShardKeyPattern().normalizeShardKey(maxKey);
 
-        shared_ptr<Chunk> firstChunk = cm->findIntersectingChunkWithSimpleCollation(txn, minKey);
+        shared_ptr<Chunk> firstChunk = cm->findIntersectingChunkWithSimpleCollation(minKey);
 
         BSONObjBuilder remoteCmdObjB;
         remoteCmdObjB.append(cmdObj[ClusterMergeChunksCommand::nsField()]);
@@ -159,8 +159,8 @@ public:
         remoteCmdObjB.append(
             ClusterMergeChunksCommand::configField(),
             Grid::get(txn)->shardRegistry()->getConfigServerConnectionString().toString());
-        remoteCmdObjB.append(ClusterMergeChunksCommand::shardNameField(), firstChunk->getShardId());
-
+        remoteCmdObjB.append(ClusterMergeChunksCommand::shardNameField(),
+                             firstChunk->getShardId().toString());
 
         BSONObj remoteResult;
 

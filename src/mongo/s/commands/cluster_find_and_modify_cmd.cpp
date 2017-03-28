@@ -39,11 +39,12 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_explain.h"
+#include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
@@ -123,16 +124,9 @@ public:
             }
 
             BSONObj shardKey = status.getValue();
-            auto chunk = chunkMgr->findIntersectingChunk(txn, shardKey, collation);
+            auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
 
-            if (!chunk.isOK()) {
-                uasserted(ErrorCodes::ShardKeyNotFound,
-                          "findAndModify must target a single shard, but was not able to due "
-                          "to non-simple collation");
-            }
-
-            auto shardStatus =
-                Grid::get(txn)->shardRegistry()->getShard(txn, chunk.getValue()->getShardId());
+            auto shardStatus = Grid::get(txn)->shardRegistry()->getShard(txn, chunk->getShardId());
             if (!shardStatus.isOK()) {
                 return shardStatus.getStatus();
             }
@@ -207,19 +201,12 @@ public:
         }
 
         BSONObj shardKey = status.getValue();
-        auto chunk = chunkMgr->findIntersectingChunk(txn, shardKey, collation);
+        auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
 
-        if (!chunk.isOK()) {
-            uasserted(ErrorCodes::ShardKeyNotFound,
-                      "findAndModify must target a single shard, but was not able to due to "
-                      "non-simple collation");
-        }
-
-        bool ok =
-            _runCommand(txn, conf, chunkMgr, chunk.getValue()->getShardId(), nss, cmdObj, result);
+        const bool ok = _runCommand(txn, conf, chunkMgr, chunk->getShardId(), nss, cmdObj, result);
         if (ok) {
-            // check whether split is necessary (using update object for size heuristic)
-            chunk.getValue()->splitIfShould(txn, cmdObj.getObjectField("update").objsize());
+            updateChunkWriteStatsAndSplitIfNeeded(
+                txn, chunkMgr.get(), chunk.get(), cmdObj.getObjectField("update").objsize());
         }
 
         return ok;

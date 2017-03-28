@@ -108,8 +108,6 @@ public:
 private:
     // Different ways we can refresh metadata
     enum RefreshType {
-        // No refresh is needed
-        RefreshType_None,
         // The version has gone up, but the collection hasn't been dropped
         RefreshType_RefreshChunkManager,
         // The collection may have been dropped, so we need to reload the db
@@ -156,11 +154,9 @@ private:
      *
      * If 'collation' is empty, we use the collection default collation for targeting.
      */
-    Status targetShardKey(OperationContext* txn,
-                          const BSONObj& doc,
-                          const BSONObj& collation,
-                          long long estDataSize,
-                          ShardEndpoint** endpoint) const;
+    std::unique_ptr<ShardEndpoint> targetShardKey(const BSONObj& doc,
+                                                  const BSONObj& collation,
+                                                  long long estDataSize) const;
 
     // Full namespace of the collection for this targeter
     const NamespaceString _nss;

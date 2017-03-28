@@ -35,7 +35,6 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/connpool.h"
-#include "mongo/client/parallel.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
@@ -70,9 +69,11 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
-#include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/parallel.h"
+#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -1404,7 +1405,10 @@ public:
         // be done under the lock.
         ON_BLOCK_EXIT([txn, &config, &rangePreserver] {
             if (rangePreserver) {
-                AutoGetCollectionForRead ctx(txn, config.ns);
+                // Be sure not to use AutoGetCollectionForRead here, since that has side-effects
+                // other than lock acquisition.
+                ScopedTransaction scopedTxn(txn, MODE_IS);
+                AutoGetCollection ctx(txn, NamespaceString(config.ns), MODE_IS);
                 rangePreserver.reset();
             }
         });
@@ -1503,7 +1507,7 @@ public:
                 }
 
                 {
-                    stdx::lock_guard<Client>(*txn->getClient());
+                    stdx::lock_guard<Client> lk(*txn->getClient());
                     CurOp::get(txn)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
                 }
 
@@ -1622,6 +1626,14 @@ public:
             // final reduce
             state.finalReduce(txn, curOp, pm);
             reduceTime += rt.micros();
+
+            // Ensure the profile shows the source namespace. If the output was not inline, the
+            // active namespace will be the temporary collection we inserted into.
+            {
+                stdx::lock_guard<Client> lk(*txn->getClient());
+                curOp->setNS_inlock(config.ns);
+            }
+
             countsBuilder.appendNumber("reduce", state.numReduces());
             timingBuilder.appendNumber("reduceTime", reduceTime / 1000);
             timingBuilder.append("mode", state.jsMode() ? "js" : "mixed");

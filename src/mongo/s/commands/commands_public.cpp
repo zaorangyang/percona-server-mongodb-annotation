@@ -52,8 +52,8 @@
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
@@ -888,8 +888,9 @@ public:
         double numObjects = 0;
         int millis = 0;
 
-        set<ShardId> shardIds;
-        cm->getShardIdsForRange(shardIds, min, max);
+        std::set<ShardId> shardIds;
+        cm->getShardIdsForRange(min, max, &shardIds);
+
         for (const ShardId& shardId : shardIds) {
             const auto shardStatus = Grid::get(txn)->shardRegistry()->getShard(txn, shardId);
             if (!shardStatus.isOK()) {
@@ -983,7 +984,7 @@ public:
 
         // Note that this implementation will not handle targeting retries and fails when the
         // sharding metadata is too stale
-        auto status = Grid::get(txn)->catalogCache()->getDatabase(txn, nss.db().toString());
+        auto status = Grid::get(txn)->catalogCache()->getDatabase(txn, nss.db());
         if (!status.isOK()) {
             return Status(status.getStatus().code(),
                           str::stream() << "Passthrough command failed: " << command.toString()
