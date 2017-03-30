@@ -37,11 +37,11 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
-#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_tags.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/sharding_raii.h"
 #include "mongo/stdx/memory.h"
@@ -308,8 +308,8 @@ BalancerChunkSelectionPolicyImpl::selectSpecificChunkToMove(OperationContext* tx
         return scopedCMStatus.getStatus();
     }
 
-    auto scopedCM = std::move(scopedCMStatus.getValue());
-    ChunkManager* const cm = scopedCM.cm();
+    const auto& scopedCM = scopedCMStatus.getValue();
+    const auto cm = scopedCM.cm().get();
 
     const auto collInfoStatus = createCollectionDistributionStatus(txn, shardStats, cm);
     if (!collInfoStatus.isOK()) {
@@ -338,8 +338,8 @@ Status BalancerChunkSelectionPolicyImpl::checkMoveAllowed(OperationContext* txn,
         return scopedCMStatus.getStatus();
     }
 
-    auto scopedCM = std::move(scopedCMStatus.getValue());
-    ChunkManager* const cm = scopedCM.cm();
+    const auto& scopedCM = scopedCMStatus.getValue();
+    const auto cm = scopedCM.cm().get();
 
     const auto collInfoStatus = createCollectionDistributionStatus(txn, shardStats, cm);
     if (!collInfoStatus.isOK()) {
@@ -371,8 +371,8 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::_getSplitCandidate
         return scopedCMStatus.getStatus();
     }
 
-    auto scopedCM = std::move(scopedCMStatus.getValue());
-    ChunkManager* const cm = scopedCM.cm();
+    const auto& scopedCM = scopedCMStatus.getValue();
+    const auto cm = scopedCM.cm().get();
 
     const auto& shardKeyPattern = cm->getShardKeyPattern().getKeyPattern();
 
@@ -390,7 +390,7 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::_getSplitCandidate
         const auto& tagRange = tagRangeEntry.second;
 
         shared_ptr<Chunk> chunkAtZoneMin =
-            cm->findIntersectingChunkWithSimpleCollation(txn, tagRange.min);
+            cm->findIntersectingChunkWithSimpleCollation(tagRange.min);
         invariant(chunkAtZoneMin->getMax().woCompare(tagRange.min) > 0);
 
         if (chunkAtZoneMin->getMin().woCompare(tagRange.min)) {
@@ -402,7 +402,7 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::_getSplitCandidate
             continue;
 
         shared_ptr<Chunk> chunkAtZoneMax =
-            cm->findIntersectingChunkWithSimpleCollation(txn, tagRange.max);
+            cm->findIntersectingChunkWithSimpleCollation(tagRange.max);
 
         // We need to check that both the chunk's minKey does not match the zone's max and also that
         // the max is not equal, which would only happen in the case of the zone ending in MaxKey.
@@ -425,8 +425,8 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
         return scopedCMStatus.getStatus();
     }
 
-    auto scopedCM = std::move(scopedCMStatus.getValue());
-    ChunkManager* const cm = scopedCM.cm();
+    const auto& scopedCM = scopedCMStatus.getValue();
+    const auto cm = scopedCM.cm().get();
 
     const auto& shardKeyPattern = cm->getShardKeyPattern().getKeyPattern();
 
@@ -441,7 +441,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
         const auto& tagRange = tagRangeEntry.second;
 
         shared_ptr<Chunk> chunkAtZoneMin =
-            cm->findIntersectingChunkWithSimpleCollation(txn, tagRange.min);
+            cm->findIntersectingChunkWithSimpleCollation(tagRange.min);
 
         if (chunkAtZoneMin->getMin().woCompare(tagRange.min)) {
             return {ErrorCodes::IllegalOperation,
@@ -460,7 +460,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
             continue;
 
         shared_ptr<Chunk> chunkAtZoneMax =
-            cm->findIntersectingChunkWithSimpleCollation(txn, tagRange.max);
+            cm->findIntersectingChunkWithSimpleCollation(tagRange.max);
 
         // We need to check that both the chunk's minKey does not match the zone's max and also that
         // the max is not equal, which would only happen in the case of the zone ending in MaxKey.

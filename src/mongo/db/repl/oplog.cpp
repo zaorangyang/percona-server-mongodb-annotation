@@ -375,10 +375,10 @@ void _logOpsInner(OperationContext* txn,
     checkOplogInsert(oplogCollection->insertDocumentsForOplog(txn, writers, nWriters));
 
     // Set replCoord last optime only after we're sure the WUOW didn't abort and roll back.
-    txn->recoveryUnit()->onCommit(
-        [replCoord, finalOpTime] { replCoord->setMyLastAppliedOpTimeForward(finalOpTime); });
-
-    ReplClientInfo::forClient(txn->getClient()).setLastOp(finalOpTime);
+    txn->recoveryUnit()->onCommit([txn, replCoord, finalOpTime] {
+        replCoord->setMyLastAppliedOpTimeForward(finalOpTime);
+        ReplClientInfo::forClient(txn->getClient()).setLastOp(finalOpTime);
+    });
 }
 
 void logOp(OperationContext* txn,
@@ -1243,8 +1243,7 @@ void SnapshotThread::run() {
                 invariant(!opTimeOfSnapshot.isNull());
             }
 
-            _manager->createSnapshot(txn.get(), name);
-            replCoord->onSnapshotCreate(opTimeOfSnapshot, name);
+            replCoord->createSnapshot(txn.get(), opTimeOfSnapshot, name);
         } catch (const WriteConflictException& wce) {
             log() << "skipping storage snapshot pass due to write conflict";
             continue;

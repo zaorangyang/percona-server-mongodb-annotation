@@ -114,6 +114,7 @@ var ReplSetTest = function(opts) {
         var twoPrimaries = false;
         self.nodes.forEach(function(node) {
             try {
+                node.setSlaveOk();
                 var n = node.getDB('admin').runCommand({ismaster: 1});
                 if (n.ismaster == true) {
                     if (self.liveNodes.master) {
@@ -122,7 +123,6 @@ var ReplSetTest = function(opts) {
                         self.liveNodes.master = node;
                     }
                 } else {
-                    node.setSlaveOk();
                     self.liveNodes.slaves.push(node);
                 }
             } catch (err) {
@@ -270,13 +270,31 @@ var ReplSetTest = function(opts) {
     }
 
     /**
-     * Returns the optime for the specified host by issuing replSetGetStatus.
+     * Returns true if the OpTime is empty, else false.
+     *
+     * Empty OpTime Formats:
+     *   PV0: Timestamp(0,0)
+     *   PV1: {ts: Timestamp(0,0), t: NumberLong(-1)}
+     */
+    function _isEmptyOpTime(opTime) {
+        if (!opTime.hasOwnProperty("ts") || !opTime.hasOwnProperty("t")) {
+            return (opTime.getTime() == 0 && opTime.getInc() == 0);
+        }
+        return (opTime.ts.getTime() == 0 && opTime.ts.getInc() == 0 && opTime.t == -1);
+    }
+
+    /**
+     * Returns the OpTime for the specified host by issuing replSetGetStatus.
      */
     function _getLastOpTime(conn) {
         var replSetStatus =
             assert.commandWorked(conn.getDB("admin").runCommand({replSetGetStatus: 1}));
         var connStatus = replSetStatus.members.filter(m => m.self)[0];
-        return connStatus.optime;
+        var opTime = connStatus.optime;
+        if (_isEmptyOpTime(opTime)) {
+            throw new Error("last OpTime is empty -- connection: " + conn);
+        }
+        return opTime;
     }
 
     /**
@@ -304,7 +322,11 @@ var ReplSetTest = function(opts) {
         if (_isRunningWithoutJournaling()) {
             opTimeType = "appliedOpTime";
         }
-        return replSetStatus.optimes[opTimeType];
+        var opTime = replSetStatus.optimes[opTimeType];
+        if (_isEmptyOpTime(opTime)) {
+            throw new Error("last durable OpTime is empty -- connection: " + conn);
+        }
+        return opTime;
     }
 
     /*
@@ -315,6 +337,13 @@ var ReplSetTest = function(opts) {
             return ts1.getInc() < ts2.getInc();
         }
         return ts1.getTime() < ts2.getTime();
+    }
+
+    /*
+     * Returns true if the node can be elected primary of a replica set.
+     */
+    function _isElectable(node) {
+        return !node.arbiterOnly && (node.priority === undefined || node.priority != 0);
     }
 
     /**
@@ -400,8 +429,8 @@ var ReplSetTest = function(opts) {
             cfg.members.push(member);
         }
 
-        if (jsTestOptions().useLegacyReplicationProtocol) {
-            cfg.protocolVersion = 0;
+        if (jsTestOptions().forceReplicationProtocolVersion !== undefined) {
+            cfg.protocolVersion = jsTestOptions().forceReplicationProtocolVersion;
         }
 
         if (_configSettings) {
@@ -485,15 +514,15 @@ var ReplSetTest = function(opts) {
     /**
      * Blocks until all nodes agree on who the primary is.
      */
-    this.awaitNodesAgreeOnPrimary = function(timeout) {
+    this.awaitNodesAgreeOnPrimary = function(timeout, nodes) {
         timeout = timeout || self.kDefaultTimeoutMS;
+        nodes = nodes || self.nodes;
 
         assert.soonNoExcept(function() {
             var primary = -1;
 
-            for (var i = 0; i < self.nodes.length; i++) {
-                var replSetGetStatus =
-                    self.nodes[i].getDB("admin").runCommand({replSetGetStatus: 1});
+            for (var i = 0; i < nodes.length; i++) {
+                var replSetGetStatus = nodes[i].getDB("admin").runCommand({replSetGetStatus: 1});
                 var nodesPrimary = -1;
                 for (var j = 0; j < replSetGetStatus.members.length; j++) {
                     if (replSetGetStatus.members[j].state === ReplSetTest.State.PRIMARY) {
@@ -635,34 +664,140 @@ var ReplSetTest = function(opts) {
     };
 
     this._setDefaultConfigOptions = function(config) {
-        if (jsTestOptions().useLegacyReplicationProtocol &&
+        if (jsTestOptions().forceReplicationProtocolVersion !== undefined &&
             !config.hasOwnProperty("protocolVersion")) {
-            config.protocolVersion = 0;
+            config.protocolVersion = jsTestOptions().forceReplicationProtocolVersion;
         }
         // Update config for non journaling test variants
         this._updateConfigIfNotDurable(config);
     };
 
-    this.initiate = function(cfg, initCmd, timeout) {
+    this.initiate = function(cfg, initCmd, ensureNode0Primary) {
         var master = this.nodes[0].getDB("admin");
         var config = cfg || this.getReplSetConfig();
         var cmd = {};
         var cmdKey = initCmd || 'replSetInitiate';
-        timeout = timeout || self.kDefaultTimeoutMS;
+        if (ensureNode0Primary === undefined) {
+            ensureNode0Primary = true;
+        }
 
+        // Throw an exception if nodes[0] is unelectable in the given config.
+        if (!_isElectable(config.members[0])) {
+            throw Error("The node at index 0 must be electable");
+        }
+
+        // Start up a single node replica set then reconfigure to the correct size (if the config
+        // contains more than 1 node), so the primary is elected more quickly.
+        var originalMembers, originalSettings;
+        if (config.members && config.members.length > 1) {
+            originalMembers = config.members.slice();
+            config.members = config.members.slice(0, 1);
+            originalSettings = config.settings;
+            delete config.settings;  // Clear settings to avoid tags referencing sliced nodes.
+        }
         this._setDefaultConfigOptions(config);
 
         cmd[cmdKey] = config;
         printjson(cmd);
 
         assert.commandWorked(master.runCommand(cmd), tojson(cmd));
-        this.awaitSecondaryNodes(timeout);
+        this.getPrimary();  // Blocks until there is a primary.
+
+        // Reconfigure the set to contain the correct number of nodes (if necessary).
+        if (originalMembers) {
+            config.members = originalMembers;
+            if (originalSettings) {
+                config.settings = originalSettings;
+            }
+            config.version = 2;
+
+            // Nodes started with the --configsvr flag must have configsvr = true in their config.
+            if (this.nodes[0].hasOwnProperty("fullOptions") &&
+                this.nodes[0].fullOptions.hasOwnProperty("configsvr")) {
+                config.configsvr = true;
+            }
+
+            cmd = {replSetReconfig: config};
+            print("Reconfiguring replica set to add in other nodes");
+            printjson(cmd);
+
+            // replSetInitiate and replSetReconfig commands can fail with a NodeNotFound error
+            // if a heartbeat times out during the quorum check. We retry three times to reduce
+            // the chance of failing this way.
+            assert.retry(() => {
+                var res;
+                try {
+                    res = master.runCommand(cmd);
+                    if (res.ok === 1) {
+                        return true;
+                    }
+                } catch (e) {
+                    // reconfig can lead to a stepdown if the primary looks for a majority before
+                    // a majority of nodes have successfully joined the set. If there is a stepdown
+                    // then the reconfig request will be killed and respond with a network error.
+                    if (isNetworkError(e)) {
+                        return true;
+                    }
+                    throw e;
+                }
+
+                assert.commandFailedWithCode(
+                    res, ErrorCodes.NodeNotFound, "replSetReconfig during initiate failed");
+                return false;
+            }, "replSetReconfig during initiate failed", 3, 5 * 1000);
+
+            if (ensureNode0Primary) {
+                this.stepUp(this.nodes[0]);
+            } else {
+                this.awaitSecondaryNodes();
+            }
+        }
 
         // Setup authentication if running test with authentication
         if ((jsTestOptions().keyFile) && cmdKey == 'replSetInitiate') {
             master = this.getPrimary();
             jsTest.authenticateNodes(this.nodes);
         }
+    };
+
+    this.stepUp = function(node) {
+        this.awaitSecondaryNodes();
+        this.awaitNodesAgreeOnPrimary();
+        if (this.getPrimary() === node) {
+            return;
+        }
+
+        if (this.protocolVersion === 0 || jsTestOptions().forceReplicationProtocolVersion === 0) {
+            // Ensure the specified node is primary.
+            for (let i = 0; i < this.nodes.length; i++) {
+                let primary = this.getPrimary();
+                if (primary === node) {
+                    break;
+                }
+                try {
+                    // Make sure the nodes do not step back up for 10 minutes.
+                    assert.commandWorked(
+                        primary.adminCommand({replSetStepDown: 10 * 60, force: true}));
+                } catch (ex) {
+                    print("Caught exception while stepping down node '" + tojson(node.host) +
+                          "': " + tojson(ex));
+                }
+                this.awaitNodesAgreeOnPrimary();
+            }
+
+            // Reset the rest of the nodes so they can run for election during the test.
+            for (let i = 0; i < this.nodes.length; i++) {
+                // Cannot call replSetFreeze on the primary.
+                if (this.nodes[i] === node) {
+                    continue;
+                }
+                assert.commandWorked(this.nodes[i].adminCommand({replSetFreeze: 0}));
+            }
+        } else {
+            assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
+            this.awaitNodesAgreeOnPrimary();
+        }
+        assert.eq(this.getPrimary(), node, node.host + " was not primary after stepUp");
     };
 
     /**
@@ -692,7 +827,7 @@ var ReplSetTest = function(opts) {
         try {
             assert.commandWorked(this.getPrimary().adminCommand({replSetReconfig: config}));
         } catch (e) {
-            if (tojson(e).indexOf("error doing query: failed") < 0) {
+            if (!isNetworkError(e)) {
                 throw e;
             }
         }
@@ -871,7 +1006,7 @@ var ReplSetTest = function(opts) {
                       " secondaries synced at optime " + tojson(masterLatestOpTime));
                 return true;
             } catch (e) {
-                print("ReplSetTest awaitReplication: caught exception " + e + ';\n' + e.stack);
+                print("ReplSetTest awaitReplication: caught exception " + e);
 
                 // We might have a new master now
                 awaitLastOpTimeWrittenFn();

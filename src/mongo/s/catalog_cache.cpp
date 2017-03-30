@@ -28,7 +28,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/catalog_cache.h"
 
 #include "mongo/base/status_with.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -41,38 +41,37 @@ namespace mongo {
 using std::shared_ptr;
 using std::string;
 
+CatalogCache::CatalogCache() = default;
 
-CatalogCache::CatalogCache() {}
+CatalogCache::~CatalogCache() = default;
 
-StatusWith<shared_ptr<DBConfig>> CatalogCache::getDatabase(OperationContext* txn,
-                                                           const string& dbName) {
+StatusWith<std::shared_ptr<DBConfig>> CatalogCache::getDatabase(OperationContext* txn,
+                                                                StringData dbName) {
     stdx::lock_guard<stdx::mutex> guard(_mutex);
 
-    ShardedDatabasesMap::iterator it = _databases.find(dbName);
+    auto it = _databases.find(dbName);
     if (it != _databases.end()) {
         return it->second;
     }
 
     // Need to load from the store
-    auto status = Grid::get(txn)->catalogClient(txn)->getDatabase(txn, dbName);
+    auto status = Grid::get(txn)->catalogClient(txn)->getDatabase(txn, dbName.toString());
     if (!status.isOK()) {
         return status.getStatus();
     }
 
-    const auto dbOpTimePair = status.getValue();
-    shared_ptr<DBConfig> db = std::make_shared<DBConfig>(dbOpTimePair.value, dbOpTimePair.opTime);
+    const auto& dbOpTimePair = status.getValue();
+    auto db = std::make_shared<DBConfig>(dbOpTimePair.value, dbOpTimePair.opTime);
     try {
         db->load(txn);
-    } catch (const DBException& excep) {
-        return excep.toStatus();
+        auto emplaceResult = _databases.try_emplace(dbName, std::move(db));
+        return emplaceResult.first->second;
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
-
-    invariant(_databases.insert(std::make_pair(dbName, db)).second);
-
-    return db;
 }
 
-void CatalogCache::invalidate(const string& dbName) {
+void CatalogCache::invalidate(StringData dbName) {
     stdx::lock_guard<stdx::mutex> guard(_mutex);
 
     ShardedDatabasesMap::iterator it = _databases.find(dbName);

@@ -42,13 +42,14 @@
 #include "mongo/db/commands/mr.h"
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/config.h"
@@ -117,7 +118,6 @@ BSONObj fixForShards(const BSONObj& orig,
 
     return b.obj();
 }
-
 
 /**
  * Outline for sharded map reduce for sharded output, $out replace:
@@ -281,6 +281,8 @@ public:
             invariant(maxChunkSizeBytes < std::numeric_limits<int>::max());
         }
 
+        const auto shardRegistry = Grid::get(txn)->shardRegistry();
+
         // modify command to run on shards with output to tmp collection
         string badShardedField;
         BSONObj shardedCommand =
@@ -289,8 +291,8 @@ public:
         if (!shardedInput && !shardedOutput && !customOutDB) {
             LOG(1) << "simple MR, just passthrough";
 
-            const auto shard = uassertStatusOK(
-                Grid::get(txn)->shardRegistry()->getShard(txn, confIn->getPrimaryId()));
+            const auto shard =
+                uassertStatusOK(shardRegistry->getShard(txn, confIn->getPrimaryId()));
 
             ShardConnection conn(shard->getConnString(), "");
 
@@ -349,8 +351,8 @@ public:
                 // Need to gather list of all servers even if an error happened
                 string server;
                 {
-                    const auto shard = uassertStatusOK(
-                        Grid::get(txn)->shardRegistry()->getShard(txn, mrResult.shardTargetId));
+                    const auto shard =
+                        uassertStatusOK(shardRegistry->getShard(txn, mrResult.shardTargetId));
                     server = shard->getConnString().toString();
                 }
                 servers.insert(server);
@@ -443,8 +445,8 @@ public:
         bool hasWCError = false;
 
         if (!shardedOutput) {
-            const auto shard = uassertStatusOK(
-                Grid::get(txn)->shardRegistry()->getShard(txn, confOut->getPrimaryId()));
+            const auto shard =
+                uassertStatusOK(shardRegistry->getShard(txn, confOut->getPrimaryId()));
 
             LOG(1) << "MR with single shard output, NS=" << outputCollNss.ns()
                    << " primary=" << shard->toString();
@@ -476,7 +478,7 @@ public:
                 // If the database has sharding already enabled, we can ignore the error
                 if (status.isOK()) {
                     // Invalidate the output database so it gets reloaded on the next fetch attempt
-                    Grid::get(txn)->catalogCache()->invalidate(outputCollNss.db().toString());
+                    Grid::get(txn)->catalogCache()->invalidate(outputCollNss.db());
                 } else if (status != ErrorCodes::AlreadyInitialized) {
                     uassertStatusOK(status);
                 }
@@ -500,8 +502,18 @@ public:
                 //
                 // TODO: pre-split mapReduce output in a safer way.
 
-                set<ShardId> outShardIds;
-                confOut->getAllShardIds(&outShardIds);
+                const std::set<ShardId> outShardIds = [&]() {
+                    std::vector<ShardId> shardIds;
+                    shardRegistry->getAllShardIds(&shardIds);
+                    uassert(ErrorCodes::ShardNotFound,
+                            str::stream()
+                                << "Unable to find shards on which to place output collection "
+                                << outputCollNss.ns(),
+                            !shardIds.empty());
+
+                    return std::set<ShardId>(shardIds.begin(), shardIds.end());
+                }();
+
 
                 BSONObj sortKey = BSON("_id" << 1);
                 ShardKeyPattern sortKeyPattern(sortKey);
@@ -609,12 +621,12 @@ public:
                 invariant(size < std::numeric_limits<int>::max());
 
                 // key reported should be the chunk's minimum
-                shared_ptr<Chunk> c = cm->findIntersectingChunkWithSimpleCollation(txn, key);
+                shared_ptr<Chunk> c = cm->findIntersectingChunkWithSimpleCollation(key);
                 if (!c) {
                     warning() << "Mongod reported " << size << " bytes inserted for key " << key
                               << " but can't find chunk";
                 } else {
-                    c->splitIfShould(txn, size);
+                    updateChunkWriteStatsAndSplitIfNeeded(txn, cm.get(), c.get(), size);
                 }
             }
         }
