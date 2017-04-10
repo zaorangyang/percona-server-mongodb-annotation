@@ -41,6 +41,7 @@ class WiredTigerGlobalOptions {
 public:
     WiredTigerGlobalOptions()
         : cacheSizeGB(0),
+          checkpointSizeMB(0),
           checkpointDelaySecs(0),
           statisticsLogDelaySecs(0),
           directoryForIndexes(false),
@@ -51,6 +52,7 @@ public:
     Status store(const moe::Environment& params, const std::vector<std::string>& args);
 
     double cacheSizeGB;
+    size_t checkpointSizeMB;
     size_t checkpointDelaySecs;
     size_t statisticsLogDelaySecs;
     std::string journalCompressor;
