@@ -40,6 +40,7 @@
 #include "mongo/bson/ordering.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/elapsed_tracker.h"
 
@@ -147,6 +148,13 @@ public:
     std::string getCanonicalName() const {
         return _canonicalName;
     }
+
+    /**
+     * Sets the implementation for `initRsOplogBackgroundThread` (allowing tests to skip the
+     * background job, for example). Intended to be called from a MONGO_INITIALIZER and therefroe in
+     * a single threaded context.
+     */
+    static void setInitRsOplogBackgroundThreadCallback(stdx::function<bool(StringData)> cb);
 
     /**
      * Initializes a background job to remove excess documents in the oplog collections.

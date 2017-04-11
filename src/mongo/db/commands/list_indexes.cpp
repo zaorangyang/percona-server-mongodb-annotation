@@ -100,7 +100,7 @@ public:
 
         // Check for the listIndexes ActionType on the database, or find on system.indexes for pre
         // 3.0 systems.
-        NamespaceString ns(parseNs(dbname, cmdObj));
+        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
         if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns),
                                                            ActionType::listIndexes) ||
             authzSession->isAuthorizedForActionsOnResource(
@@ -122,7 +122,7 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        const NamespaceString ns(parseNs(dbname, cmdObj));
+        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
 
         const long long defaultBatchSize = std::numeric_limits<long long>::max();
         long long batchSize;
@@ -227,12 +227,11 @@ public:
         if (!exec->isEOF()) {
             exec->saveState();
             exec->detachFromOperationContext();
-            ClientCursor* cursor =
-                new ClientCursor(CursorManager::getGlobalCursorManager(),
-                                 exec.release(),
-                                 cursorNss.ns(),
-                                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
-            cursorId = cursor->cursorid();
+            auto pinnedCursor = CursorManager::getGlobalCursorManager()->registerCursor(
+                {exec.release(),
+                 cursorNss.ns(),
+                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot()});
+            cursorId = pinnedCursor.getCursor()->cursorid();
         }
 
         appendCursorResponseObject(cursorId, cursorNss.ns(), firstBatch.arr(), &result);

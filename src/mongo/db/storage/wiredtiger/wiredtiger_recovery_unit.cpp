@@ -36,6 +36,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/condition_variable.h"
@@ -51,6 +52,8 @@ namespace {
 // determine if documents changed, but a different recovery unit may be used across a getMore,
 // so there is a chance the snapshot ID will be reused.
 AtomicUInt64 nextSnapshotId{1};
+
+logger::LogSeverity kSlowTransactionSeverity = logger::LogSeverity::Debug(1);
 }  // namespace
 
 WiredTigerRecoveryUnit::WiredTigerRecoveryUnit(WiredTigerSessionCache* sc)
@@ -63,15 +66,6 @@ WiredTigerRecoveryUnit::WiredTigerRecoveryUnit(WiredTigerSessionCache* sc)
 WiredTigerRecoveryUnit::~WiredTigerRecoveryUnit() {
     invariant(!_inUnitOfWork);
     _abort();
-}
-
-void WiredTigerRecoveryUnit::reportState(BSONObjBuilder* b) const {
-    b->append("wt_inUnitOfWork", _inUnitOfWork);
-    b->append("wt_active", _active);
-    b->append("wt_everStartedWrite", _everStartedWrite);
-    b->appendNumber("wt_mySnapshotId", static_cast<long long>(_mySnapshotId));
-    if (_active)
-        b->append("wt_millisSinceCommit", _timer.millis());
 }
 
 void WiredTigerRecoveryUnit::prepareForCreateSnapshot(OperationContext* opCtx) {
@@ -196,6 +190,14 @@ void WiredTigerRecoveryUnit::setOplogReadTill(const RecordId& id) {
 void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     invariant(_active);
     WT_SESSION* s = _session->getSession();
+    if (_timer) {
+        const int transactionTime = _timer->millis();
+        if (transactionTime >= serverGlobalParams.slowMS) {
+            LOG(kSlowTransactionSeverity) << "Slow WT transaction. Lifetime of SnapshotId "
+                                          << _mySnapshotId << " was " << transactionTime << "ms";
+        }
+    }
+
     if (commit) {
         invariantWTOK(s->commit_transaction(s, NULL));
         LOG(3) << "WT commit_transaction for snapshot id " << _mySnapshotId;
@@ -235,6 +237,10 @@ void WiredTigerRecoveryUnit::_txnOpen(OperationContext* opCtx) {
     invariant(!_active);
     _ensureSession();
 
+    // Only start a timer for transaction's lifetime if we're going to log it.
+    if (shouldLog(kSlowTransactionSeverity)) {
+        _timer.reset(new Timer());
+    }
     WT_SESSION* s = _session->getSession();
 
     if (_readFromMajorityCommittedSnapshot) {
@@ -245,7 +251,6 @@ void WiredTigerRecoveryUnit::_txnOpen(OperationContext* opCtx) {
     }
 
     LOG(3) << "WT begin_transaction for snapshot id " << _mySnapshotId;
-    _timer.reset();
     _active = true;
 }
 

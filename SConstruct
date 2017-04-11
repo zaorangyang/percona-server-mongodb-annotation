@@ -793,6 +793,10 @@ env_vars.Add('VERBOSE',
     default='auto',
 )
 
+env_vars.Add('WINDOWS_OPENSSL_BIN',
+    help='Sets the path to the openssl binaries for packaging',
+    default='c:/openssl/bin')
+
 # -- Validate user provided options --
 
 # A dummy environment that should *only* have the variables we have set. In practice it has
@@ -1314,7 +1318,7 @@ if link_model.startswith("dynamic"):
                 return []
             env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
     else:
-        env.AppendUnique(SHLINKFLAGS=["-Wl,--no-as-needed"])
+        env.AppendUnique(LINKFLAGS=["-Wl,--no-as-needed"])
 
         # Using zdefs doesn't work at all with the sanitizers
         if not has_option('sanitize'):
@@ -2416,6 +2420,13 @@ def doConfigure(myenv):
         # Explicitly enable GNU build id's if the linker supports it.
         AddToLINKFLAGSIfSupported(myenv, '-Wl,--build-id')
 
+        # Explicitly use the new gnu hash section if the linker offers it.
+        AddToLINKFLAGSIfSupported(myenv, '-Wl,--hash-style=gnu')
+
+        # Try to have the linker tell us about ODR violations. Don't use this on UBSAN (see SERVER-27229) for now.
+        if not has_option('sanitize') or not 'undefined' in get_option('sanitize'):
+            AddToLINKFLAGSIfSupported(myenv, '-Wl,--detect-odr-violations')
+
         # Disallow an executable stack. Also, issue a warning if any files are found that would
         # cause the stack to become executable if the noexecstack flag was not in play, so that we
         # can find them and fix them. We do this here after we check for ld.gold because the
@@ -2662,7 +2673,47 @@ def doConfigure(myenv):
     conf = Configure(myenv, custom_tests = {
         'CheckBoostMinVersion': CheckBoostMinVersion,
     })
+
+    # pthread_setname_np was added in GLIBC 2.12, and Solaris 11.3
+    if posix_system:
+        myenv = conf.Finish()
+
+        def CheckPThreadSetNameNP(context):
+            compile_test_body = textwrap.dedent("""
+            #define _GNU_SOURCE
+            #include <pthread.h>
+
+            int main() {
+                pthread_setname_np(pthread_self(), "test");
+                return 0;
+            }
+            """)
+
+            context.Message("Checking if pthread_setname_np is supported... ")
+            result = context.TryCompile(compile_test_body, ".c")
+            context.Result(result)
+            return result
+
+        conf = Configure(myenv, custom_tests = {
+            'CheckPThreadSetNameNP': CheckPThreadSetNameNP,
+        })
+
+        if conf.CheckPThreadSetNameNP():
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_PTHREAD_SETNAME_NP")
+
     libdeps.setup_conftests(conf)
+
+    def addOpenSslLibraryToDistArchive(file_name):
+        openssl_bin_path = os.path.normpath(env['WINDOWS_OPENSSL_BIN'].lower())
+        full_file_name = os.path.join(openssl_bin_path, file_name)
+        if os.path.exists(full_file_name):
+            env.Append(ARCHIVE_ADDITIONS=[full_file_name])
+            env.Append(ARCHIVE_ADDITION_DIR_MAP={
+                    openssl_bin_path: "bin"
+                    })
+            return True
+        else:
+            return False
 
     if has_option( "ssl" ):
         sslLibName = "ssl"
@@ -2670,6 +2721,12 @@ def doConfigure(myenv):
         if conf.env.TargetOSIs('windows'):
             sslLibName = "ssleay32"
             cryptoLibName = "libeay32"
+
+            # Add the SSL binaries to the zip file distribution
+            files = ['ssleay32.dll', 'libeay32.dll']
+            for extra_file in files:
+                if not addOpenSslLibraryToDistArchive(extra_file):
+                    print("WARNING: Cannot find SSL library '%s'" % extra_file)
 
         # Used to import system certificate keychains
         if conf.env.TargetOSIs('osx'):
@@ -2786,6 +2843,7 @@ def doConfigure(myenv):
             # permit more than four parameters.
             "BOOST_THREAD_DONT_PROVIDE_VARIADIC_THREAD",
             "BOOST_SYSTEM_NO_DEPRECATED",
+            "BOOST_MATH_NO_LONG_DOUBLE_MATH_FUNCTIONS",
         ]
     )
 

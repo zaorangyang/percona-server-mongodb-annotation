@@ -39,12 +39,6 @@
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
-
-// Stub to avoid including the server_options library.
-bool isMongos() {
-    return false;
-}
-
 namespace {
 
 const NamespaceString viewNss("testdb.testview");

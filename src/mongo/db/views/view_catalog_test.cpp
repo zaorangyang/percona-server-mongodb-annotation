@@ -51,12 +51,6 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
-// Stub to avoid including the server_options library.
-bool isMongos() {
-    return false;
-}
-
 namespace {
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion34, ("EndStartupOptionStorage"))

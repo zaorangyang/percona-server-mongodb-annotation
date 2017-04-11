@@ -33,6 +33,7 @@
 #include <stack>
 
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/client/mongo_uri.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/mutex.h"
@@ -77,7 +78,7 @@ public:
     /**
      * Returns the maximum number of connections stored in the pool
      */
-    int getMaxPoolSize() {
+    int getMaxPoolSize() const {
         return _maxPoolSize;
     }
 
@@ -139,11 +140,11 @@ public:
 
 private:
     struct StoredConnection {
-        StoredConnection(DBClientBase* c);
+        StoredConnection(std::unique_ptr<DBClientBase> c);
 
         bool ok();
 
-        DBClientBase* conn;
+        std::unique_ptr<DBClientBase> conn;
         time_t when;
     };
 
@@ -204,7 +205,7 @@ public:
      * This setting only applies to new host connection pools, previously-pooled host pools are
      * unaffected.
      */
-    int getMaxPoolSize() {
+    int getMaxPoolSize() const {
         return _maxPoolSize;
     }
 
@@ -227,6 +228,7 @@ public:
 
     DBClientBase* get(const std::string& host, double socketTimeout = 0);
     DBClientBase* get(const ConnectionString& host, double socketTimeout = 0);
+    DBClientBase* get(const MongoURI& uri, double socketTimeout = 0);
 
     /**
      * Gets the number of connections available in the pool.
@@ -344,6 +346,7 @@ public:
         */
     explicit ScopedDbConnection(const std::string& host, double socketTimeout = 0);
     explicit ScopedDbConnection(const ConnectionString& host, double socketTimeout = 0);
+    explicit ScopedDbConnection(const MongoURI& host, double socketTimeout = 0);
 
     ScopedDbConnection() : _host(""), _conn(0), _socketTimeout(0) {}
 

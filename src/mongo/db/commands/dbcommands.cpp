@@ -188,7 +188,8 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         // disallow dropping the config database
-        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer && (dbname == "config")) {
+        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
+            (dbname == NamespaceString::kConfigDb)) {
             return appendCommandStatus(result,
                                        Status(ErrorCodes::IllegalOperation,
                                               "Cannot drop 'config' database if mongod started "
@@ -197,7 +198,7 @@ public:
 
         if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
              repl::ReplicationCoordinator::modeNone) &&
-            (dbname == "local")) {
+            (dbname == NamespaceString::kLocalDb)) {
             return appendCommandStatus(result,
                                        Status(ErrorCodes::IllegalOperation,
                                               "Cannot drop 'local' database while replication "
@@ -261,9 +262,23 @@ public:
             return false;
         }
 
-        // TODO: SERVER-4328 Don't lock globally
+        // Closing a database requires a global lock.
         ScopedTransaction transaction(txn, MODE_X);
         Lock::GlobalWrite lk(txn->lockState());
+        if (!dbHolder().get(txn, dbname)) {
+            // If the name doesn't make an exact match, check for a case insensitive match.
+            std::set<std::string> otherCasing = dbHolder().getNamesWithConflictingCasing(dbname);
+            if (otherCasing.empty()) {
+                // Database doesn't exist. Treat this as a success (historical behavior).
+                return true;
+            }
+
+            // Database exists with a differing case. Treat this as an error. Report the casing
+            // conflict.
+            errmsg = str::stream() << "Database exists with a different case. Given: `" << dbname
+                                   << "` Found: `" << *otherCasing.begin() << "`";
+            return false;
+        }
 
         // TODO (Kal): OldClientContext legacy, needs to be removed
         {
@@ -537,7 +552,7 @@ public:
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
-        NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNs(dbname, cmdObj));
         return AuthorizationSession::get(client)->checkAuthForCreate(nss, cmdObj);
     }
 
@@ -547,7 +562,7 @@ public:
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        const NamespaceString ns(parseNs(dbname, cmdObj));
+        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
 
         if (cmdObj.hasField("autoIndexId")) {
             const char* deprecationWarning =
@@ -664,7 +679,13 @@ public:
     }
 
     virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-        std::string collectionName = cmdObj.getStringField("root");
+        std::string collectionName;
+        if (const auto rootElt = cmdObj["root"]) {
+            uassert(ErrorCodes::InvalidNamespace,
+                    "'root' must be of type String",
+                    rootElt.type() == BSONType::String);
+            collectionName = rootElt.str();
+        }
         if (collectionName.empty())
             collectionName = "fs";
         collectionName += ".chunks";
@@ -683,7 +704,7 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        const std::string ns = parseNs(dbname, jsobj);
+        const NamespaceString nss(parseNs(dbname, jsobj));
 
         md5digest d;
         md5_state_t st;
@@ -711,7 +732,7 @@ public:
         BSONObj sort = BSON("files_id" << 1 << "n" << 1);
 
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            auto qr = stdx::make_unique<QueryRequest>(NamespaceString(ns));
+            auto qr = stdx::make_unique<QueryRequest>(nss);
             qr->setFilter(query);
             qr->setSort(sort);
 
@@ -726,7 +747,7 @@ public:
             // Check shard version at startup.
             // This will throw before we've done any work if shard version is outdated
             // We drop and re-acquire these locks every document because md5'ing is expensive
-            unique_ptr<AutoGetCollectionForRead> ctx(new AutoGetCollectionForRead(txn, ns));
+            unique_ptr<AutoGetCollectionForRead> ctx(new AutoGetCollectionForRead(txn, nss));
             Collection* coll = ctx->getCollection();
 
             auto statusWithPlanExecutor = getExecutor(txn,
@@ -754,7 +775,7 @@ public:
                         break;  // skipped chunk is probably on another shard
                     }
                     log() << "should have chunk: " << n << " have:" << myn;
-                    dumpChunks(txn, ns, query, sort);
+                    dumpChunks(txn, nss.ns(), query, sort);
                     uassert(10040, "chunks out of order", n == myn);
                 }
 
@@ -772,7 +793,7 @@ public:
 
                 try {
                     // RELOCKED
-                    ctx.reset(new AutoGetCollectionForRead(txn, ns));
+                    ctx.reset(new AutoGetCollectionForRead(txn, nss));
                 } catch (const SendStaleConfigException& ex) {
                     LOG(1) << "chunk metadata changed during filemd5, will retarget and continue";
                     break;
@@ -1007,7 +1028,7 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        const NamespaceString nss(parseNs(dbname, jsobj));
+        const NamespaceString nss(parseNsCollectionRequired(dbname, jsobj));
 
         if (nss.coll().empty()) {
             errmsg = "No collection name specified";
@@ -1046,7 +1067,7 @@ public:
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
-        NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNs(dbname, cmdObj));
         return AuthorizationSession::get(client)->checkAuthForCollMod(nss, cmdObj);
     }
 
@@ -1056,7 +1077,7 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        const NamespaceString nss = parseNsCollectionRequired(dbname, jsobj);
+        const NamespaceString nss(parseNsCollectionRequired(dbname, jsobj));
         return appendCommandStatus(result, collMod(txn, nss, jsobj, &result));
     }
 
@@ -1105,6 +1126,9 @@ public:
         }
 
         const string ns = parseNs(dbname, jsobj);
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid db name: " << ns,
+                NamespaceString::validDBName(ns, NamespaceString::DollarInDbNameBehavior::Allow));
 
         // TODO (Kal): OldClientContext legacy, needs to be removed
         {
@@ -1519,19 +1543,30 @@ bool Command::run(OperationContext* txn,
         replyBuilder->setMetadata(rpc::makeEmptyMetadata());
         return result;
     }
-    auto wcResult = extractWriteConcern(txn, cmd, db, supportsWriteConcern(cmd));
-    if (!wcResult.isOK()) {
-        auto result = appendCommandStatus(inPlaceReplyBob, wcResult.getStatus());
-        inPlaceReplyBob.doneFast();
-        replyBuilder->setMetadata(rpc::makeEmptyMetadata());
-        return result;
-    }
+
     std::string errmsg;
     bool result;
     if (!supportsWriteConcern(cmd)) {
+        if (commandSpecifiesWriteConcern(cmd)) {
+            auto result = appendCommandStatus(
+                inPlaceReplyBob,
+                {ErrorCodes::InvalidOptions, "Command does not support writeConcern"});
+            inPlaceReplyBob.doneFast();
+            replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+            return result;
+        }
+
         // TODO: remove queryOptions parameter from command's run method.
         result = run(txn, db, cmd, 0, errmsg, inPlaceReplyBob);
     } else {
+        auto wcResult = extractWriteConcern(txn, cmd, db);
+        if (!wcResult.isOK()) {
+            auto result = appendCommandStatus(inPlaceReplyBob, wcResult.getStatus());
+            inPlaceReplyBob.doneFast();
+            replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+            return result;
+        }
+
         // Change the write concern while running the command.
         const auto oldWC = txn->getWriteConcern();
         ON_BLOCK_EXIT([&] { txn->setWriteConcern(oldWC); });

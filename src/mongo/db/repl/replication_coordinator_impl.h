@@ -261,7 +261,7 @@ public:
 
     virtual bool isReplEnabled() const override;
 
-    virtual HostAndPort chooseNewSyncSource(const Timestamp& lastTimestampFetched) override;
+    virtual HostAndPort chooseNewSyncSource(const OpTime& lastOpTimeFetched) override;
 
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until) override;
 
@@ -276,8 +276,8 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response) override;
 
-    void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
-                             BSONObjBuilder* builder) const override;
+    virtual void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+                                     BSONObjBuilder* builder) const override;
 
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response) override;
@@ -325,7 +325,7 @@ public:
      * If called after startReplication(), blocks until all asynchronous
      * activities associated with replication start-up complete.
      */
-    void waitForStartUpComplete();
+    void waitForStartUpComplete_forTest();
 
     /**
      * Gets the replica set configuration in use by the node.
@@ -910,7 +910,10 @@ private:
      */
     void _requestRemotePrimaryStepdown(const HostAndPort& target);
 
-    ReplicationExecutor::EventHandle _stepDownStart();
+    /**
+     * Schedules stepdown to run with the global exclusive lock.
+     */
+    ReplicationExecutor::EventHandle _stepDownStart(bool hasMutex);
 
     /**
      * Completes a step-down of the current node.  Must be run with a global
@@ -949,9 +952,11 @@ private:
      * Utility method that schedules or performs actions specified by a HeartbeatResponseAction
      * returned by a TopologyCoordinator::processHeartbeatResponse(V1) call with the given
      * value of "responseStatus".
+     * 'hasMutex' is true if the caller is holding _mutex.  TODO(SERVER-27083): Remove this.
      */
     void _handleHeartbeatResponseAction(const HeartbeatResponseAction& action,
-                                        const StatusWith<ReplSetHeartbeatResponse>& responseStatus);
+                                        const StatusWith<ReplSetHeartbeatResponse>& responseStatus,
+                                        bool hasMutex);
 
     /**
      * Scan the SlaveInfoVector and determine the highest OplogEntry present on a majority of
@@ -1118,6 +1123,12 @@ private:
      */
     void _finishCatchUpOplog_inlock(bool startToDrain);
 
+    /**
+     * Waits for the config state to leave kConfigStartingUp, which indicates that start() has
+     * finished.
+     */
+    void _waitForStartUpComplete();
+
     //
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
@@ -1180,6 +1191,14 @@ private:
     // TODO: ideally this should only change on rollbacks NOT on mongod restarts also.
     int _rbid;  // (M)
 
+    // Indicates that we've received a request to stepdown from PRIMARY (likely via a heartbeat)
+    // TODO(SERVER-27083): This bool is redundant of the same-named bool in TopologyCoordinatorImpl,
+    // but due to mutex ordering between _mutex and _topoMutex we can't inspect the
+    // TopologyCoordinator field in awaitReplication() where this bool is used.  Once we get rid
+    // of topoMutex and start guarding access to the TopologyCoordinator via _mutex we should
+    // consolidate the two bools.
+    bool _stepDownPending = false;  // (M)
+
     // list of information about clients waiting on replication.  Does *not* own the WaiterInfos.
     WaiterList _replicationWaiterList;  // (M)
 
@@ -1209,8 +1228,8 @@ private:
     // Current ReplicaSet state.
     MemberState _memberState;  // (MX)
 
-    // Used to signal threads waiting for changes to _memberState. Only used in testing.
-    stdx::condition_variable _drainFinishedCond_forTest;  // (M)
+    // Used to signal threads waiting for changes to _memberState.
+    stdx::condition_variable _drainFinishedCond;  // (M)
 
     // True if we are waiting for the applier to finish draining.
     bool _isWaitingForDrainToComplete;  // (M)
@@ -1326,9 +1345,8 @@ private:
     // Used for testing only.
     Date_t _priorityTakeoverWhen;  // (M)
 
-    // Callback handle used by waitForStartUpComplete() to block until configuration
+    // Callback handle used by _waitForStartUpComplete() to block until configuration
     // is loaded and external state threads have been started (unless this node is an arbiter).
-    // Used for testing only.
     CallbackHandle _finishLoadLocalConfigCbh;  // (M)
 
     // The id of the earliest member, for which the handleLivenessTimeout callback has been

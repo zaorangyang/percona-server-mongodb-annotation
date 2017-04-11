@@ -57,6 +57,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/initial_sync_common.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -423,7 +424,8 @@ void Cloner::copyIndexes(OperationContext* txn,
         const string targetSystemIndexesCollectionName = to_collection.getSystemIndexesCollection();
         const char* createIndexNs = targetSystemIndexesCollectionName.c_str();
         for (auto&& infoObj : indexInfoObjs) {
-            getGlobalServiceContext()->getOpObserver()->onCreateIndex(txn, createIndexNs, infoObj);
+            getGlobalServiceContext()->getOpObserver()->onCreateIndex(
+                txn, createIndexNs, infoObj, false);
         }
     }
     wunit.commit();
@@ -459,7 +461,7 @@ bool Cloner::copyCollection(OperationContext* txn,
 
             uassert(ErrorCodes::CommandNotSupportedOnView,
                     str::stream() << "copyCollection not supported for views. ns: "
-                                  << col["name"].valuestrsafe(),
+                                  << col["name"].valueStringData(),
                     !(status.isOK() && namespaceType == "view"));
         }
 
@@ -569,6 +571,7 @@ Status Cloner::createCollectionsForDb(
         auto options = params.collectionInfo["options"].Obj();
         const NamespaceString nss(dbName, params.collectionName);
 
+        uassertStatusOK(userAllowedCreateNS(dbName, params.collectionName));
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
             txn->checkForInterrupt();
             WriteUnitOfWork wunit(txn);
