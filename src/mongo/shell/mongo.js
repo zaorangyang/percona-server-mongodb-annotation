@@ -243,7 +243,7 @@ connect = function(url, user, pass) {
 
     // Check server version
     var serverVersion = db.version();
-    chatty("Percona Server for MongoDB server version: " + serverVersion);
+    chatty("Percona Server for MongoDB server version: v" + serverVersion);
 
     var shellVersion = version();
     if (serverVersion.slice(0, 3) != shellVersion.slice(0, 3)) {
