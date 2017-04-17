@@ -2,7 +2,7 @@
 (function() {
     "use strict";
 
-    let viewsDB = db.getSiblingDB("views_stats");
+    let viewsDB = db.getSiblingDB("views_coll_stats");
     const matchStage = {$match: {}};
     const collStatsStage = {$collStats: {latencyStats: {}}};
 
@@ -61,6 +61,7 @@
     // Assert that attempting to retrieve storageStats fails.
     makeView("a", "b");
     assert.commandFailedWithCode(
-        viewsDB.runCommand({aggregate: "a", pipeline: [{$collStats: {storageStats: {}}}]}),
+        viewsDB.runCommand(
+            {aggregate: "a", pipeline: [{$collStats: {storageStats: {}}}], cursor: {}}),
         ErrorCodes.CommandNotSupportedOnView);
 }());

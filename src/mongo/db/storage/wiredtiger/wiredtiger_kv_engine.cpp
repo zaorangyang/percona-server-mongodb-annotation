@@ -108,7 +108,7 @@ public:
                 invariant(e.getCode() == ErrorCodes::ShutdownInProgress);
             }
 
-            int ms = storageGlobalParams.journalCommitIntervalMs;
+            int ms = storageGlobalParams.journalCommitIntervalMs.load();
             if (!ms) {
                 ms = 100;
             }
@@ -125,7 +125,7 @@ public:
 
 private:
     WiredTigerSessionCache* _sessionCache;
-    std::atomic<bool> _shuttingDown{false};  // NOLINT
+    AtomicBool _shuttingDown{false};
 };
 
 namespace {
@@ -229,6 +229,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         ss << "checkpoint=(wait=" << wiredTigerGlobalOptions.checkpointDelaySecs;
         ss << ",log_size=2GB),";
         ss << "statistics_log=(wait=" << wiredTigerGlobalOptions.statisticsLogDelaySecs << "),";
+        ss << "verbose=(recovery_progress),";
     }
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())
               ->getTableCreateConfig("system");

@@ -2,7 +2,6 @@ stepback: false
 command_type: system
 
 pre:
-    - command: shell.track
 
 post:
     - command: shell.exec
@@ -74,9 +73,6 @@ functions:
           dsi: ${dsi_rev}
           workloads: ${workloads_rev}
           YCSB: ${YCSB_rev}
-    - command: git.apply_patch
-      params:
-        directory: src
     - command: shell.exec
       params:
         working_dir: work
@@ -166,6 +162,13 @@ functions:
       params:
         script: |
           set -o verbose
+
+          # To force re-creation of existing instances, e.g. for a patch build, you can uncomment this:
+          #if [ -d "$HOME/infrastructure_provisioning" ]; then
+          #  $HOME/infrastructure_provisioning/terraform/infrastructure_teardown.sh \
+          #  && rm -rf $HOME/infrastructure_provisioning
+          #fi
+
           if [ ! -d "$HOME/infrastructure_provisioning" ]; then
             echo "copying terraform to Evergreen host"
             mkdir $HOME/infrastructure_provisioning
@@ -205,7 +208,8 @@ functions:
             EXISTING="true"
           fi
 
-          $DSI_PATH/bin/setup-cluster.sh ${cluster} $EXISTING
+          # Disabling fio pre-qualification as of PERF-826
+          $DSI_PATH/bin/setup-cluster.sh ${cluster} $EXISTING --skip-fio
           # handle the case when setup-cluster.sh fail
           if [ $? -eq 0 ]; then
             echo "Resource provisioned/updated."
@@ -672,6 +676,25 @@ tasks:
     - func: "make test log artifact"
     - func: "analyze"
 
+- name: initialsync-logkeeper_WT
+  depends_on:
+    - name: compile
+      variant: linux-standalone
+  exec_timeout_secs: 216000 # 2.5 days
+  commands:
+    - func: "prepare environment"
+    - func: "infrastructure provisioning"
+    - func: "configure mongodb cluster"
+      vars:
+        storageEngine: "wiredTiger"
+    - func: "run test"
+      vars:
+        storageEngine: "wiredTiger"
+        test: "initialsync-logkeeper"
+        testList: "initialsync-logkeeper"
+    - func: "make test log artifact"
+    - func: "analyze"
+
 
 #######################################
 #               Modules               #
@@ -802,6 +825,22 @@ buildvariants:
     - name: initialsync_MMAPv1
     - name: initialsync_WT_dr
     - name: initialsync_MMAPv1_dr
+
+- name: linux-replSet-initialsync-logkeeper
+  display_name: Linux ReplSet Initial Sync LogKeeper
+  batchtime: 10080 # 7 days
+  modules: *modules
+  expansions:
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
+    setup: initialsync-logkeeper
+    cluster: initialsync-logkeeper
+    platform: linux
+    use_scons_cache: true
+    project: *project
+  run_on:
+      - "rhel70-perf-initialsync-logkeeper"
+  tasks:
+    - name: initialsync-logkeeper_WT
 
 - name: linux-oplog-compare
   display_name: Linux Oplog Compare

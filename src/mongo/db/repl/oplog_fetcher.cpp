@@ -37,6 +37,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/stats/timer_stats.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -51,9 +52,9 @@ namespace repl {
 
 Seconds OplogFetcher::kDefaultProtocolZeroAwaitDataTimeout(2);
 
-namespace {
+MONGO_FP_DECLARE(stopReplProducer);
 
-MONGO_FP_DECLARE(stopOplogFetcher);
+namespace {
 
 /**
  * Calculates await data timeout based on the current replica set configuration.
@@ -114,6 +115,8 @@ BSONObj makeGetMoreCommandObject(DataReplicatorExternalState* dataReplicatorExte
 StatusWith<BSONObj> makeMetadataObject(bool isV1ElectionProtocol) {
     return isV1ElectionProtocol
         ? BSON(rpc::kReplSetMetadataFieldName
+               << 1
+               << rpc::kOplogQueryMetadataFieldName
                << 1
                << rpc::ServerSelectionMetadata::fieldName()
                << BSON(rpc::ServerSelectionMetadata::kSecondaryOkFieldName << true))
@@ -423,34 +426,14 @@ void OplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
     }
 
     // Stop fetching and return on fail point.
-    // This fail point is intended to make the oplog fetcher ignore the downloaded batch of
-    // operations and not error out.
-    if (MONGO_FAIL_POINT(stopOplogFetcher)) {
+    // This fail point makes the oplog fetcher ignore the downloaded batch of operations and not
+    // error out.
+    if (MONGO_FAIL_POINT(stopReplProducer)) {
         _finishCallback(Status::OK());
-        // Wait for a while, otherwise, it will keep busy waiting.
-        sleepmillis(100);
         return;
     }
 
     const auto& queryResponse = result.getValue();
-    rpc::ReplSetMetadata metadata;
-
-    // Forward metadata (containing liveness information) to data replicator external state.
-    bool receivedMetadata =
-        queryResponse.otherFields.metadata.hasElement(rpc::kReplSetMetadataFieldName);
-    if (receivedMetadata) {
-        const auto& metadataObj = queryResponse.otherFields.metadata;
-        auto metadataResult = rpc::ReplSetMetadata::readFromMetadata(metadataObj);
-        if (!metadataResult.isOK()) {
-            error() << "invalid replication metadata from sync source " << _fetcher->getSource()
-                    << ": " << metadataResult.getStatus() << ": " << metadataObj;
-            _finishCallback(metadataResult.getStatus());
-            return;
-        }
-        metadata = metadataResult.getValue();
-        _dataReplicatorExternalState->processMetadata(metadata);
-    }
-
     const auto& documents = queryResponse.documents;
     auto firstDocToApply = documents.cbegin();
 
@@ -487,6 +470,25 @@ void OplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
     }
     auto info = validateResult.getValue();
 
+    // Process replset metadata.  It is important that this happen after we've validated the
+    // first batch, so we don't progress our knowledge of the commit point from a
+    // response that triggers a rollback.
+    rpc::ReplSetMetadata metadata;
+    bool receivedMetadata =
+        queryResponse.otherFields.metadata.hasElement(rpc::kReplSetMetadataFieldName);
+    if (receivedMetadata) {
+        const auto& metadataObj = queryResponse.otherFields.metadata;
+        auto metadataResult = rpc::ReplSetMetadata::readFromMetadata(metadataObj);
+        if (!metadataResult.isOK()) {
+            error() << "invalid replication metadata from sync source " << _fetcher->getSource()
+                    << ": " << metadataResult.getStatus() << ": " << metadataObj;
+            _finishCallback(metadataResult.getStatus());
+            return;
+        }
+        metadata = metadataResult.getValue();
+        _dataReplicatorExternalState->processMetadata(metadata);
+    }
+
     // Increment stats. We read all of the docs in the query.
     opsReadStats.increment(info.networkDocumentCount);
     networkByteStats.increment(info.networkDocumentBytes);
@@ -495,7 +497,11 @@ void OplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
     getmoreReplStats.recordMillis(durationCount<Milliseconds>(queryResponse.elapsedMillis));
 
     // TODO: back pressure handling will be added in SERVER-23499.
-    _enqueueDocumentsFn(firstDocToApply, documents.cend(), info);
+    auto status = _enqueueDocumentsFn(firstDocToApply, documents.cend(), info);
+    if (!status.isOK()) {
+        _finishCallback(status);
+        return;
+    }
 
     // Update last fetched info.
     if (firstDocToApply != documents.cend()) {
@@ -510,8 +516,10 @@ void OplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
     if (_dataReplicatorExternalState->shouldStopFetching(_fetcher->getSource(), metadata)) {
         _finishCallback(Status(ErrorCodes::InvalidSyncSource,
                                str::stream() << "sync source " << _fetcher->getSource().toString()
-                                             << " (last optime: "
+                                             << " (last visible optime: "
                                              << metadata.getLastOpVisible().toString()
+                                             << "; config version: "
+                                             << metadata.getConfigVersion()
                                              << "; sync source index: "
                                              << metadata.getSyncSourceIndex()
                                              << "; primary index: "

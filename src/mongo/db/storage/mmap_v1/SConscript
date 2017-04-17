@@ -3,6 +3,8 @@
 Import("env")
 Import("mmapv1")
 
+env = env.Clone()
+
 env.Library(
     target = 'storage_mmapv1',
     source = [ "aligned_builder.cpp",
@@ -41,18 +43,22 @@ env.Library(
         'compress',
         '$BUILD_DIR/mongo/db/catalog/collection_options',
         '$BUILD_DIR/mongo/db/commands',
+        '$BUILD_DIR/mongo/db/commands/core',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/diag_log',
         '$BUILD_DIR/mongo/db/index_names',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
         '$BUILD_DIR/mongo/db/storage/journal_listener',
         '$BUILD_DIR/mongo/db/storage/paths',
         '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
+        # '$BUILD_DIR/mongo/db/index/index_access_methods', # CYCLE
+        # '$BUILD_DIR/mongo/db/catalog/catalog', # CYCLE
     ],
     LIBDEPS_TAGS=[
-        # Many undefined symbols
-        'incomplete',
+        # TODO(ADAM, 2017-01-06): See `CYCLE` tags above
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
-    )
+)
 
 compressEnv = env.Clone()
 compressEnv.InjectThirdPartyIncludePaths(libraries=['snappy'])

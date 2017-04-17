@@ -82,8 +82,6 @@ else:
 # We pre-generate configs for platforms and just check them in.  Running
 # mozilla's config requires a relatively huge portion of their tree.
 env.Prepend(CPPPATH=[
-    '#src',
-    '$BUILD_DIR',
     'extract/js/src',
     'extract/mfbt',
     'extract/intl/icu/source/common',
@@ -137,6 +135,6 @@ env.Library(
     ],
     LIBDEPS_TAGS=[
         # Depends on allocation symbols defined elsewhere
-        'incomplete'
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )

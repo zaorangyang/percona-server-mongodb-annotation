@@ -117,6 +117,10 @@ main(int argc, char *argv[])
 
 	func = NULL;
 	switch (command[0]) {
+	case 'a':
+		if (strcmp(command, "alter") == 0)
+			func = util_alter;
+		break;
 	case 'b':
 		if (strcmp(command, "backup") == 0)
 			func = util_backup;
@@ -170,6 +174,10 @@ main(int argc, char *argv[])
 			func = util_stat;
 			config = "statistics=(all)";
 		}
+		break;
+	case 't' :
+		if (strcmp(command, "truncate") == 0)
+			func = util_truncate;
 		break;
 	case 'u':
 		if (strcmp(command, "upgrade") == 0)
@@ -252,6 +260,7 @@ usage(void)
 	    "\t" "-v\t" "verbose\n");
 	fprintf(stderr,
 	    "commands:\n"
+	    "\t" "alter\t  alter an object\n"
 	    "\t" "backup\t  database backup\n"
 	    "\t" "compact\t  compact an object\n"
 	    "\t" "copyright copyright information\n"
@@ -267,6 +276,7 @@ usage(void)
 	    "\t" "rename\t  rename an object\n"
 	    "\t" "salvage\t  salvage a file\n"
 	    "\t" "stat\t  display statistics for an object\n"
+	    "\t" "truncate  truncate an object, removing all content\n"
 	    "\t" "upgrade\t  upgrade an object\n"
 	    "\t" "verify\t  verify an object\n"
 	    "\t" "write\t  write values to an object\n");

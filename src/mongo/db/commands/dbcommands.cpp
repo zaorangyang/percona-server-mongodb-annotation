@@ -64,11 +64,11 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/diag_log.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
@@ -95,6 +95,7 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
@@ -120,6 +121,18 @@ using std::string;
 using std::stringstream;
 using std::unique_ptr;
 
+namespace {
+void registerErrorImpl(OperationContext* txn, const DBException& exception) {
+    CurOp::get(txn)->debug().exceptionInfo = exception.getInfo();
+}
+
+MONGO_INITIALIZER(InitializeRegisterErrorHandler)(InitializerContext* const) {
+    Command::registerRegisterError(registerErrorImpl);
+    return Status::OK();
+}
+}  // namespace
+
+
 class CmdShutdownMongoD : public CmdShutdown {
 public:
     virtual void help(stringstream& help) const {
@@ -139,7 +152,7 @@ public:
                      BSONObjBuilder& result) {
         bool force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
 
-        long long timeoutSecs = 0;
+        long long timeoutSecs = 10;
         if (cmdObj.hasField("timeoutSecs")) {
             timeoutSecs = cmdObj["timeoutSecs"].numberLong();
         }
@@ -469,7 +482,7 @@ public:
 
         int was = _diaglog.setLevel(cmdObj.firstElement().numberInt());
         _diaglog.flush();
-        if (!serverGlobalParams.quiet) {
+        if (!serverGlobalParams.quiet.load()) {
             LOG(0) << "CMD: diagLogging set to " << _diaglog.getLevel() << " from: " << was;
         }
         result.append("was", was);
@@ -892,7 +905,7 @@ public:
         BSONObj keyPattern = jsobj.getObjectField("keyPattern");
         bool estimate = jsobj["estimate"].trueValue();
 
-        AutoGetCollectionForRead ctx(txn, ns);
+        AutoGetCollectionForRead ctx(txn, NamespaceString(ns));
 
         Collection* collection = ctx.getCollection();
         long long numRecords = 0;
@@ -1285,9 +1298,7 @@ void appendOpTimeMetadata(OperationContext* txn,
         // Attach our own last opTime.
         repl::OpTime lastOpTimeFromClient =
             repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
-        if (request.getMetadata().hasField(rpc::kReplSetMetadataFieldName)) {
-            replCoord->prepareReplMetadata(lastOpTimeFromClient, metadataBob);
-        }
+        replCoord->prepareReplMetadata(request.getMetadata(), lastOpTimeFromClient, metadataBob);
         // For commands from mongos, append some info to help getLastError(w) work.
         // TODO: refactor out of here as part of SERVER-18236
         if (isShardingAware || isConfig) {
@@ -1303,197 +1314,19 @@ void appendOpTimeMetadata(OperationContext* txn,
     }
 }
 
-/**
- * this handles
- - auth
- - maintenance mode
- - opcounters
- - locking
- - context
- then calls run()
-*/
-void Command::execCommand(OperationContext* txn,
-                          Command* command,
-                          const rpc::RequestInterface& request,
-                          rpc::ReplyBuilderInterface* replyBuilder) {
-    try {
-        {
-            stdx::lock_guard<Client> lk(*txn->getClient());
-            CurOp::get(txn)->setCommand_inlock(command);
-        }
-
-        // TODO: move this back to runCommands when mongos supports OperationContext
-        // see SERVER-18515 for details.
-        uassertStatusOK(rpc::readRequestMetadata(txn, request.getMetadata()));
-        rpc::TrackingMetadata::get(txn).initWithOperName(command->getName());
-
-        dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kCommandReply);
-
-        std::string dbname = request.getDatabase().toString();
-        unique_ptr<MaintenanceModeSetter> mmSetter;
-
-        std::array<BSONElement, std::tuple_size<decltype(neededFieldNames)>::value>
-            extractedFields{};
-        request.getCommandArgs().getFields(neededFieldNames, &extractedFields);
-
-        if (isHelpRequest(extractedFields[kHelpField])) {
-            CurOp::get(txn)->ensureStarted();
-            // We disable last-error for help requests due to SERVER-11492, because config servers
-            // use help requests to determine which commands are database writes, and so must be
-            // forwarded to all config servers.
-            LastError::get(txn->getClient()).disable();
-            generateHelpResponse(txn, request, replyBuilder, *command);
-            return;
-        }
-
-        ImpersonationSessionGuard guard(txn);
-        uassertStatusOK(checkAuthorization(command, txn, dbname, request.getCommandArgs()));
-
-        repl::ReplicationCoordinator* replCoord =
-            repl::ReplicationCoordinator::get(txn->getClient()->getServiceContext());
-        const bool iAmPrimary = replCoord->canAcceptWritesForDatabase(dbname);
-
-        {
-            bool commandCanRunOnSecondary = command->slaveOk();
-
-            bool commandIsOverriddenToRunOnSecondary = command->slaveOverrideOk() &&
-                rpc::ServerSelectionMetadata::get(txn).canRunOnSecondary();
-
-            bool iAmStandalone = !txn->writesAreReplicated();
-            bool canRunHere = iAmPrimary || commandCanRunOnSecondary ||
-                commandIsOverriddenToRunOnSecondary || iAmStandalone;
-
-            // This logic is clearer if we don't have to invert it.
-            if (!canRunHere && command->slaveOverrideOk()) {
-                uasserted(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
-            }
-
-            uassert(ErrorCodes::NotMaster, "not master", canRunHere);
-
-            if (!command->maintenanceOk() &&
-                replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet &&
-                !replCoord->canAcceptWritesForDatabase(dbname) &&
-                !replCoord->getMemberState().secondary()) {
-
-                uassert(ErrorCodes::NotMasterOrSecondary,
-                        "node is recovering",
-                        !replCoord->getMemberState().recovering());
-                uassert(ErrorCodes::NotMasterOrSecondary,
-                        "node is not in primary or recovering state",
-                        replCoord->getMemberState().primary());
-                // Check ticket SERVER-21432, slaveOk commands are allowed in drain mode
-                uassert(ErrorCodes::NotMasterOrSecondary,
-                        "node is in drain mode",
-                        commandIsOverriddenToRunOnSecondary || commandCanRunOnSecondary);
-            }
-        }
-
-
-        if (command->adminOnly()) {
-            LOG(2) << "command: " << request.getCommandName();
-        }
-
-        if (command->maintenanceMode()) {
-            mmSetter.reset(new MaintenanceModeSetter);
-        }
-
-        if (command->shouldAffectCommandCounter()) {
-            OpCounters* opCounters = &globalOpCounters;
-            opCounters->gotCommand();
-        }
-
-        // Handle command option maxTimeMS.
-        int maxTimeMS = uassertStatusOK(
-            QueryRequest::parseMaxTimeMS(extractedFields[kCmdOptionMaxTimeMSField]));
-
-        uassert(ErrorCodes::InvalidOptions,
-                "no such command option $maxTimeMs; use maxTimeMS instead",
-                extractedFields[kQueryOptionMaxTimeMSField].eoo());
-
-        if (maxTimeMS > 0) {
-            uassert(40119,
-                    "Illegal attempt to set operation deadline within DBDirectClient",
-                    !txn->getClient()->isInDirectClient());
-            txn->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
-        }
-
-        // Operations are only versioned against the primary. We also make sure not to redo shard
-        // version handling if this command was issued via the direct client.
-        if (iAmPrimary && !txn->getClient()->isInDirectClient()) {
-            // Handle shard version and config optime information that may have been sent along with
-            // the command.
-            auto& oss = OperationShardingState::get(txn);
-
-            auto commandNS = NamespaceString(command->parseNs(dbname, request.getCommandArgs()));
-            oss.initializeShardVersion(commandNS, extractedFields[kShardVersionFieldIdx]);
-
-            auto shardingState = ShardingState::get(txn);
-
-            if (oss.hasShardVersion()) {
-                if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
-                    uassertStatusOK(
-                        {ErrorCodes::NoShardingEnabled,
-                         "Cannot accept sharding commands if not started with --shardsvr"});
-                } else if (!shardingState->enabled()) {
-                    // TODO(esha): Once 3.4 ships, we no longer need to support initializing
-                    // sharding awareness through commands, so just reject all sharding commands.
-                    if (!shardingState->commandInitializesShardingAwareness(
-                            request.getCommandName().toString())) {
-                        uassertStatusOK({ErrorCodes::NoShardingEnabled,
-                                         str::stream()
-                                             << "Received a command with sharding chunk version "
-                                                "information but this node is not sharding aware: "
-                                             << request.getCommandArgs().jsonString()});
-                    }
-                }
-            }
-
-            if (shardingState->enabled()) {
-                // TODO(spencer): Do this unconditionally once all nodes are sharding aware
-                // by default.
-                uassertStatusOK(shardingState->updateConfigServerOpTimeFromMetadata(txn));
-            }
-        }
-
-        // Can throw
-        txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
-
-        bool retval = false;
-
-        CurOp::get(txn)->ensureStarted();
-
-        command->_commandsExecuted.increment();
-
-        if (logger::globalLogDomain()->shouldLog(logger::LogComponent::kTracking,
-                                                 logger::LogSeverity::Debug(1)) &&
-            rpc::TrackingMetadata::get(txn).getParentOperId()) {
-            MONGO_LOG_COMPONENT(1, logger::LogComponent::kTracking)
-                << rpc::TrackingMetadata::get(txn).toString();
-            rpc::TrackingMetadata::get(txn).setIsLogged(true);
-        }
-        retval = command->run(txn, request, replyBuilder);
-
-        dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kOutputDocs);
-
-        if (!retval) {
-            command->_commandsFailed.increment();
-        }
-    } catch (const DBException& e) {
-        // If we got a stale config, wait in case the operation is stuck in a critical section
-        if (e.getCode() == ErrorCodes::SendStaleConfig) {
-            auto sce = dynamic_cast<const StaleConfigException*>(&e);
-            invariant(sce);  // do not upcasts from DBException created by uassert variants.
-
-            ShardingState::get(txn)->onStaleShardVersion(
-                txn, NamespaceString(sce->getns()), sce->getVersionReceived());
-        }
-
-        BSONObjBuilder metadataBob;
-        appendOpTimeMetadata(txn, request, &metadataBob);
-
-        Command::generateErrorResponse(txn, replyBuilder, e, request, command, metadataBob.done());
-    }
+namespace {
+void execCommandHandler(OperationContext* const txn,
+                        Command* const command,
+                        const rpc::RequestInterface& request,
+                        rpc::ReplyBuilderInterface* const replyBuilder) {
+    mongo::execCommandDatabase(txn, command, request, replyBuilder);
 }
+
+MONGO_INITIALIZER(InitializeCommandExecCommandHandler)(InitializerContext* const) {
+    Command::registerExecCommand(execCommandHandler);
+    return Status::OK();
+}
+}  // namespace
 
 // This really belongs in commands.cpp, but we need to move it here so we can
 // use shardingState and the repl coordinator without changing our entire library
@@ -1623,8 +1456,174 @@ bool Command::run(OperationContext* txn,
     return result;
 }
 
-void Command::registerError(OperationContext* txn, const DBException& exception) {
-    CurOp::get(txn)->debug().exceptionInfo = exception.getInfo();
-}
-
 }  // namespace mongo
+
+/**
+ * this handles
+ - auth
+ - maintenance mode
+ - opcounters
+ - locking
+ - context
+ then calls run()
+ */
+void mongo::execCommandDatabase(OperationContext* txn,
+                                Command* command,
+                                const rpc::RequestInterface& request,
+                                rpc::ReplyBuilderInterface* replyBuilder) {
+    try {
+        {
+            stdx::lock_guard<Client> lk(*txn->getClient());
+            CurOp::get(txn)->setCommand_inlock(command);
+        }
+
+        // TODO: move this back to runCommands when mongos supports OperationContext
+        // see SERVER-18515 for details.
+        uassertStatusOK(rpc::readRequestMetadata(txn, request.getMetadata()));
+        rpc::TrackingMetadata::get(txn).initWithOperName(command->getName());
+
+        dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kCommandReply);
+
+        std::string dbname = request.getDatabase().toString();
+        unique_ptr<MaintenanceModeSetter> mmSetter;
+
+        std::array<BSONElement, std::tuple_size<decltype(neededFieldNames)>::value>
+            extractedFields{};
+        request.getCommandArgs().getFields(neededFieldNames, &extractedFields);
+
+        if (Command::isHelpRequest(extractedFields[kHelpField])) {
+            CurOp::get(txn)->ensureStarted();
+            // We disable last-error for help requests due to SERVER-11492, because config servers
+            // use help requests to determine which commands are database writes, and so must be
+            // forwarded to all config servers.
+            LastError::get(txn->getClient()).disable();
+            Command::generateHelpResponse(txn, request, replyBuilder, *command);
+            return;
+        }
+
+        ImpersonationSessionGuard guard(txn);
+        uassertStatusOK(
+            Command::checkAuthorization(command, txn, dbname, request.getCommandArgs()));
+
+        repl::ReplicationCoordinator* replCoord =
+            repl::ReplicationCoordinator::get(txn->getClient()->getServiceContext());
+        const bool iAmPrimary = replCoord->canAcceptWritesForDatabase(dbname);
+
+        {
+            bool commandCanRunOnSecondary = command->slaveOk();
+
+            bool commandIsOverriddenToRunOnSecondary = command->slaveOverrideOk() &&
+                rpc::ServerSelectionMetadata::get(txn).canRunOnSecondary();
+
+            bool iAmStandalone = !txn->writesAreReplicated();
+            bool canRunHere = iAmPrimary || commandCanRunOnSecondary ||
+                commandIsOverriddenToRunOnSecondary || iAmStandalone;
+
+            // This logic is clearer if we don't have to invert it.
+            if (!canRunHere && command->slaveOverrideOk()) {
+                uasserted(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
+            }
+
+            uassert(ErrorCodes::NotMaster, "not master", canRunHere);
+
+            if (!command->maintenanceOk() &&
+                replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet &&
+                !replCoord->canAcceptWritesForDatabase(dbname) &&
+                !replCoord->getMemberState().secondary()) {
+
+                uassert(ErrorCodes::NotMasterOrSecondary,
+                        "node is recovering",
+                        !replCoord->getMemberState().recovering());
+                uassert(ErrorCodes::NotMasterOrSecondary,
+                        "node is not in primary or recovering state",
+                        replCoord->getMemberState().primary());
+                // Check ticket SERVER-21432, slaveOk commands are allowed in drain mode
+                uassert(ErrorCodes::NotMasterOrSecondary,
+                        "node is in drain mode",
+                        commandIsOverriddenToRunOnSecondary || commandCanRunOnSecondary);
+            }
+        }
+
+        if (command->adminOnly()) {
+            LOG(2) << "command: " << request.getCommandName();
+        }
+
+        if (command->maintenanceMode()) {
+            mmSetter.reset(new MaintenanceModeSetter);
+        }
+
+        if (command->shouldAffectCommandCounter()) {
+            OpCounters* opCounters = &globalOpCounters;
+            opCounters->gotCommand();
+        }
+
+        // Handle command option maxTimeMS.
+        int maxTimeMS = uassertStatusOK(
+            QueryRequest::parseMaxTimeMS(extractedFields[kCmdOptionMaxTimeMSField]));
+
+        uassert(ErrorCodes::InvalidOptions,
+                "no such command option $maxTimeMs; use maxTimeMS instead",
+                extractedFields[kQueryOptionMaxTimeMSField].eoo());
+
+        if (maxTimeMS > 0) {
+            uassert(40119,
+                    "Illegal attempt to set operation deadline within DBDirectClient",
+                    !txn->getClient()->isInDirectClient());
+            txn->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
+        }
+
+        // Operations are only versioned against the primary. We also make sure not to redo shard
+        // version handling if this command was issued via the direct client.
+        if (iAmPrimary && !txn->getClient()->isInDirectClient()) {
+            // Handle a shard version that may have been sent along with the command.
+            auto commandNS = NamespaceString(command->parseNs(dbname, request.getCommandArgs()));
+            auto& oss = OperationShardingState::get(txn);
+            oss.initializeShardVersion(commandNS, extractedFields[kShardVersionFieldIdx]);
+            auto shardingState = ShardingState::get(txn);
+            if (oss.hasShardVersion()) {
+                uassertStatusOK(shardingState->canAcceptShardedCommands());
+            }
+
+            // Handle config optime information that may have been sent along with the command.
+            uassertStatusOK(shardingState->updateConfigServerOpTimeFromMetadata(txn));
+        }
+
+        // Can throw
+        txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
+
+        bool retval = false;
+
+        CurOp::get(txn)->ensureStarted();
+
+        command->_commandsExecuted.increment();
+
+        if (logger::globalLogDomain()->shouldLog(logger::LogComponent::kTracking,
+                                                 logger::LogSeverity::Debug(1)) &&
+            rpc::TrackingMetadata::get(txn).getParentOperId()) {
+            MONGO_LOG_COMPONENT(1, logger::LogComponent::kTracking)
+                << rpc::TrackingMetadata::get(txn).toString();
+            rpc::TrackingMetadata::get(txn).setIsLogged(true);
+        }
+        retval = command->run(txn, request, replyBuilder);
+
+        dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kOutputDocs);
+
+        if (!retval) {
+            command->_commandsFailed.increment();
+        }
+    } catch (const DBException& e) {
+        // If we got a stale config, wait in case the operation is stuck in a critical section
+        if (e.getCode() == ErrorCodes::SendStaleConfig) {
+            auto sce = dynamic_cast<const StaleConfigException*>(&e);
+            invariant(sce);  // do not upcasts from DBException created by uassert variants.
+
+            ShardingState::get(txn)->onStaleShardVersion(
+                txn, NamespaceString(sce->getns()), sce->getVersionReceived());
+        }
+
+        BSONObjBuilder metadataBob;
+        appendOpTimeMetadata(txn, request, &metadataBob);
+
+        Command::generateErrorResponse(txn, replyBuilder, e, request, command, metadataBob.done());
+    }
+}

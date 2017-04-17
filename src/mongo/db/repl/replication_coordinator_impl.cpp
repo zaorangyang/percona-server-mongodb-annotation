@@ -44,7 +44,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
-#include "mongo/db/repl/data_replicator_external_state_impl.h"
+#include "mongo/db/repl/data_replicator_external_state_initial_sync.h"
 #include "mongo/db/repl/elect_cmd_runner.h"
 #include "mongo/db/repl/freshness_checker.h"
 #include "mongo/db/repl/freshness_scanner.h"
@@ -73,12 +73,15 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/connection_pool_stats.h"
+#include "mongo/executor/network_interface.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/request_interface.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/stacktrace.h"
@@ -87,6 +90,8 @@
 
 namespace mongo {
 namespace repl {
+
+MONGO_FP_DECLARE(transitionToPrimaryHangBeforeTakingGlobalExclusiveLock);
 
 using CallbackFn = executor::TaskExecutor::CallbackFn;
 using CallbackHandle = executor::TaskExecutor::CallbackHandle;
@@ -301,19 +306,16 @@ std::string ReplicationCoordinatorImpl::SnapshotInfo::toString() const {
 
 ReplicationCoordinatorImpl::ReplicationCoordinatorImpl(
     const ReplSettings& settings,
-    ReplicationCoordinatorExternalState* externalState,
-    TopologyCoordinator* topCoord,
+    std::unique_ptr<ReplicationCoordinatorExternalState> externalState,
+    std::unique_ptr<NetworkInterface> network,
+    std::unique_ptr<TopologyCoordinator> topCoord,
     StorageInterface* storage,
-    int64_t prngSeed,
-    NetworkInterface* network,
-    ReplicationExecutor* replExec,
-    stdx::function<bool()>* isDurableStorageEngineFn)
+    int64_t prngSeed)
     : _settings(settings),
       _replMode(getReplicationModeFromSettings(settings)),
-      _topCoord(topCoord),
-      _replExecutorIfOwned(replExec ? nullptr : new ReplicationExecutor(network, prngSeed)),
-      _replExecutor(replExec ? *replExec : *_replExecutorIfOwned),
-      _externalState(externalState),
+      _topCoord(std::move(topCoord)),
+      _replExecutor(std::move(network), prngSeed),
+      _externalState(std::move(externalState)),
       _inShutdown(false),
       _memberState(MemberState::RS_STARTUP),
       _isWaitingForDrainToComplete(false),
@@ -322,10 +324,7 @@ ReplicationCoordinatorImpl::ReplicationCoordinatorImpl(
       _sleptLastElection(false),
       _canAcceptNonLocalWrites(!(settings.usingReplSets() || settings.isSlave())),
       _canServeNonLocalReads(0U),
-      _storage(storage),
-      _isDurableStorageEngine(isDurableStorageEngineFn ? *isDurableStorageEngineFn : []() -> bool {
-          return getGlobalServiceContext()->getGlobalStorageEngine()->isDurable();
-      }) {
+      _storage(storage) {
     if (!isReplEnabled()) {
         return;
     }
@@ -344,33 +343,6 @@ ReplicationCoordinatorImpl::ReplicationCoordinatorImpl(
 
     _externalState->setupNoopWriter(kNoopWriterPeriod);
 }
-
-ReplicationCoordinatorImpl::ReplicationCoordinatorImpl(
-    const ReplSettings& settings,
-    ReplicationCoordinatorExternalState* externalState,
-    NetworkInterface* network,
-    TopologyCoordinator* topCoord,
-    StorageInterface* storage,
-    int64_t prngSeed)
-    : ReplicationCoordinatorImpl(
-          settings, externalState, topCoord, storage, prngSeed, network, nullptr, nullptr) {}
-
-ReplicationCoordinatorImpl::ReplicationCoordinatorImpl(
-    const ReplSettings& settings,
-    ReplicationCoordinatorExternalState* externalState,
-    TopologyCoordinator* topCoord,
-    StorageInterface* storage,
-    ReplicationExecutor* replExec,
-    int64_t prngSeed,
-    stdx::function<bool()>* isDurableStorageEngineFn)
-    : ReplicationCoordinatorImpl(settings,
-                                 externalState,
-                                 topCoord,
-                                 storage,
-                                 prngSeed,
-                                 nullptr,
-                                 replExec,
-                                 isDurableStorageEngineFn) {}
 
 ReplicationCoordinatorImpl::~ReplicationCoordinatorImpl() {}
 
@@ -415,6 +387,10 @@ Date_t ReplicationCoordinatorImpl::getPriorityTakeover_forTest() const {
 
 OpTime ReplicationCoordinatorImpl::getCurrentCommittedSnapshotOpTime() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _getCurrentCommittedSnapshotOpTime_inlock();
+}
+
+OpTime ReplicationCoordinatorImpl::_getCurrentCommittedSnapshotOpTime_inlock() const {
     if (_currentCommittedSnapshot) {
         return _currentCommittedSnapshot->opTime;
     }
@@ -428,7 +404,13 @@ void ReplicationCoordinatorImpl::appendConnectionStats(executor::ConnectionPoolS
 bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* txn) {
     StatusWith<LastVote> lastVote = _externalState->loadLocalLastVoteDocument(txn);
     if (!lastVote.isOK()) {
-        log() << "Did not find local voted for document at startup;  " << lastVote.getStatus();
+        if (lastVote.getStatus() == ErrorCodes::NoMatchingDocument) {
+            log() << "Did not find local voted for document at startup.";
+        } else {
+            severe() << "Error loading local voted for document at startup; "
+                     << lastVote.getStatus();
+            fassertFailedNoTrace(40367);
+        }
     } else {
         LockGuard topoLock(_topoMutex);
         _topCoord->loadLastVote(lastVote.getValue());
@@ -644,14 +626,15 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* txn,
                 stdx::lock_guard<stdx::mutex> lock(_mutex);
                 drCopy = std::make_shared<DataReplicator>(
                     createDataReplicatorOptions(this, _externalState.get()),
-                    stdx::make_unique<DataReplicatorExternalStateImpl>(this, _externalState.get()),
+                    stdx::make_unique<DataReplicatorExternalStateInitialSync>(this,
+                                                                              _externalState.get()),
                     _storage,
                     onCompletion);
                 _dr = drCopy;
             }
             // DataReplicator::startup() must be called outside lock because it uses features (eg.
             // setting the initial sync flag) which depend on the ReplicationCoordinatorImpl.
-            uassertStatusOK(drCopy->startup(txn, numInitialSyncAttempts));
+            uassertStatusOK(drCopy->startup(txn, numInitialSyncAttempts.load()));
         } catch (...) {
             auto status = exceptionToStatus();
             log() << "Initial Sync failed to start: " << status;
@@ -940,6 +923,21 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* txn) {
     lk.unlock();
 
     _externalState->onDrainComplete(txn);
+
+    if (MONGO_FAIL_POINT(transitionToPrimaryHangBeforeTakingGlobalExclusiveLock)) {
+        log() << "transition to primary - "
+                 "transitionToPrimaryHangBeforeTakingGlobalExclusiveLock fail point enabled. "
+                 "Blocking until fail point is disabled.";
+        while (MONGO_FAIL_POINT(transitionToPrimaryHangBeforeTakingGlobalExclusiveLock)) {
+            mongo::sleepsecs(1);
+            {
+                stdx::lock_guard<stdx::mutex> lock(_mutex);
+                if (_inShutdown) {
+                    break;
+                }
+            }
+        }
+    }
 
     ScopedTransaction transaction(txn, MODE_X);
     Lock::GlobalWrite globalWriteLock(txn->lockState());
@@ -2023,7 +2021,9 @@ StatusWith<BSONObj> ReplicationCoordinatorImpl::prepareReplSetUpdatePositionComm
 
     // Add metadata to command. Old style parsing logic will reject the metadata.
     if (commandStyle == ReplSetUpdatePositionCommandStyle::kNewStyle) {
-        prepareReplMetadata(OpTime(), &cmdBuilder);
+        stdx::lock_guard<stdx::mutex> topoLock(_topoMutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        _prepareReplSetMetadata_inlock(OpTime(), &cmdBuilder);
     }
     return cmdBuilder.obj();
 }
@@ -2120,12 +2120,13 @@ void ReplicationCoordinatorImpl::processReplSetGetConfig(BSONObjBuilder* result)
     result->append("config", _rsConfig.toBSON());
 }
 
-void ReplicationCoordinatorImpl::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) {
+void ReplicationCoordinatorImpl::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata,
+                                                        bool advanceCommitPoint) {
     EventHandle evh;
 
     {
         LockGuard topoLock(_topoMutex);
-        evh = _processReplSetMetadata_incallback(replMetadata);
+        evh = _processReplSetMetadata_incallback(replMetadata, advanceCommitPoint);
     }
 
     if (evh) {
@@ -2139,11 +2140,13 @@ void ReplicationCoordinatorImpl::cancelAndRescheduleElectionTimeout() {
 }
 
 EventHandle ReplicationCoordinatorImpl::_processReplSetMetadata_incallback(
-    const rpc::ReplSetMetadata& replMetadata) {
+    const rpc::ReplSetMetadata& replMetadata, bool advanceCommitPoint) {
     if (replMetadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
         return EventHandle();
     }
-    _setLastCommittedOpTime(replMetadata.getLastOpCommitted());
+    if (advanceCommitPoint) {
+        _setLastCommittedOpTime(replMetadata.getLastOpCommitted());
+    }
     return _updateTerm_incallback(replMetadata.getTerm());
 }
 
@@ -3132,7 +3135,7 @@ bool ReplicationCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& curre
 }
 
 void ReplicationCoordinatorImpl::_updateLastCommittedOpTime_inlock() {
-    if (!_getMemberState_inlock().primary()) {
+    if (!_getMemberState_inlock().primary() || _stepDownPending) {
         return;
     }
 
@@ -3243,10 +3246,8 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
         _topCoord->processReplSetRequestVotes(args, response, _getMyLastAppliedOpTime_inlock());
     }
 
-    if (response->getVoteGranted()) {
-        LastVote lastVote;
-        lastVote.setTerm(args.getTerm());
-        lastVote.setCandidateIndex(args.getCandidateIndex());
+    if (!args.isADryRun() && response->getVoteGranted()) {
+        LastVote lastVote{args.getTerm(), args.getCandidateIndex()};
 
         Status status = _externalState->storeLocalLastVoteDocument(txn, lastVote);
         if (!status.isOK()) {
@@ -3257,14 +3258,41 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
     return Status::OK();
 }
 
-void ReplicationCoordinatorImpl::prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+void ReplicationCoordinatorImpl::prepareReplMetadata(const BSONObj& metadataRequestObj,
+                                                     const OpTime& lastOpTimeFromClient,
                                                      BSONObjBuilder* builder) const {
-    rpc::ReplSetMetadata metadata;
-    LockGuard topoLock(_topoMutex);
 
-    OpTime lastReadableOpTime = getCurrentCommittedSnapshotOpTime();
-    OpTime lastVisibleOpTime = std::max(lastOpTimeFromClient, lastReadableOpTime);
-    _topCoord->prepareReplMetadata(&metadata, lastVisibleOpTime, _lastCommittedOpTime);
+    bool hasReplSetMetadata = metadataRequestObj.hasField(rpc::kReplSetMetadataFieldName);
+    bool hasOplogQueryMetadata = metadataRequestObj.hasField(rpc::kOplogQueryMetadataFieldName);
+    // Don't take any locks if we do not need to.
+    if (!hasReplSetMetadata && !hasOplogQueryMetadata) {
+        return;
+    }
+
+    LockGuard topoLock(_topoMutex);
+    LockGuard lock(_mutex);
+
+    if (hasReplSetMetadata) {
+        _prepareReplSetMetadata_inlock(lastOpTimeFromClient, builder);
+    }
+
+    if (hasOplogQueryMetadata) {
+        _prepareOplogQueryMetadata_inlock(builder);
+    }
+}
+
+void ReplicationCoordinatorImpl::_prepareReplSetMetadata_inlock(const OpTime& lastOpTimeFromClient,
+                                                                BSONObjBuilder* builder) const {
+    OpTime lastVisibleOpTime =
+        std::max(lastOpTimeFromClient, _getCurrentCommittedSnapshotOpTime_inlock());
+    auto metadata = _topCoord->prepareReplSetMetadata(lastVisibleOpTime, _lastCommittedOpTime);
+    metadata.writeToMetadata(builder);
+}
+
+void ReplicationCoordinatorImpl::_prepareOplogQueryMetadata_inlock(BSONObjBuilder* builder) const {
+    OpTime lastAppliedOpTime = _getMyLastAppliedOpTime_inlock();
+    auto metadata =
+        _topCoord->prepareOplogQueryMetadata(_lastCommittedOpTime, lastAppliedOpTime, _rbid);
     metadata.writeToMetadata(builder);
 }
 
@@ -3453,9 +3481,11 @@ size_t ReplicationCoordinatorImpl::getNumUncommittedSnapshots() {
     return _uncommittedSnapshotsSize.load();
 }
 
-void ReplicationCoordinatorImpl::onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name) {
+void ReplicationCoordinatorImpl::createSnapshot(OperationContext* txn,
+                                                OpTime timeOfSnapshot,
+                                                SnapshotName name) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-
+    _externalState->createSnapshot(txn, name);
     auto snapshotInfo = SnapshotInfo{timeOfSnapshot, name};
 
     if (timeOfSnapshot <= _lastCommittedOpTime) {
@@ -3545,9 +3575,7 @@ EventHandle ReplicationCoordinatorImpl::_resetElectionInfoOnProtocolVersionUpgra
         }
         invariant(cbData.txn);
 
-        LastVote lastVote;
-        lastVote.setTerm(OpTime::kInitialTerm);
-        lastVote.setCandidateIndex(-1);
+        LastVote lastVote{OpTime::kInitialTerm, -1};
         auto status = _externalState->storeLocalLastVoteDocument(cbData.txn, lastVote);
         invariant(status.isOK());
         _replExecutor.signalEvent(evh);
@@ -3629,9 +3657,10 @@ void ReplicationCoordinatorImpl::_scheduleElectionWinNotification() {
 
 WriteConcernOptions ReplicationCoordinatorImpl::populateUnsetWriteConcernOptionsSyncMode(
     WriteConcernOptions wc) {
+
     WriteConcernOptions writeConcern(wc);
     if (writeConcern.syncMode == WriteConcernOptions::SyncMode::UNSET) {
-        if (writeConcern.wMode == WriteConcernOptions::kMajority && _isDurableStorageEngine() &&
+        if (writeConcern.wMode == WriteConcernOptions::kMajority &&
             getWriteConcernMajorityShouldJournal()) {
             writeConcern.syncMode = WriteConcernOptions::SyncMode::JOURNAL;
         } else {

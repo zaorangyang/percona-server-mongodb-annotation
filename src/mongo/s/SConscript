@@ -2,6 +2,8 @@
 
 Import("env")
 
+env = env.Clone()
+
 env.SConscript(
     dirs=[
         'catalog',
@@ -9,6 +11,9 @@ env.SConscript(
         'commands',
         'query',
         'write_ops',
+    ],
+    exports=[
+        'env',
     ],
 )
 
@@ -125,6 +130,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/remote_command_targeter_mock',
+        '$BUILD_DIR/mongo/db/op_observer_d',
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/executor/network_test_env',

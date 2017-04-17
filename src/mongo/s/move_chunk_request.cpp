@@ -45,7 +45,7 @@ const char kFromShardId[] = "fromShard";
 const char kToShardId[] = "toShard";
 const char kMaxChunkSizeBytes[] = "maxChunkSizeBytes";
 const char kWaitForDelete[] = "waitForDelete";
-const char kTakeDistLock[] = "takeDistLock";
+const char kTakeDistLock[] = "takeDistLock";  // TODO: delete in 3.8
 
 }  // namespace
 
@@ -107,13 +107,11 @@ StatusWith<MoveChunkRequest> MoveChunkRequest::createFromCommand(NamespaceString
     }
 
     {
-        auto statusWithChunkVersion =
-            ChunkVersion::parseFromBSONWithFieldForCommands(obj, kChunkVersion);
-        if (statusWithChunkVersion.isOK()) {
-            request._chunkVersion = std::move(statusWithChunkVersion.getValue());
-        } else if (statusWithChunkVersion != ErrorCodes::NoSuchKey) {
-            return statusWithChunkVersion.getStatus();
-        }
+        BSONElement epochElem;
+        Status status = bsonExtractTypedField(obj, kEpoch, BSONType::jstOID, &epochElem);
+        if (!status.isOK())
+            return status;
+        request._versionEpoch = epochElem.OID();
     }
 
     {
@@ -134,11 +132,13 @@ StatusWith<MoveChunkRequest> MoveChunkRequest::createFromCommand(NamespaceString
         request._maxChunkSizeBytes = static_cast<int64_t>(maxChunkSizeBytes);
     }
 
-    {
-        Status status =
-            bsonExtractBooleanFieldWithDefault(obj, kTakeDistLock, true, &request._takeDistLock);
-        if (!status.isOK()) {
-            return status;
+    {  // TODO: delete this block in 3.8
+        bool takeDistLock = false;
+        Status status = bsonExtractBooleanField(obj, kTakeDistLock, &takeDistLock);
+        if (status.isOK() && takeDistLock) {
+            return Status{ErrorCodes::IncompatibleShardingConfigVersion,
+                          str::stream()
+                              << "Request received from an older, incompatible mongodb version"};
         }
     }
 
@@ -147,31 +147,28 @@ StatusWith<MoveChunkRequest> MoveChunkRequest::createFromCommand(NamespaceString
 
 void MoveChunkRequest::appendAsCommand(BSONObjBuilder* builder,
                                        const NamespaceString& nss,
-                                       ChunkVersion collectionVersion,
+                                       ChunkVersion chunkVersion,
                                        const ConnectionString& configServerConnectionString,
                                        const ShardId& fromShardId,
                                        const ShardId& toShardId,
                                        const ChunkRange& range,
-                                       ChunkVersion chunkVersion,
                                        int64_t maxChunkSizeBytes,
                                        const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                                       bool waitForDelete,
-                                       bool takeDistLock) {
+                                       bool waitForDelete) {
     invariant(builder->asTempObj().isEmpty());
     invariant(nss.isValid());
 
     builder->append(kMoveChunk, nss.ns());
-    collectionVersion.appendForCommands(builder);
-    builder->append(kEpoch, collectionVersion.epoch());
+    chunkVersion.appendForCommands(builder);  // 3.4 shard compatibility
+    builder->append(kEpoch, chunkVersion.epoch());
     builder->append(kConfigServerConnectionString, configServerConnectionString.toString());
     builder->append(kFromShardId, fromShardId.toString());
     builder->append(kToShardId, toShardId.toString());
     range.append(builder);
-    chunkVersion.appendWithFieldForCommands(builder, kChunkVersion);
     builder->append(kMaxChunkSizeBytes, static_cast<long long>(maxChunkSizeBytes));
     secondaryThrottle.append(builder);
     builder->append(kWaitForDelete, waitForDelete);
-    builder->append(kTakeDistLock, takeDistLock);
+    builder->append(kTakeDistLock, false);
 }
 
 bool MoveChunkRequest::operator==(const MoveChunkRequest& other) const {

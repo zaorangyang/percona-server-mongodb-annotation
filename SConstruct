@@ -126,6 +126,11 @@ def make_variant_dir_generator():
         return memoized_variant_dir[0]
     return generate_variant_dir
 
+
+# Always randomize the build order to shake out missing edges, and to help the cache:
+# http://scons.org/doc/production/HTML/scons-user/ch24s06.html
+SetOption('random', 1)
+
 # Options TODOs:
 #
 # - We should either alphabetize the entire list of options, or split them into logical groups
@@ -478,8 +483,8 @@ add_option('cache-dir',
 )
 
 add_option("cxx-std",
-    choices=["11", "14"],
-    default="11",
+    choices=["14"],
+    default="14",
     help="Select the C++ langauge standard to build with",
 )
 
@@ -1313,7 +1318,9 @@ if link_model.startswith("dynamic"):
             def libdeps_tags_expand_incomplete(source, target, env, for_signature):
                 # On darwin, since it is strict by default, we need to add a flag
                 # when libraries are tagged incomplete.
-                if 'incomplete' in target[0].get_env().get("LIBDEPS_TAGS", []):
+                if ('illegal_cyclic_or_unresolved_dependencies_whitelisted'
+                    in target[0].get_env().get("LIBDEPS_TAGS", []) or
+                    'incomplete' in target[0].get_env().get("LIBDEPS_TAGS", [])):
                     return ["-Wl,-undefined,dynamic_lookup"]
                 return []
             env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
@@ -1330,7 +1337,9 @@ if link_model.startswith("dynamic"):
                 # default, we need to add a flag when libraries are not
                 # tagged incomplete.
                 def libdeps_tags_expand_incomplete(source, target, env, for_signature):
-                    if 'incomplete' not in target[0].get_env().get("LIBDEPS_TAGS", []):
+                    if ('illegal_cyclic_or_unresolved_dependencies_whitelisted'
+                        not in target[0].get_env().get("LIBDEPS_TAGS", []) and
+                        'incomplete' not in target[0].get_env().get("LIBDEPS_TAGS", [])):
                         return ["-Wl,-z,defs"]
                     return []
                 env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
@@ -1556,7 +1565,20 @@ elif env.TargetOSIs('windows'):
     # Support large object files since some unit-test sources contain a lot of code
     env.Append( CCFLAGS=["/bigobj"] )
 
-    # This gives 32-bit programs 4 GB of user address space in WOW64, ignored in 64-bit builds
+    # Set Source and Executable character sets to UTF-8, this will produce a warning C4828 if the
+    # file contains invalid UTF-8.
+    env.Append( CCFLAGS=["/utf-8" ])
+
+    # Enforce type conversion rules for rvalue reference types as a result of a cast operation.
+    env.Append( CCFLAGS=["/Zc:rvalueCast"] )
+
+    # Disable string literal type conversion, instead const_cast must be explicitly specified.
+    env.Append( CCFLAGS=["/Zc:strictStrings"] )
+
+    # Treat volatile according to the ISO standard and do not guarantee acquire/release semantics.
+    env.Append( CCFLAGS=["/volatile:iso"] )
+
+    # This gives 32-bit programs 4 GB of user address space in WOW64, ignored in 64-bit builds.
     env.Append( LINKFLAGS=["/LARGEADDRESSAWARE"] )
 
     env.Append(
@@ -1751,7 +1773,7 @@ def doConfigure(myenv):
         }
         """ % compiler_minimum_string)
     elif myenv.ToolchainIs('clang'):
-        compiler_minimum_string = "clang 3.4 (or Apple XCode 5.1.1)"
+        compiler_minimum_string = "clang 3.6 (or Apple XCode 6.3.0)"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(__clang__)
@@ -1759,10 +1781,10 @@ def doConfigure(myenv):
         #endif
 
         #if defined(__apple_build_version__)
-        #if __apple_build_version__ < 5030040
+        #if __apple_build_version__ < 6020049
         #error %s or newer is required to build MongoDB
         #endif
-        #elif (__clang_major__ < 3) || (__clang_major__ == 3 && __clang_minor__ < 4)
+        #elif (__clang_major__ < 3) || (__clang_major__ == 3 && __clang_minor__ < 6)
         #error %s or newer is required to build MongoDB
         #endif
 
@@ -2100,39 +2122,21 @@ def doConfigure(myenv):
         conf.Finish()
 
     if not myenv.ToolchainIs('msvc'):
-        if get_option('cxx-std') == "11":
-            if not AddToCXXFLAGSIfSupported(myenv, '-std=c++11'):
-                myenv.ConfError('Compiler does not honor -std=c++11')
-        elif get_option('cxx-std') == "14":
+        if get_option('cxx-std') == "14":
             if not AddToCXXFLAGSIfSupported(myenv, '-std=c++14'):
                 myenv.ConfError('Compiler does not honor -std=c++14')
         if not AddToCFLAGSIfSupported(myenv, '-std=c11'):
-            myenv.ConfError("C++11 mode selected for C++ files, but can't enable C11 for C files")
+            myenv.ConfError("C++14 mode selected for C++ files, but can't enable C11 for C files")
 
     if using_system_version_of_cxx_libraries():
-        print( 'WARNING: System versions of C++ libraries must be compiled with C++11/14 support' )
+        print( 'WARNING: System versions of C++ libraries must be compiled with C++14 support' )
 
-    # We appear to have C++11, or at least a flag to enable it. Check that the declared C++
-    # language level is not less than C++11, and that we can at least compile an 'auto'
+    # We appear to have C++14, or at least a flag to enable it. Check that the declared C++
+    # language level is not less than C++14, and that we can at least compile an 'auto'
     # expression. We don't check the __cplusplus macro when using MSVC because as of our
-    # current required MS compiler version (MSVS 2013 Update 4), they don't set it. If
-    # MSFT ever decides (in MSVS 2015?) to define __cplusplus >= 201103L, remove the exception
+    # current required MS compiler version (MSVS 2015 Update 2), they don't set it. If
+    # MSFT ever decides (in MSVS 2017?) to define __cplusplus >= 201402L, remove the exception
     # here for _MSC_VER
-    def CheckCxx11(context):
-        test_body = """
-        #ifndef _MSC_VER
-        #if __cplusplus < 201103L
-        #error
-        #endif
-        #endif
-        auto not_an_empty_file = 0;
-        """
-
-        context.Message('Checking for C++11... ')
-        ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
-        context.Result(ret)
-        return ret
-
     def CheckCxx14(context):
         test_body = """
         #ifndef _MSC_VER
@@ -2151,16 +2155,11 @@ def doConfigure(myenv):
         return ret
 
     conf = Configure(myenv, help=False, custom_tests = {
-        'CheckCxx11' : CheckCxx11,
         'CheckCxx14' : CheckCxx14,
     })
 
-    if not conf.CheckCxx11():
-        myenv.ConfError('C++11 support is required to build MongoDB')
-
-    if get_option('cxx-std') == "14":
-        if not conf.CheckCxx14():
-            myenv.ConfError('C++14 does not appear to work with the current toolchain')
+    if not conf.CheckCxx14():
+        myenv.ConfError('C++14 support is required to build MongoDB')
 
     conf.Finish()
 
@@ -2531,46 +2530,6 @@ def doConfigure(myenv):
     if not haveTriviallyConstructibleThreadLocals:
         env.ConfError("Compiler must support a thread local storage class for trivially constructible types")
 
-    # not all C++11-enabled gcc versions have type properties
-    def CheckCXX11IsTriviallyCopyable(context):
-        test_body = """
-        #include <type_traits>
-        int main(int argc, char **argv) {
-            class Trivial {
-                int trivial1;
-                double trivial2;
-                struct {
-                    float trivial3;
-                    short trivial4;
-                } trivial_member;
-            };
-
-            class NotTrivial {
-                int x, y;
-                NotTrivial(const NotTrivial& o) : x(o.y), y(o.x) {}
-            };
-
-            static_assert(std::is_trivially_copyable<Trivial>::value,
-                          "I should be trivially copyable");
-            static_assert(!std::is_trivially_copyable<NotTrivial>::value,
-                          "I should not be trivially copyable");
-            return 0;
-        }
-        """
-        context.Message('Checking for C++11 is_trivially_copyable support... ')
-        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
-        context.Result(ret)
-        return ret
-
-    # Some GCC's don't have std::is_trivially_copyable
-    conf = Configure(myenv, help=False, custom_tests = {
-        'CheckCXX11IsTriviallyCopyable': CheckCXX11IsTriviallyCopyable,
-    })
-
-    if conf.CheckCXX11IsTriviallyCopyable():
-        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_STD_IS_TRIVIALLY_COPYABLE")
-
-    myenv = conf.Finish()
 
     def CheckCXX14EnableIfT(context):
         test_body = """
@@ -2627,32 +2586,6 @@ def doConfigure(myenv):
 
     if conf.CheckCXX14MakeUnique():
         conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_MAKE_UNIQUE')
-
-    myenv = conf.Finish()
-
-    def CheckCXX11Align(context):
-        test_body = """
-        #include <memory>
-        int main(int argc, char **argv) {
-            char buf[100];
-            void* ptr = static_cast<void*>(buf);
-            std::size_t size = sizeof(buf);
-            auto foo = std::align(16, 16, ptr, size);
-            return 0;
-        }
-        """
-        context.Message('Checking for C++11 std::align support... ')
-        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
-        context.Result(ret)
-        return ret
-
-    # Check for std::align support
-    conf = Configure(myenv, help=False, custom_tests = {
-        'CheckCXX11Align': CheckCXX11Align,
-    })
-
-    if conf.CheckCXX11Align():
-        conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_ALIGN')
 
     myenv = conf.Finish()
 
@@ -3069,9 +3002,9 @@ module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 # Currently, however, the SConscript files do need some predicates for
 # conditional decision making that hasn't been moved up to this SConstruct file,
 # and they are exported here, as well.
-Export("env")
 Export("get_option")
-Export("has_option use_system_version_of_library")
+Export("has_option")
+Export("use_system_version_of_library")
 Export("serverJs")
 Export("usemozjs")
 Export('module_sconscripts')
@@ -3104,7 +3037,16 @@ env.Alias("distsrc-tgz", env.GZip(
 env.Alias("distsrc-zip", env.DistSrc("mongodb-src-${MONGO_VERSION}.zip"))
 env.Alias("distsrc", "distsrc-tgz")
 
-env.SConscript('src/SConscript', variant_dir='$BUILD_DIR', duplicate=False)
+env.SConscript(
+    dirs=[
+        'src',
+    ],
+    duplicate=False,
+    exports=[
+        'env',
+    ],
+    variant_dir='$BUILD_DIR',
+)
 
 all = env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests'])
 

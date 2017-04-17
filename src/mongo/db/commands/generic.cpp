@@ -42,7 +42,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/shutdown.h"
 #include "mongo/db/db.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
@@ -311,7 +310,7 @@ public:
 namespace {
 MONGO_FP_DECLARE(crashOnShutdown);
 
-int* volatile illegalAddress;
+int* volatile illegalAddress;  // NOLINT - used for fail point only
 }  // namespace
 
 void CmdShutdown::addRequiredPrivileges(const std::string& dbname,

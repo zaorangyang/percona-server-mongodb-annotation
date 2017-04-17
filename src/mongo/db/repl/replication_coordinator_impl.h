@@ -65,6 +65,7 @@ struct ConnectionPoolStats;
 }  // namespace executor
 
 namespace rpc {
+class OplogQueryMetadata;
 class ReplSetMetadata;
 }  // namespace rpc
 
@@ -88,21 +89,13 @@ class ReplicationCoordinatorImpl : public ReplicationCoordinator {
     MONGO_DISALLOW_COPYING(ReplicationCoordinatorImpl);
 
 public:
-    // Takes ownership of the "externalState", "topCoord" and "network" objects.
     ReplicationCoordinatorImpl(const ReplSettings& settings,
-                               ReplicationCoordinatorExternalState* externalState,
-                               executor::NetworkInterface* network,
-                               TopologyCoordinator* topoCoord,
+                               std::unique_ptr<ReplicationCoordinatorExternalState> externalState,
+                               std::unique_ptr<executor::NetworkInterface> network,
+                               std::unique_ptr<TopologyCoordinator> topoCoord,
                                StorageInterface* storage,
                                int64_t prngSeed);
-    // Takes ownership of the "externalState" and "topCoord" objects.
-    ReplicationCoordinatorImpl(const ReplSettings& settings,
-                               ReplicationCoordinatorExternalState* externalState,
-                               TopologyCoordinator* topoCoord,
-                               StorageInterface* storage,
-                               ReplicationExecutor* replExec,
-                               int64_t prngSeed,
-                               stdx::function<bool()>* isDurableStorageEngineFn);
+
     virtual ~ReplicationCoordinatorImpl();
 
     // ================== Members of public ReplicationCoordinator API ===================
@@ -206,7 +199,8 @@ public:
 
     virtual void processReplSetGetConfig(BSONObjBuilder* result) override;
 
-    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
+    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata,
+                                        bool advanceCommitPoint) override;
 
     virtual void cancelAndRescheduleElectionTimeout() override;
 
@@ -276,7 +270,8 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response) override;
 
-    virtual void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+    virtual void prepareReplMetadata(const BSONObj& metadataRequestObj,
+                                     const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const override;
 
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
@@ -300,7 +295,9 @@ public:
 
     virtual void forceSnapshotCreation() override;
 
-    virtual void onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name) override;
+    virtual void createSnapshot(OperationContext* txn,
+                                OpTime timeOfSnapshot,
+                                SnapshotName name) override;
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
 
@@ -420,14 +417,6 @@ private:
     class LoseElectionGuardV1;
     class LoseElectionDryRunGuardV1;
 
-    ReplicationCoordinatorImpl(const ReplSettings& settings,
-                               ReplicationCoordinatorExternalState* externalState,
-                               TopologyCoordinator* topCoord,
-                               StorageInterface* storage,
-                               int64_t prngSeed,
-                               executor::NetworkInterface* network,
-                               ReplicationExecutor* replExec,
-                               stdx::function<bool()>* isDurableStorageEngineFn);
     /**
      * Configuration states for a replica set node.
      *
@@ -566,6 +555,11 @@ private:
      * Returns the _writeConcernMajorityJournalDefault of our current _rsConfig.
      */
     bool getWriteConcernMajorityShouldJournal_inlock() const;
+
+    /**
+     * Returns the OpTime of the current committed snapshot, if one exists.
+     */
+    OpTime _getCurrentCommittedSnapshotOpTime_inlock() const;
 
     /**
      * Helper method that removes entries from _slaveInfo if they correspond to a node
@@ -983,11 +977,24 @@ private:
 
     /**
      * Callback that processes the ReplSetMetadata returned from a command run against another
-     * replica set member and updates protocol version 1 information (most recent optime that is
-     * committed, member id of the current PRIMARY, the current config version and the current term)
+     * replica set member and so long as the config version in the metadata matches the replica set
+     * config version this node currently has, updates the current term and optionally updates
+     * this node's notion of the commit point.
      * Returns the finish event which is invalid if the process has already finished.
      */
-    EventHandle _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata);
+    EventHandle _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata,
+                                                   bool advanceCommitPoint);
+
+    /**
+     * Prepares a metadata object for ReplSetMetadata.
+     */
+    void _prepareReplSetMetadata_inlock(const OpTime& lastOpTimeFromClient,
+                                        BSONObjBuilder* builder) const;
+
+    /**
+     * Prepares a metadata object for OplogQueryMetadata.
+     */
+    void _prepareOplogQueryMetadata_inlock(BSONObjBuilder* builder) const;
 
     /**
      * Blesses a snapshot to be used for new committed reads.
@@ -1174,11 +1181,8 @@ private:
     // Pointer to the TopologyCoordinator owned by this ReplicationCoordinator.
     std::unique_ptr<TopologyCoordinator> _topCoord;  // (X)
 
-    // If the executer is owned then this will be set, but should not be used.
-    // This is only used to clean up and destroy the replExec if owned
-    std::unique_ptr<ReplicationExecutor> _replExecutorIfOwned;  // (S)
     // Executor that drives the topology coordinator.
-    ReplicationExecutor& _replExecutor;  // (S)
+    ReplicationExecutor _replExecutor;  // (S)
 
     // Pointer to the ReplicationCoordinatorExternalState owned by this ReplicationCoordinator.
     std::unique_ptr<ReplicationCoordinatorExternalState> _externalState;  // (PS)
@@ -1356,9 +1360,6 @@ private:
 
     // Cached copy of the current config protocol version.
     AtomicInt64 _protVersion;  // (S)
-
-    // Lambda indicating durability of storageEngine.
-    stdx::function<bool()> _isDurableStorageEngine;  // (R)
 
     // This setting affects the Applier prefetcher behavior.
     mutable stdx::mutex _indexPrefetchMutex;

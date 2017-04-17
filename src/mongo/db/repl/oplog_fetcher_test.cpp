@@ -35,6 +35,7 @@
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/rpc/metadata.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/memory.h"
@@ -140,9 +141,10 @@ void OplogFetcherTest::setUp() {
 
     enqueueDocumentsFn = [this](Fetcher::Documents::const_iterator begin,
                                 Fetcher::Documents::const_iterator end,
-                                const OplogFetcher::DocumentsInfo& info) {
+                                const OplogFetcher::DocumentsInfo& info) -> Status {
         lastEnqueuedDocuments = {begin, end};
         lastEnqueuedDocumentsInfo = info;
+        return Status::OK();
     };
 }
 
@@ -398,8 +400,9 @@ TEST_F(OplogFetcherTest, MetadataObjectContainsReplSetMetadataFieldUnderProtocol
                                     enqueueDocumentsFn,
                                     [](Status, OpTimeWithHash) {})
                            .getMetadataObject_forTest();
-    ASSERT_EQUALS(2, metadataObj.nFields());
+    ASSERT_EQUALS(3, metadataObj.nFields());
     ASSERT_EQUALS(1, metadataObj[rpc::kReplSetMetadataFieldName].numberInt());
+    ASSERT_EQUALS(1, metadataObj[rpc::kOplogQueryMetadataFieldName].numberInt());
 }
 
 TEST_F(OplogFetcherTest, MetadataObjectIsEmptyUnderProtocolVersion0) {
@@ -551,7 +554,7 @@ BSONObj makeCursorResponse(CursorId cursorId,
 
 TEST_F(OplogFetcherTest, InvalidMetadataInResponseStopsTheOplogFetcher) {
     auto shutdownState = processSingleBatch(
-        {makeCursorResponse(0, {}),
+        {makeCursorResponse(0, {makeNoopOplogEntry(lastFetched)}),
          BSON(rpc::kReplSetMetadataFieldName << BSON("invalid_repl_metadata_field" << 1)),
          Milliseconds(0)});
 
@@ -563,10 +566,27 @@ TEST_F(OplogFetcherTest, VaidMetadataInResponseShouldBeForwardedToProcessMetadat
     BSONObjBuilder bob;
     ASSERT_OK(metadata.writeToMetadata(&bob));
     auto metadataObj = bob.obj();
-    processSingleBatch(
-        {makeCursorResponse(0, {makeNoopOplogEntry(lastFetched)}), metadataObj, Milliseconds(0)});
+    ASSERT_OK(processSingleBatch({makeCursorResponse(0, {makeNoopOplogEntry(lastFetched)}),
+                                  metadataObj,
+                                  Milliseconds(0)})
+                  ->getStatus());
+    ASSERT_TRUE(dataReplicatorExternalState->metadataWasProcessed);
     ASSERT_EQUALS(metadata.getPrimaryIndex(),
                   dataReplicatorExternalState->metadataProcessed.getPrimaryIndex());
+}
+
+TEST_F(OplogFetcherTest, MetadataIsNotProcessedOnBatchThatTriggersRollback) {
+    rpc::ReplSetMetadata metadata(1, lastFetched.opTime, lastFetched.opTime, 1, OID::gen(), 2, 2);
+    BSONObjBuilder bob;
+    ASSERT_OK(metadata.writeToMetadata(&bob));
+    auto metadataObj = bob.obj();
+    ASSERT_EQUALS(ErrorCodes::OplogStartMissing,
+                  processSingleBatch(
+                      {makeCursorResponse(0, {makeNoopOplogEntry(Seconds(456), lastFetched.value)}),
+                       metadataObj,
+                       Milliseconds(0)})
+                      ->getStatus());
+    ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
 }
 
 TEST_F(OplogFetcherTest, EmptyFirstBatchStopsOplogFetcherWithRemoteOplogStaleError) {
@@ -650,6 +670,23 @@ TEST_F(OplogFetcherTest, OplogFetcherShouldExcludeFirstDocumentInFirstBatchWhenE
     ASSERT_EQUALS(OpTimeWithHash(thirdEntry["h"].numberLong(),
                                  unittest::assertGet(OpTime::parseFromOplogEntry(thirdEntry))),
                   shutdownState->getLastFetched());
+}
+
+TEST_F(OplogFetcherTest, OplogFetcherShouldReportErrorsThrownFromCallback) {
+    auto firstEntry = makeNoopOplogEntry(lastFetched);
+    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.opTime.getTerm()}, 200);
+    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.opTime.getTerm()}, 300);
+    Fetcher::Documents documents{firstEntry, secondEntry, thirdEntry};
+
+    enqueueDocumentsFn = [](Fetcher::Documents::const_iterator,
+                            Fetcher::Documents::const_iterator,
+                            const OplogFetcher::DocumentsInfo&) -> Status {
+        return Status(ErrorCodes::InternalError, "my custom error");
+    };
+
+    auto shutdownState = processSingleBatch(
+        {makeCursorResponse(0, documents), rpc::makeEmptyMetadata(), Milliseconds(0)});
+    ASSERT_EQ(shutdownState->getStatus(), Status(ErrorCodes::InternalError, "my custom error"));
 }
 
 void OplogFetcherTest::testSyncSourceChecking(rpc::ReplSetMetadata* metadata) {

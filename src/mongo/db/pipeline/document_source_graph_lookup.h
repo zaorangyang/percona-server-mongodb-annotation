@@ -94,9 +94,6 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-protected:
-    void doInjectExpressionContext() final;
-
 private:
     DocumentSourceGraphLookUp(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -124,7 +121,7 @@ private:
      * Returns boost::none if no query is necessary, i.e., all values were retrieved from the cache.
      * Otherwise, returns a query object.
      */
-    boost::optional<BSONObj> makeMatchStageFromFrontier(BSONObjSet* cached);
+    boost::optional<BSONObj> makeMatchStageFromFrontier(DocumentUnorderedSet* cached);
 
     /**
      * If we have internalized a $unwind, getNext() dispatches to this function.
@@ -148,7 +145,7 @@ private:
      * Updates '_cache' with 'result' appropriately, given that 'result' was retrieved when querying
      * for 'queried'.
      */
-    void addToCache(const BSONObj& result, const ValueUnorderedSet& queried);
+    void addToCache(Document result, const ValueUnorderedSet& queried);
 
     /**
      * Assert that '_visited' and '_frontier' have not exceeded the maximum meory usage, and then
@@ -162,7 +159,7 @@ private:
      *
      * Returns whether '_visited' was updated, and thus, whether the search should recurse.
      */
-    bool addToVisitedAndFrontier(BSONObj result, long long depth);
+    bool addToVisitedAndFrontier(Document result, long long depth);
 
     // $graphLookup options.
     NamespaceString _from;
@@ -188,14 +185,12 @@ private:
     size_t _frontierUsageBytes = 0;
 
     // Only used during the breadth-first search, tracks the set of values on the current frontier.
-    // We use boost::optional to defer initialization until the ExpressionContext containing the
-    // correct comparator is injected.
-    boost::optional<ValueUnorderedSet> _frontier;
+    ValueUnorderedSet _frontier;
 
     // Tracks nodes that have been discovered for a given input. Keys are the '_id' value of the
     // document from the foreign collection, value is the document itself.  The keys are compared
     // using the simple collation.
-    ValueUnorderedMap<BSONObj> _visited;
+    ValueUnorderedMap<Document> _visited;
 
     // Caches query results to avoid repeating any work. This structure is maintained across calls
     // to getNext().

@@ -4,8 +4,7 @@
 
     load("jstests/replsets/rslib.js");
 
-    // 3.2.1 is the final version to use the old style replSetUpdatePosition command.
-    var oldVersion = "3.2.1";
+    var oldVersion = "last-stable";
     var newVersion = "latest";
     let nodes = [
         {binVersion: newVersion},
@@ -21,13 +20,6 @@
     replTest.startSet();
     replTest.initiate();
 
-    // We set the featureCompatibilityVersion to 3.2 so that 3.2 secondaries can successfully
-    // initial sync from a 3.4 primary. We do this prior to adding any other members to the replica
-    // set. This effectively allows us to emulate upgrading some of our nodes to the latest version
-    // while performing write operations under different network partition scenarios.
-    assert.commandWorked(
-        replTest.getPrimary().adminCommand({setFeatureCompatibilityVersion: "3.2"}));
-
     for (let i = 1; i < nodes.length; ++i) {
         replTest.add(nodes[i]);
     }
@@ -35,6 +27,7 @@
     const conns = replTest.nodes;
     nodes = replTest.nodeList();
     var port = replTest.ports;
+    var nextVersion = replTest.getReplSetConfigFromNode().version + 1;
     const replSetConfig = {
         _id: name,
         members: [
@@ -112,7 +105,7 @@
                 },
             },
         },
-        version: 2,
+        version: nextVersion,
     };
 
     reconfig(replTest, replSetConfig);

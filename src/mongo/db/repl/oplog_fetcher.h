@@ -43,9 +43,12 @@
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
 namespace repl {
+
+MONGO_FP_FORWARD_DECLARE(stopReplProducer);
 
 /**
  * Used to keep track of the optime and hash of the last fetched operation.
@@ -108,9 +111,9 @@ public:
      * Additional information on the operations is provided in a DocumentsInfo
      * struct.
      */
-    using EnqueueDocumentsFn = stdx::function<void(Fetcher::Documents::const_iterator begin,
-                                                   Fetcher::Documents::const_iterator end,
-                                                   const DocumentsInfo& info)>;
+    using EnqueueDocumentsFn = stdx::function<Status(Fetcher::Documents::const_iterator begin,
+                                                     Fetcher::Documents::const_iterator end,
+                                                     const DocumentsInfo& info)>;
 
     /**
      * Validates documents in current batch of results returned from tailing the remote oplog.

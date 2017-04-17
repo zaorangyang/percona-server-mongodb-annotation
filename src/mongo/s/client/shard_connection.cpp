@@ -181,7 +181,7 @@ public:
             if (ss->avail) {
                 // If we're shutting down, don't want to initiate release mechanism as it is
                 // slow, and isn't needed since all connections will be closed anyway.
-                if (inShutdown()) {
+                if (globalInShutdownDeprecated()) {
                     if (versionManager.isVersionableCB(ss->avail)) {
                         versionManager.resetShardVersionCB(ss->avail);
                     }
@@ -241,7 +241,7 @@ public:
             warning() << "Detected additional sharded connection in the "
                       << "thread local pool for " << addr;
 
-            if (DBException::traceExceptions) {
+            if (DBException::traceExceptions.load()) {
                 // There shouldn't be more than one connection checked out to the same
                 // host on the same thread.
                 printStackTrace();

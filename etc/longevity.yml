@@ -2,7 +2,6 @@ stepback: false
 command_type: system
 
 pre:
-    - command: shell.track
 
 post:
     - command: shell.exec
@@ -79,9 +78,6 @@ functions:
         revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
           dsi: ${dsi_rev}
           YCSB: ${YCSB_rev}
-    - command: git.apply_patch
-      params:
-        directory: src
     - command: shell.exec
       params:
         working_dir: work

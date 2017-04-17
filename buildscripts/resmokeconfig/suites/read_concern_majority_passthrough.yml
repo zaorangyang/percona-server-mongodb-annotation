@@ -64,14 +64,16 @@ selector:
     # Tests that need triaging & remediation | blacklist decision
     # Comments list possible problem point under review.
     - jstests/core/capped6.js # Uses captrunc test command.
-    - jstests/core/convert_to_capped_nonexistant.js # Uses convertToCapped and captrunc command.
     - jstests/core/stages_delete.js # Uses stageDebug command for deletes.
 
 executor:
   js_test:
     config:
       shell_options:
-        eval: "var testingReplication = true; load('jstests/libs/override_methods/set_majority_read_and_write_concerns.js');"
+        global_vars:
+          TestData:
+            defaultReadConcernLevel: majority
+        eval: "var testingReplication = true; load('jstests/libs/override_methods/set_read_and_write_concerns.js');"
         readMode: commands
     hooks:
     - class: ValidateCollections

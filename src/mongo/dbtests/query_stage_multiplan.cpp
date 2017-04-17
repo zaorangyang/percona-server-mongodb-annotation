@@ -42,6 +42,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -58,7 +59,7 @@ namespace mongo {
 const std::unique_ptr<ClockSource> clockSource = stdx::make_unique<ClockSourceMock>();
 
 // How we access the external setParameter testing bool.
-extern std::atomic<bool> internalQueryForceIntersectionPlans;  // NOLINT
+extern AtomicBool internalQueryForceIntersectionPlans;
 
 }  // namespace mongo
 
@@ -132,7 +133,7 @@ public:
 
         addIndex(BSON("foo" << 1));
 
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForRead ctx(&_txn, nss);
         const Collection* coll = ctx.getCollection();
 
         // Plan 0: IXScan over foo == 7
@@ -225,7 +226,7 @@ public:
         addIndex(BSON("a" << 1));
         addIndex(BSON("b" << 1));
 
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForRead ctx(&_txn, nss);
         Collection* collection = ctx.getCollection();
 
         // Query for both 'a' and 'b' and sort on 'b'.
@@ -239,8 +240,8 @@ public:
         ASSERT(NULL != cq.get());
 
         // Force index intersection.
-        bool forceIxisectOldValue = internalQueryForceIntersectionPlans;
-        internalQueryForceIntersectionPlans = true;
+        bool forceIxisectOldValue = internalQueryForceIntersectionPlans.load();
+        internalQueryForceIntersectionPlans.store(true);
 
         // Get planner params.
         QueryPlannerParams plannerParams;
@@ -308,7 +309,7 @@ public:
             soln->root.get()));
 
         // Restore index intersection force parameter.
-        internalQueryForceIntersectionPlans = forceIxisectOldValue;
+        internalQueryForceIntersectionPlans.store(forceIxisectOldValue);
     }
 };
 
@@ -333,7 +334,7 @@ public:
             secondPlan->pushBack(PlanStage::NEED_TIME);
         }
 
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForRead ctx(&_txn, nss);
 
         auto qr = stdx::make_unique<QueryRequest>(nss);
         qr->setFilter(BSON("x" << 1));
@@ -367,7 +368,7 @@ public:
         auto allPlansStats = explained["executionStats"]["allPlansExecution"].Array();
         ASSERT_EQ(allPlansStats.size(), 2UL);
         for (auto&& planStats : allPlansStats) {
-            int maxEvaluationResults = internalQueryPlanEvaluationMaxResults;
+            int maxEvaluationResults = internalQueryPlanEvaluationMaxResults.load();
             ASSERT_EQ(planStats["executionStages"]["stage"].String(), "QUEUED_DATA");
             if (planStats["executionStages"]["needTime"].Int() > 0) {
                 // This is the losing plan. Should only have advanced about half the time.
@@ -408,7 +409,7 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("foo" << -1 << "bar" << 1));
 
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForRead ctx(&_txn, nss);
         Collection* coll = ctx.getCollection();
 
         // Create the executor (Matching all documents).

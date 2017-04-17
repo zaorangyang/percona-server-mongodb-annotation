@@ -123,9 +123,7 @@ void ReplicationCoordinatorImpl::_startElectSelfV1() {
 
 
     invariant(_rsConfig.getMemberAt(_selfIndex).isElectable());
-    // Note: If we aren't durable, send last applied.
-    const auto lastOpTime = _isDurableStorageEngine() ? _getMyLastDurableOpTime_inlock()
-                                                      : _getMyLastAppliedOpTime_inlock();
+    const auto lastOpTime = _getMyLastAppliedOpTime_inlock();
 
     if (lastOpTime == OpTime()) {
         log() << "not trying to elect self, "
@@ -191,9 +189,7 @@ void ReplicationCoordinatorImpl::_onDryRunComplete(long long originalTerm) {
     _topCoord->voteForMyselfV1();
 
     // Store the vote in persistent storage.
-    LastVote lastVote;
-    lastVote.setTerm(originalTerm + 1);
-    lastVote.setCandidateIndex(_selfIndex);
+    LastVote lastVote{originalTerm + 1, _selfIndex};
 
     auto cbStatus = _replExecutor.scheduleDBWork(
         [this, lastVote](const ReplicationExecutor::CallbackArgs& cbData) {
@@ -234,8 +230,7 @@ void ReplicationCoordinatorImpl::_startVoteRequester(long long newTerm) {
 
     LockGuard lk(_topoMutex);
 
-    const auto lastOpTime =
-        _isDurableStorageEngine() ? getMyLastDurableOpTime() : getMyLastAppliedOpTime();
+    const auto lastOpTime = getMyLastAppliedOpTime();
 
     _voteRequester.reset(new VoteRequester);
     StatusWith<ReplicationExecutor::EventHandle> nextPhaseEvh = _voteRequester->start(

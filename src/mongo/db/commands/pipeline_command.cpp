@@ -99,8 +99,7 @@ bool handleCursorCommand(OperationContext* txn,
         invariant(cursor->isAggCursor());
     }
 
-    invariant(request.getBatchSize());
-    long long batchSize = request.getBatchSize().get();
+    long long batchSize = request.getBatchSize();
 
     // can't use result BSONObjBuilder directly since it won't handle exceptions correctly.
     BSONArrayBuilder resultsArray;
@@ -258,7 +257,6 @@ boost::intrusive_ptr<Pipeline> reparsePipeline(
         fassertFailedWithStatusNoTrace(40175, reparsedPipeline.getStatus());
     }
 
-    reparsedPipeline.getValue()->injectExpressionContext(expCtx);
     reparsedPipeline.getValue()->optimizePipeline();
     return reparsedPipeline.getValue();
 }
@@ -350,18 +348,15 @@ public:
         // For operations on views, this will be the underlying namespace.
         const NamespaceString& nss = request.getNamespaceString();
 
-        // Set up the ExpressionContext.
-        intrusive_ptr<ExpressionContext> expCtx = new ExpressionContext(txn, request);
-        expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
-
-        auto resolvedNamespaces = resolveInvolvedNamespaces(txn, request);
-        if (!resolvedNamespaces.isOK()) {
-            return appendCommandStatus(result, resolvedNamespaces.getStatus());
-        }
-        expCtx->resolvedNamespaces = std::move(resolvedNamespaces.getValue());
+        // Parse the user-specified collation, if any.
+        std::unique_ptr<CollatorInterface> userSpecifiedCollator = request.getCollation().isEmpty()
+            ? nullptr
+            : uassertStatusOK(CollatorFactoryInterface::get(txn->getServiceContext())
+                                  ->makeFromBSON(request.getCollation()));
 
         boost::optional<ClientCursorPin> pin;  // either this OR the exec will be non-null
         unique_ptr<PlanExecutor> exec;
+        boost::intrusive_ptr<ExpressionContext> expCtx;
         boost::intrusive_ptr<Pipeline> pipeline;
         auto curOp = CurOp::get(txn);
         {
@@ -387,7 +382,7 @@ public:
                 // means that no collation was specified.
                 if (!request.getCollation().isEmpty()) {
                     if (!CollatorInterface::collatorsMatch(ctx.getView()->defaultCollator(),
-                                                           expCtx->getCollator())) {
+                                                           userSpecifiedCollator.get())) {
                         return appendCommandStatus(result,
                                                    {ErrorCodes::OptionNotSupportedOnView,
                                                     "Cannot override a view's default collation"});
@@ -440,13 +435,25 @@ public:
                 return status;
             }
 
+            // Determine the appropriate collation to make the ExpressionContext.
+
             // If the pipeline does not have a user-specified collation, set it from the collection
-            // default.
+            // default. Be careful to consult the original request BSON to check if a collation was
+            // specified, since a specification of {locale: "simple"} will result in a null
+            // collator.
+            auto collatorToUse = std::move(userSpecifiedCollator);
             if (request.getCollation().isEmpty() && collection &&
                 collection->getDefaultCollator()) {
-                invariant(!expCtx->getCollator());
-                expCtx->setCollator(collection->getDefaultCollator()->clone());
+                invariant(!collatorToUse);
+                collatorToUse = collection->getDefaultCollator()->clone();
             }
+
+            expCtx.reset(
+                new ExpressionContext(txn,
+                                      request,
+                                      std::move(collatorToUse),
+                                      uassertStatusOK(resolveInvolvedNamespaces(txn, request))));
+            expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
 
             // Parse the pipeline.
             auto statusWithPipeline = Pipeline::parse(request.getPipeline(), expCtx);
@@ -463,14 +470,6 @@ public:
                 return appendCommandStatus(result, pipelineCollationStatus);
             }
 
-            // Propagate the ExpressionContext throughout all of the pipeline's stages and
-            // expressions.
-            pipeline->injectExpressionContext(expCtx);
-
-            // The pipeline must be optimized after the correct collator has been set on it (by
-            // injecting the ExpressionContext containing the collator). This is necessary because
-            // optimization may make string comparisons, e.g. optimizing {$eq: [<str1>, <str2>]} to
-            // a constant.
             pipeline->optimizePipeline();
 
             if (kDebugBuild && !expCtx->isExplain && !expCtx->inShard) {
@@ -506,12 +505,6 @@ public:
             }
 
             if (collection) {
-                PlanSummaryStats stats;
-                Explain::getSummaryStats(*exec, &stats);
-                collection->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
-            }
-
-            if (collection) {
                 const bool isAggCursor = true;  // enable special locking behavior
                 pin.emplace(collection->getCursorManager()->registerCursor(
                     {exec.release(),
@@ -535,33 +528,17 @@ public:
             // Unless set to true, the ClientCursor created above will be deleted on block exit.
             bool keepCursor = false;
 
-            // Use of the aggregate command without specifying to use a cursor is deprecated.
-            // Applications should migrate to using cursors. Cursors are strictly more useful than
-            // outputting the results as a single document, since results that fit inside a single
-            // BSONObj will also fit inside a single batch.
-            //
-            // We occasionally log a deprecation warning.
-            if (!request.isCursorCommand()) {
-                RARELY {
-                    warning()
-                        << "Use of the aggregate command without the 'cursor' "
-                           "option is deprecated. See "
-                           "http://dochub.mongodb.org/core/aggregate-without-cursor-deprecation.";
-                }
-            }
-
             // If both explain and cursor are specified, explain wins.
             if (expCtx->isExplain) {
                 result << "stages" << Value(pipeline->writeExplainOps());
-            } else if (request.isCursorCommand()) {
+            } else {
+                // Cursor must be specified, if explain is not.
                 keepCursor = handleCursorCommand(txn,
                                                  origNss.ns(),
                                                  pin ? pin->getCursor() : nullptr,
                                                  pin ? pin->getCursor()->getExecutor() : exec.get(),
                                                  request,
                                                  result);
-            } else {
-                pipeline->run(result);
             }
 
             if (!expCtx->isExplain) {

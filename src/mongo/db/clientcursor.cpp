@@ -141,7 +141,7 @@ bool ClientCursor::shouldTimeout(int millis) {
     if (_isNoTimeout || _isPinned) {
         return false;
     }
-    return _idleAgeMillis > cursorTimeoutMillis;
+    return _idleAgeMillis > cursorTimeoutMillis.load();
 }
 
 void ClientCursor::resetIdleTime() {
@@ -266,14 +266,14 @@ public:
     void run() {
         Client::initThread("clientcursormon");
         Timer t;
-        while (!inShutdown()) {
+        while (!globalInShutdownDeprecated()) {
             {
                 const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
                 OperationContext& txn = *txnPtr;
                 cursorStatsTimedOut.increment(
                     CursorManager::timeoutCursorsGlobal(&txn, t.millisReset()));
             }
-            sleepsecs(clientCursorMonitorFrequencySecs);
+            sleepsecs(clientCursorMonitorFrequencySecs.load());
         }
     }
 };

@@ -753,7 +753,7 @@ void DataReplicator::_oplogFetcherCallback(const Status& oplogFetcherFinishStatu
     // It is up to the DatabasesCloner and MultiApplier to determine if they can proceed without any
     // additional data going into the oplog buffer.
     // It is not common for the OplogFetcher to return with an OK status. The only time it returns
-    // an OK status is when the 'stopOplogFetcher' fail point is enabled, which causes the
+    // an OK status is when the 'stopReplProducer' fail point is enabled, which causes the
     // OplogFetcher to ignore the current sync source response and return early.
     if (status.isOK()) {
         log() << "Finished fetching oplog fetching early. Last fetched optime and hash: "
@@ -1187,7 +1187,7 @@ Status DataReplicator::_scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn
                                    rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
                                    RemoteCommandRequest::kNoTimeout,
                                    RemoteCommandRetryScheduler::makeRetryPolicy(
-                                       numInitialSyncOplogFindAttempts,
+                                       numInitialSyncOplogFindAttempts.load(),
                                        executor::RemoteCommandRequest::kNoTimeout,
                                        RemoteCommandRetryScheduler::kAllRetriableErrors));
     Status scheduleStatus = _lastOplogEntryFetcher->schedule();
@@ -1467,15 +1467,15 @@ StatusWith<HostAndPort> DataReplicator::_chooseSyncSource_inlock() {
     return syncSource;
 }
 
-void DataReplicator::_enqueueDocuments(Fetcher::Documents::const_iterator begin,
-                                       Fetcher::Documents::const_iterator end,
-                                       const OplogFetcher::DocumentsInfo& info) {
+Status DataReplicator::_enqueueDocuments(Fetcher::Documents::const_iterator begin,
+                                         Fetcher::Documents::const_iterator end,
+                                         const OplogFetcher::DocumentsInfo& info) {
     if (info.toApplyDocumentCount == 0) {
-        return;
+        return Status::OK();
     }
 
     if (_isShuttingDown()) {
-        return;
+        return Status::OK();
     }
 
     invariant(_oplogBuffer);
@@ -1494,46 +1494,7 @@ void DataReplicator::_enqueueDocuments(Fetcher::Documents::const_iterator begin,
     _lastFetched = info.lastDocument;
 
     // TODO: updates metrics with "info".
-}
-
-DataReplicator::OnCompletionGuard::OnCompletionGuard(
-    const CancelRemainingWorkInLockFn& cancelRemainingWorkInLock,
-    const OnCompletionFn& onCompletion)
-    : _cancelRemainingWorkInLock(cancelRemainingWorkInLock), _onCompletion(onCompletion) {}
-
-DataReplicator::OnCompletionGuard::~OnCompletionGuard() {
-    MONGO_DESTRUCTOR_GUARD({
-        if (!_lastAppliedSet) {
-            severe() << "It is a programming error to destroy this initial sync attempt completion "
-                        "guard without the caller providing a result for '_lastApplied'";
-        }
-        invariant(_lastAppliedSet);
-        // _onCompletion() must be called outside the DataReplicator's lock to avoid a deadlock.
-        _onCompletion(_lastApplied);
-    });
-}
-
-void DataReplicator::OnCompletionGuard::setResultAndCancelRemainingWork_inlock(
-    const stdx::lock_guard<stdx::mutex>&, const StatusWith<OpTimeWithHash>& lastApplied) {
-    _setResultAndCancelRemainingWork_inlock(lastApplied);
-}
-
-void DataReplicator::OnCompletionGuard::setResultAndCancelRemainingWork_inlock(
-    const stdx::unique_lock<stdx::mutex>& lock, const StatusWith<OpTimeWithHash>& lastApplied) {
-    invariant(lock.owns_lock());
-    _setResultAndCancelRemainingWork_inlock(lastApplied);
-}
-
-void DataReplicator::OnCompletionGuard::_setResultAndCancelRemainingWork_inlock(
-    const StatusWith<OpTimeWithHash>& lastApplied) {
-    if (_lastAppliedSet) {
-        return;
-    }
-    _lastApplied = lastApplied;
-    _lastAppliedSet = true;
-
-    // It is fine to call this multiple times.
-    _cancelRemainingWorkInLock();
+    return Status::OK();
 }
 
 std::string DataReplicator::Stats::toString() const {

@@ -157,7 +157,7 @@ bool CmdAuthenticate::run(OperationContext* txn,
                           int,
                           string& errmsg,
                           BSONObjBuilder& result) {
-    if (!serverGlobalParams.quiet) {
+    if (!serverGlobalParams.quiet.load()) {
         mutablebson::Document cmdToLog(cmdObj, mutablebson::Document::kInPlaceDisabled);
         redactForLogging(&cmdToLog);
         log() << " authenticate db: " << dbname << " " << cmdToLog;
@@ -167,10 +167,9 @@ bool CmdAuthenticate::run(OperationContext* txn,
         mechanism = "MONGODB-CR";
     }
     UserName user;
+    auto& sslPeerInfo = SSLPeerInfo::forSession(txn->getClient()->session());
     if (mechanism == "MONGODB-X509" && !cmdObj.hasField("user")) {
-        Client* client = txn->getClient();
-        auto clientName = client->session()->getX509PeerInfo().subjectName;
-        user = UserName(clientName, dbname);
+        user = UserName(sslPeerInfo.subjectName, dbname);
     } else {
         user = UserName(cmdObj.getStringField("user"), dbname);
     }
@@ -186,7 +185,7 @@ bool CmdAuthenticate::run(OperationContext* txn,
     Status status = _authenticate(txn, mechanism, user, cmdObj);
     audit::logAuthentication(Client::getCurrent(), mechanism, user, status.code());
     if (!status.isOK()) {
-        if (!serverGlobalParams.quiet) {
+        if (!serverGlobalParams.quiet.load()) {
             log() << "Failed to authenticate " << user << " with mechanism " << mechanism << ": "
                   << status;
         }
@@ -197,7 +196,7 @@ bool CmdAuthenticate::run(OperationContext* txn,
         } else {
             appendCommandStatus(result, status);
         }
-        sleepmillis(saslGlobalParams.authFailedDelay);
+        sleepmillis(saslGlobalParams.authFailedDelay.load());
         return false;
     }
     result.append("dbname", user.getDB());
@@ -322,7 +321,7 @@ Status CmdAuthenticate::_authenticateX509(OperationContext* txn,
 
     Client* client = Client::getCurrent();
     AuthorizationSession* authorizationSession = AuthorizationSession::get(client);
-    auto clientName = client->session()->getX509PeerInfo().subjectName;
+    auto clientName = SSLPeerInfo::forSession(client->session()).subjectName;
 
     if (!getSSLManager()->getSSLConfiguration().hasCA) {
         return Status(ErrorCodes::AuthenticationFailed,

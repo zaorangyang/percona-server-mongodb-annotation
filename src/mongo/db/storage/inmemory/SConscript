@@ -1,6 +1,8 @@
 Import("env")
 Import("inmemory")
 
+env = env.Clone()
+
 if inmemory:
     imEnv = env.Clone()
     imEnv.InjectThirdPartyIncludePaths(libraries=['wiredtiger'])

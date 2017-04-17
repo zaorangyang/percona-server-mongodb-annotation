@@ -662,25 +662,28 @@ __debug_page_metadata(WT_DBG *ds, WT_REF *ref)
 		break;
 	case WT_PAGE_COL_FIX:
 		WT_RET(ds->f(ds, " recno %" PRIu64, ref->ref_recno));
-		entries = page->pg_fix_entries;
+		entries = page->entries;
 		break;
 	case WT_PAGE_COL_VAR:
 		WT_RET(ds->f(ds, " recno %" PRIu64, ref->ref_recno));
-		entries = page->pg_var_entries;
+		entries = page->entries;
 		break;
 	case WT_PAGE_ROW_INT:
 		WT_INTL_INDEX_GET(session, page, pindex);
 		entries = pindex->entries;
 		break;
 	case WT_PAGE_ROW_LEAF:
-		entries = page->pg_row_entries;
+		entries = page->entries;
 		break;
 	WT_ILLEGAL_VALUE(session);
 	}
 
 	WT_RET(ds->f(ds, ": %s\n", __wt_page_type_string(page->type)));
-	WT_RET(ds->f(ds,
-	    "\t" "disk %p, entries %" PRIu32, (void *)page->dsk, entries));
+	WT_RET(ds->f(ds, "\t" "disk %p", (void *)page->dsk));
+	if (page->dsk != NULL)
+		WT_RET(ds->f(
+		    ds, ", dsk_mem_size %" PRIu32, page->dsk->mem_size));
+	WT_RET(ds->f(ds, ", entries %" PRIu32, entries));
 	WT_RET(ds->f(ds,
 	    ", %s", __wt_page_is_modified(page) ? "dirty" : "clean"));
 	WT_RET(ds->f(ds, ", %s", __wt_rwlock_islocked(
@@ -1104,9 +1107,9 @@ __debug_cell(WT_DBG *ds, const WT_PAGE_HEADER *dsk, WT_CELL_UNPACK *unpack)
 	case WT_CELL_VALUE_OVFL_RM:
 		type = "ovfl";
 addr:		WT_RET(__wt_scr_alloc(session, 128, &buf));
-		WT_RET(ds->f(ds, ", %s %s", type,
+		ret = ds->f(ds, ", %s %s", type,
 		    __wt_addr_string(
-		    session, unpack->data, unpack->size, buf)));
+		    session, unpack->data, unpack->size, buf));
 		__wt_scr_free(session, &buf);
 		WT_RET(ret);
 		break;

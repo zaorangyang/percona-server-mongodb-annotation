@@ -44,8 +44,9 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
-#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_solution.h"
@@ -165,7 +166,7 @@ public:
     }
 
     size_t numCursors() {
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForRead ctx(&_txn, nss);
         Collection* collection = ctx.getCollection();
         if (!collection)
             return 0;
@@ -174,7 +175,7 @@ public:
 
     void registerExec(PlanExecutor* exec) {
         // TODO: This is not correct (create collection under S-lock)
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForRead ctx(&_txn, nss);
         WriteUnitOfWork wunit(&_txn);
         Collection* collection = ctx.getDb()->getOrCreateCollection(&_txn, nss.ns());
         collection->getCursorManager()->registerExecutor(exec);
@@ -183,7 +184,7 @@ public:
 
     void deregisterExec(PlanExecutor* exec) {
         // TODO: This is not correct (create collection under S-lock)
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForRead ctx(&_txn, nss);
         WriteUnitOfWork wunit(&_txn);
         Collection* collection = ctx.getDb()->getOrCreateCollection(&_txn, nss.ns());
         collection->getCursorManager()->deregisterExecutor(exec);
@@ -281,8 +282,8 @@ public:
 
         // Create the aggregation pipeline.
         std::vector<BSONObj> rawPipeline = {fromjson("{$match: {a: {$gte: 7, $lte: 10}}}")};
-        boost::intrusive_ptr<ExpressionContext> expCtx =
-            new ExpressionContext(&_txn, AggregationRequest(nss, rawPipeline));
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx =
+            new ExpressionContextForTest(&_txn, AggregationRequest(nss, rawPipeline));
 
         // Create an "inner" plan executor and register it with the cursor manager so that it can
         // get notified when the collection is dropped.
@@ -292,7 +293,8 @@ public:
         // Wrap the "inner" plan executor in a DocumentSourceCursor and add it as the first source
         // in the pipeline.
         innerExec->saveState();
-        auto cursorSource = DocumentSourceCursor::create(nss.ns(), std::move(innerExec), expCtx);
+        auto cursorSource =
+            DocumentSourceCursor::create(collection, nss.ns(), std::move(innerExec), expCtx);
         auto pipeline = assertGet(Pipeline::create({cursorSource}, expCtx));
 
         // Create the output PlanExecutor that pulls results from the pipeline.
@@ -504,7 +506,7 @@ public:
         }
 
         {
-            AutoGetCollectionForRead ctx(&_txn, nss.ns());
+            AutoGetCollectionForRead ctx(&_txn, nss);
             Collection* collection = ctx.getCollection();
 
             BSONObj filterObj = fromjson("{_id: {$gt: 0}, b: {$gt: 0}}");

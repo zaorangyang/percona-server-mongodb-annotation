@@ -56,9 +56,9 @@ const char* DocumentSourceRedact::getSourceName() const {
     return "$redact";
 }
 
-static const Value descendVal = Value("descend");
-static const Value pruneVal = Value("prune");
-static const Value keepVal = Value("keep");
+static const Value descendVal = Value("descend"_sd);
+static const Value pruneVal = Value("prune"_sd);
+static const Value keepVal = Value("keep"_sd);
 
 DocumentSource::GetNextResult DocumentSourceRedact::getNext() {
     auto nextInput = pSource->getNext();
@@ -163,10 +163,6 @@ intrusive_ptr<DocumentSource> DocumentSourceRedact::optimize() {
     return this;
 }
 
-void DocumentSourceRedact::doInjectExpressionContext() {
-    _expression->injectExpressionContext(pExpCtx);
-}
-
 Value DocumentSourceRedact::serialize(bool explain) const {
     return Value(DOC(getSourceName() << _expression.get()->serialize(explain)));
 }
@@ -179,7 +175,7 @@ intrusive_ptr<DocumentSource> DocumentSourceRedact::createFromBson(
     Variables::Id decendId = vps.defineVariable("DESCEND");
     Variables::Id pruneId = vps.defineVariable("PRUNE");
     Variables::Id keepId = vps.defineVariable("KEEP");
-    intrusive_ptr<Expression> expression = Expression::parseOperand(elem, vps);
+    intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, elem, vps);
     intrusive_ptr<DocumentSourceRedact> source = new DocumentSourceRedact(expCtx, expression);
 
     // TODO figure out how much of this belongs in constructor and how much here.

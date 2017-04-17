@@ -515,7 +515,7 @@ namespace audit {
                                  StringData command,
                                  const BSONObj& args,
                                  ErrorCodes::Error result) {
-        if ((result != ErrorCodes::OK) || auditAuthorizationSuccess) {
+        if ((result != ErrorCodes::OK) || auditAuthorizationSuccess.load()) {
             const BSONObj params = !ns.empty() ?
                 BSON("command" << command << "ns" << ns << "args" << args) :
                 BSON("command" << command << "args" << args);

@@ -31,16 +31,19 @@
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_btree_impl.h"
 
 
+#include "mongo/base/init.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+namespace {
 
-class EphemeralForTestHarnessHelper final : public HarnessHelper {
+class EphemeralForBtreeImplTestHarnessHelper final
+    : public virtual SortedDataInterfaceHarnessHelper {
 public:
-    EphemeralForTestHarnessHelper() : _order(Ordering::make(BSONObj())) {}
+    EphemeralForBtreeImplTestHarnessHelper() : _order(Ordering::make(BSONObj())) {}
 
     std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique) final {
         return std::unique_ptr<SortedDataInterface>(
@@ -56,7 +59,13 @@ private:
     Ordering _order;
 };
 
-std::unique_ptr<HarnessHelper> newHarnessHelper() {
-    return stdx::make_unique<EphemeralForTestHarnessHelper>();
+std::unique_ptr<HarnessHelper> makeHarnessHelper() {
+    return stdx::make_unique<EphemeralForBtreeImplTestHarnessHelper>();
 }
+
+MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
+    mongo::registerHarnessHelperFactory(makeHarnessHelper);
+    return Status::OK();
 }
+}  // namespace
+}  // namespace mongo

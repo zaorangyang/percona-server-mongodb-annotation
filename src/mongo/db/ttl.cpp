@@ -86,12 +86,12 @@ public:
         Client::initThread(name().c_str());
         AuthorizationSession::get(cc())->grantInternalAuthorization();
 
-        while (!inShutdown()) {
-            sleepsecs(ttlMonitorSleepSecs);
+        while (!globalInShutdownDeprecated()) {
+            sleepsecs(ttlMonitorSleepSecs.load());
 
             LOG(3) << "thread awake";
 
-            if (!ttlMonitorEnabled) {
+            if (!ttlMonitorEnabled.load()) {
                 LOG(1) << "disabled";
                 continue;
             }
@@ -130,6 +130,7 @@ private:
 
         // Get all TTL indexes from every collection.
         for (const std::string& collectionNS : ttlCollections) {
+            ScopedTransaction st(&txn, MODE_IS);
             NamespaceString collectionNSS(collectionNS);
             AutoGetCollection autoGetCollection(&txn, collectionNSS, MODE_IS);
             Collection* coll = autoGetCollection.getCollection();
