@@ -45,6 +45,7 @@
 #include "mongo/config.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/transport/session.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
@@ -54,6 +55,7 @@
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_expiration.h"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_types.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/text.h"
 
@@ -71,6 +73,16 @@
 #endif
 
 namespace mongo {
+namespace {
+
+const transport::Session::Decoration<SSLPeerInfo> peerInfoForSession =
+    transport::Session::declareDecoration<SSLPeerInfo>();
+
+}  // namespace
+
+SSLPeerInfo& SSLPeerInfo::forSession(const transport::SessionHandle& session) {
+    return peerInfoForSession(session.get());
+}
 
 SSLParams sslGlobalParams;
 
@@ -354,6 +366,7 @@ void setupFIPS() {
     fassertFailedNoTrace(17089);
 #endif
 }
+
 }  // namespace
 
 // Global variable indicating if this is a server or a client instance
@@ -883,9 +896,11 @@ inline Status checkX509_STORE_error() {
 #if defined(_WIN32)
 // This imports the certificates in a given Windows certificate store into an X509_STORE for
 // openssl to use during certificate validation.
-Status importCertStoreToX509_STORE(LPWSTR storeName, DWORD storeLocation, X509_STORE* verifyStore) {
-    HCERTSTORE systemStore =
-        CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, NULL, storeLocation, storeName);
+Status importCertStoreToX509_STORE(const wchar_t* storeName,
+                                   DWORD storeLocation,
+                                   X509_STORE* verifyStore) {
+    HCERTSTORE systemStore = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_W, 0, NULL, storeLocation, const_cast<LPWSTR>(storeName));
     if (systemStore == NULL) {
         return {ErrorCodes::InvalidSSLConfiguration,
                 str::stream() << "error opening system CA store: " << errnoWithDescription()};

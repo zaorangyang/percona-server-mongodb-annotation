@@ -43,6 +43,7 @@
 #include "mongo/util/text.h"
 #include "mongo/util/thread_safe_string.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
 
 namespace BasicTests {
 
@@ -61,15 +62,12 @@ public:
     void run() {
         int first = 0;
         int second = 0;
-        int third = 0;
         for (int i = 0; i < 128; ++i) {
             incRarely(first);
             incRarely2(second);
-            ONCE++ third;
         }
         ASSERT_EQUALS(1, first);
         ASSERT_EQUALS(1, second);
-        ASSERT_EQUALS(1, third);
     }
 
 private:

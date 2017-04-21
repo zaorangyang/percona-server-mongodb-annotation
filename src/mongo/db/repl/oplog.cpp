@@ -1244,7 +1244,7 @@ void SnapshotThread::run() {
 
             auto opTimeOfSnapshot = OpTime();
             {
-                AutoGetCollectionForRead oplog(txn.get(), rsOplogName);
+                AutoGetCollectionForRead oplog(txn.get(), NamespaceString(rsOplogName));
                 invariant(oplog.getCollection());
                 // Read the latest op from the oplog.
                 auto cursor = oplog.getCollection()->getCursor(txn.get(), /*forward*/ false);
@@ -1257,8 +1257,7 @@ void SnapshotThread::run() {
                 invariant(!opTimeOfSnapshot.isNull());
             }
 
-            _manager->createSnapshot(txn.get(), name);
-            replCoord->onSnapshotCreate(opTimeOfSnapshot, name);
+            replCoord->createSnapshot(txn.get(), opTimeOfSnapshot, name);
         } catch (const WriteConflictException& wce) {
             log() << "skipping storage snapshot pass due to write conflict";
             continue;

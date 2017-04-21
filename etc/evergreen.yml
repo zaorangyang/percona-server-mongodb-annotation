@@ -40,7 +40,7 @@ ignore:
 ## Some variables for convenience:
 variables:
 
-# Used for tests that invoke resmoke.py and require no additional setup.
+# Used when the tests it runs depend only on mongod, mongos, the mongo shell and the tools.
 - &task_template
   name: template
   depends_on:
@@ -52,6 +52,46 @@ variables:
       resmoke_args: --help
       run_multiple_jobs: false
       max_jobs: 0  # If set in combination with run_multiple_jobs, will cap the number of jobs used.
+
+# Used for tests that invoke resmoke.py and require no additional setup.
+- &task_depending_on_all_template
+  <<: *task_template
+  depends_on:
+  - name: compile_all
+
+# Used to list modules to retrieve from GitHub and apply patches if necessary.
+- &git_get_project
+  command: git.get_project
+  params:
+    directory: src
+    revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
+      enterprise: ${enterprise_rev}
+      rocksdb: ${rocksdb_rev}
+
+- &generate_compile_expansions
+  command: shell.exec
+  params:
+    working_dir: src
+    script: |
+      set -o errexit
+      set -o verbose
+
+      # We get the raw version string (r1.2.3-45-gabcdef) from git
+      MONGO_VERSION=$(git describe)
+      # If this is a patch build, we add the patch version id to the version string so we know
+      # this build was a patch, and which evergreen task it came from
+      if [ "${is_patch|}" = "true" ]; then
+        MONGO_VERSION="$MONGO_VERSION-patch-${version_id}"
+      fi
+
+      # This script converts the generated version string into a sanitized version string for
+      # use by scons and uploading artifacts as well as information about for the scons cache.
+      echo $MONGO_VERSION | SCONS_CACHE_MODE=${scons_cache_mode|nolinked} USE_SCONS_CACHE=${use_scons_cache|false} ${python|python} buildscripts/generate_compile_expansions.py | tee compile_expansions.yml
+
+- &apply_compile_expansions
+  command: expansions.update
+  params:
+    file: src/compile_expansions.yml
 
 - &jepsen_config_vars
   hang_analyzer_processes: "java"
@@ -123,6 +163,7 @@ variables:
   - enterprise-debian71-64
   - enterprise-debian81-64
   - linux-64
+  - linux-64-debug
   - amazon
   - rhel62
   - rhel70
@@ -132,7 +173,6 @@ variables:
   - ubuntu1404
   - ubuntu1604
   - ubuntu1604-arm64
-  - ubuntu1404-jepsen
   - ubuntu1404-rocksdb
   - debian71
   - debian81
@@ -170,7 +210,9 @@ functions:
     params:
       working_dir: src
       script: |
+        set -o errexit
         ${decompress|unzip} mongo-binaries.tgz
+        cp mongodb*/bin/* .
 
   "check binary version" : &check_binary_version
     command: shell.exec
@@ -376,6 +418,11 @@ functions:
           # exit immediately if virtualenv is not found
           set -o errexit
           set -o verbose
+
+          # Due to an issue with how the contents of the httplib2 package are installed on SUSE 12,
+          # some files within the system's site-packages aren't world-readable. This results in a
+          # "Permission denied" error message when attempting to install the system's site-packages
+          # into the virtual environment.
           if [ ${build_variant} == enterprise-suse12-64 ]; then
               virtualenv ./venv
           else
@@ -400,13 +447,11 @@ functions:
           fi
         fi
 
-        cp mongodb*/bin/* .
-
         if [ -f /proc/self/coredump_filter ]; then
           # Set the shell process (and its children processes) to dump ELF headers (bit 4),
           # anonymous shared mappings (bit 1), and anonymous private mappings (bit 0).
           echo 0x13 > /proc/self/coredump_filter
-        
+
           if [ -f /sbin/sysctl ]; then
             # Check that the core pattern is set explicitly on our distro image instead
             # of being the OS's default value. This ensures that coredump names are consistent
@@ -421,10 +466,28 @@ functions:
 
         extra_args=""
         if [ ${run_multiple_jobs|false} = true ]; then
-          if [ ${max_jobs|0} -gt 0 ] && [ ${max_jobs|0} -lt ${num_jobs_available|1} ]; then
+          processor_architecture=$(uname -m)
+          num_jobs_available=${num_jobs_available|1}
+          # Reduce the number of available jobs by half when running any sharding*, replicasets*
+          # and select jsCore_small_oplog tasks on Windows and ARM to avoid overwhelming test hosts.
+          if [ "Windows_NT" = "$OS" ] || [ "aarch64" = $processor_architecture ]; then
+            case "${task_name}" in
+            jsCore_small_oplog_rs_initsync          \
+            |jsCore_small_oplog_rs_initsync_static  \
+            |jsCore_small_oplog_rs_resync_static    \
+            |replicasets*                           \
+            |sharding*                              \
+            )
+              num_jobs_available=$((${num_jobs_available|2} / 2))
+              echo "Reducing jobs from ${num_jobs_available|1} to $num_jobs_available"
+              ;;
+            esac
+          fi
+
+          if [ ${max_jobs|0} -gt 0 ] && [ ${max_jobs|0} -lt $num_jobs_available ]; then
             extra_args="$extra_args --jobs=${max_jobs}"
           else
-            extra_args="$extra_args --jobs=${num_jobs_available|1}"
+            extra_args="$extra_args --jobs=$num_jobs_available"
           fi
         fi
 
@@ -456,7 +519,17 @@ functions:
           path_value="$path_value:${task_path_suffix}"
         fi
 
-        ${resmoke_wrapper} PATH="$path_value" ${san_symbolizer} ${san_options} ${rlp_environment} ${python|python} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json
+        # The "resmoke_wrapper" expansion is used by the 'burn_in_tests' task to wrap the resmoke.py
+        # invocation. It doesn't set any environment variables and should therefore come last in
+        # this list of expansions.
+        PATH="$path_value"   \
+        ${gcov_environment}  \
+        ${rlp_environment}   \
+        ${san_options}       \
+        ${san_symbolizer}    \
+        ${snmp_config_path}  \
+        ${resmoke_wrapper}   \
+        ${python|python} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json
 
 
   "do jepsen setup" :
@@ -640,10 +713,18 @@ functions:
         set -o verbose
 
         rm -rf /data/install /data/multiversion
-        # 3.2.1 is needed to check cross version compatibility as it is the final version
-        # to use the old style replSetUpdatePosition command.
-        # 3.2.1 is also needed to check for a correct implementation of SERVER-23299.
-        ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion ${multiversion_edition|"base"} ${multiversion_platform_arch|"linux/x86_64"} "2.6" "3.0" "3.2" "3.2.1" "3.4"
+        ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion ${multiversion_edition|"base"} ${multiversion_platform_arch|"linux/x86_64"} "3.0" "3.2" "3.4"
+
+  "do snmp setup" :
+    command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        mkdir -p snmpconf
+        cp -f src/mongo/db/modules/enterprise/docs/mongod.conf.master snmpconf/mongod.conf
 
   "cleanup environment" :
     - command: shell.exec
@@ -740,6 +821,7 @@ functions:
     command: shell.exec
     type: test
     params:
+      shell: bash
       working_dir: src/buildscripts/package_test
       script: |
         set -o errexit
@@ -757,18 +839,34 @@ functions:
           exit 1
         fi
 
-        # run `kitchen destroy` after we run `kitchen verify`, and exit with the `kitchen verify` exit status
-        finish () {
+        kitchen create $kitchen_variant
+
+        # retry converge in case the instance isn't fully ready
+        converged="false"
+        for i in {1..3}
+        do
+          kitchen converge "$kitchen_variant"
+          if [ $? -eq 0 ]; then
+            converged="true"
+            break
+          else
+            sleep 10
+          fi
+        done
+
+        if [ "$converged" = "true" ]; then
+          kitchen verify "$kitchen_variant"
           ret=$?
           kitchen destroy "$kitchen_variant"
           exit $ret
-        }
-        trap finish EXIT
+        else
+          echo "converge failed, running kitchen destroy and then exiting"
+          kitchen destroy "$kitchen_variant"
+          exit 1
+        fi
 
-        kitchen verify "$kitchen_variant"
 
 pre:
-  - command: shell.track
   - func: "kill processes"
   - func: "cleanup environment"
   - command: expansions.update
@@ -1036,46 +1134,19 @@ timeout:
 
 tasks:
 
-## compile ##
+## compile - build all scons targets except unittests ##
 - name: compile
   depends_on: []
   commands:
     - command: manifest.load
-    - command: git.get_project
-      params:
-        directory: src
-        revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
-          enterprise: ${enterprise_rev}
-          rocksdb: ${rocksdb_rev}
-    - command: git.apply_patch
-      params:
-        directory: src
+    - *git_get_project
     - func: "get buildnumber"
     - func: "setup credentials"
     - func: "build new tools" # noop if ${newtools} is not "true"
     - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
-    - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          set -o errexit
-          set -o verbose
-
-          # We get the raw version string (r1.2.3-45-gabcdef) from git
-          MONGO_VERSION=$(git describe)
-          # If this is a patch build, we add the patch version id to the version string so we know
-          # this build was a patch, and which evergreen task it came from
-          if [ "${is_patch|}" = "true" ]; then
-            MONGO_VERSION="$MONGO_VERSION-patch-${version_id}"
-          fi
-
-          # This script converts the generated version string into a sanitized version string for
-          # use by scons and uploading artifacts as well as information about for the scons cache.
-          echo $MONGO_VERSION | SCONS_CACHE_MODE=${scons_cache_mode|nolinked} USE_SCONS_CACHE=${use_scons_cache|false} ${python|python} buildscripts/generate_compile_expansions.py | tee compile_expansions.yml
+    - *generate_compile_expansions
     # Then we load the generated version data into the agent so we can use it in task definitions
-    - command: expansions.update
-      params:
-        file: src/compile_expansions.yml
+    - *apply_compile_expansions
 
     - command: shell.exec
       type: test
@@ -1087,7 +1158,7 @@ tasks:
 
           rm -rf ${install_directory|/data/mongo-install-directory}
 
-          ${python|python} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" all dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|} ${additional_targets|} MONGO_VERSION=${version}
+          ${python|python} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" core tools dbtest integration_tests dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|} MONGO_VERSION=${version}
 
           mv mongodb-src-*.${ext|tgz} distsrc.${ext|tgz}
           mv mongodb-*-debugsymbols.${ext|tgz} mongo-debugsymbols.tgz || true
@@ -1096,7 +1167,6 @@ tasks:
           # If strip is on the path (everywhere except windows) then we should strip the test binaries
           # before tarring them up
           if [ -x ${strip_path|/usr/bin/strip} ]; then
-            cat build/unittests.txt | xargs ${strip_command|/usr/bin/strip}
             cat build/integration_tests.txt | xargs ${strip_command|/usr/bin/strip}
             ${strip_command|/usr/bin/strip} dbtest
             ${strip_command|/usr/bin/strip} mongobridge
@@ -1106,12 +1176,15 @@ tasks:
           if [ "${is_patch}" != "true" ]; then
             burn_in_args="--checkEvergreen"
           fi
-          # Capture a list of new and modified tests.
-          ${python|python} buildscripts/burn_in_tests.py --buildVariant=${build_variant} --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
 
-          # On windows we need to make sure the paths in unittests.txt are compatible with cygwin tar
-          sed 's|\\|/|g' build/unittests.txt > build/unittests-tarlist.txt
-          ${tar|tar} -czvf mongodb-unittests.tgz -T build/unittests-tarlist.txt build/unittests.txt
+          # Create a branch in the git repository that tracks the remote branch configured for this
+          # Evergreen project so that the `git merge-base <branchname>@{upstream} HEAD` command run
+          # by the burn_in_tests.py script works.
+          git branch --force ${branch_name} origin/${branch_name}
+
+          # Capture a list of new and modified tests.
+          ${python|python} buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=${build_variant} --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
+
     - command: shell.exec
       params:
         working_dir: src
@@ -1177,17 +1250,6 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        local_file: src/mongodb-unittests.tgz
-        remote_file: mongodb-mongo-master/${build_variant}/${revision}/unittests/${build_id}.tgz
-        bucket: mciuploads
-        permissions: public-read
-        content_type: ${content_type|application/x-gzip}
-        display_name: Unit tests (stripped)
-
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
         local_file: src/distsrc.${ext|tgz}
         remote_file: mongodb-mongo-master/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
         bucket: mciuploads
@@ -1198,20 +1260,45 @@ tasks:
         # because it should be the same everywhere, so just use linux-64/windows-64-2k8.
         build_variants: [ linux-64, windows-64-2k8 ]
 
+## compile_all - build all scons targets including unittests ##
+- name: compile_all
+  depends_on: compile
+  commands:
+    - command: manifest.load
+    - *git_get_project
+    - func: "get buildnumber"
+    - func: "setup credentials"
+    - func: "build new tools" # noop if ${newtools} is not "true"
+    - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
+    - *generate_compile_expansions
+    # Then we load the generated version data into the agent so we can use it in task definitions.
+    - *apply_compile_expansions
+
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+
+          rm -rf ${install_directory|/data/mongo-install-directory}
+
+          ${python|python} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" all ${additional_targets|} MONGO_VERSION=${version}
+
+    # Run the C++ unittests as part of compile_all. The compiled binaries are automatically
+    # installed into the top-level directory by SCons.
+    - func: "run tests"
+      vars:
+        resmoke_args: --suites=unittests
+        run_multiple_jobs: true
+
 ## lint ##
 - name: lint
   depends_on: []
   commands:
     - command: manifest.load
-    - command: git.get_project
-      params:
-        directory: src
-        revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
-          enterprise: ${enterprise_rev}
-          rocksdb: ${rocksdb_rev}
-    - command: git.apply_patch
-      params:
-        directory: src
+    - *git_get_project
     - command: shell.exec
       type: test
       params:
@@ -1295,6 +1382,19 @@ tasks:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=jstestfuzz --storageEngine=wiredTiger
 
+## jstestfuzz concurrent mmapv1 ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_concurrent
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 75
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz --storageEngine=mmapv1 --numClientsPerFixture=10
+
 ## jstestfuzz concurrent WT ##
 - <<: *jstestfuzz_template
   name: jstestfuzz_concurrent_WT
@@ -1308,6 +1408,19 @@ tasks:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=jstestfuzz --storageEngine=wiredTiger --numClientsPerFixture=10
 
+## jstestfuzz concurrent replica set mmapv1 ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_concurrent_replication
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 75
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz_replication --storageEngine=mmapv1 --numClientsPerFixture=10
+
 ## jstestfuzz concurrent replica set WT ##
 - <<: *jstestfuzz_template
   name: jstestfuzz_concurrent_replication_WT
@@ -1320,6 +1433,19 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=jstestfuzz_replication --storageEngine=wiredTiger --numClientsPerFixture=10
+
+## jstestfuzz concurrent sharded cluster mmapv1 ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_concurrent_sharded
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 75
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz_sharded --storageEngine=mmapv1 --numClientsPerFixture=10
 
 ## jstestfuzz concurrent sharded cluster WT ##
 - <<: *jstestfuzz_template
@@ -1429,23 +1555,6 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=jstestfuzz_sharded --storageEngine=wiredTiger
-
-## unit tests ##
-- <<: *task_template
-  name: unittests
-  commands:
-  - func: "do setup"
-  - command: s3.get
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      remote_file: mongodb-mongo-master/${build_variant}/${revision}/unittests/${build_id}.tgz
-      bucket: mciuploads
-      extract_to: src
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=unittests
-      run_multiple_jobs: true
 
 ## integration test suites ##
 
@@ -1602,7 +1711,7 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=disk
-      run_multiple_jobs: true
+      run_multiple_jobs: false
 
 - <<: *task_template
   name: durability
@@ -1675,6 +1784,7 @@ tasks:
     vars:
       resmoke_args: --suites=gle_auth --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: gle_auth_WT
@@ -1684,6 +1794,7 @@ tasks:
     vars:
       resmoke_args: --suites=gle_auth --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: gle_auth_write_cmd
@@ -1711,6 +1822,7 @@ tasks:
     vars:
       resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: gle_auth_basics_passthrough_WT
@@ -1720,6 +1832,7 @@ tasks:
     vars:
       resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: gle_auth_basics_passthrough_write_cmd
@@ -1784,6 +1897,7 @@ tasks:
     vars:
       resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: sharding_gle_auth_basics_passthrough_WT
@@ -1795,6 +1909,7 @@ tasks:
     vars:
       resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: sharding_gle_auth_basics_passthrough_write_cmd
@@ -2295,6 +2410,7 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=parallel --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=mmapv1
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: parallel_compatibility_WT
@@ -2305,6 +2421,7 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=parallel --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=wiredTiger
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: concurrency
@@ -2387,6 +2504,28 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=rlp --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: read_concern_linearizable_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=read_concern_linearizable_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: read_concern_linearizable_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=read_concern_linearizable_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -2545,6 +2684,7 @@ tasks:
     vars:
       resmoke_args: --suites=sharding --shellReadMode=legacy --storageEngine=wiredTiger
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: sharding_auth
@@ -2581,35 +2721,23 @@ tasks:
   name: snmp
   commands:
   - func: "do setup"
-  - command: shell.exec
-    type: test
-    params:
-      working_dir: src
-      script: |
-        set -o errexit
-        set -o verbose
-
-        cp mongodb*/bin/* .
-        mkdir -p snmpconf
-        cp -f src/mongo/db/modules/enterprise/docs/mongod.conf.master snmpconf/mongod.conf
-        SNMPCONFPATH=snmpconf ${san_symbolizer} ${san_options} ${python|python} buildscripts/resmoke.py --suites=snmp --jobs ${num_jobs_available|1} --shuffle --storageEngine=mmapv1 ${test_flags} --log=buildlogger --reportFile=report.json
+  - func: "do snmp setup"
+  - func: "run tests"
+    vars:
+      snmp_config_path: SNMPCONFPATH=snmpconf
+      resmoke_args: --suites=snmp --storageEngine=mmapv1
+      run_multiple_jobs: true
 
 - <<: *task_template
   name: snmp_WT
   commands:
   - func: "do setup"
-  - command: shell.exec
-    type: test
-    params:
-      working_dir: src
-      script: |
-        set -o errexit
-        set -o verbose
-
-        cp mongodb*/bin/* .
-        mkdir -p snmpconf
-        cp -f src/mongo/db/modules/enterprise/docs/mongod.conf.master snmpconf/mongod.conf
-        SNMPCONFPATH=snmpconf ${san_symbolizer} ${san_options} ${python|python} buildscripts/resmoke.py --suites=snmp --jobs ${num_jobs_available|1} --shuffle --storageEngine=wiredTiger ${test_flags} --log=buildlogger --reportFile=report.json
+  - func: "do snmp setup"
+  - func: "run tests"
+    vars:
+      snmp_config_path: SNMPCONFPATH=snmpconf
+      resmoke_args: --suites=snmp --storageEngine=wiredTiger
+      run_multiple_jobs: true
 
 - <<: *task_template
   name: ssl
@@ -2701,42 +2829,6 @@ tasks:
       resmoke_args: --suites=read_only_sharded --storageEngine=wiredTiger
       run_multiple_jobs: true
 
-- <<: *task_template
-  name: views
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=views --storageEngine=mmapv1
-      run_multiple_jobs: true
-
-- <<: *task_template
-  name: views_WT
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=views --storageEngine=wiredTiger
-      run_multiple_jobs: true
-
-- <<: *task_template
-  name: views_rs
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=views_rs --storageEngine=mmapv1
-      run_multiple_jobs: true
-
-- <<: *task_template
-  name: views_rs_WT
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=views_rs --storageEngine=wiredTiger
-      run_multiple_jobs: true
-
 - name: package
   depends_on:
   - name: compile
@@ -2761,9 +2853,7 @@ tasks:
         bucket: mciuploads
         local_file: src/distsrc.${ext|tgz}
         build_variants: [ linux-64, windows-64-2k8 ]
-    - command: expansions.update
-      params:
-        file: src/compile_expansions.yml
+    - *apply_compile_expansions
     - func: "fetch debugsymbols archive"
     - command: shell.exec
       params:
@@ -3265,6 +3355,9 @@ buildvariants:
   - name: compile
     distros:
     - rhel62-large
+  - name: compile_all
+    distros:
+    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
@@ -3309,8 +3402,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -3339,6 +3435,7 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
+  - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: read_only
   - name: read_only_WT
@@ -3366,11 +3463,6 @@ buildvariants:
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: push
 
 - name: linux-64-repeated-execution
@@ -3389,6 +3481,9 @@ buildvariants:
   - name: compile
     distros:
     - rhel62-large
+  - name: compile_all
+    distros:
+    - rhel62-large
   - name: dbtest
   - name: dbtest_WT
   - name: integration_tests_standalone
@@ -3402,7 +3497,6 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  - name: unittests
 
 - name: linux-64-debug
   display_name: Linux DEBUG
@@ -3420,6 +3514,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel62-large
+  - name: compile_all
     distros:
     - rhel62-large
   - name: aggregation
@@ -3484,6 +3581,8 @@ buildvariants:
   - name: concurrency_simultaneous_WT
     distros:
     - rhel62-large
+  - name: read_concern_linearizable_passthrough
+  - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
@@ -3506,11 +3605,6 @@ buildvariants:
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
 
 - name: linux-64-duroff
   display_name: Linux (No Journal)
@@ -3532,6 +3626,9 @@ buildvariants:
   - name: compile
     distros:
     - rhel62-large
+  - name: compile_all
+    distros:
+    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
@@ -3549,8 +3646,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -3578,11 +3678,6 @@ buildvariants:
   - name: serial_run
   - name: sharding_jscore_passthrough
   - name: tool
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
 
 - name: linux-64-lsm
   stepback: false
@@ -3598,6 +3693,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel62-large
+  - name: compile_all
     distros:
     - rhel62-large
   - name: aggregation_WT
@@ -3637,9 +3735,6 @@ buildvariants:
   - name: sharding_jscore_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool_WT
-  - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
 
 - name: ubuntu1204
   display_name: SSL Ubuntu 12.04
@@ -3665,6 +3760,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - ubuntu1204-build
+  - name: compile_all
     distros:
     - ubuntu1204-build
   - name: aggregation
@@ -3704,8 +3802,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -3753,11 +3854,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -3787,6 +3883,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - ubuntu1404-build
+  - name: compile_all
     distros:
     - ubuntu1404-build
   - name: aggregation
@@ -3835,8 +3934,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -3884,11 +3986,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -3918,6 +4015,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - ubuntu1604-build
+  - name: compile_all
     distros:
     - ubuntu1604-build
   - name: aggregation
@@ -3957,8 +4057,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -4006,11 +4109,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -4044,80 +4142,7 @@ buildvariants:
   - name: compile
     distros:
     - ubuntu1604-arm64-large
-  - name: aggregation_WT
-  - name: aggregation_auth
-  - name: auth_WT
-  - name: dbtest_WT
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth_WT
-  - name: gle_auth_write_cmd_WT
-  - name: gle_auth_basics_passthrough_WT
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: jsCore_WT
-  - name: jsCore_compatibility_WT
-  - name: jsCore_decimal_WT
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs_WT
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded_WT
-  - name: mongosTest
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough_WT
-  - name: parallel_WT
-  - name: parallel_compatibility_WT
-  - name: concurrency_WT
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous_WT
-  - name: replicasets_WT
-  - name: replicasets_auth
-  - name: replication_WT
-  - name: replication_auth
-  - name: sharding_WT
-  - name: sharding_auth
-  - name: slow1_WT
-  - name: serial_run_WT
-  - name: sharding_jscore_passthrough_WT
-  - name: ssl
-  - name: sslSpecial
-  - name: tool_WT
-  - name: unittests
-  - name: push
-    distros:
-    - ubuntu1604-test
-
-- name: ubuntu1604-arm64
-  display_name: SSL Ubuntu 16.04 arm64
-  run_on:
-  - ubuntu1604-arm64-small
-  - ubuntu1604-arm64-large
-  batchtime: 1440 # 1 day
-  expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto)" -tags 'ssl'
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: arm64-ubuntu1604
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release CCFLAGS="-march=armv8-a+crc -mtune=generic" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    variant_excluded_flags: requires_mmapv1
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: arm64
-    packager_distro: ubuntu1604
-    repo_edition: org
-    build_mongoreplay: true
-  tasks:
-  - name: compile
+  - name: compile_all
     distros:
     - ubuntu1604-arm64-large
   - name: aggregation_WT
@@ -4165,7 +4190,84 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
-  - name: unittests
+  - name: push
+    distros:
+    - ubuntu1604-test
+
+- name: ubuntu1604-arm64
+  display_name: SSL Ubuntu 16.04 arm64
+  run_on:
+  - ubuntu1604-arm64-small
+  - ubuntu1604-arm64-large
+  batchtime: 1440 # 1 day
+  expansions:
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
+    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto)" -tags 'ssl'
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: arm64-ubuntu1604
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release CCFLAGS="-march=armv8-a+crc -mtune=generic" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    variant_excluded_flags: requires_mmapv1
+    has_packages: true
+    packager_script: packager.py
+    packager_arch: arm64
+    packager_distro: ubuntu1604
+    repo_edition: org
+    build_mongoreplay: true
+  tasks:
+  - name: compile
+    distros:
+    - ubuntu1604-arm64-large
+  - name: compile_all
+    distros:
+    - ubuntu1604-arm64-large
+  - name: aggregation_WT
+  - name: aggregation_auth
+  - name: auth_WT
+  - name: dbtest_WT
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth_WT
+  - name: gle_auth_write_cmd_WT
+  - name: gle_auth_basics_passthrough_WT
+  - name: gle_auth_basics_passthrough_write_cmd_WT
+  - name: sharding_gle_auth_basics_passthrough_WT
+  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  - name: jsCore_WT
+  - name: jsCore_compatibility_WT
+  - name: jsCore_decimal_WT
+  - name: jsCore_small_oplog_WT
+  - name: jsCore_small_oplog_rs_WT
+  - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded_WT
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded_WT
+  - name: mongosTest
+  - name: noPassthrough_WT
+  - name: noPassthroughWithMongod_WT
+  - name: bulk_gle_passthrough_WT
+  - name: parallel_WT
+  - name: parallel_compatibility_WT
+  - name: concurrency_WT
+  - name: concurrency_replication_WT
+  - name: concurrency_sharded_WT
+  - name: concurrency_simultaneous_WT
+  - name: replicasets_WT
+  - name: replicasets_auth
+  - name: replication_WT
+  - name: replication_auth
+  - name: sharding_WT
+  - name: sharding_auth
+  - name: slow1_WT
+  - name: serial_run_WT
+  - name: sharding_jscore_passthrough_WT
+  - name: ssl
+  - name: sslSpecial
+  - name: tool_WT
   - name: push
     distros:
     - ubuntu1604-test
@@ -4196,6 +4298,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - ubuntu1604-power8-build
+  - name: compile_all
     distros:
     - ubuntu1604-power8-build
   - name: aggregation_WT
@@ -4244,7 +4349,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
-  - name: unittests
   - name: push
     distros:
     - ubuntu1604-test
@@ -4275,6 +4379,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - ubuntu1604-zseries-large
+  - name: compile_all
     distros:
     - ubuntu1604-zseries-large
   - name: aggregation_WT
@@ -4314,6 +4421,7 @@ buildvariants:
   - name: noPassthrough_WT
   - name: parallel_WT
   - name: parallel_compatibility_WT
+  - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: replicasets_WT
   - name: replicasets_WT_ese
@@ -4341,7 +4449,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
-  - name: unittests
   - name: push
     distros:
     - ubuntu1604-test
@@ -4371,6 +4478,9 @@ buildvariants:
   - name: compile
     distros:
     - linux-64-amzn-build
+  - name: compile_all
+    distros:
+    - linux-64-amzn-build
   - name: aggregation_auth
   - name: aggregation_WT
   - name: audit
@@ -4391,8 +4501,11 @@ buildvariants:
   - name: jsCore_decimal_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -4426,11 +4539,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -4460,6 +4568,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - linux-64-amzn-build
+  - name: compile_all
     distros:
     - linux-64-amzn-build
   - name: aggregation
@@ -4499,8 +4610,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -4551,11 +4665,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -4585,6 +4694,9 @@ buildvariants:
     use_scons_cache: true
   tasks:
   - name: compile
+    distros:
+    - windows-64-vs2015-large
+  - name: compile_all
     distros:
     - windows-64-vs2015-large
   - name: aggregation
@@ -4620,8 +4732,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -4664,7 +4779,6 @@ buildvariants:
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool
   - name: tool_WT
-  - name: unittests
   - name: push
     distros:
     - rhel70-small
@@ -4690,6 +4804,9 @@ buildvariants:
     use_scons_cache: true
   tasks:
   - name: compile
+    distros:
+    - windows-64-vs2015-large
+  - name: compile_all
     distros:
     - windows-64-vs2015-large
   - name: aggregation
@@ -4728,8 +4845,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -4758,6 +4878,8 @@ buildvariants:
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
+  - name: read_concern_linearizable_passthrough
+  - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: replicasets
   - name: replicasets_WT
@@ -4779,7 +4901,6 @@ buildvariants:
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: tool
   - name: tool_WT
-  - name: unittests
   - name: push
     distros:
     - rhel70-small
@@ -4802,8 +4923,14 @@ buildvariants:
     use_scons_cache: true
   tasks:
   - name: compile
+    requires:
+    - name: burn_in_tests
     distros:
     - windows-64-vs2015-large
+  - name: compile_all
+    distros:
+    - windows-64-vs2015-large
+  - name: burn_in_tests
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_facet_unwind_passthrough_WT
@@ -4890,6 +5017,12 @@ buildvariants:
   - name: concurrency_simultaneous_WT
     distros:
     - windows-64-vs2015-large
+  - name: read_concern_linearizable_passthrough
+    distros:
+    - windows-64-vs2015-large
+  - name: read_concern_linearizable_passthrough_WT
+    distros:
+    - windows-64-vs2015-large
   - name: read_concern_majority_passthrough_WT
     distros:
     - windows-64-vs2015-large
@@ -4913,11 +5046,6 @@ buildvariants:
     - windows-64-vs2015-large
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
 
 - name: enterprise-windows-64
   display_name: "* Enterprise Windows"
@@ -4944,6 +5072,9 @@ buildvariants:
   - name: compile
     distros:
     - windows-64-vs2015-large
+  - name: compile_all
+    distros:
+    - windows-64-vs2015-large
   - name: audit
   - name: audit_WT
   - name: auth_audit
@@ -4961,8 +5092,11 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -4978,11 +5112,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -5015,6 +5144,9 @@ buildvariants:
   - name: compile
     distros:
     - windows-64-vs2015-large
+  - name: compile_all
+    distros:
+    - windows-64-vs2015-large
   - name: audit
   - name: audit_WT
   - name: auth_audit
@@ -5030,11 +5162,15 @@ buildvariants:
   - name: jsCore_small_oplog
   - name: jsCore_small_oplog_rs
   - name: jstestfuzz
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: read_concern_linearizable_passthrough
   - name: replicasets_auth
   - name: sasl
   - name: sharding_auth
@@ -5042,7 +5178,6 @@ buildvariants:
   - name: snmp
   - name: ssl
   - name: sslSpecial
-  - name: unittests
 
 - name: windows-64-2k8-ssl
   display_name: SSL Windows 2008R2
@@ -5068,6 +5203,9 @@ buildvariants:
   - name: compile
     distros:
     - windows-64-vs2015-large
+  - name: compile_all
+    distros:
+    - windows-64-vs2015-large
   - name: aggregation
   - name: aggregation_WT
   - name: auth
@@ -5089,8 +5227,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -5133,7 +5274,6 @@ buildvariants:
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool
   - name: tool_WT
-  - name: unittests
   - name: ssl
   - name: sslSpecial
   - name: push
@@ -5186,6 +5326,7 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+  - name: compile_all
   - name: aggregation
   - name: aggregation_WT
   - name: auth
@@ -5221,8 +5362,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -5264,11 +5408,6 @@ buildvariants:
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -5289,6 +5428,7 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+  - name: compile_all
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_read_concern_majority_passthrough_WT
@@ -5324,8 +5464,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -5366,7 +5509,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
   - name: push
     distros:
     - rhel70-small
@@ -5385,6 +5527,7 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+  - name: compile_all
   - name: aggregation
   - name: aggregation_WT
   - name: auth
@@ -5408,11 +5551,6 @@ buildvariants:
   - name: replication_WT
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
 
 - name: enterprise-osx-107
   display_name: Enterprise OS X 10.7
@@ -5432,6 +5570,7 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+  - name: compile_all
   - name: audit
   - name: audit_WT
   - name: auth_audit
@@ -5443,8 +5582,11 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -5457,11 +5599,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -5499,6 +5636,10 @@ buildvariants:
   - name: compile
     requires:
     - name: burn_in_tests
+    - name: lint
+    distros:
+    - rhel62-large
+  - name: compile_all
     distros:
     - rhel62-large
   - name: lint
@@ -5585,8 +5726,11 @@ buildvariants:
     - rhel62-large
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -5607,6 +5751,12 @@ buildvariants:
   - name: parallel_WT
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
+  - name: read_concern_linearizable_passthrough
+    distros:
+    - rhel62-large
+  - name: read_concern_linearizable_passthrough_WT
+    distros:
+    - rhel62-large
   - name: read_concern_majority_passthrough_WT
     distros:
     - rhel62-large
@@ -5684,11 +5834,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -5714,13 +5859,16 @@ buildvariants:
     # for the .gcda files. In Evergreen the path will start with /data/mci/[Hashed ID]/src/... where
     # the hashed ID is unique per task run. GCOV_PREFIX_STRIP is the number of directory levels to
     # strip from the top of the default path before appending to the GCOV_PREFIX (if any).
-    resmoke_wrapper: GCOV_PREFIX=$(pwd) GCOV_PREFIX_STRIP=4
+    gcov_environment: GCOV_PREFIX=$(pwd) GCOV_PREFIX_STRIP=4
     # Mixing --cache and --gcov doesn't work correctly yet. See SERVER-11084
     timeout_secs: 10800 # 3 hour timeout
     use_scons_cache: false
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel62-large
+  - name: compile_all
     distros:
     - rhel62-large
   - name: aggregation
@@ -5831,6 +5979,12 @@ buildvariants:
   - name: parallel_WT
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
+  - name: read_concern_linearizable_passthrough
+    distros:
+    - rhel62-large
+  - name: read_concern_linearizable_passthrough_WT
+    distros:
+    - rhel62-large
   - name: read_concern_majority_passthrough_WT
     distros:
     - rhel62-large
@@ -5906,11 +6060,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
 
 - name: enterprise-rhel-70-64-bit
   display_name: Enterprise RHEL 7.0
@@ -5939,6 +6088,9 @@ buildvariants:
   - name: compile
     distros:
     - rhel70
+  - name: compile_all
+    distros:
+    - rhel70
   - name: audit
   - name: audit_WT
   - name: dbtest
@@ -5948,8 +6100,11 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -5964,7 +6119,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
   - name: package
     distros:
     - ubuntu1604-packer
@@ -5996,6 +6150,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel62-large
+  - name: compile_all
     distros:
     - rhel62-large
   - name: aggregation
@@ -6035,8 +6192,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -6084,11 +6244,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -6119,6 +6274,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel70
+  - name: compile_all
     distros:
     - rhel70
   - name: aggregation
@@ -6158,8 +6316,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -6223,11 +6384,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -6261,6 +6417,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel71-power8-build
+  - name: compile_all
     distros:
     - rhel71-power8-build
   # - name: aggregation
@@ -6328,6 +6487,8 @@ buildvariants:
   - name: parallel_WT
   # - name: parallel_compatibility
   - name: parallel_compatibility_WT
+  # - name: read_concern_linearizable_passthrough
+  - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   # - name: replicasets
   - name: replicasets_WT
@@ -6364,9 +6525,6 @@ buildvariants:
   - name: sslSpecial
   # - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -6398,6 +6556,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel72-zseries-build
+  - name: compile_all
     distros:
     - rhel72-zseries-build
   # - name: aggregation
@@ -6465,6 +6626,8 @@ buildvariants:
   - name: parallel_WT
   # - name: parallel_compatibility
   - name: parallel_compatibility_WT
+  # - name: read_concern_linearizable_passthrough
+  - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   # - name: replicasets
   - name: replicasets_WT
@@ -6501,9 +6664,6 @@ buildvariants:
   - name: sslSpecial
   # - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -6539,6 +6699,9 @@ buildvariants:
   - name: compile
     distros:
     - ubuntu1204-build
+  - name: compile_all
+    distros:
+    - ubuntu1204-build
   - name: audit
   - name: audit_WT
   - name: dbtest
@@ -6548,8 +6711,11 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -6563,7 +6729,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
   - name: package
     distros:
     - ubuntu1604-packer
@@ -6597,6 +6762,9 @@ buildvariants:
   - name: compile
     distros:
     - ubuntu1404-build
+  - name: compile_all
+    distros:
+    - ubuntu1404-build
   - name: audit
   - name: audit_WT
   - name: dbtest
@@ -6615,8 +6783,11 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -6630,7 +6801,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
   - name: package
     distros:
     - ubuntu1604-packer
@@ -6664,6 +6834,9 @@ buildvariants:
   - name: compile
     distros:
     - ubuntu1604-build
+  - name: compile_all
+    distros:
+    - ubuntu1604-build
   - name: audit
   - name: audit_WT
   - name: dbtest
@@ -6673,8 +6846,11 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -6688,29 +6864,31 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
   - name: package
     distros:
     - ubuntu1604-packer
   - name: push
 
 
-- name: enterprise-ubuntu1404-clang-3.4-libc
-  display_name: "! Enterprise Ubuntu 14.04 (Clang 3.4/libc++)"
+- name: enterprise-ubuntu1604-clang-3.7-libcxx
+  display_name: "! Enterprise Ubuntu 16.04 (Clang 3.7/libc++)"
   modules:
   - enterprise
   run_on:
-  - ubuntu1404-test
+   - ubuntu1604-test
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
-    compile_flags: --ssl CC=/usr/bin/clang CXX=/usr/bin/clang++ --libc++ -j$(grep -c ^processor /proc/cpuinfo)
+    compile_flags: --ssl CC=/usr/bin/clang-3.7 CXX=/usr/bin/clang++-3.7 --libc++ -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
     use_scons_cache: true
     build_mongoreplay: true
   tasks:
   - name: compile
     distros:
-    - ubuntu1404-build
+    - ubuntu1604-build
+  - name: compile_all
+    distros:
+    - ubuntu1604-build
 
 ###########################################
 #          SUSE buildvariants             #
@@ -6743,6 +6921,9 @@ buildvariants:
   - name: compile
     distros:
     - suse12-build
+  - name: compile_all
+    distros:
+    - suse12-build
   - name: audit
   - name: audit_WT
   - name: dbtest
@@ -6752,8 +6933,11 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -6767,7 +6951,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
   - name: package
     distros:
     - ubuntu1604-packer
@@ -6800,6 +6983,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - suse12-zseries-build
+  - name: compile_all
     distros:
     - suse12-zseries-build
   - name: aggregation_WT
@@ -6838,6 +7024,7 @@ buildvariants:
   - name: noPassthrough_WT
   - name: parallel_WT
   - name: parallel_compatibility_WT
+  - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: replicasets_WT
   - name: replicasets_WT_ese
@@ -6863,7 +7050,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
-  - name: unittests
   - name: push
     distros:
     - suse12-test
@@ -6893,6 +7079,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - suse12-build
+  - name: compile_all
     distros:
     - suse12-build
   - name: aggregation
@@ -6930,8 +7119,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -6979,11 +7171,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7016,6 +7203,9 @@ buildvariants:
   - name: compile
     distros:
     - suse11-build
+  - name: compile_all
+    distros:
+    - suse11-build
   - name: audit
   - name: audit_WT
   - name: dbtest
@@ -7025,8 +7215,11 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -7040,7 +7233,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7070,6 +7262,7 @@ buildvariants:
     repo_edition: enterprise
   tasks:
   - name: compile
+  - name: compile_all
   - name: aggregation_WT
   - name: aggregation_WT_ese
   - name: aggregation_auth
@@ -7106,6 +7299,7 @@ buildvariants:
   - name: noPassthrough_WT
   - name: parallel_WT
   - name: parallel_compatibility_WT
+  - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: replicasets_WT
   - name: replicasets_WT_ese
@@ -7131,7 +7325,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
-  - name: unittests
   - name: push
     distros:
     - suse11-test
@@ -7160,6 +7353,9 @@ buildvariants:
     use_scons_cache: true
   tasks:
   - name: compile
+    distros:
+    - suse11-build
+  - name: compile_all
     distros:
     - suse11-build
   - name: aggregation
@@ -7197,8 +7393,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -7246,11 +7445,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7277,6 +7471,7 @@ buildvariants:
     use_scons_cache: true
   tasks:
   - name: compile
+  - name: compile_all
   - name: aggregation
   - name: aggregation_WT
   - name: auth
@@ -7309,6 +7504,12 @@ buildvariants:
   - name: jsCore_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
+  - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
+  - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded
@@ -7340,11 +7541,6 @@ buildvariants:
   - name: serial_run_WT
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -7380,6 +7576,9 @@ buildvariants:
   - name: compile
     distros:
     - debian71-build
+  - name: compile_all
+    distros:
+    - debian71-build
   - name: audit
   - name: audit_WT
   - name: dbtest
@@ -7389,8 +7588,11 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -7404,7 +7606,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7438,6 +7639,9 @@ buildvariants:
   - name: compile
     distros:
     - debian81-build
+  - name: compile_all
+    distros:
+    - debian81-build
   - name: audit
   - name: audit_WT
   - name: dbtest
@@ -7447,8 +7651,11 @@ buildvariants:
   - name: jsCore_auth
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -7462,7 +7669,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: unittests
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7494,6 +7700,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - debian71-build
+  - name: compile_all
     distros:
     - debian71-build
   - name: aggregation
@@ -7531,8 +7740,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -7583,11 +7795,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7619,6 +7826,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - debian81-build
+  - name: compile_all
     distros:
     - debian81-build
   - name: aggregation
@@ -7656,8 +7866,11 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
@@ -7708,11 +7921,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7742,6 +7950,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel62-large
+  - name: compile_all
     distros:
     - rhel62-large
   - name: aggregation_WT
@@ -7785,6 +7996,7 @@ buildvariants:
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
+  - name: read_concern_linearizable_passthrough
   - name: read_concern_majority_passthrough_WT
   - name: replicasets_WT
   - name: replicasets_auth
@@ -7808,9 +8020,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
 
 - name: linux-64-ephemeralForTest
   display_name: Linux (ephemeralForTest)
@@ -7826,6 +8035,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel62-large
+  - name: compile_all
     distros:
     - rhel62-large
   - name: aggregation_WT
@@ -7872,6 +8084,7 @@ buildvariants:
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
+  - name: read_concern_linearizable_passthrough
   - name: replicasets_WT
   - name: replicasets_auth
   - name: replicasets_legacy
@@ -7886,9 +8099,6 @@ buildvariants:
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool
-  - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
 
 - name: enterprise-rhel-71-ppc64le-inmem
   display_name: Enterprise RHEL 7.1 PPC64LE (inMemory) DEBUG
@@ -7910,6 +8120,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel71-power8-build
+  - name: compile_all
     distros:
     - rhel71-power8-build
   - name: aggregation_WT
@@ -7945,6 +8158,7 @@ buildvariants:
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
+  - name: read_concern_linearizable_passthrough
   - name: read_concern_majority_passthrough_WT
   - name: replicasets_WT
   - name: replicasets_auth
@@ -7967,8 +8181,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: unittests
-  - name: views
 
 - name: enterprise-rhel-72-s390x-inmem
   display_name: Enterprise RHEL 7.2 s390x (inMemory) DEBUG
@@ -7989,6 +8201,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - rhel72-zseries-build
+  - name: compile_all
     distros:
     - rhel72-zseries-build
   - name: aggregation_WT
@@ -8032,6 +8247,7 @@ buildvariants:
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
+  - name: read_concern_linearizable_passthrough
   - name: read_concern_majority_passthrough_WT
   - name: replicasets_WT
   - name: replicasets_auth
@@ -8054,8 +8270,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: unittests
-  - name: views
 
 - name: ubuntu1404-rocksdb
   display_name: Ubuntu 14.04 (RocksDB)
@@ -8073,6 +8287,9 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+    distros:
+    - ubuntu1404-build
+  - name: compile_all
     distros:
     - ubuntu1404-build
   - name: aggregation
@@ -8114,6 +8331,7 @@ buildvariants:
     distros:
     - ubuntu1404-build
   - name: concurrency_simultaneous
+  - name: read_concern_linearizable_passthrough
   - name: replicasets
   - name: replicasets_auth
   - name: replication
@@ -8124,8 +8342,6 @@ buildvariants:
   - name: slow1
   - name: serial_run
   - name: sharding_jscore_passthrough
-  - name: unittests
-  - name: views
 
 ###########################################
 #     Experimental buildvariants          #
@@ -8151,6 +8367,7 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+  - name: compile_all
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -8229,6 +8446,8 @@ buildvariants:
   - name: parallel_WT
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
+  - name: read_concern_linearizable_passthrough
+  - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: read_only
   - name: read_only_WT
@@ -8271,10 +8490,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs_WT
 
 - name: ubuntu1604-asan
   display_name: ~ ASAN SSL Ubuntu 16.04
@@ -8292,16 +8507,19 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
+  - name: compile_all
   - name: jstestfuzz
   - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
-  - name: unittests
 
 - name: ubuntu1604-debug-ubsan
   display_name: ~ UBSAN Enterprise Ubuntu 16.04 DEBUG
@@ -8326,6 +8544,9 @@ buildvariants:
   - name: compile
     distros:
     - ubuntu1604-build
+  - name: compile_all
+    distros:
+    - ubuntu1604-build
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -8404,6 +8625,8 @@ buildvariants:
   - name: parallel_WT
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
+  - name: read_concern_linearizable_passthrough
+  - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: read_only
   - name: read_only_WT
@@ -8446,10 +8669,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs_WT
 
 - name: enterprise-ubuntu-dynamic-1604-64-bit
   display_name: "* Shared Library Enterprise Ubuntu 16.04"
@@ -8467,161 +8686,9 @@ buildvariants:
   - name: compile
     distros:
     - ubuntu1604-build
-
-- name: enterprise-debug-rhel-62-cxx14
-  display_name: ~ Enterprise RHEL 6.2 C++14 DEBUG
-  modules:
-  - enterprise
-  run_on:
-  - rhel62-small
-  batchtime: 1440 # 1 day
-  expansions:
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
-    rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
-    compile_flags: --allocator=system --dbg=on --opt=on --ssl -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on --cxx-std=14
-    multiversion_platform_arch: "rhel62"
-    multiversion_edition: "targeted"
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    use_scons_cache: true
-    build_mongoreplay: true
-  tasks:
-  - name: compile
+  - name: compile_all
     distros:
-    - rhel62-large
-  - name: aggregation
-  - name: aggregation_WT
-  - name: aggregation_WT_ese
-  - name: aggregation_auth
-  - name: aggregation_read_concern_majority_passthrough_WT
-  - name: aggregation_sharded_collections_passthrough_WT
-  - name: audit
-  - name: audit_WT
-  - name: auth
-  - name: auth_WT
-  - name: auth_audit
-  - name: auth_audit_WT
-  - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_WT
-  - name: dbtest
-  - name: dbtest_WT
-  - name: disk
-  - name: dur_jscore_passthrough
-  - name: durability
-  - name: ese_WT
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth
-  - name: gle_auth_WT
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_WT
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: gle_auth_write_cmd
-  - name: gle_auth_write_cmd_WT
-  - name: httpinterface
-  - name: integration_tests_replset
-  - name: integration_tests_standalone
-  - name: jsCore
-  - name: jsCore_WT
-  - name: jsCore_WT_ese
-  - name: jsCore_auth
-  - name: jsCore_compatibility
-  - name: jsCore_compatibility_WT
-  - name: jsCore_minimum_batch_size_WT
-  - name: jsCore_op_query
-  - name: jsCore_op_query_WT
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_WT
-  - name: jsCore_small_oplog_rs
-  - name: jsCore_small_oplog_rs_WT
-  - name: mmap
-  - name: mongosTest
-  - name: multiversion
-  - name: multiversion_WT
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: noPassthrough_WT
-  - name: parallel
-  - name: parallel_WT
-  - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  - name: read_concern_majority_passthrough_WT
-  - name: read_only
-  - name: read_only_WT
-  - name: read_only_sharded
-  - name: read_only_sharded_WT
-  - name: replicasets
-  - name: replicasets_WT
-  - name: replicasets_WT_ese
-  - name: replicasets_auth
-  - name: replicasets_legacy
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
-  - name: rlp
-  - name: rlp_WT
-  - name: sasl
-  - name: sharded_collections_jscore_passthrough
-  - name: sharded_collections_jscore_passthrough_WT
-  - name: sharding
-  - name: sharding_WT
-  - name: sharding_WT_ese
-  - name: sharding_auth
-  - name: sharding_auth_audit_WT
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough_wire_ops_WT
-  - name: sharding_last_stable_mongos_and_mixed_shards
-  - name: sharding_op_query_WT
-  - name: sharding_csrs_continuous_config_stepdown_WT
-  - name: slow1
-  - name: slow1_WT
-  - name: serial_run
-  - name: serial_run_WT
-  - name: snmp
-  - name: snmp_WT
-  - name: ssl
-  - name: sslSpecial
-  - name: tool
-  - name: tool_WT
-  - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
-
-- name: ubuntu1404-jepsen
-  display_name: ~ Jepsen Ubuntu 14.04
-  run_on:
-  - ubuntu1404-jepsen
-  expansions:
-    compile_flags: MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    use_scons_cache: true
-  tasks:
-  - name: compile
-    distros:
-    - ubuntu1404-build
-  - name: jepsen_findAndModify_WT
-  - name: jepsen_linearizableRead
-  - name: jepsen_linearizableRead_WT
-  - name: unittests
-    distros:
-    - ubuntu1404-test
+    - ubuntu1604-build
 
 - name: initsync-3dot2-rhel-62
   display_name: "~ Initial Sync 3.2 Enterprise RHEL 6.2"
@@ -8657,12 +8724,6 @@ buildvariants:
   - name: jsCore_small_oplog_rs_WT
     distros:
     - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync
-    distros:
-    - rhel62-large
-  - name: jsCore_small_oplog_rs_initsync_WT
-    distros:
-    - rhel62-large
   - name: jsCore_small_oplog_rs_initsync_static
     distros:
     - rhel62-large
@@ -8679,6 +8740,12 @@ buildvariants:
   - name: noPassthroughWithMongod
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
+  - name: read_concern_linearizable_passthrough
+    distros:
+    - rhel62-large
+  - name: read_concern_linearizable_passthrough_WT
+    distros:
+    - rhel62-large
   - name: read_concern_majority_passthrough_WT
     distros:
     - rhel62-large

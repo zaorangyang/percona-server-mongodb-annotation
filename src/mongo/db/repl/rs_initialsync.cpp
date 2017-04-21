@@ -223,7 +223,7 @@ bool _initialSyncApplyOplog(OperationContext* txn,
         LOG(2) << "Applying oplog entries from " << startOpTime << " until " << stopOpTime;
         syncer->oplogApplication(txn, stopOpTime);
 
-        if (inShutdown()) {
+        if (globalInShutdownDeprecated()) {
             return false;
         }
     } catch (const DBException&) {
@@ -289,7 +289,7 @@ Status _initialSync(OperationContext* txn, BackgroundSync* bgsync) {
             sleepsecs(1);
         }
 
-        if (inShutdown()) {
+        if (globalInShutdownDeprecated()) {
             return Status(ErrorCodes::ShutdownInProgress, "shutting down");
         }
     }
@@ -540,7 +540,7 @@ void syncDoInitialSync(OperationContext* txn,
     });
 
     int failedAttempts = 0;
-    while (failedAttempts < num3Dot2InitialSyncAttempts) {
+    while (failedAttempts < num3Dot2InitialSyncAttempts.load()) {
         try {
             // leave loop when successful
             Status status = _initialSync(txn, bgsync.get());
@@ -552,22 +552,22 @@ void syncDoInitialSync(OperationContext* txn,
         } catch (const DBException& e) {
             error() << redact(e);
             // Return if in shutdown
-            if (inShutdown()) {
+            if (globalInShutdownDeprecated()) {
                 return;
             }
         }
 
-        if (inShutdown()) {
+        if (globalInShutdownDeprecated()) {
             return;
         }
 
         error() << "initial sync attempt failed, "
-                << (num3Dot2InitialSyncAttempts - ++failedAttempts) << " attempts remaining";
+                << (num3Dot2InitialSyncAttempts.load() - ++failedAttempts) << " attempts remaining";
         sleepmillis(durationCount<Milliseconds>(kInitialSyncRetrySleepDuration));
     }
 
     // No need to print a stack
-    if (failedAttempts >= num3Dot2InitialSyncAttempts) {
+    if (failedAttempts >= num3Dot2InitialSyncAttempts.load()) {
         severe() << "The maximum number of retries have been exhausted for initial sync.";
         fassertFailedNoTrace(16233);
     }

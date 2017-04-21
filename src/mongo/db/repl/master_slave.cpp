@@ -57,6 +57,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/internal_plans.h"
@@ -68,6 +69,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -97,8 +99,8 @@ void pretouchOperation(OperationContext* txn, const BSONObj& op);
 void pretouchN(vector<BSONObj>&, unsigned a, unsigned b);
 
 /* if 1 sync() is running */
-volatile int syncing = 0;
-volatile int relinquishSyncingSome = 0;
+AtomicInt32 syncing(0);
+AtomicInt32 relinquishSyncingSome(0);
 
 /* output by the web console */
 const char* replInfo = "";
@@ -486,6 +488,11 @@ void ReplSource::resyncDrop(OperationContext* txn, const string& dbName) {
     invariant(txn->lockState()->isW());
 
     Database* const db = dbHolder().get(txn, dbName);
+    if (!db) {
+        log() << "resync: dropping database " << dbName
+              << " - database does not exist. nothing to do.";
+        return;
+    }
     Database::dropDatabase(txn, db);
 }
 
@@ -836,7 +843,7 @@ void ReplSource::syncToTailOfRemoteLog() {
     }
 }
 
-std::atomic<int> replApplyBatchSize(1);  // NOLINT
+AtomicInt32 replApplyBatchSize(1);
 
 class ReplApplyBatchSize
     : public ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime> {
@@ -1063,7 +1070,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* txn, int& nApplied) {
 
             BSONObj op = oplogReader.nextSafe();
 
-            int b = replApplyBatchSize;
+            int b = replApplyBatchSize.load();
             bool justOne = b == 1;
             unique_ptr<Lock::GlobalWrite> lk(justOne ? 0 : new Lock::GlobalWrite(txn->lockState()));
             while (1) {
@@ -1135,7 +1142,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* txn, int& nApplied) {
 int ReplSource::sync(OperationContext* txn, int& nApplied) {
     _sleepAdviceTime = 0;
     ReplInfo r("sync");
-    if (!serverGlobalParams.quiet) {
+    if (!serverGlobalParams.quiet.load()) {
         LogstreamBuilder l = log();
         l << "syncing from ";
         if (sourceName() != "main") {
@@ -1256,8 +1263,7 @@ static void replMain(OperationContext* txn) {
             }
 
             // i.e., there is only one sync thread running. we will want to change/fix this.
-            verify(syncing == 0);
-            syncing++;
+            invariant(syncing.swap(1) == 0);
         }
 
         try {
@@ -1280,12 +1286,11 @@ static void replMain(OperationContext* txn) {
         {
             ScopedTransaction transaction(txn, MODE_X);
             Lock::GlobalWrite lk(txn->lockState());
-            verify(syncing == 1);
-            syncing--;
+            invariant(syncing.swap(0) == 1);
         }
 
-        if (relinquishSyncingSome) {
-            relinquishSyncingSome = 0;
+        if (relinquishSyncingSome.load()) {
+            relinquishSyncingSome.store(0);
             s = restartSyncAfterSleep;  // sleep before going back in to syncing=1
         }
 
@@ -1293,7 +1298,7 @@ static void replMain(OperationContext* txn) {
             stringstream ss;
             ss << "sleep " << s << " sec before next pass";
             string msg = ss.str();
-            if (!serverGlobalParams.quiet)
+            if (!serverGlobalParams.quiet.load())
                 log() << msg << endl;
             ReplInfo r(msg.c_str());
             sleepsecs(s);
@@ -1455,7 +1460,7 @@ void pretouchOperation(OperationContext* txn, const BSONObj& op) {
             BSONObjBuilder b;
             b.append(_id);
             BSONObj result;
-            AutoGetCollectionForRead ctx(txn, ns);
+            AutoGetCollectionForRead ctx(txn, NamespaceString(ns));
             if (Helpers::findById(txn, ctx.getDb(), ns, b.done(), result)) {
                 _dummy_z += result.objsize();  // touch
             }

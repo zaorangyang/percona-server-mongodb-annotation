@@ -82,7 +82,7 @@ using std::endl;
 
 namespace repl {
 
-std::atomic<int> SyncTail::replBatchLimitOperations{50 * 1000};  // NOLINT
+AtomicInt32 SyncTail::replBatchLimitOperations{50 * 1000};
 
 /**
  * This variable determines the number of writer threads SyncTail will have. It has a default
@@ -419,7 +419,7 @@ void prefetchOp(const BSONObj& op) {
             // for multiple prefetches if they are for the same database.
             const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
             OperationContext& txn = *txnPtr;
-            AutoGetCollectionForRead ctx(&txn, ns);
+            AutoGetCollectionForRead ctx(&txn, NamespaceString(ns));
             Database* db = ctx.getDb();
             if (db) {
                 prefetchPagesForReplicatedOp(&txn, db, op);

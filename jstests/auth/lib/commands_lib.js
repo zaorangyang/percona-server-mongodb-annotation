@@ -25,7 +25,7 @@ be authorized.
 
     {
         testname: "aggregate_write",
-        command: {aggregate: "foo", pipeline: [ {$out: "foo_out"} ] },
+        command: {aggregate: "foo", pipeline: [ {$out: "foo_out"} ], cursor: {} },
         testcases: [
             { runOnDb: "roles_commands_1", roles: {readWrite: 1, readWriteAnyDatabase: 1} },
             { runOnDb: "roles_commands_2", roles: {readWriteAnyDatabase: 1} }
@@ -445,7 +445,7 @@ var authCommandsLib = {
 
         {
           testname: "aggregate_readonly",
-          command: {aggregate: "foo", pipeline: []},
+          command: {aggregate: "foo", pipeline: [], cursor: {}},
           testcases: [
               {
                 runOnDb: firstDbName,
@@ -468,7 +468,7 @@ var authCommandsLib = {
           teardown: function(db) {
               db.view.drop();
           },
-          command: {aggregate: "view", pipeline: []},
+          command: {aggregate: "view", pipeline: [], cursor: {}},
           testcases: [
               // Tests that a user with read privileges on a view can aggregate it, even if they
               // don't have read privileges on the underlying namespace.
@@ -529,7 +529,7 @@ var authCommandsLib = {
         },
         {
           testname: "aggregate_write",
-          command: {aggregate: "foo", pipeline: [{$out: "foo_out"}]},
+          command: {aggregate: "foo", pipeline: [{$out: "foo_out"}], cursor: {}},
           testcases: [
               {
                 runOnDb: firstDbName,
@@ -559,7 +559,7 @@ var authCommandsLib = {
           teardown: function(db) {
               db.view.drop();
           },
-          command: {aggregate: "view", pipeline: [{$out: "view_out"}]},
+          command: {aggregate: "view", pipeline: [{$out: "view_out"}], cursor: {}},
           testcases: [
               {
                 runOnDb: firstDbName,
@@ -589,7 +589,7 @@ var authCommandsLib = {
           teardown: function(db) {
               db.view.drop();
           },
-          command: {aggregate: "foo", pipeline: [{$out: "view"}]},
+          command: {aggregate: "foo", pipeline: [{$out: "view"}], cursor: {}},
           testcases: [
               {
                 runOnDb: firstDbName,
@@ -615,26 +615,35 @@ var authCommandsLib = {
         },
         {
           testname: "aggregate_indexStats",
-          command: {aggregate: "foo", pipeline: [{$indexStats: {}}]},
+          command: {aggregate: "foo", pipeline: [{$indexStats: {}}], cursor: {}},
           setup: function(db) {
               db.createCollection("foo");
           },
           teardown: function(db) {
               db.foo.drop();
           },
-          testcases: [{
-              runOnDb: firstDbName,
-              roles: {clusterMonitor: 1, clusterAdmin: 1, root: 1, __system: 1},
-              privileges: [{resource: {anyResource: true}, actions: ["indexStats"]}]
-          }]
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_monitoring,
+                privileges:
+                    [{resource: {db: firstDbName, collection: "foo"}, actions: ["indexStats"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_monitoring,
+                privileges:
+                    [{resource: {db: secondDbName, collection: "foo"}, actions: ["indexStats"]}]
+              }
+          ]
         },
         {
           testname: "aggregate_lookup",
           command: {
               aggregate: "foo",
-              pipeline: [
-                  {$lookup: {from: "bar", localField: "_id", foreignField: "_id", as: "results"}}
-              ]
+              pipeline:
+                  [{$lookup: {from: "bar", localField: "_id", foreignField: "_id", as: "results"}}],
+              cursor: {}
           },
           setup: function(db) {
               db.createCollection("foo");
@@ -675,9 +684,10 @@ var authCommandsLib = {
           },
           command: {
               aggregate: "foo",
-              pipeline: [{
-                  $lookup: {from: "view", localField: "_id", foreignField: "_id", as: "results"}
-              }]
+              pipeline: [
+                  {$lookup: {from: "view", localField: "_id", foreignField: "_id", as: "results"}}
+              ],
+              cursor: {}
           },
           testcases: [
               // Tests that a user can successfully $lookup into a view when given read access.
@@ -711,7 +721,8 @@ var authCommandsLib = {
                       connectToField: "barId",
                       as: "results"
                   }
-              }]
+              }],
+              cursor: {}
           },
           setup: function(db) {
               db.createCollection("foo");
@@ -760,7 +771,8 @@ var authCommandsLib = {
                       connectToField: "viewId",
                       as: "results"
                   }
-              }]
+              }],
+              cursor: {}
           },
           testcases: [
               // Tests that a user can successfully $graphLookup into a view when given read access.
@@ -784,7 +796,7 @@ var authCommandsLib = {
         },
         {
           testname: "aggregate_collStats",
-          command: {aggregate: "foo", pipeline: [{$collStats: {latencyStats: {}}}]},
+          command: {aggregate: "foo", pipeline: [{$collStats: {latencyStats: {}}}], cursor: {}},
           setup: function(db) {
               db.createCollection("foo");
           },
@@ -853,7 +865,8 @@ var authCommandsLib = {
                           }
                       }]
                   }
-              }]
+              }],
+              cursor: {}
           },
           setup: function(db) {
               db.createCollection("foo");
@@ -910,7 +923,8 @@ var authCommandsLib = {
                           }
                       }]
                   }
-              }]
+              }],
+              cursor: {}
           },
           setup: function(db) {
               db.createCollection("foo");

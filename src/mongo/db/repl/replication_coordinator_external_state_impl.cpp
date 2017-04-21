@@ -87,7 +87,6 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
@@ -96,8 +95,6 @@
 
 namespace mongo {
 namespace repl {
-
-MONGO_FP_DECLARE(transitionToPrimaryHangBeforeInitializingConfigDatabase);
 
 namespace {
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
@@ -261,13 +258,11 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(Operat
     auto oldSSF = std::move(_syncSourceFeedbackThread);
     auto oldBgSync = std::move(_bgSync);
     auto oldApplier = std::move(_applierThread);
-    if (oldSSF) {
-        log() << "Stopping replication reporter thread";
-        _syncSourceFeedback.shutdown();
-    }
     lock->unlock();
 
     if (oldSSF) {
+        log() << "Stopping replication reporter thread";
+        _syncSourceFeedback.shutdown();
         oldSSF->join();
     }
 
@@ -534,9 +529,7 @@ StatusWith<LastVote> ReplicationCoordinatorExternalStateImpl::loadLocalLastVoteD
                                                 << "Did not find replica set lastVote document in "
                                                 << lastVoteCollectionName);
             }
-            LastVote lastVote;
-            lastVote.initialize(lastVoteObj);
-            return StatusWith<LastVote>(lastVote);
+            return LastVote::readFromLastVote(lastVoteObj);
         }
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
             txn, "load replica set lastVote", lastVoteCollectionName);
@@ -552,12 +545,29 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbWriteLock(txn->lockState(), lastVoteDatabaseName, MODE_X);
-            Helpers::putSingleton(txn, lastVoteCollectionName, lastVoteObj);
-            return Status::OK();
+
+            // If there is no last vote document, we want to store one. Otherwise, we only want to
+            // replace it if the new last vote document would have a higher term. We both check
+            // the term of the current last vote document and insert the new document under the
+            // DBLock to synchronize the two operations.
+            BSONObj result;
+            bool exists = Helpers::getSingleton(txn, lastVoteCollectionName, result);
+            if (!exists) {
+                Helpers::putSingleton(txn, lastVoteCollectionName, lastVoteObj);
+            } else {
+                StatusWith<LastVote> oldLastVoteDoc = LastVote::readFromLastVote(result);
+                if (!oldLastVoteDoc.isOK()) {
+                    return oldLastVoteDoc.getStatus();
+                }
+                if (lastVote.getTerm() > oldLastVoteDoc.getValue().getTerm()) {
+                    Helpers::putSingleton(txn, lastVoteCollectionName, lastVoteObj);
+                }
+            }
         }
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
             txn, "save replica set lastVote", lastVoteCollectionName);
-        MONGO_UNREACHABLE;
+        txn->recoveryUnit()->waitUntilDurable();
+        return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
@@ -729,18 +739,6 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
     fassertStatusOK(40107, status);
 
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        if (MONGO_FAIL_POINT(transitionToPrimaryHangBeforeInitializingConfigDatabase)) {
-            log() << "transition to primary - "
-                     "transitionToPrimaryHangBeforeInitializingConfigDatabase fail point enabled. "
-                     "Blocking until fail point is disabled.";
-            while (MONGO_FAIL_POINT(transitionToPrimaryHangBeforeInitializingConfigDatabase)) {
-                mongo::sleepsecs(1);
-                if (inShutdown()) {
-                    break;
-                }
-            }
-        }
-
         status = Grid::get(txn)->catalogManager()->initializeConfigDatabaseIfNeeded(txn);
         if (!status.isOK() && status != ErrorCodes::AlreadyInitialized) {
             if (ErrorCodes::isShutdownError(status.code())) {
@@ -773,16 +771,6 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
             }
 
             fassertStatusOK(40217, status);
-        }
-
-        // For upgrade from 3.2 to 3.4, check if any shards in config.shards are not yet marked as
-        // shard aware, and attempt to initialize sharding awareness on them.
-        auto shardAwareInitializationStatus =
-            Grid::get(txn)->catalogManager()->initializeShardingAwarenessOnUnawareShards(txn);
-        if (!shardAwareInitializationStatus.isOK()) {
-            warning() << "Error while attempting to initialize sharding awareness on sharding "
-                         "unaware shards "
-                      << causedBy(shardAwareInitializationStatus);
         }
 
         // Free any leftover locks from previous instantiations.
@@ -851,6 +839,13 @@ void ReplicationCoordinatorExternalStateImpl::updateCommittedSnapshot(SnapshotNa
     auto manager = getGlobalServiceContext()->getGlobalStorageEngine()->getSnapshotManager();
     invariant(manager);  // This should never be called if there is no SnapshotManager.
     manager->setCommittedSnapshot(newCommitPoint);
+}
+
+void ReplicationCoordinatorExternalStateImpl::createSnapshot(OperationContext* txn,
+                                                             SnapshotName name) {
+    auto manager = getGlobalServiceContext()->getGlobalStorageEngine()->getSnapshotManager();
+    invariant(manager);  // This should never be called if there is no SnapshotManager.
+    manager->createSnapshot(txn, name);
 }
 
 void ReplicationCoordinatorExternalStateImpl::forceSnapshotCreation() {
@@ -926,7 +921,7 @@ bool ReplicationCoordinatorExternalStateImpl::shouldUseDataReplicatorInitialSync
 }
 
 std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherMaxFetcherRestarts() const {
-    return oplogFetcherMaxFetcherRestarts;
+    return oplogFetcherMaxFetcherRestarts.load();
 }
 
 JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken() {

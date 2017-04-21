@@ -50,6 +50,7 @@
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/linenoise.h"
 #include "mongo/shell/shell_options.h"
@@ -85,7 +86,7 @@ using namespace mongo;
 string historyFile;
 bool gotInterrupted = false;
 bool inMultiLine = false;
-static volatile bool atPrompt = false;  // can eval before getting to prompt
+static AtomicBool atPrompt(false);  // can eval before getting to prompt
 
 namespace {
 const auto kDefaultMongoURL = "mongodb://127.0.0.1:27017"_sd;
@@ -180,7 +181,7 @@ void killOps() {
     if (mongo::shell_utils::_nokillop)
         return;
 
-    if (atPrompt)
+    if (atPrompt.load())
         return;
 
     sleepmillis(10);  // give current op a chance to finish
@@ -195,14 +196,14 @@ void quitNicely(int sig) {
 
 // the returned string is allocated with strdup() or malloc() and must be freed by calling free()
 char* shellReadline(const char* prompt, int handlesigint = 0) {
-    atPrompt = true;
+    atPrompt.store(true);
 
     char* ret = linenoise(prompt);
     if (!ret) {
         gotInterrupted = true;  // got ^C, break out of multiline
     }
 
-    atPrompt = false;
+    atPrompt.store(false);
     return ret;
 }
 
@@ -226,9 +227,17 @@ string getURIFromArgs(const std::string& url, const std::string& host, const std
 
     // If host looks like a full URI (i.e. has a slash and isn't a unix socket) and the other fields
     // are empty, then just return host.
+    std::string::size_type slashPos;
     if (url.size() == 0 && port.size() == 0 &&
-        (!hostEndsInSock && host.find("/") != string::npos)) {
-        return host;
+        (!hostEndsInSock && ((slashPos = host.find("/")) != string::npos))) {
+        if (str::startsWith(host, "mongodb://")) {
+            return host;
+        }
+        // If there's a slash in the host field, then it's the replica set name, not a database name
+        stringstream ss;
+        ss << "mongodb://" << host.substr(slashPos + 1)
+           << "/?replicaSet=" << host.substr(0, slashPos);
+        return ss.str();
     }
 
     stringstream ss;
@@ -621,7 +630,7 @@ int _main(int argc, char* argv[], char** envp) {
         }
     }
 
-    if (!mongo::serverGlobalParams.quiet)
+    if (!mongo::serverGlobalParams.quiet.load())
         cout << mongoShellVersion(VersionInfoInterface::instance()) << endl;
 
     mongo::StartupTest::runTests();
@@ -634,7 +643,7 @@ int _main(int argc, char* argv[], char** envp) {
 
     if (!shellGlobalParams.nodb) {  // connect to db
         stringstream ss;
-        if (mongo::serverGlobalParams.quiet)
+        if (mongo::serverGlobalParams.quiet.load())
             ss << "__quiet = true;";
         ss << "db = connect( \""
            << getURIFromArgs(
@@ -711,7 +720,7 @@ int _main(int argc, char* argv[], char** envp) {
 
     auto poolGuard = MakeGuard([] { ScriptEngine::dropScopeCache(); });
 
-    unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScopeForCurrentThread());
+    unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
     shellMainScope = scope.get();
 
     if (shellGlobalParams.runShell)
@@ -797,7 +806,8 @@ int _main(int argc, char* argv[], char** envp) {
             f.open(rcLocation.c_str(), false);  // Create empty .mongorc.js file
         }
 
-        if (!shellGlobalParams.nodb && !mongo::serverGlobalParams.quiet && isatty(fileno(stdin))) {
+        if (!shellGlobalParams.nodb && !mongo::serverGlobalParams.quiet.load() &&
+            isatty(fileno(stdin))) {
             scope->exec(
                 "shellHelper( 'show', 'startupWarnings' )", "(shellwarnings)", false, true, false);
 
@@ -838,7 +848,7 @@ int _main(int argc, char* argv[], char** envp) {
             }
 
             if (!linePtr || (strlen(linePtr) == 4 && strstr(linePtr, "exit"))) {
-                if (!mongo::serverGlobalParams.quiet)
+                if (!mongo::serverGlobalParams.quiet.load())
                     cout << "bye" << endl;
                 if (line)
                     free(line);

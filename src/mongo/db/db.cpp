@@ -64,12 +64,12 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/dbwebserver.h"
+#include "mongo/db/diag_log.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index_rebuilder.h"
 #include "mongo/db/initialize_server_global_state.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/json.h"
 #include "mongo/db/log_process_details.h"
@@ -157,8 +157,6 @@ using std::stringstream;
 using std::vector;
 
 using logger::LogComponent;
-
-void (*snmpInit)() = NULL;
 
 extern int diagLogging;
 
@@ -558,11 +556,7 @@ ExitCode _initAndListen(int listenPort) {
         uassert(12590, ss.str().c_str(), boost::filesystem::exists(storageGlobalParams.repairpath));
     }
 
-    // TODO:  This should go into a MONGO_INITIALIZER once we have figured out the correct
-    // dependencies.
-    if (snmpInit) {
-        snmpInit();
-    }
+    initializeSNMP();
 
     if (!storageGlobalParams.readOnly) {
         boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/");
@@ -878,7 +872,7 @@ static void startupConfigActions(const std::vector<std::string>& args) {
 }
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
-                                     ("SetGlobalEnvironment", "SSLManager"))
+                                     ("SetGlobalEnvironment", "SSLManager", "default"))
 (InitializerContext* context) {
     auto serviceContext = getGlobalServiceContext();
     repl::StorageInterface::set(serviceContext, stdx::make_unique<repl::StorageInterfaceImpl>());
@@ -890,9 +884,9 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
 
     auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorImpl>(
         getGlobalReplSettings(),
-        new repl::ReplicationCoordinatorExternalStateImpl(storageInterface),
-        executor::makeNetworkInterface("NetworkInterfaceASIO-Replication").release(),
-        new repl::TopologyCoordinatorImpl(topoCoordOptions),
+        stdx::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(storageInterface),
+        executor::makeNetworkInterface("NetworkInterfaceASIO-Replication"),
+        stdx::make_unique<repl::TopologyCoordinatorImpl>(topoCoordOptions),
         storageInterface,
         static_cast<int64_t>(curTimeMillis64()));
     repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
@@ -907,22 +901,6 @@ MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManage
     return Status::OK();
 }
 #endif
-
-#if defined(_WIN32)
-namespace mongo {
-// the hook for mongoAbort
-extern void (*reportEventToSystem)(const char* msg);
-static void reportEventToSystemImpl(const char* msg) {
-    static ::HANDLE hEventLog = RegisterEventSource(NULL, TEXT("mongod"));
-    if (hEventLog) {
-        std::wstring s = toNativeString(msg);
-        LPCTSTR txt = s.c_str();
-        BOOL ok = ReportEvent(hEventLog, EVENTLOG_ERROR_TYPE, 0, 0, NULL, 1, 0, &txt, 0);
-        wassert(ok);
-    }
-}
-}  // namespace mongo
-#endif  // if defined(_WIN32)
 
 #if !defined(__has_feature)
 #define __has_feature(x) 0
@@ -1053,13 +1031,7 @@ static int mongoDbMain(int argc, char* argv[], char** envp) {
 
     registerShutdownTask(shutdownTask);
 
-#if defined(_WIN32)
-    mongo::reportEventToSystem = &mongo::reportEventToSystemImpl;
-#endif
-
     setupSignalHandlers();
-
-    dbExecCommand = argv[0];
 
     srand(static_cast<unsigned>(curTimeMicros64()));
 

@@ -53,7 +53,7 @@ namespace mongo {
 namespace {
 
 // How often to check with the config servers whether authorization information has changed.
-std::atomic<int> userCacheInvalidationIntervalSecs(30);  // NOLINT 30 second default
+AtomicInt32 userCacheInvalidationIntervalSecs(30);  // 30 second default
 stdx::mutex invalidationIntervalMutex;
 stdx::condition_variable invalidationIntervalChangedCondition;
 Date_t lastInvalidationTime;
@@ -112,7 +112,7 @@ UserCacheInvalidator::UserCacheInvalidator(AuthorizationManager* authzManager)
     : _authzManager(authzManager) {}
 
 UserCacheInvalidator::~UserCacheInvalidator() {
-    invariant(inShutdown());
+    invariant(globalInShutdownDeprecated());
     // Wait to stop running.
     wait();
 }
@@ -153,7 +153,7 @@ void UserCacheInvalidator::run() {
         lastInvalidationTime = now;
         lock.unlock();
 
-        if (inShutdown()) {
+        if (globalInShutdownDeprecated()) {
             break;
         }
 

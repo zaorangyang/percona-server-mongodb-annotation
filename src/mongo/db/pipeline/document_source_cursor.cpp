@@ -30,10 +30,9 @@
 
 #include "mongo/db/pipeline/document_source_cursor.h"
 
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
@@ -46,14 +45,6 @@ namespace mongo {
 using boost::intrusive_ptr;
 using std::shared_ptr;
 using std::string;
-
-namespace {
-
-MONGO_EXPORT_SERVER_PARAMETER(internalDocumentSourceCursorBatchSizeBytes,
-                              int,
-                              FindCommon::kMaxBytesToReturnToClientAtOnce);
-
-}  // namespace
 
 const char* DocumentSourceCursor::getSourceName() const {
     return "$cursor";
@@ -115,7 +106,7 @@ void DocumentSourceCursor::loadBatch() {
 
             memUsageBytes += _currentBatch.back().getApproximateSize();
 
-            if (memUsageBytes > internalDocumentSourceCursorBatchSizeBytes) {
+            if (memUsageBytes > internalDocumentSourceCursorBatchSizeBytes.load()) {
                 // End this batch and prepare PlanExecutor for yielding.
                 _exec->saveState();
                 return;
@@ -222,12 +213,6 @@ Value DocumentSourceCursor::serialize(bool explain) const {
     return Value(DOC(getSourceName() << out.freezeToValue()));
 }
 
-void DocumentSourceCursor::doInjectExpressionContext() {
-    if (_limit) {
-        _limit->injectExpressionContext(pExpCtx);
-    }
-}
-
 void DocumentSourceCursor::detachFromOperationContext() {
     if (_exec) {
         _exec->detachFromOperationContext();
@@ -240,7 +225,8 @@ void DocumentSourceCursor::reattachToOperationContext(OperationContext* opCtx) {
     }
 }
 
-DocumentSourceCursor::DocumentSourceCursor(const string& ns,
+DocumentSourceCursor::DocumentSourceCursor(Collection* collection,
+                                           const string& ns,
                                            std::unique_ptr<PlanExecutor> exec,
                                            const intrusive_ptr<ExpressionContext>& pCtx)
     : DocumentSource(pCtx),
@@ -252,15 +238,18 @@ DocumentSourceCursor::DocumentSourceCursor(const string& ns,
 
     // We record execution metrics here to allow for capture of indexes used prior to execution.
     recordPlanSummaryStats();
+    if (collection) {
+        collection->infoCache()->notifyOfQuery(pCtx->opCtx, _planSummaryStats.indexesUsed);
+    }
 }
 
 intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
+    Collection* collection,
     const string& ns,
     std::unique_ptr<PlanExecutor> exec,
     const intrusive_ptr<ExpressionContext>& pExpCtx) {
     intrusive_ptr<DocumentSourceCursor> source(
-        new DocumentSourceCursor(ns, std::move(exec), pExpCtx));
-    source->injectExpressionContext(pExpCtx);
+        new DocumentSourceCursor(collection, ns, std::move(exec), pExpCtx));
     return source;
 }
 

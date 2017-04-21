@@ -47,7 +47,7 @@
     jsTestLog('Creating initial data');
 
     st.adminCommand({enablesharding: "test"});
-    st.ensurePrimaryShard('test', 'test-rs0');
+    st.ensurePrimaryShard('test', st.shard0.shardName);
     st.adminCommand({shardcollection: "test.foo", key: {i: 1, j: 1}});
 
     // Balancer is stopped by default, so no moveChunks will interfere with the splits we're testing
@@ -132,9 +132,10 @@
 
             res = checkCommandSucceeded(testDB, {
                 aggregate: 'foo',
-                pipeline: [{$project: {j: 1}}, {$group: {_id: 'j', sum: {$sum: '$j'}}}]
+                pipeline: [{$project: {j: 1}}, {$group: {_id: 'j', sum: {$sum: '$j'}}}],
+                cursor: {}
             });
-            assert.eq(4500, res.result[0].sum);
+            assert.eq(4500, res.cursor.firstBatch[0].sum);
         } else {
             print("Checking read operations, should fail");
             assert.throws(function() {
@@ -146,7 +147,8 @@
                                {mapreduce: 'foo', map: map, reduce: reduce, out: {inline: 1}});
             checkCommandFailed(testDB, {
                 aggregate: 'foo',
-                pipeline: [{$project: {j: 1}}, {$group: {_id: 'j', sum: {$sum: '$j'}}}]
+                pipeline: [{$project: {j: 1}}, {$group: {_id: 'j', sum: {$sum: '$j'}}}],
+                cursor: {}
             });
         }
     };

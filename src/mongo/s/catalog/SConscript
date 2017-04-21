@@ -2,6 +2,8 @@
 
 Import("env")
 
+env = env.Clone()
+
 env.Library(
     target='sharding_catalog_client',
     source=[
@@ -16,7 +18,6 @@ env.Library(
     target='sharding_catalog_mock',
     source=[
         'sharding_catalog_client_mock.cpp',
-        'sharding_catalog_manager_mock.cpp',
     ],
     LIBDEPS=[
         'dist_lock_manager_mock',
@@ -130,27 +131,30 @@ env.Library(
         '$BUILD_DIR/mongo/s/catalog/dist_lock_manager',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client',
         '$BUILD_DIR/mongo/s/client/sharding_client',
+        # '$BUILD_DIR/mongo/s/coreshard', # CYCLE
     ],
     LIBDEPS_TAGS=[
-        # Depends on coreshard, but that would be circular
-        'incomplete',
+        # TODO(ADAM, 2017-01-06): See `CYCLE` tags above
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )
 
 env.Library(
     target='sharding_catalog_manager_impl',
     source=[
+        'sharding_catalog_manager_chunk_operations_impl.cpp',
         'sharding_catalog_manager_impl.cpp',
+        'sharding_catalog_manager_shard_operations_impl.cpp',
+        'sharding_catalog_manager_zone_operations_impl.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/repl/read_concern_args',
         '$BUILD_DIR/mongo/executor/network_interface',
         '$BUILD_DIR/mongo/s/client/sharding_client',
-    ],
-    LIBDEPS_TAGS=[
-        # Depends on coreshard, but that would be circular
-        'incomplete',
+        '$BUILD_DIR/mongo/s/coreshard',
+        '$BUILD_DIR/mongo/db/commands/dcommands',
+
     ],
 )
 

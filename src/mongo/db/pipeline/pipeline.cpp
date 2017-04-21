@@ -165,13 +165,6 @@ void Pipeline::reattachToOperationContext(OperationContext* opCtx) {
     }
 }
 
-void Pipeline::injectExpressionContext(const intrusive_ptr<ExpressionContext>& expCtx) {
-    pCtx = expCtx;
-    for (auto&& stage : _sources) {
-        stage->injectExpressionContext(pCtx);
-    }
-}
-
 intrusive_ptr<Pipeline> Pipeline::splitForSharded() {
     // Create and initialize the shard spec we'll return. We start with an empty pipeline on the
     // shards and all work being done in the merger. Optimizations can move operations between
@@ -315,30 +308,6 @@ void Pipeline::stitch() {
         pTemp->setSource(prevSource);
         prevSource = pTemp.get();
     }
-}
-
-void Pipeline::run(BSONObjBuilder& result) {
-    // We should not get here in the explain case.
-    verify(!pCtx->isExplain);
-
-    // the array in which the aggregation results reside
-    // cant use subArrayStart() due to error handling
-    BSONArrayBuilder resultArray;
-    while (auto next = getNext()) {
-        // Add the document to the result set.
-        BSONObjBuilder documentBuilder(resultArray.subobjStart());
-        next->toBson(&documentBuilder);
-        documentBuilder.doneFast();
-        // Object will be too large, assert. The extra 1KB is for headers.
-        uassert(16389,
-                str::stream() << "aggregation result exceeds maximum document size ("
-                              << BSONObjMaxUserSize / (1024 * 1024)
-                              << "MB)",
-                resultArray.len() < BSONObjMaxUserSize - 1024);
-    }
-
-    resultArray.done();
-    result.appendArray("result", resultArray.arr());
 }
 
 boost::optional<Document> Pipeline::getNext() {

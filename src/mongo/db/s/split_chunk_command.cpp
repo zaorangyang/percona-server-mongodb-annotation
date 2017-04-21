@@ -63,8 +63,6 @@ using std::vector;
 
 namespace {
 
-const char kChunkVersion[] = "chunkVersion";
-
 const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
 
 bool checkIfSingleDoc(OperationContext* txn,
@@ -175,6 +173,9 @@ public:
              int options,
              std::string& errmsg,
              BSONObjBuilder& result) override {
+        auto shardingState = ShardingState::get(txn);
+        uassertStatusOK(shardingState->canAcceptShardedCommands());
+
         //
         // Check whether parameters passed to splitChunk are sound
         //
@@ -202,15 +203,6 @@ public:
         const BSONObj min = chunkRange.getMin();
         const BSONObj max = chunkRange.getMax();
 
-        boost::optional<ChunkVersion> expectedChunkVersion;
-        auto statusWithChunkVersion =
-            ChunkVersion::parseFromBSONWithFieldForCommands(cmdObj, kChunkVersion);
-        if (statusWithChunkVersion.isOK()) {
-            expectedChunkVersion = std::move(statusWithChunkVersion.getValue());
-        } else if (statusWithChunkVersion != ErrorCodes::NoSuchKey) {
-            uassertStatusOK(statusWithChunkVersion);
-        }
-
         vector<BSONObj> splitKeys;
         {
             BSONElement splitKeysElem;
@@ -231,24 +223,6 @@ public:
         auto parseShardNameStatus = bsonExtractStringField(cmdObj, "from", &shardName);
         if (!parseShardNameStatus.isOK())
             return appendCommandStatus(result, parseShardNameStatus);
-
-        //
-        // Get sharding state up-to-date
-        //
-        ShardingState* const shardingState = ShardingState::get(txn);
-
-        // This could be the first call that enables sharding - make sure we initialize the
-        // sharding state for this shard.
-        if (!shardingState->enabled()) {
-            if (cmdObj["configdb"].type() != String) {
-                errmsg = "sharding not enabled";
-                warning() << errmsg;
-                return false;
-            }
-
-            const string configdb = cmdObj["configdb"].String();
-            shardingState->initializeFromConfigConnString(txn, configdb, shardName);
-        }
 
         log() << "received splitChunk request: " << redact(cmdObj);
 
@@ -329,10 +303,6 @@ public:
             ChunkType chunkToMove;
             chunkToMove.setMin(min);
             chunkToMove.setMax(max);
-            if (expectedChunkVersion) {
-                chunkToMove.setVersion(*expectedChunkVersion);
-            }
-
             uassertStatusOK(collMetadata->checkChunkIsValid(chunkToMove));
         }
 

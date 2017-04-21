@@ -60,8 +60,6 @@ typedef std::map<MigrationIdentifier, Status> MigrationStatuses;
 
 /**
  * Manages and executes parallel migrations for the balancer.
- *
- * TODO: for v3.6, remove code making compatible with v3.2 shards that take distlock.
  */
 class MigrationManager {
     MONGO_DISALLOW_COPYING(MigrationManager);
@@ -139,11 +137,6 @@ public:
      */
     void drainActiveMigrations();
 
-    /**
-     * Tries to take or take over the balancer distributed lock.
-     */
-    Status tryTakeBalancerLock(OperationContext* txn, StringData whyMessage);
-
 private:
     // The current state of the migration manager
     enum class State {  // Allowed transitions:
@@ -202,14 +195,10 @@ private:
      * specified parameters. May block for distributed lock acquisition. If dist lock acquisition is
      * successful (or not done), schedules the migration request and returns a notification which
      * can be used to obtain the outcome of the operation.
-     *
-     * The 'shardTakesCollectionDistLock' parameter controls whether the distributed lock is
-     * acquired by the migration manager or by the shard executing the migration request.
      */
     std::shared_ptr<Notification<executor::RemoteCommandResponse>> _schedule(
         OperationContext* txn,
         const MigrateInfo& migrateInfo,
-        bool shardTakesCollectionDistLock,
         uint64_t maxChunkSizeBytes,
         const MigrationSecondaryThrottleOptions& secondaryThrottle,
         bool waitForDelete);
@@ -221,9 +210,9 @@ private:
      * The distributed lock is acquired before scheduling the first migration for the collection and
      * is only released when all active migrations on the collection have finished.
      */
-    void _scheduleWithDistLock_inlock(OperationContext* txn,
-                                      const HostAndPort& targetHost,
-                                      Migration migration);
+    void _schedule_inlock(OperationContext* txn,
+                          const HostAndPort& targetHost,
+                          Migration migration);
 
     /**
      * Used internally for migrations scheduled with the distributed lock acquired by the config
@@ -231,21 +220,9 @@ private:
      * passed iterator and if this is the last migration for the collection will free the collection
      * distributed lock.
      */
-    void _completeWithDistLock_inlock(OperationContext* txn,
-                                      MigrationsList::iterator itMigration,
-                                      const executor::RemoteCommandResponse& remoteCommandResponse);
-
-    /**
-     * Immediately schedules the specified migration without attempting to acquire the collection
-     * distributed lock or checking that it is not being held.
-     *
-     * This method is only used for retrying migrations that have failed with LockBusy errors
-     * returned by the shard, which only happens with legacy 3.2 shards that take the collection
-     * distributed lock themselves.
-     */
-    void _scheduleWithoutDistLock_inlock(OperationContext* txn,
-                                         const HostAndPort& targetHost,
-                                         Migration migration);
+    void _complete_inlock(OperationContext* txn,
+                          MigrationsList::iterator itMigration,
+                          const executor::RemoteCommandResponse& remoteCommandResponse);
 
     /**
      * If the state of the migration manager is kStopping, checks whether there are any outstanding
@@ -306,11 +283,7 @@ private:
 
     // Holds information about each collection's distributed lock and active migrations via a
     // CollectionMigrationState object.
-    CollectionMigrationsStateMap _activeMigrationsWithDistLock;
-
-    // Holds information about migrations, which have been scheduled without the collection
-    // distributed lock acquired (i.e., the shard is asked to acquire it).
-    MigrationsList _activeMigrationsWithoutDistLock;
+    CollectionMigrationsStateMap _activeMigrations;
 };
 
 }  // namespace mongo

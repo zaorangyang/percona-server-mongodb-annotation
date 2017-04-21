@@ -45,7 +45,7 @@
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/dbtests/dbtests.h"
@@ -110,8 +110,8 @@ TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoadingWhileSpilled) {
     VariablesParseState vps(&idGen);
     AccumulationStatement pushStatement{"spaceHog",
                                         AccumulationStatement::getFactory("$push"),
-                                        ExpressionFieldPath::parse("$largeStr", vps)};
-    auto groupByExpression = ExpressionFieldPath::parse("$_id", vps);
+                                        ExpressionFieldPath::parse(expCtx, "$largeStr", vps)};
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$_id", vps);
     auto group = DocumentSourceGroup::create(
         expCtx, groupByExpression, {pushStatement}, idGen.getIdCount(), maxMemoryUsageBytes);
 
@@ -150,8 +150,8 @@ TEST_F(DocumentSourceGroupTest, ShouldErrorIfNotAllowedToSpillToDiskAndResultSet
     VariablesParseState vps(&idGen);
     AccumulationStatement pushStatement{"spaceHog",
                                         AccumulationStatement::getFactory("$push"),
-                                        ExpressionFieldPath::parse("$largeStr", vps)};
-    auto groupByExpression = ExpressionFieldPath::parse("$_id", vps);
+                                        ExpressionFieldPath::parse(expCtx, "$largeStr", vps)};
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$_id", vps);
     auto group = DocumentSourceGroup::create(
         expCtx, groupByExpression, {pushStatement}, idGen.getIdCount(), maxMemoryUsageBytes);
 
@@ -173,8 +173,8 @@ TEST_F(DocumentSourceGroupTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     VariablesParseState vps(&idGen);
     AccumulationStatement pushStatement{"spaceHog",
                                         AccumulationStatement::getFactory("$push"),
-                                        ExpressionFieldPath::parse("$largeStr", vps)};
-    auto groupByExpression = ExpressionFieldPath::parse("$_id", vps);
+                                        ExpressionFieldPath::parse(expCtx, "$largeStr", vps)};
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$_id", vps);
     auto group = DocumentSourceGroup::create(
         expCtx, groupByExpression, {pushStatement}, idGen.getIdCount(), maxMemoryUsageBytes);
 
@@ -204,7 +204,8 @@ public:
     Base()
         : _queryServiceContext(stdx::make_unique<QueryTestServiceContext>()),
           _opCtx(_queryServiceContext->makeOperationContext()),
-          _ctx(new ExpressionContext(_opCtx.get(), AggregationRequest(NamespaceString(ns), {}))),
+          _ctx(new ExpressionContextForTest(_opCtx.get(),
+                                            AggregationRequest(NamespaceString(ns), {}))),
           _tempDir("DocumentSourceGroupTest") {}
 
 protected:
@@ -212,15 +213,14 @@ protected:
         BSONObj namedSpec = BSON("$group" << spec);
         BSONElement specElement = namedSpec.firstElement();
 
-        intrusive_ptr<ExpressionContext> expressionContext =
-            new ExpressionContext(_opCtx.get(), AggregationRequest(NamespaceString(ns), {}));
+        intrusive_ptr<ExpressionContextForTest> expressionContext =
+            new ExpressionContextForTest(_opCtx.get(), AggregationRequest(NamespaceString(ns), {}));
         expressionContext->inShard = inShard;
         expressionContext->inRouter = inRouter;
         // Won't spill to disk properly if it needs to.
         expressionContext->tempDir = _tempDir.path();
 
         _group = DocumentSourceGroup::createFromBson(specElement, expressionContext);
-        _group->injectExpressionContext(expressionContext);
         assertRoundTrips(_group);
     }
     DocumentSourceGroup* group() {
@@ -234,7 +234,7 @@ protected:
         ASSERT(source->getNext().isEOF());
     }
 
-    intrusive_ptr<ExpressionContext> ctx() const {
+    intrusive_ptr<ExpressionContextForTest> ctx() const {
         return _ctx;
     }
 
@@ -251,7 +251,7 @@ private:
     }
     std::unique_ptr<QueryTestServiceContext> _queryServiceContext;
     ServiceContext::UniqueOperationContext _opCtx;
-    intrusive_ptr<ExpressionContext> _ctx;
+    intrusive_ptr<ExpressionContextForTest> _ctx;
     intrusive_ptr<DocumentSource> _group;
     TempDir _tempDir;
 };
@@ -683,21 +683,21 @@ class GroupNullUndefinedIds : public CheckResultsBase {
 class ComplexId : public CheckResultsBase {
     deque<DocumentSource::GetNextResult> inputData() {
         return {DOC("a"
-                    << "de"
+                    << "de"_sd
                     << "b"
-                    << "ad"
+                    << "ad"_sd
                     << "c"
-                    << "beef"
+                    << "beef"_sd
                     << "d"
-                    << ""),
+                    << ""_sd),
                 DOC("a"
-                    << "d"
+                    << "d"_sd
                     << "b"
-                    << "eadbe"
+                    << "eadbe"_sd
                     << "c"
-                    << ""
+                    << ""_sd
                     << "d"
-                    << "ef")};
+                    << "ef"_sd)};
     }
     virtual BSONObj groupSpec() {
         return BSON("_id" << BSON("$concat" << BSON_ARRAY("$a"
@@ -932,7 +932,7 @@ public:
         ASSERT_TRUE(res.isAdvanced());
         ASSERT_VALUE_EQ(res.getDocument().getField("_id")["sub"]["x"], Value(5));
         ASSERT_VALUE_EQ(res.getDocument().getField("_id")["sub"]["y"], Value(1));
-        ASSERT_VALUE_EQ(res.getDocument().getField("_id")["sub"]["z"], Value("c"));
+        ASSERT_VALUE_EQ(res.getDocument().getField("_id")["sub"]["z"], Value("c"_sd));
 
         ASSERT_TRUE(group()->isStreaming());
 

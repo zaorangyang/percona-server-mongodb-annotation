@@ -45,7 +45,7 @@ class BSONObjBuilder;
 class CollatorInterface;
 class DocumentSource;
 class OperationContext;
-struct ExpressionContext;
+class ExpressionContext;
 
 /**
  * A Pipeline object represents a list of DocumentSources and is responsible for optimizing the
@@ -129,12 +129,6 @@ public:
     void optimizePipeline();
 
     /**
-     * Propagates a reference to the ExpressionContext to all of the pipeline's contained stages and
-     * expressions.
-     */
-    void injectExpressionContext(const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    /**
      * Returns any other collections involved in the pipeline in addition to the collection the
      * aggregation is run on.
      */
@@ -144,13 +138,6 @@ public:
      * Serializes the pipeline into a form that can be parsed into an equivalent pipeline.
      */
     std::vector<Value> serialize() const;
-
-    /**
-      Run the Pipeline on the given source.
-
-      @param result builder to write the result to
-    */
-    void run(BSONObjBuilder& result);
 
     /// The initial source is special since it varies between mongos and mongod.
     void addInitialSource(boost::intrusive_ptr<DocumentSource> source);

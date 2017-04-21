@@ -54,6 +54,10 @@ using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
+ReplicationExecutor* ReplCoordTest::getReplExec() {
+    return _repl->getExecutor();
+}
+
 ReplicaSetConfig ReplCoordTest::assertMakeRSConfig(const BSONObj& configBson) {
     ReplicaSetConfig config;
     ASSERT_OK(config.initialize(configBson));
@@ -117,18 +121,18 @@ void ReplCoordTest::init() {
     const int64_t seed = 0;
 
     TopologyCoordinatorImpl::Options settings;
-    _topo = new TopologyCoordinatorImpl(settings);
-    stdx::function<bool()> _durablityLambda = [this]() -> bool { return _isStorageEngineDurable; };
-    _net = new NetworkInterfaceMock;
-    _replExec = stdx::make_unique<ReplicationExecutor>(_net, seed);
-    _externalState = new ReplicationCoordinatorExternalStateMock;
-    _repl.reset(new ReplicationCoordinatorImpl(_settings,
-                                               _externalState,
-                                               _topo,
-                                               storageInterface,
-                                               _replExec.get(),
-                                               seed,
-                                               &_durablityLambda));
+    auto topo = stdx::make_unique<TopologyCoordinatorImpl>(settings);
+    _topo = topo.get();
+    auto net = stdx::make_unique<NetworkInterfaceMock>();
+    _net = net.get();
+    auto externalState = stdx::make_unique<ReplicationCoordinatorExternalStateMock>();
+    _externalState = externalState.get();
+    _repl = stdx::make_unique<ReplicationCoordinatorImpl>(_settings,
+                                                          std::move(externalState),
+                                                          std::move(net),
+                                                          std::move(topo),
+                                                          storageInterface,
+                                                          seed);
     auto service = getGlobalServiceContext();
     service->setFastClockSource(stdx::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
     service->setPreciseClockSource(

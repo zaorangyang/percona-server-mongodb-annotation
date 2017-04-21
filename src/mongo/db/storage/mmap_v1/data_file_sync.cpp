@@ -34,7 +34,7 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/diag_log.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/mmap_v1/dur_journal.h"
 #include "mongo/db/storage/mmap_v1/mmap.h"
@@ -64,7 +64,7 @@ void DataFileSync::run() {
         LOG(1) << "--syncdelay " << storageGlobalParams.syncdelay.load() << endl;
     }
     int time_flushing = 0;
-    while (!inShutdown()) {
+    while (!globalInShutdownDeprecated()) {
         _diaglog.flush();
         if (storageGlobalParams.syncdelay == 0) {
             // in case at some point we add an option to change at runtime
@@ -75,7 +75,7 @@ void DataFileSync::run() {
         sleepmillis(
             (long long)std::max(0.0, (storageGlobalParams.syncdelay * 1000) - time_flushing));
 
-        if (inShutdown()) {
+        if (globalInShutdownDeprecated()) {
             // occasional issue trying to flush during shutdown when sleep interrupted
             break;
         }

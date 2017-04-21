@@ -67,10 +67,12 @@ struct __wt_named_snapshot {
 	uint32_t snapshot_count;
 };
 
-struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_txn_state {
+struct __wt_txn_state {
+	WT_CACHE_LINE_PAD_BEGIN
 	volatile uint64_t id;
 	volatile uint64_t pinned_id;
 	volatile uint64_t metadata_pinned;
+	WT_CACHE_LINE_PAD_END
 };
 
 struct __wt_txn_global {
@@ -90,7 +92,7 @@ struct __wt_txn_global {
 	 * Prevents the oldest ID moving forwards while threads are scanning
 	 * the global transaction state.
 	 */
-	WT_RWLOCK *scan_rwlock;
+	WT_RWLOCK scan_rwlock;
 
 	/*
 	 * Track information about the running checkpoint. The transaction
@@ -112,7 +114,7 @@ struct __wt_txn_global {
 	volatile uint64_t metadata_pinned;	/* Oldest ID for metadata */
 
 	/* Named snapshot state. */
-	WT_RWLOCK *nsnap_rwlock;
+	WT_RWLOCK nsnap_rwlock;
 	volatile uint64_t nsnap_oldest_id;
 	TAILQ_HEAD(__wt_nsnap_qh, __wt_named_snapshot) nsnaph;
 

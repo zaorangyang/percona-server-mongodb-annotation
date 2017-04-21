@@ -310,7 +310,11 @@ struct __wt_connection_stats {
 	int64_t cache_eviction_slow;
 	int64_t cache_eviction_state;
 	int64_t cache_eviction_walks_abandoned;
+	int64_t cache_eviction_active_workers;
+	int64_t cache_eviction_worker_created;
 	int64_t cache_eviction_worker_evicting;
+	int64_t cache_eviction_worker_removed;
+	int64_t cache_eviction_stable_state_workers;
 	int64_t cache_eviction_force_fail;
 	int64_t cache_eviction_walks_active;
 	int64_t cache_eviction_walks_started;
@@ -445,6 +449,9 @@ struct __wt_connection_stats {
 	int64_t rec_split_stashed_objects;
 	int64_t session_cursor_open;
 	int64_t session_open;
+	int64_t session_table_alter_fail;
+	int64_t session_table_alter_success;
+	int64_t session_table_alter_skip;
 	int64_t session_table_compact_fail;
 	int64_t session_table_compact_success;
 	int64_t session_table_create_fail;
@@ -561,6 +568,7 @@ struct __wt_dsrc_stats {
 	int64_t cache_pages_requested;
 	int64_t cache_write;
 	int64_t cache_write_restore;
+	int64_t cache_bytes_dirty;
 	int64_t cache_eviction_clean;
 	int64_t cache_state_gen_avg_gap;
 	int64_t cache_state_avg_written_size;
