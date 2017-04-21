@@ -146,6 +146,13 @@ Status addMongodOptions(moe::OptionSection* options) {
                            "value of slow for profile and console log")
         .setDefault(moe::Value(100));
 
+    general_options
+        .addOptionChaining("operationProfiling.slowOpSampleRate",
+                           "slowOpSampleRate",
+                           moe::Double,
+                           "fraction of slow ops to include in the profile and console log")
+        .setDefault(moe::Value(1.0));
+
     general_options.addOptionChaining("profile", "profile", moe::Int, "0=off 1=slow, 2=all")
         .setSources(moe::SourceAllLegacy);
 
@@ -1058,6 +1065,10 @@ Status storeMongodOptions(const moe::Environment& params) {
         int rateLimit = params["operationProfiling.rateLimit"].as<int>();
         rateLimit = std::max(1, rateLimit);
         serverGlobalParams.rateLimit = rateLimit;
+    }
+
+    if (params.count("operationProfiling.slowOpSampleRate")) {
+        serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
     }
 
     if (params.count("storage.syncPeriodSecs")) {

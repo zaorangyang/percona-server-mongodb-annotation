@@ -538,17 +538,16 @@ Status Balancer::_enforceTagRanges(OperationContext* txn) {
             return scopedCMStatus.getStatus();
         }
 
-        auto scopedCM = std::move(scopedCMStatus.getValue());
-        ChunkManager* const cm = scopedCM.cm();
+        const auto& scopedCM = scopedCMStatus.getValue();
 
-        auto splitStatus = shardutil::splitChunkAtMultiplePoints(txn,
-                                                                 splitInfo.shardId,
-                                                                 splitInfo.nss,
-                                                                 cm->getShardKeyPattern(),
-                                                                 splitInfo.collectionVersion,
-                                                                 splitInfo.minKey,
-                                                                 splitInfo.maxKey,
-                                                                 splitInfo.splitKeys);
+        auto splitStatus =
+            shardutil::splitChunkAtMultiplePoints(txn,
+                                                  splitInfo.shardId,
+                                                  splitInfo.nss,
+                                                  scopedCM.cm()->getShardKeyPattern(),
+                                                  splitInfo.collectionVersion,
+                                                  ChunkRange(splitInfo.minKey, splitInfo.maxKey),
+                                                  splitInfo.splitKeys);
         if (!splitStatus.isOK()) {
             warning() << "Failed to enforce tag range for chunk " << redact(splitInfo.toString())
                       << causedBy(redact(splitStatus.getStatus()));
@@ -613,14 +612,32 @@ int Balancer::_moveChunks(OperationContext* txn,
 void Balancer::_splitOrMarkJumbo(OperationContext* txn,
                                  const NamespaceString& nss,
                                  const BSONObj& minKey) {
-    auto scopedChunkManager = uassertStatusOK(ScopedChunkManager::refreshAndGet(txn, nss));
-    ChunkManager* const chunkManager = scopedChunkManager.cm();
+    auto scopedCM = uassertStatusOK(ScopedChunkManager::refreshAndGet(txn, nss));
+    const auto cm = scopedCM.cm().get();
 
-    auto chunk = chunkManager->findIntersectingChunkWithSimpleCollation(txn, minKey);
+    auto chunk = cm->findIntersectingChunkWithSimpleCollation(txn, minKey);
 
-    auto splitStatus = chunk->split(txn, Chunk::normal, nullptr);
-    if (!splitStatus.isOK()) {
-        log() << "Marking chunk " << chunk->toString() << " as jumbo.";
+    try {
+        const auto splitPoints = uassertStatusOK(shardutil::selectChunkSplitPoints(
+            txn,
+            chunk->getShardId(),
+            nss,
+            cm->getShardKeyPattern(),
+            ChunkRange(chunk->getMin(), chunk->getMax()),
+            Grid::get(txn)->getBalancerConfiguration()->getMaxChunkSizeBytes(),
+            boost::none));
+
+        uassert(ErrorCodes::CannotSplit, "No split points found", !splitPoints.empty());
+
+        uassertStatusOK(
+            shardutil::splitChunkAtMultiplePoints(txn,
+                                                  chunk->getShardId(),
+                                                  nss,
+                                                  cm->getShardKeyPattern(),
+                                                  cm->getVersion(),
+                                                  ChunkRange(chunk->getMin(), chunk->getMax()),
+                                                  splitPoints));
+    } catch (const DBException& ex) {
         chunk->markAsJumbo(txn);
     }
 }

@@ -120,7 +120,8 @@ bool cursorCommandPassthrough(OperationContext* txn,
     }
 
     StatusWith<BSONObj> transformedResponse =
-        storePossibleCursor(HostAndPort(cursor->originalHost()),
+        storePossibleCursor(txn,
+                            HostAndPort(cursor->originalHost()),
                             response,
                             nss,
                             Grid::get(txn)->getExecutorPool()->getArbitraryExecutor(),
@@ -1012,7 +1013,7 @@ public:
 
         // Note that this implementation will not handle targeting retries and fails when the
         // sharding metadata is too stale
-        auto status = Grid::get(txn)->catalogCache()->getDatabase(txn, nss.db().toString());
+        auto status = Grid::get(txn)->catalogCache()->getDatabase(txn, nss.db());
         if (!status.isOK()) {
             return Status(status.getStatus().code(),
                           str::stream() << "Passthrough command failed: " << command.toString()

@@ -192,7 +192,7 @@ Status ConfigServerTestFixture::insertToConfigCollection(OperationContext* txn,
                                              kReadPref,
                                              ns.db().toString(),
                                              request.toBSON(),
-                                             Shard::kDefaultConfigCommandTimeout,
+                                             Shard::kDefaultCommandTimeout,
                                              Shard::RetryPolicy::kNoRetry);
 
     BatchedCommandResponse batchResponse;
@@ -206,7 +206,7 @@ StatusWith<BSONObj> ConfigServerTestFixture::findOneOnConfigCollection(Operation
     auto config = getConfigShard();
     invariant(config);
 
-    auto findStatus = config->exhaustiveFindOnConfig(
+    auto findStatus = config->exhaustiveFind(
         txn, kReadPref, repl::ReadConcernLevel::kMajorityReadConcern, ns, filter, BSONObj(), 1);
     if (!findStatus.isOK()) {
         return findStatus.getStatus();
@@ -251,7 +251,8 @@ StatusWith<ShardType> ConfigServerTestFixture::getShardDoc(OperationContext* txn
 Status ConfigServerTestFixture::setupChunks(const std::vector<ChunkType>& chunks) {
     const NamespaceString chunkNS(ChunkType::ConfigNS);
     for (const auto& chunk : chunks) {
-        auto insertStatus = insertToConfigCollection(operationContext(), chunkNS, chunk.toBSON());
+        auto insertStatus =
+            insertToConfigCollection(operationContext(), chunkNS, chunk.toConfigBSON());
         if (!insertStatus.isOK())
             return insertStatus;
     }
@@ -266,7 +267,7 @@ StatusWith<ChunkType> ConfigServerTestFixture::getChunkDoc(OperationContext* txn
     if (!doc.isOK())
         return doc.getStatus();
 
-    return ChunkType::fromBSON(doc.getValue());
+    return ChunkType::fromConfigBSON(doc.getValue());
 }
 
 StatusWith<std::vector<BSONObj>> ConfigServerTestFixture::getIndexes(OperationContext* txn,
@@ -277,7 +278,7 @@ StatusWith<std::vector<BSONObj>> ConfigServerTestFixture::getIndexes(OperationCo
                                             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                             ns.db().toString(),
                                             BSON("listIndexes" << ns.coll().toString()),
-                                            Shard::kDefaultConfigCommandTimeout,
+                                            Shard::kDefaultCommandTimeout,
                                             Shard::RetryPolicy::kIdempotent);
     if (!response.isOK()) {
         return response.getStatus();

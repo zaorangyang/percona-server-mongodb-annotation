@@ -194,6 +194,19 @@ TEST(ExtractAllElementsAlongPath, NestedObjectWithEmptyArrayValue) {
         obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
 
     assertBSONElementSetsAreEqual(std::vector<BSONObj>{}, actualElements);
+    assertArrayComponentsAreEqual(std::set<size_t>{1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, NestedObjectWithEmptyArrayValueAndExpandParamIsFalse) {
+    BSONObj obj(fromjson("{a: {b: []}}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = false;
+    std::set<size_t> actualArrayComponents;
+    dps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << BSONArray())}, actualElements);
     assertArrayComponentsAreEqual(std::set<size_t>{}, actualArrayComponents);
 }
 
@@ -207,6 +220,19 @@ TEST(ExtractAllElementsAlongPath, NestedObjectWithSingletonArrayValue) {
         obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
 
     assertBSONElementSetsAreEqual({BSON("" << 1)}, actualElements);
+    assertArrayComponentsAreEqual(std::set<size_t>{1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, NestedObjectWithSingletonArrayValueAndExpandParamIsFalse) {
+    BSONObj obj(fromjson("{a: {b: {c: [3]}}}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = false;
+    std::set<size_t> actualArrayComponents;
+    dps::extractAllElementsAlongPath(
+        obj, "a.b.c", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << BSON_ARRAY(3))}, actualElements);
     assertArrayComponentsAreEqual(std::set<size_t>{}, actualArrayComponents);
 }
 
@@ -477,6 +503,107 @@ TEST(ExtractAllElementsAlongPath, DoesExpandArrayFoundAfterPositionalSpecificati
                                         << "(1, 1)")},
                                   actualElements);
     assertArrayComponentsAreEqual({1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, PositionalElementsNotConsideredArrayComponents) {
+    BSONObj obj(fromjson("{a: [{b: [1, 2]}]}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    std::set<size_t> actualArrayComponents;
+    dps::extractAllElementsAlongPath(
+        obj, "a.0.b.1", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 2)}, actualElements);
+    assertArrayComponentsAreEqual(std::set<size_t>{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, TrailingArrayIsExpandedEvenIfPositional) {
+    BSONObj obj(fromjson("{a: {b: [0, [1, 2]]}}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    std::set<size_t> actualArrayComponents;
+    dps::extractAllElementsAlongPath(
+        obj, "a.b.1", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 1), BSON("" << 2)}, actualElements);
+    assertArrayComponentsAreEqual({2U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, PositionalTrailingArrayNotExpandedIfExpandParameterIsFalse) {
+    BSONObj obj(fromjson("{a: {b: [0, [1, 2]]}}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = false;
+    std::set<size_t> actualArrayComponents;
+    dps::extractAllElementsAlongPath(
+        obj, "a.b.1", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << BSON_ARRAY(1 << 2))}, actualElements);
+    assertArrayComponentsAreEqual(std::set<size_t>{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, MidPathEmptyArrayIsConsideredAnArrayComponent) {
+    BSONObj obj(fromjson("{a: [{b: []}]}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    std::set<size_t> actualArrayComponents;
+    dps::extractAllElementsAlongPath(
+        obj, "a.b.c", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual(std::vector<BSONObj>{}, actualElements);
+    assertArrayComponentsAreEqual({0U, 1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, MidPathSingletonArrayIsConsideredAnArrayComponent) {
+    BSONObj obj(fromjson("{a: {b: [{c: 3}]}}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    std::set<size_t> actualArrayComponents;
+    dps::extractAllElementsAlongPath(
+        obj, "a.b.c", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 3)}, actualElements);
+    assertArrayComponentsAreEqual({1U}, actualArrayComponents);
+}
+
+TEST(ExtractElementAtPathOrArrayAlongPath, ReturnsArrayEltWithEmptyPathWhenArrayIsAtEndOfPath) {
+    BSONObj obj(fromjson("{a: {b: {c: [1, 2, 3]}}}"));
+    StringData path("a.b.c");
+    const char* pathData = path.rawData();
+    auto resultElt = dps::extractElementAtPathOrArrayAlongPath(obj, pathData);
+    ASSERT_BSONELT_EQ(resultElt, fromjson("{c: [1, 2, 3]}").firstElement());
+    ASSERT(StringData(pathData).empty());
+}
+
+TEST(ExtractElementAtPathOrArrayAlongPath, ReturnsArrayEltWithNonEmptyPathForArrayInMiddleOfPath) {
+    BSONObj obj(fromjson("{a: {b: [{c: 1}, {c: 2}]}}"));
+    StringData path("a.b.c");
+    const char* pathData = path.rawData();
+    auto resultElt = dps::extractElementAtPathOrArrayAlongPath(obj, pathData);
+    ASSERT_BSONELT_EQ(resultElt, fromjson("{b: [{c: 1}, {c: 2}]}").firstElement());
+    ASSERT_EQ(StringData(pathData), StringData("c"));
+}
+
+TEST(ExtractElementAtPathOrArrayAlongPath, NumericalPathElementNotTreatedAsArrayIndex) {
+    BSONObj obj(fromjson("{a: [{'0': 'foo'}]}"));
+    StringData path("a.0");
+    const char* pathData = path.rawData();
+    auto resultElt = dps::extractElementAtPathOrArrayAlongPath(obj, pathData);
+    ASSERT_BSONELT_EQ(resultElt, obj.firstElement());
+    ASSERT_EQ(StringData(pathData), StringData("0"));
+}
+
+TEST(ExtractElementAtPathOrArrayAlongPath, NumericalPathElementTreatedAsFieldNameForNestedObject) {
+    BSONObj obj(fromjson("{a: {'0': 'foo'}}"));
+    StringData path("a.0");
+    const char* pathData = path.rawData();
+    auto resultElt = dps::extractElementAtPathOrArrayAlongPath(obj, pathData);
+    ASSERT_BSONELT_EQ(resultElt, fromjson("{'0': 'foo'}").firstElement());
+    ASSERT(StringData(pathData).empty());
 }
 
 }  // namespace
