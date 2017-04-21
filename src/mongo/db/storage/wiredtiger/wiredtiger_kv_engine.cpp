@@ -211,7 +211,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     ss << wiredTigerGlobalOptions.journalCompressor << "),";
     ss << "file_manager=(close_idle_time=100000),";  //~28 hours, will put better fix in 3.1.x
     ss << "checkpoint=(wait=" << wiredTigerGlobalOptions.checkpointDelaySecs;
-    ss << ",log_size=2GB),";
+    ss << ",log_size=" << wiredTigerGlobalOptions.checkpointSizeMB << "MB),";
     ss << "statistics_log=(wait=" << wiredTigerGlobalOptions.statisticsLogDelaySecs << "),";
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())->getOpenConfig("system");
     ss << extraOpenOptions;

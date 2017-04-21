@@ -57,6 +57,15 @@ Status WiredTigerGlobalOptions::add(moe::OptionSection* options) {
                           "0 means do not log statistics")
         .validRange(0, 100000)
         .setDefault(moe::Value(0));
+    wiredTigerOptions
+        .addOptionChaining("storage.wiredTiger.engineConfig.checkpointSizeMB",
+                           "wiredTigerCheckpointSizeMB",
+                           moe::Int,
+                           "wait for this amount of data to be written to the database "
+                           "between each checkpoint; valid values are between 32 and 2048; "
+                           "defaults to 2048 (2GB)")
+        .validRange(32, 2048)
+        .setDefault(moe::Value(2048));
     wiredTigerOptions.addOptionChaining("storage.wiredTiger.engineConfig.journalCompressor",
                                         "wiredTigerJournalCompressor",
                                         moe::String,
@@ -108,6 +117,10 @@ Status WiredTigerGlobalOptions::store(const moe::Environment& params,
     if (params.count("storage.wiredTiger.engineConfig.cacheSizeGB")) {
         wiredTigerGlobalOptions.cacheSizeGB =
             params["storage.wiredTiger.engineConfig.cacheSizeGB"].as<int>();
+    }
+    if (params.count("storage.wiredTiger.engineConfig.checkpointSizeMB")) {
+        wiredTigerGlobalOptions.checkpointSizeMB =
+            params["storage.wiredTiger.engineConfig.checkpointSizeMB"].as<int>();
     }
     if (params.count("storage.syncPeriodSecs")) {
         wiredTigerGlobalOptions.checkpointDelaySecs =
