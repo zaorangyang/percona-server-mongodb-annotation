@@ -39,7 +39,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/optime_with.h"
-#include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
@@ -134,8 +134,10 @@ public:
                  OpTimeWithHash lastFetched,
                  HostAndPort source,
                  NamespaceString nss,
-                 ReplicaSetConfig config,
+                 ReplSetConfig config,
                  std::size_t maxFetcherRestarts,
+                 int requiredRBID,
+                 bool requireFresherSyncSource,
                  DataReplicatorExternalState* dataReplicatorExternalState,
                  EnqueueDocumentsFn enqueueDocumentsFn,
                  OnShutdownCallbackFn onShutdownCallbackFn);
@@ -235,7 +237,7 @@ private:
     /**
      * Creates a new instance of the fetcher to tail the remote oplog starting at the given optime.
      */
-    std::unique_ptr<Fetcher> _makeFetcher(OpTime lastFetchedOpTime);
+    std::unique_ptr<Fetcher> _makeFetcher(long long currentTerm, OpTime lastFetchedOpTime);
 
     /**
      * Returns whether the oplog fetcher is in shutdown.
@@ -255,6 +257,15 @@ private:
 
     // Maximum number of times to consecutively restart the fetcher on non-cancellation errors.
     const std::size_t _maxFetcherRestarts;
+
+    // Rollback ID that the sync source is required to have after the first batch.
+    int _requiredRBID;
+
+    // A boolean indicating whether we should error if the sync source is not ahead of our initial
+    // last fetched OpTime on the first batch. Most of the time this should be set to true,
+    // but there are certain special cases, namely during initial sync, where it's acceptable for
+    // our sync source to have no ops newer than _lastFetched.
+    bool _requireFresherSyncSource;
 
     DataReplicatorExternalState* const _dataReplicatorExternalState;
     const EnqueueDocumentsFn _enqueueDocumentsFn;

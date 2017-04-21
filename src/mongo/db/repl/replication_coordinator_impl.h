@@ -35,11 +35,11 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/repl/data_replicator.h"
+#include "mongo/db/repl/initial_syncer.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/old_update_position_args.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/replication_executor.h"
@@ -65,6 +65,7 @@ struct ConnectionPoolStats;
 }  // namespace executor
 
 namespace rpc {
+class OplogQueryMetadata;
 class ReplSetMetadata;
 }  // namespace rpc
 
@@ -78,7 +79,7 @@ class HeartbeatResponseAction;
 class LastVote;
 class OplogReader;
 class ReplSetRequestVotesArgs;
-class ReplicaSetConfig;
+class ReplSetConfig;
 class SyncSourceFeedback;
 class StorageInterface;
 class TopologyCoordinator;
@@ -180,11 +181,10 @@ public:
 
     virtual bool setFollowerMode(const MemberState& newState) override;
 
-    virtual bool isWaitingForApplierToDrain() override;
+    virtual ApplierState getApplierState() override;
 
-    virtual bool isCatchingUp() override;
-
-    virtual void signalDrainComplete(OperationContext* txn) override;
+    virtual void signalDrainComplete(OperationContext* txn,
+                                     long long termWhenBufferIsEmpty) override;
 
     virtual Status waitForDrainFinish(Milliseconds timeout) override;
 
@@ -202,12 +202,13 @@ public:
 
     virtual void appendSlaveInfoData(BSONObjBuilder* result) override;
 
-    virtual ReplicaSetConfig getConfig() const override;
+    virtual ReplSetConfig getConfig() const override;
 
     virtual void processReplSetGetConfig(BSONObjBuilder* result) override;
 
-    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata,
-                                        bool advanceCommitPoint) override;
+    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
+
+    virtual void advanceCommitPoint(const OpTime& committedOpTime) override;
 
     virtual void cancelAndRescheduleElectionTimeout() override;
 
@@ -268,8 +269,10 @@ public:
 
     virtual void resetLastOpTimesFromOplog(OperationContext* txn) override;
 
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
-                                        const rpc::ReplSetMetadata& metadata) override;
+    virtual bool shouldChangeSyncSource(
+        const HostAndPort& currentSource,
+        const rpc::ReplSetMetadata& replMetadata,
+        boost::optional<rpc::OplogQueryMetadata> oqMetadata) override;
 
     virtual OpTime getLastCommittedOpTime() const override;
 
@@ -277,7 +280,8 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response) override;
 
-    virtual void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+    virtual void prepareReplMetadata(const BSONObj& metadataRequestObj,
+                                     const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const override;
 
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
@@ -333,7 +337,7 @@ public:
     /**
      * Gets the replica set configuration in use by the node.
      */
-    ReplicaSetConfig getReplicaSetConfig_forTest();
+    ReplSetConfig getReplicaSetConfig_forTest();
 
     /**
      * Returns scheduled time of election timeout callback.
@@ -341,11 +345,17 @@ public:
      */
     Date_t getElectionTimeout_forTest() const;
 
-    /**
-     * Returns scheduled time of priority takeover callback.
-     * Returns Date_t() if callback is not scheduled.
+    /*
+     * Return a randomized offset amount that is scaled in proportion to the size of the
+     * _electionTimeoutPeriod.
      */
-    Date_t getPriorityTakeover_forTest() const;
+    Milliseconds getRandomizedElectionOffset_forTest();
+
+    /**
+     * Returns the scheduled time of the priority takeover callback. If a priority
+     * takeover has not been scheduled, returns boost::none.
+     */
+    boost::optional<Date_t> getPriorityTakeover_forTest() const;
 
     /**
      * Simple wrappers around _setLastOptime_inlock to make it easier to test.
@@ -571,6 +581,11 @@ private:
     bool getWriteConcernMajorityShouldJournal_inlock() const;
 
     /**
+     * Returns the OpTime of the current committed snapshot, if one exists.
+     */
+    OpTime _getCurrentCommittedSnapshotOpTime_inlock() const;
+
+    /**
      * Helper method that removes entries from _slaveInfo if they correspond to a node
      * with a member ID that is not in the current replica set config.  Will always leave an
      * entry for ourself at the beginning of _slaveInfo, even if we aren't present in the
@@ -586,15 +601,14 @@ private:
      * Returns an action to be performed after unlocking _mutex, via
      * _performPostMemberStateUpdateAction.
      */
-    PostMemberStateUpdateAction _setCurrentRSConfig_inlock(const ReplicaSetConfig& newConfig,
+    PostMemberStateUpdateAction _setCurrentRSConfig_inlock(const ReplSetConfig& newConfig,
                                                            int myIndex);
 
     /**
      * Updates the last committed OpTime to be "committedOpTime" if it is more recent than the
      * current last committed OpTime.
      */
-    void _setLastCommittedOpTime(const OpTime& committedOpTime);
-    void _setLastCommittedOpTime_inlock(const OpTime& committedOpTime);
+    void _advanceCommitPoint_inlock(const OpTime& committedOpTime);
 
     /**
      * Helper to wake waiters in _replicationWaiterList that are doneWaitingForReplication.
@@ -640,7 +654,7 @@ private:
      * "durablyWritten" indicates whether the operation has to be durably applied.
      */
     bool _haveTaggedNodesReachedOpTime_inlock(const OpTime& opTime,
-                                              const ReplicaSetTagPattern& tagPattern,
+                                              const ReplSetTagPattern& tagPattern,
                                               bool durablyWritten);
 
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;
@@ -728,6 +742,12 @@ private:
 
     void _untrackHeartbeatHandle(const ReplicationExecutor::CallbackHandle& handle);
 
+    /*
+     * Return a randomized offset amount that is scaled in proportion to the size of the
+     * _electionTimeoutPeriod. Used to add randomization to an election timeout.
+     */
+    Milliseconds _getRandomizedElectionOffset();
+
     /**
      * Helper for _handleHeartbeatResponse.
      *
@@ -785,7 +805,7 @@ private:
      * to kConfigSteady, so that we can begin processing heartbeats and reconfigs.
      */
     void _finishLoadLocalConfig(const ReplicationExecutor::CallbackArgs& cbData,
-                                const ReplicaSetConfig& localConfig,
+                                const ReplSetConfig& localConfig,
                                 const StatusWith<OpTime>& lastOpTimeStatus,
                                 const StatusWith<LastVote>& lastVoteStatus);
 
@@ -804,14 +824,14 @@ private:
      * Finishes the work of processReplSetInitiate() while holding _topoMutex, in the event of
      * a successful quorum check.
      */
-    void _finishReplSetInitiate(const ReplicaSetConfig& newConfig, int myIndex);
+    void _finishReplSetInitiate(const ReplSetConfig& newConfig, int myIndex);
 
     /**
      * Finishes the work of processReplSetReconfig while holding _topoMutex, in the event of
      * a successful quorum check.
      */
     void _finishReplSetReconfig(const ReplicationExecutor::CallbackArgs& cbData,
-                                const ReplicaSetConfig& newConfig,
+                                const ReplSetConfig& newConfig,
                                 int myIndex);
 
     /**
@@ -929,26 +949,26 @@ private:
     /**
      * Schedules a replica set config change.
      */
-    void _scheduleHeartbeatReconfig(const ReplicaSetConfig& newConfig);
+    void _scheduleHeartbeatReconfig(const ReplSetConfig& newConfig);
 
     /**
      * Callback that continues a heartbeat-initiated reconfig after a running election
      * completes.
      */
     void _heartbeatReconfigAfterElectionCanceled(const ReplicationExecutor::CallbackArgs& cbData,
-                                                 const ReplicaSetConfig& newConfig);
+                                                 const ReplSetConfig& newConfig);
 
     /**
      * Method to write a configuration transmitted via heartbeat message to stable storage.
      */
     void _heartbeatReconfigStore(const ReplicationExecutor::CallbackArgs& cbd,
-                                 const ReplicaSetConfig& newConfig);
+                                 const ReplSetConfig& newConfig);
 
     /**
      * Conclusion actions of a heartbeat-triggered reconfiguration.
      */
     void _heartbeatReconfigFinish(const ReplicationExecutor::CallbackArgs& cbData,
-                                  const ReplicaSetConfig& newConfig,
+                                  const ReplSetConfig& newConfig,
                                   StatusWith<int> myIndex);
 
     /**
@@ -987,12 +1007,24 @@ private:
     /**
      * Callback that processes the ReplSetMetadata returned from a command run against another
      * replica set member and so long as the config version in the metadata matches the replica set
-     * config version this node currently has, updates the current term and optionally updates
-     * this node's notion of the commit point.
+     * config version this node currently has, updates the current term.
+     *
+     * This does NOT update this node's notion of the commit point.
+     *
      * Returns the finish event which is invalid if the process has already finished.
      */
-    EventHandle _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata,
-                                                   bool advanceCommitPoint);
+    EventHandle _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata);
+
+    /**
+     * Prepares a metadata object for ReplSetMetadata.
+     */
+    void _prepareReplSetMetadata_inlock(const OpTime& lastOpTimeFromClient,
+                                        BSONObjBuilder* builder) const;
+
+    /**
+     * Prepares a metadata object for OplogQueryMetadata.
+     */
+    void _prepareOplogQueryMetadata_inlock(BSONObjBuilder* builder) const;
 
     /**
      * Blesses a snapshot to be used for new committed reads.
@@ -1039,14 +1071,16 @@ private:
      * "isPriorityTakeover" is used to determine if the caller was a priority takeover or not and
      * log messages accordingly.
      */
-    void _startElectSelfIfEligibleV1(bool isPriorityTakeover);
+    enum StartElectionV1Reason { kElectionTimeout, kPriorityTakeover, kStepUpRequest };
+
+    void _startElectSelfIfEligibleV1(StartElectionV1Reason reason);
 
     /**
      * Resets the term of last vote to 0 to prevent any node from voting for term 0.
      * Returns the event handle that indicates when last vote write finishes.
      */
-    EventHandle _resetElectionInfoOnProtocolVersionUpgrade(const ReplicaSetConfig& oldConfig,
-                                                           const ReplicaSetConfig& newConfig);
+    EventHandle _resetElectionInfoOnProtocolVersionUpgrade(const ReplSetConfig& oldConfig,
+                                                           const ReplSetConfig& newConfig);
 
     /**
      * Schedules work and returns handle to callback.
@@ -1123,10 +1157,8 @@ private:
                                       long long originalTerm);
     /**
      * Finish catch-up mode and start drain mode.
-     * If "startToDrain" is true, the node enters drain mode. Otherwise, it goes back to secondary
-     * mode.
      */
-    void _finishCatchUpOplog_inlock(bool startToDrain);
+    void _finishCatchingUpOplog_inlock();
 
     /**
      * Waits for the config state to leave kConfigStartingUp, which indicates that start() has
@@ -1236,11 +1268,7 @@ private:
     // Used to signal threads waiting for changes to _memberState.
     stdx::condition_variable _drainFinishedCond;  // (M)
 
-    // True if we are waiting for the applier to finish draining.
-    bool _isWaitingForDrainToComplete;  // (M)
-
-    // True if we are waiting for oplog catch-up to finish.
-    bool _isCatchingUp = false;  // (M)
+    ReplicationCoordinator::ApplierState _applierState = ApplierState::Running;  // (M)
 
     // Used to signal threads waiting for changes to _rsConfigState.
     stdx::condition_variable _rsConfigStateChange;  // (M)
@@ -1252,7 +1280,7 @@ private:
 
     // The current ReplicaSet configuration object, including the information about tag groups
     // that is used to satisfy write concern requests with named gle modes.
-    ReplicaSetConfig _rsConfig;  // (MX)
+    ReplSetConfig _rsConfig;  // (MX)
 
     // This member's index position in the current config.
     int _selfIndex;  // (MX)
@@ -1304,10 +1332,11 @@ private:
     // _lastCommittedOpTime cannot be set to an earlier OpTime.
     OpTime _firstOpTimeOfMyTerm;  // (M)
 
-    // Storage interface used by data replicator.
+    // Storage interface used by initial syncer.
     StorageInterface* _storage;  // (PS)
-    // Data Replicator used to replicate data
-    std::shared_ptr<DataReplicator> _dr;  // (I) pointer set under mutex, copied by callers.
+    // InitialSyncer used for initial sync.
+    std::shared_ptr<InitialSyncer>
+        _initialSyncer;  // (I) pointer set under mutex, copied by callers.
 
     // Hands out the next snapshot name.
     AtomicUInt64 _snapshotNameGenerator;  // (S)

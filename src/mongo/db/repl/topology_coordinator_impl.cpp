@@ -48,6 +48,7 @@
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/hex.h"
@@ -412,10 +413,9 @@ void TopologyCoordinatorImpl::prepareSyncFromResponse(const HostAndPort& target,
         return;
     }
 
-    ReplicaSetConfig::MemberIterator targetConfig = _rsConfig.membersEnd();
+    ReplSetConfig::MemberIterator targetConfig = _rsConfig.membersEnd();
     int targetIndex = 0;
-    for (ReplicaSetConfig::MemberIterator it = _rsConfig.membersBegin();
-         it != _rsConfig.membersEnd();
+    for (ReplSetConfig::MemberIterator it = _rsConfig.membersBegin(); it != _rsConfig.membersEnd();
          ++it) {
         if (it->getHostAndPort() == target) {
             targetConfig = it;
@@ -868,8 +868,7 @@ Status TopologyCoordinatorImpl::prepareHeartbeatResponseV1(Date_t now,
 
 int TopologyCoordinatorImpl::_getMemberIndex(int id) const {
     int index = 0;
-    for (ReplicaSetConfig::MemberIterator it = _rsConfig.membersBegin();
-         it != _rsConfig.membersEnd();
+    for (ReplSetConfig::MemberIterator it = _rsConfig.membersBegin(); it != _rsConfig.membersEnd();
          ++it, ++index) {
         if (it->getId() == id) {
             return index;
@@ -908,7 +907,7 @@ std::pair<ReplSetHeartbeatArgs, Milliseconds> TopologyCoordinatorImpl::prepareHe
 
     const Milliseconds timeoutPeriod(
         _rsConfig.isInitialized() ? _rsConfig.getHeartbeatTimeoutPeriodMillis()
-                                  : Milliseconds{ReplicaSetConfig::kDefaultHeartbeatTimeoutPeriod});
+                                  : Milliseconds{ReplSetConfig::kDefaultHeartbeatTimeoutPeriod});
     const Milliseconds timeout = timeoutPeriod - alreadyElapsed;
     return std::make_pair(hbArgs, timeout);
 }
@@ -944,7 +943,7 @@ std::pair<ReplSetHeartbeatArgsV1, Milliseconds> TopologyCoordinatorImpl::prepare
 
     const Milliseconds timeoutPeriod(
         _rsConfig.isInitialized() ? _rsConfig.getHeartbeatTimeoutPeriodMillis()
-                                  : Milliseconds{ReplicaSetConfig::kDefaultHeartbeatTimeoutPeriod});
+                                  : Milliseconds{ReplSetConfig::kDefaultHeartbeatTimeoutPeriod});
     const Milliseconds timeout(timeoutPeriod - alreadyElapsed);
     return std::make_pair(hbArgs, timeout);
 }
@@ -1003,7 +1002,7 @@ HeartbeatResponseAction TopologyCoordinatorImpl::processHeartbeatResponse(
     if (hbResponse.isOK() && hbResponse.getValue().hasConfig()) {
         const long long currentConfigVersion =
             _rsConfig.isInitialized() ? _rsConfig.getConfigVersion() : -2;
-        const ReplicaSetConfig& newConfig = hbResponse.getValue().getConfig();
+        const ReplSetConfig& newConfig = hbResponse.getValue().getConfig();
         if (newConfig.getConfigVersion() > currentConfigVersion) {
             HeartbeatResponseAction nextAction = HeartbeatResponseAction::makeReconfigAction();
             nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
@@ -1554,7 +1553,7 @@ void TopologyCoordinatorImpl::changeMemberState_forTest(const MemberState& newMe
             }
             break;
         case MemberState::RS_STARTUP:
-            updateConfig(ReplicaSetConfig(), -1, Date_t(), OpTime());
+            updateConfig(ReplSetConfig(), -1, Date_t(), OpTime());
             break;
         default:
             severe() << "Cannot switch to state " << newMemberState;
@@ -1775,8 +1774,7 @@ void TopologyCoordinatorImpl::fillIsMasterForReplSet(IsMasterResponse* response)
         return;
     }
 
-    for (ReplicaSetConfig::MemberIterator it = _rsConfig.membersBegin();
-         it != _rsConfig.membersEnd();
+    for (ReplSetConfig::MemberIterator it = _rsConfig.membersBegin(); it != _rsConfig.membersEnd();
          ++it) {
         if (it->isHidden() || it->getSlaveDelay() > Seconds{0}) {
             continue;
@@ -1821,7 +1819,7 @@ void TopologyCoordinatorImpl::fillIsMasterForReplSet(IsMasterResponse* response)
     if (!selfConfig.shouldBuildIndexes()) {
         response->setShouldBuildIndexes(false);
     }
-    const ReplicaSetTagConfig tagConfig = _rsConfig.getTagConfig();
+    const ReplSetTagConfig tagConfig = _rsConfig.getTagConfig();
     if (selfConfig.hasTags(tagConfig)) {
         for (MemberConfig::TagIterator tag = selfConfig.tagsBegin(); tag != selfConfig.tagsEnd();
              ++tag) {
@@ -1912,15 +1910,14 @@ Date_t TopologyCoordinatorImpl::getStepDownTime() const {
     return _stepDownUntil;
 }
 
-void TopologyCoordinatorImpl::_updateHeartbeatDataForReconfig(const ReplicaSetConfig& newConfig,
+void TopologyCoordinatorImpl::_updateHeartbeatDataForReconfig(const ReplSetConfig& newConfig,
                                                               int selfIndex,
                                                               Date_t now) {
     std::vector<MemberHeartbeatData> oldHeartbeats;
     _hbdata.swap(oldHeartbeats);
 
     int index = 0;
-    for (ReplicaSetConfig::MemberIterator it = newConfig.membersBegin();
-         it != newConfig.membersEnd();
+    for (ReplSetConfig::MemberIterator it = newConfig.membersBegin(); it != newConfig.membersEnd();
          ++it, ++index) {
         const MemberConfig& newMemberConfig = *it;
         // TODO: C++11: use emplace_back()
@@ -1946,7 +1943,7 @@ void TopologyCoordinatorImpl::_updateHeartbeatDataForReconfig(const ReplicaSetCo
 
 // This function installs a new config object and recreates MemberHeartbeatData objects
 // that reflect the new config.
-void TopologyCoordinatorImpl::updateConfig(const ReplicaSetConfig& newConfig,
+void TopologyCoordinatorImpl::updateConfig(const ReplSetConfig& newConfig,
                                            int selfIndex,
                                            Date_t now,
                                            const OpTime& lastOpApplied) {
@@ -2430,10 +2427,12 @@ long long TopologyCoordinatorImpl::getTerm() {
 
 // TODO(siyuan): Merge _hddata into _slaveInfo, so that we have a single view of the
 // replset. Passing metadata is unnecessary.
-bool TopologyCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& currentSource,
-                                                     const OpTime& myLastOpTime,
-                                                     const rpc::ReplSetMetadata& metadata,
-                                                     Date_t now) const {
+bool TopologyCoordinatorImpl::shouldChangeSyncSource(
+    const HostAndPort& currentSource,
+    const OpTime& myLastOpTime,
+    const rpc::ReplSetMetadata& replMetadata,
+    boost::optional<rpc::OplogQueryMetadata> oqMetadata,
+    Date_t now) const {
     // Methodology:
     // If there exists a viable sync source member other than currentSource, whose oplog has
     // reached an optime greater than _options.maxSyncSourceLagSecs later than currentSource's,
@@ -2450,9 +2449,9 @@ bool TopologyCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& currentS
     }
 
     if (_rsConfig.getProtocolVersion() == 1 &&
-        metadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
+        replMetadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
         log() << "Choosing new sync source because the config version supplied by " << currentSource
-              << ", " << metadata.getConfigVersion() << ", does not match ours, "
+              << ", " << replMetadata.getConfigVersion() << ", does not match ours, "
               << _rsConfig.getConfigVersion();
         return true;
     }
@@ -2467,8 +2466,22 @@ bool TopologyCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& currentS
 
     invariant(currentSourceIndex != _selfIndex);
 
-    OpTime currentSourceOpTime =
-        std::max(metadata.getLastOpVisible(), _hbdata.at(currentSourceIndex).getAppliedOpTime());
+    // If OplogQueryMetadata was provided, use its values, otherwise use the ones in
+    // ReplSetMetadata.
+    OpTime currentSourceOpTime;
+    int syncSourceIndex = -1;
+    int primaryIndex = -1;
+    if (oqMetadata) {
+        currentSourceOpTime = std::max(oqMetadata->getLastOpApplied(),
+                                       _hbdata.at(currentSourceIndex).getAppliedOpTime());
+        syncSourceIndex = oqMetadata->getSyncSourceIndex();
+        primaryIndex = oqMetadata->getPrimaryIndex();
+    } else {
+        currentSourceOpTime = std::max(replMetadata.getLastOpVisible(),
+                                       _hbdata.at(currentSourceIndex).getAppliedOpTime());
+        syncSourceIndex = replMetadata.getSyncSourceIndex();
+        primaryIndex = replMetadata.getPrimaryIndex();
+    }
 
     if (currentSourceOpTime.isNull()) {
         // Haven't received a heartbeat from the sync source yet, so can't tell if we should
@@ -2478,16 +2491,15 @@ bool TopologyCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& currentS
 
     // Change sync source if they are not ahead of us, and don't have a sync source,
     // unless they are primary.
-    if (_rsConfig.getProtocolVersion() == 1 && metadata.getSyncSourceIndex() == -1 &&
-        currentSourceOpTime <= myLastOpTime && metadata.getPrimaryIndex() != currentSourceIndex) {
+    if (_rsConfig.getProtocolVersion() == 1 && syncSourceIndex == -1 &&
+        currentSourceOpTime <= myLastOpTime && primaryIndex != currentSourceIndex) {
         std::stringstream logMessage;
         logMessage << "Choosing new sync source because our current sync source, "
                    << currentSource.toString() << ", has an OpTime (" << currentSourceOpTime
                    << ") which is not ahead of ours (" << myLastOpTime
                    << "), it does not have a sync source, and it's not the primary";
-        if (metadata.getPrimaryIndex() >= 0) {
-            logMessage << " (" << _rsConfig.getMemberAt(metadata.getPrimaryIndex()).getHostAndPort()
-                       << " is)";
+        if (primaryIndex >= 0) {
+            logMessage << " (" << _rsConfig.getMemberAt(primaryIndex).getHostAndPort() << " is)";
         } else {
             logMessage << " (sync source does not know the primary)";
         }
@@ -2528,17 +2540,24 @@ bool TopologyCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& currentS
     return false;
 }
 
-void TopologyCoordinatorImpl::prepareReplMetadata(rpc::ReplSetMetadata* metadata,
-                                                  const OpTime& lastVisibleOpTime,
-                                                  const OpTime& lastCommittedOpTime) const {
-    *metadata =
-        rpc::ReplSetMetadata(_term,
-                             lastCommittedOpTime,
-                             lastVisibleOpTime,
-                             _rsConfig.getConfigVersion(),
-                             _rsConfig.getReplicaSetId(),
-                             _currentPrimaryIndex,
-                             _rsConfig.findMemberIndexByHostAndPort(getSyncSourceAddress()));
+rpc::ReplSetMetadata TopologyCoordinatorImpl::prepareReplSetMetadata(
+    const OpTime& lastVisibleOpTime, const OpTime& lastCommittedOpTime) const {
+    return rpc::ReplSetMetadata(_term,
+                                lastCommittedOpTime,
+                                lastVisibleOpTime,
+                                _rsConfig.getConfigVersion(),
+                                _rsConfig.getReplicaSetId(),
+                                _currentPrimaryIndex,
+                                _rsConfig.findMemberIndexByHostAndPort(getSyncSourceAddress()));
+}
+
+rpc::OplogQueryMetadata TopologyCoordinatorImpl::prepareOplogQueryMetadata(
+    const OpTime& lastCommittedOpTime, const OpTime& lastAppliedOpTime, int rbid) const {
+    return rpc::OplogQueryMetadata(lastCommittedOpTime,
+                                   lastAppliedOpTime,
+                                   rbid,
+                                   _currentPrimaryIndex,
+                                   _rsConfig.findMemberIndexByHostAndPort(getSyncSourceAddress()));
 }
 
 void TopologyCoordinatorImpl::summarizeAsHtml(ReplSetHtmlSummary* output) {
