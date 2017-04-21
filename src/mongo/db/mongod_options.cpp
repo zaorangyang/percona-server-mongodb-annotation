@@ -640,6 +640,14 @@ Status validateMongodOptions(const moe::Environment& params) {
                       "Can't specify both --journal and --nojournal options.");
     }
 
+    if (params.count("operationProfiling.slowOpSampleRate")
+        && params["operationProfiling.slowOpSampleRate"].as<double>() != 1.0
+        && params.count("operationProfiling.rateLimit")
+        && params["operationProfiling.rateLimit"].as<int>() != 1) {
+        return Status(ErrorCodes::BadValue,
+                      "Can't specify non-default values for both --rateLimit and --slowOpSampleRate options.");
+    }
+
     // SERVER-10019 Enabling rest/jsonp without --httpinterface should break in all cases in the
     // future
     if (params.count("net.http.RESTInterfaceEnabled") &&
