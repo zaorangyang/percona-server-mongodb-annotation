@@ -49,16 +49,18 @@ public:
 
     OpTimeWithTerm getCurrentTermAndLastCommittedOpTime() override;
 
-    void processMetadata(const rpc::ReplSetMetadata& metadata) override;
+    void processMetadata(const rpc::ReplSetMetadata& metadata,
+                         boost::optional<rpc::OplogQueryMetadata> oqMetadata) override;
 
     bool shouldStopFetching(const HostAndPort& source,
-                            const rpc::ReplSetMetadata& metadata) override;
+                            const rpc::ReplSetMetadata& replMetadata,
+                            boost::optional<rpc::OplogQueryMetadata> oqMetadata) override;
 
     std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(OperationContext* txn) const override;
 
     std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(OperationContext* txn) const override;
 
-    StatusWith<ReplicaSetConfig> getCurrentConfig() const override;
+    StatusWith<ReplSetConfig> getCurrentConfig() const override;
 
     // Task executor. Not owned by us.
     executor::TaskExecutor* taskExecutor = nullptr;
@@ -71,7 +73,8 @@ public:
     OpTime lastCommittedOpTime;
 
     // Set by processMetadata.
-    rpc::ReplSetMetadata metadataProcessed;
+    rpc::ReplSetMetadata replMetadataProcessed;
+    rpc::OplogQueryMetadata oqMetadataProcessed;
     bool metadataWasProcessed = false;
 
     // Set by shouldStopFetching.
@@ -91,7 +94,7 @@ public:
     MultiInitialSyncApplyFn multiInitialSyncApplyFn = [](
         MultiApplier::OperationPtrs*, const HostAndPort&, AtomicUInt32*) { return Status::OK(); };
 
-    StatusWith<ReplicaSetConfig> replSetConfigResult = ReplicaSetConfig();
+    StatusWith<ReplSetConfig> replSetConfigResult = ReplSetConfig();
 
 private:
     StatusWith<OpTime> _multiApply(OperationContext* txn,

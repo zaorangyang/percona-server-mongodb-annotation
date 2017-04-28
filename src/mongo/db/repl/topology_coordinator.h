@@ -48,7 +48,7 @@ namespace repl {
 class HeartbeatResponseAction;
 class OpTime;
 class ReplSetHeartbeatArgs;
-class ReplicaSetConfig;
+class ReplSetConfig;
 class TagSubgroup;
 class LastVote;
 struct MemberState;
@@ -166,10 +166,13 @@ public:
      * ("syncSourceHasSyncSource" is false), and only has data up to "myLastOpTime", returns true.
      *
      * "now" is used to skip over currently blacklisted sync sources.
+     *
+     * TODO (SERVER-27668): Make OplogQueryMetadata non-optional in mongodb 3.8.
      */
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const OpTime& myLastOpTime,
-                                        const rpc::ReplSetMetadata& metadata,
+                                        const rpc::ReplSetMetadata& replMetadata,
+                                        boost::optional<rpc::OplogQueryMetadata> oqMetadata,
                                         Date_t now) const = 0;
 
     /**
@@ -292,7 +295,7 @@ public:
      * newConfig.isInitialized() should be true, though implementations may accept
      * configurations where this is not true, for testing purposes.
      */
-    virtual void updateConfig(const ReplicaSetConfig& newConfig,
+    virtual void updateConfig(const ReplSetConfig& newConfig,
                               int selfIndex,
                               Date_t now,
                               const OpTime& lastOpApplied) = 0;
@@ -435,11 +438,19 @@ public:
     virtual void setMyHeartbeatMessage(const Date_t now, const std::string& s) = 0;
 
     /**
-     * Prepares a BSONObj describing the current term, primary, and lastOp information.
+     * Prepares a ReplSetMetadata object describing the current term, primary, and lastOp
+     * information.
      */
-    virtual void prepareReplMetadata(rpc::ReplSetMetadata* metadata,
-                                     const OpTime& lastVisibleOpTime,
-                                     const OpTime& lastCommittedOpTime) const = 0;
+    virtual rpc::ReplSetMetadata prepareReplSetMetadata(
+        const OpTime& lastVisibleOpTime, const OpTime& lastCommittedOpTime) const = 0;
+
+    /**
+     * Prepares an OplogQueryMetadata object describing the current sync source, rbid, primary,
+     * lastOpApplied, and lastOpCommitted.
+     */
+    virtual rpc::OplogQueryMetadata prepareOplogQueryMetadata(const OpTime& lastCommittedOpTime,
+                                                              const OpTime& lastAppliedOpTime,
+                                                              int rbid) const = 0;
 
     /**
      * Writes into 'output' all the information needed to generate a summary of the current

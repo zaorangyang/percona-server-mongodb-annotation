@@ -102,44 +102,67 @@ variables:
   - *run_jstestfuzz_tests
 
 # buildvariants in this list have debug symbols which are uploaded to s3.
+# Note this sorted list contains all buildvariants. A buildvariant that does not
+# create separate symbol files is commented out.
 - &debug_symbol_variants
+  - amazon
+  - debian71
+  - debian81
+  - enterprise-debian71-64
+  - enterprise-debian81-64
   - enterprise-linux-64-amazon-ami
   - enterprise-osx-107
   - enterprise-rhel-62-64-bit
   - enterprise-rhel-62-64-bit-coverage
-  - enterprise-rhel-67-s390x  
+  - enterprise-rhel-62-64-bit-inmem
+  - enterprise-rhel-67-s390x
   - enterprise-rhel-70-64-bit
   - enterprise-rhel-71-ppc64le
+  - enterprise-rhel-71-ppc64le-inmem
   - enterprise-rhel-72-s390x
+  - enterprise-rhel-72-s390x-inmem
   - enterprise-suse11-64
   - enterprise-suse11-s390x
   - enterprise-suse12-64
   - enterprise-suse12-s390x
+  # - enterprise-ubuntu-dynamic-1604-64-bit # Does not create separate symbol files.
   - enterprise-ubuntu1204-64
   - enterprise-ubuntu1404-64
   - enterprise-ubuntu1604-64
   - enterprise-ubuntu1604-arm64
+  # - enterprise-ubuntu1604-clang-3.7-libcxx # Does not create separate symbol files.
   - enterprise-ubuntu1604-ppc64le
   - enterprise-ubuntu1604-s390x
-  - enterprise-debian71-64
-  - enterprise-debian81-64
+  - enterprise-windows-64
+  - enterprise-windows-64-2k8-debug-unoptimized
+  - enterprise-windows-64-inmem
+  - initsync-3dot2-rhel-62
   - linux-64
-  - amazon
+  - linux-64-debug
+  - linux-64-duroff
+  - linux-64-ephemeralForTest
+  - linux-64-lsm
+  - linux-64-repeated-execution
+  - osx-107
+  - osx-107-debug
+  - osx-107-ssl
   - rhel62
   - rhel70
+  - solaris-64-bit
   - suse11
   - suse12
   - ubuntu1204
   - ubuntu1404
+  - ubuntu1404-rocksdb
   - ubuntu1604
   - ubuntu1604-arm64
-  - ubuntu1404-jepsen
-  - ubuntu1404-rocksdb
-  - debian71
-  - debian81
-  - solaris-64-bit
-  - osx-107-ssl
-  - osx-107
+  - ubuntu1604-asan
+  - ubuntu1604-debug-asan
+  - ubuntu1604-debug-ubsan
+  - windows-64
+  - windows-64-2k8
+  - windows-64-2k8-debug
+  - windows-64-2k8-ssl
 
 
 #######################################
@@ -171,7 +194,7 @@ functions:
     params:
       working_dir: src
       script: |
-        ${decompress|unzip} mongo-binaries.tgz
+        ${decompress} mongo-binaries.tgz
 
   "check binary version" : &check_binary_version
     command: shell.exec
@@ -221,13 +244,7 @@ functions:
             iostat -tdmx 5 > mongo-diskstats
         # OSX: Simulate the iostat timestamp.
         elif iostat -d > /dev/null 2>&1; then
-            while [ 1 ]
-            do
-                date +'%m/%d/%Y %I:%M:%S %p' >> mongo-diskstats
-                iostat -d >> mongo-diskstats
-                printf "\n" >> mongo-diskstats
-                sleep 5
-            done
+            iostat -d -w 5 | while IFS= read -r line; do printf '%s %s\n' "$(date +'%m/%d/%Y %H:%M:%S')" "$line" >> mongo-diskstats; done
         # Check if vmstat -t is available.
         elif vmstat -td  > /dev/null 2>&1; then
             vmstat -td 5 > mongo-diskstats
@@ -309,7 +326,7 @@ functions:
         build_phase='${task_name}_${execution}'
         END_OF_CREDS
 
-  "upload debugsymbols" :
+  "upload debugsymbols" : &upload_debugsymbols
     command: s3.put
     params:
       aws_key: ${aws_key}
@@ -322,7 +339,7 @@ functions:
       build_variants:
         *debug_symbol_variants
 
-  "fetch debugsymbols archive" :
+  "fetch debugsymbols archive" : &fetch_debugsymbols_archive
     command: s3.get
     params:
       aws_key: ${aws_key}
@@ -332,6 +349,19 @@ functions:
       local_file: src/mongo-debugsymbols.tgz
       build_variants:
         *debug_symbol_variants
+
+  "extract debugsymbols" : &extract_debugsymbols
+    command: shell.exec
+    params:
+      working_dir: src
+      build_variants:
+        *debug_symbol_variants
+      script: |
+        set -o errexit
+        set -o verbose
+        ${decompress} mongo-debugsymbols.tgz
+        mv mongodb*/mongo.{debug,dSYM,pdb} mongodb*/mongod.{debug,dSYM,pdb} mongodb*/mongos.{debug,dSYM,pdb} . 2>/dev/null || true
+        rm -r mongodb*/*.{debug,dSYM,pdb} mongo-debugsymbols.tgz 2>/dev/null || true
 
   "build rocksdb" :
     command: shell.exec
@@ -424,7 +454,7 @@ functions:
           # Set the shell process (and its children processes) to dump ELF headers (bit 4),
           # anonymous shared mappings (bit 1), and anonymous private mappings (bit 0).
           echo 0x13 > /proc/self/coredump_filter
-        
+
           if [ -f /sbin/sysctl ]; then
             # Check that the core pattern is set explicitly on our distro image instead
             # of being the OS's default value. This ensures that coredump names are consistent
@@ -499,11 +529,12 @@ functions:
         script: |
           set -o errexit
           git clone git@github.com:10gen/jepsen.git
-          cd jepsen/jepsen
+          cd jepsen
           git checkout mongodb-master-linearizable-2
           branch=$(git symbolic-ref --short HEAD)
           commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
           echo "Git branch: $branch, commit: $commit"
+          cd jepsen
           lein install
     - command: shell.exec
       params:
@@ -1052,12 +1083,15 @@ post:
   - func: "cleanup environment"
 
 timeout:
+  - func: "fetch debugsymbols archive"
+  - func: "extract debugsymbols"
   - command: shell.exec
     params:
       working_dir: src
       script: |
         set -o verbose
-        hang_analyzer_option="-p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test} -g bsondump,mongodump,mongoexport,mongofiles,mongoimport,mongooplog,mongoreplay,mongorestore,mongostat,mongotop"
+        ${set_sudo}
+        $sudo hang_analyzer_option="-p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test} -g bsondump,mongodump,mongoexport,mongofiles,mongoimport,mongooplog,mongoreplay,mongorestore,mongostat,mongotop"
         echo "Calling the hang analyzer: python buildscripts/hang_analyzer.py $hang_analyzer_option"
         PATH=/opt/mongodbtoolchain/gdb/bin:$PATH python buildscripts/hang_analyzer.py $hang_analyzer_option
 
@@ -1156,6 +1190,15 @@ tasks:
             ${python|python} ${packager_script} --prefix `pwd`/.. --distros ${packager_distro} --tarball `pwd`/../mongodb-binaries.tgz -s ${version} -m HEAD -a ${packager_arch}
             cd ..
           fi
+
+          # Create separate shell archive
+          mkdir -p shell-archive/build
+          cd shell-archive
+          ${platform_decompress|tar xzvf} ../mongodb-binaries.tgz
+          find . -mindepth 3 ! -name "mongo${exe}" -type f -exec rm {} \; # delete bin/* except bin/mongo
+          ${python|python} ../buildscripts/make_archive.py -o mongodb-shell.${ext|tgz} $(find mongodb-* -type f)
+          cd ..
+
     - command: archive.targz_pack
       params:
         target: "artifacts.tgz"
@@ -1195,6 +1238,16 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
         display_name: Binaries
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/shell-archive/mongodb-shell.${ext|tgz}
+        remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/binaries/mongo-shell-${build_id}.${ext|tgz}
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: Shell
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -2074,6 +2127,17 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: multiversion_auth
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=multiversion_auth --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: multiversion_WT
   commands:
   - func: "do setup"
@@ -2740,6 +2804,13 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
+        remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/binaries/mongo-shell-${build_id}.${ext|tgz}
+        bucket: mciuploads
+        local_file: src/mongo-shell.tgz
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
         remote_file: mongodb-mongo-v3.4/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
         bucket: mciuploads
         local_file: src/distsrc.${ext|tgz}
@@ -2783,18 +2854,11 @@ tasks:
           set -o errexit
           set -o verbose
 
-          mv mongo-binaries.tgz mongodb-binaries.${ext|tgz}
-          mv mongo-debugsymbols.tgz debugsymbols-*.${ext|tgz} || true
-          cp mongodb-*.${ext|tgz} mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}
-          cp debugsymbols-*.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} || true
+          mv mongo-binaries.tgz mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          mv mongo-shell.tgz mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          mv mongo-debugsymbols.tgz mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} || true
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-win32-${push_arch}-${suffix}.msi || true
-
-          # Extract shell and banner files out of scons-made archive for separate shell archive
-          ${platform_decompress|tar --wildcards -zxvf} mongodb-binaries.${ext|tgz} mongodb-*/bin/mongo${exe} mongodb-*/\[A-Z\]*
-
-          # Create new shell archive (make_archive.py uses filename to determine what format archive to create)
-          ${python|python} buildscripts/make_archive.py -o mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} $(ls -d mongodb-*/bin/mongo${exe} mongodb-*/[A-Z]*)
 
           /usr/local/bin/notary-client.py --key-name "server-3.4" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
@@ -3298,6 +3362,7 @@ buildvariants:
   - name: mmap
   - name: mongosTest
   - name: multiversion
+  - name: multiversion_auth
   - name: multiversion_WT
   - name: multiversion_multistorage_engine
   - name: noPassthrough
@@ -4738,6 +4803,7 @@ buildvariants:
   - name: mmap
   - name: mongosTest
   - name: multiversion
+  - name: multiversion_auth
   - name: multiversion_WT
   - name: multiversion_multistorage_engine
   - name: noPassthrough
@@ -5572,6 +5638,7 @@ buildvariants:
   - name: mmap
   - name: mongosTest
   - name: multiversion
+  - name: multiversion_auth
   - name: multiversion_WT
   - name: multiversion_multistorage_engine
   - name: noPassthrough
@@ -5706,8 +5773,7 @@ buildvariants:
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
-    rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
-    compile_flags: --dbg=on --gcov --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
+    compile_flags: --dbg=on --gcov --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     multiversion_platform_arch: "rhel62"
     multiversion_edition: "targeted"
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
@@ -5796,6 +5862,7 @@ buildvariants:
   - name: mmap
   - name: mongosTest
   - name: multiversion
+  - name: multiversion_auth
   - name: multiversion_WT
   - name: multiversion_multistorage_engine
   - name: noPassthrough
@@ -5860,8 +5927,6 @@ buildvariants:
   - name: master_slave_auth
   - name: master_slave_jscore_passthrough
   - name: master_slave_jscore_passthrough_WT
-  - name: rlp
-  - name: rlp_WT
   - name: sasl
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
@@ -6642,7 +6707,7 @@ buildvariants:
   - name: unittests
   - name: views_WT
   - name: views_rs_WT
-  - name: push      
+  - name: push
     distros:
     - rhel62-small
 
@@ -8343,6 +8408,7 @@ buildvariants:
   - name: mmap
   - name: mongosTest
   - name: multiversion
+  - name: multiversion_auth
   - name: multiversion_WT
   - name: multiversion_multistorage_engine
   - name: noPassthrough
@@ -8518,6 +8584,7 @@ buildvariants:
   - name: mmap
   - name: mongosTest
   - name: multiversion
+  - name: multiversion_auth
   - name: multiversion_WT
   - name: multiversion_multistorage_engine
   - name: noPassthrough

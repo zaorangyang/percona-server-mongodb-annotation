@@ -57,9 +57,9 @@ struct ConnectionPoolStats;
 
 namespace rpc {
 
+class OplogQueryMetadata;
 class ReplSetMetadata;
 class RequestInterface;
-class ReplSetMetadata;
 
 }  // namespace rpc
 
@@ -72,7 +72,7 @@ class OldUpdatePositionArgs;
 class OplogReader;
 class OpTime;
 class ReadConcernArgs;
-class ReplicaSetConfig;
+class ReplSetConfig;
 class ReplicationExecutor;
 class ReplSetHeartbeatArgs;
 class ReplSetHeartbeatArgsV1;
@@ -393,18 +393,62 @@ public:
     virtual bool setFollowerMode(const MemberState& newState) = 0;
 
     /**
-     * Returns true if the coordinator wants the applier to pause application.
+     * Step-up
+     * =======
+     * On stepup, repl coord enters catch-up mode. It's the same as the secondary mode from
+     * the perspective of producer and applier, so there's nothing to do with them.
+     * When a node enters drain mode, producer state = Stopped, applier state = Draining.
      *
-     * If this returns true, the applier should call signalDrainComplete() when it has
-     * completed draining its operation buffer and no further ops are being applied.
+     * If the applier state is Draining, it will signal repl coord when there's nothing to apply.
+     * The applier goes into Stopped state at the same time.
+     *
+     * The states go like the following:
+     * - secondary and during catchup mode
+     * (producer: Running, applier: Running)
+     *      |
+     *      | finish catch-up, enter drain mode
+     *      V
+     * - drain mode
+     * (producer: Stopped, applier: Draining)
+     *      |
+     *      | applier signals drain is complete
+     *      V
+     * - primary is in master mode
+     * (producer: Stopped, applier: Stopped)
+     *
+     *
+     * Step-down
+     * =========
+     * The state transitions become:
+     * - primary is in master mode
+     * (producer: Stopped, applier: Stopped)
+     *      |
+     *      | step down
+     *      V
+     * - secondary mode, starting bgsync
+     * (producer: Starting, applier: Running)
+     *      |
+     *      | bgsync runs start()
+     *      V
+     * - secondary mode, normal
+     * (producer: Running, applier: Running)
+     *
+     * When a node steps down during draining mode, it's OK to change from (producer: Stopped,
+     * applier: Draining) to (producer: Starting, applier: Running).
+     *
+     * When a node steps down during catchup mode, the states remain the same (producer: Running,
+     * applier: Running).
      */
-    virtual bool isWaitingForApplierToDrain() = 0;
+    enum class ApplierState { Running, Draining, Stopped };
 
     /**
-     * A new primary tries to have its oplog catch up after winning an election.
-     * Return true if the coordinator is waiting for catch-up to finish.
+     * In normal cases: Running -> Draining -> Stopped -> Running.
+     * Draining -> Running is also possible if a node steps down during drain mode.
+     *
+     * Only the applier can make the transition from Draining to Stopped by calling
+     * signalDrainComplete().
      */
-    virtual bool isCatchingUp() = 0;
+    virtual ApplierState getApplierState() = 0;
 
     /**
      * Signals that a previously requested pause and drain of the applier buffer
@@ -412,12 +456,18 @@ public:
      *
      * This is an interface that allows the applier to reenable writes after
      * a successful election triggers the draining of the applier buffer.
+     *
+     * The applier signals drain complete when the buffer is empty and it's in Draining
+     * state. We need to make sure the applier checks both conditions in the same term.
+     * Otherwise, it's possible that the applier confirms the empty buffer, but the node
+     * steps down and steps up so quickly that the applier signals drain complete in the wrong
+     * term.
      */
-    virtual void signalDrainComplete(OperationContext* txn) = 0;
+    virtual void signalDrainComplete(OperationContext* txn, long long termWhenBufferIsEmpty) = 0;
 
     /**
      * Waits duration of 'timeout' for applier to finish draining its buffer of operations.
-     * Returns OK if isWaitingForApplierToDrain() returns false.
+     * Returns OK if we are not in drain mode.
      * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the applier to drain its
      * buffer.
      * Returns ErrorCodes::BadValue if timeout is negative.
@@ -469,9 +519,9 @@ public:
     virtual void appendSlaveInfoData(BSONObjBuilder* result) = 0;
 
     /**
-     * Returns a copy of the current ReplicaSetConfig.
+     * Returns a copy of the current ReplSetConfig.
      */
-    virtual ReplicaSetConfig getConfig() const = 0;
+    virtual ReplSetConfig getConfig() const = 0;
 
     /**
      * Handles an incoming replSetGetConfig command. Adds BSON to 'result'.
@@ -481,11 +531,16 @@ public:
     /**
      * Processes the ReplSetMetadata returned from a command run against another
      * replica set member and so long as the config version in the metadata matches the replica set
-     * config version this node currently has, updates the current term and optionally updates
-     * this node's notion of the commit point.
+     * config version this node currently has, updates the current term.
+     *
+     * This does NOT update this node's notion of the commit point.
      */
-    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata,
-                                        bool advanceCommitPoint) = 0;
+    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) = 0;
+
+    /**
+     * This updates the node's notion of the commit point.
+     */
+    virtual void advanceCommitPoint(const OpTime& committedOptime) = 0;
 
     /**
      * Elections under protocol version 1 are triggered by a timer.
@@ -689,9 +744,11 @@ public:
                                               ReplSetRequestVotesResponse* response) = 0;
 
     /**
-     * Prepares a metadata object describing the current term, primary, and lastOp information.
+     * Prepares a metadata object with the ReplSetMetadata and the OplogQueryMetadata depending
+     * on what has been requested.
      */
-    virtual void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+    virtual void prepareReplMetadata(const BSONObj& metadataRequestObj,
+                                     const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const = 0;
 
     /**

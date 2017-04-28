@@ -209,15 +209,11 @@ bool ReplicationCoordinatorMock::setFollowerMode(const MemberState& newState) {
     return true;
 }
 
-bool ReplicationCoordinatorMock::isWaitingForApplierToDrain() {
-    return false;
+ReplicationCoordinator::ApplierState ReplicationCoordinatorMock::getApplierState() {
+    return ApplierState::Running;
 }
 
-bool ReplicationCoordinatorMock::isCatchingUp() {
-    return false;
-}
-
-void ReplicationCoordinatorMock::signalDrainComplete(OperationContext*) {}
+void ReplicationCoordinatorMock::signalDrainComplete(OperationContext*, long long) {}
 
 Status ReplicationCoordinatorMock::waitForDrainFinish(Milliseconds timeout) {
     invariant(false);
@@ -237,11 +233,11 @@ StatusWith<BSONObj> ReplicationCoordinatorMock::prepareReplSetUpdatePositionComm
     return cmdBuilder.obj();
 }
 
-ReplicaSetConfig ReplicationCoordinatorMock::getConfig() const {
+ReplSetConfig ReplicationCoordinatorMock::getConfig() const {
     return _getConfigReturnValue;
 }
 
-void ReplicationCoordinatorMock::setGetConfigReturnValue(ReplicaSetConfig returnValue) {
+void ReplicationCoordinatorMock::setGetConfigReturnValue(ReplSetConfig returnValue) {
     _getConfigReturnValue = std::move(returnValue);
 }
 
@@ -249,8 +245,9 @@ void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result)
     // TODO
 }
 
-void ReplicationCoordinatorMock::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata,
-                                                        bool advanceCommitPoint) {}
+void ReplicationCoordinatorMock::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) {}
+
+void ReplicationCoordinatorMock::advanceCommitPoint(const OpTime& committedOptime) {}
 
 void ReplicationCoordinatorMock::cancelAndRescheduleElectionTimeout() {}
 
@@ -381,8 +378,10 @@ void ReplicationCoordinatorMock::resetLastOpTimesFromOplog(OperationContext* txn
     invariant(false);
 }
 
-bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& currentSource,
-                                                        const rpc::ReplSetMetadata& metadata) {
+bool ReplicationCoordinatorMock::shouldChangeSyncSource(
+    const HostAndPort& currentSource,
+    const rpc::ReplSetMetadata& replMetadata,
+    boost::optional<rpc::OplogQueryMetadata> oqMetadata) {
     invariant(false);
 }
 
@@ -397,7 +396,8 @@ Status ReplicationCoordinatorMock::processReplSetRequestVotes(
     return Status::OK();
 }
 
-void ReplicationCoordinatorMock::prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+void ReplicationCoordinatorMock::prepareReplMetadata(const BSONObj& metadataRequestObj,
+                                                     const OpTime& lastOpTimeFromClient,
                                                      BSONObjBuilder* builder) const {}
 
 Status ReplicationCoordinatorMock::processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
