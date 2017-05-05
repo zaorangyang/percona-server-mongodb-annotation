@@ -111,6 +111,7 @@ public:
     };
 
     explicit ConnectionPool(std::unique_ptr<DependentTypeFactoryInterface> impl,
+                            std::string name,
                             Options options = Options{});
 
     ~ConnectionPool();
@@ -121,8 +122,12 @@ public:
 
     void appendConnectionStats(ConnectionPoolStats* stats) const;
 
+    size_t getNumConnectionsPerHost(const HostAndPort& hostAndPort) const;
+
 private:
     void returnConnection(ConnectionInterface* connection);
+
+    std::string _name;
 
     // Options are set at startup and never changed at run time, so these are
     // accessed outside the lock
@@ -190,7 +195,6 @@ class ConnectionPool::ConnectionInterface : public TimerInterface {
 
 public:
     ConnectionInterface() = default;
-
     virtual ~ConnectionInterface() = default;
 
     /**

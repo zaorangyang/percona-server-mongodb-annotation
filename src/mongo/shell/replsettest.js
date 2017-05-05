@@ -89,6 +89,8 @@ var ReplSetTest = function(opts) {
     var _unbridgedPorts;
     var _unbridgedNodes;
 
+    this.kDefaultTimeoutMS = 5 * 60 * 1000;
+
     // Publicly exposed variables
 
     /**
@@ -161,7 +163,7 @@ var ReplSetTest = function(opts) {
             return;
         }
 
-        timeout = timeout || 30000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         if (!node.getDB) {
             node = self.nodes[node];
@@ -401,7 +403,7 @@ var ReplSetTest = function(opts) {
      * Blocks until the secondary nodes have completed recovery and their roles are known.
      */
     this.awaitSecondaryNodes = function(timeout) {
-        timeout = timeout || 60000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         assert.soon(function() {
             // Reload who the current slaves are
@@ -445,7 +447,7 @@ var ReplSetTest = function(opts) {
      * Blocks until all nodes agree on who the primary is.
      */
     this.awaitNodesAgreeOnPrimary = function(timeout) {
-        timeout = timeout || 60000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         assert.soon(function() {
             try {
@@ -490,7 +492,7 @@ var ReplSetTest = function(opts) {
      * if primary is available will return a connection to it. Otherwise throws an exception.
      */
     this.getPrimary = function(timeout) {
-        timeout = timeout || 60000;
+        timeout = timeout || self.kDefaultTimeoutMS;
         var primary = null;
 
         assert.soon(function() {
@@ -503,7 +505,7 @@ var ReplSetTest = function(opts) {
 
     this.awaitNoPrimary = function(msg, timeout) {
         msg = msg || "Timed out waiting for there to be no primary in replset: " + this.name;
-        timeout = timeout || 30000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         assert.soon(function() {
             return _callIsMaster() == false;
@@ -572,7 +574,7 @@ var ReplSetTest = function(opts) {
         var config = cfg || this.getReplSetConfig();
         var cmd = {};
         var cmdKey = initCmd || 'replSetInitiate';
-        timeout = timeout || 120000;
+        timeout = timeout || self.kDefaultTimeoutMS;
         if (jsTestOptions().useLegacyReplicationProtocol &&
             !config.hasOwnProperty("protocolVersion")) {
             config.protocolVersion = 0;
@@ -588,6 +590,49 @@ var ReplSetTest = function(opts) {
             master = this.getPrimary();
             jsTest.authenticateNodes(this.nodes);
         }
+    };
+
+    /**
+     * Steps up 'node' as primary.
+     * Waits for all nodes to reach the same optime before each election.
+     * Calls awaitReplication() which requires all connections in 'nodes' to be authenticated.
+     */
+    this.stepUp = function(node) {
+        this.awaitReplication();
+        this.awaitNodesAgreeOnPrimary();
+        if (this.getPrimary() === node) {
+            print("Node " + node.host + " is already primary, no need to step it up.");
+            return;
+        }
+        print("Stepping up node " + node.host);
+
+        // Ensure the specified node is primary.
+        for (var i = 0; i < this.nodes.length; i++) {
+            var primary = this.getPrimary();
+            if (primary === node) {
+                break;
+            }
+            try {
+                // Make sure the nodes do not step back up for 10 minutes.
+                assert.commandWorked(primary.adminCommand({replSetStepDown: 10 * 60, force: true}));
+            } catch (ex) {
+                print("Caught exception while stepping down node '" + tojson(node.host) + "': " +
+                      tojson(ex));
+            }
+            this.awaitReplication();
+            this.awaitNodesAgreeOnPrimary();
+        }
+
+        // Reset the rest of the nodes so they can run for election during the test.
+        for (var i = 0; i < this.nodes.length; i++) {
+            // Cannot call replSetFreeze on the primary.
+            if (this.nodes[i] === node) {
+                continue;
+            }
+            assert.commandWorked(this.nodes[i].adminCommand({replSetFreeze: 0}));
+        }
+
+        assert.eq(this.getPrimary(), node, node.host + " was not primary after stepUp");
     };
 
     /**
@@ -712,7 +757,7 @@ var ReplSetTest = function(opts) {
     };
 
     this.awaitReplication = function(timeout) {
-        timeout = timeout || 30000;
+        timeout = timeout || self.kDefaultTimeoutMS;
 
         var masterLatestOpTime;
 
@@ -728,7 +773,7 @@ var ReplSetTest = function(opts) {
                 }
 
                 return true;
-            }, "awaiting oplog query", 30000);
+            }, "awaiting oplog query", timeout);
         };
 
         awaitLastOpTimeWrittenFn();
@@ -1310,7 +1355,7 @@ ReplSetTest.awaitRSClientHosts = function(conn, host, hostOk, rs, timeout) {
         return;
     }
 
-    timeout = timeout || 60000;
+    timeout = timeout || 5 * 60 * 1000;
 
     if (hostOk == undefined)
         hostOk = {

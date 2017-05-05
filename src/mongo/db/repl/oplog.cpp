@@ -795,6 +795,7 @@ Status applyOperation_inlock(OperationContext* txn,
                     // Wait for thread to start and register itself
                     IndexBuilder::waitForBgIndexStarting();
                 }
+                txn->recoveryUnit()->abandonSnapshot();
             } else {
                 IndexBuilder builder(o);
                 Status status = builder.buildInForeground(txn, db);
@@ -1201,8 +1202,7 @@ void SnapshotThread::run() {
                 invariant(!opTimeOfSnapshot.isNull());
             }
 
-            _manager->createSnapshot(txn.get(), name);
-            replCoord->onSnapshotCreate(opTimeOfSnapshot, name);
+            replCoord->createSnapshot(txn.get(), opTimeOfSnapshot, name);
         } catch (const WriteConflictException& wce) {
             log() << "skipping storage snapshot pass due to write conflict";
             continue;
