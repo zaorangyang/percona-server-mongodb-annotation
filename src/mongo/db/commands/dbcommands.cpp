@@ -38,6 +38,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
@@ -349,7 +350,8 @@ public:
                                        const BSONObj& cmdObj) {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
 
-        if (cmdObj.firstElement().numberInt() == -1 && !cmdObj.hasField("slowms") && !cmdObj.hasField("ratelimit")) {
+        if (cmdObj.firstElement().numberInt() == -1 && !cmdObj.hasField("slowms") &&
+            !cmdObj.hasField("sampleRate") && !cmdObj.hasField("ratelimit")) {
             // If you just want to get the current profiling level you can do so with just
             // read access to system.profile, even if you can't change the profiling level.
             if (authzSession->isAuthorizedForActionsOnResource(
@@ -394,6 +396,7 @@ public:
         result.append("was", db ? db->getProfilingLevel() : serverGlobalParams.defaultProfile);
         result.append("slowms", serverGlobalParams.slowMS);
         result.append("ratelimit", serverGlobalParams.rateLimit);
+        result.append("sampleRate", serverGlobalParams.sampleRate);
 
         if (!readOnly) {
             if (!db) {
@@ -409,16 +412,26 @@ public:
             serverGlobalParams.slowMS = slow.numberInt();
         }
 
-        const BSONElement ratelimitelem = cmdObj["ratelimit"];
-        if (ratelimitelem.isNumber()) {
-            // allowed range for input values is 0-RATE_LIMIT_MAX
-            // zero value is interpreted as 1 (disable filtering)
-            int rateLimit = ratelimitelem.numberInt();
-            if (0 <= rateLimit && rateLimit <= RATE_LIMIT_MAX) {
-                rateLimit = std::max(1, rateLimit);
-                serverGlobalParams.rateLimit = rateLimit;
-            }
-        }
+        long long newRateLimit;
+        uassertStatusOK(bsonExtractIntegerFieldWithDefault(
+            cmdObj, "ratelimit"_sd, serverGlobalParams.rateLimit, &newRateLimit));
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "ratelimit must be between 0 and " << RATE_LIMIT_MAX << " inclusive",
+                0 <= newRateLimit && newRateLimit <= RATE_LIMIT_MAX);
+        newRateLimit = std::max(1LL, newRateLimit);
+
+        double newSampleRate;
+        uassertStatusOK(bsonExtractDoubleFieldWithDefault(
+            cmdObj, "sampleRate"_sd, serverGlobalParams.sampleRate, &newSampleRate));
+        uassert(ErrorCodes::BadValue,
+                "sampleRate must be between 0.0 and 1.0 inclusive",
+                newSampleRate >= 0.0 && newSampleRate <= 1.0);
+
+        uassert(ErrorCodes::BadValue,
+                "cannot set both sampleRate and ratelimit to non-default values",
+                newSampleRate == 1.0 || newRateLimit == 1);
+        serverGlobalParams.rateLimit = newRateLimit;
+        serverGlobalParams.sampleRate = newSampleRate;
 
         if (!status.isOK()) {
             errmsg = status.reason();

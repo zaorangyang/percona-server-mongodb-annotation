@@ -11,8 +11,6 @@
  *
  * @param {Object} options An object with the following fields:
  *   {
- *     name {string}: name of this backup/restore test. Required.
- *     storageEngine {string}: name of storage engine. Required.
  *     backup {string}: backup method. Must be one of: fsyncLock, rolling, stopStart. Required.
  *     nodes {number}: number of nodes in replica set initially (excluding hidden secondary node to
  *                     be added during test). Default: 3.
@@ -43,39 +41,59 @@ var BackupRestoreTest = function(options) {
     /**
      * Starts a client that will run a CRUD workload.
      */
-    function _crudClient(host, dbName, coll) {
+    function _crudClient(host, dbName, collectionName) {
         // Launch CRUD client
-        var crudClientCmds = "var bulkNum = 1000;" + "var baseNum = 100000;" +
-            "var coll = db.getSiblingDB('" + dbName + "')." + coll + ";" +
-            "coll.ensureIndex({x: 1});" + "var largeValue = new Array(1024).join('L');" +
-            "Random.setRandomSeed();" +
-            // run indefinitely
-            "while (true) {" + "   try {" + "       var op = Random.rand();" +
-            "       var match = Math.floor(Random.rand() * baseNum);" + "       if (op < 0.2) {" +
-            // 20% of the operations: bulk insert bulkNum docs
-            "           var bulk = coll.initializeUnorderedBulkOp();" +
-            "           for (var i = 0; i < bulkNum; i++) {" +
-            "               bulk.insert({x: (match * i) % baseNum," +
-            "                   doc: largeValue.substring(0, match % largeValue.length)});" +
-            "           }" + "           assert.writeOK(bulk.execute());" +
-            "       } else if (op < 0.4) {" +
-            // 20% of the operations: update docs;
-            "           var updateOpts = {upsert: true, multi: true};" +
-            "           assert.writeOK(coll.update(" + "               {x: {$gte: match}}," +
-            "               {$inc: {x: baseNum}, $set: {n: 'hello'}}," +
-            "               updateOpts));" + "       } else if (op < 0.9) {" +
-            // 50% of the operations: find matchings docs
-            // itcount() consumes the cursor
-            "           coll.find({x: {$gte: match}}).itcount();" + "       } else {" +
-            // 10% of the operations: remove matching docs
-            "           assert.writeOK(coll.remove({x: {$gte: match}}));" + "       }" +
-            "   } catch(e) {" +
-            "       if (e instanceof ReferenceError || e instanceof TypeError) {" +
-            "           throw e;" + "       }" + "   }" + "}";
+        var crudClientCmds = function(dbName, collectionName) {
+            var bulkNum = 1000;
+            var baseNum = 100000;
+            var coll = db.getSiblingDB(dbName).getCollection(collectionName);
+            coll.ensureIndex({x: 1});
+            var largeValue = new Array(1024).join('L');
+            Random.setRandomSeed();
+            // Run indefinitely.
+            while (true) {
+                try {
+                    var op = Random.rand();
+                    var match = Math.floor(Random.rand() * baseNum);
+                    if (op < 0.2) {
+                        // 20% of the operations: bulk insert bulkNum docs.
+                        var bulk = coll.initializeUnorderedBulkOp();
+                        for (var i = 0; i < bulkNum; i++) {
+                            bulk.insert({
+                                x: (match * i) % baseNum,
+                                doc: largeValue.substring(0, match % largeValue.length),
+                            });
+                        }
+                        assert.writeOK(bulk.execute());
+                    } else if (op < 0.4) {
+                        // 20% of the operations: update docs.
+                        var updateOpts = {upsert: true, multi: true};
+                        assert.writeOK(coll.update({x: {$gte: match}},
+                                                   {$inc: {x: baseNum}, $set: {n: 'hello'}},
+                                                   updateOpts));
+                    } else if (op < 0.9) {
+                        // 50% of the operations: find matchings docs.
+                        // itcount() consumes the cursor
+                        coll.find({x: {$gte: match}}).itcount();
+                    } else {
+                        // 10% of the operations: remove matching docs.
+                        assert.writeOK(coll.remove({x: {$gte: match}}));
+                    }
+                } catch (e) {
+                    if (e instanceof ReferenceError || e instanceof TypeError) {
+                        throw e;
+                    }
+                }
+            }
+        };
 
         // Returns the pid of the started mongo shell so the CRUD test client can be terminated
         // without waiting for its execution to finish.
-        return startMongoProgramNoConnect("mongo", "--eval", crudClientCmds, host);
+        return startMongoProgramNoConnect(
+            'mongo',
+            '--eval',
+            '(' + crudClientCmds + ')("' + dbName + '", "' + collectionName + '")',
+            host);
     }
 
     /**
@@ -87,35 +105,70 @@ var BackupRestoreTest = function(options) {
         // started without any cluster options. Since the shell running this test was started with
         // --nodb, another mongo shell is used to allow implicit connections to be made to the
         // primary of the replica set.
-        var fsmClientCmds = "'use strict';" + "load('jstests/concurrency/fsm_libs/runner.js');" +
-            "var dir = 'jstests/concurrency/fsm_workloads';" + "var blacklist = [" +
-            "    'agg_group_external.js'," + "    'agg_sort_external.js'," +
-            "    'auth_create_role.js'," + "    'auth_create_user.js'," +
-            "    'auth_drop_role.js'," + "    'auth_drop_user.js'," +
-            "    'reindex_background.js'," + "    'yield_sort.js'," +
-            "    'create_index_background.js'," +
-            "].map(function(file) { return dir + '/' + file; });" + "Random.setRandomSeed();" +
-            // run indefinitely
-            "while (true) {" + "   try {" +
-            "       var workloads = Array.shuffle(ls(dir).filter(function(file) {" +
-            "           return !Array.contains(blacklist, file);" + "       }));" +
-            // Run workloads one at a time, so we ensure replication completes
-            "       workloads.forEach(function(workload) {" +
-            "           runWorkloadsSerially([workload]," +
-            "               {}, {}, {dropDatabaseBlacklist: ['" + blackListDb + "']});" +
-            // Wait for replication to complete between workloads
-            "           var wc = {writeConcern: {w: " + numNodes + ", wtimeout: 300000}};" +
-            "           var result = db.getSiblingDB('test').fsm_teardown.insert({ a: 1 }, wc);" +
-            "           assert.writeOK(result, 'teardown insert failed: ' + tojson(result));" +
-            "           result = db.getSiblingDB('test').fsm_teardown.drop();" +
-            "           assert(result, 'teardown drop failed');" + "       });" +
-            "   } catch(e) {" +
-            "       if (e instanceof ReferenceError || e instanceof TypeError) {" +
-            "           throw e;" + "       }" + "   }" + "}";
+        var fsmClientCmds = function(blackListDb, numNodes) {
+            'use strict';
+            load('jstests/concurrency/fsm_libs/runner.js');
+            var dir = 'jstests/concurrency/fsm_workloads';
+            var blacklist = [
+                // Disabled due to MongoDB restrictions and/or workload restrictions
+                'agg_group_external.js',  // uses >100MB of data, which can overwhelm test hosts
+                'agg_sort_external.js',   // uses >100MB of data, which can overwhelm test hosts
+                'auth_create_role.js',
+                'auth_create_user.js',
+                'auth_drop_role.js',
+                'auth_drop_user.js',
+                'create_index_background.js',
+                'findAndModify_update_grow.js',  // can cause OOM kills on test hosts
+                'reindex_background.js',
+                'rename_capped_collection_chain.js',
+                'rename_capped_collection_dbname_chain.js',
+                'rename_capped_collection_dbname_droptarget.js',
+                'rename_capped_collection_droptarget.js',
+                'rename_collection_chain.js',
+                'rename_collection_dbname_chain.js',
+                'rename_collection_dbname_droptarget.js',
+                'rename_collection_droptarget.js',
+                'update_rename.js',
+                'update_rename_noindex.js',
+                'yield_sort.js',
+            ].map(function(file) {
+                return dir + '/' + file;
+            });
+            Random.setRandomSeed();
+            // Run indefinitely.
+            while (true) {
+                try {
+                    var workloads = Array.shuffle(ls(dir).filter(function(file) {
+                        return !Array.contains(blacklist, file);
+                    }));
+                    // Run workloads one at a time, so we ensure replication completes.
+                    workloads.forEach(function(workload) {
+                        runWorkloadsSerially(
+                            [workload], {}, {}, {dropDatabaseBlacklist: [blackListDb]});
+                        // Wait for replication to complete between workloads.
+                        var wc = {
+                            writeConcern: {w: numNodes, wtimeout: ReplSetTest.kDefaultTimeoutMS}
+                        };
+                        var result = db.getSiblingDB('test').fsm_teardown.insert({a: 1}, wc);
+                        assert.writeOK(result, 'teardown insert failed: ' + tojson(result));
+                        result = db.getSiblingDB('test').fsm_teardown.drop();
+                        assert(result, 'teardown drop failed');
+                    });
+                } catch (e) {
+                    if (e instanceof ReferenceError || e instanceof TypeError) {
+                        throw e;
+                    }
+                }
+            }
+        };
 
         // Returns the pid of the started mongo shell so the FSM test client can be terminated
         // without waiting for its execution to finish.
-        return startMongoProgramNoConnect("mongo", "--eval", fsmClientCmds, host);
+        return startMongoProgramNoConnect(
+            'mongo',
+            '--eval',
+            '(' + fsmClientCmds + ')("' + blackListDb + '", ' + numNodes + ');',
+            host);
     }
 
     /**
@@ -128,11 +181,7 @@ var BackupRestoreTest = function(options) {
 
         // Test options
         // Test name
-        assert(options.name, 'Test name option not supplied');
-        var testName = options.name;
-
-        // Storage engine being tested
-        var storageEngine = options.storageEngine;
+        var testName = jsTest.name();
 
         // Backup type (must be specified)
         var allowedBackupKeys = ['fsyncLock', 'stopStart', 'rolling'];
@@ -154,17 +203,17 @@ var BackupRestoreTest = function(options) {
         var dbpathFormat = dbpathPrefix + '/mongod-$port';
 
         // Start numNodes node replSet
-        var replSetName = 'backupRestore';
         var rst = new ReplSetTest({
-            name: replSetName,
             nodes: numNodes,
-            nodeOptions: {oplogSize: 1024, storageEngine: storageEngine, dbpath: dbpathFormat}
+            nodeOptions: {dbpath: dbpathFormat},
+            oplogSize: 1024,
         });
         var nodes = rst.startSet();
 
-        // Wait up to 5 minutes for the replica set to initiate. We allow extra time because
-        // allocating 1GB oplogs on test hosts can be slow with mmapv1.
-        rst.initiate(null, null, 5 * 60 * 1000);
+        // Initialize replica set using default timeout. This should give us sufficient time to
+        // allocate 1GB oplogs on slow test hosts with mmapv1.
+        rst.initiate();
+        rst.awaitNodesAgreeOnPrimary();
         var primary = rst.getPrimary();
         var secondary = rst.getSecondary();
 
@@ -185,8 +234,7 @@ var BackupRestoreTest = function(options) {
 
         if (!ret.ok) {
             assert.commandFailedWithCode(ret, ErrorCodes.CommandNotSupported);
-            jsTestLog("Skipping test of " + options.backup + " for " + storageEngine +
-                      ' as it does not support fsync');
+            jsTestLog('Skipping test of ' + options.backup + ' as it does not support fsync.');
             return;
         }
 
@@ -213,8 +261,7 @@ var BackupRestoreTest = function(options) {
             var ret = secondary.getDB("admin").fsyncLock();
             if (!ret.ok) {
                 assert.commandFailedWithCode(ret, ErrorCodes.CommandNotSupported);
-                jsTestLog("Skipping test of " + options.backup + " for " + storageEngine +
-                          ' as it does not support fsync');
+                jsTestLog('Skipping test of ' + options.backup + ' as it does not support fsync.');
                 return;
             }
 
@@ -262,9 +309,10 @@ var BackupRestoreTest = function(options) {
         // Add new hidden node to replSetTest
         jsTestLog('Starting new hidden node (but do not add to replica set) with dbpath ' +
                   hiddenDbpath + '.');
-        var hiddenCfg =
-            {noCleanData: true, oplogSize: 1024, dbpath: hiddenDbpath, replSet: replSetName};
         var nodesBeforeAddingHiddenMember = rst.nodes.slice();
+        // ReplSetTest.add() will use default values for --oplogSize and --replSet consistent with
+        // existing nodes.
+        var hiddenCfg = {noCleanData: true, dbpath: hiddenDbpath};
         var hiddenNode = rst.add(hiddenCfg);
         var hiddenHost = hiddenNode.host;
 
@@ -307,6 +355,7 @@ var BackupRestoreTest = function(options) {
         rst.waitForState(hiddenNode, ReplSetTest.State.SECONDARY);
 
         // Wait for secondaries to finish catching up before shutting down.
+        rst.awaitNodesAgreeOnPrimary();
         primary = rst.getPrimary();
         assert.writeOK(primary.getDB("test").foo.insert(
             {}, {writeConcern: {w: rst.nodes.length, wtimeout: 10 * 60 * 1000}}));

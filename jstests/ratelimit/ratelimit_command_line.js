@@ -14,4 +14,22 @@
     }
 
     MongoRunner.stopMongod(conn);
+
+    // ensure that mongod can start with non-default slowOpSampleRate
+    conn = MongoRunner.runMongod( {slowOpSampleRate: 0.7} );
+    assert(conn !== null, "cannot start mongod with --slowOpSampleRate specified");
+    MongoRunner.stopMongod(conn);
+
+    // if one of the parameters has default value then mongod should start
+    conn = MongoRunner.runMongod( {rateLimit: 1, slowOpSampleRate: 0.7} );
+    assert(conn !== null, "cannot start mongod with --slowOpSampleRate specified");
+    MongoRunner.stopMongod(conn);
+
+    conn = MongoRunner.runMongod( {rateLimit: 100, slowOpSampleRate: 1.0} );
+    assert(conn !== null, "cannot start mongod with --slowOpSampleRate specified");
+    MongoRunner.stopMongod(conn);
+
+    // ensure that mongod does not accept non-default values for both --rateLimit and --slowOpSampleRate
+    conn = MongoRunner.runMongod( {rateLimit: 100, slowOpSampleRate: 0.7} );
+    assert.eq(conn, null);
 })();

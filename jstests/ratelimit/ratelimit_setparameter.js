@@ -14,5 +14,16 @@
         assert.eq(res.profilingRateLimit, 79);
     }
 
+    // check that we cannot use setParameter to set non-default rate limit when sampleRate is non-default
+    {
+        // set default rate limit and non-default sampleRate
+        var res = db.runCommand( { profile: 2, ratelimit: 1, sampleRate: 0.5 } );
+        assert.commandWorked(res, "successfully set prohibited parameter values");
+
+        // try to set non-default rate limit (should fail)
+        var res = db.getSiblingDB('admin').runCommand( { setParameter: 1, "profilingRateLimit": 79 } );
+        assert.commandFailed(res, "setParameter succefully set profilingRateLimit when it should not");
+    }
+
     MongoRunner.stopMongod(conn);
 })();

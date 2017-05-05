@@ -67,7 +67,7 @@ public:
 
 void ScopedMigrationRequestTest::checkMigrationsCollectionForDocument(
     std::string chunkName, const unsigned long expectedNumberOfDocuments) {
-    auto response = shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+    auto response = shardRegistry()->getConfigShard()->exhaustiveFind(
         operationContext(),
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         repl::ReadConcernLevel::kMajorityReadConcern,
@@ -101,7 +101,7 @@ MigrateInfo makeMigrateInfo() {
     kChunkVersion.appendForChunk(&chunkBuilder);
     chunkBuilder.append(ChunkType::shard(), kFromShard.toString());
 
-    ChunkType chunkType = assertGet(ChunkType::fromBSON(chunkBuilder.obj()));
+    ChunkType chunkType = assertGet(ChunkType::fromConfigBSON(chunkBuilder.obj()));
     ASSERT_OK(chunkType.validate());
 
     return MigrateInfo(kToShard, chunkType);

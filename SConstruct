@@ -917,6 +917,7 @@ envDict = dict(BUILD_ROOT=buildDir,
                DIST_ARCHIVE_SUFFIX='.tgz',
                DIST_BINARIES=[],
                MODULE_BANNERS=[],
+               MODULE_INJECTORS=dict(),
                ARCHIVE_ADDITION_DIR_MAP={},
                ARCHIVE_ADDITIONS=[],
                PYTHON=utils.find_python(),
@@ -1282,10 +1283,10 @@ if link_model.startswith("dynamic"):
     # ensure that missing symbols due to unnamed dependency edges
     # result in link errors.
     #
-    # NOTE: The 'incomplete' tag can be applied to a library to
-    # indicate that it does not (or cannot) completely express all of
-    # its required link dependencies. This can occur for three
-    # reasons:
+    # NOTE: The `illegal_cyclic_or_unresolved_dependencies_whitelisted`
+    # tag can be applied to a library to indicate that it does not (or
+    # cannot) completely express all of its required link dependencies.
+    # This can occur for four reasons:
     #
     # - No unique provider for the symbol: Some symbols do not have a
     #   unique dependency that provides a definition, in which case it
@@ -1303,12 +1304,19 @@ if link_model.startswith("dynamic"):
     #   will be linked. The mongo::inShutdown symbol is a good
     #   example.
     #
+    # - The symbol is provided by a third-party library, outside of our
+    #   control.
+    #
     # All of these are defects in the linking model. In an effort to
     # eliminate these issues, we have begun tagging those libraries
     # that are affected, and requiring that all non-tagged libraries
     # correctly express all dependencies. As we repair each defective
     # library, we can remove the tag. When all the tags are removed
-    # the graph will be acyclic.
+    # the graph will be acyclic. Libraries which are incomplete for the
+    # final reason, "libraries outside of our control", may remain for
+    # reasons beyond our control. Such libraries ideally should
+    # have no dependencies (and thus be leaves in our linking DAG).
+    # If that condition is met, then the graph will be acyclic.
 
     if env.TargetOSIs('osx'):
         if link_model == "dynamic-strict":
@@ -1319,8 +1327,7 @@ if link_model.startswith("dynamic"):
                 # On darwin, since it is strict by default, we need to add a flag
                 # when libraries are tagged incomplete.
                 if ('illegal_cyclic_or_unresolved_dependencies_whitelisted'
-                    in target[0].get_env().get("LIBDEPS_TAGS", []) or
-                    'incomplete' in target[0].get_env().get("LIBDEPS_TAGS", [])):
+                    in target[0].get_env().get("LIBDEPS_TAGS", [])):
                     return ["-Wl,-undefined,dynamic_lookup"]
                 return []
             env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
@@ -1338,8 +1345,7 @@ if link_model.startswith("dynamic"):
                 # tagged incomplete.
                 def libdeps_tags_expand_incomplete(source, target, env, for_signature):
                     if ('illegal_cyclic_or_unresolved_dependencies_whitelisted'
-                        not in target[0].get_env().get("LIBDEPS_TAGS", []) and
-                        'incomplete' not in target[0].get_env().get("LIBDEPS_TAGS", [])):
+                        not in target[0].get_env().get("LIBDEPS_TAGS", [])):
                         return ["-Wl,-z,defs"]
                     return []
                 env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
@@ -2623,7 +2629,7 @@ def doConfigure(myenv):
             """)
 
             context.Message("Checking if pthread_setname_np is supported... ")
-            result = context.TryCompile(compile_test_body, ".c")
+            result = context.TryCompile(compile_test_body, ".cpp")
             context.Result(result)
             return result
 
@@ -3018,6 +3024,13 @@ Export("inmemory")
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
 env.AddMethod(injectMongoIncludePaths, 'InjectMongoIncludePaths')
+
+def injectModule(env, module, **kwargs):
+    injector = env['MODULE_INJECTORS'].get(module)
+    if injector:
+        return injector(env, **kwargs)
+    return env
+env.AddMethod(injectModule, 'InjectModule')
 
 compileCommands = env.CompilationDatabase('compile_commands.json')
 compileDb = env.Alias("compiledb", compileCommands)

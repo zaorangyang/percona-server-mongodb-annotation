@@ -146,6 +146,13 @@ Status addMongodOptions(moe::OptionSection* options) {
                            "value of slow for profile and console log")
         .setDefault(moe::Value(100));
 
+    general_options
+        .addOptionChaining("operationProfiling.slowOpSampleRate",
+                           "slowOpSampleRate",
+                           moe::Double,
+                           "fraction of slow ops to include in the profile and console log")
+        .setDefault(moe::Value(1.0));
+
     general_options.addOptionChaining("profile", "profile", moe::Int, "0=off 1=slow, 2=all")
         .setSources(moe::SourceAllLegacy);
 
@@ -633,6 +640,14 @@ Status validateMongodOptions(const moe::Environment& params) {
                       "Can't specify both --journal and --nojournal options.");
     }
 
+    if (params.count("operationProfiling.slowOpSampleRate")
+        && params["operationProfiling.slowOpSampleRate"].as<double>() != 1.0
+        && params.count("operationProfiling.rateLimit")
+        && params["operationProfiling.rateLimit"].as<int>() != 1) {
+        return Status(ErrorCodes::BadValue,
+                      "Can't specify non-default values for both --rateLimit and --slowOpSampleRate options.");
+    }
+
     // SERVER-10019 Enabling rest/jsonp without --httpinterface should break in all cases in the
     // future
     if (params.count("net.http.RESTInterfaceEnabled") &&
@@ -1058,6 +1073,10 @@ Status storeMongodOptions(const moe::Environment& params) {
         int rateLimit = params["operationProfiling.rateLimit"].as<int>();
         rateLimit = std::max(1, rateLimit);
         serverGlobalParams.rateLimit = rateLimit;
+    }
+
+    if (params.count("operationProfiling.slowOpSampleRate")) {
+        serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
     }
 
     if (params.count("storage.syncPeriodSecs")) {

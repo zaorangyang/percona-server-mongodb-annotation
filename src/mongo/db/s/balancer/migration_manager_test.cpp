@@ -210,7 +210,7 @@ ChunkType MigrationManagerTest::setUpChunk(const std::string& collName,
     chunk.setShard(shardId);
     chunk.setVersion(version);
     ASSERT_OK(catalogClient()->insertConfigDocument(
-        operationContext(), ChunkType::ConfigNS, chunk.toBSON(), kMajorityWriteConcern));
+        operationContext(), ChunkType::ConfigNS, chunk.toConfigBSON(), kMajorityWriteConcern));
     return chunk;
 }
 
@@ -231,20 +231,19 @@ void MigrationManagerTest::setUpMigration(const ChunkType& chunk, const ShardId&
 }
 
 void MigrationManagerTest::checkMigrationsCollectionIsEmptyAndLocksAreUnlocked() {
-    auto statusWithMigrationsQueryResponse =
-        shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-            operationContext(),
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            repl::ReadConcernLevel::kMajorityReadConcern,
-            NamespaceString(MigrationType::ConfigNS),
-            BSONObj(),
-            BSONObj(),
-            boost::none);
+    auto statusWithMigrationsQueryResponse = shardRegistry()->getConfigShard()->exhaustiveFind(
+        operationContext(),
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        repl::ReadConcernLevel::kMajorityReadConcern,
+        NamespaceString(MigrationType::ConfigNS),
+        BSONObj(),
+        BSONObj(),
+        boost::none);
     Shard::QueryResponse migrationsQueryResponse =
         uassertStatusOK(statusWithMigrationsQueryResponse);
     ASSERT_EQUALS(0U, migrationsQueryResponse.docs.size());
 
-    auto statusWithLocksQueryResponse = shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+    auto statusWithLocksQueryResponse = shardRegistry()->getConfigShard()->exhaustiveFind(
         operationContext(),
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         repl::ReadConcernLevel::kMajorityReadConcern,
@@ -553,15 +552,14 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
     // Check that the migration that was active when the migration manager was interrupted can be
     // found in config.migrations (and thus would be recovered if a migration manager were to start
     // up again).
-    auto statusWithMigrationsQueryResponse =
-        shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-            operationContext(),
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            repl::ReadConcernLevel::kMajorityReadConcern,
-            NamespaceString(MigrationType::ConfigNS),
-            BSON(MigrationType::name(chunk.getName())),
-            BSONObj(),
-            boost::none);
+    auto statusWithMigrationsQueryResponse = shardRegistry()->getConfigShard()->exhaustiveFind(
+        operationContext(),
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        repl::ReadConcernLevel::kMajorityReadConcern,
+        NamespaceString(MigrationType::ConfigNS),
+        BSON(MigrationType::name(chunk.getName())),
+        BSONObj(),
+        boost::none);
     Shard::QueryResponse migrationsQueryResponse =
         uassertStatusOK(statusWithMigrationsQueryResponse);
     ASSERT_EQUALS(1U, migrationsQueryResponse.docs.size());

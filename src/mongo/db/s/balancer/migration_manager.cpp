@@ -87,27 +87,6 @@ Status extractMigrationStatusFromCommandResponse(const BSONObj& commandResponse)
     return commandStatus;
 }
 
-/**
- * Blocking call to acquire the distributed collection lock for the specified namespace.
- */
-StatusWith<DistLockHandle> acquireDistLock(OperationContext* txn,
-                                           const OID& lockSessionID,
-                                           const NamespaceString& nss) {
-    const std::string whyMessage(stream() << "Migrating chunk(s) in collection " << nss.ns());
-
-    auto statusWithDistLockHandle =
-        Grid::get(txn)->catalogClient(txn)->getDistLockManager()->lockWithSessionID(
-            txn, nss.ns(), whyMessage, lockSessionID, DistLockManager::kSingleLockAttemptTimeout);
-
-    if (!statusWithDistLockHandle.isOK()) {
-        return {statusWithDistLockHandle.getStatus().code(),
-                stream() << "Could not acquire collection lock for " << nss.ns()
-                         << " to migrate chunks, due to "
-                         << statusWithDistLockHandle.getStatus().reason()};
-    }
-
-    return statusWithDistLockHandle;
-}
 
 /**
  * Returns whether the specified status is an error caused by stepdown of the primary config node
@@ -204,10 +183,9 @@ Status MigrationManager::executeManualMigration(
         return scopedCMStatus.getStatus();
     }
 
-    auto scopedCM = std::move(scopedCMStatus.getValue());
-    ChunkManager* const cm = scopedCM.cm();
+    const auto& scopedCM = scopedCMStatus.getValue();
 
-    auto chunk = cm->findIntersectingChunkWithSimpleCollation(txn, migrateInfo.minKey);
+    auto chunk = scopedCM.cm()->findIntersectingChunkWithSimpleCollation(txn, migrateInfo.minKey);
     invariant(chunk);
 
     Status commandStatus = _processRemoteCommandResponse(
@@ -241,7 +219,7 @@ void MigrationManager::startRecoveryAndAcquireDistLocks(OperationContext* txn) {
 
     // Load the active migrations from the config.migrations collection.
     auto statusWithMigrationsQueryResponse =
-        Grid::get(txn)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+        Grid::get(txn)->shardRegistry()->getConfigShard()->exhaustiveFind(
             txn,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
             repl::ReadConcernLevel::kLocalReadConcern,
@@ -341,8 +319,7 @@ void MigrationManager::finishRecovery(OperationContext* txn,
             return;
         }
 
-        auto scopedCM = std::move(scopedCMStatus.getValue());
-        ChunkManager* const cm = scopedCM.cm();
+        const auto& scopedCM = scopedCMStatus.getValue();
 
         int scheduledMigrations = 0;
 
@@ -352,7 +329,8 @@ void MigrationManager::finishRecovery(OperationContext* txn,
             auto waitForDelete = migrationType.getWaitForDelete();
             migrateInfos.pop_front();
 
-            auto chunk = cm->findIntersectingChunkWithSimpleCollation(txn, migrationInfo.minKey);
+            auto chunk =
+                scopedCM.cm()->findIntersectingChunkWithSimpleCollation(txn, migrationInfo.minKey);
             invariant(chunk);
 
             if (chunk->getShardId() != migrationInfo.from) {
@@ -405,9 +383,9 @@ void MigrationManager::interruptAndDisableMigrations() {
 
     // Interrupt any active migrations with dist lock
     for (auto& cmsEntry : _activeMigrations) {
-        auto* cms = &cmsEntry.second;
+        auto& migrations = cmsEntry.second;
 
-        for (auto& migration : cms->migrations) {
+        for (auto& migration : migrations) {
             if (migration.callbackHandle) {
                 executor->cancel(*migration.callbackHandle);
             }
@@ -498,24 +476,34 @@ void MigrationManager::_schedule_inlock(OperationContext* txn,
 
     auto it = _activeMigrations.find(nss);
     if (it == _activeMigrations.end()) {
+        const std::string whyMessage(stream() << "Migrating chunk(s) in collection " << nss.ns());
+
         // Acquire the collection distributed lock (blocking call)
-        auto distLockHandleStatus = acquireDistLock(txn, _lockSessionID, nss);
-        if (!distLockHandleStatus.isOK()) {
-            migration.completionNotification->set(distLockHandleStatus.getStatus());
+        auto statusWithDistLockHandle =
+            Grid::get(txn)->catalogClient(txn)->getDistLockManager()->lockWithSessionID(
+                txn,
+                nss.ns(),
+                whyMessage,
+                _lockSessionID,
+                DistLockManager::kSingleLockAttemptTimeout);
+
+        if (!statusWithDistLockHandle.isOK()) {
+            migration.completionNotification->set(
+                Status(statusWithDistLockHandle.getStatus().code(),
+                       stream() << "Could not acquire collection lock for " << nss.ns()
+                                << " to migrate chunks, due to "
+                                << statusWithDistLockHandle.getStatus().reason()));
             return;
         }
 
-        it = _activeMigrations
-                 .insert(std::make_pair(
-                     nss, CollectionMigrationsState(std::move(distLockHandleStatus.getValue()))))
-                 .first;
+        it = _activeMigrations.insert(std::make_pair(nss, MigrationsList())).first;
     }
 
-    auto collectionMigrationState = &it->second;
+    auto migrations = &it->second;
 
     // Add ourselves to the list of migrations on this collection
-    collectionMigrationState->migrations.push_front(std::move(migration));
-    auto itMigration = collectionMigrationState->migrations.begin();
+    migrations->push_front(std::move(migration));
+    auto itMigration = migrations->begin();
 
     const RemoteCommandRequest remoteRequest(
         targetHost, NamespaceString::kAdminDb.toString(), itMigration->moveChunkCmdObj, txn);
@@ -523,8 +511,7 @@ void MigrationManager::_schedule_inlock(OperationContext* txn,
     StatusWith<executor::TaskExecutor::CallbackHandle> callbackHandleWithStatus =
         executor->scheduleRemoteCommand(
             remoteRequest,
-            [this, collectionMigrationState, itMigration](
-                const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
+            [this, itMigration](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
                 Client::initThread(getThreadName().c_str());
                 ON_BLOCK_EXIT([&] { Client::destroy(); });
                 auto txn = cc().makeOperationContext();
@@ -554,12 +541,12 @@ void MigrationManager::_complete_inlock(OperationContext* txn,
     auto it = _activeMigrations.find(nss);
     invariant(it != _activeMigrations.end());
 
-    auto collectionMigrationState = &it->second;
-    collectionMigrationState->migrations.erase(itMigration);
+    auto migrations = &it->second;
+    migrations->erase(itMigration);
 
-    if (collectionMigrationState->migrations.empty()) {
+    if (migrations->empty()) {
         Grid::get(txn)->catalogClient(txn)->getDistLockManager()->unlock(
-            txn, collectionMigrationState->distLockHandle, nss.ns());
+            txn, _lockSessionID, nss.ns());
         _activeMigrations.erase(it);
         _checkDrained_inlock();
     }
@@ -660,14 +647,6 @@ MigrationManager::Migration::Migration(NamespaceString inNss, BSONObj inMoveChun
 
 MigrationManager::Migration::~Migration() {
     invariant(completionNotification);
-}
-
-MigrationManager::CollectionMigrationsState::CollectionMigrationsState(
-    DistLockHandle inDistLockHandle)
-    : distLockHandle(std::move(inDistLockHandle)) {}
-
-MigrationManager::CollectionMigrationsState::~CollectionMigrationsState() {
-    invariant(migrations.empty());
 }
 
 }  // namespace mongo

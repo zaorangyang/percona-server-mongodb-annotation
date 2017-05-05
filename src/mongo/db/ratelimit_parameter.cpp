@@ -76,8 +76,12 @@ Status RateLimitParameter::_set(int rateLimit) {
     if (rateLimit == 0)
         rateLimit = 1;
     if (1 <= rateLimit && rateLimit <= RATE_LIMIT_MAX) {
-        serverGlobalParams.rateLimit = rateLimit;
-        return Status::OK();
+        if (rateLimit == 1 || serverGlobalParams.sampleRate == 1.0) {
+            serverGlobalParams.rateLimit = rateLimit;
+            return Status::OK();
+        }
+        return Status(ErrorCodes::BadValue,
+                      "cannot set both sampleRate and ratelimit to non-default values");
     }
     StringBuilder sb;
     sb << "Bad value for profilingRateLimit: " << rateLimit
