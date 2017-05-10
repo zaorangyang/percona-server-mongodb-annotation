@@ -315,7 +315,9 @@ public:
 
     virtual void forceSnapshotCreation() override;
 
-    virtual void onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name) override;
+    virtual void createSnapshot(OperationContext* txn,
+                                OpTime timeOfSnapshot,
+                                SnapshotName name) override;
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
 
@@ -1183,11 +1185,11 @@ private:
     void _startElectSelfIfEligibleV1(bool isPriorityTakeover);
 
     /**
-     * Reset the term of last vote to 0 to prevent any node from voting for term 0.
-     * Blocking until last vote write finishes. Must be called without holding _mutex.
+     * Resets the term of last vote to 0 to prevent any node from voting for term 0.
+     * Returns the event handle that indicates when last vote write finishes.
      */
-    void _resetElectionInfoOnProtocolVersionUpgrade(const ReplicaSetConfig& oldConfig,
-                                                    const ReplicaSetConfig& newConfig);
+    EventHandle _resetElectionInfoOnProtocolVersionUpgrade(const ReplicaSetConfig& oldConfig,
+                                                           const ReplicaSetConfig& newConfig);
 
     /**
      * Schedules work and returns handle to callback.

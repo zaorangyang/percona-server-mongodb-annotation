@@ -549,11 +549,22 @@ var authCommandsLib = {
           teardown: function(db) {
               db.foo.drop();
           },
-          testcases: [{
-              runOnDb: firstDbName,
-              roles: {clusterMonitor: 1, clusterAdmin: 1, root: 1, __system: 1},
-              privileges: [{resource: {anyResource: true}, actions: ["indexStats"]}]
-          }]
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_monitoring,
+                privileges:
+                    [{resource: {db: firstDbName, collection: "foo"}, actions: ["indexStats"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_monitoring,
+                privileges: [{
+                    resource: {db: secondDbName, collection: "foo"},
+                    actions: ["indexStats"]
+                }]
+              }
+          ]
         },
         {
           testname: "appendOplogNote",
@@ -1600,6 +1611,24 @@ var authCommandsLib = {
                 runOnDb: adminDbName,
                 roles: roles_monitoring,
                 privileges: [{resource: {cluster: true}, actions: ["getCmdLineOpts"]}]
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "getDiagnosticData",
+          command: {getDiagnosticData: 1},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_monitoring,
+                privileges: [
+                    {resource: {cluster: true}, actions: ["serverStatus"]},
+                    {resource: {cluster: true}, actions: ["replSetGetStatus"]},
+                    {resource: {db: "local", collection: "oplog.rs"}, actions: ["collStats"]},
+                ]
               },
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}

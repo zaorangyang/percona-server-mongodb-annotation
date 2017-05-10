@@ -404,6 +404,8 @@ void IndexCatalog::IndexBuildBlock::fail() {
 void IndexCatalog::IndexBuildBlock::success() {
     Collection* collection = _catalog->_collection;
     fassert(17207, collection->ok());
+    NamespaceString ns(_indexNamespace);
+    invariant(_txn->lockState()->isDbLockedForMode(ns.db(), MODE_X));
 
     collection->getCatalogEntry()->indexBuildSuccess(_txn, _indexName);
 
@@ -413,6 +415,8 @@ void IndexCatalog::IndexBuildBlock::success() {
     fassert(17331, entry && entry == _entry);
 
     OperationContext* txn = _txn;
+    LOG(2) << "marking index " << _indexName << " as ready in snapshot id "
+           << txn->recoveryUnit()->getSnapshotId();
     _txn->recoveryUnit()->onCommit([txn, entry, collection] {
         // Note: this runs after the WUOW commits but before we release our X lock on the
         // collection. This means that any snapshot created after this must include the full index,
@@ -1165,9 +1169,12 @@ Status IndexCatalog::_unindexRecord(OperationContext* txn,
     options.logIfError = logIfError;
     options.dupsAllowed = isDupsAllowed(index->descriptor());
 
-    // For unindex operations, dupsAllowed=false really means that it is safe to delete anything
-    // that matches the key, without checking the RecordID, since dups are impossible. We need
-    // to disable this behavior for in-progress indexes. See SERVER-17487 for more details.
+    // On WiredTiger, we do blind unindexing of records for efficiency.  However, when duplicates
+    // are allowed in unique indexes, WiredTiger does not do blind unindexing, and instead confirms
+    // that the recordid matches the element we are removing.
+    // We need to disable blind-deletes for in-progress indexes, in order to force recordid-matching
+    // for unindex operations, since initial sync can build an index over a collection with
+    // duplicates. See SERVER-17487 for more details.
     options.dupsAllowed = options.dupsAllowed || !index->isReady(txn);
 
     int64_t removed;

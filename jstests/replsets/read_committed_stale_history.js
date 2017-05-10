@@ -38,16 +38,6 @@
         });
     }
 
-    function stepUp(node) {
-        var primary = rst.getPrimary();
-        if (primary != node) {
-            assert.throws(function() {
-                primary.adminCommand({replSetStepDown: 60 * 5});
-            });
-        }
-        waitForPrimary(node);
-    }
-
     // Asserts that the given document is not visible in the committed snapshot on the given node.
     function checkDocNotCommitted(node, doc) {
         var docs =
@@ -56,8 +46,7 @@
     }
 
     jsTestLog("Make sure node 0 is primary.");
-    rst.getPrimary();
-    stepUp(nodes[0]);
+    rst.stepUp(nodes[0]);
     var primary = rst.getPrimary();
     var secondaries = rst.getSecondaries();
     assert.eq(nodes[0], primary);
@@ -133,6 +122,7 @@
         assert.commandWorked(res);
     }
     rst.waitForState(nodes[0], ReplSetTest.State.SECONDARY);
+    reconnect(nodes[0]);
 
     // At this point the former primary will attempt to go into rollback, but the
     // 'rollbackHangBeforeStart' will prevent it from doing so.
