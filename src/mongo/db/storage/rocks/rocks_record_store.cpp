@@ -949,7 +949,7 @@ RecordId RocksRecordStore::Iterator::getNext() {
 
     if (_iterator->Valid()) {
         _curr = _decodeCurr();
-        if (_cappedVisibilityManager.get()) {  // isCapped?
+        if (_forward() && _cappedVisibilityManager.get()) {  // isCapped?
             if (_readUntilForOplog.isNull()) {
                 // this is the normal capped case
                 if (_cappedVisibilityManager->isCappedHidden(_curr)) {
