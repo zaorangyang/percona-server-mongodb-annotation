@@ -43,6 +43,7 @@
 #include "mongo/s/config_server_test_fixture.h"
 #include "mongo/s/move_chunk_request.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
@@ -231,19 +232,20 @@ void MigrationManagerTest::setUpMigration(const ChunkType& chunk, const ShardId&
 }
 
 void MigrationManagerTest::checkMigrationsCollectionIsEmptyAndLocksAreUnlocked() {
-    auto statusWithMigrationsQueryResponse = shardRegistry()->getConfigShard()->exhaustiveFind(
-        operationContext(),
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        repl::ReadConcernLevel::kMajorityReadConcern,
-        NamespaceString(MigrationType::ConfigNS),
-        BSONObj(),
-        BSONObj(),
-        boost::none);
+    auto statusWithMigrationsQueryResponse =
+        shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+            operationContext(),
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            repl::ReadConcernLevel::kMajorityReadConcern,
+            NamespaceString(MigrationType::ConfigNS),
+            BSONObj(),
+            BSONObj(),
+            boost::none);
     Shard::QueryResponse migrationsQueryResponse =
         uassertStatusOK(statusWithMigrationsQueryResponse);
     ASSERT_EQUALS(0U, migrationsQueryResponse.docs.size());
 
-    auto statusWithLocksQueryResponse = shardRegistry()->getConfigShard()->exhaustiveFind(
+    auto statusWithLocksQueryResponse = shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
         operationContext(),
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         repl::ReadConcernLevel::kMajorityReadConcern,
@@ -311,6 +313,7 @@ TEST_F(MigrationManagerTest, OneCollectionTwoMigrations) {
     const std::vector<MigrateInfo> migrationRequests{{kShardId1, chunk1}, {kShardId3, chunk2}};
 
     auto future = launchAsync([this, migrationRequests] {
+        ON_BLOCK_EXIT([&] { Client::destroy(); });
         Client::initThreadIfNotAlready("Test");
         auto txn = cc().makeOperationContext();
 
@@ -373,6 +376,7 @@ TEST_F(MigrationManagerTest, TwoCollectionsTwoMigrationsEach) {
                                                      {kShardId3, chunk2coll2}};
 
     auto future = launchAsync([this, migrationRequests] {
+        ON_BLOCK_EXIT([&] { Client::destroy(); });
         Client::initThreadIfNotAlready("Test");
         auto txn = cc().makeOperationContext();
 
@@ -427,6 +431,7 @@ TEST_F(MigrationManagerTest, SourceShardNotFound) {
     const std::vector<MigrateInfo> migrationRequests{{kShardId1, chunk1}, {kShardId3, chunk2}};
 
     auto future = launchAsync([this, chunk1, chunk2, migrationRequests] {
+        ON_BLOCK_EXIT([&] { Client::destroy(); });
         Client::initThreadIfNotAlready("Test");
         auto txn = cc().makeOperationContext();
 
@@ -473,6 +478,7 @@ TEST_F(MigrationManagerTest, JumboChunkResponseBackwardsCompatibility) {
     const std::vector<MigrateInfo> migrationRequests{{kShardId1, chunk1}};
 
     auto future = launchAsync([this, chunk1, migrationRequests] {
+        ON_BLOCK_EXIT([&] { Client::destroy(); });
         Client::initThreadIfNotAlready("Test");
         auto txn = cc().makeOperationContext();
 
@@ -511,6 +517,7 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
         setUpChunk(collName, kKeyPattern.globalMin(), kKeyPattern.globalMax(), kShardId0, version);
 
     auto future = launchAsync([&] {
+        ON_BLOCK_EXIT([&] { Client::destroy(); });
         Client::initThreadIfNotAlready("Test");
         auto txn = cc().makeOperationContext();
 
@@ -552,14 +559,15 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
     // Check that the migration that was active when the migration manager was interrupted can be
     // found in config.migrations (and thus would be recovered if a migration manager were to start
     // up again).
-    auto statusWithMigrationsQueryResponse = shardRegistry()->getConfigShard()->exhaustiveFind(
-        operationContext(),
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        repl::ReadConcernLevel::kMajorityReadConcern,
-        NamespaceString(MigrationType::ConfigNS),
-        BSON(MigrationType::name(chunk.getName())),
-        BSONObj(),
-        boost::none);
+    auto statusWithMigrationsQueryResponse =
+        shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+            operationContext(),
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            repl::ReadConcernLevel::kMajorityReadConcern,
+            NamespaceString(MigrationType::ConfigNS),
+            BSON(MigrationType::name(chunk.getName())),
+            BSONObj(),
+            boost::none);
     Shard::QueryResponse migrationsQueryResponse =
         uassertStatusOK(statusWithMigrationsQueryResponse);
     ASSERT_EQUALS(1U, migrationsQueryResponse.docs.size());
@@ -598,6 +606,7 @@ TEST_F(MigrationManagerTest, RestartMigrationManager) {
     _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle);
 
     auto future = launchAsync([&] {
+        ON_BLOCK_EXIT([&] { Client::destroy(); });
         Client::initThreadIfNotAlready("Test");
         auto txn = cc().makeOperationContext();
 
@@ -652,6 +661,7 @@ TEST_F(MigrationManagerTest, MigrationRecovery) {
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
 
     auto future = launchAsync([this] {
+        ON_BLOCK_EXIT([&] { Client::destroy(); });
         Client::initThreadIfNotAlready("Test");
         auto txn = cc().makeOperationContext();
 
@@ -753,6 +763,7 @@ TEST_F(MigrationManagerTest, RemoteCallErrorConversionToOperationFailed) {
         setUpChunk(collName, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
 
     auto future = launchAsync([&] {
+        ON_BLOCK_EXIT([&] { Client::destroy(); });
         Client::initThreadIfNotAlready("Test");
         auto txn = cc().makeOperationContext();
 

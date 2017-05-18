@@ -39,7 +39,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_client.h"
@@ -157,7 +157,7 @@ public:
                 return false;
             }
 
-            chunk = cm->findIntersectingChunkWithSimpleCollation(txn, shardKey);
+            chunk = cm->findIntersectingChunkWithSimpleCollation(shardKey);
         } else {
             // bounds
             if (!cm->getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
@@ -172,7 +172,7 @@ public:
             BSONObj minKey = cm->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
             BSONObj maxKey = cm->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
 
-            chunk = cm->findIntersectingChunkWithSimpleCollation(txn, minKey);
+            chunk = cm->findIntersectingChunkWithSimpleCollation(minKey);
 
             if (chunk->getMin().woCompare(minKey) != 0 || chunk->getMax().woCompare(maxKey) != 0) {
                 errmsg = str::stream() << "no chunk found with the shard key bounds "

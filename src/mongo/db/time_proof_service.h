@@ -29,33 +29,42 @@
 #pragma once
 
 #include "mongo/base/status.h"
+#include "mongo/crypto/sha1_block.h"
 #include "mongo/db/logical_time.h"
 
 namespace mongo {
 
 /**
- *  Mock of the TimeProofService class. The class when fully implemented will be self-contained. It
- *  will provide key management and rotation, caching and other optimizations as needed.
+ * TODO: SERVER-28127 Add key rotation to the TimeProofService
+ *
+ * The TimeProofService holds the key used by mongod and mongos processes to verify logical times
+ * and contains the logic to generate this key, but not to store or retrieve it.
  */
 class TimeProofService {
 public:
     // This type must be synchronized with the library that generates SHA1 or other proof.
-    using TimeProof = std::string;
+    using TimeProof = SHA1Block;
+    using Key = SHA1Block;
+
+    TimeProofService(Key key) : _key(std::move(key)) {}
 
     /**
-     *  Returns the proof matching the time argument.
+     * Generates a pseudorandom key to be used for HMAC authentication.
      */
-    TimeProof getProof(LogicalTime time) {
-        TimeProof proof = "12345678901234567890";
-        return proof;
-    }
+    static Key generateRandomKey();
 
     /**
-     *  Verifies that the proof is matching the time argument.
+     * Returns the proof matching the time argument.
      */
-    Status checkProof(LogicalTime time, const TimeProof& proof) {
-        return Status::OK();
-    }
+    TimeProof getProof(const LogicalTime& time) const;
+
+    /**
+     * Verifies that the proof matches the time argument.
+     */
+    Status checkProof(const LogicalTime& time, const TimeProof& proof) const;
+
+private:
+    Key _key;
 };
 
 }  // namespace mongo

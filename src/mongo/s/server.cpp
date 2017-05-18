@@ -54,6 +54,8 @@
 #include "mongo/db/initialize_server_global_state.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
@@ -61,6 +63,7 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
@@ -68,13 +71,14 @@
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/shard_remote.h"
-#include "mongo/s/client/sharding_connection_hook_for_mongos.h"
+#include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/service_entry_point_mongos.h"
+#include "mongo/s/sharding_egress_metadata_hook_for_mongos.h"
 #include "mongo/s/sharding_egress_metadata_hook_for_mongos.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/s/sharding_uptime_reporter.h"
@@ -98,7 +102,6 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
-#include "mongo/util/static_observer.h"
 #include "mongo/util/stringutils.h"
 #include "mongo/util/system_clock_source.h"
 #include "mongo/util/system_tick_source.h"
@@ -199,7 +202,12 @@ static Status initializeSharding(OperationContext* txn) {
         mongosGlobalParams.configdbs,
         generateDistLockProcessId(txn),
         std::move(shardFactory),
-        []() { return stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>(); },
+        []() {
+            auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
+            // TODO SERVER-27750: add LogicalTimeMetadataHook
+            hookList->addHook(stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>());
+            return hookList;
+        },
         [](ShardingCatalogClient* catalogClient, std::unique_ptr<executor::TaskExecutor> executor) {
             return nullptr;  // Only config servers get a real ShardingCatalogManager.
         });
@@ -248,8 +256,11 @@ static ExitCode runMongosServer() {
     }
 
     // Add sharding hooks to both connection pools - ShardingConnectionHook includes auth hooks
-    globalConnPool.addHook(new ShardingConnectionHookForMongos(false));
-    shardConnectionPool.addHook(new ShardingConnectionHookForMongos(true));
+    globalConnPool.addHook(new ShardingConnectionHook(
+        false, stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>()));
+
+    shardConnectionPool.addHook(new ShardingConnectionHook(
+        true, stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>()));
 
     ReplicaSetMonitor::setAsynchronousConfigChangeHook(
         &ShardRegistry::replicaSetChangeConfigServerUpdateHook);
@@ -265,6 +276,15 @@ static ExitCode runMongosServer() {
     }
 
     auto opCtx = cc().makeOperationContext();
+
+    std::array<std::uint8_t, 20> tempKey = {};
+    TimeProofService::Key key(std::move(tempKey));
+    auto timeProofService = stdx::make_unique<TimeProofService>(std::move(key));
+    auto logicalClock = stdx::make_unique<LogicalClock>(
+        opCtx->getServiceContext(),
+        std::move(timeProofService),
+        serverGlobalParams.authState == ServerGlobalParams::AuthState::kEnabled);
+    LogicalClock::set(opCtx->getServiceContext(), std::move(logicalClock));
 
     {
         Status status = initializeSharding(opCtx.get());
@@ -436,7 +456,7 @@ MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManage
 
 int mongoSMain(int argc, char* argv[], char** envp) {
     mongo::setMongos();
-    static StaticObserver staticObserver;
+
     if (argc < 1)
         return EXIT_FAILURE;
 

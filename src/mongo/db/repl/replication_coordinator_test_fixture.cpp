@@ -32,6 +32,7 @@
 
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
 
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
@@ -41,6 +42,7 @@
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
+#include "mongo/db/time_proof_service.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
@@ -119,6 +121,13 @@ void ReplCoordTest::init() {
     ASSERT_TRUE(storageInterface == StorageInterface::get(service));
     // PRNG seed for tests.
     const int64_t seed = 0;
+
+    std::array<std::uint8_t, 20> tempKey = {};
+    TimeProofService::Key key(std::move(tempKey));
+    auto timeProofService = stdx::make_unique<TimeProofService>(std::move(key));
+    auto logicalClock =
+        stdx::make_unique<LogicalClock>(service, std::move(timeProofService), false);
+    LogicalClock::set(service, std::move(logicalClock));
 
     TopologyCoordinatorImpl::Options settings;
     auto topo = stdx::make_unique<TopologyCoordinatorImpl>(settings);
@@ -337,10 +346,15 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
             net->blackHole(noi);
         }
         net->runReadyNetworkOperations();
+        // Successful elections need to write the last vote to disk, which is done by DB worker.
+        // Wait until DB worker finishes its job to ensure the synchronization with the
+        // executor.
+        getReplExec()->waitForDBWork_forTest();
+        net->runReadyNetworkOperations();
         hasReadyRequests = net->hasReadyRequests();
         getNet()->exitNetwork();
     }
-    ASSERT(replCoord->isWaitingForApplierToDrain());
+    ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
 
     IsMasterResponse imResponse;
@@ -349,8 +363,9 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
     ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
     {
         auto txn = makeOperationContext();
-        replCoord->signalDrainComplete(txn.get());
+        replCoord->signalDrainComplete(txn.get(), replCoord->getTerm());
     }
+    ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
     replCoord->fillIsMasterForReplSet(&imResponse);
     ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();
     ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
@@ -402,7 +417,7 @@ void ReplCoordTest::simulateSuccessfulElection() {
         hasReadyRequests = net->hasReadyRequests();
         getNet()->exitNetwork();
     }
-    ASSERT(replCoord->isWaitingForApplierToDrain());
+    ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
 
     IsMasterResponse imResponse;
@@ -411,7 +426,7 @@ void ReplCoordTest::simulateSuccessfulElection() {
     ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
     {
         auto txn = makeOperationContext();
-        replCoord->signalDrainComplete(txn.get());
+        replCoord->signalDrainComplete(txn.get(), replCoord->getTerm());
     }
     replCoord->fillIsMasterForReplSet(&imResponse);
     ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();

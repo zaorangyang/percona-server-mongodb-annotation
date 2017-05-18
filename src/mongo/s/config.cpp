@@ -35,11 +35,13 @@
 #include <vector>
 
 #include "mongo/db/lasterror.h"
-#include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/grid.h"
@@ -88,8 +90,7 @@ std::shared_ptr<ChunkManager> DBConfig::getChunkManagerIfExists(OperationContext
 
     try {
         return getChunkManager(txn, ns, shouldReload, forceReload);
-    } catch (AssertionException& e) {
-        warning() << "chunk manager not found for " << ns << causedBy(e);
+    } catch (const DBException&) {
         return nullptr;
     }
 }
@@ -194,7 +195,8 @@ std::shared_ptr<ChunkManager> DBConfig::getChunkManager(OperationContext* txn,
         // Reload the chunk manager outside of the DBConfig's mutex so as to not block operations
         // for different collections on the same database
         tempChunkManager.reset(new ChunkManager(
-            oldManager->getns(),
+            NamespaceString(oldManager->getns()),
+            oldManager->getVersion().epoch(),
             oldManager->getShardKeyPattern(),
             oldManager->getDefaultCollator() ? oldManager->getDefaultCollator()->clone() : nullptr,
             oldManager->isUnique()));
@@ -321,8 +323,25 @@ bool DBConfig::_loadIfNeeded(OperationContext* txn, Counter reloadIteration) {
         _collections.erase(coll.getNs().ns());
 
         if (!coll.getDropped()) {
+            std::unique_ptr<CollatorInterface> defaultCollator;
+            if (!coll.getDefaultCollation().isEmpty()) {
+                auto statusWithCollator = CollatorFactoryInterface::get(txn->getServiceContext())
+                                              ->makeFromBSON(coll.getDefaultCollation());
+
+                // The collation was validated upon collection creation.
+                invariantOK(statusWithCollator.getStatus());
+
+                defaultCollator = std::move(statusWithCollator.getValue());
+            }
+
+            std::unique_ptr<ChunkManager> manager(
+                stdx::make_unique<ChunkManager>(coll.getNs(),
+                                                coll.getEpoch(),
+                                                ShardKeyPattern(coll.getKeyPattern()),
+                                                std::move(defaultCollator),
+                                                coll.getUnique()));
+
             // Do the blocking collection load
-            std::unique_ptr<ChunkManager> manager(stdx::make_unique<ChunkManager>(txn, coll));
             manager->loadExistingRanges(txn, nullptr);
 
             // Collections with no chunks are unsharded, no matter what the collections entry says
@@ -337,16 +356,6 @@ bool DBConfig::_loadIfNeeded(OperationContext* txn, Counter reloadIteration) {
     _reloadCount.fetchAndAdd(1);
 
     return true;
-}
-
-void DBConfig::getAllShardIds(std::set<ShardId>* shardIds) {
-    stdx::lock_guard<stdx::mutex> lk(_lock);
-    shardIds->insert(_primaryId);
-
-    for (const auto& ciEntry : _collections) {
-        const auto& ci = ciEntry.second;
-        ci.cm->getAllShardIds(shardIds);
-    }
 }
 
 ShardId DBConfig::getPrimaryId() {

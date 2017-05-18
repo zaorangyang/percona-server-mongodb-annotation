@@ -74,6 +74,7 @@
 #include "mongo/db/introspect.h"
 #include "mongo/db/json.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/operation_context.h"
@@ -107,8 +108,10 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/ttl.h"
 #include "mongo/db/wire_version.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/sharding_initialization.h"
@@ -137,7 +140,6 @@
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/startup_test.h"
-#include "mongo/util/static_observer.h"
 #include "mongo/util/text.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
@@ -892,11 +894,22 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
     topoCoordOptions.maxSyncSourceLagSecs = Seconds(repl::maxSyncSourceLagSecs);
     topoCoordOptions.clusterRole = serverGlobalParams.clusterRole;
 
+    std::array<std::uint8_t, 20> tempKey = {};
+    TimeProofService::Key key(std::move(tempKey));
+    auto timeProofService = stdx::make_unique<TimeProofService>(std::move(key));
+    auto logicalClock =
+        stdx::make_unique<LogicalClock>(serviceContext, std::move(timeProofService), false);
+    LogicalClock::set(serviceContext, std::move(logicalClock));
+
+    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
+    // TODO SERVER-27750: add LogicalTimeMetadataHook
+
     auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorImpl>(
         serviceContext,
         getGlobalReplSettings(),
         stdx::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(storageInterface),
-        executor::makeNetworkInterface("NetworkInterfaceASIO-Replication"),
+        executor::makeNetworkInterface(
+            "NetworkInterfaceASIO-Replication", nullptr, std::move(hookList)),
         stdx::make_unique<repl::TopologyCoordinatorImpl>(topoCoordOptions),
         storageInterface,
         static_cast<int64_t>(curTimeMillis64()));
@@ -1038,8 +1051,6 @@ static void shutdownTask() {
 }
 
 static int mongoDbMain(int argc, char* argv[], char** envp) {
-    static StaticObserver staticObserver;
-
     registerShutdownTask(shutdownTask);
 
     setupSignalHandlers();

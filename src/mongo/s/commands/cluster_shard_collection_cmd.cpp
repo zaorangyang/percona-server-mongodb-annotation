@@ -51,8 +51,8 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_write.h"
@@ -651,7 +651,7 @@ public:
             // 3. Subdivide the big chunks by splitting at each of the points in "allSplits"
             //    that we haven't already split by.
             auto currentChunk =
-                chunkManager->findIntersectingChunkWithSimpleCollation(txn, allSplits[0]);
+                chunkManager->findIntersectingChunkWithSimpleCollation(allSplits[0]);
 
             std::vector<BSONObj> subSplits;
             for (unsigned i = 0; i <= allSplits.size(); i++) {
@@ -675,8 +675,8 @@ public:
                     }
 
                     if (i < allSplits.size()) {
-                        currentChunk = chunkManager->findIntersectingChunkWithSimpleCollation(
-                            txn, allSplits[i]);
+                        currentChunk =
+                            chunkManager->findIntersectingChunkWithSimpleCollation(allSplits[i]);
                     }
                 } else {
                     BSONObj splitPoint(allSplits[i]);

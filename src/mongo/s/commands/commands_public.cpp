@@ -52,12 +52,11 @@
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/run_on_all_shards_cmd.h"
@@ -416,7 +415,7 @@ public:
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
+        return false;
     }
 } reIndexCmd;
 
@@ -906,8 +905,9 @@ public:
         double numObjects = 0;
         int millis = 0;
 
-        set<ShardId> shardIds;
-        cm->getShardIdsForRange(shardIds, min, max);
+        std::set<ShardId> shardIds;
+        cm->getShardIdsForRange(min, max, &shardIds);
+
         for (const ShardId& shardId : shardIds) {
             const auto shardStatus = Grid::get(txn)->shardRegistry()->getShard(txn, shardId);
             if (!shardStatus.isOK()) {

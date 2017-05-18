@@ -72,6 +72,20 @@ MONGO_FP_DECLARE(blockHeartbeatStepdown);
 
 using executor::RemoteCommandRequest;
 
+Milliseconds ReplicationCoordinatorImpl::_getRandomizedElectionOffset() {
+    long long electionTimeout = durationCount<Milliseconds>(_rsConfig.getElectionTimeoutPeriod());
+    long long randomOffsetUpperBound =
+        electionTimeout * _externalState->getElectionTimeoutOffsetLimitFraction();
+
+    // Avoid divide by zero error in random number generator.
+    if (randomOffsetUpperBound == 0) {
+        return Milliseconds(0);
+    }
+
+    int64_t randomOffset = _replExecutor.nextRandomInt64(randomOffsetUpperBound);
+    return Milliseconds(randomOffset);
+}
+
 void ReplicationCoordinatorImpl::_doMemberHeartbeat(ReplicationExecutor::CallbackArgs cbData,
                                                     const HostAndPort& target,
                                                     int targetIndex) {
@@ -162,11 +176,13 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
             replMetadata = responseStatus;
         }
         if (replMetadata.isOK()) {
+            // Arbiters are the only nodes allowed to advance their commit point via heartbeats.
+            if (getMemberState().arbiter()) {
+                advanceCommitPoint(replMetadata.getValue().getLastOpCommitted());
+            }
             // Asynchronous stepdown could happen, but it will wait for _topoMutex and execute
             // after this function, so we cannot and don't need to wait for it to finish.
-            // Arbiters are the only nodes allowed to advance their commit point via heartbeats.
-            bool advanceCommitPoint = getMemberState().arbiter();
-            _processReplSetMetadata_incallback(replMetadata.getValue(), advanceCommitPoint);
+            _processReplSetMetadata_incallback(replMetadata.getValue());
         }
     }
     const Date_t now = _replExecutor.now();
@@ -274,9 +290,13 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponseAction(
         }
         case HeartbeatResponseAction::PriorityTakeover: {
             stdx::unique_lock<stdx::mutex> lk(_mutex);
+            // Don't schedule a takeover if one is already scheduled.
             if (!_priorityTakeoverCbh.isValid()) {
-                _priorityTakeoverWhen =
-                    _replExecutor.now() + _rsConfig.getPriorityTakeoverDelay(_selfIndex);
+
+                // Add randomized offset to calculated priority takeover delay.
+                Milliseconds priorityTakeoverDelay = _rsConfig.getPriorityTakeoverDelay(_selfIndex);
+                Milliseconds randomOffset = _getRandomizedElectionOffset();
+                _priorityTakeoverWhen = _replExecutor.now() + priorityTakeoverDelay + randomOffset;
                 log() << "Scheduling priority takeover at " << _priorityTakeoverWhen;
                 _priorityTakeoverCbh = _scheduleWorkAt(
                     _priorityTakeoverWhen,
@@ -309,7 +329,14 @@ void remoteStepdownCallback(const ReplicationExecutor::RemoteCommandCallbackArgs
 }  // namespace
 
 void ReplicationCoordinatorImpl::_requestRemotePrimaryStepdown(const HostAndPort& target) {
-    RemoteCommandRequest request(target, "admin", BSON("replSetStepDown" << 20), nullptr);
+    auto secondaryCatchUpPeriod(duration_cast<Seconds>(_rsConfig.getHeartbeatInterval() / 2));
+    RemoteCommandRequest request(
+        target,
+        "admin",
+        BSON("replSetStepDown" << 20 << "secondaryCatchUpPeriodSecs"
+                               << std::min(static_cast<long long>(secondaryCatchUpPeriod.count()),
+                                           20LL)),
+        nullptr);
 
     log() << "Requesting " << target << " step down from primary";
     CBHStatus cbh = _replExecutor.scheduleRemoteCommand(request, remoteStepdownCallback);
@@ -801,9 +828,7 @@ void ReplicationCoordinatorImpl::_cancelAndRescheduleElectionTimeout_inlock() {
         return;
     }
 
-    Milliseconds randomOffset = Milliseconds(_replExecutor.nextRandomInt64(
-        durationCount<Milliseconds>(_rsConfig.getElectionTimeoutPeriod()) *
-        _externalState->getElectionTimeoutOffsetLimitFraction()));
+    Milliseconds randomOffset = _getRandomizedElectionOffset();
     auto now = _replExecutor.now();
     auto when = now + _rsConfig.getElectionTimeoutPeriod() + randomOffset;
     invariant(when > now);
