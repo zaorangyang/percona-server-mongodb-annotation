@@ -52,7 +52,6 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/storage/paths.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/logger/auditlog.h"
 #include "mongo/util/concurrency/mutex.h"

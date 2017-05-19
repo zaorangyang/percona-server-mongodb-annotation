@@ -95,7 +95,7 @@ bool CreateBackupCommand::run(mongo::OperationContext* txn,
 
     // Flush all files first.
     auto se = getGlobalServiceContext()->getGlobalStorageEngine();
-    se->flushAllFiles(true);
+    se->flushAllFiles(txn, true);
 
     // Do the backup itself.
     const auto status = se->hotBackup(dest);
