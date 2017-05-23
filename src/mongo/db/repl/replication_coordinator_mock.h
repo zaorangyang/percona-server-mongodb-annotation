@@ -128,11 +128,9 @@ public:
 
     virtual bool setFollowerMode(const MemberState& newState);
 
-    virtual bool isWaitingForApplierToDrain();
+    virtual ApplierState getApplierState();
 
-    virtual bool isCatchingUp();
-
-    virtual void signalDrainComplete(OperationContext*);
+    virtual void signalDrainComplete(OperationContext*, long long);
 
     virtual Status waitForDrainFinish(Milliseconds timeout) override;
 
@@ -155,8 +153,9 @@ public:
 
     virtual void processReplSetGetConfig(BSONObjBuilder* result);
 
-    void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata,
-                                bool advanceCommitPoint) override;
+    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
+
+    virtual void advanceCommitPoint(const OpTime& committedOptime) override;
 
     virtual void cancelAndRescheduleElectionTimeout() override;
 
@@ -213,7 +212,8 @@ public:
     virtual void resetLastOpTimesFromOplog(OperationContext* txn);
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
-                                        const rpc::ReplSetMetadata& metadata);
+                                        const rpc::ReplSetMetadata& replMetadata,
+                                        boost::optional<rpc::OplogQueryMetadata> oqMetadata);
 
     virtual OpTime getLastCommittedOpTime() const;
 
@@ -273,6 +273,8 @@ public:
      */
     void alwaysAllowWrites(bool allowWrites);
 
+    void setMaster(bool isMaster);
+
     virtual ServiceContext* getServiceContext() override {
         return _service;
     }
@@ -280,7 +282,7 @@ public:
 private:
     AtomicUInt64 _snapshotNameGenerator;
     ServiceContext* const _service;
-    const ReplSettings _settings;
+    ReplSettings _settings;
     MemberState _memberState;
     OpTime _myLastDurableOpTime;
     OpTime _myLastAppliedOpTime;

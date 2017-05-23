@@ -51,13 +51,13 @@
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_changelog.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/shard_remote.h"
@@ -231,7 +231,14 @@ executor::TaskExecutor* ShardingTestFixture::executor() const {
 
 DistLockManagerMock* ShardingTestFixture::distLock() const {
     invariant(_distLockManager);
+
     return _distLockManager;
+}
+
+ServiceContext* ShardingTestFixture::serviceContext() const {
+    invariant(_service);
+
+    return _service.get();
 }
 
 OperationContext* ShardingTestFixture::operationContext() const {
@@ -454,8 +461,6 @@ void ShardingTestFixture::expectSetShardVersion(const HostAndPort& expectedHost,
 
         ASSERT(!ssv.isInit());
         ASSERT(ssv.isAuthoritative());
-        ASSERT_EQ(shardRegistry()->getConfigServerConnectionString().toString(),
-                  ssv.getConfigServer().toString());
         ASSERT_EQ(expectedShard.getHost(), ssv.getShardConnectionString().toString());
         ASSERT_EQ(expectedNs.toString(), ssv.getNS().ns());
         ASSERT_EQ(expectedChunkVersion.toString(), ssv.getNSVersion().toString());

@@ -508,7 +508,8 @@ Status Collection::_insertDocuments(OperationContext* txn,
         // X-lock the metadata resource for this capped collection until the end of the WUOW. This
         // prevents the primary from executing with more concurrency than secondaries.
         // See SERVER-21646.
-        Lock::ResourceLock{txn->lockState(), ResourceId(RESOURCE_METADATA, _ns.ns()), MODE_X};
+        Lock::ResourceLock heldUntilEndOfWUOW{
+            txn->lockState(), ResourceId(RESOURCE_METADATA, _ns.ns()), MODE_X};
     }
 
     std::vector<Record> records;
@@ -632,7 +633,8 @@ StatusWith<RecordId> Collection::updateDocument(OperationContext* txn,
         // X-lock the metadata resource for this capped collection until the end of the WUOW. This
         // prevents the primary from executing with more concurrency than secondaries.
         // See SERVER-21646.
-        Lock::ResourceLock{txn->lockState(), ResourceId(RESOURCE_METADATA, _ns.ns()), MODE_X};
+        Lock::ResourceLock heldUntilEndOfWUOW{
+            txn->lockState(), ResourceId(RESOURCE_METADATA, _ns.ns()), MODE_X};
     }
 
     SnapshotId sid = txn->recoveryUnit()->getSnapshotId();
@@ -912,14 +914,14 @@ Status Collection::truncate(OperationContext* txn) {
     return Status::OK();
 }
 
-void Collection::temp_cappedTruncateAfter(OperationContext* txn, RecordId end, bool inclusive) {
+void Collection::cappedTruncateAfter(OperationContext* txn, RecordId end, bool inclusive) {
     dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
     invariant(isCapped());
     BackgroundOperation::assertNoBgOpInProgForNs(ns());
     invariant(_indexCatalog.numIndexesInProgress(txn) == 0);
 
     _cursorManager.invalidateAll(false, "capped collection truncated");
-    _recordStore->temp_cappedTruncateAfter(txn, end, inclusive);
+    _recordStore->cappedTruncateAfter(txn, end, inclusive);
 }
 
 Status Collection::setValidator(OperationContext* txn, BSONObj validatorDoc) {

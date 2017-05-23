@@ -331,7 +331,7 @@ var DB;
         } catch (e) {
             // we expect the command to not return a response, as the server will shut down
             // immediately.
-            if (e.message.indexOf("error doing query: failed") >= 0) {
+            if (isNetworkError(e)) {
                 print('server should be down...');
                 return;
             }
@@ -1234,7 +1234,7 @@ var DB;
     /////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    var _defaultWriteConcern = {w: 'majority', wtimeout: 5 * 60 * 1000};
+    var _defaultWriteConcern = {w: 'majority', wtimeout: 10 * 60 * 1000};
 
     function getUserObjString(userObj) {
         var pwd = userObj.pwd;

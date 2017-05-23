@@ -210,15 +210,11 @@ bool ReplicationCoordinatorMock::setFollowerMode(const MemberState& newState) {
     return true;
 }
 
-bool ReplicationCoordinatorMock::isWaitingForApplierToDrain() {
-    return false;
+ReplicationCoordinator::ApplierState ReplicationCoordinatorMock::getApplierState() {
+    return ApplierState::Running;
 }
 
-bool ReplicationCoordinatorMock::isCatchingUp() {
-    return false;
-}
-
-void ReplicationCoordinatorMock::signalDrainComplete(OperationContext*) {}
+void ReplicationCoordinatorMock::signalDrainComplete(OperationContext*, long long) {}
 
 Status ReplicationCoordinatorMock::waitForDrainFinish(Milliseconds timeout) {
     invariant(false);
@@ -250,8 +246,9 @@ void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result)
     // TODO
 }
 
-void ReplicationCoordinatorMock::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata,
-                                                        bool advanceCommitPoint) {}
+void ReplicationCoordinatorMock::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) {}
+
+void ReplicationCoordinatorMock::advanceCommitPoint(const OpTime& committedOptime) {}
 
 void ReplicationCoordinatorMock::cancelAndRescheduleElectionTimeout() {}
 
@@ -382,8 +379,10 @@ void ReplicationCoordinatorMock::resetLastOpTimesFromOplog(OperationContext* txn
     invariant(false);
 }
 
-bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& currentSource,
-                                                        const rpc::ReplSetMetadata& metadata) {
+bool ReplicationCoordinatorMock::shouldChangeSyncSource(
+    const HostAndPort& currentSource,
+    const rpc::ReplSetMetadata& replMetadata,
+    boost::optional<rpc::OplogQueryMetadata> oqMetadata) {
     invariant(false);
 }
 
@@ -473,6 +472,10 @@ Status ReplicationCoordinatorMock::stepUpIfEligible() {
 
 void ReplicationCoordinatorMock::alwaysAllowWrites(bool allowWrites) {
     _alwaysAllowWrites = allowWrites;
+}
+
+void ReplicationCoordinatorMock::setMaster(bool isMaster) {
+    _settings.setMaster(isMaster);
 }
 
 }  // namespace repl

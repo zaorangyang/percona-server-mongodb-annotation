@@ -62,11 +62,12 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_timestamp.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/delete.h"
@@ -161,7 +162,8 @@ void getNextOpTime(OperationContext* txn,
     }
 
     stdx::lock_guard<stdx::mutex> lk(newOpMutex);
-    Timestamp ts = getNextGlobalTimestamp(txn->getServiceContext(), count);
+
+    auto ts = LogicalClock::get(txn)->reserveTicks(count).asTimestamp();
     newTimestampNotifier.notify_all();
 
     fassert(28560, oplog->getRecordStore()->oplogDiskLocRegister(txn, ts));
@@ -323,8 +325,7 @@ void truncateOplogTo(OperationContext* txn, Timestamp truncateTimestamp) {
             // oplog is < truncateTimestamp.
             if (count != 1) {
                 invariant(!oldestIDToDelete.isNull());
-                oplogCollection->temp_cappedTruncateAfter(
-                    txn, oldestIDToDelete, /*inclusive=*/true);
+                oplogCollection->cappedTruncateAfter(txn, oldestIDToDelete, /*inclusive=*/true);
             }
             return;
         }
@@ -375,10 +376,10 @@ void _logOpsInner(OperationContext* txn,
     checkOplogInsert(oplogCollection->insertDocumentsForOplog(txn, writers, nWriters));
 
     // Set replCoord last optime only after we're sure the WUOW didn't abort and roll back.
-    txn->recoveryUnit()->onCommit(
-        [replCoord, finalOpTime] { replCoord->setMyLastAppliedOpTimeForward(finalOpTime); });
-
-    ReplClientInfo::forClient(txn->getClient()).setLastOp(finalOpTime);
+    txn->recoveryUnit()->onCommit([txn, replCoord, finalOpTime] {
+        replCoord->setMyLastAppliedOpTimeForward(finalOpTime);
+        ReplClientInfo::forClient(txn->getClient()).setLastOp(finalOpTime);
+    });
 }
 
 void logOp(OperationContext* txn,
@@ -533,7 +534,7 @@ void createOplog(OperationContext* txn, const std::string& oplogCollectionName, 
 
     /* sync here so we don't get any surprising lag later when we try to sync */
     StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
-    storageEngine->flushAllFiles(true);
+    storageEngine->flushAllFiles(txn, true);
     log() << "******" << endl;
 }
 
@@ -1109,7 +1110,7 @@ Status applyCommand_inlock(OperationContext* txn,
 
 void setNewTimestamp(ServiceContext* service, const Timestamp& newTime) {
     stdx::lock_guard<stdx::mutex> lk(newOpMutex);
-    setGlobalTimestamp(service, newTime);
+    LogicalClock::get(service)->advanceClusterTimeFromTrustedSource(LogicalTime(newTime));
     newTimestampNotifier.notify_all();
 }
 
@@ -1193,9 +1194,10 @@ void SnapshotThread::run() {
                 if (_inShutdown.load())
                     return;
 
-                if (_forcedSnapshotPending.load() || lastTimestamp != getLastSetTimestamp()) {
+                auto clusterTime = LogicalClock::get(service)->getClusterTime().getTime();
+                if (_forcedSnapshotPending.load() || lastTimestamp != clusterTime.asTimestamp()) {
                     _forcedSnapshotPending.store(false);
-                    lastTimestamp = getLastSetTimestamp();
+                    lastTimestamp = clusterTime.asTimestamp();
                     break;
                 }
 
