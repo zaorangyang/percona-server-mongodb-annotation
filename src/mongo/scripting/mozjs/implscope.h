@@ -96,11 +96,11 @@ public:
 
     OperationContext* getOpContext() const;
 
-    void registerOperation(OperationContext* txn) override;
+    void registerOperation(OperationContext* opCtx) override;
 
     void unregisterOperation() override;
 
-    void localConnectForDbEval(OperationContext* txn, const char* dbName) override;
+    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) override;
 
     void externalSetup() override;
 
@@ -315,6 +315,8 @@ public:
     JS::HandleId getInternedStringId(InternedString name) {
         return _internedStrings.getInternedString(name);
     }
+
+    std::string buildStackString();
 
 private:
     void _MozJSCreateFunction(const char* raw,

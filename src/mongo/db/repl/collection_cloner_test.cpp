@@ -73,7 +73,7 @@ protected:
 
 void CollectionClonerTest::setUp() {
     BaseClonerTest::setUp();
-    options.reset();
+    options = {};
     collectionCloner.reset(nullptr);
     collectionCloner = stdx::make_unique<CollectionCloner>(
         &getExecutor(),
@@ -101,7 +101,7 @@ void CollectionClonerTest::tearDown() {
     BaseClonerTest::tearDown();
     // Executor may still invoke collection cloner's callback before shutting down.
     collectionCloner.reset(nullptr);
-    options.reset();
+    options = {};
 }
 
 BaseCloner* CollectionClonerTest::getCloner() const {
@@ -320,7 +320,7 @@ TEST_F(CollectionClonerTest,
 }
 
 TEST_F(CollectionClonerTest, DoNotCreateIDIndexIfAutoIndexIdUsed) {
-    options.reset();
+    options = {};
     options.autoIndexId = CollectionOptions::NO;
     collectionCloner.reset(new CollectionCloner(
         &getExecutor(),
@@ -405,8 +405,8 @@ TEST_F(CollectionClonerTest, ListIndexesReturnedNamespaceNotFound) {
     bool writesAreReplicatedOnOpCtx = false;
     NamespaceString collNss;
     storageInterface->createCollFn = [&collNss, &collectionCreated, &writesAreReplicatedOnOpCtx](
-        OperationContext* txn, const NamespaceString& nss, const CollectionOptions& options) {
-        writesAreReplicatedOnOpCtx = txn->writesAreReplicated();
+        OperationContext* opCtx, const NamespaceString& nss, const CollectionOptions& options) {
+        writesAreReplicatedOnOpCtx = opCtx->writesAreReplicated();
         collectionCreated = true;
         collNss = nss;
         return Status::OK();
@@ -458,14 +458,14 @@ TEST_F(CollectionClonerTest,
     // Replace scheduleDbWork function to schedule the create collection task with an injected error
     // status.
     auto exec = &getExecutor();
-    collectionCloner->setScheduleDbWorkFn_forTest(
-        [exec](const executor::TaskExecutor::CallbackFn& workFn) {
-            auto wrappedTask = [workFn](const executor::TaskExecutor::CallbackArgs& cbd) {
-                workFn(executor::TaskExecutor::CallbackArgs(
-                    cbd.executor, cbd.myHandle, Status(ErrorCodes::CallbackCanceled, ""), cbd.txn));
-            };
-            return exec->scheduleWork(wrappedTask);
-        });
+    collectionCloner->setScheduleDbWorkFn_forTest([exec](
+        const executor::TaskExecutor::CallbackFn& workFn) {
+        auto wrappedTask = [workFn](const executor::TaskExecutor::CallbackArgs& cbd) {
+            workFn(executor::TaskExecutor::CallbackArgs(
+                cbd.executor, cbd.myHandle, Status(ErrorCodes::CallbackCanceled, ""), cbd.opCtx));
+        };
+        return exec->scheduleWork(wrappedTask);
+    });
 
     bool collectionCreated = false;
     storageInterface->createCollFn = [&collectionCreated](

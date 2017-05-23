@@ -55,7 +55,7 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 // kMajority implies JOURNAL if journaling is
                                                 // supported by mongod and
                                                 // writeConcernMajorityJournalDefault is set to true
-                                                // in the ReplicaSetConfig.
+                                                // in the ReplSetConfig.
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 Seconds(15));
 
@@ -103,7 +103,7 @@ public:
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
                      BSONObj& cmdObj,
                      int options,
@@ -116,9 +116,9 @@ public:
         parsedRequest.appendAsConfigCommand(&cmdBuilder);
         cmdBuilder.append("writeConcern", kMajorityWriteConcern.toBSON());
 
-        auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto cmdResponseStatus = uassertStatusOK(
-            configShard->runCommandWithFixedRetryAttempts(txn,
+            configShard->runCommandWithFixedRetryAttempts(opCtx,
                                                           kPrimaryOnlyReadPreference,
                                                           "admin",
                                                           cmdBuilder.obj(),

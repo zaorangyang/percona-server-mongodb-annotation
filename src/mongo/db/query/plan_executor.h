@@ -153,7 +153,7 @@ public:
     static StatusWith<std::unique_ptr<PlanExecutor>> make(OperationContext* opCtx,
                                                           std::unique_ptr<WorkingSet> ws,
                                                           std::unique_ptr<PlanStage> rt,
-                                                          const std::string& ns,
+                                                          NamespaceString nss,
                                                           YieldPolicy yieldPolicy);
 
     /**
@@ -203,7 +203,9 @@ public:
     /**
      * Return the NS that the query is running over.
      */
-    const std::string& ns();
+    const NamespaceString& nss() const {
+        return _nss;
+    }
 
     /**
      * Return the OperationContext that the plan is currently executing within.
@@ -336,7 +338,7 @@ public:
      * state.  As such, if the plan yields, it must be notified of relevant writes so that
      * we can ensure that it doesn't crash if we try to access invalid state.
      */
-    void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    void invalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type);
 
     /**
      * Helper method to aid in displaying an ExecState for debug or other recreational purposes.
@@ -408,18 +410,18 @@ private:
                  std::unique_ptr<QuerySolution> qs,
                  std::unique_ptr<CanonicalQuery> cq,
                  const Collection* collection,
-                 const std::string& ns);
+                 NamespaceString nss);
 
     /**
      * Public factory methods delegate to this private factory to do their work.
      */
-    static StatusWith<std::unique_ptr<PlanExecutor>> make(OperationContext* txn,
+    static StatusWith<std::unique_ptr<PlanExecutor>> make(OperationContext* opCtx,
                                                           std::unique_ptr<WorkingSet> ws,
                                                           std::unique_ptr<PlanStage> rt,
                                                           std::unique_ptr<QuerySolution> qs,
                                                           std::unique_ptr<CanonicalQuery> cq,
                                                           const Collection* collection,
-                                                          const std::string& ns,
+                                                          NamespaceString nss,
                                                           YieldPolicy yieldPolicy);
 
     /**
@@ -462,7 +464,7 @@ private:
     std::unique_ptr<ScopedExecutorRegistration> _safety;
 
     // What namespace are we operating over?
-    std::string _ns;
+    NamespaceString _nss;
 
     // This is used to handle automatic yielding when allowed by the YieldPolicy. Never NULL.
     // TODO make this a non-pointer member. This requires some header shuffling so that this

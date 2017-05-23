@@ -85,7 +85,7 @@ public:
         return Status(ErrorCodes::Unauthorized, "Unauthorized");
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      BSONObj& cmdObj,
                      int options,
@@ -93,7 +93,7 @@ public:
                      BSONObjBuilder& result) {
         const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
 
-        AutoGetCollectionForRead ctx(txn, ns);
+        AutoGetCollectionForReadCommand ctx(opCtx, ns);
 
         Collection* collection = ctx.getCollection();
         if (!collection)
@@ -111,7 +111,7 @@ public:
                                                   << " was: "
                                                   << numCursors));
 
-        auto iterators = collection->getManyCursors(txn);
+        auto iterators = collection->getManyCursors(opCtx);
         if (iterators.size() < numCursors) {
             numCursors = iterators.size();
         }
@@ -120,11 +120,11 @@ public:
         for (size_t i = 0; i < numCursors; i++) {
             unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
             unique_ptr<MultiIteratorStage> mis =
-                make_unique<MultiIteratorStage>(txn, ws.get(), collection);
+                make_unique<MultiIteratorStage>(opCtx, ws.get(), collection);
 
             // Takes ownership of 'ws' and 'mis'.
             auto statusWithPlanExecutor = PlanExecutor::make(
-                txn, std::move(ws), std::move(mis), collection, PlanExecutor::YIELD_AUTO);
+                opCtx, std::move(ws), std::move(mis), collection, PlanExecutor::YIELD_AUTO);
             invariant(statusWithPlanExecutor.isOK());
             execs.push_back(std::move(statusWithPlanExecutor.getValue()));
         }
@@ -148,13 +148,15 @@ public:
                 exec->saveState();
                 exec->detachFromOperationContext();
 
-                // Create and regiter a new ClientCursor.
+                // Create and register a new ClientCursor.
                 auto pinnedCursor = collection->getCursorManager()->registerCursor(
-                    {exec.release(),
-                     ns.ns(),
-                     txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot()});
+                    {std::move(exec),
+                     ns,
+                     AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                     opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                     cmdObj});
                 pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(
-                    txn->getRemainingMaxTimeMicros());
+                    opCtx->getRemainingMaxTimeMicros());
 
                 BSONObjBuilder threadResult;
                 appendCursorResponseObject(

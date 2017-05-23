@@ -49,45 +49,10 @@ def call(a, logger):
         raise Exception()
 
 
-# Copied from python 2.7 version of subprocess.py
-def check_output(*popenargs, **kwargs):
-    r"""Run command with arguments and return its output as a byte string.
-
-    If the exit code was non-zero it raises a CalledProcessError.  The
-    CalledProcessError object will have the return code in the returncode
-    attribute and output in the output attribute.
-
-    The arguments are the same as for the Popen constructor.  Example:
-
-    >>> check_output(["ls", "-l", "/dev/null"])
-    'crw-rw-rw- 1 root root 1, 3 Oct 18  2007 /dev/null\n'
-
-    The stdout argument is not allowed as it is used internally.
-    To capture standard error in the result, use stderr=STDOUT.
-
-    >>> check_output(["/bin/sh", "-c",
-    ...               "ls -l non_existent_file ; exit 0"],
-    ...              stderr=STDOUT)
-    'ls: non_existent_file: No such file or directory\n'
-    """
-    if 'stdout' in kwargs:
-        raise ValueError('stdout argument not allowed, it will be overridden.')
-    process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
-    output, unused_err = process.communicate()
-    retcode = process.poll()
-    if retcode:
-        cmd = kwargs.get("args")
-        if cmd is None:
-            cmd = popenargs[0]
-        raise CalledProcessError(retcode, cmd, output=output)
-
-    return output
-
-
 def callo(a, logger):
     logger.info("%s" % str(a))
 
-    return check_output(a)
+    return subprocess.check_output(a)
 
 
 def find_program(prog, paths):
@@ -108,6 +73,7 @@ def find_program(prog, paths):
 def get_process_logger(debugger_output, pid, process_name):
     """Returns the process logger from options specified."""
     process_logger = logging.Logger("process", level=logging.DEBUG)
+    process_logger.mongo_process_filename = None
 
     if 'stdout' in debugger_output:
         handler = logging.StreamHandler(sys.stdout)
@@ -115,9 +81,9 @@ def get_process_logger(debugger_output, pid, process_name):
         process_logger.addHandler(handler)
 
     if 'file' in debugger_output:
-        handler = logging.FileHandler(
-            filename="debugger_%s_%d.log" % (os.path.splitext(process_name)[0], pid),
-            mode="w")
+        filename = "debugger_%s_%d.log" % (os.path.splitext(process_name)[0], pid)
+        process_logger.mongo_process_filename = filename
+        handler = logging.FileHandler(filename=filename, mode="w")
         handler.setFormatter(logging.Formatter(fmt="%(message)s"))
         process_logger.addHandler(handler)
 
@@ -336,24 +302,78 @@ class GDBDumper(object):
         root_logger.info("dir %s" % script_dir)
         gdb_dir = os.path.join(script_dir, "gdb")
         printers_script = os.path.join(gdb_dir, "mongo.py")
+        mongo_lock_script = os.path.join(gdb_dir, "mongo_lock.py")
+
+        stack_bt = ""
+        source_mongo_lock = "source %s" % mongo_lock_script
+        mongodb_dump_locks = "mongodb-dump-locks"
+        mongodb_show_locks = "mongodb-show-locks"
+        mongodb_uniqstack = "mongodb-uniqstack mongodb-bt-if-active"
+        mongodb_waitsfor_graph = "mongodb-waitsfor-graph debugger_waitsfor_%s_%d.gv" % \
+            (process_name, pid)
+        mongodb_javascript_stack = "mongodb-javascript-stack"
+
+        # SERVER-28415 - GDB on ARM can run out of virtual memory after Python modules are loaded
+        if platform.processor() == "aarch64":
+            stack_bt = "thread apply all bt"
+            mongodb_uniqstack = ""
+
+        # The following MongoDB python extensions do not run on Solaris.
+        if sys.platform.startswith("sunos"):
+            source_mongo_lock = ""
+            # SERVER-28234 - GDB frame information not available on Solaris for a templatized
+            # function
+            mongodb_dump_locks = ""
+
+            # SERVER-28373 - GDB thread-local variables not available on Solaris
+            mongodb_show_locks = ""
+            mongodb_waitsfor_graph = ""
+            mongodb_javascript_stack = ""
+
+        if not logger.mongo_process_filename:
+            raw_stacks_commands = []
+        else:
+            base, ext = os.path.splitext(logger.mongo_process_filename)
+            raw_stacks_filename = base + '_raw_stacks' + ext
+            raw_stacks_commands = [
+                    'echo \\nWriting raw stacks to %s.\\n' % raw_stacks_filename,
+                    # This sends output to log file rather than stdout until we turn logging off.
+                    'set logging redirect on',
+                    'set logging file ' + raw_stacks_filename,
+                    'set logging on',
+                    'thread apply all bt',
+                    'set logging off',
+                    ]
 
         cmds = [
-            "set pagination off",
+            "set interactive-mode off",
+            "set print thread-events off",  # Python calls to gdb.parse_and_eval may cause threads
+                                            # to start and finish. This suppresses those messages
+                                            # from appearing in the return output.
+            "file %s" % process_name,  # Solaris must load the process to read the symbols.
             "attach %d" % pid,
             "info sharedlibrary",
             "info threads",  # Dump a simple list of commands to get the thread name
             "set python print-stack full",
-            "source " + printers_script,
-            "thread apply all bt",
+            ] + raw_stacks_commands + [
+            stack_bt,
+            "source %s" % printers_script,
+            source_mongo_lock,
+            mongodb_uniqstack,
             dump_command,
-            "mongodb-analyze",
+            mongodb_dump_locks,
+            mongodb_show_locks,
+            mongodb_waitsfor_graph,
+            mongodb_javascript_stack,  # The mongodb-javascript-stack command executes code in
+                                       # order to dump JavaScript backtraces and should therefore
+                                       # be one of the last analysis commands.
             "set confirm off",
             "quit",
             ]
 
         call([dbg, "--quiet", "--nx"] +
-            list(itertools.chain.from_iterable([['-ex', b] for b in cmds])),
-            logger)
+             list(itertools.chain.from_iterable([['-ex', b] for b in cmds])),
+             logger)
 
         root_logger.info("Done analyzing %s process with PID %d" % (process_name, pid))
 
@@ -587,6 +607,10 @@ def main():
         exit(1)
 
     all_processes = ps.dump_processes(root_logger)
+
+    # Canonicalize the process names to lowercase to handle cases where the name of the Python
+    # process is /System/Library/.../Python on OS X and -p python is specified to hang_analyzer.py.
+    all_processes = [(pid, process_name.lower()) for (pid, process_name) in all_processes]
 
     # Find all running interesting processes:
     #   If a list of process_ids is supplied, match on that.

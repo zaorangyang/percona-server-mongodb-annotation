@@ -964,10 +964,6 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
         return {ErrorCodes::InvalidPipelineOperator,
                 str::stream() << "Option " << kReturnKeyField << " not supported in aggregation."};
     }
-    if (!_comment.empty()) {
-        return {ErrorCodes::InvalidPipelineOperator,
-                str::stream() << "Option " << kCommentField << " not supported in aggregation."};
-    }
     if (_showRecordId) {
         return {ErrorCodes::InvalidPipelineOperator,
                 str::stream() << "Option " << kShowRecordIdField
@@ -1058,14 +1054,14 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
 
     // Other options.
     aggregationBuilder.append("collation", _collation);
-    if (_explain) {
-        aggregationBuilder.append("explain", _explain);
-    }
     if (_maxTimeMS > 0) {
         aggregationBuilder.append(cmdOptionMaxTimeMS, _maxTimeMS);
     }
     if (!_hint.isEmpty()) {
         aggregationBuilder.append("hint", _hint);
+    }
+    if (!_comment.empty()) {
+        aggregationBuilder.append("comment", _comment);
     }
     return StatusWith<BSONObj>(aggregationBuilder.obj());
 }

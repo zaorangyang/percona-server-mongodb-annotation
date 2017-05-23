@@ -84,7 +84,7 @@ public:
 
         out->push_back(Privilege(ResourcePattern::forExactNamespace(nss), targetActions));
     }
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& jsobj,
              int,
@@ -118,11 +118,10 @@ public:
             return false;
         }
 
-        ScopedTransaction transaction(txn, MODE_IX);
-        AutoGetDb autoDb(txn, dbname, MODE_X);
+        AutoGetDb autoDb(opCtx, dbname, MODE_X);
 
         NamespaceString nss(dbname, to);
-        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nss)) {
+        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nss)) {
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::NotMaster,
@@ -140,7 +139,7 @@ public:
         }
 
         Status status =
-            cloneCollectionAsCapped(txn, db, from.toString(), to.toString(), size, temp);
+            cloneCollectionAsCapped(opCtx, db, from.toString(), to.toString(), size, temp);
         return appendCommandStatus(result, status);
     }
 } cmdCloneCollectionAsCapped;
@@ -170,7 +169,7 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& jsobj,
              int,
@@ -184,7 +183,7 @@ public:
             return false;
         }
 
-        return appendCommandStatus(result, convertToCapped(txn, nss, size));
+        return appendCommandStatus(result, convertToCapped(opCtx, nss, size));
     }
 
 } cmdConvertToCapped;

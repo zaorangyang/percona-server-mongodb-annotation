@@ -60,14 +60,14 @@ ReplicationExecutor* ReplCoordTest::getReplExec() {
     return _repl->getExecutor();
 }
 
-ReplicaSetConfig ReplCoordTest::assertMakeRSConfig(const BSONObj& configBson) {
-    ReplicaSetConfig config;
+ReplSetConfig ReplCoordTest::assertMakeRSConfig(const BSONObj& configBson) {
+    ReplSetConfig config;
     ASSERT_OK(config.initialize(configBson));
     ASSERT_OK(config.validate());
     return config;
 }
 
-ReplicaSetConfig ReplCoordTest::assertMakeRSConfigV0(const BSONObj& configBson) {
+ReplSetConfig ReplCoordTest::assertMakeRSConfigV0(const BSONObj& configBson) {
     return assertMakeRSConfig(addProtocolVersion(configBson, 0));
 }
 
@@ -89,8 +89,8 @@ void ReplCoordTest::tearDown() {
         _externalState->setStoreLocalConfigDocumentToHang(false);
     }
     if (_callShutdown) {
-        auto txn = makeOperationContext();
-        shutdown(txn.get());
+        auto opCtx = makeOperationContext();
+        shutdown(opCtx.get());
     }
 }
 
@@ -125,8 +125,7 @@ void ReplCoordTest::init() {
     std::array<std::uint8_t, 20> tempKey = {};
     TimeProofService::Key key(std::move(tempKey));
     auto timeProofService = stdx::make_unique<TimeProofService>(std::move(key));
-    auto logicalClock =
-        stdx::make_unique<LogicalClock>(service, std::move(timeProofService), false);
+    auto logicalClock = stdx::make_unique<LogicalClock>(service, std::move(timeProofService));
     LogicalClock::set(service, std::move(logicalClock));
 
     TopologyCoordinatorImpl::Options settings;
@@ -165,8 +164,8 @@ void ReplCoordTest::start() {
         init();
     }
 
-    const auto txn = makeOperationContext();
-    _repl->startup(txn.get());
+    const auto opCtx = makeOperationContext();
+    _repl->startup(opCtx.get());
     _repl->waitForStartUpComplete_forTest();
     _callShutdown = true;
 }
@@ -212,7 +211,7 @@ ResponseStatus ReplCoordTest::makeResponseStatus(const BSONObj& doc,
 
 void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
-    ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
+    ReplSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     NetworkInterfaceMock* net = getNet();
     net->enterNetwork();
     for (int i = 0; i < rsConfig.getNumMembers() - 1; ++i) {
@@ -243,7 +242,7 @@ void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
 void ReplCoordTest::simulateSuccessfulDryRun(
     stdx::function<void(const RemoteCommandRequest& request)> onDryRunRequest) {
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
-    ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
+    ReplSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     NetworkInterfaceMock* net = getNet();
 
     auto electionTimeoutWhen = replCoord->getElectionTimeout_forTest();
@@ -305,7 +304,7 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
     NetworkInterfaceMock* net = getNet();
 
-    ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
+    ReplSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     ASSERT(replCoord->getMemberState().secondary()) << replCoord->getMemberState().toString();
     bool hasReadyRequests = true;
     // Process requests until we're primary and consume the heartbeats for the notification
@@ -362,8 +361,8 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
     ASSERT_FALSE(imResponse.isMaster()) << imResponse.toBSON().toString();
     ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
     {
-        auto txn = makeOperationContext();
-        replCoord->signalDrainComplete(txn.get(), replCoord->getTerm());
+        auto opCtx = makeOperationContext();
+        replCoord->signalDrainComplete(opCtx.get(), replCoord->getTerm());
     }
     ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
     replCoord->fillIsMasterForReplSet(&imResponse);
@@ -376,7 +375,7 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
 void ReplCoordTest::simulateSuccessfulElection() {
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
     NetworkInterfaceMock* net = getNet();
-    ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
+    ReplSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     ASSERT(replCoord->getMemberState().secondary()) << replCoord->getMemberState().toString();
     bool hasReadyRequests = true;
     // Process requests until we're primary and consume the heartbeats for the notification
@@ -425,8 +424,8 @@ void ReplCoordTest::simulateSuccessfulElection() {
     ASSERT_FALSE(imResponse.isMaster()) << imResponse.toBSON().toString();
     ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
     {
-        auto txn = makeOperationContext();
-        replCoord->signalDrainComplete(txn.get(), replCoord->getTerm());
+        auto opCtx = makeOperationContext();
+        replCoord->signalDrainComplete(opCtx.get(), replCoord->getTerm());
     }
     replCoord->fillIsMasterForReplSet(&imResponse);
     ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();
@@ -435,10 +434,10 @@ void ReplCoordTest::simulateSuccessfulElection() {
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
 }
 
-void ReplCoordTest::shutdown(OperationContext* txn) {
+void ReplCoordTest::shutdown(OperationContext* opCtx) {
     invariant(_callShutdown);
     _net->exitNetwork();
-    _repl->shutdown(txn);
+    _repl->shutdown(opCtx);
     _callShutdown = false;
 }
 
@@ -447,7 +446,7 @@ void ReplCoordTest::replyToReceivedHeartbeat() {
     net->enterNetwork();
     const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
     const RemoteCommandRequest& request = noi->getRequest();
-    const ReplicaSetConfig rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
+    const ReplSetConfig rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
     repl::ReplSetHeartbeatArgs hbArgs;
     ASSERT_OK(hbArgs.initialize(request.cmdObj));
     repl::ReplSetHeartbeatResponse hbResp;
@@ -467,7 +466,7 @@ void ReplCoordTest::replyToReceivedHeartbeatV1() {
     net->enterNetwork();
     const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
     const RemoteCommandRequest& request = noi->getRequest();
-    const ReplicaSetConfig rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
+    const ReplSetConfig rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
     repl::ReplSetHeartbeatArgsV1 hbArgs;
     ASSERT_OK(hbArgs.initialize(request.cmdObj));
     repl::ReplSetHeartbeatResponse hbResp;

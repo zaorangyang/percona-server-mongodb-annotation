@@ -30,11 +30,18 @@
 
 #include "mongo/rpc/metadata.h"
 
+#include "mongo/base/init.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/rpc/metadata/audit_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
+#include "mongo/rpc/metadata/logical_time_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
@@ -42,16 +49,38 @@
 namespace mongo {
 namespace rpc {
 
+namespace {
+
+std::vector<Privilege> advanceLogicalClockPrivilege;
+
+MONGO_INITIALIZER(InitializeAdvanceLogicalClockPrivilegeVector)(InitializerContext* const) {
+    ActionSet actions;
+    actions.addAction(ActionType::internal);
+    advanceLogicalClockPrivilege.emplace_back(ResourcePattern::forClusterResource(), actions);
+    return Status::OK();
+}
+
+bool isAuthorizedToAdvanceClock(OperationContext* opCtx) {
+    auto client = opCtx->getClient();
+    // Note: returns true if auth is off, courtesy of
+    // AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks.
+    return AuthorizationSession::get(client)->isAuthorizedForPrivileges(
+        advanceLogicalClockPrivilege);
+}
+
+}  // unnamed namespace
+
 BSONObj makeEmptyMetadata() {
     return BSONObj();
 }
 
-Status readRequestMetadata(OperationContext* txn, const BSONObj& metadataObj) {
+Status readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) {
     BSONElement ssmElem;
     BSONElement auditElem;
     BSONElement configSvrElem;
     BSONElement trackingElem;
     BSONElement clientElem;
+    BSONElement logicalTimeElem;
 
     for (const auto& metadataElem : metadataObj) {
         auto fieldName = metadataElem.fieldNameStringData();
@@ -65,6 +94,8 @@ Status readRequestMetadata(OperationContext* txn, const BSONObj& metadataObj) {
             clientElem = metadataElem;
         } else if (fieldName == TrackingMetadata::fieldName()) {
             trackingElem = metadataElem;
+        } else if (fieldName == LogicalTimeMetadata::fieldName()) {
+            logicalTimeElem = metadataElem;
         }
     }
 
@@ -72,16 +103,16 @@ Status readRequestMetadata(OperationContext* txn, const BSONObj& metadataObj) {
     if (!swServerSelectionMetadata.isOK()) {
         return swServerSelectionMetadata.getStatus();
     }
-    ServerSelectionMetadata::get(txn) = std::move(swServerSelectionMetadata.getValue());
+    ServerSelectionMetadata::get(opCtx) = std::move(swServerSelectionMetadata.getValue());
 
     auto swAuditMetadata = AuditMetadata::readFromMetadata(auditElem);
     if (!swAuditMetadata.isOK()) {
         return swAuditMetadata.getStatus();
     }
-    AuditMetadata::get(txn) = std::move(swAuditMetadata.getValue());
+    AuditMetadata::get(opCtx) = std::move(swAuditMetadata.getValue());
 
     const auto statusClientMetadata =
-        ClientMetadataIsMasterState::readFromMetadata(txn, clientElem);
+        ClientMetadataIsMasterState::readFromMetadata(opCtx, clientElem);
     if (!statusClientMetadata.isOK()) {
         return statusClientMetadata;
     }
@@ -90,19 +121,43 @@ Status readRequestMetadata(OperationContext* txn, const BSONObj& metadataObj) {
     if (!configServerMetadata.isOK()) {
         return configServerMetadata.getStatus();
     }
-    ConfigServerMetadata::get(txn) = std::move(configServerMetadata.getValue());
+    ConfigServerMetadata::get(opCtx) = std::move(configServerMetadata.getValue());
 
     auto trackingMetadata = TrackingMetadata::readFromMetadata(trackingElem);
     if (!trackingMetadata.isOK()) {
         return trackingMetadata.getStatus();
     }
-    TrackingMetadata::get(txn) = std::move(trackingMetadata.getValue());
+    TrackingMetadata::get(opCtx) = std::move(trackingMetadata.getValue());
+
+    auto logicalClock = LogicalClock::get(opCtx);
+    if (logicalClock) {
+        auto logicalTimeMetadata = LogicalTimeMetadata::readFromMetadata(logicalTimeElem);
+        if (!logicalTimeMetadata.isOK()) {
+            return logicalTimeMetadata.getStatus();
+        }
+
+        if (isAuthorizedToAdvanceClock(opCtx)) {
+            auto advanceClockStatus = logicalClock->advanceClusterTimeFromTrustedSource(
+                logicalTimeMetadata.getValue().getSignedTime());
+
+            if (!advanceClockStatus.isOK()) {
+                return advanceClockStatus;
+            }
+        } else {
+            auto advanceClockStatus =
+                logicalClock->advanceClusterTime(logicalTimeMetadata.getValue().getSignedTime());
+
+            if (!advanceClockStatus.isOK()) {
+                return advanceClockStatus;
+            }
+        }
+    }
 
     return Status::OK();
 }
 
-Status writeRequestMetadata(OperationContext* txn, BSONObjBuilder* metadataBob) {
-    auto ssStatus = ServerSelectionMetadata::get(txn).writeToMetadata(metadataBob);
+Status writeRequestMetadata(OperationContext* opCtx, BSONObjBuilder* metadataBob) {
+    auto ssStatus = ServerSelectionMetadata::get(opCtx).writeToMetadata(metadataBob);
     if (!ssStatus.isOK()) {
         return ssStatus;
     }

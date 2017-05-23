@@ -33,9 +33,9 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/is_master_response.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
-#include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
@@ -66,7 +66,7 @@ TEST_F(ReplCoordTest, RandomizedElectionOffsetWithinProperBounds) {
                                            << BSON("_id" << 3 << "host"
                                                          << "node3:12345")));
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
 
     Milliseconds electionTimeout = config.getElectionTimeoutPeriod();
     long long randomOffsetUpperBound = durationCount<Milliseconds>(electionTimeout) *
@@ -162,15 +162,15 @@ TEST_F(ReplCoordTest, ElectionSucceedsWhenNodeIsTheOnlyElectableNode) {
     simulateCatchUpTimeout();
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
 
-    const auto txnPtr = makeOperationContext();
-    auto& txn = *txnPtr;
+    const auto opCtxPtr = makeOperationContext();
+    auto& opCtx = *opCtxPtr;
 
     // Since we're still in drain mode, expect that we report ismaster: false, issecondary:true.
     IsMasterResponse imResponse;
     getReplCoord()->fillIsMasterForReplSet(&imResponse);
     ASSERT_FALSE(imResponse.isMaster()) << imResponse.toBSON().toString();
     ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
-    getReplCoord()->signalDrainComplete(&txn, getReplCoord()->getTerm());
+    getReplCoord()->signalDrainComplete(&opCtx, getReplCoord()->getTerm());
     getReplCoord()->fillIsMasterForReplSet(&imResponse);
     ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();
     ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
@@ -226,15 +226,15 @@ TEST_F(ReplCoordTest, ElectionSucceedsWhenNodeIsTheOnlyNode) {
     simulateCatchUpTimeout();
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
 
-    const auto txnPtr = makeOperationContext();
-    auto& txn = *txnPtr;
+    const auto opCtxPtr = makeOperationContext();
+    auto& opCtx = *opCtxPtr;
 
     // Since we're still in drain mode, expect that we report ismaster: false, issecondary:true.
     IsMasterResponse imResponse;
     getReplCoord()->fillIsMasterForReplSet(&imResponse);
     ASSERT_FALSE(imResponse.isMaster()) << imResponse.toBSON().toString();
     ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
-    getReplCoord()->signalDrainComplete(&txn, getReplCoord()->getTerm());
+    getReplCoord()->signalDrainComplete(&opCtx, getReplCoord()->getTerm());
     getReplCoord()->fillIsMasterForReplSet(&imResponse);
     ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();
     ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
@@ -255,7 +255,7 @@ TEST_F(ReplCoordTest, ElectionSucceedsWhenAllNodesVoteYea) {
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     getReplCoord()->setMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0));
     getReplCoord()->setMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0));
     ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
@@ -296,7 +296,7 @@ TEST_F(ReplCoordTest, ElectionSucceedsWhenMaxSevenNodesVoteYea) {
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     getReplCoord()->setMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0));
     getReplCoord()->setMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0));
     ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
@@ -330,9 +330,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenInsufficientVotesAreReceivedDuringDryRun)
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
     getReplCoord()->setMyLastDurableOpTime(time1);
@@ -389,9 +389,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenDryRunResponseContainsANewerTerm) {
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
     getReplCoord()->setMyLastDurableOpTime(time1);
@@ -439,7 +439,7 @@ TEST_F(ReplCoordTest, ElectionFailsWhenDryRunResponseContainsANewerTerm) {
 TEST_F(ReplCoordTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
     // start up, receive reconfig via heartbeat while at the same time, become candidate.
     // candidate state should be cleared.
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     assertStartSuccess(BSON("_id"
                             << "mySet"
                             << "version"
@@ -469,7 +469,7 @@ TEST_F(ReplCoordTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
     NetworkInterfaceMock* net = getNet();
     net->enterNetwork();
     ReplSetHeartbeatResponse hbResp2;
-    ReplicaSetConfig config;
+    ReplSetConfig config;
     config.initialize(BSON("_id"
                            << "mySet"
                            << "version"
@@ -497,14 +497,14 @@ TEST_F(ReplCoordTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
     args.force = false;
     args.newConfigObj = config.toBSON();
     ASSERT_EQUALS(ErrorCodes::ConfigurationInProgress,
-                  getReplCoord()->processReplSetReconfig(&txn, args, &result));
+                  getReplCoord()->processReplSetReconfig(&opCtx, args, &result));
 
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(2));
     startCapturingLogMessages();
 
     // receive sufficient heartbeats to allow the node to see a majority.
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
-    ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
+    ReplSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     net->enterNetwork();
     for (int i = 0; i < 2; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
@@ -566,9 +566,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenInsufficientVotesAreReceivedDuringRequest
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
     getReplCoord()->setMyLastDurableOpTime(time1);
@@ -617,9 +617,9 @@ TEST_F(ReplCoordTest, ElectionsAbortWhenNodeTransitionsToRollbackState) {
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
     getReplCoord()->setMyLastDurableOpTime(time1);
@@ -655,9 +655,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenVoteRequestResponseContainsANewerTerm) {
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
     getReplCoord()->setMyLastDurableOpTime(time1);
@@ -711,9 +711,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenTermChangesDuringDryRun) {
                              << 1);
 
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
     getReplCoord()->setMyLastDurableOpTime(time1);
@@ -750,9 +750,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenTermChangesDuringActualElection) {
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
     getReplCoord()->setMyLastDurableOpTime(time1);
@@ -761,7 +761,7 @@ TEST_F(ReplCoordTest, ElectionFailsWhenTermChangesDuringActualElection) {
     simulateEnoughHeartbeatsForAllNodesUp();
     simulateSuccessfulDryRun();
     // update to a future term before the election completes
-    getReplCoord()->updateTerm(&txn, 1000);
+    getReplCoord()->updateTerm(&opCtx, 1000);
 
     NetworkInterfaceMock* net = getNet();
     net->enterNetwork();
@@ -795,7 +795,7 @@ public:
      * Verify that a given priority takeover delay is valid. Takeover delays are
      * verified in terms of bounds since the delay value is randomized.
      */
-    void assertValidTakeoverDelay(ReplicaSetConfig config,
+    void assertValidTakeoverDelay(ReplSetConfig config,
                                   Date_t now,
                                   Date_t priorityTakeoverTime,
                                   int nodeIndex) {
@@ -828,7 +828,7 @@ public:
      *
      * Returns the time that it ran until, which should always be equal to 'until'.
      */
-    Date_t respondToHeartbeatsUntil(const ReplicaSetConfig& config,
+    Date_t respondToHeartbeatsUntil(const ReplSetConfig& config,
                                     Date_t until,
                                     const HostAndPort& primaryHostAndPort,
                                     const OpTime& otherNodesOpTime) {
@@ -883,7 +883,7 @@ private:
      *
      * Intended as a helper function only.
      */
-    void _respondToHeartbeatsNow(const ReplicaSetConfig& config,
+    void _respondToHeartbeatsNow(const ReplSetConfig& config,
                                  const HostAndPort& primaryHostAndPort,
                                  const OpTime& otherNodesOpTime) {
 
@@ -937,12 +937,12 @@ TEST_F(PriorityTakeoverTest, SchedulesPriorityTakeoverIfNodeHasHigherPriorityTha
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
 
     auto replCoord = getReplCoord();
     auto now = getNet()->now();
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime myOptime(Timestamp(100, 1), 0);
     replCoord->setMyLastAppliedOpTime(myOptime);
     replCoord->setMyLastDurableOpTime(myOptime);
@@ -963,7 +963,7 @@ TEST_F(PriorityTakeoverTest, SchedulesPriorityTakeoverIfNodeHasHigherPriorityTha
     assertValidTakeoverDelay(config, now, priorityTakeoverTime, 0);
 
     // Also make sure that updating the term cancels the scheduled priority takeover.
-    ASSERT_EQUALS(ErrorCodes::StaleTerm, replCoord->updateTerm(&txn, replCoord->getTerm() + 1));
+    ASSERT_EQUALS(ErrorCodes::StaleTerm, replCoord->updateTerm(&opCtx, replCoord->getTerm() + 1));
     ASSERT_FALSE(replCoord->getPriorityTakeover_forTest());
 }
 
@@ -984,12 +984,12 @@ TEST_F(PriorityTakeoverTest, SuccessfulPriorityTakeover) {
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
 
     auto replCoord = getReplCoord();
     auto now = getNet()->now();
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime myOptime(Timestamp(100, 1), 0);
     replCoord->setMyLastAppliedOpTime(myOptime);
     replCoord->setMyLastDurableOpTime(myOptime);
@@ -1036,14 +1036,14 @@ TEST_F(PriorityTakeoverTest, DontCallForPriorityTakeoverWhenLaggedSameSecond) {
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
     HostAndPort primaryHostAndPort("node2", 12345);
 
     auto replCoord = getReplCoord();
     auto timeZero = getNet()->now();
     auto now = getNet()->now();
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime currentOpTime(Timestamp(100, 5000), 0);
     OpTime behindOpTime(Timestamp(100, 3999), 0);
     OpTime closeEnoughOpTime(Timestamp(100, 4000), 0);
@@ -1112,14 +1112,14 @@ TEST_F(PriorityTakeoverTest, DontCallForPriorityTakeoverWhenLaggedDifferentSecon
                              << "protocolVersion"
                              << 1);
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
-    ReplicaSetConfig config = assertMakeRSConfig(configObj);
+    ReplSetConfig config = assertMakeRSConfig(configObj);
     HostAndPort primaryHostAndPort("node2", 12345);
 
     auto replCoord = getReplCoord();
     auto timeZero = getNet()->now();
     auto now = getNet()->now();
 
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
     OpTime currentOpTime(Timestamp(100, 0), 0);
     OpTime behindOpTime(Timestamp(97, 0), 0);
     OpTime closeEnoughOpTime(Timestamp(98, 0), 0);
@@ -1218,8 +1218,8 @@ TEST_F(ReplCoordTest, NodeCancelsElectionUponReceivingANewConfigDuringDryRun) {
         true};
 
     BSONObjBuilder result;
-    const auto txn = makeOperationContext();
-    ASSERT_OK(getReplCoord()->processReplSetReconfig(txn.get(), config, &result));
+    const auto opCtx = makeOperationContext();
+    ASSERT_OK(getReplCoord()->processReplSetReconfig(opCtx.get(), config, &result));
     // Wait until election cancels.
     net->enterNetwork();
     net->runReadyNetworkOperations();
@@ -1264,8 +1264,8 @@ TEST_F(ReplCoordTest, NodeCancelsElectionUponReceivingANewConfigDuringVotePhase)
         true};
 
     BSONObjBuilder result;
-    const auto txn = makeOperationContext();
-    ASSERT_OK(getReplCoord()->processReplSetReconfig(txn.get(), config, &result));
+    const auto opCtx = makeOperationContext();
+    ASSERT_OK(getReplCoord()->processReplSetReconfig(opCtx.get(), config, &result));
     // Wait until election cancels.
     getNet()->enterNetwork();
     getNet()->runReadyNetworkOperations();
@@ -1279,7 +1279,7 @@ protected:
     using FreshnessScanFn = stdx::function<void(const NetworkOpIter)>;
 
     void replyToHeartbeatRequestAsSecondaries(const NetworkOpIter noi) {
-        ReplicaSetConfig rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
+        ReplSetConfig rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
         ReplSetHeartbeatResponse hbResp;
         hbResp.setSetName(rsConfig.getReplSetName());
         hbResp.setState(MemberState::RS_SECONDARY);
@@ -1337,7 +1337,7 @@ protected:
         }
     }
 
-    ReplicaSetConfig setUp3NodeReplSetAndRunForElection(OpTime opTime) {
+    ReplSetConfig setUp3NodeReplSetAndRunForElection(OpTime opTime) {
         BSONObj configObj = BSON("_id"
                                  << "mySet"
                                  << "version"
@@ -1354,7 +1354,7 @@ protected:
                                  << "settings"
                                  << BSON("catchUpTimeoutMillis" << 5000));
         assertStartSuccess(configObj, HostAndPort("node1", 12345));
-        ReplicaSetConfig config = assertMakeRSConfig(configObj);
+        ReplSetConfig config = assertMakeRSConfig(configObj);
 
         getReplCoord()->setMyLastAppliedOpTime(opTime);
         getReplCoord()->setMyLastDurableOpTime(opTime);
@@ -1421,7 +1421,7 @@ protected:
 TEST_F(PrimaryCatchUpTest, PrimaryDoNotNeedToCatchUp) {
     startCapturingLogMessages();
     OpTime time1(Timestamp(100, 1), 0);
-    ReplicaSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
+    ReplSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
 
     processFreshnessScanRequests([this](const NetworkOpIter noi) {
         getNet()->scheduleResponse(noi, getNet()->now(), makeFreshnessScanResponse(OpTime()));
@@ -1429,16 +1429,17 @@ TEST_F(PrimaryCatchUpTest, PrimaryDoNotNeedToCatchUp) {
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
     ASSERT_EQUALS(1, countLogLinesContaining("My optime is most up-to-date, skipping catch-up"));
-    auto txn = makeOperationContext();
-    getReplCoord()->signalDrainComplete(txn.get(), getReplCoord()->getTerm());
-    ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase("test"));
+    auto opCtx = makeOperationContext();
+    getReplCoord()->signalDrainComplete(opCtx.get(), getReplCoord()->getTerm());
+    Lock::GlobalLock lock(opCtx.get(), MODE_IX, 1);
+    ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "test"));
 }
 
 TEST_F(PrimaryCatchUpTest, PrimaryFreshnessScanTimeout) {
     startCapturingLogMessages();
 
     OpTime time1(Timestamp(100, 1), 0);
-    ReplicaSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
+    ReplSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
 
     processFreshnessScanRequests([this](const NetworkOpIter noi) {
         auto request = noi->getRequest();
@@ -1452,9 +1453,10 @@ TEST_F(PrimaryCatchUpTest, PrimaryFreshnessScanTimeout) {
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
     ASSERT_EQUALS(1, countLogLinesContaining("Could not access any nodes within timeout"));
-    auto txn = makeOperationContext();
-    getReplCoord()->signalDrainComplete(txn.get(), getReplCoord()->getTerm());
-    ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase("test"));
+    auto opCtx = makeOperationContext();
+    getReplCoord()->signalDrainComplete(opCtx.get(), getReplCoord()->getTerm());
+    Lock::GlobalLock lock(opCtx.get(), MODE_IX, 1);
+    ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "test"));
 }
 
 TEST_F(PrimaryCatchUpTest, PrimaryCatchUpSucceeds) {
@@ -1462,7 +1464,7 @@ TEST_F(PrimaryCatchUpTest, PrimaryCatchUpSucceeds) {
 
     OpTime time1(Timestamp(100, 1), 0);
     OpTime time2(Timestamp(100, 2), 0);
-    ReplicaSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
+    ReplSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
 
     processFreshnessScanRequests([this, time2](const NetworkOpIter noi) {
         auto net = getNet();
@@ -1481,9 +1483,10 @@ TEST_F(PrimaryCatchUpTest, PrimaryCatchUpSucceeds) {
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
     ASSERT_EQUALS(1, countLogLinesContaining("Finished catch-up oplog after becoming primary."));
-    auto txn = makeOperationContext();
-    getReplCoord()->signalDrainComplete(txn.get(), getReplCoord()->getTerm());
-    ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase("test"));
+    auto opCtx = makeOperationContext();
+    getReplCoord()->signalDrainComplete(opCtx.get(), getReplCoord()->getTerm());
+    Lock::GlobalLock lock(opCtx.get(), MODE_IX, 1);
+    ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "test"));
 }
 
 TEST_F(PrimaryCatchUpTest, PrimaryCatchUpTimeout) {
@@ -1491,7 +1494,7 @@ TEST_F(PrimaryCatchUpTest, PrimaryCatchUpTimeout) {
 
     OpTime time1(Timestamp(100, 1), 0);
     OpTime time2(Timestamp(100, 2), 0);
-    ReplicaSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
+    ReplSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
 
     // The new primary learns of the latest OpTime.
     processFreshnessScanRequests([this, time2](const NetworkOpIter noi) {
@@ -1504,9 +1507,10 @@ TEST_F(PrimaryCatchUpTest, PrimaryCatchUpTimeout) {
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
     ASSERT_EQUALS(1, countLogLinesContaining("Cannot catch up oplog after becoming primary"));
-    auto txn = makeOperationContext();
-    getReplCoord()->signalDrainComplete(txn.get(), getReplCoord()->getTerm());
-    ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase("test"));
+    auto opCtx = makeOperationContext();
+    getReplCoord()->signalDrainComplete(opCtx.get(), getReplCoord()->getTerm());
+    Lock::GlobalLock lock(opCtx.get(), MODE_IX, 1);
+    ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "test"));
 }
 
 TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringFreshnessScan) {
@@ -1514,7 +1518,7 @@ TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringFreshnessScan) {
 
     OpTime time1(Timestamp(100, 1), 0);
     OpTime time2(Timestamp(100, 2), 0);
-    ReplicaSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
+    ReplSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
 
     processFreshnessScanRequests([this, time2](const NetworkOpIter noi) {
         auto request = noi->getRequest();
@@ -1532,7 +1536,9 @@ TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringFreshnessScan) {
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Running);
     stopCapturingLogMessages();
     ASSERT_EQUALS(1, countLogLinesContaining("Stopped transition to primary"));
-    ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase("test"));
+    auto opCtx = makeOperationContext();
+    Lock::GlobalLock lock(opCtx.get(), MODE_IX, 1);
+    ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "test"));
 }
 
 TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringCatchUp) {
@@ -1540,7 +1546,7 @@ TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringCatchUp) {
 
     OpTime time1(Timestamp(100, 1), 0);
     OpTime time2(Timestamp(100, 2), 0);
-    ReplicaSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
+    ReplSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
 
     processFreshnessScanRequests([this, time2](const NetworkOpIter noi) {
         auto net = getNet();
@@ -1558,14 +1564,15 @@ TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringCatchUp) {
     net->enterNetwork();
     net->runReadyNetworkOperations();
     net->exitNetwork();
-    auto txn = makeOperationContext();
+    auto opCtx = makeOperationContext();
     // Simulate the applier signaling replCoord to exit drain mode.
     // At this point, we see the stepdown and reset the states.
-    getReplCoord()->signalDrainComplete(txn.get(), getReplCoord()->getTerm());
+    getReplCoord()->signalDrainComplete(opCtx.get(), getReplCoord()->getTerm());
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Running);
     stopCapturingLogMessages();
     ASSERT_EQUALS(1, countLogLinesContaining("Cannot catch up oplog after becoming primary"));
-    ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase("test"));
+    Lock::GlobalLock lock(opCtx.get(), MODE_IX, 1);
+    ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "test"));
 }
 
 TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringDrainMode) {
@@ -1573,7 +1580,7 @@ TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringDrainMode) {
 
     OpTime time1(Timestamp(100, 1), 0);
     OpTime time2(Timestamp(100, 2), 0);
-    ReplicaSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
+    ReplSetConfig config = setUp3NodeReplSetAndRunForElection(time1);
 
     processFreshnessScanRequests([this, time2](const NetworkOpIter noi) {
         auto net = getNet();
@@ -1611,11 +1618,15 @@ TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringDrainMode) {
         getNet()->scheduleResponse(noi, getNet()->now(), makeFreshnessScanResponse(OpTime()));
     });
     ASSERT(replCoord->getApplierState() == ApplierState::Draining);
-    ASSERT_FALSE(replCoord->canAcceptWritesForDatabase("test"));
-    auto txn = makeOperationContext();
-    replCoord->signalDrainComplete(txn.get(), replCoord->getTerm());
+    auto opCtx = makeOperationContext();
+    {
+        Lock::GlobalLock lock(opCtx.get(), MODE_IX, 1);
+        ASSERT_FALSE(replCoord->canAcceptWritesForDatabase(opCtx.get(), "test"));
+    }
+    replCoord->signalDrainComplete(opCtx.get(), replCoord->getTerm());
+    Lock::GlobalLock lock(opCtx.get(), MODE_IX, 1);
     ASSERT(replCoord->getApplierState() == ApplierState::Stopped);
-    ASSERT_TRUE(replCoord->canAcceptWritesForDatabase("test"));
+    ASSERT_TRUE(replCoord->canAcceptWritesForDatabase(opCtx.get(), "test"));
 }
 
 }  // namespace

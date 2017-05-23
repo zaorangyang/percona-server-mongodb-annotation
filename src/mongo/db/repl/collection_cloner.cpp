@@ -39,7 +39,6 @@
 #include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/initial_sync_common.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/server_parameters.h"
@@ -72,6 +71,10 @@ MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncListIndexesAttempts, int, 3);
 // The number of attempts for the find command, which gets the data.
 MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncCollectionFindAttempts, int, 3);
 }  // namespace
+
+// Failpoint which causes initial sync to hang when it has cloned 'numDocsToClone' documents to
+// collection 'namespace'.
+MONGO_FP_DECLARE(initialSyncHangDuringCollectionClone);
 
 CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                                    OldThreadPool* dbWorkThreadPool,
@@ -119,9 +122,9 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
       _documents(),
       _dbWorkTaskRunner(_dbWorkThreadPool),
       _scheduleDbWorkFn([this](const executor::TaskExecutor::CallbackFn& work) {
-          auto task = [work](OperationContext* txn,
+          auto task = [work](OperationContext* opCtx,
                              const Status& status) -> TaskRunner::NextAction {
-              work(executor::TaskExecutor::CallbackArgs(nullptr, {}, status, txn));
+              work(executor::TaskExecutor::CallbackArgs(nullptr, {}, status, opCtx));
               return TaskRunner::NextAction::kDisposeOperationContext;
           };
           _dbWorkTaskRunner.schedule(task);
@@ -337,9 +340,10 @@ void CollectionCloner::_listIndexesCallback(const Fetcher::QueryResponseStatus& 
                     _finishCallback(cbd.status);
                     return;
                 }
-                auto txn = cbd.txn;
-                txn->setReplicatedWrites(false);
-                auto&& createStatus = _storageInterface->createCollection(txn, _destNss, _options);
+                auto opCtx = cbd.opCtx;
+                UnreplicatedWritesBlock uwb(opCtx);
+                auto&& createStatus =
+                    _storageInterface->createCollection(opCtx, _destNss, _options);
                 _finishCallback(createStatus);
             });
         if (!scheduleResult.isOK()) {

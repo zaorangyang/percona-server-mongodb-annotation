@@ -39,15 +39,15 @@ env.Library(
         "fail_point_cmd.cpp",
         "feature_compatibility_version_command_parser.cpp",
         "find_and_modify_common.cpp",
+        "generic.cpp",
         "hashcmd.cpp",
         "isself.cpp",
         "mr_common.cpp",
+        "parameters.cpp",
         "rename_collection_common.cpp",
         "server_status.cpp",
-        "parameters.cpp",
         "user_management_commands_common.cpp",
         "write_commands/write_commands_common.cpp",
-        "generic.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver',
@@ -96,13 +96,13 @@ env.Library(
         "clone.cpp",
         "clone_collection.cpp",
         "collection_to_capped.cpp",
-        "dbcommands.cpp",
         "compact.cpp",
         "copydb.cpp",
         "copydb_start_commands.cpp",
         "count_cmd.cpp",
         "create_indexes.cpp",
         "current_op.cpp",
+        "dbcommands.cpp",
         "dbhash.cpp",
         "distinct.cpp",
         "driverHelpers.cpp",
@@ -132,6 +132,7 @@ env.Library(
         "plan_cache_commands.cpp",
         "rename_collection_cmd.cpp",
         "repair_cursor.cpp",
+        "run_aggregate.cpp",
         "set_feature_compatibility_version_command.cpp",
         "snapshot_management.cpp",
         "test_commands.cpp",
@@ -167,6 +168,11 @@ env.Library(
         'apply_ops_cmd_common',
         'core',
         'killcursors_common',
+        #'$BUILD_DIR/mongo/db/catalog/catalog', # CYCLE
+    ],
+    LIBDEPS_TAGS=[
+        # TODO(ADAM, 2017-03-10): See `CYCLE` tags above.
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )
 

@@ -185,8 +185,8 @@ rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData databas
     metadataBob.appendElements(metadata);
 
     if (_metadataWriter) {
-        uassertStatusOK(_metadataWriter(
-            (haveClient() ? cc().getOperationContext() : nullptr), &metadataBob, host));
+        uassertStatusOK(
+            _metadataWriter((haveClient() ? cc().getOperationContext() : nullptr), &metadataBob));
     }
 
     auto requestBuilder = rpc::makeRequestBuilder(getClientRPCProtocols(), getServerRPCProtocols());
@@ -223,14 +223,14 @@ rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData databas
                           << "' ",
             requestBuilder->getProtocol() == commandReply->getProtocol());
 
+    if (_metadataReader) {
+        uassertStatusOK(_metadataReader(commandReply->getMetadata(), host));
+    }
+
     if (ErrorCodes::SendStaleConfig ==
         getStatusFromCommandResult(commandReply->getCommandReply())) {
         throw RecvStaleConfigException("stale config in runCommand",
                                        commandReply->getCommandReply());
-    }
-
-    if (_metadataReader) {
-        uassertStatusOK(_metadataReader(commandReply->getMetadata(), host));
     }
 
     return rpc::UniqueReply(std::move(replyMsg), std::move(commandReply));
@@ -581,25 +581,6 @@ bool DBClientWithCommands::eval(const string& dbname, const string& jscode) {
     BSONObj info;
     BSONElement retValue;
     return eval(dbname, jscode, info, retValue);
-}
-
-list<string> DBClientWithCommands::getDatabaseNames() {
-    BSONObj info;
-    uassert(
-        10005,
-        "listdatabases failed",
-        runCommand(
-            "admin", BSON("listDatabases" << 1 << "nameOnly" << true), info, QueryOption_SlaveOk));
-    uassert(10006, "listDatabases.databases not array", info["databases"].type() == Array);
-
-    list<string> names;
-
-    BSONObjIterator i(info["databases"].embeddedObjectUserCheck());
-    while (i.more()) {
-        names.push_back(i.next().embeddedObjectUserCheck()["name"].valuestr());
-    }
-
-    return names;
 }
 
 list<BSONObj> DBClientWithCommands::getCollectionInfos(const string& db, const BSONObj& filter) {

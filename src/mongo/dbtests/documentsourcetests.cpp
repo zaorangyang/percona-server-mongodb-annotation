@@ -108,10 +108,7 @@ protected:
             getExecutor(&_opCtx, ctx.getCollection(), std::move(cq), PlanExecutor::YIELD_MANUAL));
 
         exec->saveState();
-        exec->registerExec(ctx.getCollection());
-
-        _source =
-            DocumentSourceCursor::create(ctx.getCollection(), nss.ns(), std::move(exec), _ctx);
+        _source = DocumentSourceCursor::create(ctx.getCollection(), std::move(exec), _ctx);
     }
 
     intrusive_ptr<ExpressionContextForTest> ctx() {
@@ -310,6 +307,40 @@ public:
     }
 };
 
+class SerializationRespectsExplainModes : public Base {
+public:
+    void run() {
+        createSource();
+
+        {
+            // Nothing serialized when no explain mode specified.
+            auto explainResult = source()->serialize();
+            ASSERT_TRUE(explainResult.missing());
+        }
+
+        {
+            auto explainResult = source()->serialize(ExplainOptions::Verbosity::kQueryPlanner);
+            ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+            ASSERT_TRUE(explainResult["$cursor"]["executionStats"].missing());
+        }
+
+        {
+            auto explainResult = source()->serialize(ExplainOptions::Verbosity::kExecStats);
+            ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+            ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
+            ASSERT_TRUE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
+        }
+
+        {
+            auto explainResult =
+                source()->serialize(ExplainOptions::Verbosity::kExecAllPlans).getDocument();
+            ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+            ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
+            ASSERT_FALSE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
+        }
+    }
+};
+
 }  // namespace DocumentSourceCursor
 
 class All : public Suite {
@@ -325,6 +356,7 @@ public:
         add<DocumentSourceCursor::IndexScanProvidesSortOnKeys>();
         add<DocumentSourceCursor::ReverseIndexScanProvidesSort>();
         add<DocumentSourceCursor::CompoundIndexScanProvidesMultipleSorts>();
+        add<DocumentSourceCursor::SerializationRespectsExplainModes>();
     }
 };
 

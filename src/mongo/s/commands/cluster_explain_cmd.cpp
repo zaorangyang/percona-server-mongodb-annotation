@@ -87,7 +87,7 @@ public:
      * the command that you are explaining. The auth check is performed recursively
      * on the nested command.
      */
-    virtual Status checkAuthForOperation(OperationContext* txn,
+    virtual Status checkAuthForOperation(OperationContext* opCtx,
                                          const std::string& dbname,
                                          const BSONObj& cmdObj) {
         if (Object != cmdObj.firstElement().type()) {
@@ -103,19 +103,18 @@ public:
             return Status(ErrorCodes::CommandNotFound, ss);
         }
 
-        return commToExplain->checkAuthForOperation(txn, dbname, explainObj);
+        return commToExplain->checkAuthForOperation(opCtx, dbname, explainObj);
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbName,
                      BSONObj& cmdObj,
                      int options,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
-        ExplainCommon::Verbosity verbosity;
-        Status parseStatus = ExplainCommon::parseCmdBSON(cmdObj, &verbosity);
-        if (!parseStatus.isOK()) {
-            return appendCommandStatus(result, parseStatus);
+        auto verbosity = ExplainOptions::parseCmdBSON(cmdObj);
+        if (!verbosity.isOK()) {
+            return appendCommandStatus(result, verbosity.getStatus());
         }
 
         // This is the nested command which we are explaining.
@@ -139,8 +138,8 @@ public:
         rpc::ServerSelectionMetadata metadata(secondaryOk, readPref.getValue());
 
         // Actually call the nested command's explain(...) method.
-        Status explainStatus =
-            commToExplain->explain(txn, dbName, explainObj, verbosity, metadata, &result);
+        Status explainStatus = commToExplain->explain(
+            opCtx, dbName, explainObj, verbosity.getValue(), metadata, &result);
         if (!explainStatus.isOK()) {
             return appendCommandStatus(result, explainStatus);
         }

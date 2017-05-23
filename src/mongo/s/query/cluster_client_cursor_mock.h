@@ -43,11 +43,13 @@ public:
 
     ~ClusterClientCursorMock();
 
-    StatusWith<ClusterQueryResult> next(OperationContext* txn) final;
+    StatusWith<ClusterQueryResult> next(OperationContext* opCtx) final;
 
-    void kill(OperationContext* txn) final;
+    void kill(OperationContext* opCtx) final;
 
     bool isTailable() const final;
+
+    UserNameIterator getAuthenticatedUsers() const final;
 
     boost::optional<BSONObj> viewDefinition() const final;
 
