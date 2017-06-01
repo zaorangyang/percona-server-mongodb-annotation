@@ -33,6 +33,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
@@ -69,7 +70,7 @@ public:
         }
         return Status::OK();
     }
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      BSONObj& cmdObj,
                      int,
@@ -87,11 +88,10 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        ScopedTransaction scopedXact(txn, MODE_X);
-        Lock::GlobalWrite globalWrite(txn->lockState());
+        Lock::GlobalWrite globalWrite(opCtx);
 
-        WriteUnitOfWork wuow(txn);
-        getGlobalServiceContext()->getOpObserver()->onOpMessage(txn, dataElement.Obj());
+        WriteUnitOfWork wuow(opCtx);
+        getGlobalServiceContext()->getOpObserver()->onOpMessage(opCtx, dataElement.Obj());
         wuow.commit();
         return true;
     }

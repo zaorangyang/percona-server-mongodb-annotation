@@ -36,79 +36,49 @@
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/commands/cluster_aggregate.h"
 #include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
-
-using std::string;
-using std::vector;
-
 namespace {
-
-long long applySkipLimit(long long num, const BSONObj& cmd) {
-    BSONElement s = cmd["skip"];
-    BSONElement l = cmd["limit"];
-
-    if (s.isNumber()) {
-        num = num - s.numberLong();
-        if (num < 0) {
-            num = 0;
-        }
-    }
-
-    if (l.isNumber()) {
-        long long limit = l.numberLong();
-        if (limit < 0) {
-            limit = -limit;
-        }
-
-        // 0 limit means no limit
-        if (limit < num && limit != 0) {
-            num = limit;
-        }
-    }
-
-    return num;
-}
-
 
 class ClusterCountCmd : public Command {
 public:
     ClusterCountCmd() : Command("count", false) {}
 
-    virtual bool slaveOk() const {
+    bool slaveOk() const override {
         return true;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return false;
     }
 
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) override {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
-    virtual bool run(OperationContext* txn,
-                     const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             BSONObj& cmdObj,
+             int options,
+             std::string& errmsg,
+             BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
-        uassert(
-            ErrorCodes::InvalidNamespace, "count command requires valid namespace", nss.isValid());
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
+                nss.isValid());
 
         long long skip = 0;
 
@@ -167,8 +137,8 @@ public:
             }
         }
 
-        vector<Strategy::CommandResult> countResult;
-        Strategy::commandOp(txn,
+        std::vector<Strategy::CommandResult> countResult;
+        Strategy::commandOp(opCtx,
                             dbname,
                             countCmdBuilder.done(),
                             options,
@@ -189,16 +159,19 @@ public:
                 return appendCommandStatus(result, aggCmdOnView.getStatus());
             }
 
-            auto resolvedView = ResolvedView::fromBSON(countResult[0].result);
-            auto aggCmd = resolvedView.asExpandedViewAggregation(aggCmdOnView.getValue());
-            if (!aggCmd.isOK()) {
-                return appendCommandStatus(result, aggCmd.getStatus());
+            auto aggRequestOnView = AggregationRequest::parseFromBSON(nss, aggCmdOnView.getValue());
+            if (!aggRequestOnView.isOK()) {
+                return appendCommandStatus(result, aggRequestOnView.getStatus());
             }
 
+            auto resolvedView = ResolvedView::fromBSON(countResult[0].result);
+            auto resolvedAggRequest =
+                resolvedView.asExpandedViewAggregation(aggRequestOnView.getValue());
+            auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
 
             BSONObjBuilder aggResult;
             Command::findCommand("aggregate")
-                ->run(txn, dbname, aggCmd.getValue(), options, errmsg, aggResult);
+                ->run(opCtx, dbname, resolvedAggCmd, options, errmsg, aggResult);
 
             result.resetToEmpty();
             ViewResponseFormatter formatter(aggResult.obj());
@@ -210,33 +183,29 @@ public:
             return true;
         }
 
-
         long long total = 0;
         BSONObjBuilder shardSubTotal(result.subobjStart("shards"));
 
-        for (vector<Strategy::CommandResult>::const_iterator iter = countResult.begin();
-             iter != countResult.end();
-             ++iter) {
-            const ShardId& shardName = iter->shardTargetId;
+        for (const auto& resultEntry : countResult) {
+            const ShardId& shardName = resultEntry.shardTargetId;
+            const auto resultBSON = resultEntry.result;
 
-            if (iter->result["ok"].trueValue()) {
-                long long shardCount = iter->result["n"].numberLong();
+            if (resultBSON["ok"].trueValue()) {
+                long long shardCount = resultBSON["n"].numberLong();
 
                 shardSubTotal.appendNumber(shardName.toString(), shardCount);
                 total += shardCount;
             } else {
                 shardSubTotal.doneFast();
-                errmsg = "failed on : " + shardName.toString();
-                result.append("cause", iter->result);
 
-                // Add "code" to the top-level response, if the failure of the sharded command
-                // can be accounted to a single error
-                int code = getUniqueCodeFromCommandResults(countResult);
-                if (code != 0) {
-                    result.append("code", code);
-                }
-
-                return false;
+                // Add error context so that you can see on which shard failed as well as details
+                // about that error.
+                auto shardError = getStatusFromCommandResult(resultBSON);
+                auto errorWithContext =
+                    Status(shardError.code(),
+                           str::stream() << "failed on: " << shardName.toString()
+                                         << causedBy(shardError.reason()));
+                return appendCommandStatus(result, errorWithContext);
             }
         }
 
@@ -247,17 +216,16 @@ public:
         return true;
     }
 
-    virtual Status explain(OperationContext* txn,
-                           const std::string& dbname,
-                           const BSONObj& cmdObj,
-                           ExplainCommon::Verbosity verbosity,
-                           const rpc::ServerSelectionMetadata& serverSelectionMetadata,
-                           BSONObjBuilder* out) const {
+    Status explain(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   ExplainOptions::Verbosity verbosity,
+                   const rpc::ServerSelectionMetadata& serverSelectionMetadata,
+                   BSONObjBuilder* out) const override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
-        if (!nss.isValid()) {
-            return Status{ErrorCodes::InvalidNamespace,
-                          str::stream() << "Invalid collection name: " << nss.ns()};
-        }
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
+                nss.isValid());
 
         // Extract the targeting query.
         BSONObj targetingQuery;
@@ -284,8 +252,8 @@ public:
         // We will time how long it takes to run the commands on the shards
         Timer timer;
 
-        vector<Strategy::CommandResult> shardResults;
-        Strategy::commandOp(txn,
+        std::vector<Strategy::CommandResult> shardResults;
+        Strategy::commandOp(opCtx,
                             dbname,
                             explainCmdBob.obj(),
                             options,
@@ -308,25 +276,56 @@ public:
                 return aggCmdOnView.getStatus();
             }
 
+            auto aggRequestOnView =
+                AggregationRequest::parseFromBSON(nss, aggCmdOnView.getValue(), verbosity);
+            if (!aggRequestOnView.isOK()) {
+                return aggRequestOnView.getStatus();
+            }
+
             auto resolvedView = ResolvedView::fromBSON(shardResults[0].result);
-            auto aggCmd = resolvedView.asExpandedViewAggregation(aggCmdOnView.getValue());
-            if (!aggCmd.isOK()) {
-                return aggCmd.getStatus();
-            }
+            auto resolvedAggRequest =
+                resolvedView.asExpandedViewAggregation(aggRequestOnView.getValue());
+            auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
 
-            std::string errMsg;
-            if (Command::findCommand("aggregate")
-                    ->run(txn, dbname, aggCmd.getValue(), 0, errMsg, *out)) {
-                return Status::OK();
-            }
+            ClusterAggregate::Namespaces nsStruct;
+            nsStruct.requestedNss = nss;
+            nsStruct.executionNss = resolvedAggRequest.getNamespaceString();
 
-            return getStatusFromCommandResult(out->asTempObj());
+            return ClusterAggregate::runAggregate(
+                opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, 0, out);
         }
 
         const char* mongosStageName = ClusterExplain::getStageNameForReadOp(shardResults, cmdObj);
 
         return ClusterExplain::buildExplainResult(
-            txn, shardResults, mongosStageName, millisElapsed, out);
+            opCtx, shardResults, mongosStageName, millisElapsed, out);
+    }
+
+private:
+    static long long applySkipLimit(long long num, const BSONObj& cmd) {
+        BSONElement s = cmd["skip"];
+        BSONElement l = cmd["limit"];
+
+        if (s.isNumber()) {
+            num = num - s.numberLong();
+            if (num < 0) {
+                num = 0;
+            }
+        }
+
+        if (l.isNumber()) {
+            long long limit = l.numberLong();
+            if (limit < 0) {
+                limit = -limit;
+            }
+
+            // 0 limit means no limit
+            if (limit < num && limit != 0) {
+                num = limit;
+            }
+        }
+
+        return num;
     }
 
 } clusterCountCmd;

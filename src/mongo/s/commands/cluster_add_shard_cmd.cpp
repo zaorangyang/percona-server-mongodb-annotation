@@ -80,7 +80,7 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
                      BSONObj& cmdObj,
                      int options,
@@ -94,9 +94,9 @@ public:
                            parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize()
                                                       : 0 /*kMaxSizeMBDefault*/);
 
-        auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto cmdResponseStatus = uassertStatusOK(
-            configShard->runCommandWithFixedRetryAttempts(txn,
+            configShard->runCommandWithFixedRetryAttempts(opCtx,
                                                           kPrimaryOnlyReadPreference,
                                                           "admin",
                                                           parsedRequest.toCommandForConfig(),
@@ -109,8 +109,8 @@ public:
         result << "shardAdded" << shardAdded;
 
         // Ensure the added shard is visible to this process.
-        auto shardRegistry = Grid::get(txn)->shardRegistry();
-        if (!shardRegistry->getShard(txn, shardAdded).isOK()) {
+        auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+        if (!shardRegistry->getShard(opCtx, shardAdded).isOK()) {
             return appendCommandStatus(result,
                                        {ErrorCodes::OperationFailed,
                                         "Could not find shard metadata for shard after adding it. "

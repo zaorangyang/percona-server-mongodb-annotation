@@ -31,6 +31,8 @@
 #include "mongo/s/write_ops/batch_write_op.h"
 
 #include "mongo/base/error_codes.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 namespace mongo {
 
@@ -233,10 +235,10 @@ static void cancelBatches(const WriteErrorDetail& why,
     batchMap->clear();
 }
 
-Status BatchWriteOp::targetBatch(OperationContext* txn,
+Status BatchWriteOp::targetBatch(OperationContext* opCtx,
                                  const NSTargeter& targeter,
                                  bool recordTargetErrors,
-                                 vector<TargetedWriteBatch*>* targetedBatches) {
+                                 std::map<ShardId, TargetedWriteBatch*>* targetedBatches) {
     //
     // Targeting of unordered batches is fairly simple - each remaining write op is targeted,
     // and each of those targeted writes are grouped into a batch for a particular shard
@@ -293,7 +295,7 @@ Status BatchWriteOp::targetBatch(OperationContext* txn,
         OwnedPointerVector<TargetedWrite> writesOwned;
         vector<TargetedWrite*>& writes = writesOwned.mutableVector();
 
-        Status targetStatus = writeOp.targetWrites(txn, targeter, &writes);
+        Status targetStatus = writeOp.targetWrites(opCtx, targeter, &writes);
 
         if (!targetStatus.isOK()) {
             WriteErrorDetail targetError;
@@ -400,7 +402,8 @@ Status BatchWriteOp::targetBatch(OperationContext* txn,
         // Remember targeted batch for reporting
         _targeted.insert(batch);
         // Send the handle back to caller
-        targetedBatches->push_back(batch);
+        invariant(targetedBatches->find(batch->getEndpoint().shardName) == targetedBatches->end());
+        targetedBatches->insert(std::make_pair(batch->getEndpoint().shardName, batch));
     }
 
     return Status::OK();
@@ -548,9 +551,9 @@ void BatchWriteOp::noteBatchResponse(const TargetedWriteBatch& targetedBatch,
 
     // Special handling for write concern errors, save for later
     if (response.isWriteConcernErrorSet()) {
-        unique_ptr<ShardWCError> wcError(
-            new ShardWCError(targetedBatch.getEndpoint(), *response.getWriteConcernError()));
-        _wcErrors.mutableVector().push_back(wcError.release());
+        auto wcError = stdx::make_unique<ShardWCError>(targetedBatch.getEndpoint(),
+                                                       *response.getWriteConcernError());
+        _wcErrors.push_back(std::move(wcError));
     }
 
     vector<WriteErrorDetail*> itemErrors;
@@ -628,10 +631,10 @@ void BatchWriteOp::noteBatchResponse(const TargetedWriteBatch& targetedBatch,
             int batchIndex = targetedBatch.getWrites()[childBatchIndex]->writeOpRef.first;
 
             // Push the upserted id with the correct index into the batch upserted ids
-            BatchedUpsertDetail* upsertedId = new BatchedUpsertDetail;
+            auto upsertedId = stdx::make_unique<BatchedUpsertDetail>();
             upsertedId->setIndex(batchIndex);
             upsertedId->setUpsertedID(childUpsertedId->getUpsertedID());
-            _upsertedIds.mutableVector().push_back(upsertedId);
+            _upsertedIds.push_back(std::move(upsertedId));
         }
     }
 }
@@ -761,9 +764,8 @@ void BatchWriteOp::buildClientResponse(BatchedCommandResponse* batchResp) {
             error->setErrCode((*_wcErrors.begin())->error.getErrCode());
         }
 
-        for (vector<ShardWCError*>::const_iterator it = _wcErrors.begin(); it != _wcErrors.end();
-             ++it) {
-            const ShardWCError* wcError = *it;
+        for (auto it = _wcErrors.begin(); it != _wcErrors.end(); ++it) {
+            const ShardWCError* wcError = it->get();
             if (it != _wcErrors.begin())
                 msg << " :: and :: ";
             msg << wcError->error.getErrMessage() << " at " << wcError->endpoint.shardName;
@@ -778,7 +780,7 @@ void BatchWriteOp::buildClientResponse(BatchedCommandResponse* batchResp) {
     //
 
     if (_upsertedIds.size() != 0) {
-        batchResp->setUpsertDetails(_upsertedIds.vector());
+        batchResp->setUpsertDetails(transitional_tools_do_not_use::unspool_vector(_upsertedIds));
     }
 
     // Stats

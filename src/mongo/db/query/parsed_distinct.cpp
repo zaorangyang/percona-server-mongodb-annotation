@@ -86,9 +86,6 @@ StatusWith<BSONObj> ParsedDistinct::asAggregationCommand() const {
     groupStageBuilder.doneFast();
     pipelineBuilder.doneFast();
 
-    if (_query->getQueryRequest().isExplain()) {
-        aggregationBuilder.append("explain", true);
-    }
     aggregationBuilder.append(kCollationField, qr.getCollation());
 
     // Specify the 'cursor' option so that aggregation uses the cursor interface.
@@ -97,7 +94,7 @@ StatusWith<BSONObj> ParsedDistinct::asAggregationCommand() const {
     return aggregationBuilder.obj();
 }
 
-StatusWith<ParsedDistinct> ParsedDistinct::parse(OperationContext* txn,
+StatusWith<ParsedDistinct> ParsedDistinct::parse(OperationContext* opCtx,
                                                  const NamespaceString& nss,
                                                  const BSONObj& cmdObj,
                                                  const ExtensionsCallback& extensionsCallback,
@@ -142,7 +139,7 @@ StatusWith<ParsedDistinct> ParsedDistinct::parse(OperationContext* txn,
 
     qr->setExplain(isExplain);
 
-    auto cq = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
+    auto cq = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
     if (!cq.isOK()) {
         return cq.getStatus();
     }

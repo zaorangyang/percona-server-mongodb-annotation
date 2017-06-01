@@ -110,14 +110,19 @@ ClusterCursorManager::PinnedCursor& ClusterCursorManager::PinnedCursor::operator
     return *this;
 }
 
-StatusWith<ClusterQueryResult> ClusterCursorManager::PinnedCursor::next(OperationContext* txn) {
+StatusWith<ClusterQueryResult> ClusterCursorManager::PinnedCursor::next(OperationContext* opCtx) {
     invariant(_cursor);
-    return _cursor->next(txn);
+    return _cursor->next(opCtx);
 }
 
 bool ClusterCursorManager::PinnedCursor::isTailable() const {
     invariant(_cursor);
     return _cursor->isTailable();
+}
+
+UserNameIterator ClusterCursorManager::PinnedCursor::getAuthenticatedUsers() const {
+    invariant(_cursor);
+    return _cursor->getAuthenticatedUsers();
 }
 
 void ClusterCursorManager::PinnedCursor::returnCursor(CursorState cursorState) {
@@ -187,7 +192,7 @@ void ClusterCursorManager::shutdown() {
 }
 
 StatusWith<CursorId> ClusterCursorManager::registerCursor(
-    OperationContext* txn,
+    OperationContext* opCtx,
     std::unique_ptr<ClusterClientCursor> cursor,
     const NamespaceString& nss,
     CursorType cursorType,
@@ -199,7 +204,7 @@ StatusWith<CursorId> ClusterCursorManager::registerCursor(
 
     if (_inShutdown) {
         lk.unlock();
-        cursor->kill(txn);
+        cursor->kill(opCtx);
         return Status(ErrorCodes::ShutdownInProgress,
                       "Cannot register new cursors as we are in the process of shutting down");
     }
@@ -246,7 +251,7 @@ StatusWith<CursorId> ClusterCursorManager::registerCursor(
 }
 
 StatusWith<ClusterCursorManager::PinnedCursor> ClusterCursorManager::checkOutCursor(
-    const NamespaceString& nss, CursorId cursorId, OperationContext* txn) {
+    const NamespaceString& nss, CursorId cursorId, OperationContext* opCtx) {
     // Read the clock out of the lock.
     const auto now = _clockSource->now();
 

@@ -43,6 +43,7 @@
 namespace mongo {
 
 const std::string ChunkType::ConfigNS = "config.chunks";
+const std::string ChunkType::ShardNSPrefix = "config.chunks.";
 
 const BSONField<std::string> ChunkType::name("_id");
 const BSONField<BSONObj> ChunkType::minShardID("_id");
@@ -131,6 +132,15 @@ bool ChunkRange::operator==(const ChunkRange& other) const {
 bool ChunkRange::operator!=(const ChunkRange& other) const {
     return !(*this == other);
 }
+
+ChunkType::ChunkType() = default;
+
+ChunkType::ChunkType(NamespaceString nss, ChunkRange range, ChunkVersion version, ShardId shardId)
+    : _ns(nss.ns()),
+      _min(range.getMin()),
+      _max(range.getMax()),
+      _version(version),
+      _shard(std::move(shardId)) {}
 
 StatusWith<ChunkType> ChunkType::fromConfigBSON(const BSONObj& source) {
     ChunkType chunk;

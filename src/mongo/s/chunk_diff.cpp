@@ -90,7 +90,7 @@ typename ConfigDiffTracker<ValType>::RangeOverlap ConfigDiffTracker<ValType>::_o
 }
 
 template <class ValType>
-int ConfigDiffTracker<ValType>::calculateConfigDiff(OperationContext* txn,
+int ConfigDiffTracker<ValType>::calculateConfigDiff(OperationContext* opCtx,
                                                     const std::vector<ChunkType>& chunks) {
     // Apply the chunk changes to the ranges and versions
     //
@@ -105,7 +105,7 @@ int ConfigDiffTracker<ValType>::calculateConfigDiff(OperationContext* txn,
     // Store epoch now so it doesn't change when we change max
     OID currEpoch = _maxVersion->epoch();
 
-    _validDiffs = 0;
+    int validDiffs = 0;
 
     for (const ChunkType& chunk : chunks) {
         const ChunkVersion& chunkVersion = chunk.getVersion();
@@ -121,7 +121,7 @@ int ConfigDiffTracker<ValType>::calculateConfigDiff(OperationContext* txn,
             return -1;
         }
 
-        _validDiffs++;
+        validDiffs++;
 
         // Get max changed version and chunk version
         if (chunkVersion > *_maxVersion) {
@@ -129,7 +129,7 @@ int ConfigDiffTracker<ValType>::calculateConfigDiff(OperationContext* txn,
         }
 
         // Chunk version changes
-        ShardId shard = shardFor(txn, chunk.getShard());
+        ShardId shard = shardFor(opCtx, chunk.getShard());
 
         typename MaxChunkVersionMap::const_iterator shardVersionIt = _maxShardVersions->find(shard);
         if (shardVersionIt == _maxShardVersions->end() || shardVersionIt->second < chunkVersion) {
@@ -151,7 +151,7 @@ int ConfigDiffTracker<ValType>::calculateConfigDiff(OperationContext* txn,
         }
     }
 
-    LOG(3) << "found " << _validDiffs << " new chunks for collection " << _ns << " (tracking "
+    LOG(3) << "found " << validDiffs << " new chunks for collection " << _ns << " (tracking "
            << newTracked.size() << "), new version is " << *_maxVersion;
 
     for (const ChunkType& chunk : newTracked) {
@@ -164,10 +164,10 @@ int ConfigDiffTracker<ValType>::calculateConfigDiff(OperationContext* txn,
             return -1;
         }
 
-        _currMap->insert(rangeFor(txn, chunk));
+        _currMap->insert(rangeFor(opCtx, chunk));
     }
 
-    return _validDiffs;
+    return validDiffs;
 }
 
 ConfigDiffTrackerBase::QueryAndSort ConfigDiffTrackerBase::createConfigDiffQuery(

@@ -50,42 +50,23 @@
 
 namespace mongo {
 
-using std::string;
 using std::vector;
 
 namespace {
-unsigned idFromCursorId(CursorId id) {
+uint32_t idFromCursorId(CursorId id) {
     uint64_t x = static_cast<uint64_t>(id);
     x = x >> 32;
-    return static_cast<unsigned>(x);
+    return static_cast<uint32_t>(x);
 }
 
-CursorId cursorIdFromParts(unsigned collection, unsigned cursor) {
-    CursorId x = static_cast<CursorId>(collection) << 32;
+CursorId cursorIdFromParts(uint32_t collectionIdentifier, uint32_t cursor) {
+    // The leading two bits of a non-global CursorId should be 0.
+    invariant((collectionIdentifier & (0b11 << 30)) == 0);
+    CursorId x = static_cast<CursorId>(collectionIdentifier) << 32;
     x |= cursor;
     return x;
 }
-
-class IdWorkTest : public StartupTest {
-public:
-    void _run(unsigned a, unsigned b) {
-        CursorId x = cursorIdFromParts(a, b);
-        invariant(a == idFromCursorId(x));
-        CursorId y = cursorIdFromParts(a, b + 1);
-        invariant(x != y);
-    }
-
-    void run() {
-        _run(123, 456);
-        _run(0xdeadbeef, 0xcafecafe);
-        _run(0, 0);
-        _run(99999999, 999);
-        _run(0xFFFFFFFF, 1);
-        _run(0xFFFFFFFF, 0);
-        _run(0xFFFFFFFF, 0xFFFFFFFF);
-    }
-} idWorkTest;
-}
+}  // namespace
 
 class GlobalCursorIdCache {
 public:
@@ -93,33 +74,33 @@ public:
     ~GlobalCursorIdCache();
 
     /**
-     * this gets called when a CursorManager gets created
-     * @return the id the CursorManager should use when generating
-     * cursor ids
+     * Returns a unique 32-bit identifier to be used as the first 32 bits of all cursor ids for a
+     * new CursorManager.
      */
-    unsigned created(const std::string& ns);
+    uint32_t registerCursorManager(const NamespaceString& nss);
 
     /**
-     * called by CursorManager when its going away
+     * Must be called when a CursorManager is deleted. 'id' must be the identifier returned by
+     * registerCursorManager().
      */
-    void destroyed(unsigned id, const std::string& ns);
+    void deregisterCursorManager(uint32_t id, const NamespaceString& nss);
 
     /**
      * works globally
      */
-    bool eraseCursor(OperationContext* txn, CursorId id, bool checkAuth);
+    bool eraseCursor(OperationContext* opCtx, CursorId id, bool checkAuth);
 
     void appendStats(BSONObjBuilder& builder);
 
-    std::size_t timeoutCursors(OperationContext* txn, int millisSinceLastCall);
+    std::size_t timeoutCursors(OperationContext* opCtx, int millisSinceLastCall);
 
     int64_t nextSeed();
 
 private:
     SimpleMutex _mutex;
 
-    typedef unordered_map<unsigned, string> Map;
-    Map _idToNS;
+    typedef unordered_map<unsigned, NamespaceString> Map;
+    Map _idToNss;
     unsigned _nextId;
 
     std::unique_ptr<SecureRandom> _secureRandom;
@@ -137,7 +118,7 @@ MONGO_INITIALIZER(GlobalCursorIdCache)(InitializerContext* context) {
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(GlobalCursorManager, ("GlobalCursorIdCache"))
 (InitializerContext* context) {
-    globalCursorManager.reset(new CursorManager(""));
+    globalCursorManager.reset(new CursorManager({}));
     return Status::OK();
 }
 
@@ -152,71 +133,72 @@ int64_t GlobalCursorIdCache::nextSeed() {
     return _secureRandom->nextInt64();
 }
 
-unsigned GlobalCursorIdCache::created(const std::string& ns) {
-    static const unsigned MAX_IDS = 1000 * 1000 * 1000;
+uint32_t GlobalCursorIdCache::registerCursorManager(const NamespaceString& nss) {
+    static const uint32_t kMaxIds = 1000 * 1000 * 1000;
+    static_assert((kMaxIds & (0b11 << 30)) == 0,
+                  "the first two bits of a collection identifier must always be zeroes");
 
     stdx::lock_guard<SimpleMutex> lk(_mutex);
 
-    fassert(17359, _idToNS.size() < MAX_IDS);
+    fassert(17359, _idToNss.size() < kMaxIds);
 
-    for (unsigned i = 0; i <= MAX_IDS; i++) {
-        unsigned id = ++_nextId;
+    for (uint32_t i = 0; i <= kMaxIds; i++) {
+        uint32_t id = ++_nextId;
         if (id == 0)
             continue;
-        if (_idToNS.count(id) > 0)
+        if (_idToNss.count(id) > 0)
             continue;
-        _idToNS[id] = ns;
+        _idToNss[id] = nss;
         return id;
     }
 
-    invariant(false);
+    MONGO_UNREACHABLE;
 }
 
-void GlobalCursorIdCache::destroyed(unsigned id, const std::string& ns) {
+void GlobalCursorIdCache::deregisterCursorManager(uint32_t id, const NamespaceString& nss) {
     stdx::lock_guard<SimpleMutex> lk(_mutex);
-    invariant(ns == _idToNS[id]);
-    _idToNS.erase(id);
+    invariant(nss == _idToNss[id]);
+    _idToNss.erase(id);
 }
 
-bool GlobalCursorIdCache::eraseCursor(OperationContext* txn, CursorId id, bool checkAuth) {
+bool GlobalCursorIdCache::eraseCursor(OperationContext* opCtx, CursorId id, bool checkAuth) {
     // Figure out what the namespace of this cursor is.
-    std::string ns;
-    if (globalCursorManager->ownsCursorId(id)) {
-        auto pin = globalCursorManager.get()->pinCursor(id);
+    NamespaceString nss;
+    if (CursorManager::isGloballyManagedCursor(id)) {
+        auto pin = globalCursorManager->pinCursor(id);
         if (!pin.isOK()) {
             invariant(pin == ErrorCodes::CursorNotFound);
             // No such cursor.  TODO: Consider writing to audit log here (even though we don't
             // have a namespace).
             return false;
         }
-        ns = pin.getValue().getCursor()->ns();
+        nss = pin.getValue().getCursor()->nss();
     } else {
         stdx::lock_guard<SimpleMutex> lk(_mutex);
-        unsigned nsid = idFromCursorId(id);
-        Map::const_iterator it = _idToNS.find(nsid);
-        if (it == _idToNS.end()) {
+        uint32_t nsid = idFromCursorId(id);
+        Map::const_iterator it = _idToNss.find(nsid);
+        if (it == _idToNss.end()) {
             // No namespace corresponding to this cursor id prefix.  TODO: Consider writing to
             // audit log here (even though we don't have a namespace).
             return false;
         }
-        ns = it->second;
+        nss = it->second;
     }
-    const NamespaceString nss(ns);
     invariant(nss.isValid());
 
     // Check if we are authorized to erase this cursor.
     if (checkAuth) {
-        AuthorizationSession* as = AuthorizationSession::get(txn->getClient());
+        AuthorizationSession* as = AuthorizationSession::get(opCtx->getClient());
         Status authorizationStatus = as->checkAuthForKillCursors(nss, id);
         if (!authorizationStatus.isOK()) {
-            audit::logKillCursorsAuthzCheck(txn->getClient(), nss, id, ErrorCodes::Unauthorized);
+            audit::logKillCursorsAuthzCheck(opCtx->getClient(), nss, id, ErrorCodes::Unauthorized);
             return false;
         }
     }
 
     // If this cursor is owned by the global cursor manager, ask it to erase the cursor for us.
-    if (globalCursorManager->ownsCursorId(id)) {
-        Status eraseStatus = globalCursorManager->eraseCursor(txn, id, checkAuth);
+    if (CursorManager::isGloballyManagedCursor(id)) {
+        Status eraseStatus = globalCursorManager->eraseCursor(opCtx, id, checkAuth);
         massert(28697,
                 eraseStatus.reason(),
                 eraseStatus.code() == ErrorCodes::OK ||
@@ -226,15 +208,16 @@ bool GlobalCursorIdCache::eraseCursor(OperationContext* txn, CursorId id, bool c
 
     // If not, then the cursor must be owned by a collection.  Erase the cursor under the
     // collection lock (to prevent the collection from going away during the erase).
-    AutoGetCollectionForRead ctx(txn, nss);
+    AutoGetCollectionForReadCommand ctx(opCtx, nss);
     Collection* collection = ctx.getCollection();
     if (!collection) {
         if (checkAuth)
-            audit::logKillCursorsAuthzCheck(txn->getClient(), nss, id, ErrorCodes::CursorNotFound);
+            audit::logKillCursorsAuthzCheck(
+                opCtx->getClient(), nss, id, ErrorCodes::CursorNotFound);
         return false;
     }
 
-    Status eraseStatus = collection->getCursorManager()->eraseCursor(txn, id, checkAuth);
+    Status eraseStatus = collection->getCursorManager()->eraseCursor(opCtx, id, checkAuth);
     massert(16089,
             eraseStatus.reason(),
             eraseStatus.code() == ErrorCodes::OK ||
@@ -242,30 +225,25 @@ bool GlobalCursorIdCache::eraseCursor(OperationContext* txn, CursorId id, bool c
     return eraseStatus.isOK();
 }
 
-std::size_t GlobalCursorIdCache::timeoutCursors(OperationContext* txn, int millisSinceLastCall) {
+std::size_t GlobalCursorIdCache::timeoutCursors(OperationContext* opCtx, int millisSinceLastCall) {
     size_t totalTimedOut = 0;
 
     // Time out the cursors from the global cursor manager.
     totalTimedOut += globalCursorManager->timeoutCursors(millisSinceLastCall);
 
     // Compute the set of collection names that we have to time out cursors for.
-    vector<string> todo;
+    vector<NamespaceString> todo;
     {
         stdx::lock_guard<SimpleMutex> lk(_mutex);
-        for (Map::const_iterator i = _idToNS.begin(); i != _idToNS.end(); ++i) {
-            if (globalCursorManager->ownsCursorId(cursorIdFromParts(i->first, 0))) {
-                // Skip the global cursor manager, since we handle it above (and it's not
-                // associated with a collection).
-                continue;
-            }
-            todo.push_back(i->second);
+        for (auto&& entry : _idToNss) {
+            todo.push_back(entry.second);
         }
     }
 
     // For each collection, time out its cursors under the collection lock (to prevent the
     // collection from going away during the erase).
     for (unsigned i = 0; i < todo.size(); i++) {
-        AutoGetCollectionOrViewForRead ctx(txn, NamespaceString(todo[i]));
+        AutoGetCollectionOrViewForReadCommand ctx(opCtx, NamespaceString(todo[i]));
         if (!ctx.getDb()) {
             continue;
         }
@@ -287,40 +265,45 @@ CursorManager* CursorManager::getGlobalCursorManager() {
     return globalCursorManager.get();
 }
 
-std::size_t CursorManager::timeoutCursorsGlobal(OperationContext* txn, int millisSinceLastCall) {
-    return globalCursorIdCache->timeoutCursors(txn, millisSinceLastCall);
+std::size_t CursorManager::timeoutCursorsGlobal(OperationContext* opCtx, int millisSinceLastCall) {
+    return globalCursorIdCache->timeoutCursors(opCtx, millisSinceLastCall);
 }
 
-int CursorManager::eraseCursorGlobalIfAuthorized(OperationContext* txn, int n, const char* _ids) {
+int CursorManager::eraseCursorGlobalIfAuthorized(OperationContext* opCtx, int n, const char* _ids) {
     ConstDataCursor ids(_ids);
     int numDeleted = 0;
     for (int i = 0; i < n; i++) {
-        if (eraseCursorGlobalIfAuthorized(txn, ids.readAndAdvance<LittleEndian<int64_t>>()))
+        if (eraseCursorGlobalIfAuthorized(opCtx, ids.readAndAdvance<LittleEndian<int64_t>>()))
             numDeleted++;
         if (globalInShutdownDeprecated())
             break;
     }
     return numDeleted;
 }
-bool CursorManager::eraseCursorGlobalIfAuthorized(OperationContext* txn, CursorId id) {
-    return globalCursorIdCache->eraseCursor(txn, id, true);
+bool CursorManager::eraseCursorGlobalIfAuthorized(OperationContext* opCtx, CursorId id) {
+    return globalCursorIdCache->eraseCursor(opCtx, id, true);
 }
-bool CursorManager::eraseCursorGlobal(OperationContext* txn, CursorId id) {
-    return globalCursorIdCache->eraseCursor(txn, id, false);
+bool CursorManager::eraseCursorGlobal(OperationContext* opCtx, CursorId id) {
+    return globalCursorIdCache->eraseCursor(opCtx, id, false);
 }
 
 
 // --------------------------
 
 
-CursorManager::CursorManager(StringData ns) : _nss(ns) {
-    _collectionCacheRuntimeId = globalCursorIdCache->created(_nss.ns());
+CursorManager::CursorManager(NamespaceString nss) : _nss(std::move(nss)) {
+    if (!isGlobalManager()) {
+        // Generate a unique id for this collection.
+        _collectionCacheRuntimeId = globalCursorIdCache->registerCursorManager(_nss);
+    }
     _random.reset(new PseudoRandom(globalCursorIdCache->nextSeed()));
 }
 
 CursorManager::~CursorManager() {
     invalidateAll(true, "collection going away");
-    globalCursorIdCache->destroyed(_collectionCacheRuntimeId, _nss.ns());
+    if (!isGlobalManager()) {
+        globalCursorIdCache->deregisterCursorManager(_collectionCacheRuntimeId, _nss);
+    }
 }
 
 void CursorManager::invalidateAll(bool collectionGoingAway, const std::string& reason) {
@@ -370,11 +353,8 @@ void CursorManager::invalidateAll(bool collectionGoingAway, const std::string& r
                     continue;
                 }
 
-                if (cc->_isPinned || cc->isAggCursor()) {
-                    // Pinned cursors need to stay alive, so we leave them around.  Aggregation
-                    // cursors also can stay alive (since they don't have their lifetime bound to
-                    // the underlying collection).  However, if they have an associated executor, we
-                    // need to kill it, because it's now invalid.
+                if (cc->_isPinned) {
+                    // Pinned cursors need to stay alive, so we leave them around.
                     if (cc->getExecutor())
                         cc->getExecutor()->kill(reason);
                     newMap.insert(*i);
@@ -397,7 +377,7 @@ void CursorManager::invalidateAll(bool collectionGoingAway, const std::string& r
     }
 }
 
-void CursorManager::invalidateDocument(OperationContext* txn,
+void CursorManager::invalidateDocument(OperationContext* opCtx,
                                        const RecordId& dl,
                                        InvalidationType type) {
     if (supportsDocLocking()) {
@@ -411,13 +391,13 @@ void CursorManager::invalidateDocument(OperationContext* txn,
     for (ExecSet::iterator it = _nonCachedExecutors.begin(); it != _nonCachedExecutors.end();
          ++it) {
         PlanExecutor* exec = *it;
-        exec->invalidate(txn, dl, type);
+        exec->invalidate(opCtx, dl, type);
     }
 
     for (CursorMap::const_iterator i = _cursors.begin(); i != _cursors.end(); ++i) {
         PlanExecutor* exec = i->second->getExecutor();
         if (exec) {
-            exec->invalidate(txn, dl, type);
+            exec->invalidate(opCtx, dl, type);
         }
     }
 }
@@ -483,10 +463,6 @@ void CursorManager::unpin(ClientCursor* cursor) {
     cursor->_isPinned = false;
 }
 
-bool CursorManager::ownsCursorId(CursorId cursorId) const {
-    return _collectionCacheRuntimeId == idFromCursorId(cursorId);
-}
-
 void CursorManager::getCursorIds(std::set<CursorId>* openCursors) const {
     stdx::lock_guard<SimpleMutex> lk(_mutex);
 
@@ -503,19 +479,32 @@ size_t CursorManager::numCursors() const {
 
 CursorId CursorManager::_allocateCursorId_inlock() {
     for (int i = 0; i < 10000; i++) {
-        unsigned mypart = static_cast<unsigned>(_random->nextInt32());
-        CursorId id = cursorIdFromParts(_collectionCacheRuntimeId, mypart);
+        // The leading two bits of a CursorId are used to determine if the cursor is registered on
+        // the global cursor manager.
+        CursorId id;
+        if (isGlobalManager()) {
+            // This is the global cursor manager, so generate a random number and make sure the
+            // first two bits are 01.
+            uint64_t mask = 0x3FFFFFFFFFFFFFFF;
+            uint64_t bitToSet = 1ULL << 62;
+            id = ((_random->nextInt64() & mask) | bitToSet);
+        } else {
+            // The first 2 bits are 0, the next 30 bits are the collection identifier, the next 32
+            // bits are random.
+            uint32_t myPart = static_cast<uint32_t>(_random->nextInt32());
+            id = cursorIdFromParts(_collectionCacheRuntimeId, myPart);
+        }
         if (_cursors.count(id) == 0)
             return id;
     }
     fassertFailed(17360);
 }
 
-ClientCursorPin CursorManager::registerCursor(const ClientCursorParams& cursorParams) {
+ClientCursorPin CursorManager::registerCursor(ClientCursorParams&& cursorParams) {
     stdx::lock_guard<SimpleMutex> lk(_mutex);
     CursorId cursorId = _allocateCursorId_inlock();
     std::unique_ptr<ClientCursor, ClientCursor::Deleter> clientCursor(
-        new ClientCursor(cursorParams, this, cursorId));
+        new ClientCursor(std::move(cursorParams), this, cursorId));
     return _registerCursor_inlock(std::move(clientCursor));
 }
 
@@ -543,7 +532,7 @@ void CursorManager::deregisterCursor(ClientCursor* cc) {
     _deregisterCursor_inlock(cc);
 }
 
-Status CursorManager::eraseCursor(OperationContext* txn, CursorId id, bool shouldAudit) {
+Status CursorManager::eraseCursor(OperationContext* opCtx, CursorId id, bool shouldAudit) {
     ClientCursor* cursor;
 
     {
@@ -553,7 +542,7 @@ Status CursorManager::eraseCursor(OperationContext* txn, CursorId id, bool shoul
         if (it == _cursors.end()) {
             if (shouldAudit) {
                 audit::logKillCursorsAuthzCheck(
-                    txn->getClient(), _nss, id, ErrorCodes::CursorNotFound);
+                    opCtx->getClient(), _nss, id, ErrorCodes::CursorNotFound);
             }
             return {ErrorCodes::CursorNotFound, str::stream() << "Cursor id not found: " << id};
         }
@@ -563,14 +552,14 @@ Status CursorManager::eraseCursor(OperationContext* txn, CursorId id, bool shoul
         if (cursor->_isPinned) {
             if (shouldAudit) {
                 audit::logKillCursorsAuthzCheck(
-                    txn->getClient(), _nss, id, ErrorCodes::OperationFailed);
+                    opCtx->getClient(), _nss, id, ErrorCodes::OperationFailed);
             }
             return {ErrorCodes::OperationFailed,
                     str::stream() << "Cannot kill pinned cursor: " << id};
         }
 
         if (shouldAudit) {
-            audit::logKillCursorsAuthzCheck(txn->getClient(), _nss, id, ErrorCodes::OK);
+            audit::logKillCursorsAuthzCheck(opCtx->getClient(), _nss, id, ErrorCodes::OK);
         }
 
         cursor->kill();

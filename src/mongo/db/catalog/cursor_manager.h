@@ -73,7 +73,7 @@ class PlanExecutor;
  */
 class CursorManager {
 public:
-    CursorManager(StringData ns);
+    CursorManager(NamespaceString nss);
 
     /**
      * Destroys the CursorManager. Managed cursors which are not pinned are destroyed. Ownership of
@@ -99,7 +99,7 @@ public:
      * Broadcast a document invalidation to all relevant PlanExecutor(s).  invalidateDocument
      * must called *before* the provided RecordId is about to be deleted or mutated.
      */
-    void invalidateDocument(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    void invalidateDocument(OperationContext* opCtx, const RecordId& dl, InvalidationType type);
 
     /**
      * Destroys cursors that have been inactive for too long.
@@ -124,7 +124,7 @@ public:
      * Constructs a new ClientCursor according to the given 'cursorParams'. The cursor is atomically
      * registered with the manager and returned in pinned state.
      */
-    ClientCursorPin registerCursor(const ClientCursorParams& cursorParams);
+    ClientCursorPin registerCursor(ClientCursorParams&& cursorParams);
 
     /**
      * Constructs and pins a special ClientCursor used to track sharding state for the given
@@ -151,16 +151,7 @@ public:
      *
      * If 'shouldAudit' is true, will perform audit logging.
      */
-    Status eraseCursor(OperationContext* txn, CursorId id, bool shouldAudit);
-
-    /**
-     * Returns true if the space of cursor ids that cursor manager is responsible for includes
-     * the given cursor id.  Otherwise, returns false.
-     *
-     * The return value of this method does not indicate any information about whether or not a
-     * cursor actually exists with the given cursor id.
-     */
-    bool ownsCursorId(CursorId cursorId) const;
+    Status eraseCursor(OperationContext* opCtx, CursorId id, bool shouldAudit);
 
     void getCursorIds(std::set<CursorId>* openCursors) const;
 
@@ -172,17 +163,28 @@ public:
 
     static CursorManager* getGlobalCursorManager();
 
-    static int eraseCursorGlobalIfAuthorized(OperationContext* txn, int n, const char* ids);
+    /**
+     * Returns true if this CursorId would be registered with the global CursorManager. Note that if
+     * this method returns true it does not imply the cursor exists.
+     */
+    static bool isGloballyManagedCursor(CursorId cursorId) {
+        // The first two bits are 01 for globally managed cursors, and 00 for cursors owned by a
+        // collection. The leading bit is always 0 so that CursorIds do not appear as negative.
+        const long long mask = static_cast<long long>(0b11) << 62;
+        return (cursorId & mask) == (static_cast<long long>(0b01) << 62);
+    }
 
-    static bool eraseCursorGlobalIfAuthorized(OperationContext* txn, CursorId id);
+    static int eraseCursorGlobalIfAuthorized(OperationContext* opCtx, int n, const char* ids);
 
-    static bool eraseCursorGlobal(OperationContext* txn, CursorId id);
+    static bool eraseCursorGlobalIfAuthorized(OperationContext* opCtx, CursorId id);
+
+    static bool eraseCursorGlobal(OperationContext* opCtx, CursorId id);
 
     /**
      * Deletes inactive cursors from the global cursor manager and from all per-collection cursor
      * managers. Returns the number of cursors that were timed out.
      */
-    static std::size_t timeoutCursorsGlobal(OperationContext* txn, int millisSinceLastCall);
+    static std::size_t timeoutCursorsGlobal(OperationContext* opCtx, int millisSinceLastCall);
 
 private:
     friend class ClientCursorPin;
@@ -196,8 +198,12 @@ private:
 
     void unpin(ClientCursor* cursor);
 
+    bool isGlobalManager() const {
+        return _nss.isEmpty();
+    }
+
     NamespaceString _nss;
-    unsigned _collectionCacheRuntimeId;
+    uint32_t _collectionCacheRuntimeId;
     std::unique_ptr<PseudoRandom> _random;
 
     mutable SimpleMutex _mutex;

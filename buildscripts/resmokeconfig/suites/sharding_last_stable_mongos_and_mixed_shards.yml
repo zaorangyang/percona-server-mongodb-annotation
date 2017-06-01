@@ -5,8 +5,6 @@ selector:
     exclude_files:
     # Doesn't use ShardingTest so won't actually be run in a mixed version configuration
     - jstests/sharding/config_version_rollback.js
-    # TODO: Enable when SERVER-22672 is complete
-    - jstests/sharding/printShardingStatus.js
     # Behavior change to addShard
     - jstests/sharding/addshard_idempotent.js
     # SERVER-27438: Preserves $comment in OP_QUERY and tests for this change.
@@ -14,6 +12,12 @@ selector:
     # 3.6 mongods have improved covering behavior for queries on shard key index. Un-blacklist when
     # 3.6 becomes 'last-stable'.
     - jstests/sharding/covered_shard_key_indexes.js
+    # Can un-blacklist once SERVER-27701 backport (BACKPORT-483) is finished and in 3.4 release
+    - jstests/sharding/linearizable_read_concern.js
+    # Enable when 3.6 becomes last-stable.
+    - jstests/sharding/views.js
+    # New feature in v3.6 mongos
+    - jstests/sharding/logical_time_metadata.js
 
 executor:
   js_test:

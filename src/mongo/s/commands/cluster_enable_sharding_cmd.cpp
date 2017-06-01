@@ -41,7 +41,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 
@@ -87,7 +86,7 @@ public:
         return cmdObj.firstElement().str();
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname_unused,
                      BSONObj& cmdObj,
                      int options,
@@ -105,11 +104,11 @@ public:
             return false;
         }
 
-        uassertStatusOK(Grid::get(txn)->catalogClient(txn)->enableSharding(txn, dbname));
+        uassertStatusOK(Grid::get(opCtx)->catalogClient(opCtx)->enableSharding(opCtx, dbname));
         audit::logEnableSharding(Client::getCurrent(), dbname);
 
         // Make sure to force update of any stale metadata
-        Grid::get(txn)->catalogCache()->invalidate(dbname);
+        Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname);
 
         return true;
     }

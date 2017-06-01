@@ -61,8 +61,18 @@ using std::vector;
 
 /// Helper function to easily wrap constants with $const.
 static Value serializeConstant(Value val) {
+    if (val.missing()) {
+        return Value("$$REMOVE"_sd);
+    }
+
     return Value(DOC("$const" << val));
 }
+
+constexpr Variables::Id Variables::kRootId;
+constexpr Variables::Id Variables::kRemoveId;
+
+const StringMap<Variables::Id> Variables::kBuiltinVarNameToId = {{"ROOT"_sd, kRootId},
+                                                                 {"REMOVE"_sd, kRemoveId}};
 
 void Variables::uassertValidNameForUserWrite(StringData varName) {
     // System variables users allowed to write to (currently just one)
@@ -124,26 +134,37 @@ void Variables::uassertValidNameForUserRead(StringData varName) {
 }
 
 void Variables::setValue(Id id, const Value& value) {
-    massert(17199, "can't use Variables::setValue to set ROOT", id != ROOT_ID);
-
-    verify(id < _numVars);
-    _rest[id] = value;
+    uassert(17199, "can't use Variables::setValue to set a reserved builtin variable", id >= 0);
+    auto varIndex = static_cast<size_t>(id);
+    invariant(varIndex < _numVars);
+    _rest[varIndex] = value;
 }
 
 Value Variables::getValue(Id id) const {
-    if (id == ROOT_ID)
-        return Value(_root);
+    if (id < 0) {
+        // This is a reserved id for a builtin variable.
+        switch (id) {
+            case Variables::kRootId:
+                return Value(_root);
+            case Variables::kRemoveId:
+                return Value();
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
 
-    verify(id < _numVars);
-    return _rest[id];
+    auto varIndex = static_cast<size_t>(id);
+    invariant(varIndex < _numVars);
+    return _rest[varIndex];
 }
 
 Document Variables::getDocument(Id id) const {
-    if (id == ROOT_ID)
+    if (id == Variables::kRootId) {
+        // For the common case of ROOT, avoid round-tripping through Value.
         return _root;
+    }
 
-    verify(id < _numVars);
-    const Value var = _rest[id];
+    const Value var = getValue(id);
     if (var.getType() == Object)
         return var.getDocument();
 
@@ -151,24 +172,34 @@ Document Variables::getDocument(Id id) const {
 }
 
 Variables::Id VariablesParseState::defineVariable(StringData name) {
-    // caller should have validated before hand by using Variables::uassertValidNameForUserWrite
-    massert(17275, "Can't redefine ROOT", name != "ROOT");
+    // Caller should have validated before hand by using Variables::uassertValidNameForUserWrite.
+    massert(17275,
+            "Can't redefine a non-user-writable variable",
+            Variables::kBuiltinVarNameToId.find(name) == Variables::kBuiltinVarNameToId.end());
 
     Variables::Id id = _idGenerator->generateId();
+    invariant(id >= 0);
     _variables[name] = id;
     return id;
 }
 
 Variables::Id VariablesParseState::getVariable(StringData name) const {
-    StringMap<Variables::Id>::const_iterator it = _variables.find(name);
-    if (it != _variables.end())
+    auto it = _variables.find(name);
+    if (it != _variables.end()) {
+        // Found a user-defined variable.
         return it->second;
+    }
 
-    uassert(17276,
-            str::stream() << "Use of undefined variable: " << name,
-            name == "ROOT" || name == "CURRENT");
+    it = Variables::kBuiltinVarNameToId.find(name);
+    if (it != Variables::kBuiltinVarNameToId.end()) {
+        // This is a builtin variable.
+        return it->second;
+    }
 
-    return Variables::ROOT_ID;
+    // If we didn't find either a user-defined or builtin variable, then we reject everything other
+    // than CURRENT. If this is CURRENT, then we treat it as equivalent to ROOT.
+    uassert(17276, str::stream() << "Use of undefined variable: " << name, name == "CURRENT");
+    return Variables::kRootId;
 }
 
 /* --------------------------- Expression ------------------------------ */
@@ -631,6 +662,105 @@ Value ExpressionObjectToArray::evaluateInternal(Variables* vars) const {
 REGISTER_EXPRESSION(objectToArray, ExpressionObjectToArray::parse);
 const char* ExpressionObjectToArray::getOpName() const {
     return "$objectToArray";
+}
+
+/* ------------------------- ExpressionArrayToObject -------------------------- */
+Value ExpressionArrayToObject::evaluateInternal(Variables* vars) const {
+    const Value input = vpOperand[0]->evaluateInternal(vars);
+    if (input.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40386,
+            str::stream() << "$arrayToObject requires an array input, found: "
+                          << typeName(input.getType()),
+            input.isArray());
+
+    MutableDocument output;
+    const vector<Value>& array = input.getArray();
+    if (array.empty()) {
+        return output.freezeToValue();
+    }
+
+    // There are two accepted input formats in an array: [ [key, val] ] or [ {k:key, v:val} ]. The
+    // first array element determines the format for the rest of the array. Mixing input formats is
+    // not allowed.
+    bool inputArrayFormat;
+    if (array[0].isArray()) {
+        inputArrayFormat = true;
+    } else if (array[0].getType() == BSONType::Object) {
+        inputArrayFormat = false;
+    } else {
+        uasserted(40398,
+                  str::stream() << "Unrecognised input type format for $arrayToObject: "
+                                << typeName(array[0].getType()));
+    }
+
+    for (auto&& elem : array) {
+        if (inputArrayFormat == true) {
+            uassert(
+                40396,
+                str::stream() << "$arrayToObject requires a consistent input format. Elements must"
+                                 "all be arrays or all be objects. Array was detected, now found: "
+                              << typeName(elem.getType()),
+                elem.isArray());
+
+            const vector<Value>& valArray = elem.getArray();
+
+            uassert(40397,
+                    str::stream() << "$arrayToObject requires an array of size 2 arrays,"
+                                     "found array of size: "
+                                  << valArray.size(),
+                    (valArray.size() == 2));
+
+            uassert(40395,
+                    str::stream() << "$arrayToObject requires an array of key-value pairs, where "
+                                     "the key must be of type string. Found key type: "
+                                  << typeName(valArray[0].getType()),
+                    (valArray[0].getType() == BSONType::String));
+
+            output.addField(valArray[0].getString(), valArray[1]);
+
+        } else {
+            uassert(
+                40391,
+                str::stream() << "$arrayToObject requires a consistent input format. Elements must"
+                                 "all be arrays or all be objects. Object was detected, now found: "
+                              << typeName(elem.getType()),
+                (elem.getType() == BSONType::Object));
+
+            uassert(40392,
+                    str::stream() << "$arrayToObject requires an object keys of 'k' and 'v'. "
+                                     "Found incorrect number of keys:"
+                                  << elem.getDocument().size(),
+                    (elem.getDocument().size() == 2));
+
+            Value key = elem.getDocument().getField("k");
+            Value value = elem.getDocument().getField("v");
+
+            uassert(40393,
+                    str::stream() << "$arrayToObject requires an object with keys 'k' and 'v'. "
+                                     "Missing either or both keys from: "
+                                  << elem.toString(),
+                    (!key.nullish() && !value.nullish()));
+
+            uassert(
+                40394,
+                str::stream() << "$arrayToObject requires an object with keys 'k' and 'v', where "
+                                 "the value of 'k' must be of type string. Found type: "
+                              << typeName(key.getType()),
+                (key.getType() == BSONType::String));
+
+            output.addField(key.getString(), value);
+        }
+    }
+
+    return output.freezeToValue();
+}
+
+REGISTER_EXPRESSION(arrayToObject, ExpressionArrayToObject::parse);
+const char* ExpressionArrayToObject::getOpName() const {
+    return "$arrayToObject";
 }
 
 /* ------------------------- ExpressionCeil -------------------------- */
@@ -1320,7 +1450,7 @@ Value ExpressionObject::serialize(bool explain) const {
 // this is the old deprecated version only used by tests not using variables
 intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx, const string& fieldPath) {
-    return new ExpressionFieldPath(expCtx, "CURRENT." + fieldPath, Variables::ROOT_ID);
+    return new ExpressionFieldPath(expCtx, "CURRENT." + fieldPath, Variables::kRootId);
 }
 
 // this is the new version that supports every syntax
@@ -1355,12 +1485,16 @@ ExpressionFieldPath::ExpressionFieldPath(const boost::intrusive_ptr<ExpressionCo
     : Expression(expCtx), _fieldPath(theFieldPath), _variable(variable) {}
 
 intrusive_ptr<Expression> ExpressionFieldPath::optimize() {
-    /* nothing can be done for these */
+    if (_variable == Variables::kRemoveId) {
+        // The REMOVE system variable optimizes to a constant missing value.
+        return ExpressionConstant::create(getExpressionContext(), Value());
+    }
+
     return intrusive_ptr<Expression>(this);
 }
 
 void ExpressionFieldPath::addDependencies(DepsTracker* deps) const {
-    if (_variable == Variables::ROOT_ID) {  // includes CURRENT when it is equivalent to ROOT.
+    if (_variable == Variables::kRootId) {  // includes CURRENT when it is equivalent to ROOT.
         if (_fieldPath.getPathLength() == 1) {
             deps->needWholeDocument = true;  // need full doc if just "$$ROOT"
         } else {
@@ -1412,7 +1546,7 @@ Value ExpressionFieldPath::evaluateInternal(Variables* vars) const {
     if (_fieldPath.getPathLength() == 1)  // get the whole variable
         return vars->getValue(_variable);
 
-    if (_variable == Variables::ROOT_ID) {
+    if (_variable == Variables::kRootId) {
         // ROOT is always a document so use optimized code path
         return evaluatePath(1, vars->getRoot());
     }

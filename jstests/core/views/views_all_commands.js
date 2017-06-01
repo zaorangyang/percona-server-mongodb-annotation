@@ -104,6 +104,7 @@
         cleanupOrphaned: {
             skip: "Tested in views/views_sharded.js",
         },
+        clearLog: {skip: isUnrelated},
         clone: {skip: "Tested in replsets/cloneDb.js"},
         cloneCollection: {skip: "Tested in noPassthroughWithMongod/clonecollection.js"},
         cloneCollectionAsCapped: {
@@ -313,6 +314,7 @@
                     ok: 1
                 };
                 delete res.operationTime;
+                delete res.logicalTime;
                 assert.eq(expectedRes, res, "unexpected result for: " + tojson(killCursorsCmd));
             }
         },

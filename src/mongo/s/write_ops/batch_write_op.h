@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -106,10 +107,10 @@ public:
      *
      * Returned TargetedWriteBatches are owned by the caller.
      */
-    Status targetBatch(OperationContext* txn,
+    Status targetBatch(OperationContext* opCtx,
                        const NSTargeter& targeter,
                        bool recordTargetErrors,
-                       std::vector<TargetedWriteBatch*>* targetedBatches);
+                       std::map<ShardId, TargetedWriteBatch*>* targetedBatches);
 
     /**
      * Fills a BatchCommandRequest from a TargetedWriteBatch for this BatchWriteOp.
@@ -173,10 +174,10 @@ private:
     std::set<const TargetedWriteBatch*> _targeted;
 
     // Write concern responses from all write batches so far
-    OwnedPointerVector<ShardWCError> _wcErrors;
+    std::vector<std::unique_ptr<ShardWCError>> _wcErrors;
 
     // Upserted ids for the whole write batch
-    OwnedPointerVector<BatchedUpsertDetail> _upsertedIds;
+    std::vector<std::unique_ptr<BatchedUpsertDetail>> _upsertedIds;
 
     // Stats for the entire batch op
     std::unique_ptr<BatchWriteStats> _stats;

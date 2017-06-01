@@ -50,6 +50,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/util/background.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
 
 namespace mongo {
@@ -77,17 +78,17 @@ long long ClientCursor::totalOpen() {
     return cursorStatsOpen.get();
 }
 
-ClientCursor::ClientCursor(const ClientCursorParams& params,
+ClientCursor::ClientCursor(ClientCursorParams&& params,
                            CursorManager* cursorManager,
                            CursorId cursorId)
     : _cursorid(cursorId),
-      _ns(params.ns),
+      _nss(std::move(params.nss)),
+      _authenticatedUsers(std::move(params.authenticatedUsers)),
       _isReadCommitted(params.isReadCommitted),
       _cursorManager(cursorManager),
-      _query(params.query),
-      _queryOptions(params.qopts),
-      _isAggCursor(params.isAggCursor) {
-    _exec.reset(params.exec);
+      _originatingCommand(params.originatingCommandObj),
+      _queryOptions(params.queryOptions),
+      _exec(std::move(params.exec)) {
     init();
 }
 
@@ -95,7 +96,7 @@ ClientCursor::ClientCursor(const Collection* collection,
                            CursorManager* cursorManager,
                            CursorId cursorId)
     : _cursorid(cursorId),
-      _ns(collection->ns().ns()),
+      _nss(collection->ns()),
       _cursorManager(cursorManager),
       _queryOptions(QueryOption_NoCursorTimeout) {
     init();
@@ -106,10 +107,9 @@ void ClientCursor::init() {
 
     cursorStatsOpen.increment();
 
-    if (_queryOptions & QueryOption_NoCursorTimeout) {
+    if (isNoTimeout()) {
         // cursors normally timeout after an inactivity period to prevent excess memory use
         // setting this prevents timeout of the cursor in question.
-        _isNoTimeout = true;
         cursorStatsOpenNoTimeout.increment();
     }
 }
@@ -120,7 +120,7 @@ ClientCursor::~ClientCursor() {
     invariant(!_cursorManager);
 
     cursorStatsOpen.decrement();
-    if (_isNoTimeout) {
+    if (isNoTimeout()) {
         cursorStatsOpenNoTimeout.decrement();
     }
 }
@@ -138,7 +138,7 @@ void ClientCursor::kill() {
 
 bool ClientCursor::shouldTimeout(int millis) {
     _idleAgeMillis += millis;
-    if (_isNoTimeout || _isPinned) {
+    if (isNoTimeout() || _isPinned) {
         return false;
     }
     return _idleAgeMillis > cursorTimeoutMillis.load();
@@ -148,13 +148,13 @@ void ClientCursor::resetIdleTime() {
     _idleAgeMillis = 0;
 }
 
-void ClientCursor::updateSlaveLocation(OperationContext* txn) {
+void ClientCursor::updateSlaveLocation(OperationContext* opCtx) {
     if (_slaveReadTill.isNull())
         return;
 
-    verify(str::startsWith(_ns.c_str(), "local.oplog."));
+    verify(_nss.isOplog());
 
-    Client* c = txn->getClient();
+    Client* c = opCtx->getClient();
     verify(c);
     OID rid = repl::ReplClientInfo::forClient(c).getRemoteID();
     if (!rid.isSet())
@@ -221,7 +221,7 @@ void ClientCursorPin::release() {
 
     if (!_cursor->_cursorManager) {
         // The ClientCursor was killed while we had it.  Therefore, it is our responsibility to
-        // kill it.
+        // delete it.
         deleteUnderlying();
     } else {
         // Unpin the cursor under the collection cursor manager lock.
@@ -275,11 +275,12 @@ public:
         Timer t;
         while (!globalInShutdownDeprecated()) {
             {
-                const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-                OperationContext& txn = *txnPtr;
+                const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+                OperationContext& opCtx = *opCtxPtr;
                 cursorStatsTimedOut.increment(
-                    CursorManager::timeoutCursorsGlobal(&txn, t.millisReset()));
+                    CursorManager::timeoutCursorsGlobal(&opCtx, t.millisReset()));
             }
+            MONGO_IDLE_THREAD_BLOCK;
             sleepsecs(clientCursorMonitorFrequencySecs.load());
         }
     }

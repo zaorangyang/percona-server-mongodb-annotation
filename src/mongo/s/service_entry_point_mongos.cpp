@@ -43,6 +43,7 @@
 #include "mongo/transport/service_entry_point_utils.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/thread_idle_callback.h"
@@ -85,7 +86,10 @@ void ServiceEntryPointMongos::_sessionLoop(const transport::SessionHandle& sessi
 
         // Source a Message from the client
         {
-            auto status = session->sourceMessage(&message).wait();
+            auto status = [&] {
+                MONGO_IDLE_THREAD_BLOCK;
+                return session->sourceMessage(&message).wait();
+            }();
 
             if (ErrorCodes::isInterruption(status.code()) ||
                 ErrorCodes::isNetworkError(status.code())) {
@@ -100,7 +104,7 @@ void ServiceEntryPointMongos::_sessionLoop(const transport::SessionHandle& sessi
             uassertStatusOK(status);
         }
 
-        auto txn = cc().makeOperationContext();
+        auto opCtx = cc().makeOperationContext();
 
         const int32_t msgId = message.header().getId();
 
@@ -110,12 +114,12 @@ void ServiceEntryPointMongos::_sessionLoop(const transport::SessionHandle& sessi
         // connection
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "Message type " << op << " is not supported.",
-                op > dbMsg);
+                isSupportedNetworkOp(op));
 
         // Start a new LastError session. Any exceptions thrown from here onwards will be returned
         // to the caller (if the type of the message permits it).
-        ClusterLastErrorInfo::get(txn->getClient()).newRequest();
-        LastError::get(txn->getClient()).startRequest();
+        ClusterLastErrorInfo::get(opCtx->getClient()).newRequest();
+        LastError::get(opCtx->getClient()).startRequest();
 
         DbMessage dbm(message);
 
@@ -135,7 +139,7 @@ void ServiceEntryPointMongos::_sessionLoop(const transport::SessionHandle& sessi
                         nss.db() != NamespaceString::kLocalDb);
             }
 
-            AuthorizationSession::get(txn->getClient())->startRequest(txn.get());
+            AuthorizationSession::get(opCtx->getClient())->startRequest(opCtx.get());
 
             LOG(3) << "Request::process begin ns: " << nss << " msg id: " << msgId
                    << " op: " << networkOpToString(op);
@@ -143,19 +147,19 @@ void ServiceEntryPointMongos::_sessionLoop(const transport::SessionHandle& sessi
             switch (op) {
                 case dbQuery:
                     if (nss.isCommand() || nss.isSpecialCommand()) {
-                        Strategy::clientCommandOp(txn.get(), nss, &dbm);
+                        Strategy::clientCommandOp(opCtx.get(), nss, &dbm);
                     } else {
-                        Strategy::queryOp(txn.get(), nss, &dbm);
+                        Strategy::queryOp(opCtx.get(), nss, &dbm);
                     }
                     break;
                 case dbGetMore:
-                    Strategy::getMore(txn.get(), nss, &dbm);
+                    Strategy::getMore(opCtx.get(), nss, &dbm);
                     break;
                 case dbKillCursors:
-                    Strategy::killCursors(txn.get(), &dbm);
+                    Strategy::killCursors(opCtx.get(), &dbm);
                     break;
                 default:
-                    Strategy::writeOp(txn.get(), &dbm);
+                    Strategy::writeOp(opCtx.get(), &dbm);
                     break;
             }
 
@@ -172,7 +176,7 @@ void ServiceEntryPointMongos::_sessionLoop(const transport::SessionHandle& sessi
             }
 
             // We *always* populate the last error for now
-            LastError::get(txn->getClient()).setLastError(ex.getCode(), ex.what());
+            LastError::get(opCtx->getClient()).setLastError(ex.getCode(), ex.what());
         }
 
         if ((counter++ & 0xf) == 0) {

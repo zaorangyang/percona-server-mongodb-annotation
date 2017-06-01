@@ -50,13 +50,13 @@ public:
     static LogicalClock* get(OperationContext* ctx);
     static void set(ServiceContext* service, std::unique_ptr<LogicalClock> logicalClock);
 
+    static constexpr Seconds kMaxAcceptableLogicalClockDrift =
+        Seconds(365 * 24 * 60 * 60);  // 1 year
+
     /**
      *  Creates an instance of LogicalClock. The TimeProofService must already be fully initialized.
-     *  The validateProof indicates if the advanceClusterTime validates newTime. It should do so
-     *  only when LogicalClock installed on mongos and the auth is on. When the auth is off we
-     *  assume that the DBA uses other ways to validate authenticity of user messages.
      */
-    LogicalClock(ServiceContext*, std::unique_ptr<TimeProofService>, bool validateProof);
+    LogicalClock(ServiceContext*, std::unique_ptr<TimeProofService>);
 
     /**
      * The method sets clusterTime to the newTime if the newTime > _clusterTime and the newTime
@@ -67,9 +67,16 @@ public:
     Status advanceClusterTime(const SignedLogicalTime&);
 
     /**
-     * Simliar to advaneClusterTime, but only does rate checking and not proof validation.
+     * Similar to advaneClusterTime, but only does rate checking and not proof validation.
      */
-    Status advanceClusterTimeFromTrustedSource(LogicalTime);
+    Status advanceClusterTimeFromTrustedSource(SignedLogicalTime newTime);
+
+    /**
+     * Similar to advanceClusterTimeFromTrustedSource, but also signs the new time. Note that this
+     * should only be used on trusted LogicalTime (for example, LogicalTime extracted from local
+     * oplog entry).
+     */
+    Status signAndAdvanceClusterTime(LogicalTime newTime);
 
     /**
      * Returns the current clusterTime.
@@ -94,13 +101,20 @@ private:
      */
     SignedLogicalTime _makeSignedLogicalTime(LogicalTime);
 
+    Status _advanceClusterTime_inlock(SignedLogicalTime newTime);
+
+    /**
+     * Rate limiter for advancing logical time. Rejects newTime if its seconds value is more than
+     * kMaxAcceptableLogicalClockDrift seconds ahead of this node's wall clock.
+     */
+    Status _passesRateLimiter_inlock(LogicalTime newTime);
+
     ServiceContext* const _service;
     std::unique_ptr<TimeProofService> _timeProofService;
 
     // the mutex protects _clusterTime
     stdx::mutex _mutex;
     SignedLogicalTime _clusterTime;
-    const bool _validateProof;
 };
 
 }  // namespace mongo

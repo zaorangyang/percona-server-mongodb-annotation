@@ -36,6 +36,8 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
+#include "mongo/db/logical_time_metadata_hook.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/s/sharding_egress_metadata_hook_for_mongod.h"
 #include "mongo/db/server_options.h"
 #include "mongo/executor/task_executor.h"
@@ -49,7 +51,7 @@
 
 namespace mongo {
 
-Status initializeGlobalShardingStateForMongod(OperationContext* txn,
+Status initializeGlobalShardingStateForMongod(OperationContext* opCtx,
                                               const ConnectionString& configCS,
                                               StringData distLockProcessId) {
     auto targeterFactory = stdx::make_unique<RemoteCommandTargeterFactoryImpl>();
@@ -82,13 +84,14 @@ Status initializeGlobalShardingStateForMongod(OperationContext* txn,
         stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
     return initializeGlobalShardingState(
-        txn,
+        opCtx,
         configCS,
         distLockProcessId,
         std::move(shardFactory),
-        [] {
+        [opCtx] {
             auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
-            // TODO SERVER-27750: add LogicalTimeMetadataHook
+            hookList->addHook(
+                stdx::make_unique<rpc::LogicalTimeMetadataHook>(opCtx->getServiceContext()));
             hookList->addHook(stdx::make_unique<rpc::ShardingEgressMetadataHookForMongod>());
             return hookList;
         },

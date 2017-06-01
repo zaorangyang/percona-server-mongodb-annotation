@@ -65,7 +65,7 @@ const WriteErrorDetail& WriteOp::getOpError() const {
     return *_error;
 }
 
-Status WriteOp::targetWrites(OperationContext* txn,
+Status WriteOp::targetWrites(OperationContext* opCtx,
                              const NSTargeter& targeter,
                              std::vector<TargetedWrite*>* targetedWrites) {
     bool isUpdate = _itemRef.getOpType() == BatchedCommandRequest::BatchType_Update;
@@ -73,20 +73,19 @@ Status WriteOp::targetWrites(OperationContext* txn,
     bool isIndexInsert = _itemRef.getRequest()->isInsertIndexRequest();
 
     Status targetStatus = Status::OK();
-    OwnedPointerVector<ShardEndpoint> endpointsOwned;
-    vector<ShardEndpoint*>& endpoints = endpointsOwned.mutableVector();
+    std::vector<std::unique_ptr<ShardEndpoint>> endpoints;
 
     if (isUpdate) {
-        targetStatus = targeter.targetUpdate(txn, *_itemRef.getUpdate(), &endpoints);
+        targetStatus = targeter.targetUpdate(opCtx, *_itemRef.getUpdate(), &endpoints);
     } else if (isDelete) {
-        targetStatus = targeter.targetDelete(txn, *_itemRef.getDelete(), &endpoints);
+        targetStatus = targeter.targetDelete(opCtx, *_itemRef.getDelete(), &endpoints);
     } else {
         dassert(_itemRef.getOpType() == BatchedCommandRequest::BatchType_Insert);
 
         ShardEndpoint* endpoint = NULL;
         // TODO: Remove the index targeting stuff once there is a command for it
         if (!isIndexInsert) {
-            targetStatus = targeter.targetInsert(txn, _itemRef.getDocument(), &endpoint);
+            targetStatus = targeter.targetInsert(opCtx, _itemRef.getDocument(), &endpoint);
         } else {
             // TODO: Retry index writes with stale version?
             targetStatus = targeter.targetCollection(&endpoints);
@@ -99,7 +98,7 @@ Status WriteOp::targetWrites(OperationContext* txn,
 
         // Store single endpoint result if we targeted a single endpoint
         if (endpoint)
-            endpoints.push_back(endpoint);
+            endpoints.push_back(std::unique_ptr<ShardEndpoint>{endpoint});
     }
 
     // If we're targeting more than one endpoint with an update/delete, we have to target
@@ -107,7 +106,7 @@ Status WriteOp::targetWrites(OperationContext* txn,
     // NOTE: Index inserts are currently specially targeted only at the current collection to
     // avoid creating collections everywhere.
     if (targetStatus.isOK() && endpoints.size() > 1u && !isIndexInsert) {
-        endpointsOwned.clear();
+        endpoints.clear();
         invariant(endpoints.empty());
         targetStatus = targeter.targetAllShards(&endpoints);
     }
@@ -116,8 +115,8 @@ Status WriteOp::targetWrites(OperationContext* txn,
     if (!targetStatus.isOK())
         return targetStatus;
 
-    for (vector<ShardEndpoint*>::iterator it = endpoints.begin(); it != endpoints.end(); ++it) {
-        ShardEndpoint* endpoint = *it;
+    for (auto it = endpoints.begin(); it != endpoints.end(); ++it) {
+        ShardEndpoint* endpoint = it->get();
 
         _childOps.push_back(new ChildWriteOp(this));
 

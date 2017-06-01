@@ -56,17 +56,46 @@ TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
     const BSONObj inputBson = fromjson(
         "{pipeline: [{$match: {a: 'abc'}}], explain: true, allowDiskUse: true, fromRouter: true, "
         "bypassDocumentValidation: true, collation: {locale: 'en_US'}, cursor: {batchSize: 10}, "
-        "hint: {a: 1}}");
+        "hint: {a: 1}, comment: 'agg_comment'}");
     auto request = unittest::assertGet(AggregationRequest::parseFromBSON(nss, inputBson));
-    ASSERT_TRUE(request.isExplain());
+    ASSERT_TRUE(request.getExplain());
+    ASSERT(*request.getExplain() == ExplainOptions::Verbosity::kQueryPlanner);
     ASSERT_TRUE(request.shouldAllowDiskUse());
     ASSERT_TRUE(request.isFromRouter());
     ASSERT_TRUE(request.shouldBypassDocumentValidation());
     ASSERT_EQ(request.getBatchSize(), 10);
     ASSERT_BSONOBJ_EQ(request.getHint(), BSON("a" << 1));
+    ASSERT_EQ(request.getComment(), "agg_comment");
     ASSERT_BSONOBJ_EQ(request.getCollation(),
                       BSON("locale"
                            << "en_US"));
+}
+
+TEST(AggregationRequestTest, ShouldParseExplicitExplainFalseWithCursorOption) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: [], explain: false, cursor: {batchSize: 10}}");
+    auto request = unittest::assertGet(AggregationRequest::parseFromBSON(nss, inputBson));
+    ASSERT_FALSE(request.getExplain());
+    ASSERT_EQ(request.getBatchSize(), 10);
+}
+
+TEST(AggregationRequestTest, ShouldParseWithSeparateQueryPlannerExplainModeArg) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: []}");
+    auto request = unittest::assertGet(AggregationRequest::parseFromBSON(
+        nss, inputBson, ExplainOptions::Verbosity::kQueryPlanner));
+    ASSERT_TRUE(request.getExplain());
+    ASSERT(*request.getExplain() == ExplainOptions::Verbosity::kQueryPlanner);
+}
+
+TEST(AggregationRequestTest, ShouldParseWithSeparateQueryPlannerExplainModeArgAndCursorOption) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: [], cursor: {batchSize: 10}}");
+    auto request = unittest::assertGet(
+        AggregationRequest::parseFromBSON(nss, inputBson, ExplainOptions::Verbosity::kExecStats));
+    ASSERT_TRUE(request.getExplain());
+    ASSERT(*request.getExplain() == ExplainOptions::Verbosity::kExecStats);
+    ASSERT_EQ(request.getBatchSize(), 10);
 }
 
 //
@@ -87,12 +116,13 @@ TEST(AggregationRequestTest, ShouldOnlySerializeRequiredFieldsIfNoOptionalFields
 TEST(AggregationRequestTest, ShouldNotSerializeOptionalValuesIfEquivalentToDefault) {
     NamespaceString nss("a.collection");
     AggregationRequest request(nss, {});
-    request.setExplain(false);
+    request.setExplain(boost::none);
     request.setAllowDiskUse(false);
     request.setFromRouter(false);
     request.setBypassDocumentValidation(false);
     request.setCollation(BSONObj());
     request.setHint(BSONObj());
+    request.setComment("");
 
     auto expectedSerialization =
         Document{{AggregationRequest::kCommandName, nss.coll()},
@@ -104,13 +134,14 @@ TEST(AggregationRequestTest, ShouldNotSerializeOptionalValuesIfEquivalentToDefau
 TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
     NamespaceString nss("a.collection");
     AggregationRequest request(nss, {});
-    request.setExplain(true);
     request.setAllowDiskUse(true);
     request.setFromRouter(true);
     request.setBypassDocumentValidation(true);
-    request.setBatchSize(10);  // batchSize not serialzed when explain is true.
+    request.setBatchSize(10);
     const auto hintObj = BSON("a" << 1);
     request.setHint(hintObj);
+    const auto comment = std::string("agg_comment");
+    request.setComment(comment);
     const auto collationObj = BSON("locale"
                                    << "en_US");
     request.setCollation(collationObj);
@@ -118,12 +149,14 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
     auto expectedSerialization =
         Document{{AggregationRequest::kCommandName, nss.coll()},
                  {AggregationRequest::kPipelineName, Value(std::vector<Value>{})},
-                 {AggregationRequest::kExplainName, true},
                  {AggregationRequest::kAllowDiskUseName, true},
                  {AggregationRequest::kFromRouterName, true},
                  {bypassDocumentValidationCommandOption(), true},
                  {AggregationRequest::kCollationName, collationObj},
-                 {AggregationRequest::kHintName, hintObj}};
+                 {AggregationRequest::kCursorName,
+                  Value(Document({{AggregationRequest::kBatchSizeName, 10}}))},
+                 {AggregationRequest::kHintName, hintObj},
+                 {AggregationRequest::kCommentName, comment}};
     ASSERT_DOCUMENT_EQ(request.serializeToCommandObj(), expectedSerialization);
 }
 
@@ -157,6 +190,18 @@ TEST(AggregationRequestTest, ShouldAcceptHintAsString) {
     ASSERT_BSONOBJ_EQ(request.getValue().getHint(),
                       BSON("$hint"
                            << "a_1"));
+}
+
+TEST(AggregationRequestTest, ShouldNotSerializeBatchSizeOrExplainWhenExplainSet) {
+    NamespaceString nss("a.collection");
+    AggregationRequest request(nss, {});
+    request.setBatchSize(10);
+    request.setExplain(ExplainOptions::Verbosity::kQueryPlanner);
+
+    auto expectedSerialization =
+        Document{{AggregationRequest::kCommandName, nss.coll()},
+                 {AggregationRequest::kPipelineName, Value(std::vector<Value>{})}};
+    ASSERT_DOCUMENT_EQ(request.serializeToCommandObj(), expectedSerialization);
 }
 
 //
@@ -201,10 +246,25 @@ TEST(AggregationRequestTest, ShouldRejectHintAsArray) {
         AggregationRequest::parseFromBSON(NamespaceString("a.collection"), inputBson).getStatus());
 }
 
-TEST(AggregationRequestTest, ShouldRejectNonBoolExplain) {
+TEST(AggregationRequestTest, ShouldRejectNonStringComment) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, comment: 1}");
+    ASSERT_NOT_OK(
+        AggregationRequest::parseFromBSON(NamespaceString("a.collection"), inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectExplainIfNumber) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson =
         fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, explain: 1}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectExplainIfObject) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, explain: {}}");
     ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
 
@@ -226,6 +286,52 @@ TEST(AggregationRequestTest, ShouldRejectNoCursorNoExplain) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson = fromjson("{pipeline: [{$match: {a: 'abc'}}]}");
     ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectExplainTrueWithSeparateExplainArg) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: [], explain: true}");
+    ASSERT_NOT_OK(
+        AggregationRequest::parseFromBSON(nss, inputBson, ExplainOptions::Verbosity::kExecStats)
+            .getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectExplainFalseWithSeparateExplainArg) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: [], explain: false}");
+    ASSERT_NOT_OK(
+        AggregationRequest::parseFromBSON(nss, inputBson, ExplainOptions::Verbosity::kExecStats)
+            .getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectExplainWithReadConcernMajority) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [], explain: true, readConcern: {level: 'majority'}}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectExplainExecStatsVerbosityWithReadConcernMajority) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: [], readConcern: {level: 'majority'}}");
+    ASSERT_NOT_OK(
+        AggregationRequest::parseFromBSON(nss, inputBson, ExplainOptions::Verbosity::kExecStats)
+            .getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectExplainWithWriteConcernMajority) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [], explain: true, writeConcern: {w: 'majority'}}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectExplainExecStatsVerbosityWithWriteConcernMajority) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: [], writeConcern: {w: 'majority'}}");
+    ASSERT_NOT_OK(
+        AggregationRequest::parseFromBSON(nss, inputBson, ExplainOptions::Verbosity::kExecStats)
+            .getStatus());
 }
 
 //

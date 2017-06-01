@@ -48,7 +48,7 @@ namespace repl {
 class HeartbeatResponseAction;
 class OpTime;
 class ReplSetHeartbeatArgs;
-class ReplicaSetConfig;
+class ReplSetConfig;
 class TagSubgroup;
 class LastVote;
 struct MemberState;
@@ -295,7 +295,7 @@ public:
      * newConfig.isInitialized() should be true, though implementations may accept
      * configurations where this is not true, for testing purposes.
      */
-    virtual void updateConfig(const ReplicaSetConfig& newConfig,
+    virtual void updateConfig(const ReplSetConfig& newConfig,
                               int selfIndex,
                               Date_t now,
                               const OpTime& lastOpApplied) = 0;
@@ -425,6 +425,11 @@ public:
      * scheduled.  Returns true if it actually steps down, and false otherwise.
      */
     virtual bool stepDownIfPending() = 0;
+
+    /**
+     * Returns true if a stepdown request is pending on acquisition of the global lock.
+     */
+    virtual bool isStepDownPending() const = 0;
 
     /**
      * Considers whether or not this node should stand for election, and returns true

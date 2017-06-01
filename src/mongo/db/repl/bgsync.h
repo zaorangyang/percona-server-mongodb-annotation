@@ -37,6 +37,7 @@
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/rollback_impl.h"
 #include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
@@ -53,6 +54,7 @@ namespace repl {
 
 class ReplicationCoordinator;
 class ReplicationCoordinatorExternalState;
+class StorageInterface;
 
 class BackgroundSync {
     MONGO_DISALLOW_COPYING(BackgroundSync);
@@ -84,17 +86,17 @@ public:
     /**
      * Starts oplog buffer, task executor and producer thread, in that order.
      */
-    void startup(OperationContext* txn);
+    void startup(OperationContext* opCtx);
 
     /**
      * Signals producer thread to stop.
      */
-    void shutdown(OperationContext* txn);
+    void shutdown(OperationContext* opCtx);
 
     /**
      * Waits for producer thread to stop before shutting down the task executor and oplog buffer.
      */
-    void join(OperationContext* txn);
+    void join(OperationContext* opCtx);
 
     /**
      * Returns true if shutdown() has been called.
@@ -109,8 +111,8 @@ public:
 
     // Interface implementation
 
-    bool peek(OperationContext* txn, BSONObj* op);
-    void consume(OperationContext* txn);
+    bool peek(OperationContext* opCtx, BSONObj* op);
+    void consume(OperationContext* opCtx);
     void clearSyncTarget();
     void waitForMore();
 
@@ -118,7 +120,7 @@ public:
     BSONObj getCounters();
 
     // Clears any fetched and buffered oplog entries.
-    void clearBuffer(OperationContext* txn);
+    void clearBuffer(OperationContext* opCtx);
 
     /**
      * Returns true if any of the following is true:
@@ -134,7 +136,7 @@ public:
     void startProducerIfStopped();
 
     // Adds a fake oplog entry to buffer. Used for testing only.
-    void pushTestOpToBuffer(OperationContext* txn, const BSONObj& op);
+    void pushTestOpToBuffer(OperationContext* opCtx, const BSONObj& op);
 
 private:
     bool _inShutdown_inlock() const;
@@ -148,7 +150,7 @@ private:
     void _run();
     // Production thread inner loop.
     void _runProducer();
-    void _produce(OperationContext* txn);
+    void _produce(OperationContext* opCtx);
 
     /**
      * Checks current background sync state before pushing operations into blocking queue and
@@ -158,22 +160,21 @@ private:
      */
     Status _enqueueDocuments(Fetcher::Documents::const_iterator begin,
                              Fetcher::Documents::const_iterator end,
-                             const OplogFetcher::DocumentsInfo& info,
-                             boost::optional<int>* requiredRBID);
+                             const OplogFetcher::DocumentsInfo& info);
 
     /**
      * Executes a rollback.
-     * 'getConnection' returns a connection to the sync source.
      */
-    void _rollback(OperationContext* txn,
-                   const HostAndPort& source,
-                   boost::optional<int> requiredRBID,
-                   stdx::function<DBClientBase*()> getConnection);
+    void _runRollback(OperationContext* opCtx,
+                      const Status& fetcherReturnStatus,
+                      const HostAndPort& source,
+                      int requiredRBID,
+                      StorageInterface* storageInterface);
 
     // restart syncing
-    void start(OperationContext* txn);
+    void start(OperationContext* opCtx);
 
-    OpTimeWithHash _readLastAppliedOpTimeWithHash(OperationContext* txn);
+    OpTimeWithHash _readLastAppliedOpTimeWithHash(OperationContext* opCtx);
 
     // Production thread
     std::unique_ptr<OplogBuffer> _oplogBuffer;
@@ -212,6 +213,11 @@ private:
 
     // Current oplog fetcher tailing the oplog on the sync source.
     std::unique_ptr<OplogFetcher> _oplogFetcher;
+
+    // Current rollback process. If this component is active, we are currently reverting local
+    // operations in the local oplog in order to bring this server to a consistent state relative
+    // to the sync source.
+    std::unique_ptr<RollbackImpl> _rollback;
 };
 
 

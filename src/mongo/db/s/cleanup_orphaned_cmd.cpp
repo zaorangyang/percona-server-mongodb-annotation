@@ -72,7 +72,7 @@ enum CleanupResult { CleanupResult_Done, CleanupResult_Continue, CleanupResult_E
  *
  * If the collection is not sharded, returns CleanupResult_Done.
  */
-CleanupResult cleanupOrphanedData(OperationContext* txn,
+CleanupResult cleanupOrphanedData(OperationContext* opCtx,
                                   const NamespaceString& ns,
                                   const BSONObj& startingFromKeyConst,
                                   const WriteConcernOptions& secondaryThrottle,
@@ -82,11 +82,11 @@ CleanupResult cleanupOrphanedData(OperationContext* txn,
 
     ScopedCollectionMetadata metadata;
     {
-        AutoGetCollection autoColl(txn, ns, MODE_IS);
-        metadata = CollectionShardingState::get(txn, ns.toString())->getMetadata();
+        AutoGetCollection autoColl(opCtx, ns, MODE_IS);
+        metadata = CollectionShardingState::get(opCtx, ns.toString())->getMetadata();
     }
 
-    if (!metadata || metadata->getKeyPattern().isEmpty()) {
+    if (!metadata) {
         warning() << "skipping orphaned data cleanup for " << ns.toString()
                   << ", collection is not sharded";
 
@@ -132,7 +132,7 @@ CleanupResult cleanupOrphanedData(OperationContext* txn,
     deleterOptions.waitForOpenCursors = true;
     deleterOptions.removeSaverReason = "cleanup-cmd";
 
-    if (!getDeleter()->deleteNow(txn, deleterOptions, errMsg)) {
+    if (!getDeleter()->deleteNow(opCtx, deleterOptions, errMsg)) {
         warning() << redact(*errMsg);
         return CleanupResult_Error;
     }
@@ -203,7 +203,7 @@ public:
     // Output
     static BSONField<BSONObj> stoppedAtKeyField;
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              string const& db,
              BSONObj& cmdObj,
              int,
@@ -227,9 +227,9 @@ public:
         const auto secondaryThrottle =
             uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
         const auto writeConcern = uassertStatusOK(
-            ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(txn, secondaryThrottle));
+            ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(opCtx, secondaryThrottle));
 
-        ShardingState* const shardingState = ShardingState::get(txn);
+        ShardingState* const shardingState = ShardingState::get(opCtx);
 
         if (!shardingState->enabled()) {
             errmsg = str::stream() << "server is not part of a sharded cluster or "
@@ -237,21 +237,12 @@ public:
             return false;
         }
 
-        ChunkVersion shardVersion;
-        Status status = shardingState->refreshMetadataNow(txn, nss, &shardVersion);
-        if (!status.isOK()) {
-            if (status.code() == ErrorCodes::RemoteChangeDetected) {
-                warning() << "Shard version in transition detected while refreshing "
-                          << "metadata for " << ns << " at version " << shardVersion;
-            } else {
-                errmsg = str::stream() << "failed to refresh shard metadata: " << redact(status);
-                return false;
-            }
-        }
+        ChunkVersion unusedShardVersion;
+        uassertStatusOK(shardingState->refreshMetadataNow(opCtx, nss, &unusedShardVersion));
 
         BSONObj stoppedAtKey;
         CleanupResult cleanupResult =
-            cleanupOrphanedData(txn, nss, startingFromKey, writeConcern, &stoppedAtKey, &errmsg);
+            cleanupOrphanedData(opCtx, nss, startingFromKey, writeConcern, &stoppedAtKey, &errmsg);
 
         if (cleanupResult == CleanupResult_Error) {
             return false;

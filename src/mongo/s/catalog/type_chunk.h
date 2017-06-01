@@ -32,6 +32,7 @@
 #include <string>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/shard_id.h"
 
@@ -132,6 +133,9 @@ public:
     // Name of the chunks collection in the config server.
     static const std::string ConfigNS;
 
+    // The shard chunks collections' common namespace prefix.
+    static const std::string ShardNSPrefix;
+
     // Field names and types in the chunks collections.
     static const BSONField<std::string> name;
     static const BSONField<BSONObj> minShardID;
@@ -142,6 +146,9 @@ public:
     static const BSONField<bool> jumbo;
     static const BSONField<Date_t> DEPRECATED_lastmod;
     static const BSONField<OID> DEPRECATED_epoch;
+
+    ChunkType();
+    ChunkType(NamespaceString nss, ChunkRange range, ChunkVersion version, ShardId shardId);
 
     /**
      * Constructs a new ChunkType object from BSON that has the config server's config.chunks

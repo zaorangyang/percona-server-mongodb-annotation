@@ -71,8 +71,8 @@ public:
      *
      * If provided, session's ref count will be bumped by this Client.
      */
-    static void initThread(const char* desc, transport::SessionHandle session = nullptr);
-    static void initThread(const char* desc,
+    static void initThread(StringData desc, transport::SessionHandle session = nullptr);
+    static void initThread(StringData desc,
                            ServiceContext* serviceContext,
                            transport::SessionHandle session);
 
@@ -116,7 +116,7 @@ public:
      * Inits a thread if that thread has not already been init'd, setting the thread name to
      * "desc".
      */
-    static void initThreadIfNotAlready(const char* desc);
+    static void initThreadIfNotAlready(StringData desc);
 
     /**
      * Inits a thread if that thread has not already been init'd, using the existing thread name
@@ -155,12 +155,12 @@ public:
     ServiceContext::UniqueOperationContext makeOperationContext();
 
     /**
-     * Sets the active operation context on this client to "txn", which must be non-NULL.
+     * Sets the active operation context on this client to "opCtx", which must be non-NULL.
      *
      * It is an error to call this method if there is already an operation context on Client.
      * It is an error to call this on an unlocked client.
      */
-    void setOperationContext(OperationContext* txn);
+    void setOperationContext(OperationContext* opCtx);
 
     /**
      * Clears the active operation context on this client.
@@ -177,7 +177,7 @@ public:
      * by this method while the client is not locked.
      */
     OperationContext* getOperationContext() {
-        return _txn;
+        return _opCtx;
     }
 
     // TODO(spencer): SERVER-10228 SERVER-14779 Remove this/move it fully into OperationContext.
@@ -224,7 +224,7 @@ private:
     bool _inDirectClient = false;
 
     // If != NULL, then contains the currently active OperationContext
-    OperationContext* _txn = nullptr;
+    OperationContext* _opCtx = nullptr;
 
     PseudoRandom _prng;
 };

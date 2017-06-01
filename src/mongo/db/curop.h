@@ -33,6 +33,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/cursor_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
 #include "mongo/platform/atomic_word.h"
@@ -191,7 +192,7 @@ public:
         return _originatingCommand;
     }
 
-    void enter_inlock(const char* ns, int dbProfileLevel);
+    void enter_inlock(const char* ns, boost::optional<int> dbProfileLevel);
 
     /**
      * Sets the type of the current network operation.
@@ -331,7 +332,7 @@ public:
     }
 
     /**
-     * Sets the original command object. Used only by the getMore command.
+     * Sets the original command object.
      */
     void setOriginatingCommand_inlock(const BSONObj& commandObj) {
         _originatingCommand = commandObj.getOwned();
@@ -466,4 +467,18 @@ private:
     bool _shouldDBProfileWithRateLimit() const;
 
 };
+
+/**
+ * Upconverts a legacy query object such that it matches the format of the find command.
+ */
+BSONObj upconvertQueryEntry(const BSONObj& query,
+                            const NamespaceString& nss,
+                            int ntoreturn,
+                            int ntoskip);
+
+/**
+ * Generates a getMore command object from the specified namespace, cursor ID and batchsize.
+ */
+BSONObj upconvertGetMoreEntry(const NamespaceString& nss, CursorId cursorId, int ntoreturn);
+
 }  // namespace mongo
