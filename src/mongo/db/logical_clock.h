@@ -84,8 +84,9 @@ public:
     SignedLogicalTime getClusterTime();
 
     /**
-     * Returns the next  clusterTime value and provides the guarantee that the next reserveTicks
-     * call will return the value at least nTicks ticks in the future from the current clusterTime.
+     * Returns the next clusterTime value and provides a guarantee that any future call to
+     * reserveTicks() will return a value at least 'nTicks' ticks in the future from the current
+     * clusterTime.
      */
     LogicalTime reserveTicks(uint64_t nTicks);
 
@@ -115,6 +116,14 @@ private:
     // the mutex protects _clusterTime
     stdx::mutex _mutex;
     SignedLogicalTime _clusterTime;
+
+    /**
+     * Temporary key only used for unit tests.
+     *
+     * TODO: SERVER-28436 Implement KeysCollectionManager
+     * Remove _tempKey and its uses from logical clock, and pass actual key from key manager.
+     */
+    TimeProofService::Key _tempKey = {};
 };
 
 }  // namespace mongo

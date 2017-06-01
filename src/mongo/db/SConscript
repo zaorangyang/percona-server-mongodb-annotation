@@ -198,6 +198,7 @@ env.CppUnitTest(
         'operation_context_test.cpp',
     ],
     LIBDEPS=[
+        'logical_session_id',
         'service_context',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
@@ -546,7 +547,7 @@ env.Library(
         '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
         'audit',
-        'auth/authorization_manager_global',
+        'auth/authcore',
         'commands/server_status_core',
         'commands/test_commands_enabled',
         'service_context',
@@ -574,8 +575,11 @@ env.Library(
         'db_raii.cpp',
     ],
     LIBDEPS=[
+        'curop',
         'stats/top',
         'views/views',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/s/sharding',
         #'catalog/catalog', # CYCLE
     ],
     LIBDEPS_TAGS=[
@@ -604,7 +608,7 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver',
         'curop',
         'lasterror',
-        # 'assemble_response', # CYCLE
+        #'assemble_response', # CYCLE
     ],
     LIBDEPS_TAGS=[
         # TODO(ADAM, 2017-01-09): See `CYCLE` tags above
@@ -724,7 +728,7 @@ env.Library(
     LIBDEPS=[
         "db_raii",
         "index/index_access_methods",
-        #"catalog/catalog", # CYCYLE
+        #"catalog/catalog", # CYCLE
     ],
     LIBDEPS_TAGS=[
         # TODO(ADAM, 2017-03-10): See `CYCLE` tags above.
@@ -739,11 +743,6 @@ env.Library(
     ],
     LIBDEPS=[
         "db_raii",
-        #"catalog/catalog", # CYCLE
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-03-10): See `CYCLE` tags above.
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )
 
@@ -753,9 +752,13 @@ env.Library(
         "prefetch.cpp",
     ],
     LIBDEPS=[
-        "catalog/catalog",
+        #"catalog/catalog", # CYCLE
         "dbhelpers",
         "index/index_access_methods",
+    ],
+    LIBDEPS_TAGS=[
+        # TODO(ADAM, 2017-04-06): See `CYCLE` tags above.
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )
 
@@ -778,9 +781,8 @@ env.Library(
 )
 
 env.Library(
-    target="rw_concern_d",
+    target="write_concern_d",
     source=[
-        "read_concern.cpp",
         "write_concern.cpp",
     ],
     LIBDEPS=[
@@ -802,6 +804,7 @@ env.Library(
     LIBDEPS=[
         "background",
         "catalog/index_key_validate",
+        "$BUILD_DIR/mongo/db/storage/mmap_v1/storage_mmapv1",
         #"catalog/catalog", # CYCLE
     ],
     LIBDEPS_TAGS=[
@@ -946,7 +949,7 @@ env.Library(
         "repl/sync_tail",
         "repl/topology_coordinator_impl",
         "run_commands",
-        "rw_concern_d",
+        "write_concern_d",
         "s/commands",
         "s/metadata",
         "s/sharding",
@@ -969,6 +972,28 @@ env.Library(
         "ttl_d",
         "update_index_data",
         "views/views_mongod",
+    ],
+)
+
+env.Library(
+    target='logical_session_id',
+    source=[
+        'logical_session_id.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/util/uuid',
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target='logical_session_id_test',
+    source=[
+        'logical_session_id_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        'logical_session_id'
     ],
 )
 
@@ -1007,15 +1032,49 @@ env.Library(
 )
 
 env.Library(
+    target='keys_collection_document',
+    source=[
+        'keys_collection_document.cpp',
+    ],
+    LIBDEPS=[
+        'logical_time',
+        'time_proof_service'
+    ],
+)
+
+env.Library(
+    target='keys_collection_manager',
+    source=[
+        'keys_collection_cache_reader.cpp',
+    ],
+    LIBDEPS=[
+        'keys_collection_document',
+        'logical_time',
+    ],
+)
+
+env.Library(
     target='logical_clock',
     source=[
         'logical_clock.cpp',
     ],
     LIBDEPS=[
+        'keys_collection_manager',
         'server_parameters',
         'service_context',
         'signed_logical_time',
         'time_proof_service',
+        '$BUILD_DIR/mongo/util/clock_source_mock'
+    ],
+)
+
+env.CppUnitTest(
+    target='keys_collection_document_test',
+    source=[
+        'keys_collection_document_test.cpp',
+    ],
+    LIBDEPS=[
+        'keys_collection_document',
     ],
 )
 

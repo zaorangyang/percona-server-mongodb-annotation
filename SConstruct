@@ -20,85 +20,22 @@ import SCons
 # we are to avoid bulk loading all tools in the DefaultEnvironment.
 DefaultEnvironment(tools=[])
 
-EnsureSConsVersion( 2, 3, 5 )
+# These come from site_scons/mongo. Import these things
+# after calling DefaultEnvironment, for the sake of paranoia.
+import mongo
+import mongo.platform as mongo_platform
+import mongo.toolchain as mongo_toolchain
+import mongo.generators as mongo_generators
+
+EnsurePythonVersion(2, 7)
+EnsureSConsVersion(2, 5)
 
 from buildscripts import utils
 from buildscripts import moduleconfig
 
-from mongo_scons_utils import (
-    default_buildinfo_environment_data,
-    default_variant_dir_generator,
-    get_toolchain_ver,
-)
-
 import libdeps
 
-def print_build_failures():
-    from SCons.Script import GetBuildFailures
-    for bf in GetBuildFailures():
-        print "%s failed: %s" % (bf.node, bf.errstr)
-atexit.register(print_build_failures)
-
-def versiontuple(v):
-    return tuple(map(int, (v.split("."))))
-
-# --- OS identification ---
-#
-# This needs to precede the options section so that we can only offer some options on certain
-# operating systems.
-
-# This function gets the running OS as identified by Python
-# It should only be used to set up defaults for options/variables, because
-# its value could potentially be overridden by setting TARGET_OS on the
-# command-line. Treat this output as the value of HOST_OS
-def get_running_os_name():
-    running_os = os.sys.platform
-    if running_os.startswith('linux'):
-        running_os = 'linux'
-    elif running_os.startswith('freebsd'):
-        running_os = 'freebsd'
-    elif running_os.startswith('openbsd'):
-        running_os = 'openbsd'
-    elif running_os == 'sunos5':
-        running_os = 'solaris'
-    elif running_os == 'win32':
-        running_os = 'windows'
-    elif running_os == 'darwin':
-        running_os = 'macOS'
-    else:
-        running_os = 'unknown'
-    return running_os
-
-def env_get_os_name_wrapper(self):
-    return env['TARGET_OS']
-
-def is_os_raw(target_os, os_list_to_check):
-    okay = False
-
-    darwin_os_list = [ 'macOS', 'tvOS', 'tvOS-sim', 'iOS', 'iOS-sim' ]
-    posix_os_list = [ 'linux', 'openbsd', 'freebsd', 'solaris' ] + darwin_os_list
-
-    for p in os_list_to_check:
-        if p == 'posix' and target_os in posix_os_list:
-            okay = True
-            break
-        if p == 'darwin' and target_os in darwin_os_list:
-            okay = True
-            break
-        elif p == target_os:
-            okay = True
-            break
-    return okay
-
-# This function tests the running OS as identified by Python
-# It should only be used to set up defaults for options/variables, because
-# its value could potentially be overridden by setting TARGET_OS on the
-# command-line. Treat this output as the value of HOST_OS
-def is_running_os(*os_list):
-    return is_os_raw(get_running_os_name(), os_list)
-
-def env_os_is_wrapper(self, *os_list):
-    return is_os_raw(self['TARGET_OS'], os_list)
+atexit.register(mongo.print_build_failures)
 
 def add_option(name, **kwargs):
 
@@ -467,7 +404,6 @@ add_option('osx-version-min',
 )
 
 win_version_min_choices = {
-    'vista'   : ('0600', '0000'),
     'win7'    : ('0601', '0000'),
     'ws08r2'  : ('0601', '0000'),
     'win8'    : ('0602', '0000'),
@@ -588,7 +524,7 @@ def variable_shlex_converter(val):
         return val
     parse_mode = get_option('variable-parse-mode')
     if parse_mode == 'auto':
-        parse_mode = 'other' if is_running_os('windows') else 'posix'
+        parse_mode = 'other' if mongo_platform.is_running_os('windows') else 'posix'
     return shlex.split(val, posix=(parse_mode == 'posix'))
 
 def variable_arch_converter(val):
@@ -618,12 +554,12 @@ def variable_arch_converter(val):
 # If we aren't on a platform where we know the minimal set of tools, we fall back to loading
 # the 'default' tool.
 def decide_platform_tools():
-    if is_running_os('windows'):
+    if mongo_platform.is_running_os('windows'):
         # we only support MS toolchain on windows
         return ['msvc', 'mslink', 'mslib', 'masm']
-    elif is_running_os('linux', 'solaris'):
+    elif mongo_platform.is_running_os('linux', 'solaris'):
         return ['gcc', 'g++', 'gnulink', 'ar', 'gas']
-    elif is_running_os('darwin'):
+    elif mongo_platform.is_running_os('darwin'):
         return ['gcc', 'g++', 'applelink', 'ar', 'as']
     else:
         return ["default"]
@@ -633,6 +569,7 @@ def variable_tools_converter(val):
     return tool_list + [
         "distsrc",
         "gziptool",
+        'idl_tool',
         "jsheader",
         "mergelib",
         "mongo_integrationtest",
@@ -736,7 +673,7 @@ env_vars.Add('MAXLINELENGTH',
 # default_buildinfo_environment_data() function for examples of how to use this.
 env_vars.Add('MONGO_BUILDINFO_ENVIRONMENT_DATA',
     help='Sets the info returned from the buildInfo command and --version command-line flag',
-    default=default_buildinfo_environment_data())
+    default=mongo_generators.default_buildinfo_environment_data())
 
 env_vars.Add('MONGO_DIST_SRC_PREFIX',
     help='Sets the prefix for files in the source distribution archive',
@@ -755,9 +692,16 @@ env_vars.Add('MONGO_DISTNAME',
     help='Sets the version string to be used in dist archive naming',
     default='$MONGO_VERSION')
 
+def validate_mongo_version(key, val, env):
+    regex = r'^(\d+)\.(\d+)\.(\d+)-?((?:(rc)(\d+))?.*)?'
+    if not re.match(regex, val):
+        print("Invalid MONGO_VERSION '{}', or could not derive from version.json or git metadata. Please add a conforming MONGO_VERSION=x.y.z[-extra] as an argument to SCons".format(val))
+        Exit(1)
+
 env_vars.Add('MONGO_VERSION',
     help='Sets the version string for MongoDB',
-    default=version_data['version'])
+    default=version_data['version'],
+    validator=validate_mongo_version)
 
 env_vars.Add('MONGO_GIT_HASH',
     help='Sets the githash to store in the MongoDB version information',
@@ -803,7 +747,7 @@ env_vars.Add('TARGET_ARCH',
 
 env_vars.Add('TARGET_OS',
     help='Sets the target OS to build for',
-    default=get_running_os_name())
+    default=mongo_platform.get_running_os_name())
 
 env_vars.Add('TOOLS',
     help='Sets the list of SCons tools to add to the environment',
@@ -812,7 +756,7 @@ env_vars.Add('TOOLS',
 
 env_vars.Add('VARIANT_DIR',
     help='Sets the name (or generator function) for the variant directory',
-    default=default_variant_dir_generator,
+    default=mongo_generators.default_variant_dir_generator,
 )
 
 env_vars.Add('VERBOSE',
@@ -960,8 +904,8 @@ envDict = dict(BUILD_ROOT=buildDir,
 env = Environment(variables=env_vars, **envDict)
 del envDict
 
-env.AddMethod(env_os_is_wrapper, 'TargetOSIs')
-env.AddMethod(env_get_os_name_wrapper, 'GetTargetOSName')
+env.AddMethod(mongo_platform.env_os_is_wrapper, 'TargetOSIs')
+env.AddMethod(mongo_platform.env_get_os_name_wrapper, 'GetTargetOSName')
 
 def fatal_error(env, msg, *args):
     print msg.format(*args)
@@ -1158,7 +1102,7 @@ if not detectConf.CheckForCXXLink():
         detectEnv['CXX'])
 
 toolchain_search_sequence = [ "GCC", "clang" ]
-if is_running_os('windows'):
+if mongo_platform.is_running_os('windows'):
     toolchain_search_sequence = [ 'MSVC', 'clang', 'GCC' ]
 for candidate_toolchain in toolchain_search_sequence:
     if detectConf.CheckForToolchain(candidate_toolchain, "C++", "CXX", ".cpp"):
@@ -1202,8 +1146,8 @@ elif not detectConf.CheckForOS(env['TARGET_OS']):
 
 detectConf.Finish()
 
-env['CC_VERSION'] = get_toolchain_ver(env, 'CC')
-env['CXX_VERSION'] = get_toolchain_ver(env, 'CXX')
+env['CC_VERSION'] = mongo_toolchain.get_toolchain_ver(env, 'CC')
+env['CXX_VERSION'] = mongo_toolchain.get_toolchain_ver(env, 'CXX')
 
 if not env['HOST_ARCH']:
     env['HOST_ARCH'] = env['TARGET_ARCH']
@@ -1880,7 +1824,7 @@ def doConfigure(myenv):
             win_version_min = get_option('win-version-min')
         else:
             # If no minimum version has beeen specified, use our default
-            win_version_min = 'vista'
+            win_version_min = 'ws08r2'
 
         env['WIN_VERSION_MIN'] = win_version_min
         win_version_min = win_version_min_choices[win_version_min]
@@ -2502,8 +2446,10 @@ def doConfigure(myenv):
 
     if myenv.ToolchainIs('gcc', 'clang'):
         # This tells clang/gcc to use the gold linker if it is available - we prefer the gold linker
-        # because it is much faster.
-        AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+        # because it is much faster. Don't use it if the user has already configured another linker
+        # selection manually.
+        if not any(flag.startswith('-fuse-ld=') for flag in env['LINKFLAGS']):
+            AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
 
         # Explicitly enable GNU build id's if the linker supports it.
         AddToLINKFLAGSIfSupported(myenv, '-Wl,--build-id')
@@ -3045,7 +2991,7 @@ env.Tool("compilation_db")
 
 # If we can, load the dagger tool for build dependency graph introspection.
 # Dagger is only supported on Linux and OSX (not Windows or Solaris).
-should_dagger = ( is_running_os('osx') or is_running_os('linux')  ) and "dagger" in COMMAND_LINE_TARGETS
+should_dagger = ( mongo_platform.is_running_os('osx') or mongo_platform.is_running_os('linux')  ) and "dagger" in COMMAND_LINE_TARGETS
 
 if should_dagger:
     env.Tool("dagger")

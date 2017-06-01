@@ -47,6 +47,7 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -55,9 +56,12 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/delete.h"
+#include "mongo/db/exec/update.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/ops/parsed_update.h"
+#include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/collection_bulk_loader_impl.h"
 #include "mongo/db/repl/oplog.h"
@@ -67,7 +71,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/old_thread_pool.h"
-#include "mongo/util/destructor_guard.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -90,14 +93,6 @@ StorageInterfaceImpl::StorageInterfaceImpl()
 
 StorageInterfaceImpl::StorageInterfaceImpl(const NamespaceString& minValidNss)
     : _minValidNss(minValidNss) {}
-
-StorageInterfaceImpl::~StorageInterfaceImpl() {
-    DESTRUCTOR_GUARD(shutdown(););
-}
-
-void StorageInterfaceImpl::startup() {}
-
-void StorageInterfaceImpl::shutdown() {}
 
 NamespaceString StorageInterfaceImpl::getMinValidNss() const {
     return _minValidNss;
@@ -315,17 +310,40 @@ Status StorageInterfaceImpl::insertDocument(OperationContext* opCtx,
 
 namespace {
 
+/**
+ * Returns Collection* from database RAII object.
+ * Returns NamespaceNotFound if the database or collection does not exist.
+ */
+template <typename AutoGetCollectionType>
+StatusWith<Collection*> getCollection(const AutoGetCollectionType& autoGetCollection,
+                                      const NamespaceString& nss,
+                                      const std::string& message) {
+    if (!autoGetCollection.getDb()) {
+        return {ErrorCodes::NamespaceNotFound,
+                str::stream() << "Database [" << nss.db() << "] not found. " << message};
+    }
+
+    auto collection = autoGetCollection.getCollection();
+    if (!collection) {
+        return {ErrorCodes::NamespaceNotFound,
+                str::stream() << "Collection [" << nss.ns() << "] not found. " << message};
+    }
+
+    return collection;
+}
+
 Status insertDocumentsSingleBatch(OperationContext* opCtx,
                                   const NamespaceString& nss,
                                   std::vector<BSONObj>::const_iterator begin,
                                   std::vector<BSONObj>::const_iterator end) {
     AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-    auto collection = autoColl.getCollection();
-    if (!collection) {
-        return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "The collection must exist before inserting documents, ns:"
-                              << nss.ns()};
+
+    auto collectionResult =
+        getCollection(autoColl, nss, "The collection must exist before inserting documents.");
+    if (!collectionResult.isOK()) {
+        return collectionResult.getStatus();
     }
+    auto collection = collectionResult.getValue();
 
     WriteUnitOfWork wunit(opCtx);
     OpDebug* const nullOpDebug = nullptr;
@@ -381,13 +399,14 @@ Status StorageInterfaceImpl::createOplog(OperationContext* opCtx, const Namespac
 
 StatusWith<size_t> StorageInterfaceImpl::getOplogMaxSize(OperationContext* opCtx,
                                                          const NamespaceString& nss) {
-    AutoGetCollectionForReadCommand collection(opCtx, nss);
-    if (!collection.getCollection()) {
-        return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Your oplog doesn't exist: " << nss.ns()};
+    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    auto collectionResult = getCollection(autoColl, nss, "Your oplog doesn't exist.");
+    if (!collectionResult.isOK()) {
+        return collectionResult.getStatus();
     }
+    auto collection = collectionResult.getValue();
 
-    const auto options = collection.getCollection()->getCatalogEntry()->getCollectionOptions(opCtx);
+    const auto options = collection->getCatalogEntry()->getCollectionOptions(opCtx);
     if (!options.capped)
         return {ErrorCodes::BadValue, str::stream() << nss.ns() << " isn't capped"};
 
@@ -401,7 +420,7 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
         AutoGetOrCreateDb databaseWriteGuard(opCtx, nss.db(), MODE_X);
         auto db = databaseWriteGuard.getDb();
         invariant(db);
-        if (db->getCollection(nss)) {
+        if (db->getCollection(opCtx, nss)) {
             return {ErrorCodes::NamespaceExists,
                     str::stream() << "Collection " << nss.ns() << " already exists."};
         }
@@ -426,7 +445,7 @@ Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const Names
             return Status::OK();
         }
         WriteUnitOfWork wunit(opCtx);
-        const auto status = autoDB.getDb()->dropCollection(opCtx, nss.ns());
+        const auto status = autoDB.getDb()->dropCollectionEvenIfSystem(opCtx, nss);
         if (status.isOK()) {
             wunit.commit();
         }
@@ -465,17 +484,18 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
 
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         auto collectionAccessMode = isFind ? MODE_IS : MODE_IX;
-        AutoGetCollection collectionGuard(opCtx, nss, collectionAccessMode);
-        auto collection = collectionGuard.getCollection();
-        if (!collection) {
-            return {ErrorCodes::NamespaceNotFound,
-                    str::stream() << "Collection not found, ns:" << nss.ns()};
+        AutoGetCollection autoColl(opCtx, nss, collectionAccessMode);
+        auto collectionResult = getCollection(
+            autoColl, nss, str::stream() << "Unable to proceed with " << opStr << ".");
+        if (!collectionResult.isOK()) {
+            return collectionResult.getStatus();
         }
+        auto collection = collectionResult.getValue();
 
         auto isForward = scanDirection == StorageInterface::ScanDirection::kForward;
         auto direction = isForward ? InternalPlanner::FORWARD : InternalPlanner::BACKWARD;
 
-        std::unique_ptr<PlanExecutor> planExecutor;
+        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor;
         if (!indexName) {
             if (!startKey.isEmpty()) {
                 return {ErrorCodes::NoSuchKey,
@@ -489,12 +509,12 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
             // Use collection scan.
             planExecutor = isFind
                 ? InternalPlanner::collectionScan(
-                      opCtx, nss.ns(), collection, PlanExecutor::YIELD_MANUAL, direction)
+                      opCtx, nss.ns(), collection, PlanExecutor::NO_YIELD, direction)
                 : InternalPlanner::deleteWithCollectionScan(
                       opCtx,
                       collection,
                       makeDeleteStageParamsForDeleteDocuments(),
-                      PlanExecutor::YIELD_MANUAL,
+                      PlanExecutor::NO_YIELD,
                       direction);
         } else {
             // Use index scan.
@@ -531,7 +551,7 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
                                              bounds.first,
                                              bounds.second,
                                              boundInclusion,
-                                             PlanExecutor::YIELD_MANUAL,
+                                             PlanExecutor::NO_YIELD,
                                              direction,
                                              InternalPlanner::IXSCAN_FETCH)
                 : InternalPlanner::deleteWithIndexScan(opCtx,
@@ -541,7 +561,7 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
                                                        bounds.first,
                                                        bounds.second,
                                                        boundInclusion,
-                                                       PlanExecutor::YIELD_MANUAL,
+                                                       PlanExecutor::NO_YIELD,
                                                        direction);
         }
 
@@ -600,18 +620,97 @@ StatusWith<std::vector<BSONObj>> StorageInterfaceImpl::deleteDocuments(
                                   FindDeleteMode::kDelete);
 }
 
+namespace {
+
+/**
+ * Checks _id key passed to upsertById and returns a query document for UpdateRequest.
+ */
+StatusWith<BSONObj> makeUpsertQuery(const BSONElement& idKey) {
+    auto query = BSON("_id" << idKey);
+
+    // With the ID hack, only simple _id queries are allowed. Otherwise, UpdateStage will fail with
+    // a fatal assertion.
+    if (!CanonicalQuery::isSimpleIdQuery(query)) {
+        return {ErrorCodes::InvalidIdField,
+                str::stream() << "Unable to update document with a non-simple _id query: "
+                              << query};
+    }
+
+    return query;
+}
+
+}  // namespace
+
+Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
+                                        const NamespaceString& nss,
+                                        const BSONElement& idKey,
+                                        const BSONObj& update) {
+    // Validate and construct an _id query for UpdateResult.
+    // The _id key will be passed directly to IDHackStage.
+    auto queryResult = makeUpsertQuery(idKey);
+    if (!queryResult.isOK()) {
+        return queryResult.getStatus();
+    }
+    auto query = queryResult.getValue();
+
+    UpdateRequest request(nss);
+    request.setQuery(query);
+    request.setUpdates(update);
+    request.setUpsert(true);
+    invariant(!request.isMulti());  // This follows from using an exact _id query.
+    invariant(!request.shouldReturnAnyDocs());
+    invariant(PlanExecutor::NO_YIELD == request.getYieldPolicy());
+
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        // ParsedUpdate needs to be inside the write conflict retry loop because it contains
+        // the UpdateDriver whose state may be modified while we are applying the update.
+        ParsedUpdate parsedUpdate(opCtx, &request);
+        auto parsedUpdateStatus = parsedUpdate.parseRequest();
+        if (!parsedUpdateStatus.isOK()) {
+            return parsedUpdateStatus;
+        }
+
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+        auto collectionResult = getCollection(autoColl, nss, "Unable to update document.");
+        if (!collectionResult.isOK()) {
+            return collectionResult.getStatus();
+        }
+        auto collection = collectionResult.getValue();
+
+        // We're using the ID hack to perform the update so we have to disallow collections
+        // without an _id index.
+        auto descriptor = collection->getIndexCatalog()->findIdIndex(opCtx);
+        if (!descriptor) {
+            return {ErrorCodes::IndexNotFound,
+                    "Unable to update document in a collection without an _id index."};
+        }
+
+        UpdateStageParams updateStageParams(
+            parsedUpdate.getRequest(), parsedUpdate.getDriver(), nullptr);
+        auto planExecutor = InternalPlanner::updateWithIdHack(opCtx,
+                                                              collection,
+                                                              updateStageParams,
+                                                              descriptor,
+                                                              idKey.wrap(""),
+                                                              parsedUpdate.yieldPolicy());
+
+        return planExecutor->executePlan();
+    }
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "StorageInterfaceImpl::upsertById", nss.ns());
+
+    MONGO_UNREACHABLE;
+}
+
 StatusWith<StorageInterface::CollectionSize> StorageInterfaceImpl::getCollectionSize(
     OperationContext* opCtx, const NamespaceString& nss) {
     AutoGetCollectionForRead autoColl(opCtx, nss);
-    if (!autoColl.getDb()) {
-        return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Database [" << nss.db().toString() << "] not found."};
+
+    auto collectionResult =
+        getCollection(autoColl, nss, "Unable to get total size of documents in collection.");
+    if (!collectionResult.isOK()) {
+        return collectionResult.getStatus();
     }
-    Collection* collection = autoColl.getCollection();
-    if (!collection) {
-        return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Collection [" << nss.toString() << "] not found."};
-    }
+    auto collection = collectionResult.getValue();
 
     return collection->dataSize(opCtx);
 }
@@ -619,15 +718,13 @@ StatusWith<StorageInterface::CollectionSize> StorageInterfaceImpl::getCollection
 StatusWith<StorageInterface::CollectionCount> StorageInterfaceImpl::getCollectionCount(
     OperationContext* opCtx, const NamespaceString& nss) {
     AutoGetCollectionForRead autoColl(opCtx, nss);
-    if (!autoColl.getDb()) {
-        return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Database [" << nss.db().toString() << "] not found."};
+
+    auto collectionResult =
+        getCollection(autoColl, nss, "Unable to get number of documents in collection.");
+    if (!collectionResult.isOK()) {
+        return collectionResult.getStatus();
     }
-    Collection* collection = autoColl.getCollection();
-    if (!collection) {
-        return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Collection [" << nss.toString() << "] not found."};
-    }
+    auto collection = collectionResult.getValue();
 
     return collection->numRecords(opCtx);
 }
@@ -640,11 +737,11 @@ Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
     }
 
     Collection* const usersCollection =
-        adminDb->getCollection(AuthorizationManager::usersCollectionNamespace);
+        adminDb->getCollection(opCtx, AuthorizationManager::usersCollectionNamespace);
     const bool hasUsers =
         usersCollection && !Helpers::findOne(opCtx, usersCollection, BSONObj(), false).isNull();
     Collection* const adminVersionCollection =
-        adminDb->getCollection(AuthorizationManager::versionCollectionNamespace);
+        adminDb->getCollection(opCtx, AuthorizationManager::versionCollectionNamespace);
     BSONObj authSchemaVersionDocument;
     if (!adminVersionCollection ||
         !Helpers::findOne(opCtx,

@@ -122,10 +122,11 @@ Status _applyOps(OperationContext* opCtx,
                 continue;
 
             const std::string ns = opObj["ns"].String();
+            const NamespaceString nss{ns};
 
             // Need to check this here, or OldClientContext may fail an invariant.
-            if (*opType != 'c' && !NamespaceString(ns).isValid())
-                return {ErrorCodes::InvalidNamespace, "invalid ns: " + ns};
+            if (*opType != 'c' && !nss.isValid())
+                return {ErrorCodes::InvalidNamespace, "invalid ns: " + nss.ns()};
 
             Status status(ErrorCodes::InternalError, "");
 
@@ -143,7 +144,7 @@ Status _applyOps(OperationContext* opCtx,
                 status = repl::applyOperation_inlock(opCtx, ctx.db(), opObj, alwaysUpsert);
                 if (!status.isOK())
                     return status;
-                logOpForDbHash(opCtx, ns.c_str());
+                logOpForDbHash(opCtx, nss);
             } else {
                 try {
                     // Run operations under a nested lock as a hack to prevent yielding.
@@ -186,7 +187,7 @@ Status _applyOps(OperationContext* opCtx,
                     return Status(ErrorCodes::UnknownError, ex.what());
                 }
                 WriteUnitOfWork wuow(opCtx);
-                logOpForDbHash(opCtx, ns.c_str());
+                logOpForDbHash(opCtx, nss);
                 wuow.commit();
             }
 
@@ -207,8 +208,6 @@ Status _applyOps(OperationContext* opCtx,
         // We want this applied atomically on slaves
         // so we re-wrap without the pre-condition for speed
 
-        std::string tempNS = str::stream() << dbName << ".$cmd";
-
         // TODO: possibly use mutable BSON to remove preCondition field
         // once it is available
         BSONObjBuilder cmdBuilder;
@@ -227,7 +226,7 @@ Status _applyOps(OperationContext* opCtx,
         auto opObserver = getGlobalServiceContext()->getOpObserver();
         invariant(opObserver);
         if (haveWrappingWUOW) {
-            opObserver->onApplyOps(opCtx, tempNS, cmdRewritten);
+            opObserver->onApplyOps(opCtx, dbName, cmdRewritten);
         } else {
             // When executing applyOps outside of a wrapping WriteUnitOfWOrk, always logOp the
             // command regardless of whether the individial ops succeeded and rely on any
@@ -236,7 +235,7 @@ Status _applyOps(OperationContext* opCtx,
             while (true) {
                 try {
                     WriteUnitOfWork wunit(opCtx);
-                    opObserver->onApplyOps(opCtx, tempNS, cmdRewritten);
+                    opObserver->onApplyOps(opCtx, dbName, cmdRewritten);
 
                     wunit.commit();
                     break;
@@ -283,7 +282,7 @@ Status preconditionOK(OperationContext* opCtx, const BSONObj& applyOpCmd, BSONOb
                 return {ErrorCodes::NamespaceNotFound,
                         "database in ns does not exist: " + nss.ns()};
             }
-            Collection* collection = database->getCollection(nss.ns());
+            Collection* collection = database->getCollection(opCtx, nss);
             if (!collection) {
                 return {ErrorCodes::NamespaceNotFound,
                         "collection in ns does not exist: " + nss.ns()};
@@ -330,10 +329,12 @@ Status applyOps(OperationContext* opCtx,
     // Perform write ops atomically
     try {
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            BSONObjBuilder intermediateResult;
             WriteUnitOfWork wunit(opCtx);
             numApplied = 0;
-            uassertStatusOK(_applyOps(opCtx, dbName, applyOpCmd, result, &numApplied));
+            uassertStatusOK(_applyOps(opCtx, dbName, applyOpCmd, &intermediateResult, &numApplied));
             wunit.commit();
+            result->appendElements(intermediateResult.obj());
         }
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "applyOps", dbName);
     } catch (const DBException& ex) {

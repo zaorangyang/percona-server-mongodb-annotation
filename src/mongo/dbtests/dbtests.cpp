@@ -97,7 +97,7 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
     Collection* coll;
     {
         WriteUnitOfWork wunit(opCtx);
-        coll = autoDb.getDb()->getOrCreateCollection(opCtx, ns);
+        coll = autoDb.getDb()->getOrCreateCollection(opCtx, NamespaceString(ns));
         invariant(coll);
         wunit.commit();
     }
@@ -132,9 +132,7 @@ int dbtestsMain(int argc, char** argv, char** envp) {
     replSettings.setOplogSizeBytes(10 * 1024 * 1024);
     ServiceContext* service = getGlobalServiceContext();
 
-    std::array<std::uint8_t, 20> tempKey = {};
-    TimeProofService::Key key(std::move(tempKey));
-    auto timeProofService = stdx::make_unique<TimeProofService>(std::move(key));
+    auto timeProofService = stdx::make_unique<TimeProofService>();
     auto logicalClock = stdx::make_unique<LogicalClock>(service, std::move(timeProofService));
     LogicalClock::set(service, std::move(logicalClock));
 

@@ -100,7 +100,10 @@ variables:
   jepsen_read_concern: ""
   jepsen_read_with_find_and_modify: ""
   jepsen_storage_engine: ""
-  jepsen_time_limit: --time-limit 300
+  jepsen_test_name: ""
+  # Empirically, we've had greater success in reproducing the issues found in MongoDB versions
+  # 3.4.0-rc3 and 3.4.0-rc4 when running Jepsen with at least --time-limit=600.
+  jepsen_time_limit: --time-limit 1200
   jepsen_write_concern: ""
 
 # Template for running Jepsen tests
@@ -140,69 +143,6 @@ variables:
   - func: "do setup"
   - func: "run jstestfuzz"
   - *run_jstestfuzz_tests
-
-# buildvariants in this list have debug symbols which are uploaded to s3.
-# Note this sorted list contains all buildvariants. A buildvariant that does not
-# create separate symbol files is commented out.
-- &debug_symbol_variants
-  - amazon
-  - debian71
-  - debian81
-  - enterprise-debian71-64
-  - enterprise-debian81-64
-  - enterprise-linux-64-amazon-ami
-  - enterprise-osx-107
-  - enterprise-rhel-62-64-bit
-  - enterprise-rhel-62-64-bit-coverage
-  - enterprise-rhel-62-64-bit-inmem
-  - enterprise-rhel-67-s390x
-  - enterprise-rhel-70-64-bit
-  - enterprise-rhel-71-ppc64le
-  - enterprise-rhel-71-ppc64le-inmem
-  - enterprise-rhel-72-s390x
-  - enterprise-rhel-72-s390x-inmem
-  - enterprise-suse11-64
-  - enterprise-suse11-s390x
-  - enterprise-suse12-64
-  - enterprise-suse12-s390x
-  # - enterprise-ubuntu-dynamic-1604-64-bit # Does not create separate symbol files.
-  - enterprise-ubuntu1204-64
-  - enterprise-ubuntu1404-64
-  - enterprise-ubuntu1604-64
-  - enterprise-ubuntu1604-arm64
-  # - enterprise-ubuntu1604-clang-3.7-libcxx # Does not create separate symbol files.
-  - enterprise-ubuntu1604-ppc64le
-  - enterprise-ubuntu1604-s390x
-  - enterprise-windows-64
-  - enterprise-windows-64-2k8-debug-unoptimized
-  - enterprise-windows-64-inmem
-  - linux-64
-  - linux-64-debug
-  - linux-64-duroff
-  - linux-64-ephemeralForTest
-  - linux-64-lsm
-  - linux-64-repeated-execution
-  - osx-107
-  - osx-107-debug
-  - osx-107-ssl
-  - rhel62
-  - rhel70
-  - rollback-3dot4-rhel-62
-  - solaris-64-bit
-  - suse11
-  - suse12
-  - ubuntu1204
-  - ubuntu1404
-  - ubuntu1404-rocksdb
-  - ubuntu1604
-  - ubuntu1604-arm64
-  - ubuntu1604-asan
-  - ubuntu1604-debug-asan
-  - ubuntu1604-debug-ubsan
-  - windows-64
-  - windows-64-2k8
-  - windows-64-2k8-debug
-  - windows-64-2k8-ssl
 
 
 #######################################
@@ -378,8 +318,6 @@ functions:
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
-      build_variants:
-        *debug_symbol_variants
 
   "fetch debugsymbols archive" : &fetch_debugsymbols_archive
     command: s3.get
@@ -389,18 +327,18 @@ functions:
       remote_file: mongodb-mongo-master/${build_variant}/${revision}/debugsymbols/debugsymbols-${build_id}.${ext|tgz}
       bucket: mciuploads
       local_file: src/mongo-debugsymbols.tgz
-      build_variants:
-        *debug_symbol_variants
 
   "extract debugsymbols" : &extract_debugsymbols
     command: shell.exec
     params:
       working_dir: src
-      build_variants:
-        *debug_symbol_variants
       script: |
         set -o errexit
         set -o verbose
+        # Debug symbols are not created for every variant
+        if [ ! -f mongo-debugsymbols.tgz ]; then
+          exit
+        fi
         ${decompress} mongo-debugsymbols.tgz
         files="mongo mongod mongos"
         file_exts="debug dSYM pdb"
@@ -575,7 +513,15 @@ functions:
         ${san_symbolizer}    \
         ${snmp_config_path}  \
         ${resmoke_wrapper}   \
-        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json --taskId=${task_id}
+        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/resmoke.py \
+          ${resmoke_args}                   \
+          $extra_args                       \
+          ${test_flags}                     \
+          --log=buildlogger                 \
+          --reportFile=report.json          \
+          --staggerJobs=on                  \
+          --tagFile=etc/test_lifecycle.yml  \
+          --taskId=${task_id}
 
 
   "do jepsen setup" :
@@ -584,9 +530,27 @@ functions:
         working_dir: src
         script: |
           set -o errexit
-          git clone git@github.com:10gen/jepsen.git
-          cd jepsen/jepsen
-          git checkout mongodb-master-linearizable-2
+
+          # Build libfaketime. A version of libfaketime at least as new as v0.9.6-9-g75896bd is
+          # required to use the FAKETIME_NO_CACHE and FAKETIME_TIMESTAMP_FILE environment variables.
+          git clone git@github.com:wolfcw/libfaketime.git
+          cd libfaketime
+          git checkout 3c0ce9c8859ed136a154b61da396deece94844e0
+          make PREFIX=$(pwd)/build/ LIBDIRNAME='.' install
+
+          # Add libfaketime to mongo-binaries.tgz so it gets uploaded to each of the LXC containers.
+          # The build/ prefix of the shared object will get removed when Jepsen extracts the tarball
+          # into the /opt/mongodb/ directory.
+          gzip --stdout --decompress ../mongo-binaries.tgz > mongo-binaries.tar
+          tar --append --file=mongo-binaries.tar build/libfaketime.so.1
+          gzip --stdout mongo-binaries.tar > ../mongo-binaries.tgz
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          git clone --branch=jepsen-mongodb-master --depth=1 git@github.com:10gen/jepsen.git jepsen-mongodb
+          cd jepsen-mongodb
           branch=$(git symbolic-ref --short HEAD)
           commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
           echo "Git branch: $branch, commit: $commit"
@@ -640,11 +604,24 @@ functions:
       type: test
       timeout_secs: 2700 # Timeout test if there is no output for more than 45 minutes.
       params:
-        working_dir: src/jepsen/mongodb
+        working_dir: src/jepsen-mongodb
         script: |
           set -o verbose
           start_time=$(date +%s)
-          lein run --tarball "file:///root/mongo-binaries.tgz" ${jepsen_key_time_limit} ${jepsen_protocol_version} ${jepsen_read_concern} ${jepsen_read_with_find_and_modify} ${jepsen_storage_engine} ${jepsen_time_limit} ${jepsen_write_concern} 2>&1 | tee jepsen_${task_name}_${execution}.log
+          lein run test --test ${jepsen_test_name}                        \
+                        --tarball "file:///root/mongo-binaries.tgz"       \
+                        --ssh-private-key ~/.ssh/id_rsa_lxc               \
+                        --clock-skew faketime                             \
+                        --libfaketime-path /opt/mongodb/libfaketime.so.1  \
+                        ${jepsen_key_time_limit}                          \
+                        ${jepsen_protocol_version}                        \
+                        ${jepsen_read_concern}                            \
+                        ${jepsen_read_with_find_and_modify}               \
+                        ${jepsen_storage_engine}                          \
+                        ${jepsen_time_limit}                              \
+                        ${jepsen_write_concern}                           \
+                        2>&1                                              \
+          | tee jepsen_${task_name}_${execution}.log
           end_time=$(date +%s)
           elapsed_secs=$((end_time-start_time))
           # Since we cannot use PIPESTATUS to get the exit code from the "lein run ..." pipe in dash shell,
@@ -671,7 +648,7 @@ functions:
           exit $exit_code
     - command: shell.exec
       params:
-        working_dir: src/jepsen/mongodb
+        working_dir: src/jepsen-mongodb
         script: |
           set -o verbose
           # Jepsen system failure if file exists.
@@ -787,8 +764,8 @@ functions:
       silent: true
       script: |
         process_kill_list="(^cl\.exe$|bsondump|java|lein|lldb|mongo|python|_test$|_test\.exe$)"
-        # Exclude Evergreen agent processes
-        process_exclude_list="(main)"
+        # Exclude Evergreen agent processes and other system daemons
+        process_exclude_list="(main|tuned)"
 
         if [ "Windows_NT" = "$OS" ]; then
           # Get the list of Windows tasks (tasklist list format):
@@ -807,18 +784,10 @@ functions:
           # - The first column has the process ID
           # - The second column (and beyond) has task name
 
-          # There are 2 "styles" of pgrep, figure out which one works
-          pgrep_list_full=$(pgrep -f --list-full ".*" 2>&1 > /dev/null)
-          if [ -z "$pgrep_list_full" ]; then
-            pgrep_list=$(pgrep -f --list-full "$process_kill_list")
-          else
-            pgrep_list=$(pgrep -f -l "$process_kill_list")
-          fi
-
           # There are 2 "styles" of grep, figure out which one works
           grep=grep
-          grep_extended=$(echo "a" | $grep -E "(a)" 2>&1 > /dev/null)
-          if [ ! -z "$grep_extended" ]; then
+          echo "a" | $grep -qE "(a)" > /dev/null 2>&1
+          if [ $? -ne 0 ]; then
             # Extended grep on Solaris is in the following location
             grep=/usr/xpg4/bin/grep
             if [ ! -f $grep ]; then
@@ -827,9 +796,20 @@ functions:
             fi
           fi
 
+          # There are 2 "styles" of pgrep, figure out which one works.
+          # Due to https://bugs.launchpad.net/ubuntu/+source/procps/+bug/1501916
+          # we cannot rely on the return status ($?) to detect if the option is supported.
+          pgrep -f --list-full ".*" 2>&1 | $grep -qE "(illegal|invalid|unrecognized) option"
+          if [ $? -ne 0 ]; then
+            pgrep_list=$(pgrep -f --list-full "$process_kill_list")
+          else
+            pgrep_list=$(pgrep -f -l "$process_kill_list")
+          fi
+
           # Since a process name might have a CR or LF in it, we need to delete any lines from
           # pgrep which do not start with space(s) and 1 digit and trim any leading spaces.
-          processes=$(echo "$pgrep_list" | $grep -i -v -E "$process_exclude_list" | sed -e '/^ *[0-9]/!d; s/^ *//; s/[[:cntrl:]]//g;')
+          processes=$(echo "$pgrep_list" | $grep -ivE "$process_exclude_list" | sed -e '/^ *[0-9]/!d; s/^ *//; s/[[:cntrl:]]//g;')
+
           # Kill the Unix process ID with signal KILL (9)
           kill_process () { pid=$(echo $1 | cut -f1 -d ' '); echo "Killing process $1"; kill -9 $pid; }
         fi
@@ -1075,7 +1055,7 @@ post:
   - command: archive.targz_pack
     params:
       target: "src/jepsen-results.tgz"
-      source_dir: "src/jepsen/mongodb/store"
+      source_dir: "src/jepsen-mongodb/store"
       include:
         - "./**"
   - command: s3.put
@@ -1239,6 +1219,15 @@ tasks:
             ${python|/opt/mongodbtoolchain/v2/bin/python2} ${packager_script} --prefix `pwd`/.. --distros ${packager_distro} --tarball `pwd`/../mongodb-binaries.tgz -s ${version} -m HEAD -a ${packager_arch}
             cd ..
           fi
+
+          # Create separate shell archive
+          mkdir -p shell-archive/build
+          cd shell-archive
+          ${platform_decompress|tar xzvf} ../mongodb-binaries.tgz
+          find . -mindepth 3 ! -name "mongo${exe}" -type f -exec rm {} \; # delete bin/* except bin/mongo
+          ${python|/opt/mongodbtoolchain/v2/bin/python2} ../buildscripts/make_archive.py -o mongodb-shell.${ext|tgz} $(find mongodb-* -type f)
+          cd ..
+
     - command: archive.targz_pack
       params:
         target: "artifacts.tgz"
@@ -1260,11 +1249,13 @@ tasks:
           - "./**.msi"
           - "./etc/*san.suppressions"
           - "./etc/repo_config.yaml"
+          - "./etc/test_lifecycle.yml"
           - "./build/integration_tests/**"
           - "./build/integration_tests.txt"
           - "./build/**.gcno"
           - "repo/**"
           - "src/mongo/util/options_parser/test_config_files/**"
+          - "library_dependency_graph.json"
         exclude_files:
           - "*_test.pdb"
     - func: "upload debugsymbols"
@@ -1278,6 +1269,16 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
         display_name: Binaries
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/shell-archive/mongodb-shell.${ext|tgz}
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/binaries/mongo-shell-${build_id}.${ext|tgz}
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: Shell
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -1328,6 +1329,18 @@ tasks:
 
           ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" all ${additional_targets|} MONGO_VERSION=${version}
 
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/library_dependency_graph.json
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/library_dependency_graph.${build_id}.json
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/json
+        display_name: Library Dependency Graph (library_dependency_graph.json)
+        build_variants: [enterprise-ubuntu-dynamic-1604-64-bit]
+
     # Run the C++ unittests as part of compile_all. The compiled binaries are automatically
     # installed into the top-level directory by SCons.
     - func: "run tests"
@@ -1365,9 +1378,8 @@ tasks:
       resmoke_args: --repeat=2
       run_multiple_jobs: true
 
-## jepsen WT ##
 - <<: *run_jepsen_template
-  name: jepsen_findAndModify_WT
+  name: jepsen_register_findAndModify_WT
   commands:
   - func: "do setup"
   - func: "do jepsen setup"
@@ -1377,9 +1389,36 @@ tasks:
       hang_analyzer_processes: "java"
       jepsen_read_with_find_and_modify: --read-with-find-and-modify
       jepsen_storage_engine: --storage-engine wiredTiger
+      jepsen_test_name: register
 
 - <<: *run_jepsen_template
-  name: jepsen_linearizableRead
+  name: jepsen_register_findAndModify_pv0
+  commands:
+  - func: "do setup"
+  - func: "do jepsen setup"
+  - func: "run jepsen test"
+    vars:
+      <<: *jepsen_config_vars
+      jepsen_protocol_version: --protocol-version 0
+      jepsen_read_with_find_and_modify: --read-with-find-and-modify
+      jepsen_storage_engine: --storage-engine mmapv1
+      jepsen_test_name: register
+
+- <<: *run_jepsen_template
+  name: jepsen_register_findAndModify_pv0_WT
+  commands:
+  - func: "do setup"
+  - func: "do jepsen setup"
+  - func: "run jepsen test"
+    vars:
+      <<: *jepsen_config_vars
+      jepsen_protocol_version: --protocol-version 0
+      jepsen_read_with_find_and_modify: --read-with-find-and-modify
+      jepsen_storage_engine: --storage-engine wiredTiger
+      jepsen_test_name: register
+
+- <<: *run_jepsen_template
+  name: jepsen_register_linearizableRead
   commands:
   - func: "do setup"
   - func: "do jepsen setup"
@@ -1389,9 +1428,13 @@ tasks:
       hang_analyzer_processes: "java"
       jepsen_read_concern: --read-concern linearizable
       jepsen_storage_engine: --storage-engine mmapv1
+      jepsen_test_name: register
+      # Running Jepsen when using the MMAPv1 storage engine for longer periods of time can lead to
+      # out of memory issues and task timeouts during the analysis phase.
+      jepsen_time_limit: --time-limit 300
 
 - <<: *run_jepsen_template
-  name: jepsen_linearizableRead_WT
+  name: jepsen_register_linearizableRead_WT
   commands:
   - func: "do setup"
   - func: "do jepsen setup"
@@ -1401,6 +1444,34 @@ tasks:
       hang_analyzer_processes: "java"
       jepsen_read_concern: --read-concern linearizable
       jepsen_storage_engine: --storage-engine wiredTiger
+      jepsen_test_name: register
+
+- <<: *run_jepsen_template
+  name: jepsen_set_linearizableRead
+  commands:
+  - func: "do setup"
+  - func: "do jepsen setup"
+  - func: "run jepsen test"
+    vars:
+      <<: *jepsen_config_vars
+      jepsen_read_concern: --read-concern linearizable
+      jepsen_storage_engine: --storage-engine mmapv1
+      jepsen_test_name: set
+      # Running Jepsen when using the MMAPv1 storage engine for longer periods of time can lead to
+      # out of memory issues and task timeouts during the analysis phase.
+      jepsen_time_limit: --time-limit 300
+
+- <<: *run_jepsen_template
+  name: jepsen_set_linearizableRead_WT
+  commands:
+  - func: "do setup"
+  - func: "do jepsen setup"
+  - func: "run jepsen test"
+    vars:
+      <<: *jepsen_config_vars
+      jepsen_read_concern: --read-concern linearizable
+      jepsen_storage_engine: --storage-engine wiredTiger
+      jepsen_test_name: set
 
 ## jstestfuzz mmapv1 ##
 - <<: *jstestfuzz_template
@@ -2925,6 +2996,13 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/binaries/mongo-shell-${build_id}.${ext|tgz}
+        bucket: mciuploads
+        local_file: src/mongo-shell.tgz
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
         remote_file: mongodb-mongo-master/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
         bucket: mciuploads
         local_file: src/distsrc.${ext|tgz}
@@ -2966,18 +3044,11 @@ tasks:
           set -o errexit
           set -o verbose
 
-          mv mongo-binaries.tgz mongodb-binaries.${ext|tgz}
-          mv mongo-debugsymbols.tgz debugsymbols-*.${ext|tgz} || true
-          cp mongodb-*.${ext|tgz} mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}
-          cp debugsymbols-*.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} || true
+          mv mongo-binaries.tgz mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          mv mongo-shell.tgz mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          mv mongo-debugsymbols.tgz mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} || true
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-win32-${push_arch}-${suffix}.msi || true
-
-          # Extract shell and banner files out of scons-made archive for separate shell archive
-          ${platform_decompress|tar --wildcards -zxvf} mongodb-binaries.${ext|tgz} mongodb-*/bin/mongo${exe} mongodb-*/\[A-Z\]*
-
-          # Create new shell archive (make_archive.py uses filename to determine what format archive to create)
-          ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/make_archive.py -o mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} $(ls -d mongodb-*/bin/mongo${exe} mongodb-*/[A-Z]*)
 
           /usr/local/bin/notary-client.py --key-name "server-3.4" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
@@ -3025,12 +3096,12 @@ tasks:
       params:
         aws_secret: ${aws_secret}
         aws_key: ${aws_key}
-        build_variants: *debug_symbol_variants
         permissions: public-read
         local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}
         bucket: build-push-testing
         content_type: ${content_type|application/x-gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}
+        optional: true
 
     # Put the binaries tarball signature
     - command: s3.put
@@ -3042,6 +3113,7 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig
+
     # Put the shell tarball signature
     - command: s3.put
       params:
@@ -3052,7 +3124,6 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig
-
 
     # Put the source tarball signature
     - command: s3.put
@@ -3071,12 +3142,12 @@ tasks:
       params:
         aws_secret: ${aws_secret}
         aws_key: ${aws_key}
-        build_variants: *debug_symbol_variants
         permissions: public-read
         local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sig
         bucket: build-push-testing
         content_type: ${content_type|application/x-gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sig
+        optional: true
 
     # Put the signed MSI file
     - command: s3.put
@@ -3100,6 +3171,7 @@ tasks:
         bucket: build-push-testing
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
+
     # Put the shell tarball sha1
     - command: s3.put
       params:
@@ -3128,12 +3200,12 @@ tasks:
       params:
         aws_secret: ${aws_secret}
         aws_key: ${aws_key}
-        build_variants: *debug_symbol_variants
         permissions: public-read
         local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha1
         bucket: build-push-testing
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha1
+        optional: true
 
     # Push the signed MSI sha1
     - command: s3.put
@@ -3157,6 +3229,7 @@ tasks:
         bucket: build-push-testing
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
+
     # Put the shell tarball sha256
     - command: s3.put
       params:
@@ -3184,13 +3257,13 @@ tasks:
     - command: s3.put
       params:
         aws_secret: ${aws_secret}
-        build_variants: *debug_symbol_variants
         local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha256
         aws_key: ${aws_key}
         bucket: build-push-testing
         permissions: public-read
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha256
+        optional: true
 
     # Put the signed MSI sha256
     - command: s3.put
@@ -3214,6 +3287,7 @@ tasks:
         permissions: public-read
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
+
     # Put the shell tarball md5
     - command: s3.put
       params:
@@ -3242,12 +3316,12 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        build_variants: *debug_symbol_variants
         local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.md5
         bucket: build-push-testing
         content_type: text/plain
         permissions: public-read
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.md5
+        optional: true
 
     # Put the signed MSI md5
     - command: s3.put
@@ -3277,19 +3351,12 @@ tasks:
             #Source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'linux-64', 'windows-64-2k8' ]
-            }
-
-            #Debug Symbols
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'},
-               'build_variants': *debug_symbol_variants
-              }
+               'build_variants': [ 'linux-64', 'windows-64-2k8' ]}
 
             #MSI (Windows only)
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl' ] }
+               'build_variants': [ 'enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl' ]}
 
             #Binaries Signature
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
@@ -3299,17 +3366,10 @@ tasks:
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'}}
 
-            #Debug Symbols Signature
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'},
-               'build_variants': *debug_symbol_variants
-              }
-
             #Source tarball signature
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sig', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sig', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'linux-64', 'windows-64-2k8' ]
-            }
+               'build_variants': [ 'linux-64', 'windows-64-2k8' ]}
 
             #SHA1 for binaries
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
@@ -3322,19 +3382,12 @@ tasks:
             #SHA1 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha1', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sha1', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'linux-64', 'windows-64-2k8' ]
-            }
-
-            #SHA1 for debug symbols
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'},
-               'build_variants': *debug_symbol_variants
-              }
+               'build_variants': [ 'linux-64', 'windows-64-2k8' ]}
 
             #SHA1 for MSI
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.sha1', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.sha1', 'bucket': '${push_bucket}'},
-               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl'] }
+               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl']}
 
             #SHA256 for binaries
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
@@ -3347,19 +3400,12 @@ tasks:
             #SHA256 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha256', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sha256', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'linux-64', 'windows-64-2k8' ]
-            }
-
-            #SHA256 for debugsymbols
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'},
-               'build_variants': *debug_symbol_variants}
+               'build_variants': [ 'linux-64', 'windows-64-2k8' ]}
 
             #SHA256 for MSI files
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.sha256', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.sha256', 'bucket': '${push_bucket}'},
-               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl'], }
-
+               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl']}
 
             #MD5 for binaries
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
@@ -3372,19 +3418,39 @@ tasks:
             #MD5 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.md5', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.md5', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'linux-64', 'windows-64-2k8' ]
-            }
-
-            #MD5 for debugsymbols
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'},
-               'build_variants': *debug_symbol_variants
-                }
+               'build_variants': [ 'linux-64', 'windows-64-2k8' ]}
 
             #MD5 for MSIs
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.md5', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.md5', 'bucket': '${push_bucket}'},
                'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl'], }
+
+    # Debug symbols are not created for all variants and the copy is optional.
+    - command: s3Copy.copy
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        optional: true
+        s3_copy_files:
+            #Debug Symbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
+
+            #Debug Symbols Signature
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'}}
+
+            #SHA1 for debug symbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
+
+            #SHA256 for debugsymbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'}}
+
+            #MD5 for debugsymbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
 
 
 #######################################
@@ -3995,13 +4061,25 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: jepsen_findAndModify_WT
+  - name: jepsen_register_findAndModify_WT
     distros:
     - ubuntu1404-jepsen
-  - name: jepsen_linearizableRead
+  - name: jepsen_register_findAndModify_pv0
     distros:
     - ubuntu1404-jepsen
-  - name: jepsen_linearizableRead_WT
+  - name: jepsen_register_findAndModify_pv0_WT
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_register_linearizableRead
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_register_linearizableRead_WT
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_set_linearizableRead
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_set_linearizableRead_WT
     distros:
     - ubuntu1404-jepsen
   - name: jsCore
@@ -4782,242 +4860,6 @@ buildvariants:
 #         Windows buildvariants           #
 ###########################################
 
-- name: windows-64
-  display_name: Windows Vista
-  run_on:
-  - windows-64-vs2015-small
-  batchtime: 1440 # 1 day
-  expansions:
-    platform_decompress: unzip
-    exe: ".exe"
-    push_path: win32
-    push_bucket: downloads.mongodb.org
-    push_name: win32
-    push_arch: x86_64
-    msi_target: msi
-    content_type: application/zip
-    compile_flags: --release -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 ))
-    python: python
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    ext: zip
-    use_scons_cache: true
-  tasks:
-  - name: compile
-    distros:
-    - windows-64-vs2015-large
-  - name: compile_all
-    distros:
-    - windows-64-vs2015-large
-  - name: aggregation
-  - name: aggregation_WT
-  - name: auth
-  - name: auth_WT
-  - name: dbtest
-  - name: dbtest_WT
-  - name: disk
-  - name: disk_WT
-  - name: durability
-  - name: failpoints
-  - name: gle_auth
-  - name: gle_auth_WT
-  - name: gle_auth_write_cmd
-  - name: gle_auth_write_cmd_WT
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_WT
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: jsCore
-  - name: jsCore_WT
-  - name: jsCore_compatibility
-  - name: jsCore_compatibility_WT
-  - name: jsCore_decimal
-  - name: jsCore_decimal_WT
-  - name: jstestfuzz
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_WT
-  - name: mmap
-  - name: mongosTest
-  - name: noPassthrough
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
-  - name: parallel
-  - name: parallel_WT
-  - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_WT
-  - name: replica_sets
-  - name: replica_sets_WT
-  - name: replica_sets_jscore_passthrough
-  - name: replica_sets_jscore_passthrough_WT
-  - name: master_slave
-  - name: master_slave_WT
-  - name: master_slave_jscore_passthrough
-  - name: master_slave_jscore_passthrough_WT
-  - name: sharding
-  - name: sharding_WT
-  - name: slow1
-  - name: slow1_WT
-  - name: serial_run
-  - name: serial_run_WT
-  - name: sharded_collections_jscore_passthrough
-  - name: sharded_collections_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough_wire_ops_WT
-  - name: tool
-  - name: tool_WT
-  - name: push
-    distros:
-    - rhel70-small
-
-- name: windows-64-2k8
-  display_name: Windows 2008R2
-  run_on:
-  - windows-64-vs2015-small
-  batchtime: 1440 # 1 day
-  expansions:
-    platform_decompress: unzip
-    exe: ".exe"
-    push_path: win32
-    push_bucket: downloads.mongodb.org
-    push_name: win32
-    push_arch: x86_64-2008plus
-    multiversion_platform_arch: "windows/x86_64-2008plus"
-    msi_target: msi
-    content_type: application/zip
-    compile_flags: --release --win-version-min=ws08r2 -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) MONGO_DISTMOD=2008plus
-    python: python
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    ext: zip
-    use_scons_cache: true
-  tasks:
-  - name: compile
-    distros:
-    - windows-64-vs2015-large
-  - name: compile_all
-    distros:
-    - windows-64-vs2015-large
-  - name: aggregation
-  - name: aggregation_WT
-  - name: aggregation_read_concern_majority_passthrough_WT
-  - name: aggregation_sharded_collections_passthrough_WT
-  - name: auth
-  - name: auth_WT
-  - name: dbtest
-  - name: dbtest_WT
-  - name: disk
-  - name: disk_WT
-  - name: durability
-  - name: failpoints
-  - name: gle_auth
-  - name: gle_auth_WT
-  - name: gle_auth_write_cmd
-  - name: gle_auth_write_cmd_WT
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_WT
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: jsCore
-  - name: jsCore_WT
-  - name: jsCore_compatibility
-  - name: jsCore_compatibility_WT
-  - name: jsCore_compression
-  - name: jsCore_decimal
-  - name: jsCore_decimal_WT
-  - name: jstestfuzz
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_WT
-  - name: mmap
-  - name: mongosTest
-  - name: multiversion
-  - name: multiversion_auth
-  - name: multiversion_WT
-  - name: multiversion_multistorage_engine
-  - name: noPassthrough
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
-  - name: parallel
-  - name: parallel_WT
-  - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_WT
-  - name: read_concern_linearizable_passthrough
-  - name: read_concern_linearizable_passthrough_WT
-  - name: read_concern_majority_passthrough_WT
-  - name: replica_sets
-  - name: replica_sets_WT
-  - name: replica_sets_compression
-  - name: replica_sets_jscore_passthrough
-  - name: replica_sets_jscore_passthrough_WT
-  - name: master_slave
-  - name: master_slave_WT
-  - name: master_slave_jscore_passthrough
-  - name: master_slave_jscore_passthrough_WT
-  - name: sharding
-  - name: sharding_WT
-  - name: sharding_compression
-  - name: slow1
-  - name: slow1_WT
-  - name: serial_run
-  - name: serial_run_WT
-  - name: sharded_collections_jscore_passthrough
-  - name: sharded_collections_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough_wire_ops_WT
-  - name: sharding_last_stable_mongos_and_mixed_shards
-  - name: tool
-  - name: tool_WT
-  - name: push
-    distros:
-    - rhel70-small
-
 - name: windows-64-2k8-debug
   display_name: "! Windows 2008R2 DEBUG"
   run_on:
@@ -5166,8 +5008,8 @@ buildvariants:
   - name: tool
   - name: tool_WT
 
-- name: enterprise-windows-64
-  display_name: "* Enterprise Windows"
+- name: enterprise-windows-64-2k8
+  display_name: "* Enterprise Windows 2008R2"
   modules:
   - enterprise
   run_on:
@@ -5236,8 +5078,8 @@ buildvariants:
     distros:
     - rhel70-small
 
-- name: enterprise-windows-64-inmem
-  display_name: Enterprise Windows (inMemory)
+- name: enterprise-windows-64-2k8-inmem
+  display_name: Enterprise Windows 2008R2 (inMemory)
   modules:
   - enterprise
   run_on:
@@ -5313,6 +5155,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: win32
     push_arch: x86_64-2008plus-ssl
+    multiversion_platform_arch: windows/x86_64-2008plus-ssl
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=2008plus-ssl CPPPATH="c:/openssl/include" LIBPATH="c:/openssl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
@@ -5329,18 +5172,39 @@ buildvariants:
     - windows-64-vs2015-large
   - name: aggregation
   - name: aggregation_WT
+  - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_sharded_collections_passthrough_WT
   - name: auth
   - name: auth_WT
+  - name: bulk_gle_passthrough
+  - name: bulk_gle_passthrough_WT
+  - name: concurrency
+  - name: concurrency_WT
+  - name: concurrency_replication
+  - name: concurrency_replication_WT
+  - name: concurrency_sharded
+  - name: concurrency_sharded_WT
+  - name: concurrency_simultaneous
+  - name: concurrency_simultaneous_WT
   - name: dbtest
   - name: dbtest_WT
   - name: disk
   - name: disk_WT
   - name: durability
   - name: failpoints
+  - name: gle_auth
+  - name: gle_auth_WT
+  - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_WT
+  - name: gle_auth_basics_passthrough_write_cmd
+  - name: gle_auth_basics_passthrough_write_cmd_WT
+  - name: gle_auth_write_cmd
+  - name: gle_auth_write_cmd_WT
   - name: jsCore
   - name: jsCore_WT
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
+  - name: jsCore_compression
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
   - name: jstestfuzz
@@ -5355,49 +5219,53 @@ buildvariants:
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
-  - name: mmap
-  - name: mongosTest
-  - name: noPassthrough
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
-  - name: parallel
-  - name: parallel_WT
-  - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_WT
-  - name: replica_sets
-  - name: replica_sets_WT
-  - name: replica_sets_jscore_passthrough
-  - name: replica_sets_jscore_passthrough_WT
   - name: master_slave
   - name: master_slave_WT
   - name: master_slave_jscore_passthrough
   - name: master_slave_jscore_passthrough_WT
-  - name: sharding
-  - name: sharding_WT
-  - name: slow1
-  - name: slow1_WT
+  - name: mmap
+  - name: mongosTest
+  - name: multiversion
+  - name: multiversion_WT
+  - name: multiversion_auth
+  - name: multiversion_multistorage_engine
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: noPassthroughWithMongod_WT
+  - name: noPassthrough_WT
+  - name: parallel
+  - name: parallel_WT
+  - name: parallel_compatibility
+  - name: parallel_compatibility_WT
+  - name: read_concern_linearizable_passthrough
+  - name: read_concern_linearizable_passthrough_WT
+  - name: read_concern_majority_passthrough_WT
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_compression
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
   - name: serial_run
   - name: serial_run_WT
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
+  - name: sharding
+  - name: sharding_WT
+  - name: sharding_compression
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_WT
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
-  - name: tool
-  - name: tool_WT
+  - name: sharding_last_stable_mongos_and_mixed_shards
+  - name: slow1
+  - name: slow1_WT
   - name: ssl
   - name: sslSpecial
+  - name: tool
+  - name: tool_WT
   - name: push
     distros:
     - rhel70-small
@@ -5434,111 +5302,8 @@ buildvariants:
 #             OSX buildvariants           #
 ###########################################
 
-- name: osx-107
-  display_name: OS X 10.7
-  run_on:
-  - osx-1010
-  batchtime: 1440 # 1 day
-  expansions:
-    push_path: osx
-    push_bucket: downloads.mongodb.org
-    push_name: osx
-    push_arch: x86_64
-    compile_flags: --allocator=system -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
-    python: python2.7
-    num_jobs_available: 1
-    build_mongoreplay: true
-  tasks:
-  - name: compile
-  - name: compile_all
-  - name: aggregation
-  - name: aggregation_WT
-  - name: auth
-  - name: auth_WT
-  - name: dbtest
-  - name: dbtest_WT
-  - name: disk
-  - name: disk_WT
-  - name: durability
-  - name: failpoints
-  - name: gle_auth
-  - name: gle_auth_WT
-  - name: gle_auth_write_cmd
-  - name: gle_auth_write_cmd_WT
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_WT
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: httpinterface
-  - name: jsCore
-  - name: jsCore_WT
-  - name: jsCore_compatibility
-  - name: jsCore_compatibility_WT
-  - name: jsCore_compression
-  - name: jsCore_decimal
-  - name: jsCore_decimal_WT
-  - name: jstestfuzz
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_WT
-  - name: mmap
-  - name: mongosTest
-  - name: noPassthrough
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
-  - name: parallel
-  - name: parallel_WT
-  - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_WT
-  - name: replica_sets
-  - name: replica_sets_WT
-  - name: replica_sets_compression
-  - name: replica_sets_jscore_passthrough
-  - name: replica_sets_jscore_passthrough_WT
-  - name: master_slave
-  - name: master_slave_WT
-  - name: master_slave_jscore_passthrough
-  - name: master_slave_jscore_passthrough_WT
-  - name: slow1
-  - name: slow1_WT
-  - name: serial_run
-  - name: serial_run_WT
-  - name: sharded_collections_jscore_passthrough
-  - name: sharded_collections_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough_wire_ops_WT
-  - name: tool
-  - name: tool_WT
-  - name: push
-    distros:
-    - rhel70-small
-
-- name: osx-107-ssl
-  display_name: SSL OS X 10.7
+- name: osx-1010-ssl
+  display_name: SSL OS X 10.10
   run_on:
   - osx-1010
   batchtime: 1440 # 1 day
@@ -5561,6 +5326,16 @@ buildvariants:
   - name: aggregation_sharded_collections_passthrough_WT
   - name: auth
   - name: auth_WT
+  - name: bulk_gle_passthrough
+  - name: bulk_gle_passthrough_WT
+  - name: concurrency
+  - name: concurrency_WT
+  - name: concurrency_replication
+  - name: concurrency_replication_WT
+  - name: concurrency_sharded
+  - name: concurrency_sharded_WT
+  - name: concurrency_simultaneous
+  - name: concurrency_simultaneous_WT
   - name: dbtest
   - name: dbtest_WT
   - name: disk
@@ -5569,20 +5344,18 @@ buildvariants:
   - name: failpoints
   - name: gle_auth
   - name: gle_auth_WT
-  - name: gle_auth_write_cmd
-  - name: gle_auth_write_cmd_WT
   - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_WT
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  - name: gle_auth_write_cmd
+  - name: gle_auth_write_cmd_WT
+  - name: httpinterface
   - name: jsCore
   - name: jsCore_WT
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
+  - name: jsCore_compression
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
   - name: jstestfuzz
@@ -5597,42 +5370,40 @@ buildvariants:
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
-  - name: mmap
-  - name: mongosTest
-  - name: noPassthrough
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
-  - name: parallel
-  - name: parallel_WT
-  - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_WT
-  - name: read_concern_majority_passthrough_WT
-  - name: replica_sets
-  - name: replica_sets_WT
-  - name: replica_sets_jscore_passthrough
-  - name: replica_sets_jscore_passthrough_WT
-  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
   - name: master_slave
   - name: master_slave_WT
   - name: master_slave_jscore_passthrough
   - name: master_slave_jscore_passthrough_WT
-  - name: slow1
-  - name: slow1_WT
+  - name: mmap
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: noPassthroughWithMongod_WT
+  - name: noPassthrough_WT
+  - name: parallel
+  - name: parallel_WT
+  - name: parallel_compatibility
+  - name: parallel_compatibility_WT
+  - name: read_concern_majority_passthrough_WT
+  - name: replica_sets
+  - name: replica_sets_WT
+  - name: replica_sets_compression
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
   - name: serial_run
   - name: serial_run_WT
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_WT
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_passthrough_wire_ops_WT
+  - name: slow1
+  - name: slow1_WT
   - name: ssl
   - name: sslSpecial
   - name: tool
@@ -5641,8 +5412,8 @@ buildvariants:
     distros:
     - rhel70-small
 
-- name: osx-107-debug
-  display_name: "* OS X 10.7 DEBUG"
+- name: osx-1010-debug
+  display_name: "* OS X 10.10 DEBUG"
   run_on:
   - osx-1010
   expansions:
@@ -5682,8 +5453,8 @@ buildvariants:
   - name: tool
   - name: tool_WT
 
-- name: enterprise-osx-107
-  display_name: Enterprise OS X 10.7
+- name: enterprise-osx-1010
+  display_name: Enterprise OS X 10.10
   modules:
   - enterprise
   run_on:
@@ -5987,8 +5758,7 @@ buildvariants:
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
-    rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
-    compile_flags: --dbg=on --gcov --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
+    compile_flags: --dbg=on --gcov --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     multiversion_platform_arch: "rhel62"
     multiversion_edition: "targeted"
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
@@ -6156,8 +5926,6 @@ buildvariants:
   - name: master_slave_auth
   - name: master_slave_jscore_passthrough
   - name: master_slave_jscore_passthrough_WT
-  - name: rlp
-  - name: rlp_WT
   - name: sasl
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
@@ -7056,13 +6824,25 @@ buildvariants:
   - name: dbtest
   - name: dbtest_WT
   - name: ese_WT
-  - name: jepsen_findAndModify_WT
+  - name: jepsen_register_findAndModify_WT
     distros:
     - ubuntu1404-jepsen
-  - name: jepsen_linearizableRead
+  - name: jepsen_register_findAndModify_pv0
     distros:
     - ubuntu1404-jepsen
-  - name: jepsen_linearizableRead_WT
+  - name: jepsen_register_findAndModify_pv0_WT
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_register_linearizableRead
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_register_linearizableRead_WT
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_set_linearizableRead
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_set_linearizableRead_WT
     distros:
     - ubuntu1404-jepsen
   - name: jsCore
@@ -8981,6 +8761,7 @@ buildvariants:
     use_scons_cache: true
     scons_cache_mode: all
     build_mongoreplay: true
+    additional_targets: dagger
   tasks:
   - name: compile
     distros:

@@ -315,7 +315,7 @@ void receivedQuery(OperationContext* opCtx,
         dbResponse.exhaustNS = runQuery(opCtx, q, nss, dbResponse.response);
     } catch (const AssertionException& e) {
         // If we got a stale config, wait in case the operation is stuck in a critical section
-        if (e.getCode() == ErrorCodes::SendStaleConfig) {
+        if (!opCtx->getClient()->isInDirectClient() && e.getCode() == ErrorCodes::SendStaleConfig) {
             auto& sce = static_cast<const StaleConfigException&>(e);
             ShardingState::get(opCtx)->onStaleShardVersion(
                 opCtx, NamespaceString(sce.getns()), sce.getVersionReceived());
@@ -628,7 +628,7 @@ void assembleResponse(OperationContext* opCtx,
         log() << debug.report(&c, currentOp, lockerInfo.stats);
     }
 
-    if (shouldSample && currentOp.shouldDBProfile()) {
+    if (currentOp.shouldDBProfile(shouldSample)) {
         // Performance profiling is on
         if (opCtx->lockState()->isReadLocked()) {
             LOG(1) << "note: not profiling because recursive read lock";

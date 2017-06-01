@@ -52,10 +52,6 @@ public:
 
     StorageInterfaceImpl();
     explicit StorageInterfaceImpl(const NamespaceString& minValidNss);
-    virtual ~StorageInterfaceImpl();
-
-    void startup() override;
-    void shutdown() override;
 
     /**
      * Returns namespace of collection containing the minvalid boundaries and initial sync flag.
@@ -120,6 +116,11 @@ public:
                                                      const BSONObj& startKey,
                                                      BoundInclusion boundInclusion,
                                                      std::size_t limit) override;
+
+    Status upsertById(OperationContext* opCtx,
+                      const NamespaceString& nss,
+                      const BSONElement& idKey,
+                      const BSONObj& update) override;
 
     StatusWith<StorageInterface::CollectionSize> getCollectionSize(
         OperationContext* opCtx, const NamespaceString& nss) override;

@@ -122,9 +122,6 @@ public:
 
     StorageInterfaceMock() = default;
 
-    void startup() override;
-    void shutdown() override;
-
     bool getInitialSyncFlag(OperationContext* opCtx) const override;
     void setInitialSyncFlag(OperationContext* opCtx) override;
     void clearInitialSyncFlag(OperationContext* opCtx) override;
@@ -200,6 +197,13 @@ public:
                                                      std::size_t limit) override {
         return deleteDocumentsFn(
             opCtx, nss, indexName, scanDirection, startKey, boundInclusion, limit);
+    }
+
+    Status upsertById(OperationContext* opCtx,
+                      const NamespaceString& nss,
+                      const BSONElement& idKey,
+                      const BSONObj& update) override {
+        return Status{ErrorCodes::IllegalOperation, "upsertbyId not implemented."};
     }
 
     StatusWith<StorageInterface::CollectionSize> getCollectionSize(

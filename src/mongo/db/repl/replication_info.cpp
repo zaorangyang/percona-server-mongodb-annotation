@@ -96,8 +96,8 @@ void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int 
         {
             const NamespaceString localSources{"local.sources"};
             AutoGetCollectionForReadCommand ctx(opCtx, localSources);
-            unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
-                opCtx, localSources.ns(), ctx.getCollection(), PlanExecutor::YIELD_MANUAL));
+            auto exec = InternalPlanner::collectionScan(
+                opCtx, localSources.ns(), ctx.getCollection(), PlanExecutor::NO_YIELD);
             BSONObj obj;
             PlanExecutor::ExecState state;
             while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
@@ -228,7 +228,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      BSONObj& cmdObj,
-                     int,
                      string& errmsg,
                      BSONObjBuilder& result) {
         /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
