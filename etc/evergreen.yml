@@ -54,13 +54,15 @@ variables:
       max_jobs: 0  # If set in combination with run_multiple_jobs, will cap the number of jobs used.
 
 - &jepsen_config_vars
-  hang_analyzer_processes: "java"
   jepsen_key_time_limit: --key-time-limit 15
   jepsen_protocol_version: --protocol-version 1
   jepsen_read_concern: ""
   jepsen_read_with_find_and_modify: ""
   jepsen_storage_engine: ""
-  jepsen_time_limit: --time-limit 300
+  jepsen_test_name: ""
+  # Empirically, we've had greater success in reproducing the issues found in MongoDB versions
+  # 3.4.0-rc3 and 3.4.0-rc4 when running Jepsen with at least --time-limit=600.
+  jepsen_time_limit: --time-limit 1200
   jepsen_write_concern: ""
 
 # Template for running Jepsen tests
@@ -389,10 +391,10 @@ functions:
             set -o igncr
         fi;
 
-        . ./${set_tools_gopath|set_gopath.sh}
-
         sed -i.bak "s/built-without-version-string/$(git describe)/" common/options/options.go
         sed -i.bak "s/built-without-git-spec/$(git rev-parse HEAD)/" common/options/options.go
+
+        . ./${set_tools_gopath|set_gopath.sh}
 
         build_tools="bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog"
 
@@ -511,6 +513,9 @@ functions:
         fi
         set -o errexit
 
+        # Combine the exclusion tags from both the variant and the task.
+        extra_args="$extra_args --excludeWithAnyTags=${task_excluded_tags},${variant_excluded_flags}"
+
         path_value="$PATH"
         if [ ${variant_path_suffix} ]; then
           path_value="$path_value:${variant_path_suffix}"
@@ -528,13 +533,35 @@ functions:
         working_dir: src
         script: |
           set -o errexit
-          git clone git@github.com:10gen/jepsen.git
-          cd jepsen
-          git checkout mongodb-master-linearizable-2
+
+          # Build libfaketime. A version of libfaketime at least as new as v0.9.6-9-g75896bd is
+          # required to use the FAKETIME_NO_CACHE and FAKETIME_TIMESTAMP_FILE environment variables.
+          # Additionally, a version of libfaketime containing the changes mentioned in SERVER-29336
+          # is required to avoid needing to use libfaketimeMT.so.1 and serializing all calls to
+          # fake_clock_gettime() with a mutex.
+          git clone --branch=for-jepsen --depth=1 git@github.com:10gen/libfaketime.git
+          cd libfaketime
           branch=$(git symbolic-ref --short HEAD)
           commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
           echo "Git branch: $branch, commit: $commit"
-          cd jepsen
+          make PREFIX=$(pwd)/build/ LIBDIRNAME='.' install
+
+          # Add libfaketime to mongo-binaries.tgz so it gets uploaded to each of the LXC containers.
+          # The build/ prefix of the shared object will get removed when Jepsen extracts the tarball
+          # into the /opt/mongodb/ directory.
+          gzip --stdout --decompress ../mongo-binaries.tgz > mongo-binaries.tar
+          tar --append --file=mongo-binaries.tar build/libfaketime.so.1
+          gzip --stdout mongo-binaries.tar > ../mongo-binaries.tgz
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          git clone --branch=jepsen-mongodb-master --depth=1 git@github.com:10gen/jepsen.git jepsen-mongodb
+          cd jepsen-mongodb
+          branch=$(git symbolic-ref --short HEAD)
+          commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
+          echo "Git branch: $branch, commit: $commit"
           lein install
     - command: shell.exec
       params:
@@ -585,38 +612,54 @@ functions:
       type: test
       timeout_secs: 2700 # Timeout test if there is no output for more than 45 minutes.
       params:
-        working_dir: src/jepsen/mongodb
+        working_dir: src/jepsen-mongodb
         script: |
           set -o verbose
           start_time=$(date +%s)
-          lein run --tarball "file:///root/mongo-binaries.tgz" ${jepsen_key_time_limit} ${jepsen_protocol_version} ${jepsen_read_concern} ${jepsen_read_with_find_and_modify} ${jepsen_storage_engine} ${jepsen_time_limit} ${jepsen_write_concern} 2>&1 | tee jepsen_${task_name}_${execution}.log
+          lein run test --test ${jepsen_test_name}                        \
+                        --tarball "file:///root/mongo-binaries.tgz"       \
+                        --ssh-private-key ~/.ssh/id_rsa_lxc               \
+                        --clock-skew faketime                             \
+                        --libfaketime-path /opt/mongodb/libfaketime.so.1  \
+                        ${jepsen_key_time_limit}                          \
+                        ${jepsen_protocol_version}                        \
+                        ${jepsen_read_concern}                            \
+                        ${jepsen_read_with_find_and_modify}               \
+                        ${jepsen_storage_engine}                          \
+                        ${jepsen_time_limit}                              \
+                        ${jepsen_write_concern}                           \
+                        2>&1                                              \
+          | tee jepsen_${task_name}_${execution}.log
           end_time=$(date +%s)
           elapsed_secs=$((end_time-start_time))
           # Since we cannot use PIPESTATUS to get the exit code from the "lein run ..." pipe in dash shell,
-          # we will check the output for success, failure or setup error.
+          # we will check the output for success, failure or setup error. Note that 'grep' returns with exit code
+          # 0 if it finds a match, and exit code 1 if no match is found.
           grep -q "Everything looks good" jepsen_${task_name}_${execution}.log
-          exit_code=$?
-          if [ $exit_code -eq 0 ]; then
+          grep_exit_code=$?
+          if [ $grep_exit_code -eq 0 ]; then
             status='"pass"'
             failures=0
+            final_exit_code=0
           else
             grep -q "Analysis invalid" jepsen_${task_name}_${execution}.log
-            exit_code=$?
-            if [ $exit_code -eq 0 ]; then
+            grep_exit_code=$?
+            if [ $grep_exit_code -eq 0 ]; then
               status='"fail"'
               failures=1
+              final_exit_code=1
             else
               # If the failure is due to setup, then this is considered a system failure.
-              echo $exit_code > jepsen_system_failure_${task_name}_${execution}
+              echo $grep_exit_code > jepsen_system_failure_${task_name}_${execution}
               exit 0
             fi
           fi
           # Create report.json
-          echo "{\"failures\": $failures, \"results\": [{\"status\": $status, \"exit_code\": $exit_code, \"test_file\": \"${task_name}\", \"start\": $start_time, \"end\": $end_time, \"elapsed\": $elapsed_secs}]}" > ../../report.json
-          exit $exit_code
+          echo "{\"failures\": $failures, \"results\": [{\"status\": $status, \"exit_code\": $final_exit_code, \"test_file\": \"${task_name}\", \"start\": $start_time, \"end\": $end_time, \"elapsed\": $elapsed_secs}]}" > ../report.json
+          exit $final_exit_code
     - command: shell.exec
       params:
-        working_dir: src/jepsen/mongodb
+        working_dir: src/jepsen-mongodb
         script: |
           set -o verbose
           # Jepsen system failure if file exists.
@@ -716,7 +759,7 @@ functions:
         set -o errexit
         set -o verbose
 
-        rm -rf src /data/db/* mongo-diskstats* mongo-coredumps.tgz ~/.aws
+        rm -rf src /data/db/* mongo-diskstats* mongo-*.tgz ~/.aws
 
   "kill processes" :
     command: shell.exec
@@ -1013,7 +1056,7 @@ post:
   - command: archive.targz_pack
     params:
       target: "src/jepsen-results.tgz"
-      source_dir: "src/jepsen/mongodb/store"
+      source_dir: "src/jepsen-mongodb/store"
       include:
         - "./**"
   - command: s3.put
@@ -1046,6 +1089,25 @@ post:
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
       display_name: Core Dumps - Execution ${execution}
+      optional: true
+
+  # Gather and archive hang_analyzer debugger files.
+  - command: archive.targz_pack
+    params:
+      target: "src/mongo-hanganalyzer.tgz"
+      source_dir: "src"
+      include:
+        - "./debugger*.*"
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/mongo-hanganalyzer.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/hanganalyzer/mongo-hanganalyzer-${build_id}-${task_name}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Hang Analyzer Output - Execution ${execution}
       optional: true
 
   # Gather and archive disk statistics.
@@ -1090,10 +1152,17 @@ timeout:
       working_dir: src
       script: |
         set -o verbose
-        ${set_sudo}
-        $sudo hang_analyzer_option="-p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test} -g bsondump,mongodump,mongoexport,mongofiles,mongoimport,mongooplog,mongoreplay,mongorestore,mongostat,mongotop"
-        echo "Calling the hang analyzer: python buildscripts/hang_analyzer.py $hang_analyzer_option"
-        PATH=/opt/mongodbtoolchain/gdb/bin:$PATH python buildscripts/hang_analyzer.py $hang_analyzer_option
+
+        # We run the hang_analyzer.py script with root privileges when running the Jepsen tests in
+        # order to be able to attach to the mongod processes inside the LXC containers.
+        sudo=
+        if [ ${distro_id} = "ubuntu1404-jepsen" ]; then
+          ${set_sudo}
+        fi
+
+        hang_analyzer_option="-c -o file -o stdout -p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test} -g bsondump,mongodump,mongoexport,mongofiles,mongoimport,mongooplog,mongoreplay,mongorestore,mongostat,mongotop"
+        echo "Calling the hang analyzer: PATH=\"/opt/mongodbtoolchain/gdb/bin:$PATH\" $sudo python buildscripts/hang_analyzer.py $hang_analyzer_option"
+        PATH="/opt/mongodbtoolchain/gdb/bin:$PATH" $sudo python buildscripts/hang_analyzer.py $hang_analyzer_option
 
 #######################################
 #               Tasks                 #
@@ -1321,42 +1390,97 @@ tasks:
       resmoke_args: --repeat=2
       run_multiple_jobs: true
 
-## jepsen WT ##
 - <<: *run_jepsen_template
-  name: jepsen_findAndModify_WT
+  name: jepsen_register_findAndModify_WT
   commands:
   - func: "do setup"
   - func: "do jepsen setup"
   - func: "run jepsen test"
     vars:
       <<: *jepsen_config_vars
-      hang_analyzer_processes: "java"
       jepsen_read_with_find_and_modify: --read-with-find-and-modify
       jepsen_storage_engine: --storage-engine wiredTiger
+      jepsen_test_name: register
 
 - <<: *run_jepsen_template
-  name: jepsen_linearizableRead
+  name: jepsen_register_findAndModify_pv0
   commands:
   - func: "do setup"
   - func: "do jepsen setup"
   - func: "run jepsen test"
     vars:
       <<: *jepsen_config_vars
-      hang_analyzer_processes: "java"
+      jepsen_protocol_version: --protocol-version 0
+      jepsen_read_with_find_and_modify: --read-with-find-and-modify
+      jepsen_storage_engine: --storage-engine mmapv1
+      jepsen_test_name: register
+
+- <<: *run_jepsen_template
+  name: jepsen_register_findAndModify_pv0_WT
+  commands:
+  - func: "do setup"
+  - func: "do jepsen setup"
+  - func: "run jepsen test"
+    vars:
+      <<: *jepsen_config_vars
+      jepsen_protocol_version: --protocol-version 0
+      jepsen_read_with_find_and_modify: --read-with-find-and-modify
+      jepsen_storage_engine: --storage-engine wiredTiger
+      jepsen_test_name: register
+
+- <<: *run_jepsen_template
+  name: jepsen_register_linearizableRead
+  commands:
+  - func: "do setup"
+  - func: "do jepsen setup"
+  - func: "run jepsen test"
+    vars:
+      <<: *jepsen_config_vars
       jepsen_read_concern: --read-concern linearizable
       jepsen_storage_engine: --storage-engine mmapv1
+      jepsen_test_name: register
+      # Running Jepsen when using the MMAPv1 storage engine for longer periods of time can lead to
+      # out of memory issues and task timeouts during the analysis phase.
+      jepsen_time_limit: --time-limit 300
 
 - <<: *run_jepsen_template
-  name: jepsen_linearizableRead_WT
+  name: jepsen_register_linearizableRead_WT
   commands:
   - func: "do setup"
   - func: "do jepsen setup"
   - func: "run jepsen test"
     vars:
       <<: *jepsen_config_vars
-      hang_analyzer_processes: "java"
       jepsen_read_concern: --read-concern linearizable
       jepsen_storage_engine: --storage-engine wiredTiger
+      jepsen_test_name: register
+
+- <<: *run_jepsen_template
+  name: jepsen_set_linearizableRead
+  commands:
+  - func: "do setup"
+  - func: "do jepsen setup"
+  - func: "run jepsen test"
+    vars:
+      <<: *jepsen_config_vars
+      jepsen_read_concern: --read-concern linearizable
+      jepsen_storage_engine: --storage-engine mmapv1
+      jepsen_test_name: set
+      # Running Jepsen when using the MMAPv1 storage engine for longer periods of time can lead to
+      # out of memory issues and task timeouts during the analysis phase.
+      jepsen_time_limit: --time-limit 300
+
+- <<: *run_jepsen_template
+  name: jepsen_set_linearizableRead_WT
+  commands:
+  - func: "do setup"
+  - func: "do jepsen setup"
+  - func: "run jepsen test"
+    vars:
+      <<: *jepsen_config_vars
+      jepsen_read_concern: --read-concern linearizable
+      jepsen_storage_engine: --storage-engine wiredTiger
+      jepsen_test_name: set
 
 ## jstestfuzz mmapv1 ##
 - <<: *jstestfuzz_template
@@ -1440,6 +1564,58 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=jstestfuzz_replication --storageEngine=wiredTiger
+
+## jstestfuzz initial sync replica set mmapv1 ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_replication_initsync
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 75
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz_replication_initsync --storageEngine=mmapv1
+
+## jstestfuzz initial sync replica set WT ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_replication_initsync_WT
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 75
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz_replication_initsync --storageEngine=wiredTiger
+
+## jstestfuzz initial sync replica set mmapv1 ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_replication_resync
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 75
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz_replication_resync --storageEngine=mmapv1
+
+## jstestfuzz initial sync replica set WT ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_replication_resync_WT
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 75
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz_replication_resync --storageEngine=wiredTiger
 
 ## jstestfuzz sharded cluster mmapv1 ##
 - <<: *jstestfuzz_template
@@ -1532,6 +1708,7 @@ tasks:
     vars:
       resmoke_args: --suites=aggregation_facet_unwind_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
+      task_excluded_tags: do_not_wrap_aggregations_in_facets
 
 - <<: *task_template
   name: aggregation_read_concern_majority_passthrough_WT
@@ -1705,8 +1882,9 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=gle_auth --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
+      resmoke_args: --suites=gle_auth --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1 --excludeWithAnyTags=requires_find_command
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: gle_auth_WT
@@ -1714,8 +1892,9 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=gle_auth --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
+      resmoke_args: --suites=gle_auth --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: gle_auth_write_cmd
@@ -1741,8 +1920,9 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
+      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1 --excludeWithAnyTags=requires_find_command
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: gle_auth_basics_passthrough_WT
@@ -1750,8 +1930,9 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
+      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: gle_auth_basics_passthrough_write_cmd
@@ -1798,6 +1979,15 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: integration_tests_sharded
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=integration_tests_sharded
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: external_auth_WT
   commands:
   - func: "do setup"
@@ -1814,8 +2004,9 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
+      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1 --excludeWithAnyTags=requires_find_command
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: sharding_gle_auth_basics_passthrough_WT
@@ -1825,8 +2016,9 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
+      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: sharding_gle_auth_basics_passthrough_write_cmd
@@ -1896,8 +2088,9 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=mmapv1
+      resmoke_args: --suites=core --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=mmapv1 --excludeWithAnyTags=requires_find_command
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: jsCore_compatibility_WT
@@ -1907,8 +2100,9 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=wiredTiger
+      resmoke_args: --suites=core --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: jsCore_compression
@@ -2098,6 +2292,17 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: replica_sets_kill_secondaries_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_kill_secondaries_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: mongosTest
   commands:
   - func: "do setup"
@@ -2123,8 +2328,9 @@ tasks:
   - func: "run tests"
     vars:
       task_path_suffix: /data/multiversion
-      resmoke_args: --suites=multiversion --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger
+      resmoke_args: --suites=multiversion --storageEngine=mmapv1
       run_multiple_jobs: true
+      task_excluded_tags: requires_wiredtiger
 
 - <<: *task_template
   name: multiversion_auth
@@ -2145,8 +2351,9 @@ tasks:
   - func: "run tests"
     vars:
       task_path_suffix: /data/multiversion
-      resmoke_args: --suites=multiversion --storageEngine=wiredTiger --excludeWithAnyTags=requires_mmapv1
+      resmoke_args: --suites=multiversion --storageEngine=wiredTiger
       run_multiple_jobs: true
+      task_excluded_tags: requires_mmapv1
 
 - <<: *task_template
   name: multiversion_multistorage_engine
@@ -2301,8 +2508,9 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=sharding_jscore_passthrough --storageEngine=wiredTiger --shellReadMode=legacy --shellWriteMode=compatibility
+      resmoke_args: --suites=sharding_jscore_passthrough --storageEngine=wiredTiger --shellReadMode=legacy --shellWriteMode=compatibility --excludeWithAnyTags=requires_find_command
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: parallel
@@ -2333,6 +2541,7 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=parallel --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=mmapv1
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: parallel_compatibility_WT
@@ -2343,6 +2552,7 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=parallel --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=wiredTiger
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: concurrency
@@ -2590,8 +2800,9 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=sharding --shellReadMode=legacy --storageEngine=wiredTiger
+      resmoke_args: --suites=sharding --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
       run_multiple_jobs: true
+      task_excluded_tags: requires_find_command
 
 - <<: *task_template
   name: sharding_auth
@@ -2746,42 +2957,6 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=read_only_sharded --storageEngine=wiredTiger
-      run_multiple_jobs: true
-
-- <<: *task_template
-  name: views
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=views --storageEngine=mmapv1
-      run_multiple_jobs: true
-
-- <<: *task_template
-  name: views_WT
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=views --storageEngine=wiredTiger
-      run_multiple_jobs: true
-
-- <<: *task_template
-  name: views_rs
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=views_rs --storageEngine=mmapv1
-      run_multiple_jobs: true
-
-- <<: *task_template
-  name: views_rs_WT
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=views_rs --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - name: package
@@ -3337,6 +3512,7 @@ buildvariants:
   - name: httpinterface
   - name: integration_tests_standalone
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd
@@ -3415,10 +3591,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: push
 
 - name: linux-64-repeated-execution
@@ -3441,6 +3613,7 @@ buildvariants:
   - name: dbtest_WT
   - name: integration_tests_standalone
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: jsCore
   - name: jsCore_WT
   - name: parallel_WT
@@ -3455,21 +3628,19 @@ buildvariants:
 - name: linux-64-debug
   display_name: Linux DEBUG
   run_on:
-  - rhel62-small
+  - rhel62-large
   batchtime: 1440 # 1 day
   expansions:
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux-debug
     push_arch: x86_64
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 2)) # Avoid starting too many mongod's
     compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     use_scons_cache: true
     build_mongoreplay: true
   tasks:
   - name: compile
-    distros:
-    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
@@ -3503,31 +3674,13 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: concurrency
-    # Some concurrency workloads require a lot of memory, so we use machines
-    # with more RAM for these suites.
-    distros:
-    - rhel62-large
   - name: concurrency_WT
-    distros:
-    - rhel62-large
   - name: concurrency_replication
-    distros:
-    - rhel62-large
   - name: concurrency_replication_WT
-    distros:
-    - rhel62-large
   - name: concurrency_sharded
-    distros:
-    - rhel62-large
   - name: concurrency_sharded_WT
-    distros:
-    - rhel62-large
   - name: concurrency_simultaneous
-    distros:
-    - rhel62-large
   - name: concurrency_simultaneous_WT
-    distros:
-    - rhel62-large
   - name: read_concern_majority_passthrough_WT
   - name: replica_sets
   - name: replica_sets_WT
@@ -3555,10 +3708,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
 
 - name: linux-64-duroff
   display_name: Linux (No Journal)
@@ -3572,7 +3721,8 @@ buildvariants:
     push_arch: x86_64
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --nojournal --excludeWithAnyTags=requires_journaling
+    test_flags: --nojournal
+    variant_excluded_flags: requires_journaling
     use_scons_cache: true
     build_mongoreplay: true
   tasks:
@@ -3626,10 +3776,6 @@ buildvariants:
   - name: sharding_jscore_passthrough
   - name: tool
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
 
 - name: linux-64-lsm
   stepback: false
@@ -3685,8 +3831,6 @@ buildvariants:
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool_WT
   - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
 
 - name: ubuntu1204
   display_name: SSL Ubuntu 12.04
@@ -3801,10 +3945,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -3860,13 +4000,25 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: jepsen_findAndModify_WT
+  - name: jepsen_register_findAndModify_WT
     distros:
     - ubuntu1404-jepsen
-  - name: jepsen_linearizableRead
+  - name: jepsen_register_findAndModify_pv0
     distros:
     - ubuntu1404-jepsen
-  - name: jepsen_linearizableRead_WT
+  - name: jepsen_register_findAndModify_pv0_WT
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_register_linearizableRead
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_register_linearizableRead_WT
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_set_linearizableRead
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_set_linearizableRead_WT
     distros:
     - ubuntu1404-jepsen
   - name: jsCore
@@ -3932,10 +4084,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -4054,10 +4202,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -4080,7 +4224,7 @@ buildvariants:
     push_arch: arm64-enterprise-ubuntu1604
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    variant_excluded_flags: requires_mmapv1
     has_packages: true
     packager_script: packager-enterprise.py
     packager_arch: arm64
@@ -4167,7 +4311,7 @@ buildvariants:
     push_arch: arm64-ubuntu1604
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release CCFLAGS="-march=armv8-a+crc -mtune=generic" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    variant_excluded_flags: requires_mmapv1
     has_packages: true
     packager_script: packager.py
     packager_arch: arm64
@@ -4256,7 +4400,7 @@ buildvariants:
     push_arch: ppc64le-enterprise-ubuntu1604
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) --release CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: 2
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    variant_excluded_flags: requires_mmapv1
     has_packages: true
     packager_script: packager-enterprise.py
     packager_arch: ppc64le
@@ -4333,9 +4477,9 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: s390x-enterprise-ubuntu1604
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: 2
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    variant_excluded_flags: requires_mmapv1
     has_packages: true
     packager_script: packager-enterprise.py
     packager_arch: s390x
@@ -4369,6 +4513,7 @@ buildvariants:
   - name: gle_auth_write_cmd_WT
   - name: httpinterface
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
   - name: jsCore_WT
   - name: jsCore_WT_ese
@@ -4376,6 +4521,12 @@ buildvariants:
   - name: jsCore_compression
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
+  - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded_WT
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded_WT
   - name: mongosTest
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
@@ -4496,10 +4647,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -4621,10 +4768,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -4889,6 +5032,7 @@ buildvariants:
   - name: httpinterface
   - name: integration_tests_standalone
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: jsCore
   - name: jsCore_WT
   - name: jsCore_compatibility
@@ -4971,6 +5115,9 @@ buildvariants:
   - name: replica_sets_resync_static_jscore_passthrough_WT
     distros:
     - windows-64-vs2015-large
+  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
+    distros:
+    - windows-64-vs2015-large
   - name: master_slave
   - name: master_slave_WT
   - name: master_slave_jscore_passthrough
@@ -4984,10 +5131,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
 
 - name: enterprise-windows-64
   display_name: "* Enterprise Windows"
@@ -5049,10 +5192,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -5077,7 +5216,8 @@ buildvariants:
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2 VARIANT_DIR=win32
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling
+    test_flags: --storageEngine=inMemory
+    variant_excluded_flags: requires_persistence,requires_journaling
     ext: zip
     use_scons_cache: true
   tasks:
@@ -5334,10 +5474,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -5353,7 +5489,8 @@ buildvariants:
     push_name: osx-ssl
     push_arch: x86_64
     tooltags: "-tags ssl"
-    compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++
+    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include
+    compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++ CPPPATH=/opt/mongodbtoolchain/v2/include
     num_jobs_available: 1
     build_mongoreplay: true
   tasks:
@@ -5421,6 +5558,7 @@ buildvariants:
   - name: replica_sets_WT
   - name: replica_sets_jscore_passthrough
   - name: replica_sets_jscore_passthrough_WT
+  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
   - name: master_slave
   - name: master_slave_WT
   - name: master_slave_jscore_passthrough
@@ -5478,10 +5616,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
 
 - name: enterprise-osx-107
   display_name: Enterprise OS X 10.7
@@ -5496,7 +5630,8 @@ buildvariants:
     push_name: osx
     push_arch: x86_64-enterprise
     tooltags: "-tags 'ssl sasl'"
-    compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++
+    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include
+    compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++ CPPPATH=/opt/mongodbtoolchain/v2/include
     num_jobs_available: 1
     build_mongoreplay: true
   tasks:
@@ -5522,15 +5657,9 @@ buildvariants:
   - name: mmap
   - name: replica_sets_auth
   - name: sasl
-  - name: snmp
-  - name: snmp_WT
   - name: ssl
   - name: sslSpecial
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -5613,6 +5742,7 @@ buildvariants:
   - name: gle_auth_write_cmd_WT
   - name: httpinterface
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
   - name: jsCore
   - name: jsCore_WT
@@ -5635,6 +5765,8 @@ buildvariants:
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_WT
+  - name: jstestfuzz_replication_initsync
+  - name: jstestfuzz_replication_initsync_WT
   - name: mmap
   - name: mongosTest
   - name: multiversion
@@ -5696,6 +5828,9 @@ buildvariants:
     distros:
     - rhel62-large
   - name: replica_sets_resync_static_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
     distros:
     - rhel62-large
   - name: master_slave
@@ -5753,10 +5888,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -5767,7 +5898,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel62-small
+  - rhel62-large
   batchtime: 10080 # 7 days
   stepback: false
   expansions:
@@ -5776,7 +5907,7 @@ buildvariants:
     compile_flags: --dbg=on --gcov --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     multiversion_platform_arch: "rhel62"
     multiversion_edition: "targeted"
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 2)) # Avoid starting too many mongod's
     # The gcov instrumentation saves the path the .gcno files were created in as the default path
     # for the .gcda files. In Evergreen the path will start with /data/mci/[Hashed ID]/src/... where
     # the hashed ID is unique per task run. GCOV_PREFIX_STRIP is the number of directory levels to
@@ -5788,8 +5919,6 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
-    distros:
-    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -5805,29 +5934,13 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
   - name: concurrency
-    distros:
-    - rhel62-large
   - name: concurrency_WT
-    distros:
-    - rhel62-large
   - name: concurrency_replication
-    distros:
-    - rhel62-large
   - name: concurrency_replication_WT
-    distros:
-    - rhel62-large
   - name: concurrency_sharded
-    distros:
-    - rhel62-large
   - name: concurrency_sharded_WT
-    distros:
-    - rhel62-large
   - name: concurrency_simultaneous
-    distros:
-    - rhel62-large
   - name: concurrency_simultaneous_WT
-    distros:
-    - rhel62-large
   - name: dbtest
   - name: dbtest_WT
   - name: disk
@@ -5846,6 +5959,7 @@ buildvariants:
   - name: gle_auth_write_cmd_WT
   - name: httpinterface
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
   - name: jsCore
   - name: jsCore_WT
@@ -5874,54 +5988,25 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
-    distros:
-    - rhel62-large
   - name: read_only
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
   - name: replica_sets
-    distros:
-    - rhel62-large
   - name: replica_sets_WT
-    distros:
-    - rhel62-large
   - name: replica_sets_WT_ese
-    distros:
-    - rhel62-large
   - name: replica_sets_auth
-    distros:
-    - rhel62-large
   - name: replica_sets_compression
-    distros:
-    - rhel62-large
   - name: replica_sets_pv0
-    distros:
-    - rhel62-large
   - name: replica_sets_jscore_passthrough
-    distros:
-    - rhel62-large
   - name: replica_sets_jscore_passthrough_WT
-    distros:
-    - rhel62-large
   - name: replica_sets_initsync_jscore_passthrough
-    distros:
-    - rhel62-large
   - name: replica_sets_initsync_jscore_passthrough_WT
-    distros:
-    - rhel62-large
   - name: replica_sets_initsync_static_jscore_passthrough
-    distros:
-    - rhel62-large
   - name: replica_sets_initsync_static_jscore_passthrough_WT
-    distros:
-    - rhel62-large
   - name: replica_sets_resync_static_jscore_passthrough
-    distros:
-    - rhel62-large
   - name: replica_sets_resync_static_jscore_passthrough_WT
-    distros:
-    - rhel62-large
+  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
   - name: master_slave
   - name: master_slave_WT
   - name: master_slave_auth
@@ -5931,23 +6016,11 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding
-    distros:
-    - rhel62-large
   - name: sharding_WT
-    distros:
-    - rhel62-large
   - name: sharding_WT_ese
-    distros:
-    - rhel62-large
   - name: sharding_auth
-    distros:
-    - rhel62-large
   - name: sharding_auth_audit_WT
-    distros:
-    - rhel62-large
   - name: sharding_compression
-    distros:
-    - rhel62-large
   - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd
@@ -5956,14 +6029,8 @@ buildvariants:
   - name: sharding_jscore_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_last_stable_mongos_and_mixed_shards
-    distros:
-    - rhel62-large
   - name: sharding_op_query_WT
-    distros:
-    - rhel62-large
   - name: sharding_csrs_continuous_config_stepdown_WT
-    distros:
-    - rhel62-large
   - name: slow1
   - name: slow1_WT
   - name: serial_run
@@ -5973,10 +6040,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
 
 - name: enterprise-rhel-70-64-bit
   display_name: Enterprise RHEL 7.0
@@ -6151,10 +6214,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -6290,10 +6349,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -6314,7 +6369,7 @@ buildvariants:
     # We need to compensate for SMT8 setting the cpu count very high and lower the amount of parallelism down
     compile_flags: --ssl MONGO_DISTMOD=rhel71 --release -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(echo "$(grep -c processor /proc/cpuinfo)/4" | bc)
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    variant_excluded_flags: requires_mmapv1
     has_packages: true
     packager_script: packager-enterprise.py
     packager_arch: ppc64le
@@ -6329,110 +6384,75 @@ buildvariants:
   - name: compile
     distros:
     - rhel71-power8-build
-  # - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
   - name: aggregation_auth
   - name: aggregation_read_concern_majority_passthrough_WT
   - name: aggregation_sharded_collections_passthrough_WT
-  # - name: audit
   - name: audit_WT
-  # - name: auth
   - name: auth_WT
-  # - name: auth_audit
   - name: auth_audit_WT
-  # - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
-  # - name: concurrency
   - name: concurrency_WT
-  # - name: concurrency_replication
   - name: concurrency_replication_WT
-  # - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  # - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  # - name: dbtest
   - name: dbtest_WT
-  # - name: disk
-  # - name: dur_jscore_passthrough
-  # - name: durability
   - name: ese_WT
   - name: failpoints
   - name: failpoints_auth
-  # - name: gle_auth
   - name: gle_auth_WT
-  # - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_WT
-  # - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_basics_passthrough_write_cmd_WT
-  # - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
   - name: httpinterface
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
-  # - name: jsCore
   - name: jsCore_WT
   - name: jsCore_WT_ese
-  # - name: jsCore_auth
-  # - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  # - name: jsCore_minimum_batch_size_WT
-  # - name: jsCore_op_query
   - name: jsCore_op_query_WT
-  # - name: mmap
+  - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded_WT
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded_WT
   - name: mongosTest
-  # - name: noPassthrough
-  # - name: noPassthroughWithMongod
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
-  # - name: parallel
   - name: parallel_WT
-  # - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
-  # - name: replica_sets
   - name: replica_sets_WT
   - name: replica_sets_WT_ese
   - name: replica_sets_auth
   - name: replica_sets_pv0
-  # - name: replica_sets_jscore_passthrough
   - name: replica_sets_jscore_passthrough_WT
-  # - name: master_slave
   - name: master_slave_WT
   - name: master_slave_auth
-  # - name: master_slave_jscore_passthrough
   - name: master_slave_jscore_passthrough_WT
   - name: sasl
-  # - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
-  # - name: sharding
   - name: sharding_WT
   - name: sharding_WT_ese
   - name: sharding_auth
   - name: sharding_auth_audit_WT
   - name: sharding_csrs_continuous_config_stepdown_WT
-  # - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_WT
-  # - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  # - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
-  # - name: slow1
   - name: slow1_WT
-  # - name: serial_run
   - name: serial_run_WT
-  # - name: snmp
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  # - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -6449,9 +6469,9 @@ buildvariants:
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
-    compile_flags: --ssl MONGO_DISTMOD=rhel72 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
+    compile_flags: --ssl MONGO_DISTMOD=rhel72 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: 2
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    variant_excluded_flags: requires_mmapv1
     has_packages: true
     packager_script: packager-enterprise.py
     packager_arch: s390x
@@ -6466,110 +6486,75 @@ buildvariants:
   - name: compile
     distros:
     - rhel72-zseries-build
-  # - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
   - name: aggregation_auth
   - name: aggregation_read_concern_majority_passthrough_WT
   - name: aggregation_sharded_collections_passthrough_WT
-  # - name: audit
   - name: audit_WT
-  # - name: auth
   - name: auth_WT
-  # - name: auth_audit
   - name: auth_audit_WT
-  # - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
-  # - name: concurrency
   - name: concurrency_WT
-  # - name: concurrency_replication
   - name: concurrency_replication_WT
-  # - name: concurrency_sharded
   - name: concurrency_sharded_WT
-  # - name: concurrency_simultaneous
   - name: concurrency_simultaneous_WT
-  # - name: dbtest
   - name: dbtest_WT
-  # - name: disk
-  # - name: dur_jscore_passthrough
-  # - name: durability
   - name: ese_WT
   - name: failpoints
   - name: failpoints_auth
-  # - name: gle_auth
   - name: gle_auth_WT
-  # - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_WT
-  # - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_basics_passthrough_write_cmd_WT
-  # - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
   - name: httpinterface
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
-  # - name: jsCore
   - name: jsCore_WT
   - name: jsCore_WT_ese
-  # - name: jsCore_auth
-  # - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  # - name: jsCore_minimum_batch_size_WT
-  # - name: jsCore_op_query
   - name: jsCore_op_query_WT
-  # - name: mmap
+  - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded_WT
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded_WT
   - name: mongosTest
-  # - name: noPassthrough
-  # - name: noPassthroughWithMongod
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
-  # - name: parallel
   - name: parallel_WT
-  # - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_majority_passthrough_WT
-  # - name: replica_sets
   - name: replica_sets_WT
   - name: replica_sets_WT_ese
   - name: replica_sets_auth
   - name: replica_sets_pv0
-  # - name: replica_sets_jscore_passthrough
   - name: replica_sets_jscore_passthrough_WT
-  # - name: master_slave
   - name: master_slave_WT
   - name: master_slave_auth
-  # - name: master_slave_jscore_passthrough
   - name: master_slave_jscore_passthrough_WT
   - name: sasl
-  # - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
-  # - name: sharding
   - name: sharding_WT
   - name: sharding_WT_ese
   - name: sharding_auth
   - name: sharding_auth_audit_WT
   - name: sharding_csrs_continuous_config_stepdown_WT
-  # - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_WT
-  # - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  # - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
-  # - name: slow1
   - name: slow1_WT
-  # - name: serial_run
   - name: serial_run_WT
-  # - name: snmp
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  # - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -6705,8 +6690,6 @@ buildvariants:
   # - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel62-small
@@ -6805,13 +6788,25 @@ buildvariants:
   - name: dbtest
   - name: dbtest_WT
   - name: ese_WT
-  - name: jepsen_findAndModify_WT
+  - name: jepsen_register_findAndModify_WT
     distros:
     - ubuntu1404-jepsen
-  - name: jepsen_linearizableRead
+  - name: jepsen_register_findAndModify_pv0
     distros:
     - ubuntu1404-jepsen
-  - name: jepsen_linearizableRead_WT
+  - name: jepsen_register_findAndModify_pv0_WT
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_register_linearizableRead
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_register_linearizableRead_WT
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_set_linearizableRead
+    distros:
+    - ubuntu1404-jepsen
+  - name: jepsen_set_linearizableRead_WT
     distros:
     - ubuntu1404-jepsen
   - name: jsCore
@@ -6992,9 +6987,9 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: s390x-enterprise-suse12
-    compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
+    compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    variant_excluded_flags: requires_mmapv1
     has_packages: true
     packager_script: packager-enterprise.py
     packager_arch: s390x
@@ -7028,12 +7023,19 @@ buildvariants:
   - name: gle_auth_write_cmd_WT
   - name: httpinterface
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
   - name: jsCore_WT
   - name: jsCore_WT_ese
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
+  - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded_WT
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded_WT
   - name: mongosTest
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
@@ -7183,10 +7185,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7265,7 +7263,7 @@ buildvariants:
     push_arch: s390x-enterprise-suse11
     compile_flags: --ssl MONGO_DISTMOD=suse11 --release -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z9-109 -mtune=z10" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    variant_excluded_flags: requires_mmapv1
     has_packages: true
     packager_script: packager-enterprise.py
     packager_arch: s390x
@@ -7296,12 +7294,19 @@ buildvariants:
   - name: gle_auth_write_cmd_WT
   - name: httpinterface
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
   - name: jsCore_WT
   - name: jsCore_WT_ese
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
+  - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded_WT
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded_WT
   - name: mongosTest
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
@@ -7450,10 +7455,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7544,10 +7545,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: push
     distros:
     - rhel70-small
@@ -7787,10 +7784,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7912,10 +7905,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7937,9 +7926,10 @@ buildvariants:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
-    test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling
+    test_flags: --storageEngine=inMemory
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    variant_excluded_flags: requires_persistence,requires_journaling
     use_scons_cache: true
     build_mongoreplay: true
   tasks:
@@ -7968,6 +7958,7 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
   - name: jsCore
   - name: jsCore_WT
@@ -8011,8 +8002,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
 
 - name: linux-64-ephemeralForTest
   display_name: Linux (ephemeralForTest)
@@ -8020,9 +8009,10 @@ buildvariants:
   - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling
+    test_flags: --storageEngine=ephemeralForTest
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    variant_excluded_flags: requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling
     use_scons_cache: true
     build_mongoreplay: true
   tasks:
@@ -8049,6 +8039,7 @@ buildvariants:
   - name: httpinterface
   - name: integration_tests_standalone
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: jsCore
@@ -8088,8 +8079,6 @@ buildvariants:
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool
   - name: unittests
-  - name: views_WT
-  - name: views_rs_WT
 
 - name: enterprise-rhel-71-ppc64le-inmem
   display_name: Enterprise RHEL 7.1 PPC64LE (inMemory) DEBUG
@@ -8106,7 +8095,8 @@ buildvariants:
     # We need to compensate for SMT8 setting the cpu count very high and lower the amount of parallelism down
     compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel71 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(echo "$(grep -c processor /proc/cpuinfo)/4" | bc)
-    test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_mmapv1,requires_journaling
+    test_flags: --storageEngine=inMemory
+    variant_excluded_flags: requires_persistence,requires_mmapv1,requires_journaling
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8132,6 +8122,7 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
   - name: jsCore
   - name: jsCore_WT
@@ -8168,7 +8159,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: unittests
-  - name: views
 
 - name: enterprise-rhel-72-s390x-inmem
   display_name: Enterprise RHEL 7.2 s390x (inMemory) DEBUG
@@ -8182,9 +8172,10 @@ buildvariants:
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
-    compile_flags: --dbg=on --opt=on --ssl --link-model=static MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --use-s390x-crc32=off
+    compile_flags: --dbg=on --opt=on --ssl --link-model=static MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: 2
-    test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_mmapv1,requires_journaling
+    test_flags: --storageEngine=inMemory
+    variant_excluded_flags: requires_persistence,requires_mmapv1,requires_journaling
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8218,6 +8209,7 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
   - name: jsCore
   - name: jsCore_WT
@@ -8254,7 +8246,6 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: unittests
-  - name: views
 
 - name: ubuntu1404-rocksdb
   display_name: Ubuntu 14.04 (RocksDB)
@@ -8324,7 +8315,6 @@ buildvariants:
   - name: serial_run
   - name: sharding_jscore_passthrough
   - name: unittests
-  - name: views
 
 ###########################################
 #     Experimental buildvariants          #
@@ -8391,6 +8381,7 @@ buildvariants:
   - name: gle_auth_write_cmd_WT
   - name: httpinterface
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
   - name: jsCore
   - name: jsCore_WT
@@ -8438,6 +8429,7 @@ buildvariants:
   - name: replica_sets_initsync_static_jscore_passthrough_WT
   - name: replica_sets_resync_static_jscore_passthrough
   - name: replica_sets_resync_static_jscore_passthrough_WT
+  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
   - name: master_slave
   - name: master_slave_WT
   - name: master_slave_auth
@@ -8472,9 +8464,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs_WT
 
 - name: ubuntu1604-asan
   display_name: ~ ASAN SSL Ubuntu 16.04
@@ -8508,7 +8497,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-test
+  - ubuntu1604-build
   stepback: true
   batchtime: 1440 # 1 day
   expansions:
@@ -8520,12 +8509,10 @@ buildvariants:
     compile_flags: CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 --dbg=on --opt=on --allocator=system --sanitize=undefined --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip CXXFLAGS="-nostdlib -nostdinc++" LIBPATH=/opt/mongodbtoolchain/v2/lib/gcc/x86_64-mongodb-linux/5.4.0 CPPPATH="/opt/mongodbtoolchain/v2/include/c++/5.4.0/ /opt/mongodbtoolchain/v2/include/c++/5.4.0/x86_64-mongodb-linux" CPPDEFINES="_GLIBCXX_USE_CXX11_ABI=0" VARIANT_DIR=build
     multiversion_platform_arch: "ubuntu1604"
     multiversion_edition: "targeted"
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under UBSAN build.
     build_mongoreplay: true
   tasks:
   - name: compile
-    distros:
-    - ubuntu1604-build
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -8567,6 +8554,7 @@ buildvariants:
   - name: gle_auth_write_cmd_WT
   - name: httpinterface
   - name: integration_tests_replset
+  - name: integration_tests_sharded
   - name: integration_tests_standalone
   - name: jsCore
   - name: jsCore_WT
@@ -8614,6 +8602,7 @@ buildvariants:
   - name: replica_sets_initsync_static_jscore_passthrough_WT
   - name: replica_sets_resync_static_jscore_passthrough
   - name: replica_sets_resync_static_jscore_passthrough_WT
+  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
   - name: master_slave
   - name: master_slave_WT
   - name: master_slave_auth
@@ -8648,9 +8637,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs_WT
 
 - name: enterprise-ubuntu-dynamic-1604-64-bit
   display_name: "* Shared Library Enterprise Ubuntu 16.04"
@@ -8800,29 +8786,6 @@ buildvariants:
   - name: tool
   - name: tool_WT
   - name: unittests
-  - name: views
-  - name: views_WT
-  - name: views_rs
-  - name: views_rs_WT
-
-- name: ubuntu1404-jepsen
-  display_name: ~ Jepsen Ubuntu 14.04
-  run_on:
-  - ubuntu1404-jepsen
-  expansions:
-    compile_flags: MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    use_scons_cache: true
-  tasks:
-  - name: compile
-    distros:
-    - ubuntu1404-build
-  - name: jepsen_findAndModify_WT
-  - name: jepsen_linearizableRead
-  - name: jepsen_linearizableRead_WT
-  - name: unittests
-    distros:
-    - ubuntu1404-test
 
 - name: initsync-3dot2-rhel-62
   display_name: "~ Initial Sync 3.2 Enterprise RHEL 6.2"

@@ -276,6 +276,9 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
         const OpTime minValidSaved = storageInterface->getMinValid(opCtx);
 
         stdx::lock_guard<stdx::mutex> lock(_mutex);
+        if (_state != ProducerState::Running) {
+            return;
+        }
         const auto requiredOpTime = (minValidSaved > _lastOpTimeFetched) ? minValidSaved : OpTime();
         lastOpTimeFetched = _lastOpTimeFetched;
         _syncSourceHost = HostAndPort();
@@ -315,10 +318,20 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
             return;
         }
 
+        // We only need to mark ourselves as too stale once.
+        if (_tooStale) {
+            return;
+        }
+
+        // Mark yourself as too stale.
+        _tooStale = true;
+
         error() << "too stale to catch up -- entering maintenance mode";
         log() << "Our newest OpTime : " << lastOpTimeFetched;
         log() << "Earliest OpTime available is " << syncSourceResp.earliestOpTimeSeen;
         log() << "See http://dochub.mongodb.org/core/resyncingaverystalereplicasetmember";
+
+        // Activate maintenance mode and transition to RECOVERING.
         auto status = _replCoord->setMaintenanceMode(true);
         if (!status.isOK()) {
             warning() << "Failed to transition into maintenance mode: " << status;
@@ -330,10 +343,11 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
         }
         return;
     } else if (syncSourceResp.isOK() && !syncSourceResp.getSyncSource().empty()) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        _syncSourceHost = syncSourceResp.getSyncSource();
-        source = _syncSourceHost;
-
+        {
+            stdx::lock_guard<stdx::mutex> lock(_mutex);
+            _syncSourceHost = syncSourceResp.getSyncSource();
+            source = _syncSourceHost;
+        }
         // If our sync source has not changed, it is likely caused by our heartbeat data map being
         // out of date. In that case we sleep for 1 second to reduce the amount we spin waiting
         // for our map to update.
@@ -351,6 +365,20 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
         // No sync source found.
         sleepsecs(1);
         return;
+    }
+
+    // If we find a good sync source after having gone too stale, disable maintenance mode so we can
+    // transition to SECONDARY.
+    if (_tooStale) {
+
+        _tooStale = false;
+
+        log() << "No longer too stale. Able to sync from " << _syncSourceHost;
+
+        auto status = _replCoord->setMaintenanceMode(false);
+        if (!status.isOK()) {
+            warning() << "Failed to leave maintenance mode: " << status;
+        }
     }
 
     long long lastHashFetched;
@@ -403,6 +431,9 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
                        stdx::placeholders::_3),
             onOplogFetcherShutdownCallbackFn);
         stdx::lock_guard<stdx::mutex> lock(_mutex);
+        if (_state != ProducerState::Running) {
+            return;
+        }
         _oplogFetcher = std::move(oplogFetcherPtr);
         oplogFetcher = _oplogFetcher.get();
     } catch (const mongo::DBException& ex) {
