@@ -181,7 +181,7 @@ var ReplSetTest = function(opts) {
         var currTime = new Date().getTime();
         var status;
 
-        assert.soon(function() {
+        assert.soonNoExcept(function() {
             try {
                 var conn = _callIsMaster();
                 if (!conn) {
@@ -405,7 +405,7 @@ var ReplSetTest = function(opts) {
     this.awaitSecondaryNodes = function(timeout) {
         timeout = timeout || self.kDefaultTimeoutMS;
 
-        assert.soon(function() {
+        assert.soonNoExcept(function() {
             // Reload who the current slaves are
             self.getPrimary(timeout);
 
@@ -445,45 +445,44 @@ var ReplSetTest = function(opts) {
 
     /**
      * Blocks until all nodes agree on who the primary is.
+     * If 'expectedPrimaryNodeId' is provided, ensure that every node is seeing this node as the
+     * primary. Otherwise, ensure that all the nodes in the set agree with the first node on the
+     * identity of the primary.
      */
-    this.awaitNodesAgreeOnPrimary = function(timeout) {
+    this.awaitNodesAgreeOnPrimary = function(timeout, nodes, expectedPrimaryNodeId) {
         timeout = timeout || self.kDefaultTimeoutMS;
+        nodes = nodes || self.nodes;
+        expectedPrimaryNodeId = expectedPrimaryNodeId || -1;
 
-        assert.soon(function() {
-            try {
-                var primary = -1;
+        assert.soonNoExcept(function() {
+            var primary = expectedPrimaryNodeId;
 
-                for (var i = 0; i < self.nodes.length; i++) {
-                    var replSetGetStatus =
-                        self.nodes[i].getDB("admin").runCommand({replSetGetStatus: 1});
-                    var nodesPrimary = -1;
-                    for (var j = 0; j < replSetGetStatus.members.length; j++) {
-                        if (replSetGetStatus.members[j].state === ReplSetTest.State.PRIMARY) {
-                            // Node sees two primaries.
-                            if (nodesPrimary !== -1) {
-                                return false;
-                            }
-                            nodesPrimary = j;
+            for (var i = 0; i < nodes.length; i++) {
+                var replSetGetStatus = nodes[i].getDB("admin").runCommand({replSetGetStatus: 1});
+                var nodesPrimary = -1;
+                for (var j = 0; j < replSetGetStatus.members.length; j++) {
+                    if (replSetGetStatus.members[j].state === ReplSetTest.State.PRIMARY) {
+                        // Node sees two primaries.
+                        if (nodesPrimary !== -1) {
+                            return false;
                         }
-                    }
-                    // Node doesn't see a primary.
-                    if (nodesPrimary < 0) {
-                        return false;
-                    }
-
-                    if (primary < 0) {
-                        // If we haven't seen a primary yet, set it to this.
-                        primary = nodesPrimary;
-                    } else if (primary !== nodesPrimary) {
-                        return false;
+                        nodesPrimary = j;
                     }
                 }
+                // Node doesn't see a primary.
+                if (nodesPrimary < 0) {
+                    return false;
+                }
 
-                return true;
-            } catch (e) {
-                print("caught exception " + e);
-                return false;
+                if (primary < 0) {
+                    // If we haven't seen a primary yet, set it to this.
+                    primary = nodesPrimary;
+                } else if (primary !== nodesPrimary) {
+                    return false;
+                }
             }
+
+            return true;
         }, "Awaiting nodes to agree on primary", timeout);
     };
 
@@ -495,7 +494,7 @@ var ReplSetTest = function(opts) {
         timeout = timeout || self.kDefaultTimeoutMS;
         var primary = null;
 
-        assert.soon(function() {
+        assert.soonNoExcept(function() {
             primary = _callIsMaster();
             return primary;
         }, "Finding primary", timeout);
@@ -507,7 +506,7 @@ var ReplSetTest = function(opts) {
         msg = msg || "Timed out waiting for there to be no primary in replset: " + this.name;
         timeout = timeout || self.kDefaultTimeoutMS;
 
-        assert.soon(function() {
+        assert.soonNoExcept(function() {
             return _callIsMaster() == false;
         }, msg, timeout);
     };
@@ -723,7 +722,7 @@ var ReplSetTest = function(opts) {
         print("Waiting for op with OpTime " + tojson(opTime) +
               " to be committed on all secondaries");
 
-        assert.soon(function() {
+        assert.soonNoExcept(function() {
             for (var i = 0; i < rst.nodes.length; i++) {
                 var node = rst.nodes[i];
 
@@ -764,7 +763,7 @@ var ReplSetTest = function(opts) {
         // Blocking call, which will wait for the last optime written on the master to be available
         var awaitLastOpTimeWrittenFn = function() {
             var master = self.getPrimary();
-            assert.soon(function() {
+            assert.soonNoExcept(function() {
                 try {
                     masterLatestOpTime = _getLastOpTime(master);
                 } catch (e) {
@@ -801,7 +800,7 @@ var ReplSetTest = function(opts) {
               ", is " + tojson(masterLatestOpTime) + ", last oplog entry is " +
               tojsononeline(masterOpTime));
 
-        assert.soon(function() {
+        assert.soonNoExcept(function() {
             try {
                 print("ReplSetTest awaitReplication: checking secondaries against timestamp " +
                       tojson(masterLatestOpTime));
@@ -1236,7 +1235,7 @@ var ReplSetTest = function(opts) {
      */
     this.waitForMaster = function(timeout) {
         var master;
-        assert.soon(function() {
+        assert.soonNoExcept(function() {
             return (master = self.getPrimary());
         }, "waiting for master", timeout);
 
@@ -1370,7 +1369,7 @@ ReplSetTest.awaitRSClientHosts = function(conn, host, hostOk, rs, timeout) {
 
     var tests = 0;
 
-    assert.soon(function() {
+    assert.soonNoExcept(function() {
         var rsClientHosts = conn.adminCommand('connPoolStats').replicaSets;
         if (tests++ % 10 == 0) {
             printjson(rsClientHosts);
