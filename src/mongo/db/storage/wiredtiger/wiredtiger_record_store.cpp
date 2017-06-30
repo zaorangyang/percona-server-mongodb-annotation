@@ -56,6 +56,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -180,6 +181,7 @@ void WiredTigerRecordStore::OplogStones::awaitHasExcessStonesOrDead() {
     // Wait until kill() is called or there are too many oplog stones.
     stdx::unique_lock<stdx::mutex> lock(_oplogReclaimMutex);
     while (!_isDead && !hasExcessStones()) {
+        MONGO_IDLE_THREAD_BLOCK;
         _oplogReclaimCv.wait(lock);
     }
 }
@@ -1281,7 +1283,7 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* txn,
         } else if (_isCapped) {
             stdx::lock_guard<stdx::mutex> lk(_uncommittedRecordIdsMutex);
             record.id = _nextId();
-            _addUncommitedRecordId_inlock(txn, record.id);
+            _addUncommittedRecordId_inlock(txn, record.id);
         } else {
             record.id = _nextId();
         }
@@ -1329,7 +1331,7 @@ StatusWith<RecordId> WiredTigerRecordStore::insertRecord(OperationContext* txn,
 }
 
 void WiredTigerRecordStore::_dealtWithCappedId(SortedRecordIds::iterator it, bool didCommit) {
-    invariant(&(*it) != NULL);
+    invariant(it->isNormal());
     stdx::lock_guard<stdx::mutex> lk(_uncommittedRecordIdsMutex);
     if (didCommit && _isOplog && *it != _oplog_highestSeen) {
         // Defer removal from _uncommittedRecordIds until it is durable. We don't need to wait for
@@ -1667,7 +1669,7 @@ Status WiredTigerRecordStore::oplogDiskLocRegister(OperationContext* txn, const 
         return id.getStatus();
 
     stdx::lock_guard<stdx::mutex> lk(_uncommittedRecordIdsMutex);
-    _addUncommitedRecordId_inlock(txn, id.getValue());
+    _addUncommittedRecordId_inlock(txn, id.getValue());
     return Status::OK();
 }
 
@@ -1698,8 +1700,11 @@ void WiredTigerRecordStore::_oplogJournalThreadLoop(WiredTigerSessionCache* sess
     Client::initThread("WTOplogJournalThread");
     while (true) {
         stdx::unique_lock<stdx::mutex> lk(_uncommittedRecordIdsMutex);
-        _opsWaitingForJournalCV.wait(
-            lk, [&] { return _shuttingDown || !_opsWaitingForJournal.empty(); });
+        {
+            MONGO_IDLE_THREAD_BLOCK;
+            _opsWaitingForJournalCV.wait(
+                lk, [&] { return _shuttingDown || !_opsWaitingForJournal.empty(); });
+        }
 
         while (!_shuttingDown && MONGO_FAIL_POINT(WTPausePrimaryOplogDurabilityLoop)) {
             lk.unlock();
@@ -1746,11 +1751,10 @@ void WiredTigerRecordStore::waitForAllEarlierOplogWritesToBeVisible(OperationCon
     });
 }
 
-void WiredTigerRecordStore::_addUncommitedRecordId_inlock(OperationContext* txn,
-                                                          const RecordId& id) {
-    // todo: make this a dassert at some point
-    // invariant(_uncommittedRecordIds.empty() || _uncommittedRecordIds.back() < id);
+void WiredTigerRecordStore::_addUncommittedRecordId_inlock(OperationContext* txn, RecordId id) {
+    dassert(_uncommittedRecordIds.empty() || _uncommittedRecordIds.back() < id);
     SortedRecordIds::iterator it = _uncommittedRecordIds.insert(_uncommittedRecordIds.end(), id);
+    invariant(it->isNormal());
     txn->recoveryUnit()->registerChange(new CappedInsertChange(this, it));
     _oplog_highestSeen = id;
 }
