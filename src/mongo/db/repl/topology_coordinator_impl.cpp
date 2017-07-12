@@ -2293,10 +2293,7 @@ void TopologyCoordinatorImpl::processLoseElection() {
     }
 }
 
-bool TopologyCoordinatorImpl::stepDown(Date_t until,
-                                       bool force,
-                                       const OpTime& lastOpApplied,
-                                       const OpTime& lastOpCommitted) {
+bool TopologyCoordinatorImpl::stepDown(Date_t until, bool force, const OpTime& lastOpApplied) {
 
     // force==true overrides all other checks.
     if (force) {
@@ -2305,12 +2302,8 @@ bool TopologyCoordinatorImpl::stepDown(Date_t until,
         return true;
     }
 
-    // Ensure a majority of caught up nodes.
-    if (lastOpCommitted < lastOpApplied) {
-        return false;
-    }
-
-    // Now make sure we also have at least one caught up node that is also electable.
+    // We already checked in ReplicationCoordinator that a majority of nodes are caught up.
+    // Here we must check that we also have at least one caught up node that is electable.
     for (int memberIndex = 0; memberIndex < _rsConfig.getNumMembers(); memberIndex++) {
         // ignore your self
         if (memberIndex == _selfIndex) {
@@ -2643,6 +2636,36 @@ Status TopologyCoordinatorImpl::becomeCandidateIfElectable(const Date_t now,
 void TopologyCoordinatorImpl::setStorageEngineSupportsReadCommitted(bool supported) {
     _storageEngineSupportsReadCommitted =
         supported ? ReadCommittedSupport::kYes : ReadCommittedSupport::kNo;
+}
+
+void TopologyCoordinatorImpl::restartHeartbeats() {
+    for (auto& hb : _hbdata) {
+        hb.restart();
+    }
+}
+
+boost::optional<OpTime> TopologyCoordinatorImpl::latestKnownOpTimeSinceHeartbeatRestart() const {
+    // The smallest OpTime in PV1.
+    OpTime latest(Timestamp(0, 0), 0);
+    for (size_t i = 0; i < _hbdata.size(); i++) {
+        auto& peer = _hbdata[i];
+
+        if (static_cast<int>(i) == _selfIndex) {
+            continue;
+        }
+        // If any heartbeat is not fresh enough, return none.
+        if (!peer.isUpdatedSinceRestart()) {
+            return boost::none;
+        }
+        // Ignore down members
+        if (!peer.up()) {
+            continue;
+        }
+        if (peer.getAppliedOpTime() > latest) {
+            latest = peer.getAppliedOpTime();
+        }
+    }
+    return latest;
 }
 
 }  // namespace repl
