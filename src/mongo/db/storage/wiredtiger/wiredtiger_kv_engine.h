@@ -31,8 +31,8 @@
 
 #pragma once
 
+#include <list>
 #include <memory>
-#include <queue>
 #include <string>
 
 #include <wiredtiger.h>
@@ -140,6 +140,8 @@ public:
         return _conn;
     }
     void dropSomeQueuedIdents();
+    std::list<WiredTigerCachedCursor> filterCursorsWithQueuedDrops(
+        std::list<WiredTigerCachedCursor>* cache);
     bool haveDropsQueued() const;
 
     void syncSizeInfo(bool sync) const;
@@ -189,7 +191,7 @@ private:
 
     mutable stdx::mutex _dropAllQueuesMutex;
     mutable stdx::mutex _identToDropMutex;
-    std::queue<std::string> _identToDrop;
+    std::list<std::string> _identToDrop;
 
     mutable Date_t _previousCheckedDropsQueued;
 

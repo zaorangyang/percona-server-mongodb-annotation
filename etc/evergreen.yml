@@ -4567,11 +4567,12 @@ buildvariants:
     - ubuntu1604-test
 
 - name: enterprise-linux-64-amazon-ami
-  display_name: "* Enterprise Amazon Linux"
+  display_name: "Enterprise Amazon Linux"
   modules:
   - enterprise
   run_on:
   - linux-64-amzn-test
+  batchtime: 1440 # 1 day
   expansions:
     tooltags: "-tags 'ssl sasl'"
     push_path: linux
@@ -5383,13 +5384,14 @@ buildvariants:
 - name: osx-107
   display_name: OS X 10.7
   run_on:
-  - osx-1010
+  - macos-1012
   batchtime: 1440 # 1 day
   expansions:
     push_path: osx
     push_bucket: downloads.mongodb.org
     push_name: osx
     push_arch: x86_64
+    gorootvars: CGO_CFLAGS=-mmacosx-version-min=10.7 CGO_LDFLAGS=-mmacosx-version-min=10.7
     compile_flags: --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++
     num_jobs_available: 1
     build_mongoreplay: true
@@ -5481,7 +5483,7 @@ buildvariants:
 - name: osx-107-ssl
   display_name: SSL OS X 10.7
   run_on:
-  - osx-1010
+  - macos-1012
   batchtime: 1440 # 1 day
   expansions:
     push_path: osx
@@ -5489,7 +5491,7 @@ buildvariants:
     push_name: osx-ssl
     push_arch: x86_64
     tooltags: "-tags ssl"
-    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include
+    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.7 CGO_LDFLAGS=-mmacosx-version-min=10.7
     compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++ CPPPATH=/opt/mongodbtoolchain/v2/include
     num_jobs_available: 1
     build_mongoreplay: true
@@ -5581,13 +5583,14 @@ buildvariants:
 - name: osx-107-debug
   display_name: "* OS X 10.7 DEBUG"
   run_on:
-  - osx-1010
+  - macos-1012
   expansions:
     push_path: osx
     push_bucket: downloads.mongodb.org
     push_name: osx-debug
     push_arch: x86_64
     num_jobs_available: 1
+    gorootvars: CGO_CFLAGS=-mmacosx-version-min=10.7 CGO_LDFLAGS=-mmacosx-version-min=10.7
     compile_flags: --dbg=on --opt=on --allocator=system -j$(sysctl -n hw.logicalcpu) --osx-version-min=10.7 --libc++
     build_mongoreplay: true
   tasks:
@@ -5622,7 +5625,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - osx-1010
+  - macos-1012
   batchtime: 1440 # 1 day
   expansions:
     push_path: osx
@@ -5630,7 +5633,7 @@ buildvariants:
     push_name: osx
     push_arch: x86_64-enterprise
     tooltags: "-tags 'ssl sasl'"
-    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include
+    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.7 CGO_LDFLAGS=-mmacosx-version-min=10.7
     compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++ CPPPATH=/opt/mongodbtoolchain/v2/include
     num_jobs_available: 1
     build_mongoreplay: true

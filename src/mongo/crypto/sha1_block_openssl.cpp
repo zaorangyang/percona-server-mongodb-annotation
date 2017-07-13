@@ -28,8 +28,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/crypto/sha1_block.h"
+
 #include "mongo/config.h"
-#include "mongo/crypto/crypto.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 
@@ -62,12 +63,11 @@ void EVP_MD_CTX_free(EVP_MD_CTX* ctx) {
 #endif
 
 namespace mongo {
-namespace crypto {
 /*
  * Computes a SHA-1 hash of 'input'.
  */
-SHA1Hash sha1(const unsigned char* input, const size_t inputLen) {
-    SHA1Hash output;
+SHA1Block SHA1Block::computeHash(const uint8_t* input, size_t inputLen) {
+    HashType output;
 
     std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digestCtx(EVP_MD_CTX_new(),
                                                                       EVP_MD_CTX_free);
@@ -76,20 +76,19 @@ SHA1Hash sha1(const unsigned char* input, const size_t inputLen) {
             EVP_DigestInit_ex(digestCtx.get(), EVP_sha1(), NULL) == 1 &&
                 EVP_DigestUpdate(digestCtx.get(), input, inputLen) == 1 &&
                 EVP_DigestFinal_ex(digestCtx.get(), output.data(), NULL) == 1);
-    return output;
+    return SHA1Block(output);
 }
 
 /*
- * Computes a HMAC SHA-1 keyed hash of 'input' using the key 'key'
+ * Computes a HMAC SHA-1 keyed hash of 'input' using the key 'key', writes output into 'output'.
  */
-SHA1Hash hmacSha1(const unsigned char* key,
-                  const size_t keyLen,
-                  const unsigned char* input,
-                  const size_t inputLen) {
-    SHA1Hash output;
-    fassert(40380, HMAC(EVP_sha1(), key, keyLen, input, inputLen, output.data(), NULL) != NULL);
-    return output;
+void SHA1Block::computeHmac(const uint8_t* key,
+                            size_t keyLen,
+                            const uint8_t* input,
+                            size_t inputLen,
+                            SHA1Block* const output) {
+    fassert(40380,
+            HMAC(EVP_sha1(), key, keyLen, input, inputLen, output->_hash.data(), NULL) != NULL);
 }
 
-}  // namespace crypto
 }  // namespace mongo

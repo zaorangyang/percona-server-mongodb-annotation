@@ -32,13 +32,11 @@
 
 #include "mongo/base/secure_allocator.h"
 #include "mongo/base/status.h"
-#include "mongo/crypto/crypto.h"
+#include "mongo/crypto/sha1_block.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 namespace scram {
-// Convert a SHA1Hash into a base64 encoded string.
-std::string hashToBase64(const SecureHandle<SHA1Hash>& hash);
 
 const std::string serverKeyConst = "Server Key";
 const std::string clientKeyConst = "Client Key";
@@ -74,16 +72,54 @@ inline bool operator==(const SCRAMPresecrets& lhs, const SCRAMPresecrets& rhs) {
 /*
  * Computes the SaltedPassword from password, salt and iterationCount.
  */
-SHA1Hash generateSaltedPassword(const SCRAMPresecrets& presecrets);
+SHA1Block generateSaltedPassword(const SCRAMPresecrets& presecrets);
 
 /*
  * Stores all of the keys, generated from a password, needed for a client or server to perform a
- * SCRAM handshake. This structure will secureZeroMemory itself on destruction.
+ * SCRAM handshake.
+ * These keys are reference counted, and allocated using the SecureAllocator.
+ * May be unpopulated. SCRAMSecrets created via the default constructor are unpopulated.
+ * The behavior is undefined if the accessors are called when unpopulated.
  */
-struct SCRAMSecrets {
-    SecureHandle<SHA1Hash> clientKey;
-    SecureHandle<SHA1Hash> storedKey;
-    SecureHandle<SHA1Hash> serverKey;
+class SCRAMSecrets {
+private:
+    struct SCRAMSecretsHolder {
+        SHA1Block clientKey;
+        SHA1Block storedKey;
+        SHA1Block serverKey;
+    };
+
+public:
+    // Creates an unpopulated SCRAMSecrets object.
+    SCRAMSecrets() = default;
+
+    // Creates a populated SCRAMSecrets object. First, allocates secure storage, then provides it
+    // to a callback, which fills the memory.
+    template <typename T>
+    explicit SCRAMSecrets(T initializationFun)
+        : _ptr(std::make_shared<SecureHandle<SCRAMSecretsHolder>>()) {
+        initializationFun((*this)->clientKey, (*this)->storedKey, (*this)->serverKey);
+    }
+
+    // Returns true if the underlying shared_pointer is populated.
+    explicit operator bool() const {
+        return static_cast<bool>(_ptr);
+    }
+
+    const SecureHandle<SCRAMSecretsHolder>& operator*() const& {
+        invariant(_ptr);
+        return *_ptr;
+    }
+    void operator*() && = delete;
+
+    const SecureHandle<SCRAMSecretsHolder>& operator->() const& {
+        invariant(_ptr);
+        return *_ptr;
+    }
+    void operator->() && = delete;
+
+private:
+    std::shared_ptr<SecureHandle<SCRAMSecretsHolder>> _ptr;
 };
 
 /*
@@ -95,7 +131,7 @@ SCRAMSecrets generateSecrets(const SCRAMPresecrets& presecrets);
 /*
  * Computes the ClientKey and StoredKey from SaltedPassword (client side).
  */
-SCRAMSecrets generateSecrets(const SHA1Hash& saltedPassword);
+SCRAMSecrets generateSecrets(const SHA1Block& saltedPassword);
 
 /*
  * Generates the user salt and the SCRAM secrets storedKey and serverKey as

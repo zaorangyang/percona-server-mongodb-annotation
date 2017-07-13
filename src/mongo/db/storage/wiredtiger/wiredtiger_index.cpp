@@ -457,8 +457,8 @@ Status WiredTigerIndex::initAsEmpty(OperationContext* txn) {
 Status WiredTigerIndex::compact(OperationContext* txn) {
     WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(txn)->getSessionCache();
     if (!cache->isEphemeral()) {
-        UniqueWiredTigerSession session = cache->getSession();
-        WT_SESSION* s = session->getSession();
+        WT_SESSION* s = WiredTigerRecoveryUnit::get(txn)->getSession(txn)->getSession();
+        txn->recoveryUnit()->abandonSnapshot();
         int ret = s->compact(s, uri().c_str(), "timeout=0");
         invariantWTOK(ret);
     }
@@ -487,7 +487,7 @@ protected:
         // Open cursors can cause bulk open_cursor to fail with EBUSY.
         // TODO any other cases that could cause EBUSY?
         WiredTigerSession* outerSession = WiredTigerRecoveryUnit::get(_txn)->getSession(_txn);
-        outerSession->closeAllCursors();
+        outerSession->closeAllCursors(idx->uri());
 
         // Not using cursor cache since we need to set "bulk".
         WT_CURSOR* cursor;
