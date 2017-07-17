@@ -22,7 +22,7 @@ BuildRoot:      /var/tmp/%{name}-%{version}-%{release}
 %undefine       _missing_build_ids_terminate_build
 %define         _unpackaged_files_terminate_build 0
 
-%define         src_dir ./percona-server-mongodb-3.4.4-1.4
+%define         src_dir @@SRC_DIR@@
 
 BuildRequires: gcc, make, cmake, gcc-c++, openssl-devel, cyrus-sasl-devel
 BuildRequires: snappy-devel, zlib-devel, libbz2-devel
@@ -33,9 +33,7 @@ Requires: %{name}-mongos = %{version}-%{release}
 Requires: %{name}-server = %{version}-%{release}
 Requires: %{name}-shell = %{version}-%{release}
 Requires: %{name}-tools = %{version}-%{release}
-Requires: numactl libpcap0
-
-Autoreq: 0
+Requires: numactl libpcap
 
 Conflicts: Percona-Server-MongoDB Percona-Server-MongoDB-32 mongodb-org
 
@@ -84,8 +82,6 @@ Conflicts: Percona-Server-MongoDB-shell Percona-Server-MongoDB-32-shell mongodb-
 %package tools
 Group:          Applications/Databases
 Summary:        The tools package for Percona Server for MongoDB
-#Autoreq: 0
-#Requires: libpcap0
 %description tools
 This package contains various tools from MongoDB project, recompiled for Percona Server for MongoDB
 Conflicts: Percona-Server-MongoDB-tools Percona-Server-MongoDB-32-tools mongodb-org-tools
@@ -123,14 +119,12 @@ buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
 --rocksdb --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
 popd
 
-sed -i "s|linux LDFLAGS: -lpcap|linux LDFLAGS: /usr/lib64/libpcap.a|" $RPM_BUILD_DIR/%{src_dir}/mongo-tools/vendor/src/github.com/google/gopacket/pcap/pcap.go
 # Mongo Tools compilation
 pushd $RPM_BUILD_DIR/%{src_dir}/mongo-tools
 . ./set_gopath.sh
 . ./set_tools_revision.sh
 rm -rf $RPM_BUILD_DIR/%{src_dir}/mongo-tools/vendor/pkg
 mkdir -p $RPM_BUILD_DIR/%{src_dir}/bin
-sed -i "s|linux LDFLAGS: -lpcap|linux LDFLAGS: /usr/lib64/libpcap.a|" vendor/src/github.com/google/gopacket/pcap/pcap.go
 for tool in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog mongoreplay; do
   go build -a -x -o $RPM_BUILD_DIR/%{src_dir}/bin/${tool} -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec=${PSMDB_TOOLS_COMMIT_HASH} -X github.com/mongodb/mongo-tools/common/options.VersionStr=${PSMDB_TOOLS_REVISION}" -tags "${TOOLS_TAGS}" $RPM_BUILD_DIR/%{src_dir}/mongo-tools/${tool}/main/${tool}.go
 done
@@ -158,6 +152,10 @@ sed -i 's:mongodb:mongo:g' %{buildroot}/%{_sysconfdir}/mongod.conf
 install -m 755 -d %{buildroot}/etc/init.d
 install -m 750 %{SOURCE5} %{buildroot}/etc/init.d/mongod
 #
+
+install -m 755 -d %{buildroot}/%{_unitdir}
+install -m 644 %{SOURCE2} %{buildroot}/%{_unitdir}/mongod.service
+
 install -m 644 %{SOURCE3} %{buildroot}/%{_sysconfdir}/sysconfig/mongod
 install -m 755 %{SOURCE4} %{buildroot}/%{_bindir}/
 install -m 755 %{SOURCE7} %{buildroot}/%{_bindir}/
@@ -184,6 +182,7 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 %{_bindir}/percona-server-mongodb-helper.sh
 %{_bindir}/percona-server-mongodb-enable-auth.sh
 /etc/init.d/mongod
+%{_unitdir}/mongod.service
 /etc/selinux/targeted/modules/active/modules/mongod.pp
 %attr(0750,mongod,mongod) %dir %{mongo_home}
 %attr(0750,mongod,mongod) %dir /var/log/mongo
@@ -241,6 +240,7 @@ fi
 %post server
 #
 /sbin/chkconfig --add mongod
+%systemd_post mongod.service
 echo " * To start the service, configure your engine and start mongod"
 parse_yaml() {
    local s='[[:space:]]*' w='[a-zA-Z0-9_]*' fs=$(echo @|tr @ '\034')
@@ -303,12 +303,14 @@ if [ $1 -gt 1 ]; then
 fi
 
 %preun server
+%systemd_preun mongod.service
 if [ -x %{_sysconfdir}/init.d/mongod ] ; then
   %{_sysconfdir}/init.d/mongod stop
 fi
 /sbin/chkconfig --del mongod
 
 %postun server
+%systemd_postun mongod.service
 /sbin/service mongod condrestart >/dev/null 2>&1 || :
 if [ $1 == 0 ]; then
   if /usr/bin/id -g mongod > /dev/null 2>&1; then
