@@ -47,6 +47,7 @@
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -85,9 +86,10 @@ void ReplCoordTest::setUp() {
 }
 
 void ReplCoordTest::tearDown() {
-    if (_externalState) {
-        _externalState->setStoreLocalConfigDocumentToHang(false);
-    }
+    getGlobalFailPointRegistry()
+        ->getFailPoint("blockHeartbeatReconfigFinish")
+        ->setMode(FailPoint::off);
+
     if (_callShutdown) {
         auto opCtx = makeOperationContext();
         shutdown(opCtx.get());
@@ -122,9 +124,7 @@ void ReplCoordTest::init() {
     // PRNG seed for tests.
     const int64_t seed = 0;
 
-    std::array<std::uint8_t, 20> tempKey = {};
-    TimeProofService::Key key(std::move(tempKey));
-    auto timeProofService = stdx::make_unique<TimeProofService>(std::move(key));
+    auto timeProofService = stdx::make_unique<TimeProofService>();
     auto logicalClock = stdx::make_unique<LogicalClock>(service, std::move(timeProofService));
     LogicalClock::set(service, std::move(logicalClock));
 

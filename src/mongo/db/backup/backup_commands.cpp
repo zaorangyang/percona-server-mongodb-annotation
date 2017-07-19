@@ -64,7 +64,6 @@ public:
     bool run(mongo::OperationContext* txn,
              const std::string& db,
              BSONObj& cmdObj,
-             int options,
              std::string& errmsg,
              BSONObjBuilder& result) override;
 } createBackupCmd;
@@ -72,7 +71,6 @@ public:
 bool CreateBackupCommand::run(mongo::OperationContext* txn,
                               const std::string& db,
                               BSONObj& cmdObj,
-                              int options,
                               std::string& errmsg,
                               BSONObjBuilder& result) {
     namespace fs = boost::filesystem;

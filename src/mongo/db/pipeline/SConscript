@@ -110,6 +110,7 @@ env.Library(
     target='expression_context',
     source=[
         'expression_context.cpp',
+        'variables.cpp',
     ],
     LIBDEPS=[
         'aggregation_request',
@@ -190,6 +191,7 @@ env.Library(
         'accumulator_push.cpp',
         'accumulator_std_dev.cpp',
         'accumulator_sum.cpp',
+        'accumulator_merge_objects.cpp'
         ],
     LIBDEPS=[
         'document_value',
@@ -473,7 +475,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/index/index_access_methods',
         '$BUILD_DIR/mongo/db/matcher/expressions_mongod_only',
         '$BUILD_DIR/mongo/db/stats/serveronly',
-        '$BUILD_DIR/mongo/db/clientcursor',
         #'$BUILD_DIR/mongo/db/catalog/catalog', # CYCLE
     ],
     LIBDEPS_TAGS=[

@@ -28,14 +28,24 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/s/commands/run_on_all_shards_cmd.h"
+#include "mongo/db/commands.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
 
-class ClusterRepairDatabaseCmd : public RunOnAllShardsCommand {
+class ClusterRepairDatabaseCmd : public Command {
 public:
-    ClusterRepairDatabaseCmd() : RunOnAllShardsCommand("repairDatabase") {}
+    ClusterRepairDatabaseCmd() : Command("repairDatabase") {}
+
+    bool slaveOk() const override {
+        return true;
+    }
+    bool adminOnly() const override {
+        return false;
+    }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -47,6 +57,17 @@ public:
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
+    }
+
+    bool run(OperationContext* opCtx,
+             const std::string& dbName,
+             BSONObj& cmdObj,
+             std::string& errmsg,
+             BSONObjBuilder& output) override {
+        auto requests = buildRequestsForAllShards(opCtx, cmdObj);
+        auto swResponses =
+            gatherResponsesFromShards(opCtx, dbName, cmdObj, requests, &output, nullptr);
+        return appendCommandStatus(output, swResponses.getStatus());
     }
 
 } clusterRepairDatabaseCmd;

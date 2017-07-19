@@ -387,9 +387,7 @@ namespace audit {
         return Status::OK();
     }
 
-    MONGO_INITIALIZER_WITH_PREREQUISITES(AuditInit, ("SetGlobalEnvironment"))
-                                         (InitializerContext *context)
-    {
+    MONGO_INITIALIZER(AuditInit)(InitializerContext *context) {
         return initialize();
     }
 

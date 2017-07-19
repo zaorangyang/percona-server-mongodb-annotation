@@ -697,7 +697,14 @@ var ReplSetTest = function(opts) {
         this._updateConfigIfNotDurable(config);
     };
 
-    this.initiate = function(cfg, initCmd) {
+    /**
+     * Runs replSetInitiate on the first node of the replica set.
+     * Ensures that a primary is elected (not necessarily node 0).
+     * initiate() should be preferred instead of this, but this is useful when the connections
+     * aren't authorized to run replSetGetStatus.
+     * TODO(SERVER-14017): remove this in favor of using initiate() everywhere.
+     */
+    this.initiateWithAnyNodeAsPrimary = function(cfg, initCmd) {
         var master = this.nodes[0].getDB("admin");
         var config = cfg || this.getReplSetConfig();
         var cmd = {};
@@ -767,8 +774,6 @@ var ReplSetTest = function(opts) {
                     res, ErrorCodes.NodeNotFound, "replSetReconfig during initiate failed");
                 return false;
             }, "replSetReconfig during initiate failed", 3, 5 * 1000);
-
-            this.stepUp(this.nodes[0]);
         }
 
         // Setup authentication if running test with authentication
@@ -776,10 +781,41 @@ var ReplSetTest = function(opts) {
             master = this.getPrimary();
             jsTest.authenticateNodes(this.nodes);
         }
+
+        this.awaitSecondaryNodes();
     };
 
+    /**
+     * Runs replSetInitiate on the replica set and requests the first node to step up as primary.
+     * This version should be prefered where possible but requires all connections in the
+     * ReplSetTest to be authorized to run replSetGetStatus.
+     */
+    this.initiateWithNodeZeroAsPrimary = function(cfg, initCmd) {
+        this.initiateWithAnyNodeAsPrimary(cfg, initCmd);
+
+        // stepUp() calls awaitReplication() which requires all nodes to be authorized to run
+        // replSetGetStatus.
+        asCluster(this.nodes, function() {
+            self.stepUp(self.nodes[0]);
+        });
+    };
+
+    /**
+     * Runs replSetInitiate on the replica set and requests the first node to step up as
+     * primary.
+     */
+    this.initiate = function(cfg, initCmd) {
+        this.initiateWithNodeZeroAsPrimary(cfg, initCmd);
+    };
+
+    /**
+     * Steps up 'node' as primary.
+     * Waits for all nodes to reach the same optime before sending the replSetStepUp command
+     * to 'node'.
+     * Calls awaitReplication() which requires all connections in 'nodes' to be authenticated.
+     */
     this.stepUp = function(node) {
-        this.awaitSecondaryNodes();
+        this.awaitReplication();
         this.awaitNodesAgreeOnPrimary();
         if (this.getPrimary() === node) {
             return;
@@ -800,6 +836,7 @@ var ReplSetTest = function(opts) {
                     print("Caught exception while stepping down node '" + tojson(node.host) +
                           "': " + tojson(ex));
                 }
+                this.awaitReplication();
                 this.awaitNodesAgreeOnPrimary();
             }
 

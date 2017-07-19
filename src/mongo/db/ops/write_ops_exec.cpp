@@ -119,7 +119,7 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
             log() << curOp->debug().report(opCtx->getClient(), *curOp, lockerInfo.stats);
         }
 
-        if (shouldSample && curOp->shouldDBProfile()) {
+        if (curOp->shouldDBProfile(shouldSample)) {
             profile(opCtx, CurOp::get(opCtx)->getNetworkOp());
         }
     } catch (const DBException& ex) {
@@ -182,7 +182,7 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         AutoGetOrCreateDb db(opCtx, ns.db(), MODE_X);
         assertCanWrite_inlock(opCtx, ns);
-        if (!db.getDb()->getCollection(ns.ns())) {  // someone else may have beat us to it.
+        if (!db.getDb()->getCollection(opCtx, ns)) {  // someone else may have beat us to it.
             WriteUnitOfWork wuow(opCtx);
             uassertStatusOK(userCreateNS(opCtx, db.getDb(), ns.ns(), BSONObj()));
             wuow.commit();
@@ -221,8 +221,10 @@ bool handleError(OperationContext* opCtx,
                                    << demangleName(typeid(ex)));
         }
 
-        ShardingState::get(opCtx)->onStaleShardVersion(
-            opCtx, wholeOp.ns, staleConfigException->getVersionReceived());
+        if (!opCtx->getClient()->isInDirectClient()) {
+            ShardingState::get(opCtx)->onStaleShardVersion(
+                opCtx, wholeOp.ns, staleConfigException->getVersionReceived());
+        }
         out->staleConfigException =
             stdx::make_unique<SendStaleConfigException>(*staleConfigException);
         return false;
@@ -499,6 +501,7 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* opCtx,
     request.setQuery(op.query);
     request.setCollation(op.collation);
     request.setUpdates(op.update);
+    request.setArrayFilters(op.arrayFilters);
     request.setMulti(op.multi);
     request.setUpsert(op.upsert);
     request.setYieldPolicy(PlanExecutor::YIELD_AUTO);  // ParsedUpdate overrides this for $isolated.

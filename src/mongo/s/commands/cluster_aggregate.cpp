@@ -60,12 +60,6 @@
 namespace mongo {
 
 namespace {
-// These fields are not part of the AggregationRequest since they are not handled by the aggregation
-// subsystem, so we serialize them separately.
-const std::initializer_list<StringData> kFieldsToPropagateToShards = {
-    "$queryOptions", "readConcern", QueryRequest::cmdOptionMaxTimeMS,
-};
-
 // Given a document representing an aggregation command such as
 //
 //   {aggregate: "myCollection", pipeline: [], ...},
@@ -73,23 +67,13 @@ const std::initializer_list<StringData> kFieldsToPropagateToShards = {
 // produces the corresponding explain command:
 //
 //   {explain: {aggregate: "myCollection", pipline: [], ...}, verbosity: ...}
-//
-// The 'cmdObj' is the original user request, which may contain fields to propagate to the shards
-// that are not handled by the aggregation subsystem itself (e.g. maxTimeMS).
-Document wrapAggAsExplain(Document aggregateCommand,
-                          ExplainOptions::Verbosity verbosity,
-                          const BSONObj& cmdObj) {
+Document wrapAggAsExplain(Document aggregateCommand, ExplainOptions::Verbosity verbosity) {
     MutableDocument explainCommandBuilder;
     explainCommandBuilder["explain"] = Value(aggregateCommand);
 
     // Add explain command options.
     for (auto&& explainOption : ExplainOptions::toBSON(verbosity)) {
         explainCommandBuilder[explainOption.fieldNameStringData()] = Value(explainOption);
-    }
-
-    // Propagate options not specific to agg to the shards.
-    for (auto&& field : kFieldsToPropagateToShards) {
-        explainCommandBuilder[field] = Value(cmdObj[field]);
     }
 
     return explainCommandBuilder.freeze();
@@ -101,7 +85,6 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                       const Namespaces& namespaces,
                                       const AggregationRequest& request,
                                       BSONObj cmdObj,
-                                      int options,
                                       BSONObjBuilder* result) {
     auto const catalogCache = Grid::get(opCtx)->catalogCache();
 
@@ -134,13 +117,8 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     }
 
     if (!executionNsRoutingInfo.cm()) {
-        return aggPassthrough(opCtx,
-                              namespaces,
-                              executionNsRoutingInfo.primary()->getId(),
-                              request,
-                              cmdObj,
-                              result,
-                              options);
+        return aggPassthrough(
+            opCtx, namespaces, executionNsRoutingInfo.primary()->getId(), request, cmdObj, result);
     }
 
     const auto chunkMgr = executionNsRoutingInfo.cm();
@@ -190,43 +168,44 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     const bool needPrimaryShardMerger = pipeline.getValue()->needsPrimaryShardMerger();
     const bool needSplit = !singleShard || needPrimaryShardMerger;
 
-    // Split the pipeline into pieces for mongod(s) and this mongos. If needSplit is true,
-    // 'pipeline' will become the merger side.
-    boost::intrusive_ptr<Pipeline> shardPipeline(needSplit ? pipeline.getValue()->splitForSharded()
-                                                           : pipeline.getValue());
+    // Split the pipeline into pieces for mongod(s) and this mongos. It is illegal to use 'pipeline'
+    // after this point.
+    std::unique_ptr<Pipeline, Pipeline::Deleter> pipelineForTargetedShards;
+    std::unique_ptr<Pipeline, Pipeline::Deleter> pipelineForMergingShard;
+    if (needSplit) {
+        pipelineForTargetedShards = pipeline.getValue()->splitForSharded();
+        pipelineForMergingShard = std::move(pipeline.getValue());
+    } else {
+        pipelineForTargetedShards = std::move(pipeline.getValue());
+    }
 
     // Create the command for the shards. The 'fromRouter' field means produce output to be
     // merged.
-    MutableDocument commandBuilder(request.serializeToCommandObj());
-    commandBuilder[AggregationRequest::kPipelineName] = Value(shardPipeline->serialize());
+    MutableDocument targetedCommandBuilder(request.serializeToCommandObj());
+    targetedCommandBuilder[AggregationRequest::kPipelineName] =
+        Value(pipelineForTargetedShards->serialize());
     if (needSplit) {
-        commandBuilder[AggregationRequest::kFromRouterName] = Value(true);
-        commandBuilder[AggregationRequest::kCursorName] =
+        targetedCommandBuilder[AggregationRequest::kFromRouterName] = Value(true);
+        targetedCommandBuilder[AggregationRequest::kCursorName] =
             Value(DOC(AggregationRequest::kBatchSizeName << 0));
     }
 
     // If this is a request for an aggregation explain, then we must wrap the aggregate inside an
     // explain command.
     if (mergeCtx->explain) {
-        commandBuilder.reset(wrapAggAsExplain(commandBuilder.freeze(), *mergeCtx->explain, cmdObj));
-    } else {
-        // Add things like $queryOptions which must be sent to the shards but are not part of the
-        // agg request.
-        for (auto&& field : kFieldsToPropagateToShards) {
-            commandBuilder[field] = Value(cmdObj[field]);
-        }
+        targetedCommandBuilder.reset(
+            wrapAggAsExplain(targetedCommandBuilder.freeze(), *mergeCtx->explain));
     }
 
-    BSONObj shardedCommand = commandBuilder.freeze().toBson();
-    BSONObj shardQuery = shardPipeline->getInitialQuery();
+    BSONObj targetedCommand = targetedCommandBuilder.freeze().toBson();
+    BSONObj shardQuery = pipelineForTargetedShards->getInitialQuery();
 
     // Run the command on the shards
     // TODO need to make sure cursors are killed if a retry is needed
     std::vector<Strategy::CommandResult> shardResults;
     Strategy::commandOp(opCtx,
                         namespaces.executionNss.db().toString(),
-                        shardedCommand,
-                        options,
+                        targetedCommand,
                         namespaces.executionNss.ns(),
                         shardQuery,
                         request.getCollation(),
@@ -238,9 +217,10 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 
         if (needSplit) {
             *result << "needsPrimaryShardMerger" << needPrimaryShardMerger << "splitPipeline"
-                    << Document{{"shardsPart", shardPipeline->writeExplainOps(*mergeCtx->explain)},
+                    << Document{{"shardsPart",
+                                 pipelineForTargetedShards->writeExplainOps(*mergeCtx->explain)},
                                 {"mergerPart",
-                                 pipeline.getValue()->writeExplainOps(*mergeCtx->explain)}};
+                                 pipelineForMergingShard->writeExplainOps(*mergeCtx->explain)}};
         } else {
             *result << "splitPipeline" << BSONNULL;
         }
@@ -270,16 +250,12 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         return getStatusFromCommandResult(reply);
     }
 
-    pipeline.getValue()->addInitialSource(
+    pipelineForMergingShard->addInitialSource(
         DocumentSourceMergeCursors::create(parseCursors(shardResults), mergeCtx));
 
     MutableDocument mergeCmd(request.serializeToCommandObj());
-    mergeCmd["pipeline"] = Value(pipeline.getValue()->serialize());
+    mergeCmd["pipeline"] = Value(pipelineForMergingShard->serialize());
     mergeCmd["cursor"] = Value(cmdObj["cursor"]);
-
-    if (cmdObj.hasField("$queryOptions")) {
-        mergeCmd["$queryOptions"] = Value(cmdObj["$queryOptions"]);
-    }
 
     if (cmdObj.hasField(QueryRequest::cmdOptionMaxTimeMS)) {
         mergeCmd[QueryRequest::cmdOptionMaxTimeMS] =
@@ -300,7 +276,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 
     std::string outputNsOrEmpty;
     if (DocumentSourceOut* out =
-            dynamic_cast<DocumentSourceOut*>(pipeline.getValue()->getSources().back().get())) {
+            dynamic_cast<DocumentSourceOut*>(pipelineForMergingShard->getSources().back().get())) {
         outputNsOrEmpty = out->getOutputNs().ns();
     }
 
@@ -317,7 +293,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 
     ShardConnection conn(mergingShard->getConnString(), outputNsOrEmpty);
     BSONObj mergedResults =
-        aggRunCommand(opCtx, conn.get(), namespaces, request, mergeCmd.freeze().toBson(), options);
+        aggRunCommand(opCtx, conn.get(), namespaces, request, mergeCmd.freeze().toBson());
     conn.done();
 
     if (auto wcErrorElem = mergedResults["writeConcernError"]) {
@@ -438,15 +414,13 @@ BSONObj ClusterAggregate::aggRunCommand(OperationContext* opCtx,
                                         DBClientBase* conn,
                                         const Namespaces& namespaces,
                                         const AggregationRequest& aggRequest,
-                                        BSONObj cmd,
-                                        int queryOptions) {
+                                        BSONObj cmd) {
     // Temporary hack. See comment on declaration for details.
     auto cursor = conn->query(namespaces.executionNss.db() + ".$cmd",
                               cmd,
-                              -1,    // nToReturn
-                              0,     // nToSkip
-                              NULL,  // fieldsToReturn
-                              queryOptions);
+                              -1,  // nToReturn
+                              0,   // nToSkip
+                              NULL);
     massert(17014,
             str::stream() << "aggregate command didn't return results on host: "
                           << conn->toString(),
@@ -481,8 +455,7 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
                                         const ShardId& shardId,
                                         const AggregationRequest& aggRequest,
                                         BSONObj cmdObj,
-                                        BSONObjBuilder* out,
-                                        int queryOptions) {
+                                        BSONObjBuilder* out) {
     // Temporary hack. See comment on declaration for details.
     auto shardStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId);
     if (!shardStatus.isOK()) {
@@ -493,12 +466,12 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
     // the shards.
     if (aggRequest.getExplain()) {
         auto explainCmdObj =
-            wrapAggAsExplain(aggRequest.serializeToCommandObj(), *aggRequest.getExplain(), cmdObj);
+            wrapAggAsExplain(aggRequest.serializeToCommandObj(), *aggRequest.getExplain());
         cmdObj = explainCmdObj.toBson();
     }
 
     ShardConnection conn(shardStatus.getValue()->getConnString(), "");
-    BSONObj result = aggRunCommand(opCtx, conn.get(), namespaces, aggRequest, cmdObj, queryOptions);
+    BSONObj result = aggRunCommand(opCtx, conn.get(), namespaces, aggRequest, cmdObj);
     conn.done();
 
     // First append the properly constructed writeConcernError. It will then be skipped
@@ -526,7 +499,7 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
         nsStruct.executionNss = resolvedView.getNamespace();
 
         return ClusterAggregate::runAggregate(
-            opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, queryOptions, out);
+            opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, out);
     }
 
     return getStatusFromCommandResult(result);

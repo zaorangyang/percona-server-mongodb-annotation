@@ -119,7 +119,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& cmdObj,
-             int,
              string& errmsg,
              BSONObjBuilder& result) {
         const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
@@ -198,11 +197,11 @@ public:
         dassert(ns == cursorNss.getTargetNSForListIndexes());
 
         auto statusWithPlanExecutor = PlanExecutor::make(
-            opCtx, std::move(ws), std::move(root), cursorNss, PlanExecutor::YIELD_MANUAL);
+            opCtx, std::move(ws), std::move(root), cursorNss, PlanExecutor::NO_YIELD);
         if (!statusWithPlanExecutor.isOK()) {
             return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
-        unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        auto exec = std::move(statusWithPlanExecutor.getValue());
 
         BSONArrayBuilder firstBatch;
 
@@ -228,6 +227,7 @@ public:
             exec->saveState();
             exec->detachFromOperationContext();
             auto pinnedCursor = CursorManager::getGlobalCursorManager()->registerCursor(
+                opCtx,
                 {std::move(exec),
                  cursorNss,
                  AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),

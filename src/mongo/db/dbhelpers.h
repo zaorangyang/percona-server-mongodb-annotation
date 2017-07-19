@@ -32,7 +32,6 @@
 #include <memory>
 
 #include "mongo/db/db.h"
-#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/data_protector.h"
 
@@ -53,23 +52,6 @@ struct WriteConcernOptions;
  */
 struct Helpers {
     class RemoveSaver;
-
-    /* ensure the specified index exists.
-
-       @param keyPattern key pattern, e.g., { ts : 1 }
-       @param name index name, e.g., "name_1"
-
-       This method can be a little (not much) cpu-slow, so you may wish to use
-         OCCASIONALLY ensureIndex(...);
-
-       Note: does nothing if collection does not yet exist.
-    */
-    static void ensureIndex(OperationContext* opCtx,
-                            Collection* collection,
-                            BSONObj keyPattern,
-                            IndexDescriptor::IndexVersion indexVersion,
-                            bool unique,
-                            const char* name);
 
     /* fetch a single object from collection ns that matches query.
        set your db SavedContext first.
@@ -99,7 +81,7 @@ struct Helpers {
      */
     static bool findById(OperationContext* opCtx,
                          Database* db,
-                         const char* ns,
+                         StringData ns,
                          BSONObj query,
                          BSONObj& result,
                          bool* nsFound = 0,
@@ -184,7 +166,7 @@ struct Helpers {
      * You do not need to set the database before calling.
      * Does not oplog the operation.
      */
-    static void emptyCollection(OperationContext* opCtx, const char* ns);
+    static void emptyCollection(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * for saving deleted bson objects to a flat file

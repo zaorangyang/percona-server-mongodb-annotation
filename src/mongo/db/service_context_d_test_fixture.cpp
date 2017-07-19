@@ -55,9 +55,7 @@ void ServiceContextMongoDTest::setUp() {
     Client::initThread(getThreadName());
     ServiceContext* serviceContext = getServiceContext();
 
-    std::array<std::uint8_t, 20> tempKey = {};
-    TimeProofService::Key key(std::move(tempKey));
-    auto timeProofService = stdx::make_unique<TimeProofService>(std::move(key));
+    auto timeProofService = stdx::make_unique<TimeProofService>();
     auto logicalClock =
         stdx::make_unique<LogicalClock>(serviceContext, std::move(timeProofService));
     LogicalClock::set(serviceContext, std::move(logicalClock));
@@ -107,7 +105,7 @@ void ServiceContextMongoDTest::_dropAllDBs(OperationContext* opCtx) {
     // allocates resources to track these empty databases. These resources not released by
     // dropAllDatabasesExceptLocal() will be leaked at exit unless we call DatabaseHolder::closeAll.
     BSONObjBuilder unused;
-    invariant(dbHolder().closeAll(opCtx, unused, false));
+    invariant(dbHolder().closeAll(opCtx, unused, false, "all databases dropped"));
 }
 
 }  // namespace mongo

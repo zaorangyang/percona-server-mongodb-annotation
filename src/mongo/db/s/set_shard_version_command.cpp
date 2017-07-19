@@ -91,7 +91,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string&,
              BSONObj& cmdObj,
-             int options,
              string& errmsg,
              BSONObjBuilder& result) {
         auto shardingState = ShardingState::get(opCtx);
@@ -226,7 +225,7 @@ public:
             }
 
             // Views do not require a shard version check.
-            if (autoDb->getDb() && !autoDb->getDb()->getCollection(nss.ns()) &&
+            if (autoDb->getDb() && !autoDb->getDb()->getCollection(opCtx, nss) &&
                 autoDb->getDb()->getViewCatalog()->lookup(opCtx, nss.ns())) {
                 return true;
             }

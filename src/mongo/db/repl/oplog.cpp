@@ -301,7 +301,7 @@ void truncateOplogTo(OperationContext* opCtx, Timestamp truncateTimestamp) {
     const NamespaceString oplogNss(rsOplogName);
     AutoGetDb autoDb(opCtx, oplogNss.db(), MODE_IX);
     Lock::CollectionLock oplogCollectionLoc(opCtx->lockState(), oplogNss.ns(), MODE_X);
-    Collection* oplogCollection = autoDb.getDb()->getCollection(oplogNss);
+    Collection* oplogCollection = autoDb.getDb()->getCollection(opCtx, oplogNss);
     if (!oplogCollection) {
         fassertFailedWithStatusNoTrace(
             34418,
@@ -390,13 +390,12 @@ void _logOpsInner(OperationContext* opCtx,
 
 void logOp(OperationContext* opCtx,
            const char* opstr,
-           const char* ns,
+           const NamespaceString& nss,
            const BSONObj& obj,
            const BSONObj* o2,
            bool fromMigrate) {
     ReplicationCoordinator::Mode replMode =
         ReplicationCoordinator::get(opCtx)->getReplicationMode();
-    NamespaceString nss(ns);
     if (oplogDisabled(opCtx, replMode, nss))
         return;
 
@@ -495,7 +494,7 @@ void createOplog(OperationContext* opCtx, const std::string& oplogCollectionName
     const ReplSettings& replSettings = ReplicationCoordinator::get(opCtx)->getSettings();
 
     OldClientContext ctx(opCtx, oplogCollectionName);
-    Collection* collection = ctx.db()->getCollection(oplogCollectionName);
+    Collection* collection = ctx.db()->getCollection(opCtx, oplogCollectionName);
 
     if (collection) {
         if (replSettings.getOplogSizeBytes() != 0) {
@@ -705,6 +704,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             "'ns' must be of type String",
             fieldNs.type() == BSONType::String);
     const StringData ns = fieldNs.valueStringData();
+    NamespaceString requestNss{ns};
 
     BSONObj o2;
     if (fieldO2.isABSONObj())
@@ -723,7 +723,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_X));
         }
     }
-    Collection* collection = db->getCollection(ns);
+    Collection* collection = db->getCollection(opCtx, requestNss);
     IndexCatalog* indexCatalog = collection == nullptr ? nullptr : collection->getIndexCatalog();
     const bool haveWrappingWriteUnitOfWork = opCtx->lockState()->inAWriteUnitOfWork();
     uassert(ErrorCodes::CommandNotSupportedOnView,
@@ -758,7 +758,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     nsToDatabaseSubstring(ns) == indexNss.db());
 
             // Check if collection exists.
-            auto indexCollection = db->getCollection(indexNss);
+            auto indexCollection = db->getCollection(opCtx, indexNss);
             uassert(ErrorCodes::NamespaceNotFound,
                     str::stream() << "Failed to create index due to missing collection: "
                                   << op.toString(),
@@ -885,13 +885,12 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 BSONObjBuilder b;
                 b.append(o.getField("_id"));
 
-                const NamespaceString requestNs(ns);
-                UpdateRequest request(requestNs);
+                UpdateRequest request(requestNss);
 
                 request.setQuery(b.done());
                 request.setUpdates(o);
                 request.setUpsert();
-                UpdateLifecycleImpl updateLifecycle(requestNs);
+                UpdateLifecycleImpl updateLifecycle(requestNss);
                 request.setLifecycle(&updateLifecycle);
 
                 UpdateResult res = update(opCtx, db, request);
@@ -916,13 +915,12 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 str::stream() << "Failed to apply update due to missing _id: " << op.toString(),
                 updateCriteria.hasField("_id"));
 
-        const NamespaceString requestNs(ns);
-        UpdateRequest request(requestNs);
+        UpdateRequest request(requestNss);
 
         request.setQuery(updateCriteria);
         request.setUpdates(o);
         request.setUpsert(upsert);
-        UpdateLifecycleImpl updateLifecycle(requestNs);
+        UpdateLifecycleImpl updateLifecycle(requestNss);
         request.setLifecycle(&updateLifecycle);
 
         UpdateResult ur = update(opCtx, db, request);
@@ -976,7 +974,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 o.hasField("_id"));
 
         if (opType[1] == 0) {
-            deleteObjects(opCtx, collection, ns, o, PlanExecutor::YIELD_MANUAL, /*justOne*/ valueB);
+            deleteObjects(opCtx, collection, requestNss, o, /*justOne*/ valueB);
         } else
             verify(opType[1] == 'b');  // "db" advertisement
         if (incrementOpsAppliedStats) {
@@ -999,7 +997,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
     // observers.
     WriteUnitOfWork wuow(opCtx);
     getGlobalAuthorizationManager()->logOp(
-        opCtx, opType, ns.toString().c_str(), o, fieldO2.isABSONObj() ? &o2 : NULL);
+        opCtx, opType, requestNss, o, fieldO2.isABSONObj() ? &o2 : NULL);
     wuow.commit();
 
     return Status::OK();
@@ -1037,7 +1035,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
     }
     {
         Database* db = dbHolder().get(opCtx, nss.ns());
-        if (db && !db->getCollection(nss.ns()) && db->getViewCatalog()->lookup(opCtx, nss.ns())) {
+        if (db && !db->getCollection(opCtx, nss) && db->getViewCatalog()->lookup(opCtx, nss.ns())) {
             return {ErrorCodes::CommandNotSupportedOnView,
                     str::stream() << "applyOps not supported on view:" << nss.ns()};
         }
@@ -1115,7 +1113,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
     // AuthorizationManager's logOp method registers a RecoveryUnit::Change
     // and to do so we need to have begun a UnitOfWork
     WriteUnitOfWork wuow(opCtx);
-    getGlobalAuthorizationManager()->logOp(opCtx, opType, nss.ns().c_str(), o, nullptr);
+    getGlobalAuthorizationManager()->logOp(opCtx, opType, nss, o, nullptr);
     wuow.commit();
 
     return Status::OK();

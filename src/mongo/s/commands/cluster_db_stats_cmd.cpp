@@ -30,16 +30,27 @@
 
 #include <vector>
 
-#include "mongo/s/commands/run_on_all_shards_cmd.h"
+#include "mongo/db/commands.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
 
 using std::vector;
 
-class DBStatsCmd : public RunOnAllShardsCommand {
+class DBStatsCmd : public Command {
 public:
-    DBStatsCmd() : RunOnAllShardsCommand("dbStats", "dbstats") {}
+    DBStatsCmd() : Command("dbStats", false, "dbstats") {}
+
+    bool slaveOk() const override {
+        return true;
+    }
+    bool adminOnly() const override {
+        return false;
+    }
+
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {
@@ -52,7 +63,32 @@ public:
         return false;
     }
 
-    virtual void aggregateResults(const vector<ShardAndReply>& results, BSONObjBuilder& output) {
+    bool run(OperationContext* opCtx,
+             const std::string& dbName,
+             BSONObj& cmdObj,
+             std::string& errmsg,
+             BSONObjBuilder& output) override {
+        auto requests = buildRequestsForAllShards(opCtx, cmdObj);
+        auto swResponses =
+            gatherResponsesFromShards(opCtx, dbName, cmdObj, requests, &output, nullptr);
+        if (!swResponses.isOK()) {
+            // We failed to obtain a response or error from all shards.
+            return appendCommandStatus(output, swResponses.getStatus());
+        }
+
+        // Only aggregate results if we got a success response from every shard.
+        auto responses = std::move(swResponses.getValue());
+        if (std::all_of(
+                responses.begin(), responses.end(), [](AsyncRequestsSender::Response response) {
+                    return response.swResponse.getStatus().isOK();
+                })) {
+            aggregateResults(std::move(responses), output);
+        }
+        return true;
+    }
+
+    void aggregateResults(const vector<AsyncRequestsSender::Response>& responses,
+                          BSONObjBuilder& output) {
         long long objects = 0;
         long long unscaledDataSize = 0;
         long long dataSize = 0;
@@ -65,8 +101,9 @@ public:
         long long freeListNum = 0;
         long long freeListSize = 0;
 
-        for (const ShardAndReply& shardAndReply : results) {
-            const BSONObj& b = std::get<1>(shardAndReply);
+        for (const auto& response : responses) {
+            invariant(response.swResponse.getStatus().isOK());
+            const BSONObj& b = response.swResponse.getValue().data;
 
             objects += b["objects"].numberLong();
             unscaledDataSize += b["avgObjSize"].numberLong() * b["objects"].numberLong();

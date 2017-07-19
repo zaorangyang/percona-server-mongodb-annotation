@@ -360,7 +360,7 @@ void CurOp::reportState(BSONObjBuilder* builder) {
     // When currentOp is run, it returns a single response object containing all current
     // operations. This request will fail if the response exceeds the 16MB document limit. We limit
     // query object size here to reduce the risk of exceeding.
-    const size_t maxQuerySize = 512;
+    const size_t maxQuerySize = 1000;
 
     if (_networkOp == dbInsert) {
         appendAsObjOrString("insert", _query, maxQuerySize, builder);
@@ -420,14 +420,29 @@ void CurOp::reportState(BSONObjBuilder* builder) {
     builder->append("numYields", _numYields);
 }
 
-bool CurOp::_shouldDBProfileWithRateLimit() const {
+bool CurOp::_shouldDBProfileWithRateLimit() {
     // Pseudo RNG for rate limiter feature
     static PseudoRandom _prng(std::unique_ptr<SecureRandom>(SecureRandom::create())->nextInt64());
 
     const int64_t RATE_LIMIT_MULTIPLIER = 1LL << 52;
     static_assert( RATE_LIMIT_MAX * RATE_LIMIT_MULTIPLIER <= std::numeric_limits<int64_t>::max(),
                   "product of RATE_LIMIT_MAX and RATE_LIMIT_MULTIPLIER should not exceed int64_t range");
-    return _prng.nextInt64(RATE_LIMIT_MULTIPLIER) * serverGlobalParams.rateLimit < RATE_LIMIT_MULTIPLIER;
+
+    // Here we assume rate limiter feature is enabled
+    dassert(serverGlobalParams.rateLimit > 1);
+
+    if (_dbprofile <= 0)
+        return false;
+
+    long long opMicros = isDone() ? totalTimeMicros() : elapsedMicros();
+    // Slow operations are always profiled in both "slow queries" and "all queries" modes
+    if (opMicros >= serverGlobalParams.slowMS * 1000LL)
+        return true;
+    // Fast operations are sampled by rate limit (only in "all queries" mode)
+    if (_dbprofile >= 2)
+        return _prng.nextInt64(RATE_LIMIT_MULTIPLIER) * serverGlobalParams.rateLimit < RATE_LIMIT_MULTIPLIER;
+
+    return false;
 }
 
 namespace {

@@ -41,6 +41,8 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builder.h"
@@ -83,7 +85,7 @@ Status renameCollection(OperationContext* opCtx,
     }
 
     Database* const sourceDB = dbHolder().get(opCtx, source.db());
-    Collection* const sourceColl = sourceDB ? sourceDB->getCollection(source.ns()) : nullptr;
+    Collection* const sourceColl = sourceDB ? sourceDB->getCollection(opCtx, source) : nullptr;
     if (!sourceColl) {
         if (sourceDB && sourceDB->getViewCatalog()->lookup(opCtx, source.ns()))
             return Status(ErrorCodes::CommandNotSupportedOnView,
@@ -124,13 +126,13 @@ Status renameCollection(OperationContext* opCtx,
 
     Database* const targetDB = dbHolder().openDb(opCtx, target.db());
 
-    {
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         WriteUnitOfWork wunit(opCtx);
 
         // Check if the target namespace exists and if dropTarget is true.
         // Return a non-OK status if target exists and dropTarget is not true or if the collection
         // is sharded.
-        if (targetDB->getCollection(target)) {
+        if (targetDB->getCollection(opCtx, target)) {
             if (CollectionShardingState::get(opCtx, target)->getMetadata()) {
                 return {ErrorCodes::IllegalOperation, "cannot rename to a sharded collection"};
             }
@@ -165,6 +167,7 @@ Status renameCollection(OperationContext* opCtx,
 
         wunit.commit();
     }
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "renameCollection", target.ns());
 
     // If we get here, we are renaming across databases, so we must copy all the data and
     // indexes, then remove the source collection.

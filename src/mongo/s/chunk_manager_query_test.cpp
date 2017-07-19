@@ -33,13 +33,15 @@
 #include <set>
 
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/s/catalog_cache_test_fixture.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/chunk_manager_test_fixture.h"
 
 namespace mongo {
 namespace {
 
-class ChunkManagerQueryTest : public ChunkManagerTestFixture {
+const NamespaceString kNss("TestDB", "TestColl");
+
+class ChunkManagerQueryTest : public CatalogCacheTestFixture {
 protected:
     void runQueryTest(const BSONObj& shardKey,
                       std::unique_ptr<CollatorInterface> defaultCollator,
@@ -50,7 +52,7 @@ protected:
                       const std::set<ShardId> expectedShardIds) {
         const ShardKeyPattern shardKeyPattern(shardKey);
         auto chunkManager =
-            makeChunkManager(shardKeyPattern, std::move(defaultCollator), false, splitPoints);
+            makeChunkManager(kNss, shardKeyPattern, std::move(defaultCollator), false, splitPoints);
 
         std::set<ShardId> shardIds;
         chunkManager->getShardIdsForQuery(operationContext(), query, queryCollation, &shardIds);

@@ -70,7 +70,7 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
                                                 opCtx);
 
     const NamespaceString& nsString = request.getNamespaceString();
-    Collection* collection = db->getCollection(nsString.ns());
+    Collection* collection = db->getCollection(opCtx, nsString);
 
     // If this is the local database, don't set last op.
     if (db->name() == "local") {
@@ -111,8 +111,7 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     uassertStatusOK(parsedUpdate.parseRequest());
 
     OpDebug* const nullOpDebug = nullptr;
-    std::unique_ptr<PlanExecutor> exec =
-        uassertStatusOK(getExecutorUpdate(opCtx, nullOpDebug, collection, &parsedUpdate));
+    auto exec = uassertStatusOK(getExecutorUpdate(opCtx, nullOpDebug, collection, &parsedUpdate));
 
     uassertStatusOK(exec->executePlan());
     if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {

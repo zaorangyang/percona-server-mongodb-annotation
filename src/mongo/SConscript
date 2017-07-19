@@ -31,6 +31,7 @@ env.SConscript(
         'db',
         'dbtests',
         'executor',
+        'idl',
         'installer',
         'logger',
         'platform',

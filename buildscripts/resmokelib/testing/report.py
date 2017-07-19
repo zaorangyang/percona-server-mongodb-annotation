@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 
-from .. import config
+from .. import config as _config
 from .. import logging
 
 
@@ -19,17 +19,14 @@ class TestReport(unittest.TestResult):
     Records test status and timing information.
     """
 
-    def __init__(self, logger, logging_config, build_id=None, build_config=None):
+    def __init__(self, job_logger):
         """
         Initializes the TestReport with the buildlogger configuration.
         """
 
         unittest.TestResult.__init__(self)
 
-        self.logger = logger
-        self.logging_config = logging_config
-        self.build_id = build_id
-        self.build_config = build_config
+        self.job_logger = job_logger
 
         self._lock = threading.Lock()
 
@@ -46,7 +43,9 @@ class TestReport(unittest.TestResult):
         dynamically add a #dbhash# test case.
         """
 
-        combined_report = cls(logging.loggers.EXECUTOR, {})
+        # TestReports that are used when running tests need a JobLogger but combined reports don't
+        # use the logger.
+        combined_report = cls(logging.loggers.EXECUTOR_LOGGER)
         combining_time = time.time()
 
         for report in reports:
@@ -100,25 +99,7 @@ class TestReport(unittest.TestResult):
             command = "(dynamic test case)"
         else:
             command = test.as_command()
-        self.logger.info("Running %s...\n%s", basename, command)
-
-        test_id = logging.buildlogger.new_test_id(self.build_id,
-                                                  self.build_config,
-                                                  basename,
-                                                  command)
-
-        if self.build_id is not None:
-            endpoint = logging.buildlogger.APPEND_TEST_LOGS_ENDPOINT % {
-                "build_id": self.build_id,
-                "test_id": test_id,
-            }
-
-            test_info.url_endpoint = "%s/%s/" % (config.BUILDLOGGER_URL.rstrip("/"),
-                                                 endpoint.strip("/"))
-
-            self.logger.info("Writing output of %s to %s.",
-                             test.shortDescription(),
-                             test_info.url_endpoint)
+        self.job_logger.info("Running %s...\n%s", basename, command)
 
         with self._lock:
             self.test_infos.append(test_info)
@@ -126,18 +107,14 @@ class TestReport(unittest.TestResult):
                 self.num_dynamic += 1
 
         # Set up the test-specific logger.
-        logger_name = "%s:%s" % (test.logger.name, test.short_name())
-        logger = logging.loggers.new_logger(logger_name, parent=test.logger)
-        logging.config.apply_buildlogger_test_handler(logger,
-                                                      self.logging_config,
-                                                      build_id=self.build_id,
-                                                      build_config=self.build_config,
-                                                      test_id=test_id)
+        test_logger = self.job_logger.new_test_logger(test.short_name(), test.basename(),
+                                                      command, test.logger)
+        test_info.url_endpoint = test_logger.url_endpoint
 
         # TestReport.combine() doesn't access the '__original_loggers' attribute, so we don't bother
         # protecting it with the lock.
         self.__original_loggers[test_info.test_id] = test.logger
-        test.logger = logger
+        test.logger = test_logger
 
     def stopTest(self, test):
         """
@@ -151,7 +128,7 @@ class TestReport(unittest.TestResult):
             test_info.end_time = time.time()
 
         time_taken = test_info.end_time - test_info.start_time
-        self.logger.info("%s ran in %0.2f seconds.", test.basename(), time_taken)
+        self.job_logger.info("%s ran in %0.2f seconds.", test.basename(), time_taken)
 
         # Asynchronously closes the buildlogger test handler to avoid having too many threads open
         # on 32-bit systems.
@@ -302,7 +279,7 @@ class TestReport(unittest.TestResult):
                 status = test_info.status
                 if status == "error":
                     # Don't distinguish between failures and errors.
-                    status = "fail"
+                    status = _config.REPORT_FAILURE_STATUS
                 elif status == "timeout":
                     # Until EVG-1536 is completed, we shouldn't distinguish between failures and
                     # interrupted tests in the report.json file. In Evergreen, the behavior to sort

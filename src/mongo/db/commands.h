@@ -137,7 +137,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const std::string& db,
                      BSONObj& cmdObj,
-                     int options,
                      std::string& errmsg,
                      BSONObjBuilder& result) = 0;
 
@@ -472,6 +471,22 @@ public:
                                      const std::string& dbname,
                                      const BSONObj& cmdObj);
 
+    /**
+     * Returns true if the provided argument is one that is handled by the command processing layer
+     * and should generally be ignored by individual command implementations. In particular,
+     * commands that fail on unrecognized arguments must not fail for any of these.
+     */
+    static bool isGenericArgument(StringData arg) {
+        // Not including "help" since we don't pass help requests through to the command parser.
+        // If that changes, it should be added.
+        return arg == "maxTimeMS" ||   //
+            arg == "$queryOptions" ||  //
+            arg == "shardVersion" ||   //
+            arg == "writeConcern" ||   //
+            arg == "readConcern" ||    //
+            false;  // These comments tell clang-format to keep this line-oriented.
+    }
+
 private:
     /**
      * Checks if the given client is authorized to run this command on database "dbname"
@@ -509,7 +524,7 @@ private:
     friend void mongo::execCommandClient(OperationContext* opCtx,
                                          Command* c,
                                          int queryOptions,
-                                         const char* ns,
+                                         StringData dbname,
                                          BSONObj& cmdObj,
                                          BSONObjBuilder& result);
 

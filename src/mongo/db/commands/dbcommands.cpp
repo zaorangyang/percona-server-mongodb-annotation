@@ -84,7 +84,6 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/read_concern.h"
 #include "mongo/db/repair_database.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -93,6 +92,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/metadata.h"
@@ -123,6 +123,15 @@ using std::stringstream;
 using std::unique_ptr;
 
 namespace {
+
+// This is a special flag that allows for testing of snapshot behavior by skipping the replication
+// related checks and isolating the storage/query side of snapshotting.
+bool testingSnapshotBehaviorInIsolation = false;
+ExportedServerParameter<bool, ServerParameterType::kStartupOnly> TestingSnapshotBehaviorInIsolation(
+    ServerParameterSet::getGlobal(),
+    "testingSnapshotBehaviorInIsolation",
+    &testingSnapshotBehaviorInIsolation);
+
 void registerErrorImpl(OperationContext* opCtx, const DBException& exception) {
     CurOp::get(opCtx)->debug().exceptionInfo = exception.getInfo();
 }
@@ -135,7 +144,7 @@ MONGO_INITIALIZER(InitializeRegisterErrorHandler)(InitializerContext* const) {
  * For replica set members it returns the last known op time from opCtx. Otherwise will return
  * uninitialized logical time.
  */
-LogicalTime _getClientOperationTime(OperationContext* opCtx) {
+LogicalTime getClientOperationTime(OperationContext* opCtx) {
     repl::ReplicationCoordinator* replCoord =
         repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
     const bool isReplSet =
@@ -156,9 +165,9 @@ LogicalTime _getClientOperationTime(OperationContext* opCtx) {
  *
  * TODO: SERVER-28419 Do not compute operationTime if replica set does not propagate clusterTime.
  */
-LogicalTime _computeOperationTime(OperationContext* opCtx,
-                                  LogicalTime startOperationTime,
-                                  repl::ReadConcernLevel level) {
+LogicalTime computeOperationTime(OperationContext* opCtx,
+                                 LogicalTime startOperationTime,
+                                 repl::ReadConcernLevel level) {
     repl::ReplicationCoordinator* replCoord =
         repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
     const bool isReplSet =
@@ -168,7 +177,7 @@ LogicalTime _computeOperationTime(OperationContext* opCtx,
         return LogicalTime();
     }
 
-    auto operationTime = _getClientOperationTime(opCtx);
+    auto operationTime = getClientOperationTime(opCtx);
     invariant(operationTime >= startOperationTime);
 
     // If the last operationTime has not changed, consider this command a read, and, for replica set
@@ -183,6 +192,160 @@ LogicalTime _computeOperationTime(OperationContext* opCtx,
 
     return operationTime;
 }
+
+Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
+    repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
+    auto lastAppliedTime = LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
+    if (clusterTime > lastAppliedTime) {
+        auto shardingState = ShardingState::get(opCtx);
+        // standalone replica set, so there is no need to advance the OpLog on the primary.
+        if (!shardingState->enabled()) {
+            return Status::OK();
+        }
+
+        auto myShard =
+            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardingState->getShardName());
+        if (!myShard.isOK()) {
+            return myShard.getStatus();
+        }
+
+        auto swRes = myShard.getValue()->runCommand(
+            opCtx,
+            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+            "admin",
+            BSON("applyOpLogNote" << 1 << "clusterTime" << clusterTime.asTimestamp() << "data"
+                                  << BSON("append noop write" << 1)),
+            Shard::RetryPolicy::kIdempotent);
+        return swRes.getStatus();
+    }
+    return Status::OK();
+}
+
+Status waitForReadConcern(OperationContext* opCtx, const repl::ReadConcernArgs& readConcernArgs) {
+    repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
+
+    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kLinearizableReadConcern) {
+        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
+            // For master/slave and standalone nodes, Linearizable Read is not supported.
+            return {ErrorCodes::NotAReplicaSet,
+                    "node needs to be a replica set member to use read concern"};
+        }
+
+        // Replica sets running pv0 do not support linearizable read concern until further testing
+        // is completed (SERVER-27025).
+        if (!replCoord->isV1ElectionProtocol()) {
+            return {
+                ErrorCodes::IncompatibleElectionProtocol,
+                "Replica sets running protocol version 0 do not support readConcern: linearizable"};
+        }
+
+        if (readConcernArgs.getArgsOpTime()) {
+            return {ErrorCodes::FailedToParse,
+                    "afterOpTime not compatible with linearizable read concern"};
+        }
+
+        if (!replCoord->getMemberState().primary()) {
+            return {ErrorCodes::NotMaster,
+                    "cannot satisfy linearizable read concern on non-primary node"};
+        }
+    }
+
+    auto afterClusterTime = readConcernArgs.getArgsClusterTime();
+    if (afterClusterTime) {
+        auto currentTime = LogicalClock::get(opCtx)->getClusterTime().getTime();
+        if (currentTime < *afterClusterTime) {
+            return {ErrorCodes::InvalidOptions,
+                    "readConcern afterClusterTime must not be greater than clusterTime value"};
+        }
+    }
+
+    // Skip waiting for the OpTime when testing snapshot behavior
+    if (!testingSnapshotBehaviorInIsolation && !readConcernArgs.isEmpty()) {
+        if (afterClusterTime) {
+            auto status = makeNoopWriteIfNeeded(opCtx, *afterClusterTime);
+            if (!status.isOK()) {
+                LOG(1) << "failed noop write due to " << status.toString();
+            }
+        }
+
+        auto status = replCoord->waitUntilOpTimeForRead(opCtx, readConcernArgs);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    if ((replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet ||
+         testingSnapshotBehaviorInIsolation) &&
+        readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
+        // ReadConcern Majority is not supported in ProtocolVersion 0.
+        if (!testingSnapshotBehaviorInIsolation && !replCoord->isV1ElectionProtocol()) {
+            return {ErrorCodes::ReadConcernMajorityNotEnabled,
+                    str::stream() << "Replica sets running protocol version 0 do not support "
+                                     "readConcern: majority"};
+        }
+
+        const int debugLevel = serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
+
+        LOG(debugLevel) << "Waiting for 'committed' snapshot to be available for reading: "
+                        << readConcernArgs;
+
+        Status status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+
+        // Wait until a snapshot is available.
+        while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
+            LOG(debugLevel) << "Snapshot not available yet.";
+            replCoord->waitUntilSnapshotCommitted(opCtx, SnapshotName::min());
+            status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+        }
+
+        if (!status.isOK()) {
+            return status;
+        }
+
+        LOG(debugLevel) << "Using 'committed' snapshot: " << CurOp::get(opCtx)->query();
+    }
+
+    return Status::OK();
+}
+
+Status waitForLinearizableReadConcern(OperationContext* opCtx) {
+
+    repl::ReplicationCoordinator* replCoord =
+        repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
+
+    {
+        Lock::DBLock lk(opCtx, "local", MODE_IX);
+        Lock::CollectionLock lock(opCtx->lockState(), "local.oplog.rs", MODE_IX);
+
+        if (!replCoord->canAcceptWritesForDatabase(opCtx, "admin")) {
+            return {ErrorCodes::NotMaster,
+                    "No longer primary when waiting for linearizable read concern"};
+        }
+
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+
+            WriteUnitOfWork uow(opCtx);
+            opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
+                opCtx,
+                BSON("msg"
+                     << "linearizable read"));
+            uow.commit();
+        }
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
+            opCtx, "waitForLinearizableReadConcern", "local.rs.oplog");
+    }
+    WriteConcernOptions wc = WriteConcernOptions(
+        WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, 0);
+
+    repl::OpTime lastOpApplied = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    auto awaitReplResult = replCoord->awaitReplication(opCtx, lastOpApplied, wc);
+    if (awaitReplResult.status == ErrorCodes::WriteConcernFailed) {
+        return Status(ErrorCodes::LinearizableReadConcernError,
+                      "Failed to confirm that read was linearizable.");
+    }
+    return awaitReplResult.status;
+}
+
 }  // namespace
 
 
@@ -200,7 +363,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      BSONObj& cmdObj,
-                     int options,
                      string& errmsg,
                      BSONObjBuilder& result) {
         bool force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
@@ -250,7 +412,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& cmdObj,
-             int,
              string& errmsg,
              BSONObjBuilder& result) {
         // disallow dropping the config database
@@ -319,7 +480,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& cmdObj,
-             int,
              string& errmsg,
              BSONObjBuilder& result) {
         BSONElement e = cmdObj.firstElement();
@@ -423,7 +583,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& cmdObj,
-             int options,
              string& errmsg,
              BSONObjBuilder& result) {
         BSONElement firstElement = cmdObj.firstElement();
@@ -520,7 +679,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& cmdObj,
-             int,
              string& errmsg,
              BSONObjBuilder& result) {
         const char* deprecationWarning =
@@ -578,7 +736,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      BSONObj& cmdObj,
-                     int,
                      string& errmsg,
                      BSONObjBuilder& result) {
         const NamespaceString nsToDrop = parseNsCollectionRequired(dbname, cmdObj);
@@ -630,7 +787,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      BSONObj& cmdObj,
-                     int,
                      string& errmsg,
                      BSONObjBuilder& result) {
         const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
@@ -772,7 +928,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& jsobj,
-             int,
              string& errmsg,
              BSONObjBuilder& result) {
         const NamespaceString nss(parseNs(dbname, jsobj));
@@ -832,9 +987,7 @@ public:
                 return 0;
             }
 
-            unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
-            // Process notifications when the lock is released/reacquired in the loop below
-            exec->registerExec(coll);
+            auto exec = std::move(statusWithPlanExecutor.getValue());
 
             BSONObj obj;
             PlanExecutor::ExecState state;
@@ -954,7 +1107,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& jsobj,
-             int,
              string& errmsg,
              BSONObjBuilder& result) {
         Timer timer;
@@ -982,7 +1134,7 @@ public:
 
         result.appendBool("estimate", estimate);
 
-        unique_ptr<PlanExecutor> exec;
+        unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
         if (min.isEmpty() && max.isEmpty()) {
             if (estimate) {
                 result.appendNumber("size", static_cast<long long>(collection->dataSize(opCtx)));
@@ -990,8 +1142,7 @@ public:
                 result.append("millis", timer.millis());
                 return 1;
             }
-            exec =
-                InternalPlanner::collectionScan(opCtx, ns, collection, PlanExecutor::YIELD_MANUAL);
+            exec = InternalPlanner::collectionScan(opCtx, ns, collection, PlanExecutor::NO_YIELD);
         } else if (min.isEmpty() || max.isEmpty()) {
             errmsg = "only one of min or max specified";
             return false;
@@ -1021,7 +1172,7 @@ public:
                                               min,
                                               max,
                                               BoundInclusion::kIncludeStartKeyOnly,
-                                              PlanExecutor::YIELD_MANUAL);
+                                              PlanExecutor::NO_YIELD);
         }
 
         long long avgObjSize = collection->dataSize(opCtx) / numRecords;
@@ -1099,7 +1250,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& jsobj,
-             int,
              string& errmsg,
              BSONObjBuilder& result) {
         const NamespaceString nss(parseNsCollectionRequired(dbname, jsobj));
@@ -1148,7 +1298,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& jsobj,
-             int,
              string& errmsg,
              BSONObjBuilder& result) {
         const NamespaceString nss(parseNsCollectionRequired(dbname, jsobj));
@@ -1184,7 +1333,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              BSONObj& jsobj,
-             int,
              string& errmsg,
              BSONObjBuilder& result) {
         int scale = 1;
@@ -1269,7 +1417,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      BSONObj& cmdObj,
-                     int,
                      string& errmsg,
                      BSONObjBuilder& result) {
         result << "you" << opCtx->getClient()->clientAddress(true /*includePort*/);
@@ -1296,7 +1443,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      BSONObj& cmdObj,
-                     int,
                      string& errmsg,
                      BSONObjBuilder& result) {
         result << "options" << QueryOption_AllSupported;
@@ -1421,7 +1567,7 @@ bool Command::run(OperationContext* opCtx,
     // run expects const db std::string (can't bind to temporary)
     const std::string db = request.getDatabase().toString();
 
-    BSONObjBuilder inPlaceReplyBob(replyBuilder->getInPlaceReplyBuilder(bytesToReserve));
+    BSONObjBuilder inPlaceReplyBob = replyBuilder->getInPlaceReplyBuilder(bytesToReserve);
     auto readConcernArgsStatus = _extractReadConcern(cmd, supportsReadConcern());
 
     if (!readConcernArgsStatus.isOK()) {
@@ -1449,7 +1595,7 @@ bool Command::run(OperationContext* opCtx,
 
     std::string errmsg;
     bool result;
-    auto startOperationTime = _getClientOperationTime(opCtx);
+    auto startOperationTime = getClientOperationTime(opCtx);
     if (!supportsWriteConcern(cmd)) {
         if (commandSpecifiesWriteConcern(cmd)) {
             auto result = appendCommandStatus(
@@ -1461,7 +1607,7 @@ bool Command::run(OperationContext* opCtx,
         }
 
         // TODO: remove queryOptions parameter from command's run method.
-        result = run(opCtx, db, cmd, 0, errmsg, inPlaceReplyBob);
+        result = run(opCtx, db, cmd, errmsg, inPlaceReplyBob);
     } else {
         auto wcResult = extractWriteConcern(opCtx, cmd, db);
         if (!wcResult.isOK()) {
@@ -1476,7 +1622,7 @@ bool Command::run(OperationContext* opCtx,
         ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
         opCtx->setWriteConcern(wcResult.getValue());
 
-        result = run(opCtx, db, cmd, 0, errmsg, inPlaceReplyBob);
+        result = run(opCtx, db, cmd, errmsg, inPlaceReplyBob);
 
         // Nothing in run() should change the writeConcern.
         dassert(SimpleBSONObjComparator::kInstance.evaluate(opCtx->getWriteConcern().toBSON() ==
@@ -1519,7 +1665,7 @@ bool Command::run(OperationContext* opCtx,
 
     appendCommandStatus(inPlaceReplyBob, result, errmsg);
 
-    auto operationTime = _computeOperationTime(
+    auto operationTime = computeOperationTime(
         opCtx, startOperationTime, readConcernArgsStatus.getValue().getLevel());
 
     // An uninitialized operation time means the cluster time is not propagated, so the operation
@@ -1563,9 +1709,12 @@ void mongo::execCommandDatabase(OperationContext* opCtx,
         uassertStatusOK(rpc::readRequestMetadata(opCtx, request.getMetadata()));
         rpc::TrackingMetadata::get(opCtx).initWithOperName(command->getName());
 
-        dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kCommandReply);
-
         std::string dbname = request.getDatabase().toString();
+        uassert(
+            ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid database name: '" << dbname << "'",
+            NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
+
         unique_ptr<MaintenanceModeSetter> mmSetter;
 
         BSONElement cmdOptionMaxTimeMSField;
@@ -1706,8 +1855,6 @@ void mongo::execCommandDatabase(OperationContext* opCtx,
         }
         retval = command->run(opCtx, request, replyBuilder);
 
-        dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kOutputDocs);
-
         if (!retval) {
             command->_commandsFailed.increment();
         }
@@ -1717,20 +1864,22 @@ void mongo::execCommandDatabase(OperationContext* opCtx,
             auto sce = dynamic_cast<const StaleConfigException*>(&e);
             invariant(sce);  // do not upcasts from DBException created by uassert variants.
 
-            ShardingState::get(opCtx)->onStaleShardVersion(
-                opCtx, NamespaceString(sce->getns()), sce->getVersionReceived());
+            if (!opCtx->getClient()->isInDirectClient()) {
+                ShardingState::get(opCtx)->onStaleShardVersion(
+                    opCtx, NamespaceString(sce->getns()), sce->getVersionReceived());
+            }
         }
 
         BSONObjBuilder metadataBob;
         appendReplyMetadata(opCtx, request, &metadataBob);
 
-        // Ideally this should be using _computeOperationTime, but with the code
+        // Ideally this should be using computeOperationTime, but with the code
         // structured as it currently is we don't know the startOperationTime or
         // readConcern at this point. Using the cluster time instead of the actual
         // operation time is correct, but can result in extra waiting on subsequent
         // afterClusterTime reads.
         //
-        // TODO: SERVER-28445 change this to use _computeOperationTime once the exception handling
+        // TODO: SERVER-28445 change this to use computeOperationTime once the exception handling
         // path is moved into Command::run()
         auto operationTime = LogicalClock::get(opCtx)->getClusterTime().getTime();
 
