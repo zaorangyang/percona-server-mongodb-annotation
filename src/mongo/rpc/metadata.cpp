@@ -38,6 +38,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/rpc/metadata/audit_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
@@ -131,26 +132,36 @@ Status readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) 
 
     auto logicalClock = LogicalClock::get(opCtx);
     if (logicalClock) {
-        auto logicalTimeMetadata = LogicalTimeMetadata::readFromMetadata(logicalTimeElem);
+        auto logicalTimeMetadata = rpc::LogicalTimeMetadata::readFromMetadata(logicalTimeElem);
         if (!logicalTimeMetadata.isOK()) {
             return logicalTimeMetadata.getStatus();
         }
 
-        if (isAuthorizedToAdvanceClock(opCtx)) {
-            auto advanceClockStatus = logicalClock->advanceClusterTimeFromTrustedSource(
-                logicalTimeMetadata.getValue().getSignedTime());
+        auto& signedTime = logicalTimeMetadata.getValue().getSignedTime();
+        // LogicalTimeMetadata is default constructed if no logical time metadata was sent, so a
+        // default constructed SignedLogicalTime should be ignored.
+        if (signedTime.getTime() == LogicalTime::kUninitialized) {
+            return Status::OK();
+        }
 
-            if (!advanceClockStatus.isOK()) {
-                return advanceClockStatus;
+        auto logicalTimeValidator = LogicalTimeValidator::get(opCtx);
+        if (isAuthorizedToAdvanceClock(opCtx)) {
+            if (logicalTimeValidator) {
+                logicalTimeValidator->updateCacheTrustedSource(signedTime);
             }
+        } else if (!logicalTimeValidator) {
+            return Status(ErrorCodes::CannotVerifyAndSignLogicalTime,
+                          "Cannot accept logicalTime: " + signedTime.getTime().toString() +
+                              ". May not be a part of a sharded cluster");
         } else {
-            auto advanceClockStatus =
-                logicalClock->advanceClusterTime(logicalTimeMetadata.getValue().getSignedTime());
+            auto advanceClockStatus = logicalTimeValidator->validate(signedTime);
 
             if (!advanceClockStatus.isOK()) {
                 return advanceClockStatus;
             }
         }
+
+        logicalClock->advanceClusterTime(signedTime.getTime());
     }
 
     return Status::OK();

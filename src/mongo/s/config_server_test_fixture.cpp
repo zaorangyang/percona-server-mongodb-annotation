@@ -66,6 +66,7 @@
 #include "mongo/s/client/shard_local.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/shard_remote.h"
+#include "mongo/s/config_server_catalog_cache_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/set_shard_version_request.h"
@@ -144,8 +145,14 @@ std::unique_ptr<ShardingCatalogManager> ConfigServerTestFixture::makeShardingCat
     return stdx::make_unique<ShardingCatalogManagerImpl>(std::move(specialExec));
 }
 
-std::unique_ptr<CatalogCache> ConfigServerTestFixture::makeCatalogCache() {
-    return stdx::make_unique<CatalogCache>();
+std::unique_ptr<CatalogCacheLoader> ConfigServerTestFixture::makeCatalogCacheLoader() {
+    return stdx::make_unique<ConfigServerCatalogCacheLoader>();
+}
+
+std::unique_ptr<CatalogCache> ConfigServerTestFixture::makeCatalogCache(
+    std::unique_ptr<CatalogCacheLoader> catalogCacheLoader) {
+    invariant(catalogCacheLoader);
+    return stdx::make_unique<CatalogCache>(std::move(catalogCacheLoader));
 }
 
 std::unique_ptr<BalancerConfiguration> ConfigServerTestFixture::makeBalancerConfiguration() {
@@ -292,5 +299,27 @@ StatusWith<std::vector<BSONObj>> ConfigServerTestFixture::getIndexes(OperationCo
     return cursorResponse.getValue().getBatch();
 }
 
+std::vector<KeysCollectionDocument> ConfigServerTestFixture::getKeys(OperationContext* opCtx) {
+    auto config = getConfigShard();
+    auto findStatus =
+        config->exhaustiveFindOnConfig(opCtx,
+                                       kReadPref,
+                                       repl::ReadConcernLevel::kMajorityReadConcern,
+                                       NamespaceString(KeysCollectionDocument::ConfigNS),
+                                       BSONObj(),
+                                       BSON("expiresAt" << 1),
+                                       boost::none);
+    ASSERT_OK(findStatus.getStatus());
+
+    std::vector<KeysCollectionDocument> keys;
+    const auto& docs = findStatus.getValue().docs;
+    for (const auto& doc : docs) {
+        auto keyStatus = KeysCollectionDocument::fromBSON(doc);
+        ASSERT_OK(keyStatus.getStatus());
+        keys.push_back(keyStatus.getValue());
+    }
+
+    return keys;
+}
 
 }  // namespace mongo

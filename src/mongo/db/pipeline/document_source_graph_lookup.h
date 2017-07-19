@@ -149,7 +149,7 @@ private:
      * Updates '_cache' with 'result' appropriately, given that 'result' was retrieved when querying
      * for 'queried'.
      */
-    void addToCache(Document result, const ValueUnorderedSet& queried);
+    void addToCache(const Document& result, const ValueUnorderedSet& queried);
 
     /**
      * Assert that '_visited' and '_frontier' have not exceeded the maximum meory usage, and then
@@ -203,9 +203,6 @@ private:
     // When we have internalized a $unwind, we must keep track of the input document, since we will
     // need it for multiple "getNext()" calls.
     boost::optional<Document> _input;
-
-    // The variables that are in scope to be used by the '_startWith' expression.
-    std::unique_ptr<Variables> _variables;
 
     // Keep track of a $unwind that was absorbed into this stage.
     boost::optional<boost::intrusive_ptr<DocumentSourceUnwind>> _unwind;

@@ -55,7 +55,6 @@
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/ops/update_driver.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -66,6 +65,7 @@
 #include "mongo/db/storage/record_fetcher.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+#include "mongo/db/update/update_driver.h"
 
 #include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
 #include "mongo/rpc/object_check.h"
@@ -80,11 +80,12 @@ MONGO_INITIALIZER(InitializeCollectionFactory)(InitializerContext* const) {
         [](Collection* const _this,
            OperationContext* const opCtx,
            const StringData fullNS,
+           OptionalCollectionUUID uuid,
            CollectionCatalogEntry* const details,
            RecordStore* const recordStore,
            DatabaseCatalogEntry* const dbce) -> std::unique_ptr<Collection::Impl> {
             return stdx::make_unique<CollectionImpl>(
-                _this, opCtx, fullNS, details, recordStore, dbce);
+                _this, opCtx, fullNS, uuid, details, recordStore, dbce);
         });
     return Status::OK();
 }
@@ -237,10 +238,12 @@ bool CappedInsertNotifier::isDead() {
 CollectionImpl::CollectionImpl(Collection* _this_init,
                                OperationContext* opCtx,
                                StringData fullNS,
+                               OptionalCollectionUUID uuid,
                                CollectionCatalogEntry* details,
                                RecordStore* recordStore,
                                DatabaseCatalogEntry* dbce)
     : _ns(fullNS),
+      _uuid(uuid),
       _details(details),
       _recordStore(recordStore),
       _dbce(dbce),
@@ -443,7 +446,8 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
         return status;
     invariant(sid == opCtx->recoveryUnit()->getSnapshotId());
 
-    getGlobalServiceContext()->getOpObserver()->onInserts(opCtx, ns(), begin, end, fromMigrate);
+    getGlobalServiceContext()->getOpObserver()->onInserts(
+        opCtx, ns(), uuid(), begin, end, fromMigrate);
 
     opCtx->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
@@ -506,7 +510,7 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
     docs.push_back(doc);
 
     getGlobalServiceContext()->getOpObserver()->onInserts(
-        opCtx, ns(), docs.begin(), docs.end(), false);
+        opCtx, ns(), uuid(), docs.begin(), docs.end(), false);
 
     opCtx->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
@@ -621,7 +625,7 @@ void CollectionImpl::deleteDocument(
     _recordStore->deleteRecord(opCtx, loc);
 
     getGlobalServiceContext()->getOpObserver()->onDelete(
-        opCtx, ns(), std::move(deleteState), fromMigrate);
+        opCtx, ns(), uuid(), std::move(deleteState), fromMigrate);
 }
 
 Counter64 moveCounter;
@@ -942,7 +946,7 @@ Status CollectionImpl::truncate(OperationContext* opCtx) {
 }
 
 void CollectionImpl::cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
+    dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_X));
     invariant(isCapped());
     BackgroundOperation::assertNoBgOpInProgForNs(ns());
     invariant(_indexCatalog.numIndexesInProgress(opCtx) == 0);

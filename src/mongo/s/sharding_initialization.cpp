@@ -37,10 +37,13 @@
 #include "mongo/base/status.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
 #include "mongo/db/audit.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/s/sharding_task_executor.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/time_proof_service.h"
 #include "mongo/executor/connection_pool.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
@@ -157,6 +160,7 @@ Status initializeGlobalShardingState(OperationContext* opCtx,
                                      const ConnectionString& configCS,
                                      StringData distLockProcessId,
                                      std::unique_ptr<ShardFactory> shardFactory,
+                                     std::unique_ptr<CatalogCache> catalogCache,
                                      rpc::ShardingEgressMetadataHookBuilder hookBuilder,
                                      ShardingCatalogManagerBuilder catalogManagerBuilder) {
     if (configCS.type() == ConnectionString::INVALID) {
@@ -199,7 +203,7 @@ Status initializeGlobalShardingState(OperationContext* opCtx,
     grid.init(
         std::move(catalogClient),
         std::move(catalogManager),
-        stdx::make_unique<CatalogCache>(),
+        std::move(catalogCache),
         std::move(shardRegistry),
         stdx::make_unique<ClusterCursorManager>(getGlobalServiceContext()->getPreciseClockSource()),
         stdx::make_unique<BalancerConfiguration>(),
@@ -221,6 +225,9 @@ Status initializeGlobalShardingState(OperationContext* opCtx,
             return status;
         }
     }
+
+    LogicalTimeValidator::set(opCtx->getServiceContext(),
+                              stdx::make_unique<LogicalTimeValidator>());
 
     return Status::OK();
 }

@@ -28,10 +28,13 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/base/status_with.h"
 #include "mongo/db/repl/abstract_async_component.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/rollback.h"
+#include "mongo/db/repl/rollback_common_point_resolver.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/net/hostandport.h"
@@ -74,6 +77,11 @@ class StorageInterface;
 class RollbackImpl : public AbstractAsyncComponent, public Rollback {
 public:
     /**
+     * Implementation of RollbackCommonPointResolver::Listener used by this class.
+     */
+    class Listener;
+
+    /**
      * This constructor is used to create a RollbackImpl instance that will run the entire
      * rollback algorithm. This is called during steady state replication when we determine that we
      * have to roll back after processing the first batch of oplog entries from the sync source.
@@ -85,6 +93,8 @@ public:
     RollbackImpl(executor::TaskExecutor* executor,
                  OplogInterface* localOplog,
                  const HostAndPort& syncSource,
+                 const NamespaceString& remoteOplogNss,
+                 std::size_t maxFetcherRestarts,
                  int requiredRollbackId,
                  ReplicationCoordinator* replicationCoordinator,
                  StorageInterface* storageInterface,
@@ -144,6 +154,10 @@ private:
      *         |
      *         |
      *         V
+     *     _commonPointResolverCallback()
+     *         |
+     *         |
+     *         V
      *    _tearDown()
      *         |
      *         |
@@ -159,6 +173,13 @@ private:
      * This callback is scheduled by _doStartup_inlock().
      */
     void _transitionToRollbackCallback(const executor::TaskExecutor::CallbackArgs& callbackArgs);
+
+    /**
+     * Callback function invoked when the RollbackCommonPointResolver completes its processing.
+     *
+     * This callback is scheduled by _transitionToRollbackCallback().
+     */
+    void _commonPointResolverCallback(const Status& commonPointResolverStatus);
 
     /**
      * If we detected that we rolled back the shardIdentity document as part of this rollback
@@ -218,6 +239,12 @@ private:
     // Host and port of the sync source we are rolling back against.
     const HostAndPort _syncSource;  // (R)
 
+    // Fully qualified namespace of the remote oplog.
+    const NamespaceString _remoteOplogNss;  // (R)
+
+    // Number of times to restart the query in the RollbackCommonPointResolver and OplogFetcher.
+    std::size_t _maxFetcherRestarts;  // (R)
+
     // This is the current rollback ID on the sync source that we are rolling back against.
     // It is an error if the rollback ID on the sync source changes before rollback is complete.
     const int _requiredRollbackId;  // (R)
@@ -230,6 +257,14 @@ private:
 
     // This is used to read and update the global minValid settings and to access the storage layer.
     StorageInterface* const _storageInterface;  // (R)
+
+    // Once we are in ROLLBACK, this is used to determine the common point between the local and
+    // remote oplogs. As we walk the local oplog backwards towards the common point, we will use
+    // the RollbackFixUpInfo to process each entry (but not including the common point itself). This
+    // gives us the information we need to roll back the local oplog entries that succeed the common
+    // point.
+    std::unique_ptr<RollbackCommonPointResolver::Listener> _listener;   // (S)
+    std::unique_ptr<RollbackCommonPointResolver> _commonPointResolver;  // (S)
 
     // This is invoked with the final status of the rollback. If startup() fails, this callback
     // is never invoked. The caller gets the last applied optime when the rollback completes

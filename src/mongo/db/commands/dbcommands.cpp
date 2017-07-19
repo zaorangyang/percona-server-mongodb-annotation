@@ -76,6 +76,7 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
@@ -84,6 +85,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
+#include "mongo/db/read_concern.h"
 #include "mongo/db/repair_database.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -106,7 +108,6 @@
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/rpc/request_interface.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
@@ -123,14 +124,6 @@ using std::stringstream;
 using std::unique_ptr;
 
 namespace {
-
-// This is a special flag that allows for testing of snapshot behavior by skipping the replication
-// related checks and isolating the storage/query side of snapshotting.
-bool testingSnapshotBehaviorInIsolation = false;
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly> TestingSnapshotBehaviorInIsolation(
-    ServerParameterSet::getGlobal(),
-    "testingSnapshotBehaviorInIsolation",
-    &testingSnapshotBehaviorInIsolation);
 
 void registerErrorImpl(OperationContext* opCtx, const DBException& exception) {
     CurOp::get(opCtx)->debug().exceptionInfo = exception.getInfo();
@@ -191,159 +184,6 @@ LogicalTime computeOperationTime(OperationContext* opCtx,
     }
 
     return operationTime;
-}
-
-Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
-    repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
-    auto lastAppliedTime = LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
-    if (clusterTime > lastAppliedTime) {
-        auto shardingState = ShardingState::get(opCtx);
-        // standalone replica set, so there is no need to advance the OpLog on the primary.
-        if (!shardingState->enabled()) {
-            return Status::OK();
-        }
-
-        auto myShard =
-            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardingState->getShardName());
-        if (!myShard.isOK()) {
-            return myShard.getStatus();
-        }
-
-        auto swRes = myShard.getValue()->runCommand(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
-            BSON("applyOpLogNote" << 1 << "clusterTime" << clusterTime.asTimestamp() << "data"
-                                  << BSON("append noop write" << 1)),
-            Shard::RetryPolicy::kIdempotent);
-        return swRes.getStatus();
-    }
-    return Status::OK();
-}
-
-Status waitForReadConcern(OperationContext* opCtx, const repl::ReadConcernArgs& readConcernArgs) {
-    repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
-
-    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kLinearizableReadConcern) {
-        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
-            // For master/slave and standalone nodes, Linearizable Read is not supported.
-            return {ErrorCodes::NotAReplicaSet,
-                    "node needs to be a replica set member to use read concern"};
-        }
-
-        // Replica sets running pv0 do not support linearizable read concern until further testing
-        // is completed (SERVER-27025).
-        if (!replCoord->isV1ElectionProtocol()) {
-            return {
-                ErrorCodes::IncompatibleElectionProtocol,
-                "Replica sets running protocol version 0 do not support readConcern: linearizable"};
-        }
-
-        if (readConcernArgs.getArgsOpTime()) {
-            return {ErrorCodes::FailedToParse,
-                    "afterOpTime not compatible with linearizable read concern"};
-        }
-
-        if (!replCoord->getMemberState().primary()) {
-            return {ErrorCodes::NotMaster,
-                    "cannot satisfy linearizable read concern on non-primary node"};
-        }
-    }
-
-    auto afterClusterTime = readConcernArgs.getArgsClusterTime();
-    if (afterClusterTime) {
-        auto currentTime = LogicalClock::get(opCtx)->getClusterTime().getTime();
-        if (currentTime < *afterClusterTime) {
-            return {ErrorCodes::InvalidOptions,
-                    "readConcern afterClusterTime must not be greater than clusterTime value"};
-        }
-    }
-
-    // Skip waiting for the OpTime when testing snapshot behavior
-    if (!testingSnapshotBehaviorInIsolation && !readConcernArgs.isEmpty()) {
-        if (afterClusterTime) {
-            auto status = makeNoopWriteIfNeeded(opCtx, *afterClusterTime);
-            if (!status.isOK()) {
-                LOG(1) << "failed noop write due to " << status.toString();
-            }
-        }
-
-        auto status = replCoord->waitUntilOpTimeForRead(opCtx, readConcernArgs);
-        if (!status.isOK()) {
-            return status;
-        }
-    }
-
-    if ((replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet ||
-         testingSnapshotBehaviorInIsolation) &&
-        readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
-        // ReadConcern Majority is not supported in ProtocolVersion 0.
-        if (!testingSnapshotBehaviorInIsolation && !replCoord->isV1ElectionProtocol()) {
-            return {ErrorCodes::ReadConcernMajorityNotEnabled,
-                    str::stream() << "Replica sets running protocol version 0 do not support "
-                                     "readConcern: majority"};
-        }
-
-        const int debugLevel = serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
-
-        LOG(debugLevel) << "Waiting for 'committed' snapshot to be available for reading: "
-                        << readConcernArgs;
-
-        Status status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
-
-        // Wait until a snapshot is available.
-        while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
-            LOG(debugLevel) << "Snapshot not available yet.";
-            replCoord->waitUntilSnapshotCommitted(opCtx, SnapshotName::min());
-            status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
-        }
-
-        if (!status.isOK()) {
-            return status;
-        }
-
-        LOG(debugLevel) << "Using 'committed' snapshot: " << CurOp::get(opCtx)->query();
-    }
-
-    return Status::OK();
-}
-
-Status waitForLinearizableReadConcern(OperationContext* opCtx) {
-
-    repl::ReplicationCoordinator* replCoord =
-        repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
-
-    {
-        Lock::DBLock lk(opCtx, "local", MODE_IX);
-        Lock::CollectionLock lock(opCtx->lockState(), "local.oplog.rs", MODE_IX);
-
-        if (!replCoord->canAcceptWritesForDatabase(opCtx, "admin")) {
-            return {ErrorCodes::NotMaster,
-                    "No longer primary when waiting for linearizable read concern"};
-        }
-
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-
-            WriteUnitOfWork uow(opCtx);
-            opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
-                opCtx,
-                BSON("msg"
-                     << "linearizable read"));
-            uow.commit();
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
-            opCtx, "waitForLinearizableReadConcern", "local.rs.oplog");
-    }
-    WriteConcernOptions wc = WriteConcernOptions(
-        WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, 0);
-
-    repl::OpTime lastOpApplied = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-    auto awaitReplResult = replCoord->awaitReplication(opCtx, lastOpApplied, wc);
-    if (awaitReplResult.status == ErrorCodes::WriteConcernFailed) {
-        return Status(ErrorCodes::LinearizableReadConcernError,
-                      "Failed to confirm that read was linearizable.");
-    }
-    return awaitReplResult.status;
 }
 
 }  // namespace
@@ -1488,7 +1328,8 @@ void appendReplyMetadata(OperationContext* opCtx,
         // Attach our own last opTime.
         repl::OpTime lastOpTimeFromClient =
             repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-        replCoord->prepareReplMetadata(request.getMetadata(), lastOpTimeFromClient, metadataBob);
+        replCoord->prepareReplMetadata(
+            opCtx, request.getMetadata(), lastOpTimeFromClient, metadataBob);
         // For commands from mongos, append some info to help getLastError(w) work.
         // TODO: refactor out of here as part of SERVER-18236
         if (isShardingAware || isConfig) {
@@ -1496,8 +1337,14 @@ void appendReplyMetadata(OperationContext* opCtx,
                 .writeToMetadata(metadataBob);
         }
 
-        rpc::LogicalTimeMetadata logicalTimeMetadata(LogicalClock::get(opCtx)->getClusterTime());
-        logicalTimeMetadata.writeToMetadata(metadataBob);
+        auto validator = LogicalTimeValidator::get(opCtx);
+        if (validator) {
+
+            auto currentTime =
+                validator->signLogicalTime(LogicalClock::get(opCtx)->getClusterTime());
+            rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
+            logicalTimeMetadata.writeToMetadata(metadataBob);
+        }
     }
 
     // If we're a shard other than the config shard, attach the last configOpTime we know about.
@@ -1540,6 +1387,27 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(const BSONObj& cmdObj,
     }
 
     return readConcernArgs;
+}
+
+void _waitForWriteConcernAndAddToCommandResponse(OperationContext* opCtx,
+                                                 const std::string& commandName,
+                                                 BSONObjBuilder* commandResponseBuilder) {
+    WriteConcernResult res;
+    auto waitForWCStatus =
+        waitForWriteConcern(opCtx,
+                            repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
+                            opCtx->getWriteConcern(),
+                            &res);
+    Command::appendCommandWCStatus(*commandResponseBuilder, waitForWCStatus, res);
+
+    // SERVER-22421: This code is to ensure error response backwards compatibility with the
+    // user management commands. This can be removed in 3.6.
+    if (!waitForWCStatus.isOK() && Command::isUserManagementCommand(commandName)) {
+        BSONObj temp = commandResponseBuilder->asTempObj().copy();
+        commandResponseBuilder->resetToEmpty();
+        Command::appendCommandStatus(*commandResponseBuilder, waitForWCStatus);
+        commandResponseBuilder->appendElementsUnique(temp);
+    }
 }
 
 }  // namespace
@@ -1621,29 +1489,15 @@ bool Command::run(OperationContext* opCtx,
         const auto oldWC = opCtx->getWriteConcern();
         ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
         opCtx->setWriteConcern(wcResult.getValue());
+        ON_BLOCK_EXIT([&] {
+            _waitForWriteConcernAndAddToCommandResponse(opCtx, getName(), &inPlaceReplyBob);
+        });
 
         result = run(opCtx, db, cmd, errmsg, inPlaceReplyBob);
 
         // Nothing in run() should change the writeConcern.
         dassert(SimpleBSONObjComparator::kInstance.evaluate(opCtx->getWriteConcern().toBSON() ==
                                                             wcResult.getValue().toBSON()));
-
-        WriteConcernResult res;
-        auto waitForWCStatus =
-            waitForWriteConcern(opCtx,
-                                repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
-                                wcResult.getValue(),
-                                &res);
-        appendCommandWCStatus(inPlaceReplyBob, waitForWCStatus, res);
-
-        // SERVER-22421: This code is to ensure error response backwards compatibility with the
-        // user management commands. This can be removed in 3.6.
-        if (!waitForWCStatus.isOK() && isUserManagementCommand(getName())) {
-            BSONObj temp = inPlaceReplyBob.asTempObj().copy();
-            inPlaceReplyBob.resetToEmpty();
-            appendCommandStatus(inPlaceReplyBob, waitForWCStatus);
-            inPlaceReplyBob.appendElementsUnique(temp);
-        }
     }
 
     // When a linearizable read command is passed in, check to make sure we're reading
@@ -1881,7 +1735,7 @@ void mongo::execCommandDatabase(OperationContext* opCtx,
         //
         // TODO: SERVER-28445 change this to use computeOperationTime once the exception handling
         // path is moved into Command::run()
-        auto operationTime = LogicalClock::get(opCtx)->getClusterTime().getTime();
+        auto operationTime = LogicalClock::get(opCtx)->getClusterTime();
 
         // An uninitialized operation time means the cluster time is not propagated, so the
         // operation time should not be attached to the error response.

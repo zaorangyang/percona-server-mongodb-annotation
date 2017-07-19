@@ -80,6 +80,9 @@ protected:
     // The first field is interpreted as a collection name.
     static NamespaceString parseNsCollectionRequired(const std::string& dbname,
                                                      const BSONObj& cmdObj);
+    static NamespaceString parseNsOrUUID(OperationContext* opCtx,
+                                         const std::string& dbname,
+                                         const BSONObj& cmdObj);
 
 public:
     typedef StringMap<Command*> CommandMap;
@@ -479,11 +482,21 @@ public:
     static bool isGenericArgument(StringData arg) {
         // Not including "help" since we don't pass help requests through to the command parser.
         // If that changes, it should be added.
-        return arg == "maxTimeMS" ||   //
-            arg == "$queryOptions" ||  //
-            arg == "shardVersion" ||   //
-            arg == "writeConcern" ||   //
-            arg == "readConcern" ||    //
+        return arg == "$audit" ||           //
+            arg == "$client" ||             //
+            arg == "$configServerState" ||  //
+            arg == "$db" ||                 //
+            arg == "$gleStats" ||           //
+            arg == "$oplogQueryData" ||     //
+            arg == "$queryOptions" ||       //
+            arg == "$replData" ||           //
+            arg == "$ssm" ||                //
+            arg == "logicalTime" ||         //
+            arg == "maxTimeMS" ||           //
+            arg == "readConcern" ||         //
+            arg == "shardVersion" ||        //
+            arg == "tracking_info" ||       //
+            arg == "writeConcern" ||        //
             false;  // These comments tell clang-format to keep this line-oriented.
     }
 

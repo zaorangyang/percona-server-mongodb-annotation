@@ -43,6 +43,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/exit.h"
@@ -51,6 +52,13 @@
 namespace mongo {
 
 using std::vector;
+
+constexpr Minutes CursorManager::kDefaultCursorTimeoutMinutes;
+
+MONGO_EXPORT_SERVER_PARAMETER(
+    cursorTimeoutMillis,
+    int,
+    durationCount<Milliseconds>(CursorManager::kDefaultCursorTimeoutMinutes));
 
 namespace {
 uint32_t idFromCursorId(CursorId id) {
@@ -92,7 +100,7 @@ public:
 
     void appendStats(BSONObjBuilder& builder);
 
-    std::size_t timeoutCursors(OperationContext* opCtx, int millisSinceLastCall);
+    std::size_t timeoutCursors(OperationContext* opCtx, Date_t now);
 
     int64_t nextSeed();
 
@@ -225,11 +233,11 @@ bool GlobalCursorIdCache::eraseCursor(OperationContext* opCtx, CursorId id, bool
     return eraseStatus.isOK();
 }
 
-std::size_t GlobalCursorIdCache::timeoutCursors(OperationContext* opCtx, int millisSinceLastCall) {
+std::size_t GlobalCursorIdCache::timeoutCursors(OperationContext* opCtx, Date_t now) {
     size_t totalTimedOut = 0;
 
     // Time out the cursors from the global cursor manager.
-    totalTimedOut += globalCursorManager->timeoutCursors(opCtx, millisSinceLastCall);
+    totalTimedOut += globalCursorManager->timeoutCursors(opCtx, now);
 
     // Compute the set of collection names that we have to time out cursors for.
     vector<NamespaceString> todo;
@@ -253,7 +261,7 @@ std::size_t GlobalCursorIdCache::timeoutCursors(OperationContext* opCtx, int mil
             continue;
         }
 
-        totalTimedOut += collection->getCursorManager()->timeoutCursors(opCtx, millisSinceLastCall);
+        totalTimedOut += collection->getCursorManager()->timeoutCursors(opCtx, now);
     }
 
     return totalTimedOut;
@@ -265,8 +273,8 @@ CursorManager* CursorManager::getGlobalCursorManager() {
     return globalCursorManager.get();
 }
 
-std::size_t CursorManager::timeoutCursorsGlobal(OperationContext* opCtx, int millisSinceLastCall) {
-    return globalCursorIdCache->timeoutCursors(opCtx, millisSinceLastCall);
+std::size_t CursorManager::timeoutCursorsGlobal(OperationContext* opCtx, Date_t now) {
+    return globalCursorIdCache->timeoutCursors(opCtx, now);
 }
 
 int CursorManager::eraseCursorGlobalIfAuthorized(OperationContext* opCtx, int n, const char* _ids) {
@@ -311,6 +319,8 @@ void CursorManager::invalidateAll(OperationContext* opCtx,
                                   bool collectionGoingAway,
                                   const std::string& reason) {
     invariant(!isGlobalManager());  // The global cursor manager should never need to kill cursors.
+    dassert(opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_X));
+
     stdx::lock_guard<SimpleMutex> lk(_mutex);
     fassert(28819, !BackgroundOperation::inProgForNs(_nss));
 
@@ -358,27 +368,29 @@ void CursorManager::invalidateDocument(OperationContext* opCtx,
 
     for (ExecSet::iterator it = _nonCachedExecutors.begin(); it != _nonCachedExecutors.end();
          ++it) {
-        PlanExecutor* exec = *it;
-        exec->invalidate(opCtx, dl, type);
+        (*it)->invalidate(opCtx, dl, type);
     }
 
     for (CursorMap::const_iterator i = _cursors.begin(); i != _cursors.end(); ++i) {
-        PlanExecutor* exec = i->second->getExecutor();
-        if (exec) {
-            exec->invalidate(opCtx, dl, type);
-        }
+        i->second->getExecutor()->invalidate(opCtx, dl, type);
     }
 }
 
-std::size_t CursorManager::timeoutCursors(OperationContext* opCtx, int millisSinceLastCall) {
+bool CursorManager::cursorShouldTimeout_inlock(const ClientCursor* cursor, Date_t now) {
+    if (cursor->isNoTimeout() || cursor->_isPinned) {
+        return false;
+    }
+    return (now - cursor->_lastUseDate) >= Milliseconds(cursorTimeoutMillis.load());
+}
+
+std::size_t CursorManager::timeoutCursors(OperationContext* opCtx, Date_t now) {
     vector<ClientCursor*> toDelete;
 
     stdx::lock_guard<SimpleMutex> lk(_mutex);
 
     for (CursorMap::const_iterator i = _cursors.begin(); i != _cursors.end(); ++i) {
         ClientCursor* cc = i->second;
-        // shouldTimeout() ensures that we skip pinned cursors.
-        if (cc->shouldTimeout(millisSinceLastCall))
+        if (cursorShouldTimeout_inlock(cc, now))
             toDelete.push_back(cc);
     }
 
@@ -413,9 +425,8 @@ StatusWith<ClientCursorPin> CursorManager::pinCursor(OperationContext* opCtx, Cu
 
     ClientCursor* cursor = it->second;
     uassert(12051, str::stream() << "cursor id " << id << " is already in use", !cursor->_isPinned);
-    if (cursor->_killed) {
+    if (cursor->getExecutor()->isMarkedAsKilled()) {
         // This cursor was killed while it was idle.
-        invariant(cursor->getExecutor());  // We should never unpin RangePreserver cursors.
         Status error{ErrorCodes::QueryPlanKilled,
                      str::stream() << "cursor killed because: "
                                    << cursor->getExecutor()->getKillReason()};
@@ -428,11 +439,15 @@ StatusWith<ClientCursorPin> CursorManager::pinCursor(OperationContext* opCtx, Cu
     return ClientCursorPin(opCtx, cursor);
 }
 
-void CursorManager::unpin(ClientCursor* cursor) {
+void CursorManager::unpin(OperationContext* opCtx, ClientCursor* cursor) {
+    // Avoid computing the current time within the critical section.
+    auto now = opCtx->getServiceContext()->getPreciseClockSource()->now();
+
     stdx::lock_guard<SimpleMutex> lk(_mutex);
 
     invariant(cursor->_isPinned);
     cursor->_isPinned = false;
+    cursor->_lastUseDate = now;
 }
 
 void CursorManager::getCursorIds(std::set<CursorId>* openCursors) const {
@@ -474,6 +489,9 @@ CursorId CursorManager::_allocateCursorId_inlock() {
 
 ClientCursorPin CursorManager::registerCursor(OperationContext* opCtx,
                                               ClientCursorParams&& cursorParams) {
+    // Avoid computing the current time within the critical section.
+    auto now = opCtx->getServiceContext()->getPreciseClockSource()->now();
+
     stdx::lock_guard<SimpleMutex> lk(_mutex);
     // Make sure the PlanExecutor isn't registered, since we will register the ClientCursor wrapping
     // it.
@@ -483,24 +501,9 @@ ClientCursorPin CursorManager::registerCursor(OperationContext* opCtx,
     cursorParams.exec->unsetRegistered();
 
     CursorId cursorId = _allocateCursorId_inlock();
-    std::unique_ptr<ClientCursor, ClientCursor::Deleter> clientCursor(
-        new ClientCursor(std::move(cursorParams), this, cursorId));
-    return _registerCursor_inlock(opCtx, std::move(clientCursor));
-}
-
-ClientCursorPin CursorManager::registerRangePreserverCursor(OperationContext* opCtx,
-                                                            const Collection* collection) {
-    stdx::lock_guard<SimpleMutex> lk(_mutex);
-    CursorId cursorId = _allocateCursorId_inlock();
-    std::unique_ptr<ClientCursor, ClientCursor::Deleter> clientCursor(
-        new ClientCursor(collection, this, cursorId));
-    return _registerCursor_inlock(opCtx, std::move(clientCursor));
-}
-
-ClientCursorPin CursorManager::_registerCursor_inlock(
-    OperationContext* opCtx, std::unique_ptr<ClientCursor, ClientCursor::Deleter> clientCursor) {
-    CursorId cursorId = clientCursor->cursorid();
     invariant(cursorId);
+    std::unique_ptr<ClientCursor, ClientCursor::Deleter> clientCursor(
+        new ClientCursor(std::move(cursorParams), this, cursorId, now));
 
     // Transfer ownership of the cursor to '_cursors'.
     ClientCursor* unownedCursor = clientCursor.release();

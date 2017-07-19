@@ -104,7 +104,7 @@ void AuthorizationSession::startRequest(OperationContext* opCtx) {
 Status AuthorizationSession::addAndAuthorizeUser(OperationContext* opCtx,
                                                  const UserName& userName) {
     User* user;
-    Status status = getAuthorizationManager().acquireUser(opCtx, userName, &user);
+    Status status = getAuthorizationManager().acquireUserForInitialAuth(opCtx, userName, &user);
     if (!status.isOK()) {
         return status;
     }
@@ -337,8 +337,7 @@ Status AuthorizationSession::checkAuthForGetMore(const NamespaceString& ns,
     if (ns.isListCollectionsCursorNS()) {
         // "ns" is of the form "<db>.$cmd.listCollections".  Check if we can perform the
         // listCollections action on the database resource for "<db>".
-        if (!isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(ns.db()),
-                                              ActionType::listCollections)) {
+        if (!isAuthorizedToListCollections(ns.db())) {
             return Status(ErrorCodes::Unauthorized,
                           str::stream() << "not authorized for listCollections getMore on "
                                         << ns.ns());
@@ -446,8 +445,7 @@ Status AuthorizationSession::checkAuthForKillCursors(const NamespaceString& ns,
     if (ns.isListCollectionsCursorNS()) {
         if (!(isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(ns.db()),
                                                ActionType::killCursors) ||
-              isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(ns.db()),
-                                               ActionType::listCollections))) {
+              isAuthorizedToListCollections(ns.db()))) {
             return Status(ErrorCodes::Unauthorized,
                           str::stream() << "not authorized to kill listCollections cursor on "
                                         << ns.ns());
@@ -722,6 +720,17 @@ bool AuthorizationSession::isAuthorizedToChangeOwnCustomDataAsUser(const UserNam
                                                             ActionType::changeOwnCustomData);
 }
 
+bool AuthorizationSession::isAuthorizedToListCollections(StringData dbname) {
+    // Check for the listCollections ActionType on the database or find on system.namespaces for
+    // pre 3.0 systems.
+
+    return AuthorizationSession::isAuthorizedForActionsOnResource(
+               ResourcePattern::forDatabaseName(dbname), ActionType::listCollections) ||
+        AuthorizationSession::isAuthorizedForActionsOnResource(
+               ResourcePattern::forExactNamespace(NamespaceString(dbname, "system.namespaces")),
+               ActionType::find);
+}
+
 bool AuthorizationSession::isAuthenticatedAsUserWithRole(const RoleName& roleName) {
     for (UserSet::iterator it = _authenticatedUsers.begin(); it != _authenticatedUsers.end();
          ++it) {
@@ -744,7 +753,9 @@ void AuthorizationSession::_refreshUserInfoAsNeeded(OperationContext* opCtx) {
             UserName name = user->getName();
             User* updatedUser;
 
-            Status status = authMan.acquireUser(opCtx, name, &updatedUser);
+            Status status =
+                authMan.acquireUserToRefreshSessionCache(opCtx, name, user->getID(), &updatedUser);
+
             switch (status.code()) {
                 case ErrorCodes::OK: {
                     // Success! Replace the old User object with the updated one.

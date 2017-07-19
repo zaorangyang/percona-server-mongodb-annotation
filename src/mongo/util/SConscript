@@ -7,6 +7,8 @@ Import("use_system_version_of_library")
 
 env = env.Clone()
 
+env.InjectThirdPartyIncludePaths('asio')
+
 env.SConscript(
     dirs=[
         'cmdline_utils',
@@ -51,6 +53,9 @@ debuggerEnv.Library(
     LIBDEPS=[
         # NOTE: You *must not* add any library dependencies to the debugger library
     ],
+    LIBDEPS_TAGS=[
+        'init-no-global-side-effects',
+    ]
 )
 
 env.Library(
@@ -100,6 +105,20 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog/collection',
+        '$BUILD_DIR/mongo/util/decorable',
+        '$BUILD_DIR/third_party/murmurhash3/murmurhash3',
+    ],
+)
+
+env.Library(
+    target='uuid_catalog',
+    source=[
+        'uuid_catalog.cpp'
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog/collection',
         '$BUILD_DIR/mongo/util/decorable',
         '$BUILD_DIR/third_party/murmurhash3/murmurhash3',
     ],
@@ -125,6 +144,18 @@ env.CppUnitTest(
         'uuid',
     ],
 )
+
+env.CppUnitTest(
+    target='uuid_catalog_test',
+    source=[
+        'uuid_catalog_test.cpp',
+        ],
+    LIBDEPS=[
+        'uuid_catalog',
+        'uuid',
+        '$BUILD_DIR/mongo/db/service_context',
+        ]
+    )
 
 env.Library(
     target='summation',
@@ -282,6 +313,38 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "fail_point",
+    ],
+)
+
+env.Library(
+    target="periodic_runner",
+    source=[
+        "periodic_runner.cpp",
+    ],
+    LIBDEPS=[
+    ],
+)
+
+env.Library(
+    target="periodic_runner_asio",
+    source=[
+        "periodic_runner_asio.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/third_party/shim_asio",
+        "periodic_runner",
+    ],
+)
+
+env.CppUnitTest(
+    target="periodic_runner_asio_test",
+    source=[
+        "periodic_runner_asio_test.cpp",
+    ],
+    LIBDEPS=[
+        "periodic_runner_asio",
+        "$BUILD_DIR/mongo/executor/async_timer_mock",
     ],
 )
 

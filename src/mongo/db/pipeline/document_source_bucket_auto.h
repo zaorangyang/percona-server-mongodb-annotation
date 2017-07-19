@@ -69,7 +69,6 @@ public:
     static boost::intrusive_ptr<DocumentSourceBucketAuto> create(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const boost::intrusive_ptr<Expression>& groupByExpression,
-        Variables::Id numVariables,
         int numBuckets,
         std::vector<AccumulationStatement> accumulationStatements = {},
         const boost::intrusive_ptr<GranularityRounder>& granularityRounder = nullptr,
@@ -87,7 +86,6 @@ protected:
 private:
     DocumentSourceBucketAuto(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
                              const boost::intrusive_ptr<Expression>& groupByExpression,
-                             Variables::Id numVariables,
                              int numBuckets,
                              std::vector<AccumulationStatement> accumulationStatements,
                              const boost::intrusive_ptr<GranularityRounder>& granularityRounder,
@@ -98,7 +96,7 @@ private:
         Bucket(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                Value min,
                Value max,
-               std::vector<Accumulator::Factory> accumulatorFactories);
+               const std::vector<AccumulationStatement>& accumulationStatements);
         Value _min;
         Value _max;
         std::vector<boost::intrusive_ptr<Accumulator>> _accums;
@@ -141,20 +139,13 @@ private:
     std::unique_ptr<Sorter<Value, Document>> _sorter;
     std::unique_ptr<Sorter<Value, Document>::Iterator> _sortedInput;
 
-    // _fieldNames contains the field names for the result documents, _accumulatorFactories contains
-    // the accumulator factories for the result documents, and _expressions contains the common
-    // expressions used by each instance of each accumulator in order to find the right-hand side of
-    // what gets added to the accumulator. These three vectors parallel each other.
-    std::vector<std::string> _fieldNames;
-    std::vector<Accumulator::Factory> _accumulatorFactories;
-    std::vector<boost::intrusive_ptr<Expression>> _expressions;
+    std::vector<AccumulationStatement> _accumulatedFields;
 
     int _nBuckets;
     uint64_t _maxMemoryUsageBytes;
     bool _populated = false;
     std::vector<Bucket> _buckets;
     std::vector<Bucket>::iterator _bucketsIterator;
-    std::unique_ptr<Variables> _variables;
     boost::intrusive_ptr<Expression> _groupByExpression;
     boost::intrusive_ptr<GranularityRounder> _granularityRounder;
     long long _nDocuments = 0;

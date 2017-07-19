@@ -83,9 +83,25 @@ public:
     bool operator==(const ChunkRange& other) const;
     bool operator!=(const ChunkRange& other) const;
 
+    /**
+     * Returns true iff the union of *this and the argument range is the same as *this.
+     */
+    bool covers(ChunkRange const& other) const;
+
+    /**
+     * Returns the range of overlap between *this and other, if any.
+     */
+    boost::optional<ChunkRange> overlapWith(ChunkRange const& other) const;
+
+    /**
+     * Returns a range that includes *this and other. If the ranges do not overlap, it includes
+     * all the space between, as well.
+     */
+    ChunkRange unionWith(ChunkRange const& other) const;
+
 private:
-    BSONObj _minKey;
-    BSONObj _maxKey;
+    const BSONObj _minKey;
+    const BSONObj _maxKey;
 };
 
 /**
@@ -239,7 +255,7 @@ public:
 private:
     // Convention: (M)andatory, (O)ptional, (S)pecial; (C)onfig, (S)hard.
 
-    // (M)(C)     collection this chunk is in
+    // (O)(C)     collection this chunk is in
     boost::optional<std::string> _ns;
     // (M)(C)(S)  first key of the range, inclusive
     boost::optional<BSONObj> _min;
