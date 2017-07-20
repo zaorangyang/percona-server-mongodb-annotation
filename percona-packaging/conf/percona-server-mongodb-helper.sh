@@ -26,6 +26,11 @@ if which numactl >/dev/null 2>/dev/null && numactl $NUMACTL_ARGS ls / >/dev/null
 then
     NUMACTL="numactl $NUMACTL_ARGS"
     DAEMON_OPTS=${DAEMON_OPTS:-"--config $CONF"}
+    NUMA_CONF=$(grep -c 'NUMACTL="numactl --interleave=all"' /etc/@@LOCATION@@/mongod)
+    if [ $NUMA_CONF = 0 ]
+    then
+        echo 'NUMACTL="numactl --interleave=all"' >> /etc/@@LOCATION@@/mongod
+    fi
 else
     NUMACTL=""
     DAEMON_OPTS=${DAEMON_OPTS:-"--config $CONF"}
