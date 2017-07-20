@@ -70,7 +70,7 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
  */
 class UpdateZoneKeyRangeCmd : public Command {
 public:
-    UpdateZoneKeyRangeCmd() : Command("updateZoneKeyRange", false, "updatezonekeyRange") {}
+    UpdateZoneKeyRangeCmd() : Command("updateZoneKeyRange", "updatezonekeyRange") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -120,7 +120,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         auto parsedRequest =

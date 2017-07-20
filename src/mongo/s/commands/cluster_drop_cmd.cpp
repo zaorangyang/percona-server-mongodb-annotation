@@ -73,7 +73,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
@@ -106,7 +106,11 @@ private:
                                                   const ShardId& shardId,
                                                   const NamespaceString& nss,
                                                   BSONObjBuilder* result) {
+        const auto catalogClient = Grid::get(opCtx)->catalogClient(opCtx);
         const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+
+        auto scopedDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+            opCtx, nss.ns(), "drop", DistLockManager::kDefaultLockTimeout));
 
         const auto dropCommandBSON = [shardRegistry, opCtx, &shardId, &nss] {
             BSONObjBuilder builder;

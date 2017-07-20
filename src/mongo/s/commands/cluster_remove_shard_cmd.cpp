@@ -52,7 +52,7 @@ namespace {
 
 class RemoveShardCmd : public Command {
 public:
-    RemoveShardCmd() : Command("removeShard", false, "removeshard") {}
+    RemoveShardCmd() : Command("removeShard", "removeshard") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -81,7 +81,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         uassert(ErrorCodes::TypeMismatch,

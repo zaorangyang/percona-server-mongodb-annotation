@@ -53,6 +53,7 @@
 #include "mongo/db/introspect.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_options.h"
@@ -421,54 +422,98 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 
     BackgroundOperation::assertNoBgOpInProgForNs(fullns);
 
+    // Make sure no indexes builds are in progress.
+    // Use massert() to be consistent with IndexCatalog::dropAllIndexes().
+    auto numIndexesInProgress = collection->getIndexCatalog()->numIndexesInProgress(opCtx);
+    massert(40461,
+            str::stream() << "cannot drop collection " << fullns.ns() << " when "
+                          << numIndexesInProgress
+                          << " index builds in progress.",
+            numIndexesInProgress == 0);
+
     audit::logDropCollection(&cc(), fullns.toString());
-
-    collection->getCursorManager()->invalidateAll(opCtx, true, "collection dropped");
-    Status s = collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
-
-    if (!s.isOK()) {
-        warning() << "could not drop collection, trying to drop indexes" << fullns << " because of "
-                  << redact(s.toString());
-        return s;
-    }
-
-    verify(collection->getCatalogEntry()->getTotalIndexCount(opCtx) == 0);
-    LOG(1) << "\t dropIndexes done";
 
     Top::get(opCtx->getClient()->getServiceContext()).collectionDropped(fullns.toString());
 
-    // We want to destroy the Collection object before telling the StorageEngine to destroy the
-    // RecordStore.
     auto uuid = collection->uuid();
-    _clearCollectionCache(opCtx, fullns.toString(), "collection dropped");
 
-    s = _dbEntry->dropCollection(opCtx, fullns.toString());
-
-    if (!s.isOK())
-        return s;
-
-    DEV {
-        // check all index collection entries are gone
-        string nstocheck = fullns.toString() + ".$";
-
-        for (CollectionMap::const_iterator i = _collections.begin(); i != _collections.end(); ++i) {
-            string temp = i->first;
-
-            if (temp.find(nstocheck) != 0)
-                continue;
-            log() << "after drop, bad cache entries for: " << fullns << " have " << temp;
-            verify(0);
+    // Drop unreplicated collections immediately.
+    // Replicated collections should also be dropped immediately if there is no active reaper to
+    // remove the drop-pending collections.
+    auto isOplogDisabledForNamespace =
+        repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, fullns);
+    auto reaper = repl::DropPendingCollectionReaper::get(opCtx);
+    if (isOplogDisabledForNamespace || !reaper) {
+        auto status = _finishDropCollection(opCtx, fullns, collection);
+        if (!status.isOK()) {
+            return status;
         }
+        getGlobalServiceContext()->getOpObserver()->onDropCollection(opCtx, fullns, uuid);
+        return Status::OK();
     }
 
-    getGlobalServiceContext()->getOpObserver()->onDropCollection(opCtx, fullns, uuid);
+    // Replicated collections will be renamed with a special drop-pending namespace and dropped when
+    // the replica set optime reaches the drop optime.
+    auto dropOpTime =
+        getGlobalServiceContext()->getOpObserver()->onDropCollection(opCtx, fullns, uuid);
+
+    // Drop collection immediately if OpObserver did not write entry to oplog.
+    // After writing the oplog entry, all errors are fatal. See getNextOpTime() comments in
+    // oplog.cpp.
+    if (dropOpTime.isNull()) {
+        log() << "dropCollection: " << fullns << " - no drop optime available for pending-drop. "
+              << "Dropping collection immediately.";
+        fassertStatusOK(40462, _finishDropCollection(opCtx, fullns, collection));
+        return Status::OK();
+    }
+
+    // Check if drop-pending namespace is too long for the index names in the collection.
+    auto dpns = fullns.makeDropPendingNamespace(dropOpTime);
+    auto status =
+        dpns.checkLengthForRename(collection->getIndexCatalog()->getLongestIndexNameLength(opCtx));
+    if (!status.isOK()) {
+        log() << "dropCollection: " << fullns
+              << " - cannot proceed with collection rename for pending-drop: " << status
+              << ". Dropping collection immediately.";
+        fassertStatusOK(40463, _finishDropCollection(opCtx, fullns, collection));
+        return Status::OK();
+    }
+
+    // Rename collection using drop-pending namespace generated from drop optime.
+    const bool stayTemp = true;
+    log() << "dropCollection: " << fullns << " - renaming to drop-pending collection: " << dpns
+          << " with drop optime " << dropOpTime;
+    fassertStatusOK(40464, renameCollection(opCtx, fullns.ns(), dpns.ns(), stayTemp));
+
+    // Register this drop-pending namespace with DropPendingCollectionReaper to remove when the
+    // committed optime reaches the drop optime.
+    invariant(reaper);
+    reaper->addDropPendingNamespace(dropOpTime, dpns);
 
     return Status::OK();
 }
 
+Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
+                                           const NamespaceString& fullns,
+                                           Collection* collection) {
+    LOG(1) << "dropCollection: " << fullns << " - dropAllIndexes start";
+    collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
+
+    invariant(collection->getCatalogEntry()->getTotalIndexCount(opCtx) == 0);
+    LOG(1) << "dropCollection: " << fullns << " - dropAllIndexes done";
+
+    // We want to destroy the Collection object before telling the StorageEngine to destroy the
+    // RecordStore.
+    _clearCollectionCache(
+        opCtx, fullns.toString(), "collection dropped", /*collectionGoingAway*/ true);
+
+    return _dbEntry->dropCollection(opCtx, fullns.toString());
+}
+
 void DatabaseImpl::_clearCollectionCache(OperationContext* opCtx,
                                          StringData fullns,
-                                         const std::string& reason) {
+                                         const std::string& reason,
+                                         bool collectionGoingAway) {
     verify(_name == nsToDatabaseSubstring(fullns));
     CollectionMap::const_iterator it = _collections.find(fullns.toString());
 
@@ -478,7 +523,7 @@ void DatabaseImpl::_clearCollectionCache(OperationContext* opCtx,
     // Takes ownership of the collection
     opCtx->recoveryUnit()->registerChange(new RemoveCollectionChange(this, it->second));
 
-    it->second->getCursorManager()->invalidateAll(opCtx, false, reason);
+    it->second->getCursorManager()->invalidateAll(opCtx, collectionGoingAway, reason);
     _collections.erase(it);
 }
 
@@ -531,11 +576,12 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
 
         while (ii.more()) {
             IndexDescriptor* desc = ii.next();
-            _clearCollectionCache(opCtx, desc->indexNamespace(), clearCacheReason);
+            _clearCollectionCache(
+                opCtx, desc->indexNamespace(), clearCacheReason, /*collectionGoingAway*/ true);
         }
 
-        _clearCollectionCache(opCtx, fromNS, clearCacheReason);
-        _clearCollectionCache(opCtx, toNS, clearCacheReason);
+        _clearCollectionCache(opCtx, fromNS, clearCacheReason, /*collectionGoingAway*/ true);
+        _clearCollectionCache(opCtx, toNS, clearCacheReason, /*collectionGoingAway*/ false);
 
         Top::get(opCtx->getClient()->getServiceContext()).collectionDropped(fromNS.toString());
     }

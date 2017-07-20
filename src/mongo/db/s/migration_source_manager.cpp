@@ -92,7 +92,7 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
             _args.getFromShardId() != _args.getToShardId());
 
     log() << "Starting chunk migration " << redact(_args.toString())
-          << " with expected collection version epoch" << _args.getVersionEpoch();
+          << " with expected collection version epoch " << _args.getVersionEpoch();
 
     // Now that the collection is locked, snapshot the metadata and fetch the latest versions
     ShardingState* const shardingState = ShardingState::get(opCtx);
@@ -392,13 +392,20 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
                                   << migrationCommitStatus.reason()};
         }
 
-        // Schedule clearing out orphaned documents when they are no longer in active use.
-        const auto orphans = ChunkRange(_args.getMinKey(), _args.getMaxKey());
-        uassertStatusOK(css->cleanUpRange(orphans));
-
         // Migration succeeded
         log() << "Migration succeeded and updated collection version to "
               << refreshedMetadata->getCollVersion();
+
+        // Schedule clearing out orphaned documents when they are no longer in active use.
+        const auto orphans = ChunkRange(_args.getMinKey(), _args.getMaxKey());
+        auto notification = css->cleanUpRange(orphans);
+        if (notification.ready() && !notification.waitStatus(opCtx).isOK()) {
+            // if it fails immediately, report that and continue.
+            warning() << "Failed to initiate cleanup of " << getNss().ns() << " orphan range "
+                      << redact(orphans.toString()) << ": "
+                      << redact(notification.waitStatus(opCtx).reason());
+        }
+        notification.abandon();
     } else {
         AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_X);
 

@@ -42,7 +42,6 @@
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
@@ -200,11 +199,13 @@ Status DatabasesCloner::startup() noexcept {
         return _status;
     }
 
-    // Schedule listDatabase command which will kick off the database cloner per result db.
+    // Schedule listDatabase command which will kick off the database cloner per result db. We only
+    // retrieve database names since computing & fetching all database stats can be costly on the
+    // remote node when there are a large number of collections.
     Request listDBsReq(_source,
                        "admin",
-                       BSON("listDatabases" << true),
-                       rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                       BSON("listDatabases" << true << "nameOnly" << true),
+                       ReadPreferenceSetting::secondaryPreferredMetadata(),
                        nullptr);
     _listDBsScheduler = stdx::make_unique<RemoteCommandRetryScheduler>(
         _exec,

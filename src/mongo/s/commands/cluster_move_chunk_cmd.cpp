@@ -57,7 +57,7 @@ namespace {
 
 class MoveChunkCmd : public Command {
 public:
-    MoveChunkCmd() : Command("moveChunk", false, "movechunk") {}
+    MoveChunkCmd() : Command("moveChunk", "movechunk") {}
 
     bool slaveOk() const override {
         return true;
@@ -97,7 +97,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override {
         Timer t;

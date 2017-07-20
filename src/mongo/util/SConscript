@@ -117,8 +117,10 @@ env.Library(
         'uuid_catalog.cpp'
     ],
     LIBDEPS=[
+        'uuid',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/catalog/collection',
+        '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/util/decorable',
         '$BUILD_DIR/third_party/murmurhash3/murmurhash3',
     ],
@@ -398,10 +400,7 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
             'heap_profiler.cpp',
         ],
         LIBDEPS=[
-            # TODO: This is needless, the definition of
-            # ServerStatusSection should live in its own library, as
-            # it doesn't require all of the other commands.
-            '$BUILD_DIR/mongo/db/commands/core',
+            '$BUILD_DIR/mongo/db/commands/server_status',
             '$BUILD_DIR/mongo/db/server_parameters',
             '$BUILD_DIR/mongo/util/net/network',
         ],

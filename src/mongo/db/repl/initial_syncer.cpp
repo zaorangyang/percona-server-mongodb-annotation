@@ -56,7 +56,6 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
@@ -756,6 +755,9 @@ void InitialSyncer::_oplogFetcherCallback(const Status& oplogFetcherFinishStatus
 
 void InitialSyncer::_databasesClonerCallback(const Status& databaseClonerFinishStatus,
                                              std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
+    log() << "Finished cloning data: " << redact(databaseClonerFinishStatus)
+          << ". Beginning oplog replay.";
+
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     auto status = _checkForShutdownAndConvertStatus_inlock(databaseClonerFinishStatus,
                                                            "error cloning databases");
@@ -1165,7 +1167,7 @@ Status InitialSyncer::_scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn 
                                    _opts.remoteOplogNS.db().toString(),
                                    query,
                                    callback,
-                                   rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                                   ReadPreferenceSetting::secondaryPreferredMetadata(),
                                    RemoteCommandRequest::kNoTimeout,
                                    RemoteCommandRetryScheduler::makeRetryPolicy(
                                        numInitialSyncOplogFindAttempts.load(),
@@ -1395,7 +1397,7 @@ StatusWith<Operations> InitialSyncer::_getNextApplierBatch_inlock() {
             // Index builds are achieved through the use of an insert op, not a command op.
             // The following line is the same as what the insert code uses to detect an index
             // build.
-            (entry.hasNamespace() && entry.getCollectionName() == "system.indexes")) {
+            (entry.getNamespace().isSystemDotIndexes())) {
             if (ops.empty()) {
                 // Apply commands one-at-a-time.
                 ops.push_back(std::move(entry));

@@ -86,7 +86,7 @@ BSONObj selectMedianKey(OperationContext* opCtx,
 
 class SplitCollectionCmd : public Command {
 public:
-    SplitCollectionCmd() : Command("split", false, "split") {}
+    SplitCollectionCmd() : Command("split", "split") {}
 
     bool slaveOk() const override {
         return true;
@@ -125,7 +125,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));

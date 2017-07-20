@@ -571,9 +571,14 @@ functions:
 
           # Build libfaketime. A version of libfaketime at least as new as v0.9.6-9-g75896bd is
           # required to use the FAKETIME_NO_CACHE and FAKETIME_TIMESTAMP_FILE environment variables.
-          git clone git@github.com:wolfcw/libfaketime.git
+          # Additionally, a version of libfaketime containing the changes mentioned in SERVER-29336
+          # is required to avoid needing to use libfaketimeMT.so.1 and serializing all calls to
+          # fake_clock_gettime() with a mutex.
+          git clone --branch=for-jepsen --depth=1 git@github.com:10gen/libfaketime.git
           cd libfaketime
-          git checkout 3c0ce9c8859ed136a154b61da396deece94844e0
+          branch=$(git symbolic-ref --short HEAD)
+          commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
+          echo "Git branch: $branch, commit: $commit"
           make PREFIX=$(pwd)/build/ LIBDIRNAME='.' install
 
           # Add libfaketime to mongo-binaries.tgz so it gets uploaded to each of the LXC containers.
@@ -1369,7 +1374,7 @@ tasks:
         display_name: Source tarball
         # We only need to upload the source tarball from one of the build variants
         # because it should be the same everywhere, so just use linux-64/windows-64-2k8.
-        build_variants: [ linux-64, windows-64-2k8 ]
+        build_variants: [ linux-64, windows-64-2k8-ssl ]
 
 ## compile_all - build all scons targets including unittests ##
 - name: compile_all
@@ -3077,7 +3082,7 @@ tasks:
         remote_file: mongodb-mongo-master/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
         bucket: mciuploads
         local_file: src/distsrc.${ext|tgz}
-        build_variants: [ linux-64, windows-64-2k8 ]
+        build_variants: [ linux-64, windows-64-2k8-ssl ]
     - *apply_compile_expansions
     - func: "fetch debugsymbols archive"
     - command: shell.exec
@@ -3160,7 +3165,7 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}
-        build_variants: [ linux-64, windows-64-2k8 ]
+        build_variants: [ linux-64, windows-64-2k8-ssl ]
 
     # Put the debug symbols
     - command: s3.put
@@ -3206,7 +3211,7 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sig
-        build_variants: [ linux-64, windows-64-2k8 ]
+        build_variants: [ linux-64, windows-64-2k8-ssl ]
 
     # Put the debug symbols signature
     - command: s3.put
@@ -3226,7 +3231,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         permissions: public-read
-        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-64-2k8-ssl"]
+        build_variants: ["enterprise-windows-64-2k8", "windows-64-2k8-ssl"]
         local_file: src/mongodb-win32-${push_arch}-${suffix}-signed.msi
         bucket: build-push-testing
         content_type: application/x-msi
@@ -3264,7 +3269,7 @@ tasks:
         bucket: build-push-testing
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha1
-        build_variants: [ linux-64, windows-64-2k8 ]
+        build_variants: [ linux-64, windows-64-2k8-ssl ]
 
     # Put the debug symbols sha1
     - command: s3.put
@@ -3284,7 +3289,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         permissions: public-read
-        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-64-2k8-ssl"]
+        build_variants: ["enterprise-windows-64-2k8", "windows-64-2k8-ssl"]
         local_file: src/mongodb-win32-${push_arch}-${suffix}-signed.msi.sha1
         bucket: build-push-testing
         content_type: text/plain
@@ -3322,7 +3327,7 @@ tasks:
         bucket: build-push-testing
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha256
-        build_variants: [ linux-64, windows-64-2k8 ]
+        build_variants: [ linux-64, windows-64-2k8-ssl ]
 
     # Put the debug symbols sha256
     - command: s3.put
@@ -3341,7 +3346,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-64-2k8-ssl"]
+        build_variants: ["enterprise-windows-64-2k8", "windows-64-2k8-ssl"]
         local_file: src/mongodb-win32-${push_arch}-${suffix}-signed.msi.sha256
         bucket: build-push-testing
         permissions: public-read
@@ -3380,7 +3385,7 @@ tasks:
         permissions: public-read
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.md5
-        build_variants: [ linux-64, windows-64-2k8 ]
+        build_variants: [ linux-64, windows-64-2k8-ssl ]
 
     # Put the debug symbols md5
     - command: s3.put
@@ -3399,7 +3404,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-64-2k8-ssl"]
+        build_variants: ["enterprise-windows-64-2k8", "windows-64-2k8-ssl"]
         local_file: src/mongodb-win32-${push_arch}-${suffix}-signed.msi.md5
         bucket: build-push-testing
         permissions: public-read
@@ -3422,12 +3427,12 @@ tasks:
             #Source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'linux-64', 'windows-64-2k8' ]}
+               'build_variants': [ 'linux-64', 'windows-64-2k8-ssl' ]}
 
             #MSI (Windows only)
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl' ]}
+               'build_variants': [ 'enterprise-windows-64-2k8', 'windows-64-2k8-ssl' ]}
 
             #Binaries Signature
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
@@ -3440,7 +3445,7 @@ tasks:
             #Source tarball signature
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sig', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sig', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'linux-64', 'windows-64-2k8' ]}
+               'build_variants': [ 'linux-64', 'windows-64-2k8-ssl' ]}
 
             #SHA1 for binaries
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
@@ -3453,12 +3458,12 @@ tasks:
             #SHA1 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha1', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sha1', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'linux-64', 'windows-64-2k8' ]}
+               'build_variants': [ 'linux-64', 'windows-64-2k8-ssl' ]}
 
             #SHA1 for MSI
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.sha1', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.sha1', 'bucket': '${push_bucket}'},
-               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl']}
+               'build_variants': ['enterprise-windows-64-2k8', 'windows-64-2k8-ssl']}
 
             #SHA256 for binaries
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
@@ -3471,12 +3476,12 @@ tasks:
             #SHA256 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha256', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sha256', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'linux-64', 'windows-64-2k8' ]}
+               'build_variants': [ 'linux-64', 'windows-64-2k8-ssl' ]}
 
             #SHA256 for MSI files
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.sha256', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.sha256', 'bucket': '${push_bucket}'},
-               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl']}
+               'build_variants': ['enterprise-windows-64-2k8', 'windows-64-2k8-ssl']}
 
             #MD5 for binaries
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
@@ -3489,12 +3494,12 @@ tasks:
             #MD5 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.md5', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.md5', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'linux-64', 'windows-64-2k8' ]}
+               'build_variants': [ 'linux-64', 'windows-64-2k8-ssl' ]}
 
             #MD5 for MSIs
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.md5', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.md5', 'bucket': '${push_bucket}'},
-               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl'], }
+               'build_variants': ['enterprise-windows-64-2k8', 'windows-64-2k8-ssl'], }
 
     # Debug symbols are not created for all variants and the copy is optional.
     - command: s3Copy.copy
@@ -5568,8 +5573,6 @@ buildvariants:
   - name: mmap
   - name: replica_sets_auth
   - name: sasl
-  - name: snmp
-  - name: snmp_WT
   - name: ssl
   - name: sslSpecial
   - name: push
@@ -6935,7 +6938,7 @@ buildvariants:
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
-    compile_flags: --ssl CC=/usr/bin/clang-3.7 CXX=/usr/bin/clang++-3.7 --libc++ -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
+    compile_flags: --link-model=dynamic --ssl CC=/usr/bin/clang-3.7 CXX=/usr/bin/clang++-3.7 --libc++ -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
     use_scons_cache: true
     build_mongoreplay: true
   tasks:
@@ -8774,7 +8777,11 @@ buildvariants:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
-    test_flags: "\"--mongodSetParameters={use3dot4Rollback: true}\""
+    # Write the resmoke.py value using a YAML "folded style" (>) string in order to be able to
+    # nest curly braces inside. The curly braces "{}" need their own quotes to protect them from
+    # being interpreted by bash.
+    test_flags: >
+      --mongodSetParameters='{use3dot4Rollback: true}'
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     use_scons_cache: true

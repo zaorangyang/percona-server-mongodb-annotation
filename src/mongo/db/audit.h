@@ -42,7 +42,7 @@ namespace mongo {
 class AuthorizationSession;
 class BSONObj;
 class Client;
-class Command;
+class CommandInterface;
 class NamespaceString;
 class OperationContext;
 class StringData;
@@ -71,7 +71,7 @@ void logAuthentication(Client* client,
 void logCommandAuthzCheck(Client* client,
                           const std::string& dbname,
                           const BSONObj& cmdObj,
-                          Command* command,
+                          CommandInterface* command,
                           ErrorCodes::Error result);
 
 /**

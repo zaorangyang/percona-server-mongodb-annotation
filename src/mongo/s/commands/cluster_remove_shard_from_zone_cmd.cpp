@@ -67,7 +67,7 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
  */
 class RemoveShardFromZoneCmd : public Command {
 public:
-    RemoveShardFromZoneCmd() : Command("removeShardFromZone", false, "removeshardfromzone") {}
+    RemoveShardFromZoneCmd() : Command("removeShardFromZone", "removeshardfromzone") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -105,7 +105,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         auto parsedRequest =

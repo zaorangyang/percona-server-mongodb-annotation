@@ -18,7 +18,7 @@ IDL AST classes.
 Represents the derived IDL specification after type resolution in the binding pass has occurred.
 
 This is a lossy translation from the IDL Syntax tree as the IDL AST only contains information about
-the structs that need code generated for them, and just enough information to do that.
+the enums and structs that need code generated for them, and just enough information to do that.
 """
 
 from __future__ import absolute_import, print_function, unicode_literals
@@ -48,6 +48,9 @@ class IDLAST(object):
         # type: () -> None
         """Construct an IDLAST."""
         self.globals = None  # type: Global
+
+        self.commands = []  # type: List[Command]
+        self.enums = []  # type: List[Enum]
         self.structs = []  # type: List[Struct]
 
 
@@ -119,4 +122,55 @@ class Field(common.SourceLocation):
         # Properties specific to fields which are arrays.
         self.array = False  # type: bool
 
+        # Properties specific to fields which are enums.
+        self.enum_type = False  # type: bool
+
         super(Field, self).__init__(file_name, line, column)
+
+
+class Command(Struct):
+    """
+    IDL commmand information.
+
+    All fields are either required or have a non-None default.
+    """
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct a command."""
+        self.namespace = None  # type: unicode
+        super(Command, self).__init__(file_name, line, column)
+
+
+class EnumValue(common.SourceLocation):
+    """
+    IDL Enum Value information.
+
+    All fields are either required or have a non-None default.
+    """
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct an Enum."""
+        self.name = None  # type: unicode
+        self.value = None  # type: unicode
+
+        super(EnumValue, self).__init__(file_name, line, column)
+
+
+class Enum(common.SourceLocation):
+    """
+    IDL Enum information.
+
+    All fields are either required or have a non-None default.
+    """
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct an Enum."""
+        self.name = None  # type: unicode
+        self.description = None  # type: unicode
+        self.type = None  # type: unicode
+        self.values = []  # type: List[EnumValue]
+
+        super(Enum, self).__init__(file_name, line, column)

@@ -46,8 +46,8 @@
                 // active, which it may not be in our polling cycle - particularly b/c we sleep
                 // every
                 // second in both the query and the assert
-                if ((o.active || o.waitingForLock) && o.query && o.query &&
-                    o.query.find === "jstests_killop" && o.query.comment === "kill_own_ops") {
+                if ((o.active || o.waitingForLock) && o.command && o.command &&
+                    o.command.find === "jstests_killop" && o.command.comment === "kill_own_ops") {
                     print("OP: " + tojson(o));
                     ids.push(o.opid);
                 }
@@ -149,9 +149,9 @@
         assert.lt(diff, 30000, "Start: " + start + "; end: " + end + "; diff: " + diff);
     }
 
-    var m = MongoRunner.runMongod({auth: ""});
-    runTest(m);
-    MongoRunner.stopMongod(m);
+    var conn = MongoRunner.runMongod({auth: ""});
+    runTest(conn);
+    MongoRunner.stopMongod(conn);
 
     // TODO: This feature is currently not supported on sharded clusters.
     /*var st =

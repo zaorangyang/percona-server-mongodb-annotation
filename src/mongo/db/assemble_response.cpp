@@ -141,7 +141,7 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
 void beginCommandOp(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& queryObj) {
     auto curop = CurOp::get(opCtx);
     stdx::lock_guard<Client> lk(*opCtx->getClient());
-    curop->setQuery_inlock(queryObj);
+    curop->setOpDescription_inlock(queryObj);
     curop->setNS_inlock(nss.ns());
 }
 
@@ -180,7 +180,7 @@ DbResponse receivedCommand(OperationContext* opCtx,
 
         op->debug().iscommand = true;
     } catch (const DBException& exception) {
-        Command::generateErrorResponse(opCtx, &builder, exception);
+        generateErrorResponse(opCtx, &builder, exception);
     }
 
     auto response = builder.done();
@@ -217,7 +217,7 @@ DbResponse receivedMsg(OperationContext* opCtx, Client& client, const Message& m
         curOp->debug().iscommand = true;
     } catch (const DBException& exception) {
         replyBuilder.reset();
-        Command::generateErrorResponse(opCtx, &replyBuilder, exception);
+        generateErrorResponse(opCtx, &replyBuilder, exception);
     }
 
     auto response = replyBuilder.done();
@@ -257,7 +257,7 @@ DbResponse receivedRpc(OperationContext* opCtx, Client& client, const Message& m
         curOp->debug().iscommand = true;
 
     } catch (const DBException& exception) {
-        Command::generateErrorResponse(opCtx, &replyBuilder, exception);
+        generateErrorResponse(opCtx, &replyBuilder, exception);
     }
 
     auto response = replyBuilder.done();

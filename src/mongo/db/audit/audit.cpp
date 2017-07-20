@@ -548,7 +548,7 @@ namespace audit {
     void logCommandAuthzCheck(Client* client,
                               const std::string& dbname,
                               const BSONObj& cmdObj,
-                              Command* command,
+                              CommandInterface* command,
                               ErrorCodes::Error result) {
         if (!_auditLog) {
             return;

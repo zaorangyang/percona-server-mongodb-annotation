@@ -105,7 +105,6 @@ public:
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                    BSONObjBuilder* out) const final {
         const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
         // Parse the command BSON to a QueryRequest.
@@ -116,7 +115,7 @@ public:
         }
 
         auto result = Strategy::explainFind(
-            opCtx, cmdObj, *qr.getValue(), verbosity, serverSelectionMetadata, out);
+            opCtx, cmdObj, *qr.getValue(), verbosity, ReadPreferenceSetting::get(opCtx), out);
 
         if (result == ErrorCodes::CommandOnShardedViewNotSupportedOnMongod) {
             auto resolvedView = ResolvedView::fromBSON(out->asTempObj());
@@ -152,7 +151,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) final {
         // We count find command as a query op.

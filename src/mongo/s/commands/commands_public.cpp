@@ -52,7 +52,6 @@
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
@@ -149,7 +148,7 @@ StatusWith<BSONObj> getCollation(const BSONObj& cmdObj) {
 
 class PublicGridCommand : public Command {
 protected:
-    PublicGridCommand(const char* n, const char* oldname = NULL) : Command(n, false, oldname) {}
+    PublicGridCommand(const char* n, const char* oldname = NULL) : Command(n, oldname) {}
 
     virtual bool slaveOk() const {
         return true;
@@ -200,7 +199,7 @@ protected:
                                const char* oldname = NULL,
                                bool implicitCreateDb = false,
                                bool appendShardVersion = true)
-        : Command(name, false, oldname),
+        : Command(name, oldname),
           _implicitCreateDb(implicitCreateDb),
           _appendShardVersion(appendShardVersion) {}
 
@@ -213,7 +212,7 @@ protected:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& output) override {
         const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
@@ -247,7 +246,7 @@ protected:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbName, cmdObj));
@@ -353,7 +352,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& output) {
         const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
@@ -424,7 +423,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         uassertStatusOK(createShardDatabase(opCtx, dbName));
@@ -456,7 +455,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         const auto fullNsFromElt = cmdObj.firstElement();
@@ -514,7 +513,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         const auto todbElt = cmdObj["todb"];
@@ -587,7 +586,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
@@ -767,7 +766,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbName, cmdObj));
@@ -889,21 +888,10 @@ public:
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                    BSONObjBuilder* out) const override {
         // We will time how long it takes to run the commands on the shards.
         Timer timer;
-
-        BSONObj command;
-        int options = 0;
-
-        {
-            BSONObjBuilder explainCmdBob;
-            ClusterExplain::wrapAsExplainDeprecated(
-                cmdObj, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
-            command = explainCmdBob.obj();
-        }
-
+        BSONObj command = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
         auto routingInfo =
@@ -919,7 +907,7 @@ public:
             ShardConnection conn(routingInfo.primary()->getConnString(), "");
 
             // TODO: this can throw a stale config when mongos is not up-to-date -- fix.
-            if (!conn->runCommand(nss.db().toString(), command, shardResult, options)) {
+            if (!conn->runCommand(nss.db().toString(), command, shardResult)) {
                 conn.done();
                 return Status(ErrorCodes::OperationFailed,
                               str::stream() << "Passthrough command failed: " << command
@@ -971,7 +959,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         const std::string ns = parseNs(dbName, cmdObj);
@@ -1006,7 +994,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
@@ -1127,7 +1115,6 @@ public:
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata& ssm,
                    BSONObjBuilder* out) const {
         const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
 
@@ -1150,8 +1137,7 @@ public:
         // Extract the targeting collation.
         auto targetingCollation = uassertStatusOK(getCollation(cmdObj));
 
-        BSONObjBuilder explainCmdBob;
-        ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
+        const auto explainCmd = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
 
         // We will time how long it takes to run the commands on the shards.
         Timer timer;
@@ -1159,8 +1145,8 @@ public:
         BSONObj viewDefinition;
         auto swShardResponses = scatterGatherForNamespace(opCtx,
                                                           nss,
-                                                          explainCmdBob.obj(),
-                                                          getReadPref(ssm),
+                                                          explainCmd,
+                                                          getReadPref(explainCmd),
                                                           targetingQuery,
                                                           targetingCollation,
                                                           true,  // do shard versioning
@@ -1254,7 +1240,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbName, cmdObj));
@@ -1396,7 +1382,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
@@ -1533,7 +1519,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) override {
         RARELY {
@@ -1578,7 +1564,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) final {
         auto nss = NamespaceString::makeListCollectionsNSS(dbName);
@@ -1627,7 +1613,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) final {
         const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));

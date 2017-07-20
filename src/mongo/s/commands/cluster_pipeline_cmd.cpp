@@ -33,7 +33,6 @@
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/commands/cluster_aggregate.h"
 
 namespace mongo {
@@ -41,7 +40,7 @@ namespace {
 
 class ClusterPipelineCommand : public Command {
 public:
-    ClusterPipelineCommand() : Command("aggregate", false) {}
+    ClusterPipelineCommand() : Command("aggregate") {}
 
     void help(std::stringstream& help) const {
         help << "Runs the sharded aggregation command. See "
@@ -69,7 +68,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override {
         return appendCommandStatus(result,
@@ -80,15 +79,16 @@ public:
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                    BSONObjBuilder* out) const override {
-        // Add the server selection metadata to the aggregate command in the "unwrapped" format that
+        // Add the read preference to the aggregate command in the "unwrapped" format that
         // runAggregate() expects: {aggregate: ..., $queryOptions: {$readPreference: ...}}.
+        const auto& readPref = ReadPreferenceSetting::get(opCtx);
         BSONObjBuilder aggCmdBuilder;
         aggCmdBuilder.appendElements(cmdObj);
-        if (auto readPref = serverSelectionMetadata.getReadPreference()) {
-            aggCmdBuilder.append(QueryRequest::kUnwrappedReadPrefField,
-                                 BSON("$readPreference" << readPref->toBSON()));
+        if (readPref.canRunOnSecondary()) {
+            auto queryOptionsBuilder =
+                BSONObjBuilder(aggCmdBuilder.subobjStart(QueryRequest::kUnwrappedReadPrefField));
+            readPref.toContainingBSON(&queryOptionsBuilder);
         }
         BSONObj aggCmd = aggCmdBuilder.obj();
 

@@ -36,7 +36,6 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
@@ -174,7 +173,7 @@ std::unique_ptr<Fetcher> SyncSourceResolver::_makeFirstOplogEntryFetcher(
                    stdx::placeholders::_1,
                    candidate,
                    earliestOpTimeSeen),
-        rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+        ReadPreferenceSetting::secondaryPreferredMetadata(),
         kFetcherTimeout);
 }
 
@@ -194,7 +193,7 @@ std::unique_ptr<Fetcher> SyncSourceResolver::_makeRequiredOpTimeFetcher(HostAndP
                    stdx::placeholders::_1,
                    candidate,
                    earliestOpTimeSeen),
-        rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+        ReadPreferenceSetting::secondaryPreferredMetadata(),
         kFetcherTimeout);
 }
 

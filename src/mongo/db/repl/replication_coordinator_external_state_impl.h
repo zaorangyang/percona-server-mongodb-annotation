@@ -51,6 +51,7 @@ namespace {
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
 }  // namespace
 
+class DropPendingCollectionReaper;
 class SnapshotThread;
 class StorageInterface;
 class NoopWriter;
@@ -60,8 +61,10 @@ class ReplicationCoordinatorExternalStateImpl final : public ReplicationCoordina
     MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalStateImpl);
 
 public:
-    ReplicationCoordinatorExternalStateImpl(ServiceContext* service,
-                                            StorageInterface* storageInterface);
+    ReplicationCoordinatorExternalStateImpl(
+        ServiceContext* service,
+        DropPendingCollectionReaper* dropPendingCollectionReaper,
+        StorageInterface* storageInterface);
     virtual ~ReplicationCoordinatorExternalStateImpl();
     virtual void startThreads(const ReplSettings& settings) override;
     virtual void startSteadyStateReplication(OperationContext* opCtx,
@@ -100,7 +103,7 @@ public:
     void createSnapshot(OperationContext* opCtx, SnapshotName name) final;
     void forceSnapshotCreation() final;
     virtual bool snapshotsEnabled() const;
-    virtual void notifyOplogMetadataWaiters();
+    virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime);
     virtual double getElectionTimeoutOffsetLimitFraction() const;
     virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* opCtx) const;
     virtual StatusWith<OpTime> multiApply(OperationContext* opCtx,
@@ -154,6 +157,10 @@ private:
     // Flag for guarding against concurrent data replication stopping.
     bool _stoppingDataReplication = false;
     stdx::condition_variable _dataReplicationStopped;
+
+    // Used to clean up drop-pending collections with drop optimes before the current replica set
+    // committed OpTime.
+    DropPendingCollectionReaper* _dropPendingCollectionReaper;
 
     StorageInterface* _storageInterface;
     // True when the threads have been started

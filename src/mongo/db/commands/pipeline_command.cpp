@@ -47,7 +47,7 @@ bool isMergePipeline(const std::vector<BSONObj>& pipeline) {
 
 class PipelineCommand : public Command {
 public:
-    PipelineCommand() : Command("aggregate", false) {}
+    PipelineCommand() : Command("aggregate") {}
 
     void help(std::stringstream& help) const override {
         help << "Runs the aggregation command. See http://dochub.mongodb.org/core/aggregation for "
@@ -66,8 +66,8 @@ public:
         return true;
     }
 
-    bool supportsReadConcern() const override {
-        return true;
+    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const override {
+        return !AggregationRequest::parseNs(dbName, cmdObj).isCollectionlessAggregateNS();
     }
 
     ReadWriteType getReadWriteType() const {
@@ -77,13 +77,13 @@ public:
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString nss(AggregationRequest::parseNs(dbname, cmdObj));
         return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj);
     }
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override {
         return appendCommandStatus(result,
@@ -94,7 +94,6 @@ public:
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                    BSONObjBuilder* out) const override {
         return _runAggCommand(opCtx, dbname, cmdObj, verbosity, out);
     }
@@ -105,10 +104,8 @@ private:
                                  const BSONObj& cmdObj,
                                  boost::optional<ExplainOptions::Verbosity> verbosity,
                                  BSONObjBuilder* result) {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
-
         const auto aggregationRequest =
-            uassertStatusOK(AggregationRequest::parseFromBSON(nss, cmdObj, verbosity));
+            uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, verbosity));
 
         // If the featureCompatibilityVersion is 3.2, we disallow collation from the user. However,
         // operations should still respect the collection default collation. The mongos attaches the
@@ -123,7 +120,8 @@ private:
                         ServerGlobalParams::FeatureCompatibility::Version::k32 ||
                     isMergePipeline(aggregationRequest.getPipeline()));
 
-        return runAggregate(opCtx, nss, aggregationRequest, cmdObj, *result);
+        return runAggregate(
+            opCtx, aggregationRequest.getNamespaceString(), aggregationRequest, cmdObj, *result);
     }
 
 } pipelineCmd;

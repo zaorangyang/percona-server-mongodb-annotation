@@ -61,6 +61,12 @@ public:
     static constexpr long long kDefaultBatchSize = 101;
 
     /**
+     * Parse an aggregation pipeline definition from 'pipelineElem'. Returns a non-OK status if
+     * pipeline is not an array or if any of the array elements are not objects.
+     */
+    static StatusWith<std::vector<BSONObj>> parsePipelineFromBSON(BSONElement pipelineElem);
+
+    /**
      * Create a new instance of AggregationRequest by parsing the raw command object. Returns a
      * non-OK status if a required field was missing, if there was an unrecognized field name or if
      * there was a bad value for one of the fields.
@@ -73,6 +79,22 @@ public:
         NamespaceString nss,
         const BSONObj& cmdObj,
         boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none);
+
+    /**
+     * Convenience overload which constructs the request's NamespaceString from the given database
+     * name and command object.
+     */
+    static StatusWith<AggregationRequest> parseFromBSON(
+        const std::string& dbName,
+        const BSONObj& cmdObj,
+        boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none);
+
+    /*
+     * The first field in 'cmdObj' must be a string representing a valid collection name, or the
+     * number 1. In the latter case, returns a reserved namespace that does not represent a user
+     * collection. See 'NamespaceString::makeCollectionlessAggregateNSS()'.
+     */
+    static NamespaceString parseNs(const std::string& dbname, const BSONObj& cmdObj);
 
     /**
      * Constructs an AggregationRequest over the given namespace with the given pipeline. All

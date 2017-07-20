@@ -46,6 +46,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/old_update_position_args.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
@@ -95,7 +96,7 @@ public:
     CmdReplSetTest() : ReplSetCommand("replSetTest") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         log() << "replSetTest command received: " << cmdObj.toString();
@@ -163,7 +164,7 @@ public:
     CmdReplSetGetRBID() : ReplSetCommand("replSetGetRBID") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
@@ -187,10 +188,10 @@ public:
         help << "{ replSetGetStatus : 1 }";
         help << "\nhttp://dochub.mongodb.org/core/replicasetcommands";
     }
-    CmdReplSetGetStatus() : ReplSetCommand("replSetGetStatus", true) {}
+    CmdReplSetGetStatus() : ReplSetCommand("replSetGetStatus") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         if (cmdObj["forShell"].trueValue())
@@ -228,10 +229,10 @@ public:
         help << "{ replSetGetConfig : 1 }";
         help << "\nhttp://dochub.mongodb.org/core/replicasetcommands";
     }
-    CmdReplSetGetConfig() : ReplSetCommand("replSetGetConfig", true) {}
+    CmdReplSetGetConfig() : ReplSetCommand("replSetGetConfig") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
@@ -330,7 +331,7 @@ public:
     }
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         BSONObj configObj;
@@ -353,8 +354,10 @@ public:
             result.append("info2", noConfigMessage);
             log() << "initiate : " << noConfigMessage;
 
-            ReplicationCoordinatorExternalStateImpl externalState(opCtx->getServiceContext(),
-                                                                  StorageInterface::get(opCtx));
+            ReplicationCoordinatorExternalStateImpl externalState(
+                opCtx->getServiceContext(),
+                DropPendingCollectionReaper::get(opCtx),
+                StorageInterface::get(opCtx));
             std::string name;
             std::vector<HostAndPort> seeds;
             parseReplSetSeedList(&externalState, replSetString, &name, &seeds);  // may throw...
@@ -404,7 +407,7 @@ public:
     CmdReplSetReconfig() : ReplSetCommand("replSetReconfig") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
@@ -460,7 +463,7 @@ public:
     CmdReplSetFreeze() : ReplSetCommand("replSetFreeze") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
@@ -491,7 +494,7 @@ public:
     CmdReplSetStepDown() : ReplSetCommand("replSetStepDown") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
@@ -556,7 +559,7 @@ public:
     CmdReplSetMaintenance() : ReplSetCommand("replSetMaintenance") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
@@ -584,7 +587,7 @@ public:
     CmdReplSetSyncFrom() : ReplSetCommand("replSetSyncFrom") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
@@ -612,7 +615,7 @@ public:
     CmdReplSetUpdatePosition() : ReplSetCommand("replSetUpdatePosition") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
@@ -711,7 +714,7 @@ public:
     CmdReplSetHeartbeat() : ReplSetCommand("replSetHeartbeat") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         MONGO_FAIL_POINT_BLOCK(rsDelayHeartbeatResponse, delay) {
@@ -797,7 +800,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
@@ -829,7 +832,7 @@ public:
 private:
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         DEV log() << "received elect msg " << cmdObj.toString();
@@ -862,7 +865,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
@@ -898,7 +901,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) override {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);

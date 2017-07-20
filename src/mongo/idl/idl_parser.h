@@ -34,6 +34,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/db/namespace_string.h"
 
 namespace mongo {
 
@@ -90,28 +91,39 @@ public:
     /**
      * Throw an error message about the BSONElement being a duplicate field.
      */
-    void throwDuplicateField(const BSONElement& element) const;
+    MONGO_COMPILER_NORETURN void throwDuplicateField(const BSONElement& element) const;
 
     /**
      * Throw an error message about the required field missing from the document.
      */
-    void throwMissingField(StringData fieldName) const;
+    MONGO_COMPILER_NORETURN void throwMissingField(StringData fieldName) const;
 
     /**
      * Throw an error message about an unknown field in a document.
      */
-    void throwUnknownField(StringData fieldName) const;
+    MONGO_COMPILER_NORETURN void throwUnknownField(StringData fieldName) const;
 
     /**
      * Throw an error message about an array field name not being a valid unsigned integer.
      */
-    void throwBadArrayFieldNumberValue(StringData value) const;
+    MONGO_COMPILER_NORETURN void throwBadArrayFieldNumberValue(StringData value) const;
 
     /**
      * Throw an error message about the array field name not being the next number in the sequence.
      */
-    void throwBadArrayFieldNumberSequence(std::uint32_t actualValue,
-                                          std::uint32_t expectedValue) const;
+    MONGO_COMPILER_NORETURN void throwBadArrayFieldNumberSequence(
+        std::uint32_t actualValue, std::uint32_t expectedValue) const;
+
+    /**
+     * Throw an error message about an unrecognized enum value.
+     */
+    MONGO_COMPILER_NORETURN void throwBadEnumValue(StringData enumValue) const;
+    MONGO_COMPILER_NORETURN void throwBadEnumValue(int enumValue) const;
+
+    /**
+     * Equivalent to Command::parseNsCollectionRequired
+     */
+    static NamespaceString parseNSCollectionRequired(StringData dbName, const BSONElement& element);
 
 private:
     /**

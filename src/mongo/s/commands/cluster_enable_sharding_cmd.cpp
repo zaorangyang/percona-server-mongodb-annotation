@@ -49,7 +49,7 @@ namespace {
 
 class EnableShardingCmd : public Command {
 public:
-    EnableShardingCmd() : Command("enableSharding", false, "enablesharding") {}
+    EnableShardingCmd() : Command("enableSharding", "enablesharding") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -88,7 +88,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname_unused,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         const std::string dbname = parseNs("", cmdObj);

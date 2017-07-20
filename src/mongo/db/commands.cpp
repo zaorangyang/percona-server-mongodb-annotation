@@ -48,9 +48,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/rpc/metadata.h"
 #include "mongo/rpc/write_concern_error_detail.h"
-#include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 #include "mongo/util/uuid_catalog.h"
 
@@ -139,9 +137,8 @@ ResourcePattern Command::parseResourcePattern(const std::string& dbname,
     return ResourcePattern::forExactNamespace(NamespaceString(ns));
 }
 
-Command::Command(StringData name, bool webUI, StringData oldName)
+Command::Command(StringData name, StringData oldName)
     : _name(name.toString()),
-      _webUI(webUI),
       _commandsExecutedMetric("commands." + _name + ".total", &_commandsExecuted),
       _commandsFailedMetric("commands." + _name + ".failed", &_commandsFailed) {
     // register ourself.
@@ -167,7 +164,6 @@ Status Command::explain(OperationContext* opCtx,
                         const string& dbname,
                         const BSONObj& cmdObj,
                         ExplainOptions::Verbosity verbosity,
-                        const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                         BSONObjBuilder* out) const {
     return {ErrorCodes::IllegalOperation, str::stream() << "Cannot explain cmd: " << getName()};
 }
@@ -313,114 +309,6 @@ void Command::generateHelpResponse(OperationContext* opCtx,
 }
 
 namespace {
-
-void _generateErrorResponse(OperationContext* opCtx,
-                            rpc::ReplyBuilderInterface* replyBuilder,
-                            const DBException& exception,
-                            const BSONObj& metadata) {
-    Command::registerError(opCtx, exception);
-
-    // We could have thrown an exception after setting fields in the builder,
-    // so we need to reset it to a clean state just to be sure.
-    replyBuilder->reset();
-
-    // We need to include some extra information for SendStaleConfig.
-    if (exception.getCode() == ErrorCodes::SendStaleConfig) {
-        const SendStaleConfigException& scex =
-            static_cast<const SendStaleConfigException&>(exception);
-        replyBuilder->setCommandReply(scex.toStatus(),
-                                      BSON("ns" << scex.getns() << "vReceived"
-                                                << BSONArray(scex.getVersionReceived().toBSON())
-                                                << "vWanted"
-                                                << BSONArray(scex.getVersionWanted().toBSON())));
-    } else {
-        replyBuilder->setCommandReply(exception.toStatus());
-    }
-
-    replyBuilder->setMetadata(metadata);
-}
-
-void _generateErrorResponse(OperationContext* opCtx,
-                            rpc::ReplyBuilderInterface* replyBuilder,
-                            const DBException& exception,
-                            const BSONObj& metadata,
-                            LogicalTime operationTime) {
-    Command::registerError(opCtx, exception);
-
-    // We could have thrown an exception after setting fields in the builder,
-    // so we need to reset it to a clean state just to be sure.
-    replyBuilder->reset();
-
-    // We need to include some extra information for SendStaleConfig.
-    if (exception.getCode() == ErrorCodes::SendStaleConfig) {
-        const SendStaleConfigException& scex =
-            static_cast<const SendStaleConfigException&>(exception);
-        replyBuilder->setCommandReply(scex.toStatus(),
-                                      BSON("ns" << scex.getns() << "vReceived"
-                                                << BSONArray(scex.getVersionReceived().toBSON())
-                                                << "vWanted"
-                                                << BSONArray(scex.getVersionWanted().toBSON())
-                                                << "operationTime"
-                                                << operationTime.asTimestamp()));
-    } else {
-        replyBuilder->setCommandReply(exception.toStatus(),
-                                      BSON("operationTime" << operationTime.asTimestamp()));
-    }
-
-    replyBuilder->setMetadata(metadata);
-}
-
-}  // namespace
-
-void Command::generateErrorResponse(OperationContext* opCtx,
-                                    rpc::ReplyBuilderInterface* replyBuilder,
-                                    const DBException& exception,
-                                    const rpc::RequestInterface& request,
-                                    Command* command,
-                                    const BSONObj& metadata,
-                                    LogicalTime operationTime) {
-    LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
-           << "on database '" << request.getDatabase() << "' "
-           << "with arguments '" << command->getRedactedCopyForLogging(request.getCommandArgs())
-           << "' metadata '" << request.getMetadata() << "' and operationTime '"
-           << operationTime.toString() << "': " << exception.toString();
-
-    _generateErrorResponse(opCtx, replyBuilder, exception, metadata, operationTime);
-}
-
-void Command::generateErrorResponse(OperationContext* opCtx,
-                                    rpc::ReplyBuilderInterface* replyBuilder,
-                                    const DBException& exception,
-                                    const rpc::RequestInterface& request,
-                                    Command* command,
-                                    const BSONObj& metadata) {
-    LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
-           << "on database '" << request.getDatabase() << "' "
-           << "with arguments '" << command->getRedactedCopyForLogging(request.getCommandArgs())
-           << "' "
-           << "and metadata '" << request.getMetadata() << "': " << exception.toString();
-
-    _generateErrorResponse(opCtx, replyBuilder, exception, metadata);
-}
-
-void Command::generateErrorResponse(OperationContext* opCtx,
-                                    rpc::ReplyBuilderInterface* replyBuilder,
-                                    const DBException& exception,
-                                    const rpc::RequestInterface& request) {
-    LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
-           << "on database '" << request.getDatabase() << "': " << exception.toString();
-
-    _generateErrorResponse(opCtx, replyBuilder, exception, rpc::makeEmptyMetadata());
-}
-
-void Command::generateErrorResponse(OperationContext* opCtx,
-                                    rpc::ReplyBuilderInterface* replyBuilder,
-                                    const DBException& exception) {
-    LOG(1) << "assertion while executing command: " << exception.toString();
-    _generateErrorResponse(opCtx, replyBuilder, exception, rpc::makeEmptyMetadata());
-}
-
-namespace {
 const stdx::unordered_set<std::string> userManagementCommands{"createUser",
                                                               "updateUser",
                                                               "dropUser",
@@ -443,36 +331,4 @@ bool Command::isUserManagementCommand(const std::string& name) {
     return userManagementCommands.count(name);
 }
 
-namespace {
-stdx::function<void(OperationContext*, const DBException&)> registeredRegisterErrorHandler =
-    [](OperationContext*, const DBException&) { fassertFailed(40357); };
-}  // namespace
-
-void Command::registerRegisterError(
-    stdx::function<void(OperationContext*, const DBException&)> handler) {
-    registeredRegisterErrorHandler = std::move(handler);
-}
-
-void Command::registerError(OperationContext* const opCtx, const DBException& exception) {
-    registeredRegisterErrorHandler(opCtx, exception);
-}
-
-namespace {
-stdx::function<Command::ExecCommandHandler> execCommandHandler =
-    [](OperationContext* const,
-       Command* const,
-       const rpc::RequestInterface&,
-       rpc::ReplyBuilderInterface* const) { invariant(false); };
-}  // namespace
-
-void Command::execCommand(OperationContext* const opCtx,
-                          Command* const command,
-                          const rpc::RequestInterface& request,
-                          rpc::ReplyBuilderInterface* const replyBuilder) {
-    execCommandHandler(opCtx, command, request, replyBuilder);
-}
-
-void Command::registerExecCommand(stdx::function<Command::ExecCommandHandler> handler) {
-    execCommandHandler = std::move(handler);
-}
 }  // namespace mongo

@@ -63,16 +63,13 @@ constexpr long long AggregationRequest::kDefaultBatchSize;
 AggregationRequest::AggregationRequest(NamespaceString nss, std::vector<BSONObj> pipeline)
     : _nss(std::move(nss)), _pipeline(std::move(pipeline)), _batchSize(kDefaultBatchSize) {}
 
-StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
-    NamespaceString nss,
-    const BSONObj& cmdObj,
-    boost::optional<ExplainOptions::Verbosity> explainVerbosity) {
-    // Parse required parameters.
-    auto pipelineElem = cmdObj[kPipelineName];
+StatusWith<std::vector<BSONObj>> AggregationRequest::parsePipelineFromBSON(
+    BSONElement pipelineElem) {
+    std::vector<BSONObj> pipeline;
     if (pipelineElem.eoo() || pipelineElem.type() != BSONType::Array) {
         return {ErrorCodes::TypeMismatch, "'pipeline' option must be specified as an array"};
     }
-    std::vector<BSONObj> pipeline;
+
     for (auto elem : pipelineElem.Obj()) {
         if (elem.type() != BSONType::Object) {
             return {ErrorCodes::TypeMismatch,
@@ -81,7 +78,28 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
         pipeline.push_back(elem.embeddedObject().getOwned());
     }
 
-    AggregationRequest request(std::move(nss), std::move(pipeline));
+    return std::move(pipeline);
+}
+
+StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
+    const std::string& dbName,
+    const BSONObj& cmdObj,
+    boost::optional<ExplainOptions::Verbosity> explainVerbosity) {
+    return parseFromBSON(parseNs(dbName, cmdObj), cmdObj, explainVerbosity);
+}
+
+StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
+    NamespaceString nss,
+    const BSONObj& cmdObj,
+    boost::optional<ExplainOptions::Verbosity> explainVerbosity) {
+    // Parse required parameters.
+    auto pipelineElem = cmdObj[kPipelineName];
+    auto pipeline = AggregationRequest::parsePipelineFromBSON(pipelineElem);
+    if (!pipeline.isOK()) {
+        return pipeline.getStatus();
+    }
+
+    AggregationRequest request(std::move(nss), std::move(pipeline.getValue()));
 
     const std::initializer_list<StringData> optionsParsedElseWhere = {kPipelineName, kCommandName};
 
@@ -221,10 +239,36 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
     return request;
 }
 
+NamespaceString AggregationRequest::parseNs(const std::string& dbname, const BSONObj& cmdObj) {
+    auto firstElement = cmdObj.firstElement();
+
+    if (firstElement.isNumber()) {
+        uassert(ErrorCodes::FailedToParse,
+                str::stream() << "Invalid command format: the '"
+                              << firstElement.fieldNameStringData()
+                              << "' field must specify a collection name or 1",
+                firstElement.number() == 1);
+        return NamespaceString::makeCollectionlessAggregateNSS(dbname);
+    } else {
+        uassert(ErrorCodes::TypeMismatch,
+                str::stream() << "collection name has invalid type: "
+                              << typeName(firstElement.type()),
+                firstElement.type() == BSONType::String);
+
+        const NamespaceString nss(dbname, firstElement.valueStringData());
+
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
+                nss.isValid() && !nss.isCollectionlessAggregateNS());
+
+        return nss;
+    }
+}
+
 Document AggregationRequest::serializeToCommandObj() const {
     MutableDocument serialized;
     return Document{
-        {kCommandName, _nss.coll()},
+        {kCommandName, (_nss.isCollectionlessAggregateNS() ? Value(1) : Value(_nss.coll()))},
         {kPipelineName, _pipeline},
         // Only serialize booleans if different than their default.
         {kAllowDiskUseName, _allowDiskUse ? Value(true) : Value()},

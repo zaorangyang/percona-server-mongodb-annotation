@@ -61,7 +61,7 @@ public:
 
     const char* getSourceName() const final;
 
-    bool isValidInitialSource() const final;
+    InitialSourceType getInitialSourceType() const final;
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 

@@ -44,7 +44,7 @@ using namespace mongo;
 
 class TopCommand : public Command {
 public:
-    TopCommand() : Command("top", true) {}
+    TopCommand() : Command("top") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -67,7 +67,7 @@ public:
     }
     virtual bool run(OperationContext* opCtx,
                      const std::string& db,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         {

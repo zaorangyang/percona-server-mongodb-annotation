@@ -538,13 +538,17 @@ var ReplSetTest = function(opts) {
 
     /**
      * Blocks until all nodes agree on who the primary is.
+     * If 'expectedPrimaryNodeId' is provided, ensure that every node is seeing this node as the
+     * primary. Otherwise, ensure that all the nodes in the set agree with the first node on the
+     * identity of the primary.
      */
-    this.awaitNodesAgreeOnPrimary = function(timeout, nodes) {
+    this.awaitNodesAgreeOnPrimary = function(timeout, nodes, expectedPrimaryNodeId) {
         timeout = timeout || self.kDefaultTimeoutMS;
         nodes = nodes || self.nodes;
+        expectedPrimaryNodeId = expectedPrimaryNodeId || -1;
 
         assert.soonNoExcept(function() {
-            var primary = -1;
+            var primary = expectedPrimaryNodeId;
 
             for (var i = 0; i < nodes.length; i++) {
                 var replSetGetStatus = nodes[i].getDB("admin").runCommand({replSetGetStatus: 1});
@@ -1711,11 +1715,11 @@ var ReplSetTest = function(opts) {
 
         n = this.getNodeId(n);
 
-        var port = _useBridge ? _unbridgedPorts[n] : this.ports[n];
-        print('ReplSetTest stop *** Shutting down mongod in port ' + port + ' ***');
-        var ret = MongoRunner.stopMongod(port, signal, opts);
+        var conn = _useBridge ? _unbridgedNodes[n] : this.nodes[n];
+        print('ReplSetTest stop *** Shutting down mongod in port ' + conn.port + ' ***');
+        var ret = MongoRunner.stopMongod(conn, signal, opts);
 
-        print('ReplSetTest stop *** Mongod in port ' + port + ' shutdown with code (' + ret +
+        print('ReplSetTest stop *** Mongod in port ' + conn.port + ' shutdown with code (' + ret +
               ') ***');
 
         if (_useBridge) {

@@ -209,7 +209,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) final {
         try {
@@ -304,7 +304,6 @@ public:
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata&,
                    BSONObjBuilder* out) const final {
         const auto batch = parseUpdateCommand(dbname, cmdObj);
         uassert(ErrorCodes::InvalidLength,
@@ -375,7 +374,6 @@ public:
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata&,
                    BSONObjBuilder* out) const final {
         const auto batch = parseDeleteCommand(dbname, cmdObj);
         uassert(ErrorCodes::InvalidLength,

@@ -228,7 +228,7 @@ public:
                 "Output is in the \"value\" field\n";
     }
 
-    CmdFindAndModify() : Command("findAndModify", false, "findandmodify") {}
+    CmdFindAndModify() : Command("findAndModify", "findandmodify") {}
 
     bool slaveOk() const override {
         return false;
@@ -252,7 +252,6 @@ public:
                    const std::string& dbName,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata&,
                    BSONObjBuilder* out) const override {
         const NamespaceString fullNs = parseNsCollectionRequired(dbName, cmdObj);
         Status allowedWriteStatus = userAllowedWriteNS(fullNs.ns());
@@ -338,7 +337,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override {
         // findAndModify command is not replicated directly.

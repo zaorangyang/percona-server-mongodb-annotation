@@ -31,7 +31,6 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/query/cluster_find.h"
 
 namespace mongo {
@@ -108,7 +107,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbName,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         auto verbosity = ExplainOptions::parseCmdBSON(cmdObj);
@@ -116,8 +115,23 @@ public:
             return appendCommandStatus(result, verbosity.getStatus());
         }
 
-        // This is the nested command which we are explaining.
-        BSONObj explainObj = cmdObj.firstElement().Obj();
+        // This is the nested command which we are explaining. We need to propagate generic
+        // arguments into the inner command since it is what is passed to the virtual
+        // Command::explain() method.
+        const BSONObj explainObj = ([&] {
+            const auto innerObj = cmdObj.firstElement().Obj();
+            BSONObjBuilder bob;
+            bob.appendElements(innerObj);
+            for (auto outerElem : cmdObj) {
+                // If the argument is in both the inner and outer command, we currently let the
+                // inner version take precedence.
+                const auto name = outerElem.fieldNameStringData();
+                if (Command::isGenericArgument(name) && !innerObj.hasField(name)) {
+                    bob.append(outerElem);
+                }
+            }
+            return bob.obj();
+        }());
 
         const std::string cmdName = explainObj.firstElementFieldName();
         Command* commToExplain = Command::findCommand(cmdName);
@@ -128,16 +142,9 @@ public:
                        str::stream() << "Explain failed due to unknown command: " << cmdName});
         }
 
-        auto readPref = ClusterFind::extractUnwrappedReadPref(cmdObj);
-        if (!readPref.isOK()) {
-            return appendCommandStatus(result, readPref.getStatus());
-        }
-        const bool secondaryOk = (readPref.getValue().pref != ReadPreference::PrimaryOnly);
-        rpc::ServerSelectionMetadata metadata(secondaryOk, readPref.getValue());
-
         // Actually call the nested command's explain(...) method.
-        Status explainStatus = commToExplain->explain(
-            opCtx, dbName, explainObj, verbosity.getValue(), metadata, &result);
+        Status explainStatus =
+            commToExplain->explain(opCtx, dbName, explainObj, verbosity.getValue(), &result);
         if (!explainStatus.isOK()) {
             return appendCommandStatus(result, explainStatus);
         }
