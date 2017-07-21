@@ -59,6 +59,7 @@
 #include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/rslog.h"
@@ -826,7 +827,10 @@ Status _syncRollback(OperationContext* opCtx,
     log() << "rollback common point is " << how.commonPoint;
     log() << "rollback 3 fixup";
     try {
-        ON_BLOCK_EXIT([&] { replCoord->incrementRollbackID(); });
+        ON_BLOCK_EXIT([&] {
+            auto status = ReplicationProcess::get(opCtx)->incrementRollbackID(opCtx);
+            fassertStatusOK(40425, status);
+        });
         syncFixUp(opCtx, how, rollbackSource, replCoord, storageInterface);
     } catch (const RSFatalException& e) {
         return Status(ErrorCodes::UnrecoverableRollbackError, e.what(), 18753);

@@ -32,6 +32,9 @@ selector:
     - jstests/core/notablescan.js  # notablescan.
     - jstests/core/profile*.js  # profiling.
     - jstests/core/rename*.js # renameCollection.
+    - jstests/core/repair_database.js # repairDatabase
+    - jstests/core/repair_database_input_validation.js # repairDatabase
+    - jstests/core/repair_server12955.js # repairDatabase
     - jstests/core/stages*.js  # stageDebug.
     - jstests/core/startup_log.js  # "local" database.
     - jstests/core/storageDetailsCommand.js  # diskStorageStats.
@@ -73,8 +76,6 @@ selector:
     - jstests/core/mr1.js
     - jstests/core/mr3.js
     - jstests/core/mr4.js
-    # TODO SERVER-28577 mongos doesn't support arrayFilters option to update and findAndModify.
-    - jstests/core/update_arrayFilters.js
     exclude_with_any_tags:
     # Tests tagged with the following will fail because they assume collections are not sharded.
     - assumes_no_implicit_collection_creation_after_drop
@@ -98,6 +99,7 @@ executor:
         set_parameters:
           enableTestCommands: 1
       mongod_options:
+        bind_ip_all: ''
         nopreallocj: ''
         set_parameters:
           enableTestCommands: 1

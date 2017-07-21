@@ -84,60 +84,28 @@ void LogicalClock::set(ServiceContext* service, std::unique_ptr<LogicalClock> cl
     clock = std::move(clockArg);
 }
 
-LogicalClock::LogicalClock(ServiceContext* service, std::unique_ptr<TimeProofService> tps)
-    : _service(service), _timeProofService(std::move(tps)) {}
+LogicalClock::LogicalClock(ServiceContext* service) : _service(service) {}
 
-SignedLogicalTime LogicalClock::getClusterTime() {
+LogicalTime LogicalClock::getClusterTime() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     return _clusterTime;
 }
 
-SignedLogicalTime LogicalClock::_makeSignedLogicalTime(LogicalTime logicalTime) {
-    // TODO: SERVER-28436 Implement KeysCollectionManager
-    // Replace dummy keyId with real id from key manager.
-    return SignedLogicalTime(logicalTime, _timeProofService->getProof(logicalTime, _tempKey), 0);
-}
-
-Status LogicalClock::advanceClusterTime(const SignedLogicalTime& newTime) {
-    const auto& newLogicalTime = newTime.getTime();
-
-    // No need to check proof if no time was given.
-    if (newLogicalTime == LogicalTime::kUninitialized) {
-        return Status::OK();
-    }
-
-    invariant(_timeProofService);
-    auto res = _timeProofService->checkProof(newLogicalTime, newTime.getProof(), _tempKey);
-    if (res != Status::OK()) {
-        return res;
-    }
-
-    return advanceClusterTimeFromTrustedSource(newTime);
-}
-
-Status LogicalClock::_advanceClusterTime_inlock(SignedLogicalTime newTime) {
-    if (newTime.getTime() > _clusterTime.getTime()) {
-        _clusterTime = newTime;
-    }
-
-    return Status::OK();
-}
-
-Status LogicalClock::advanceClusterTimeFromTrustedSource(SignedLogicalTime newTime) {
+Status LogicalClock::advanceClusterTime(const LogicalTime newTime) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-    auto rateLimitStatus = _passesRateLimiter_inlock(newTime.getTime());
+
+    // The rate limiter check cannot be moved into _advanceClusterTime_inlock to avoid code
+    // repetition because it shouldn't be called on direct oplog operations.
+    auto rateLimitStatus = _passesRateLimiter_inlock(newTime);
     if (!rateLimitStatus.isOK()) {
         return rateLimitStatus;
     }
 
-    return _advanceClusterTime_inlock(std::move(newTime));
-}
+    if (newTime > _clusterTime) {
+        _clusterTime = newTime;
+    }
 
-Status LogicalClock::signAndAdvanceClusterTime(LogicalTime newTime) {
-    auto newSignedTime = _makeSignedLogicalTime(newTime);
-
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
-    return _advanceClusterTime_inlock(std::move(newSignedTime));
+    return Status::OK();
 }
 
 LogicalTime LogicalClock::reserveTicks(uint64_t nTicks) {
@@ -146,8 +114,7 @@ LogicalTime LogicalClock::reserveTicks(uint64_t nTicks) {
 
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
-    LogicalTime clusterTime = _clusterTime.getTime();
-    LogicalTime nextClusterTime;
+    LogicalTime clusterTime = _clusterTime;
 
     const unsigned wallClockSecs =
         durationCount<Seconds>(_service->getFastClockSource()->now().toDurationSinceEpoch());
@@ -173,22 +140,25 @@ LogicalTime LogicalClock::reserveTicks(uint64_t nTicks) {
 
     // Save the next cluster time.
     clusterTime.addTicks(1);
-    nextClusterTime = clusterTime;
+    _clusterTime = clusterTime;
 
     // Add the rest of the requested ticks if needed.
     if (nTicks > 1) {
-        clusterTime.addTicks(nTicks - 1);
+        _clusterTime.addTicks(nTicks - 1);
     }
 
-    _clusterTime = _makeSignedLogicalTime(clusterTime);
-    return nextClusterTime;
+    return clusterTime;
 }
 
-void LogicalClock::initClusterTimeFromTrustedSource(LogicalTime newTime) {
-    invariant(_clusterTime.getTime() == LogicalTime::kUninitialized);
+void LogicalClock::setClusterTimeFromTrustedSource(LogicalTime newTime) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+
     // Rate limit checks are skipped here so a server with no activity for longer than
     // maxAcceptableLogicalClockDrift seconds can still have its cluster time initialized.
-    _clusterTime = _makeSignedLogicalTime(newTime);
+
+    if (newTime > _clusterTime) {
+        _clusterTime = newTime;
+    }
 }
 
 Status LogicalClock::_passesRateLimiter_inlock(LogicalTime newTime) {

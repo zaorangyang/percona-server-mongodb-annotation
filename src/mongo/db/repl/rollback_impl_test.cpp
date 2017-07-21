@@ -32,6 +32,7 @@
 
 #include <memory>
 
+#include "mongo/db/repl/abstract_oplog_fetcher_test_fixture.h"
 #include "mongo/db/repl/oplog_interface_mock.h"
 #include "mongo/db/repl/rollback_impl.h"
 #include "mongo/db/repl/task_executor_mock.h"
@@ -42,13 +43,14 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/uuid.h"
 
 namespace {
 
 using namespace mongo;
 using namespace mongo::repl;
 
-const OplogInterfaceMock::Operations kEmptyMockOperations;
+NamespaceString nss("local.oplog.rs");
 
 /**
  * Unit test for rollback implementation introduced in 3.6.
@@ -59,7 +61,6 @@ private:
     void tearDown() override;
 
 protected:
-    TaskExecutorMock::ShouldFailRequestFn _shouldFailScheduleRemoteCommandRequest;
     std::unique_ptr<TaskExecutorMock> _taskExecutorMock;
     Rollback::OnCompletionFn _onCompletion;
     StatusWith<OpTime> _onCompletionResult = executor::TaskExecutorTest::getDetectableErrorStatus();
@@ -70,15 +71,8 @@ protected:
 
 void RollbackImplTest::setUp() {
     RollbackTest::setUp();
-    _shouldFailScheduleRemoteCommandRequest = [](const executor::RemoteCommandRequest& request) {
-        return false;
-    };
-    _taskExecutorMock = stdx::make_unique<TaskExecutorMock>(
-        &_threadPoolExecutorTest.getExecutor(),
-        [this](const executor::RemoteCommandRequest& request) {
-            return _shouldFailScheduleRemoteCommandRequest(request);
-        });
-    _localOplog = stdx::make_unique<OplogInterfaceMock>(kEmptyMockOperations);
+    _taskExecutorMock = stdx::make_unique<TaskExecutorMock>(&_threadPoolExecutorTest.getExecutor());
+    _localOplog = stdx::make_unique<OplogInterfaceMock>();
     HostAndPort syncSource("localhost", 1234);
     _requiredRollbackId = 1;
     _onCompletionResult = executor::TaskExecutorTest::getDetectableErrorStatus();
@@ -89,6 +83,8 @@ void RollbackImplTest::setUp() {
         _taskExecutorMock.get(),
         _localOplog.get(),
         syncSource,
+        nss,
+        0,
         _requiredRollbackId,
         _coordinator,
         &_storageInterface,
@@ -105,8 +101,68 @@ void RollbackImplTest::tearDown() {
     _requiredRollbackId = -1;
     _localOplog = {};
     _taskExecutorMock = {};
-    _shouldFailScheduleRemoteCommandRequest = {};
     RollbackTest::tearDown();
+}
+
+/**
+ * Helper functions to make simple oplog entries with timestamps, terms, and hashes.
+ */
+BSONObj makeOp(OpTime time, long long hash) {
+    return BSON("ts" << time.getTimestamp() << "h" << hash << "t" << time.getTerm() << "op"
+                     << "i"
+                     << "ui"
+                     << UUID::gen());
+}
+
+BSONObj makeOp(int count) {
+    return makeOp(OpTime(Timestamp(count, count), count), count);
+}
+
+/**
+ * Helper functions to make pairs of oplog entries and recordIds for the OplogInterfaceMock used
+ * to mock out the local oplog.
+ */
+int recordId = 0;
+OplogInterfaceMock::Operation makeOpAndRecordId(const BSONObj& op) {
+    return std::make_pair(op, RecordId(++recordId));
+}
+
+OplogInterfaceMock::Operation makeOpAndRecordId(OpTime time, long long hash) {
+    return makeOpAndRecordId(makeOp(time, hash));
+}
+
+OplogInterfaceMock::Operation makeOpAndRecordId(int count) {
+    return makeOpAndRecordId(makeOp(count));
+}
+
+OplogInterfaceMock::Operation makeOpAndRecordIdWithUnrecognizedOpType(int count) {
+    OpTime opTime(Timestamp(count, count), count);
+    return std::make_pair(BSON("ts" << opTime.getTimestamp() << "h" << count << "t"
+                                    << opTime.getTerm()
+                                    << "op"
+                                    << "x"
+                                    << "ns"
+                                    << nss.ns()
+                                    << "ui"
+                                    << UUID::gen()
+                                    << "o"
+                                    << BSON("_id"
+                                            << "mydocid"
+                                            << "a"
+                                            << 1)),
+                          RecordId(++recordId));
+}
+
+OplogInterfaceMock::Operation makeOpAndRecordIdWithMissingUuidField(int count) {
+    OpTime opTime(Timestamp(count, count), count);
+    return std::make_pair(
+        BSON("ts" << opTime.getTimestamp() << "h" << count << "t" << opTime.getTerm() << "op"
+                  << "i"
+                  << "ns"
+                  << nss.ns()
+                  << "o"
+                  << BSON("_id" << 0)),
+        RecordId(++recordId));
 }
 
 TEST_F(RollbackImplTest, TestFixtureSetUpInitializesStorageEngine) {
@@ -124,7 +180,7 @@ TEST_F(RollbackImplTest, TestFixtureSetUpInitializesTaskExecutor) {
 
 TEST_F(RollbackImplTest, InvalidConstruction) {
     auto executor = &_threadPoolExecutorTest.getExecutor();
-    OplogInterfaceMock emptyOplog(kEmptyMockOperations);
+    OplogInterfaceMock emptyOplog;
     HostAndPort syncSource("localhost", 1234);
     int requiredRollbackId = 1;
     auto replicationCoordinator = _coordinator;
@@ -136,6 +192,8 @@ TEST_F(RollbackImplTest, InvalidConstruction) {
     ASSERT_THROWS_CODE_AND_WHAT(RollbackImpl(nullptr,
                                              &emptyOplog,
                                              syncSource,
+                                             nss,
+                                             0,
                                              requiredRollbackId,
                                              replicationCoordinator,
                                              storageInterface,
@@ -148,6 +206,8 @@ TEST_F(RollbackImplTest, InvalidConstruction) {
     ASSERT_THROWS_CODE_AND_WHAT(RollbackImpl(executor,
                                              &emptyOplog,
                                              HostAndPort(),
+                                             nss,
+                                             0,
                                              requiredRollbackId,
                                              replicationCoordinator,
                                              storageInterface,
@@ -159,14 +219,14 @@ TEST_F(RollbackImplTest, InvalidConstruction) {
 
 TEST_F(RollbackImplTest,
        StartupReturnsOperationFailedIfMockExecutorFailsToScheduleRollbackTransitionCallback) {
-    _taskExecutorMock->shouldFailScheduleWork = true;
+    _taskExecutorMock->shouldFailScheduleWorkRequest = []() { return true; };
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _rollback->startup());
 }
 
 TEST_F(
     RollbackImplTest,
     RollbackReturnsCallbackCanceledIfExecutorIsShutdownAfterSchedulingTransitionToRollbackCallback) {
-    _taskExecutorMock->shouldDeferScheduleWorkByOneSecond = true;
+    _taskExecutorMock->shouldDeferScheduleWorkRequestByOneSecond = []() { return true; };
     ASSERT_OK(_rollback->startup());
     _threadPoolExecutorTest.getExecutor().shutdown();
     _rollback->join();
@@ -176,15 +236,133 @@ TEST_F(
 TEST_F(
     RollbackImplTest,
     RollbackReturnsCallbackCanceledIfRollbackIsShutdownAfterSchedulingTransitionToRollbackCallback) {
-    _taskExecutorMock->shouldDeferScheduleWorkByOneSecond = true;
+    _taskExecutorMock->shouldDeferScheduleWorkRequestByOneSecond = []() { return true; };
     ASSERT_OK(_rollback->startup());
     _rollback->shutdown();
     _rollback->join();
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, _onCompletionResult);
 }
 
+TEST_F(RollbackImplTest, RollbackReturnsOperationFailedOnFailingToStartUpCommonPointResolver) {
+    // RollbackImpl schedules the RollbackCommonPointResolver in _transitionToRollbackCallback()
+    // after completing the transition to ROLLBACK.
+    //
+    // Since both _transitionToRollbackCallback() and RollbackCommonPointResolver::startup() are
+    // scheduled using scheduleWork(), we have to make the second scheduleWork() request error out
+    // in order to make RollbackCommonPointResolver::startup() fail.
+    std::size_t numRequests = 0;
+    _taskExecutorMock->shouldFailScheduleWorkRequest = [&numRequests]() -> bool {
+        return numRequests++;  // false only if numRequests is 0
+    };
+    ASSERT_OK(_rollback->startup());
+    _rollback->join();
+    ASSERT_EQUALS(ErrorCodes::OperationFailed, _onCompletionResult);
+    ASSERT_EQUALS(2U, numRequests);
+}
+
+TEST_F(RollbackImplTest, RollbackShutsDownCommonPointResolverOnShutdown) {
+    ASSERT_OK(_rollback->startup());
+
+    // Wait for common point resolver to schedule fetcher.
+    auto net = _threadPoolExecutorTest.getNet();
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+
+        // Oplog query.
+        auto noi = net->getNextReadyRequest();
+        _threadPoolExecutorTest.assertRemoteCommandNameEquals("find", noi->getRequest());
+
+        // Blackhole request. This request will be canceled when we shut down RollbackImpl.
+        net->blackHole(noi);
+    }
+
+    // Shutting down RollbackImpl should in turn shut down the RollbackCommonPointResolver.
+    _rollback->shutdown();
+
+    // Run ready network operations so that the TaskExecutor delivers the CallbackCanceled signal
+    // to the RollbackCommonPointResolver callback.
+    executor::NetworkInterfaceMock::InNetworkGuard(net)->runReadyNetworkOperations();
+
+    _rollback->join();
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, _onCompletionResult);
+}
+
+TEST_F(RollbackImplTest,
+       RollbackReturnsIncompatibleRollbackAlgorithmOnMissingUuidFieldInOplogEntry) {
+    // Remote oplog: commonOp
+    // Local oplog: commonOp, opMissingUuid
+    // op2 is an oplog entry representing a document insert. However, op2 is missing a collection
+    // UUID field because it is generated by a 3.4 server.
+    auto commonOp = makeOpAndRecordId(1);
+    auto opMissingUuid = makeOpAndRecordIdWithMissingUuidField(2);
+    _localOplog->setOperations({opMissingUuid, commonOp});
+
+    ASSERT_OK(_rollback->startup());
+
+    auto net = _threadPoolExecutorTest.getNet();
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+
+        // RollbackCommonPointResolver remote oplog query.
+        net->scheduleSuccessfulResponse(
+            AbstractOplogFetcherTest::makeCursorResponse(0, {commonOp.first}, true, nss));
+        net->runReadyNetworkOperations();
+    }
+
+    _rollback->join();
+    ASSERT_EQUALS(ErrorCodes::IncompatibleRollbackAlgorithm, _onCompletionResult);
+}
+
+DEATH_TEST_F(RollbackImplTest,
+             RollbackTerminatesOnUnrecognizedOpType,
+             "Unable to complete rollback. A full resync may be needed") {
+    // Remote oplog: commonOp
+    // Local oplog: commonOp, opWithBadOpType
+    // op2 is an oplog entry representing a document insert. However, op2 is missing a collection
+    // UUID field because it is generated by a 3.4 server.
+    auto commonOp = makeOpAndRecordId(1);
+    auto opWithBadOpType = makeOpAndRecordIdWithUnrecognizedOpType(2);
+    _localOplog->setOperations({opWithBadOpType, commonOp});
+
+    ASSERT_OK(_rollback->startup());
+
+    auto net = _threadPoolExecutorTest.getNet();
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+
+        // RollbackCommonPointResolver remote oplog query.
+        net->scheduleSuccessfulResponse(
+            AbstractOplogFetcherTest::makeCursorResponse(0, {commonOp.first}, true, nss));
+        net->runReadyNetworkOperations();
+    }
+
+    _rollback->join();
+}
+
+TEST_F(RollbackImplTest, RollbackReturnsLastAppliedOpTimeOnSuccess) {
+    // Set both local and remote oplog so that the oplog entry representing the common point
+    // is at the tail of each oplog.
+    auto opAndRecordId = makeOpAndRecordId(1);
+    _localOplog->setOperations({opAndRecordId});
+
+    ASSERT_OK(_rollback->startup());
+
+    auto net = _threadPoolExecutorTest.getNet();
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+
+        // RollbackCommonPointResolver remote oplog query.
+        net->scheduleSuccessfulResponse(
+            AbstractOplogFetcherTest::makeCursorResponse(0, {opAndRecordId.first}, true, nss));
+        net->runReadyNetworkOperations();
+    }
+
+    _rollback->join();
+    ASSERT_EQUALS(OpTime(), unittest::assertGet(_onCompletionResult));
+}
+
 DEATH_TEST_F(RollbackImplTest, RollbackTerminatesIfCompletionCallbackThrowsException, "terminate") {
-    _taskExecutorMock->shouldDeferScheduleWorkByOneSecond = true;
+    _taskExecutorMock->shouldDeferScheduleWorkRequestByOneSecond = []() { return true; };
     ASSERT_OK(_rollback->startup());
     _onCompletion = [](const StatusWith<OpTime>&) noexcept {
         uassertStatusOK({ErrorCodes::InternalError,
@@ -210,8 +388,11 @@ DEATH_TEST_F(RollbackImplTest,
     ShardIdentityRollbackNotifier::get(_opCtx.get())->recordThatRollbackHappened();
     ASSERT_TRUE(ShardIdentityRollbackNotifier::get(_opCtx.get())->didRollbackHappen());
 
+    _taskExecutorMock->shouldDeferScheduleWorkRequestByOneSecond = []() { return true; };
     ASSERT_OK(_rollback->startup());
+    _rollback->shutdown();
     _rollback->join();
+    MONGO_UNREACHABLE;
 }
 
 DEATH_TEST_F(
@@ -220,14 +401,26 @@ DEATH_TEST_F(
     "Failed to transition into SECONDARY; expected to be in state ROLLBACK but found self in "
     "ROLLBACK") {
     _coordinator->_failSetFollowerModeOnThisMemberState = MemberState::RS_SECONDARY;
-    ASSERT_OK(_rollback->startup());
-    _rollback->join();
-}
 
-TEST_F(RollbackImplTest, RollbackReturnsLastAppliedOpTimeOnSuccess) {
     ASSERT_OK(_rollback->startup());
+
+    // We have to wait until we are in ROLLBACK before shutting down.
+    // RollbackImpl schedules RollbackCommonPointResolver after it enters ROLLBACK so we wait until
+    // RollbackCommonPointResolver schedules its first network request.
+    auto net = _threadPoolExecutorTest.getNet();
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+        net->blackHole(net->getNextReadyRequest());
+    }
+
+    // Shutting down RollbackImpl should in turn shut down the RollbackCommonPointResolver.
+    _rollback->shutdown();
+
+    // Run ready network operations so that the TaskExecutor delivers the CallbackCanceled signal
+    // to the RollbackCommonPointResolver callback.
+    executor::NetworkInterfaceMock::InNetworkGuard(net)->runReadyNetworkOperations();
     _rollback->join();
-    ASSERT_EQUALS(OpTime(), unittest::assertGet(_onCompletionResult));
+    MONGO_UNREACHABLE;
 }
 
 class SharedCallbackState {
@@ -253,6 +446,8 @@ TEST_F(RollbackImplTest, RollbackResetsOnCompletionCallbackFunctionPointerUponCo
         _taskExecutorMock.get(),
         _localOplog.get(),
         HostAndPort("localhost", 1234),
+        nss,
+        0,
         _requiredRollbackId,
         _coordinator,
         &_storageInterface,

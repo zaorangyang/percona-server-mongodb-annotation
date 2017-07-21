@@ -37,6 +37,7 @@
 #include "mongo/db/record_id.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
@@ -73,6 +74,9 @@ class PlanExecutor;
  */
 class CursorManager {
 public:
+    // The number of minutes a cursor is allowed to be idle before timing out.
+    static constexpr Minutes kDefaultCursorTimeoutMinutes{10};
+
     CursorManager(NamespaceString nss);
 
     /**
@@ -82,12 +86,11 @@ public:
     ~CursorManager();
 
     /**
-     * Kills all managed query executors and ClientCursors.
+     * Kills all managed query executors and ClientCursors. Callers must have exclusive access to
+     * the collection (i.e. must have the collection, databse, or global resource locked in MODE_X).
      *
      * 'collectionGoingAway' indicates whether the Collection instance is being deleted.  This could
-     * be because the db is being closed, or the collection/db is being dropped. When passing
-     * a 'collectionGoingAway' value of true, callers must have exclusive access to the collection
-     * (i.e. must have the collection, database, or global resource locked in MODE_X).
+     * be because the db is being closed, or the collection/db is being dropped.
      *
      * The 'reason' is the motivation for invalidating all cursors. This will be used for error
      * reporting and logging when an operation finds that the cursor it was operating on has been
@@ -108,7 +111,7 @@ public:
      *
      * Returns the number of cursors that were timed out.
      */
-    std::size_t timeoutCursors(OperationContext* opCtx, int millisSinceLastCall);
+    std::size_t timeoutCursors(OperationContext* opCtx, Date_t now);
 
     /**
      * Register an executor so that it can be notified of deletion/invalidation during yields.
@@ -128,13 +131,6 @@ public:
      * registered with the manager and returned in pinned state.
      */
     ClientCursorPin registerCursor(OperationContext* opCtx, ClientCursorParams&& cursorParams);
-
-    /**
-     * Constructs and pins a special ClientCursor used to track sharding state for the given
-     * collection. See range_preserver.h for more details.
-     */
-    ClientCursorPin registerRangePreserverCursor(OperationContext* opCtx,
-                                                 const Collection* collection);
 
     /**
      * Pins and returns the cursor with the given id.
@@ -189,19 +185,19 @@ public:
      * Deletes inactive cursors from the global cursor manager and from all per-collection cursor
      * managers. Returns the number of cursors that were timed out.
      */
-    static std::size_t timeoutCursorsGlobal(OperationContext* opCtx, int millisSinceLastCall);
+    static std::size_t timeoutCursorsGlobal(OperationContext* opCtx, Date_t now);
 
 private:
     friend class ClientCursorPin;
 
     CursorId _allocateCursorId_inlock();
     void _deregisterCursor_inlock(ClientCursor* cc);
-    ClientCursorPin _registerCursor_inlock(
-        OperationContext* opCtx, std::unique_ptr<ClientCursor, ClientCursor::Deleter> clientCursor);
 
     void deregisterCursor(ClientCursor* cc);
 
-    void unpin(ClientCursor* cursor);
+    void unpin(OperationContext* opCtx, ClientCursor* cursor);
+
+    bool cursorShouldTimeout_inlock(const ClientCursor* cursor, Date_t now);
 
     bool isGlobalManager() const {
         return _nss.isEmpty();

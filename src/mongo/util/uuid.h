@@ -35,6 +35,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 
 namespace mongo {
@@ -47,7 +48,10 @@ class UUID {
     using UUIDStorage = std::array<unsigned char, 16>;
 
 public:
-    UUID() = delete;
+    /**
+     * This constructor exists for IDL only.
+     */
+    UUID() = default;
 
     /**
      * The number of bytes contained in a UUID.
@@ -70,6 +74,13 @@ public:
      * otherwise returns an error.
      */
     static StatusWith<UUID> parse(BSONElement from);
+
+    /**
+     * Parse a BSON document of the form { uuid: BinData(4, "...") }.
+     *
+     * For IDL.
+     */
+    static UUID parse(const BSONObj& obj);
 
     /**
      * Returns whether this string represents a valid UUID.
@@ -128,5 +139,12 @@ inline std::ostream& operator<<(std::ostream& s, const UUID& uuid) {
 inline StringBuilder& operator<<(StringBuilder& s, const UUID& uuid) {
     return (s << uuid.toString());
 }
+
+/**
+ * Supports use of UUID with the BSON macro:
+ *     BSON("uuid" << uuid) -> { uuid: BinData(4, "...") }
+ */
+template <>
+BSONObjBuilder& BSONObjBuilderValueStream::operator<<<UUID>(UUID value);
 
 }  // namespace mongo

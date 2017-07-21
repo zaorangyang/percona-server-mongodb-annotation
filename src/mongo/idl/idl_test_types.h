@@ -28,6 +28,9 @@
 
 #pragma once
 
+#include <vector>
+
+#include "mongo/base/data_range.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 
@@ -38,11 +41,28 @@ namespace mongo {
  */
 class AnyBasicType {
 public:
-    static AnyBasicType parse(BSONElement element) {
-        return AnyBasicType();
+    static AnyBasicType parseFromBSON(const BSONElement& element) {
+        AnyBasicType any;
+        any._element = element;
+        return any;
     }
 
-    void serialize(BSONObjBuilder* builder) const {}
+    /**
+     * Serialize this class as a field in a document.
+     */
+    void serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const {
+        builder->appendAs(_element, fieldName);
+    }
+
+    /**
+     * Serialize this class as an element of a BSON array.
+     */
+    void serializeToBSON(BSONArrayBuilder* builder) const {
+        builder->append(_element);
+    }
+
+private:
+    BSONElement _element;
 };
 
 /**
@@ -51,11 +71,96 @@ public:
  */
 class ObjectBasicType {
 public:
-    static ObjectBasicType parse(const BSONObj& obj) {
-        return ObjectBasicType();
+    static ObjectBasicType parseFromBSON(const BSONObj& obj) {
+        ObjectBasicType object;
+        object._obj = obj.getOwned();
+        return object;
     }
 
-    void serialize(BSONObjBuilder* builder) const {}
+    const BSONObj serializeToBSON() const {
+        return _obj;
+    }
+
+private:
+    BSONObj _obj;
+};
+
+/**
+ * Simple class that demonstrates the contract a class must implement to parse a BSON "bindata"
+ * variable length type
+ * from the IDL parser.
+ */
+class BinDataCustomType {
+public:
+    BinDataCustomType() {}
+    BinDataCustomType(std::vector<std::uint8_t>& vec) : _vec(std::move(vec)) {}
+
+    static BinDataCustomType parseFromBSON(const std::vector<std::uint8_t> vec) {
+        BinDataCustomType b;
+        b._vec = std::move(vec);
+        return b;
+    }
+
+    ConstDataRange serializeToBSON() const {
+        return makeCDR(_vec);
+    }
+
+    const std::vector<std::uint8_t>& getVector() const {
+        return _vec;
+    }
+
+private:
+    std::vector<std::uint8_t> _vec;
+};
+
+/**
+ * Simple class that demonstrates the contract a class must implement to parse an IDL  "chain" type
+ * from the IDL parser.
+ */
+class ChainedType {
+public:
+    static ChainedType parseFromBSON(const BSONObj& obj) {
+        ChainedType object;
+        object._str = obj["field1"].str();
+        return object;
+    }
+
+    void serializeToBSON(BSONObjBuilder* builder) const {
+        builder->append("field1", _str);
+    }
+
+    StringData getField1() const {
+        return _str;
+    }
+    void setField1(StringData value) {
+        _str = value.toString();
+    }
+
+private:
+    std::string _str;
+};
+
+class AnotherChainedType {
+public:
+    static AnotherChainedType parseFromBSON(const BSONObj& obj) {
+        AnotherChainedType object;
+        object._num = obj["field2"].numberLong();
+        return object;
+    }
+
+    void serializeToBSON(BSONObjBuilder* builder) const {
+        builder->append("field2", _num);
+    }
+
+    std::int64_t getField2() const {
+        return _num;
+    }
+    void setField2(std::int64_t value) {
+        _num = value;
+    }
+
+private:
+    std::int64_t _num;
 };
 
 }  // namespace mongo

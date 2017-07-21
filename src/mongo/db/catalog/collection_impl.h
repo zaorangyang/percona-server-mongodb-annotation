@@ -29,6 +29,7 @@
 #pragma once
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 
 namespace mongo {
 class CollectionImpl final : virtual public Collection::Impl,
@@ -41,6 +42,7 @@ public:
     explicit CollectionImpl(Collection* _this,
                             OperationContext* opCtx,
                             StringData fullNS,
+                            OptionalCollectionUUID uuid,
                             CollectionCatalogEntry* details,  // does not own
                             RecordStore* recordStore,         // does not own
                             DatabaseCatalogEntry* dbce);      // does not own
@@ -71,6 +73,10 @@ public:
 
     const NamespaceString& ns() const final {
         return _ns;
+    }
+
+    OptionalCollectionUUID uuid() const {
+        return _uuid;
     }
 
     const IndexCatalog* getIndexCatalog() const final {
@@ -381,6 +387,7 @@ private:
     int _magic;
 
     const NamespaceString _ns;
+    OptionalCollectionUUID _uuid;
     CollectionCatalogEntry* const _details;
     RecordStore* const _recordStore;
     DatabaseCatalogEntry* const _dbce;

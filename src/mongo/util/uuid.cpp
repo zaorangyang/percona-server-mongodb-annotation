@@ -81,6 +81,12 @@ StatusWith<UUID> UUID::parse(const std::string& s) {
     return UUID{std::move(uuid)};
 }
 
+UUID UUID::parse(const BSONObj& obj) {
+    auto res = parse(obj.getField("uuid"));
+    invariant(res.isOK());
+    return res.getValue();
+}
+
 bool UUID::isUUIDString(const std::string& s) {
     return std::regex_match(s, uuidRegex);
 }
@@ -134,6 +140,13 @@ std::string UUID::toString() const {
     ss << toHexLower(&_uuid[10], 6);
 
     return ss.str();
+}
+
+template <>
+BSONObjBuilder& BSONObjBuilderValueStream::operator<<<UUID>(UUID value) {
+    value.appendToBuilder(_builder, _fieldName);
+    _fieldName = StringData();
+    return *_builder;
 }
 
 }  // namespace mongo

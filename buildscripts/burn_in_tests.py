@@ -7,12 +7,14 @@ Command line utility for determining what jstests have been added or modified
 from __future__ import absolute_import
 
 import collections
+import copy
 import json
 import optparse
 import os.path
 import subprocess
 import re
 import requests
+import shlex
 import sys
 import urlparse
 import yaml
@@ -107,7 +109,7 @@ def find_last_activated_task(revisions, variant, branch_name):
     build_prefix = "mongodb_mongo_" + branch_name + "_" + variant.replace('-', '_')
 
     evg_cfg = read_evg_config()
-    if "api_server_host" in evg_cfg:
+    if evg_cfg is not None and "api_server_host" in evg_cfg:
         api_server = "{url.scheme}://{url.netloc}".format(
             url=urlparse.urlparse(evg_cfg["api_server_host"]))
     else:
@@ -412,10 +414,11 @@ def main():
         test_results = {"failures": 0, "results": []}
 
         for task in sorted(tests_by_task):
+            resmoke_cmd = copy.deepcopy(args)
+            resmoke_cmd.extend(shlex.split(tests_by_task[task]["resmoke_args"]))
+            resmoke_cmd.extend(tests_by_task[task]["tests"])
             try:
-                subprocess.check_call(" ".join(args) + " " +
-                                      tests_by_task[task]["resmoke_args"] + " " +
-                                      " ".join(tests_by_task[task]["tests"]), shell=True)
+                subprocess.check_call(resmoke_cmd, shell=False)
             except subprocess.CalledProcessError as err:
                 print "Resmoke returned an error with task:", task
                 _save_report_data(test_results, values.report_file, task)
@@ -426,6 +429,7 @@ def main():
         _write_report_file(test_results, values.report_file)
 
     sys.exit(0)
+
 
 if __name__ == "__main__":
     main()

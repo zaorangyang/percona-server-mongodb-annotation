@@ -48,6 +48,8 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -63,6 +65,7 @@
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_local.h"
 #include "mongo/s/client/shard_registry.h"
@@ -122,6 +125,14 @@ void ShardingMongodTestFixture::setUp() {
     replCoordPtr->setGetConfigReturnValue(replSetConfig);
 
     repl::ReplicationCoordinator::set(service, std::move(replCoordPtr));
+
+    auto storagePtr = stdx::make_unique<repl::StorageInterfaceMock>();
+
+    repl::ReplicationProcess::set(service,
+                                  stdx::make_unique<repl::ReplicationProcess>(storagePtr.get()));
+    repl::ReplicationProcess::get(_opCtx.get())->initializeRollbackID(_opCtx.get());
+
+    repl::StorageInterface::set(service, std::move(storagePtr));
 
     service->setOpObserver(stdx::make_unique<OpObserverImpl>());
     repl::setOplogCollectionName();
@@ -225,7 +236,12 @@ std::unique_ptr<ShardingCatalogManager> ShardingMongodTestFixture::makeShardingC
     return nullptr;
 }
 
-std::unique_ptr<CatalogCache> ShardingMongodTestFixture::makeCatalogCache() {
+std::unique_ptr<CatalogCacheLoader> ShardingMongodTestFixture::makeCatalogCacheLoader() {
+    return nullptr;
+}
+
+std::unique_ptr<CatalogCache> ShardingMongodTestFixture::makeCatalogCache(
+    std::unique_ptr<CatalogCacheLoader> catalogCacheLoader) {
     return nullptr;
 }
 
@@ -259,7 +275,9 @@ Status ShardingMongodTestFixture::initializeGlobalShardingStateForMongodForTest(
 
     auto catalogClientPtr = makeShardingCatalogClient(std::move(distLockManagerPtr));
     auto catalogManagerPtr = makeShardingCatalogManager(catalogClientPtr.get());
-    auto catalogCachePtr = makeCatalogCache();
+
+    auto catalogCacheLoaderPtr = makeCatalogCacheLoader();
+    auto catalogCachePtr = makeCatalogCache(std::move(catalogCacheLoaderPtr));
 
     auto clusterCursorManagerPtr = makeClusterCursorManager();
 

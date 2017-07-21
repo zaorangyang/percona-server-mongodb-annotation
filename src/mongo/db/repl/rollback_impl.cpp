@@ -38,7 +38,9 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/rollback_impl_listener.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -60,6 +62,8 @@ ServiceContext::UniqueOperationContext makeOpCtx() {
 RollbackImpl::RollbackImpl(executor::TaskExecutor* executor,
                            OplogInterface* localOplog,
                            const HostAndPort& syncSource,
+                           const NamespaceString& remoteOplogNss,
+                           std::size_t maxFetcherRestarts,
                            int requiredRollbackId,
                            ReplicationCoordinator* replicationCoordinator,
                            StorageInterface* storageInterface,
@@ -67,9 +71,20 @@ RollbackImpl::RollbackImpl(executor::TaskExecutor* executor,
     : AbstractAsyncComponent(executor, "rollback"),
       _localOplog(localOplog),
       _syncSource(syncSource),
+      _remoteOplogNss(remoteOplogNss),
+      _maxFetcherRestarts(maxFetcherRestarts),
       _requiredRollbackId(requiredRollbackId),
       _replicationCoordinator(replicationCoordinator),
       _storageInterface(storageInterface),
+      _listener(stdx::make_unique<Listener>()),
+      _commonPointResolver(stdx::make_unique<RollbackCommonPointResolver>(
+          executor,
+          syncSource,
+          remoteOplogNss,
+          maxFetcherRestarts,
+          localOplog,
+          _listener.get(),
+          stdx::bind(&RollbackImpl::_commonPointResolverCallback, this, stdx::placeholders::_1))),
       _onCompletion(onCompletion) {
     // Task executor will be validated by AbstractAsyncComponent's constructor.
     invariant(localOplog);
@@ -99,6 +114,7 @@ Status RollbackImpl::_doStartup_inlock() noexcept {
 
 void RollbackImpl::_doShutdown_inlock() noexcept {
     _cancelHandle_inlock(_transitionToRollbackHandle);
+    _shutdownComponent_inlock(_commonPointResolver);
 }
 
 stdx::mutex* RollbackImpl::_getMutex() noexcept {
@@ -107,12 +123,8 @@ stdx::mutex* RollbackImpl::_getMutex() noexcept {
 
 void RollbackImpl::_transitionToRollbackCallback(
     const executor::TaskExecutor::CallbackArgs& callbackArgs) {
-    auto status = Status::OK();
-    {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        status = _checkForShutdownAndConvertStatus_inlock(
-            callbackArgs, str::stream() << "error before transition to ROLLBACK");
-    }
+    auto status = _checkForShutdownAndConvertStatus(
+        callbackArgs, str::stream() << "error before transition to ROLLBACK");
     if (!status.isOK()) {
         _finishCallback(nullptr, status);
         return;
@@ -136,8 +148,25 @@ void RollbackImpl::_transitionToRollbackCallback(
         return;
     }
 
+    // Schedule RollbackCommonPointResolver
+    status = _startupComponent(_commonPointResolver);
+    if (!status.isOK()) {
+        _finishCallback(opCtx.get(), status);
+        return;
+    }
+}
+
+void RollbackImpl::_commonPointResolverCallback(const Status& commonPointResolverStatus) {
+    auto status = _checkForShutdownAndConvertStatus(
+        commonPointResolverStatus,
+        str::stream() << "failed to find common point between local and remote oplogs");
+    if (!status.isOK()) {
+        _finishCallback(nullptr, status);
+        return;
+    }
+
     // Success! For now....
-    _finishCallback(opCtx.get(), OpTime());
+    _finishCallback(nullptr, OpTime());
 }
 
 void RollbackImpl::_checkShardIdentityRollback(OperationContext* opCtx) {
@@ -179,6 +208,15 @@ void RollbackImpl::_tearDown(OperationContext* opCtx) {
 }
 
 void RollbackImpl::_finishCallback(OperationContext* opCtx, StatusWith<OpTime> lastApplied) {
+    // Abort only when we are in a unrecoverable state.
+    // WARNING: these statuses sometimes have location codes which are lost with uassertStatusOK
+    // so we need to check here first.
+    if (ErrorCodes::UnrecoverableRollbackError == lastApplied.getStatus().code()) {
+        severe() << "Unable to complete rollback. A full resync may be needed: "
+                 << redact(lastApplied.getStatus());
+        fassertFailedNoTrace(40435);
+    }
+
     // After running callback function '_onCompletion', clear '_onCompletion' to release any
     // resources that might be held by this function object.
     // '_onCompletion' must be moved to a temporary copy and destroyed outside the lock in case

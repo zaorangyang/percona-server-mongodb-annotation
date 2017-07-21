@@ -1216,8 +1216,8 @@ elif has_option("release") and link_model != "object":
 
 # The only link model currently supported on Windows is 'object', since there is no equivalent
 # to --whole-archive.
-if env.TargetOSIs('windows') and link_model != 'object':
-    env.FatalError("Windows builds must use the 'object' link model");
+if env.TargetOSIs('windows') and link_model not in ['object', 'static']:
+    env.FatalError("Windows builds must use the 'object' or 'static' link models");
 
 # The 'object' mode for libdeps is enabled by setting _LIBDEPS to $_LIBDEPS_OBJS. The other two
 # modes operate in library mode, enabled by setting _LIBDEPS to $_LIBDEPS_LIBS.
@@ -1401,18 +1401,24 @@ libdeps.setup_environment(env, emitting_shared=(link_model.startswith("dynamic")
 if env.TargetOSIs('linux', 'freebsd', 'openbsd'):
     env['LINK_LIBGROUP_START'] = '-Wl,--start-group'
     env['LINK_LIBGROUP_END'] = '-Wl,--end-group'
-    env['LINK_WHOLE_ARCHIVE_START'] = '-Wl,--whole-archive'
-    env['LINK_WHOLE_ARCHIVE_END'] = '-Wl,--no-whole-archive'
+    # NOTE: The leading and trailing spaces here are important. Do not remove them.
+    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-Wl,--whole-archive '
+    env['LINK_WHOLE_ARCHIVE_LIB_END'] = ' -Wl,--no-whole-archive'
 elif env.TargetOSIs('darwin'):
     env['LINK_LIBGROUP_START'] = ''
     env['LINK_LIBGROUP_END'] = ''
-    env['LINK_WHOLE_ARCHIVE_START'] = '-Wl,-all_load'
-    env['LINK_WHOLE_ARCHIVE_END'] = '-Wl,-noall_load'
+    # NOTE: The trailing space here is important. Do not remove it.
+    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-force_load '
+    env['LINK_WHOLE_ARCHIVE_LIB_END'] = ''
 elif env.TargetOSIs('solaris'):
     env['LINK_LIBGROUP_START'] = '-z rescan-start'
     env['LINK_LIBGROUP_END'] = '-z rescan-end'
-    env['LINK_WHOLE_ARCHIVE_START'] = '-z allextract'
-    env['LINK_WHOLE_ARCHIVE_END'] = '-z defaultextract'
+    # NOTE: The leading and trailing spaces here are important. Do not remove them.
+    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-z allextract '
+    env['LINK_WHOLE_ARCHIVE_LIB_END'] = ' -z defaultextract'
+elif env.TargetOSIs('windows'):
+    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '/WHOLEARCHIVE:'
+    env['LINK_WHOLE_ARCHIVE_LIB_END'] = ''
 
 if has_option('audit'):
     env.Append( CPPDEFINES=[ 'PERCONA_AUDIT_ENABLED' ] )
@@ -1487,8 +1493,14 @@ elif env.TargetOSIs('windows'):
     #  on extremely old versions of MSVC (pre 2k5), default constructing an array member in a
     #  constructor's initialization list would not zero the array members "in some cases".
     #  since we don't target MSVC versions that old, this warning is safe to ignore.
+    # c4373
+    #  Older versions of MSVC would fail to make a function in a derived class override a virtual
+    #  function in the parent, when defined inline and at least one of the parameters is made const.
+    #  The behavior is incorrect under the standard.  MSVC is fixed now, and the warning exists
+    #  merely to alert users who may have relied upon the older, non-compliant behavior.  Our code
+    #  should not have any problems with the older behavior, so we can just disable this warning.
     env.Append( CCFLAGS=["/wd4355", "/wd4800", "/wd4267", "/wd4244",
-                         "/wd4290", "/wd4068", "/wd4351"] )
+                         "/wd4290", "/wd4068", "/wd4351", "/wd4373"] )
 
     # some warnings we should treat as errors:
     # c4013
@@ -1623,7 +1635,12 @@ if env.TargetOSIs('posix'):
             env.Append( CCFLAGS=["-Werror"] )
 
     env.Append( CXXFLAGS=["-Woverloaded-virtual"] )
-    env.Append( LINKFLAGS=["-pthread"] )
+
+    # On OS X, clang doesn't want the pthread flag at link time, or it
+    # issues warnings which make it impossible for us to declare link
+    # warnings as errors. See http://stackoverflow.com/a/19382663.
+    if not (env.TargetOSIs('darwin') and env.ToolchainIs('clang')):
+        env.Append( LINKFLAGS=["-pthread"] )
 
     # SERVER-9761: Ensure early detection of missing symbols in dependent libraries at program
     # startup.
@@ -1653,11 +1670,11 @@ if env.TargetOSIs('posix'):
 
     # Promote linker warnings into errors. We can't yet do this on OS X because its linker considers
     # noall_load obsolete and warns about it.
-    if not env.TargetOSIs('darwin') and not has_option("disable-warnings-as-errors"):
+    if not has_option("disable-warnings-as-errors"):
         env.Append(
             LINKFLAGS=[
-                "-Wl,--fatal-warnings",
-            ],
+                '-Wl,-fatal_warnings' if env.TargetOSIs('darwin') else "-Wl,--fatal-warnings",
+            ]
         )
 
 mmapv1 = False
@@ -3026,6 +3043,9 @@ def doLint( env , target , source ):
     import buildscripts.clang_format
     if not buildscripts.clang_format.lint_all(None):
         raise Exception("clang-format lint errors")
+
+    import buildscripts.pylinters
+    buildscripts.pylinters.lint_all(None, {}, [])
 
     import buildscripts.lint
     if not buildscripts.lint.run_lint( [ "src/mongo/" ] ):

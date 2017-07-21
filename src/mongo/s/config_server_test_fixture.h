@@ -34,6 +34,7 @@ namespace mongo {
 
 class BSONObj;
 class ChunkType;
+class KeysCollectionDocument;
 class NamespaceString;
 class Shard;
 class ShardingCatalogClient;
@@ -109,6 +110,11 @@ public:
      */
     void onCommandForAddShard(executor::NetworkTestEnv::OnCommandFunction func);
 
+    /**
+     * Returns all the keys in admin.system.keys
+     */
+    std::vector<KeysCollectionDocument> getKeys(OperationContext* opCtx);
+
 protected:
     /**
      * Sets this node up as a mongod with sharding components for ClusterRole::ConfigServer.
@@ -126,7 +132,10 @@ protected:
     std::unique_ptr<ShardingCatalogManager> makeShardingCatalogManager(
         ShardingCatalogClient* catalogClient) override;
 
-    std::unique_ptr<CatalogCache> makeCatalogCache() override;
+    std::unique_ptr<CatalogCacheLoader> makeCatalogCacheLoader() override;
+
+    std::unique_ptr<CatalogCache> makeCatalogCache(
+        std::unique_ptr<CatalogCacheLoader> catalogCacheLoader) override;
 
     std::unique_ptr<ClusterCursorManager> makeClusterCursorManager() override;
 

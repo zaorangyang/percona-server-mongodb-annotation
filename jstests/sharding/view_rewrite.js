@@ -68,9 +68,10 @@
             "ns": coll.getFullName(),
             "command.aggregate": coll.getName(),
             "command.comment": "agg_rewrite",
-            "command.maxTimeMS": 5 * 60 * 1000,
+            "command.maxTimeMS": {"$exists": true},
             "command.readConcern": {level: "linearizable"},
-            "command.pipeline.$mergeCursors": {"$exists": false}
+            "command.pipeline.$mergeCursors": {"$exists": false},
+            "nreturned": {"$exists": true}
         });
 
         // Find
@@ -85,9 +86,10 @@
             "ns": coll.getFullName(),
             "command.aggregate": coll.getName(),
             "command.comment": "find_rewrite",
-            "command.maxTimeMS": 5 * 60 * 1000,
+            "command.maxTimeMS": {"$exists": true},
             "command.readConcern": {level: "linearizable"},
-            "command.pipeline.$mergeCursors": {"$exists": false}
+            "command.pipeline.$mergeCursors": {"$exists": false},
+            "nreturned": {"$exists": true}
         });
 
         // Count
@@ -102,9 +104,10 @@
             "ns": coll.getFullName(),
             "command.aggregate": coll.getName(),
             "command.comment": "count_rewrite",
-            "command.maxTimeMS": 5 * 60 * 1000,
+            "command.maxTimeMS": {"$exists": true},
             "command.readConcern": {level: "linearizable"},
-            "command.pipeline.$mergeCursors": {"$exists": false}
+            "command.pipeline.$mergeCursors": {"$exists": false},
+            "nreturned": {"$exists": true}
         });
 
         // Distinct
@@ -120,9 +123,10 @@
             "ns": coll.getFullName(),
             "command.aggregate": coll.getName(),
             "command.comment": "distinct_rewrite",
-            "command.maxTimeMS": 5 * 60 * 1000,
+            "command.maxTimeMS": {"$exists": true},
             "command.readConcern": {level: "linearizable"},
-            "command.pipeline.$mergeCursors": {"$exists": false}
+            "command.pipeline.$mergeCursors": {"$exists": false},
+            "nreturned": {"$exists": true}
         });
 
         assert.commandWorked(shardPrimary.setProfilingLevel(0));
