@@ -38,7 +38,7 @@ namespace {
 
 class NetStatCmd : public Command {
 public:
-    NetStatCmd() : Command("netstat", false, "netstat") {}
+    NetStatCmd() : Command("netstat") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -67,7 +67,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         result.append("configserver",

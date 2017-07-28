@@ -41,7 +41,6 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
@@ -79,7 +78,7 @@ const int kMaxCommandRetry = 3;
 
 const BSONObj kReplSecondaryOkMetadata{[] {
     BSONObjBuilder o;
-    o.appendElements(rpc::ServerSelectionMetadata(true, boost::none).toBSON());
+    o.appendElements(ReadPreferenceSetting::secondaryPreferredMetadata());
     o.append(rpc::kReplSetMetadataFieldName, 1);
     return o.obj();
 }()};
@@ -257,117 +256,6 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseNotExisting) {
     onFindCommand([](const RemoteCommandRequest& request) { return vector<BSONObj>{}; });
     onFindCommand([](const RemoteCommandRequest& request) { return vector<BSONObj>{}; });
 
-    future.timed_get(kFutureTimeout);
-}
-
-TEST_F(ShardingCatalogClientTest, UpdateCollection) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    CollectionType collection;
-    collection.setNs(NamespaceString("db.coll"));
-    collection.setUpdatedAt(network()->now());
-    collection.setUnique(true);
-    collection.setEpoch(OID::gen());
-    collection.setKeyPattern(KeyPattern(BSON("_id" << 1)));
-
-    auto future = launchAsync([this, collection] {
-        auto status = catalogClient()->updateCollection(
-            operationContext(), collection.getNs().toString(), collection);
-        ASSERT_OK(status);
-    });
-
-    expectUpdateCollection(HostAndPort("TestHost1"), collection);
-
-    // Now wait for the updateCollection call to return
-    future.timed_get(kFutureTimeout);
-}
-
-TEST_F(ShardingCatalogClientTest, UpdateCollectionNotMaster) {
-    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
-
-    CollectionType collection;
-    collection.setNs(NamespaceString("db.coll"));
-    collection.setUpdatedAt(network()->now());
-    collection.setUnique(true);
-    collection.setEpoch(OID::gen());
-    collection.setKeyPattern(KeyPattern(BSON("_id" << 1)));
-
-    auto future = launchAsync([this, collection] {
-        auto status = catalogClient()->updateCollection(
-            operationContext(), collection.getNs().toString(), collection);
-        ASSERT_EQUALS(ErrorCodes::NotMaster, status);
-    });
-
-    for (int i = 0; i < 3; ++i) {
-        onCommand([](const RemoteCommandRequest& request) {
-            BatchedCommandResponse response;
-            response.setOk(false);
-            response.setErrCode(ErrorCodes::NotMaster);
-            response.setErrMessage("not master");
-
-            return response.toBSON();
-        });
-    }
-
-    // Now wait for the updateCollection call to return
-    future.timed_get(kFutureTimeout);
-}
-
-TEST_F(ShardingCatalogClientTest, UpdateCollectionNotMasterFromTargeter) {
-    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotMaster, "not master"));
-
-    CollectionType collection;
-    collection.setNs(NamespaceString("db.coll"));
-    collection.setUpdatedAt(network()->now());
-    collection.setUnique(true);
-    collection.setEpoch(OID::gen());
-    collection.setKeyPattern(KeyPattern(BSON("_id" << 1)));
-
-    auto future = launchAsync([this, collection] {
-        auto status = catalogClient()->updateCollection(
-            operationContext(), collection.getNs().toString(), collection);
-        ASSERT_EQUALS(ErrorCodes::NotMaster, status);
-    });
-
-    // Now wait for the updateCollection call to return
-    future.timed_get(kFutureTimeout);
-}
-
-TEST_F(ShardingCatalogClientTest, UpdateCollectionNotMasterRetrySuccess) {
-    HostAndPort host1("TestHost1");
-    HostAndPort host2("TestHost2");
-    configTargeter()->setFindHostReturnValue(host1);
-
-    CollectionType collection;
-    collection.setNs(NamespaceString("db.coll"));
-    collection.setUpdatedAt(network()->now());
-    collection.setUnique(true);
-    collection.setEpoch(OID::gen());
-    collection.setKeyPattern(KeyPattern(BSON("_id" << 1)));
-
-    auto future = launchAsync([this, collection] {
-        auto status = catalogClient()->updateCollection(
-            operationContext(), collection.getNs().toString(), collection);
-        ASSERT_OK(status);
-    });
-
-    onCommand([&](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(host1, request.target);
-
-        BatchedCommandResponse response;
-        response.setOk(false);
-        response.setErrCode(ErrorCodes::NotMaster);
-        response.setErrMessage("not master");
-
-        // Ensure that when the catalog manager tries to retarget after getting the
-        // NotMaster response, it will get back a new target.
-        configTargeter()->setFindHostReturnValue(host2);
-        return response.toBSON();
-    });
-
-    expectUpdateCollection(HostAndPort(host2), collection);
-
-    // Now wait for the updateCollection call to return
     future.timed_get(kFutureTimeout);
 }
 
@@ -1492,7 +1380,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 10);
@@ -1506,7 +1394,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 1);
@@ -1519,7 +1407,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
         string cmdName = request.cmdObj.firstElement().fieldName();
         ASSERT_EQUALS("listDatabases", cmdName);
 
-        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 100);
@@ -1774,7 +1662,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 10);
@@ -1788,7 +1676,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 1);
@@ -1802,7 +1690,7 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 100);
@@ -1900,7 +1788,7 @@ TEST_F(ShardingCatalogClientTest, EnableShardingNoDBExists) {
         ASSERT_EQ("admin", request.dbname);
         ASSERT_BSONOBJ_EQ(BSON("listDatabases" << 1), request.cmdObj);
 
-        ASSERT_BSONOBJ_EQ(rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return fromjson(R"({

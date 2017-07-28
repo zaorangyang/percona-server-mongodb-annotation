@@ -49,7 +49,6 @@
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
@@ -439,7 +438,8 @@ void ShardingTestFixture::expectChangeLogInsert(const HostAndPort& configHost,
 }
 
 void ShardingTestFixture::expectUpdateCollection(const HostAndPort& expectedHost,
-                                                 const CollectionType& coll) {
+                                                 const CollectionType& coll,
+                                                 bool expectUpsert) {
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(expectedHost, request.target);
         ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1),
@@ -454,7 +454,7 @@ void ShardingTestFixture::expectUpdateCollection(const HostAndPort& expectedHost
         ASSERT_EQUALS(1U, updates.size());
         auto update = updates.front();
 
-        ASSERT_TRUE(update->getUpsert());
+        ASSERT_EQ(expectUpsert, update->getUpsert());
         ASSERT_FALSE(update->getMulti());
         ASSERT_BSONOBJ_EQ(update->getQuery(),
                           BSON(CollectionType::fullNs(coll.getNs().toString())));

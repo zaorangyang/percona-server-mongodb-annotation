@@ -17,11 +17,11 @@
         db.batch.insert( { n: i, tag: "rateLimit test" } );
     }
 
-    var cnt = db.system.profile.count( { op: "insert", ns: "test.batch", "query.documents.0.tag": "rateLimit test" } );
+    var cnt = db.system.profile.count( { op: "insert", ns: "test.batch", "command.documents.0.tag": "rateLimit test" } );
     assert(170 < cnt && cnt < 230, "rateLimit failed to filter events (" + cnt + ")");
 
     // check that all profiled events have correct 'rateLimit' value
-    var cnt2 = db.system.profile.count( { op: "insert", ns: "test.batch", "query.documents.0.tag": "rateLimit test" , rateLimit: 5} );
+    var cnt2 = db.system.profile.count( { op: "insert", ns: "test.batch", "command.documents.0.tag": "rateLimit test" , rateLimit: 5} );
 
     if (cnt != cnt2) {
         db.system.profile.find().forEach( printjsononeline );

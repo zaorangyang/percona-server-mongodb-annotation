@@ -638,6 +638,30 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "aggregate_currentOp_allUsers_true",
+          command: {aggregate: 1, pipeline: [{$currentOp: {allUsers: true}}], cursor: {}},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_monitoring,
+                privileges: [{resource: {cluster: true}, actions: ["inprog"]}]
+              },
+              {
+                runOnDb: firstDbName,
+                roles: roles_monitoring,
+                privileges: [{resource: {cluster: true}, actions: ["inprog"]}],
+                expectFail: true
+              }
+          ]
+        },
+        {
+          testname: "aggregate_currentOp_allUsers_false",
+          command: {aggregate: 1, pipeline: [{$currentOp: {allUsers: false}}], cursor: {}},
+          skipSharded: true,
+          testcases: [{runOnDb: adminDbName, roles: roles_all}]
+        },
+        {
           testname: "aggregate_lookup",
           command: {
               aggregate: "foo",
@@ -3054,12 +3078,17 @@ var authCommandsLib = {
         {
           testname: "insert_system_users",
           command: {insert: "system.users", documents: [{data: 5}]},
+          setup: function(db) {
+              // Ensure unique indexes consistently cause insertion failure
+              db.system.users.insert({data: 5});
+          },
           testcases: [
               {
                 runOnDb: "admin",
                 roles: {"root": 1, "__system": 1, "restore": 1},
                 privileges:
                     [{resource: {db: "admin", collection: "system.users"}, actions: ["insert"]}],
+                expectFail: true,
               },
           ]
         },

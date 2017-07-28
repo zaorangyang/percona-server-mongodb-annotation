@@ -45,7 +45,6 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/background.h"
-#include "mongo/db/catalog/apply_ops.h"
 #include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/collection.h"
@@ -57,7 +56,6 @@
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/dbhash.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -73,6 +71,7 @@
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
+#include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/optime.h"
@@ -250,26 +249,6 @@ Collection* getLocalOplogCollection(OperationContext* opCtx,
     return _localOplogCollection;
 }
 
-bool oplogDisabled(OperationContext* opCtx,
-                   ReplicationCoordinator::Mode replicationMode,
-                   const NamespaceString& nss) {
-    if (replicationMode == ReplicationCoordinator::modeNone)
-        return true;
-
-    if (nss.db() == "local")
-        return true;
-
-    if (nss.isSystemDotProfile())
-        return true;
-
-    if (!opCtx->writesAreReplicated())
-        return true;
-
-    fassert(28626, opCtx->recoveryUnit());
-
-    return false;
-}
-
 OplogDocWriter _logOpWriter(OperationContext* opCtx,
                             const char* opstr,
                             const NamespaceString& nss,
@@ -391,28 +370,29 @@ void _logOpsInner(OperationContext* opCtx,
     });
 }
 
-void logOp(OperationContext* opCtx,
-           const char* opstr,
-           const NamespaceString& nss,
-           OptionalCollectionUUID uuid,
-           const BSONObj& obj,
-           const BSONObj* o2,
-           bool fromMigrate) {
-    ReplicationCoordinator::Mode replMode =
-        ReplicationCoordinator::get(opCtx)->getReplicationMode();
-    if (oplogDisabled(opCtx, replMode, nss))
-        return;
+OpTime logOp(OperationContext* opCtx,
+             const char* opstr,
+             const NamespaceString& nss,
+             OptionalCollectionUUID uuid,
+             const BSONObj& obj,
+             const BSONObj* o2,
+             bool fromMigrate) {
+    auto replCoord = ReplicationCoordinator::get(opCtx);
+    if (replCoord->isOplogDisabledFor(opCtx, nss)) {
+        return {};
+    }
 
-    ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
     Collection* oplog = getLocalOplogCollection(opCtx, _oplogCollectionName);
     Lock::DBLock lk(opCtx, "local", MODE_IX);
     Lock::CollectionLock lock(opCtx->lockState(), _oplogCollectionName, MODE_IX);
+    auto replMode = replCoord->getReplicationMode();
     OplogSlot slot;
     getNextOpTime(opCtx, oplog, replCoord, replMode, 1, &slot);
     auto writer =
         _logOpWriter(opCtx, opstr, nss, uuid, obj, o2, fromMigrate, slot.opTime, slot.hash);
     const DocWriter* basePtr = &writer;
     _logOpsInner(opCtx, nss, &basePtr, 1, oplog, replMode, slot.opTime);
+    return slot.opTime;
 }
 
 void logOps(OperationContext* opCtx,
@@ -422,12 +402,12 @@ void logOps(OperationContext* opCtx,
             std::vector<BSONObj>::const_iterator begin,
             std::vector<BSONObj>::const_iterator end,
             bool fromMigrate) {
-    ReplicationCoordinator* replCoord = ReplicationCoordinator::get(opCtx);
-    ReplicationCoordinator::Mode replMode = replCoord->getReplicationMode();
-
     invariant(begin != end);
-    if (oplogDisabled(opCtx, replMode, nss))
+
+    auto replCoord = ReplicationCoordinator::get(opCtx);
+    if (replCoord->isOplogDisabledFor(opCtx, nss)) {
         return;
+    }
 
     const size_t count = end - begin;
     std::vector<OplogDocWriter> writers;
@@ -436,6 +416,7 @@ void logOps(OperationContext* opCtx,
     Lock::DBLock lk(opCtx, "local", MODE_IX);
     Lock::CollectionLock lock(opCtx->lockState(), _oplogCollectionName, MODE_IX);
     std::unique_ptr<OplogSlot[]> slots(new OplogSlot[count]);
+    auto replMode = replCoord->getReplicationMode();
     getNextOpTime(opCtx, oplog, replCoord, replMode, count, slots.get());
     for (size_t i = 0; i < count; i++) {
         writers.emplace_back(_logOpWriter(
@@ -682,6 +663,45 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
 
 }  // namespace
 
+std::pair<BSONObj, NamespaceString> prepForApplyOpsIndexInsert(const BSONElement& fieldO,
+                                                               const BSONObj& op,
+                                                               const NamespaceString& requestNss) {
+    uassert(ErrorCodes::NoSuchKey,
+            str::stream() << "Missing expected index spec in field 'o': " << op,
+            !fieldO.eoo());
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "Expected object for index spec in field 'o': " << op,
+            fieldO.isABSONObj());
+    BSONObj indexSpec = fieldO.embeddedObject();
+
+    std::string indexNs;
+    uassertStatusOK(bsonExtractStringField(indexSpec, "ns", &indexNs));
+    const NamespaceString indexNss(indexNs);
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid namespace in index spec: " << op,
+            indexNss.isValid());
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Database name mismatch for database (" << requestNss.db()
+                          << ") while creating index: "
+                          << op,
+            requestNss.db() == indexNss.db());
+
+    if (!indexSpec["v"]) {
+        // If the "v" field isn't present in the index specification, then we assume it is a
+        // v=1 index from an older version of MongoDB. This is because
+        //   (1) we haven't built v=0 indexes as the default for a long time, and
+        //   (2) the index version has been included in the corresponding oplog entry since
+        //       v=2 indexes were introduced.
+        BSONObjBuilder bob;
+
+        bob.append("v", static_cast<int>(IndexVersion::kV1));
+        bob.appendElements(indexSpec);
+
+        indexSpec = bob.obj();
+    }
+
+    return std::make_pair(indexSpec, indexNss);
+}
 // @return failure status if an update should have happened and the document DNE.
 // See replset initial sync code.
 Status applyOperation_inlock(OperationContext* opCtx,
@@ -741,27 +761,11 @@ Status applyOperation_inlock(OperationContext* opCtx,
     invariant(*opType != 'c');  // commands are processed in applyCommand_inlock()
 
     if (*opType == 'i') {
-        if (nsToCollectionSubstring(ns) == "system.indexes") {
-            uassert(ErrorCodes::NoSuchKey,
-                    str::stream() << "Missing expected index spec in field 'o': " << op,
-                    !fieldO.eoo());
-            uassert(ErrorCodes::TypeMismatch,
-                    str::stream() << "Expected object for index spec in field 'o': " << op,
-                    fieldO.isABSONObj());
-            BSONObj indexSpec = fieldO.embeddedObject();
-
-            std::string indexNs;
-            uassertStatusOK(bsonExtractStringField(indexSpec, "ns", &indexNs));
-            const NamespaceString indexNss(indexNs);
-            uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid namespace in index spec: " << op,
-                    indexNss.isValid());
-            uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Database name mismatch for database ("
-                                  << nsToDatabaseSubstring(ns)
-                                  << ") while creating index: "
-                                  << op,
-                    nsToDatabaseSubstring(ns) == indexNss.db());
+        if (requestNss.isSystemDotIndexes()) {
+            BSONObj indexSpec;
+            NamespaceString indexNss;
+            std::tie(indexSpec, indexNss) =
+                repl::prepForApplyOpsIndexInsert(fieldO, op, requestNss);
 
             // Check if collection exists.
             auto indexCollection = db->getCollection(opCtx, indexNss);
@@ -771,20 +775,6 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     indexCollection);
 
             opCounters->gotInsert();
-
-            if (!indexSpec["v"]) {
-                // If the "v" field isn't present in the index specification, then we assume it is a
-                // v=1 index from an older version of MongoDB. This is because
-                //   (1) we haven't built v=0 indexes as the default for a long time, and
-                //   (2) the index version has been included in the corresponding oplog entry since
-                //       v=2 indexes were introduced.
-                BSONObjBuilder bob;
-
-                bob.append("v", static_cast<int>(IndexVersion::kV1));
-                bob.appendElements(indexSpec);
-
-                indexSpec = bob.obj();
-            }
 
             bool relaxIndexConstraints =
                 ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, indexNss);
@@ -995,16 +985,6 @@ Status applyOperation_inlock(OperationContext* opCtx,
         throw MsgAssertionException(
             14825, str::stream() << "error in applyOperation : unknown opType " << *opType);
     }
-
-    // AuthorizationManager's logOp method registers a RecoveryUnit::Change and to do so we need
-    // to a new WriteUnitOfWork, if we dont have a wrapping unit of work already. If we already
-    // have a wrapping WUOW, the extra nexting is harmless. The logOp really should have been
-    // done in the WUOW that did the write, but this won't happen because applyOps turns off
-    // observers.
-    WriteUnitOfWork wuow(opCtx);
-    getGlobalAuthorizationManager()->logOp(
-        opCtx, opType, requestNss, o, fieldO2.isABSONObj() ? &o2 : NULL);
-    wuow.commit();
 
     return Status::OK();
 }

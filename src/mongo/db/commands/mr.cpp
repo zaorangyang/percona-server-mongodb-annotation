@@ -1341,7 +1341,7 @@ BSONObj _bailFromJS(const BSONObj& args, void* data) {
  */
 class MapReduceCommand : public Command {
 public:
-    MapReduceCommand() : Command("mapReduce", false, "mapreduce") {}
+    MapReduceCommand() : Command("mapReduce", "mapreduce") {}
 
     virtual bool slaveOk() const {
         return repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
@@ -1375,7 +1375,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& cmd,
+             const BSONObj& cmd,
              string& errmsg,
              BSONObjBuilder& result) {
         Timer t;
@@ -1710,7 +1710,7 @@ public:
     }
     bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) {
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {

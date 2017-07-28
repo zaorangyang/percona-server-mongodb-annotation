@@ -16,6 +16,7 @@ var auditTest = function(name, fn, serverParams) {
     var auditPath = dbpath + '/auditLog.json';
     removeFile(auditPath);
     var port = allocatePorts(1);
+    var conn
     var startServer = function(extraParams) {
         params = Object.merge(mongodOptions(serverParams), extraParams);
         if (serverParams === undefined || serverParams.config === undefined) {
@@ -25,15 +26,16 @@ var auditTest = function(name, fn, serverParams) {
                 auditFormat: 'JSON'
             }, params);
         }
-        return MongoRunner.runMongod(
+        conn = MongoRunner.runMongod(
             Object.merge({
                 port: port,
                 dbpath: dbpath,
             }, params)
         );
+        return conn;
     }
     var stopServer = function() {
-        MongoRunner.stopMongod(port);
+        MongoRunner.stopMongod(conn);
     }
     var restartServer = function() {
         stopServer();
@@ -42,7 +44,7 @@ var auditTest = function(name, fn, serverParams) {
     try {
         fn(startServer(), restartServer);
     } finally {
-        MongoRunner.stopMongod(port);
+        MongoRunner.stopMongod(conn);
     }
     loudTestEcho(name + ' PASSED ');
 }

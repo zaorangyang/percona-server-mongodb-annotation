@@ -96,7 +96,6 @@ public:
                            const std::string& dbname,
                            const BSONObj& cmdObj,
                            ExplainOptions::Verbosity verbosity,
-                           const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                            BSONObjBuilder* out) const {
         BatchedCommandRequest request(_writeType);
 
@@ -110,8 +109,7 @@ public:
             return Status(ErrorCodes::InvalidLength, "explained write batches must be of size 1");
         }
 
-        BSONObjBuilder explainCmdBob;
-        ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
+        const auto explainCmd = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
 
         // We will time how long it takes to run the commands on the shards.
         Timer timer;
@@ -120,7 +118,7 @@ public:
         BatchItemRef targetingBatchItem(&request, 0);
         vector<Strategy::CommandResult> shardResults;
         Status status =
-            _commandOpWrite(opCtx, dbname, explainCmdBob.obj(), targetingBatchItem, &shardResults);
+            _commandOpWrite(opCtx, dbname, explainCmd, targetingBatchItem, &shardResults);
         if (!status.isOK()) {
             return status;
         }
@@ -131,7 +129,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      string& errmsg,
                      BSONObjBuilder& result) {
         BatchedCommandRequest request(_writeType);

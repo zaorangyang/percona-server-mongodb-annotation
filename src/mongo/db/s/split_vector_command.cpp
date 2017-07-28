@@ -71,7 +71,7 @@ BSONObj prettyKey(const BSONObj& keyPattern, const BSONObj& key) {
 
 class SplitVector : public Command {
 public:
-    SplitVector() : Command("splitVector", false) {}
+    SplitVector() : Command("splitVector") {}
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -113,7 +113,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& jsobj,
+             const BSONObj& jsobj,
              string& errmsg,
              BSONObjBuilder& result) override {
         //

@@ -257,6 +257,13 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                 msgassertedNoTrace(28718, s.reason());
             }
             invariantWTOK(_conn->close(_conn, NULL));
+            // After successful recovery, remove the journal directory.
+            try {
+                boost::filesystem::remove_all(journalPath);
+            } catch (std::exception& e) {
+                error() << "error removing journal dir " << journalPath.string() << ' ' << e.what();
+                throw;
+            }
         }
         // This setting overrides the earlier setting because it is later in the config string.
         ss << ",log=(enabled=false),";
@@ -524,10 +531,11 @@ void WiredTigerKVEngine::setSortedDataInterfaceExtraOptions(const std::string& o
     _indexOptions = options;
 }
 
-Status WiredTigerKVEngine::createRecordStore(OperationContext* opCtx,
-                                             StringData ns,
-                                             StringData ident,
-                                             const CollectionOptions& options) {
+Status WiredTigerKVEngine::createGroupedRecordStore(OperationContext* opCtx,
+                                                    StringData ns,
+                                                    StringData ident,
+                                                    const CollectionOptions& options,
+                                                    KVPrefix prefix) {
     _checkIdentPath(ident);
     WiredTigerSession session(_conn);
 
@@ -544,10 +552,12 @@ Status WiredTigerKVEngine::createRecordStore(OperationContext* opCtx,
     return wtRCToStatus(s->create(s, uri.c_str(), config.c_str()));
 }
 
-std::unique_ptr<RecordStore> WiredTigerKVEngine::getRecordStore(OperationContext* opCtx,
-                                                                StringData ns,
-                                                                StringData ident,
-                                                                const CollectionOptions& options) {
+std::unique_ptr<RecordStore> WiredTigerKVEngine::getGroupedRecordStore(
+    OperationContext* opCtx,
+    StringData ns,
+    StringData ident,
+    const CollectionOptions& options,
+    KVPrefix prefix) {
     if (options.capped) {
         return stdx::make_unique<WiredTigerRecordStore>(
             opCtx,
@@ -559,7 +569,8 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::getRecordStore(OperationContext
             options.cappedSize ? options.cappedSize : 4096,
             options.cappedMaxDocs ? options.cappedMaxDocs : -1,
             nullptr,
-            _sizeStorer.get());
+            _sizeStorer.get(),
+            prefix);
     } else {
         return stdx::make_unique<WiredTigerRecordStore>(opCtx,
                                                         ns,
@@ -570,7 +581,8 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::getRecordStore(OperationContext
                                                         -1,
                                                         -1,
                                                         nullptr,
-                                                        _sizeStorer.get());
+                                                        _sizeStorer.get(),
+                                                        prefix);
     }
 }
 
@@ -578,9 +590,10 @@ string WiredTigerKVEngine::_uri(StringData ident) const {
     return string("table:") + ident.toString();
 }
 
-Status WiredTigerKVEngine::createSortedDataInterface(OperationContext* opCtx,
-                                                     StringData ident,
-                                                     const IndexDescriptor* desc) {
+Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* opCtx,
+                                                            StringData ident,
+                                                            const IndexDescriptor* desc,
+                                                            KVPrefix prefix) {
     _checkIdentPath(ident);
 
     std::string collIndexOptions;
@@ -613,12 +626,13 @@ Status WiredTigerKVEngine::createSortedDataInterface(OperationContext* opCtx,
     return wtRCToStatus(WiredTigerIndex::Create(opCtx, _uri(ident), config));
 }
 
-SortedDataInterface* WiredTigerKVEngine::getSortedDataInterface(OperationContext* opCtx,
-                                                                StringData ident,
-                                                                const IndexDescriptor* desc) {
+SortedDataInterface* WiredTigerKVEngine::getGroupedSortedDataInterface(OperationContext* opCtx,
+                                                                       StringData ident,
+                                                                       const IndexDescriptor* desc,
+                                                                       KVPrefix prefix) {
     if (desc->unique())
-        return new WiredTigerIndexUnique(opCtx, _uri(ident), desc);
-    return new WiredTigerIndexStandard(opCtx, _uri(ident), desc);
+        return new WiredTigerIndexUnique(opCtx, _uri(ident), desc, prefix);
+    return new WiredTigerIndexStandard(opCtx, _uri(ident), desc, prefix);
 }
 
 Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, StringData ident) {

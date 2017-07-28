@@ -33,6 +33,7 @@
 #include "mongo/db/field_parser.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface_local.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 
@@ -42,21 +43,17 @@ namespace {
 
 class OpObserverTest : public ServiceContextMongoDTest {
 
-public:
-    void setUp() {
-
+private:
+    void setUp() override {
         // Set up mongod.
         ServiceContextMongoDTest::setUp();
-        repl::ReplSettings replSettings;
-        replSettings.setOplogSizeBytes(5 * 1024 * 1024);
-        replSettings.setReplSetString("repl");
 
         auto service = getServiceContext();
         auto opCtx = cc().makeOperationContext();
 
         // Set up ReplicationCoordinator and create oplog.
         repl::ReplicationCoordinator::set(
-            service, stdx::make_unique<repl::ReplicationCoordinatorMock>(service, replSettings));
+            service, stdx::make_unique<repl::ReplicationCoordinatorMock>(service));
         repl::setOplogCollectionName();
         repl::createOplog(opCtx.get());
 
@@ -65,6 +62,7 @@ public:
         ASSERT_TRUE(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
     }
 
+protected:
     // Assert that oplog only has a single entry and return that oplog entry.
     BSONObj getSingleOplogEntry(OperationContext* opCtx) {
         repl::OplogInterfaceLocal oplogInterface(opCtx, repl::rsOplogName);
@@ -174,6 +172,35 @@ TEST_F(OpObserverTest, CollModWithOnlyCollectionOptions) {
              << BSON("validationLevel" << oldCollOpts.validationLevel << "validationAction"
                                        << oldCollOpts.validationAction));
     ASSERT_BSONOBJ_EQ(o2Expected, o2);
+}
+
+TEST_F(OpObserverTest, OnDropCollectionReturnsDropOpTime) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    auto uuid = CollectionUUID::gen();
+
+    // Create 'drop' command.
+    NamespaceString nss("test.coll");
+    auto dropCmd = BSON("drop" << nss.coll());
+
+    // Write to the oplog.
+    repl::OpTime dropOpTime;
+    {
+        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        dropOpTime = opObserver.onDropCollection(opCtx.get(), nss, uuid);
+        wunit.commit();
+    }
+
+    auto oplogEntry = getSingleOplogEntry(opCtx.get());
+
+    // Ensure that drop fields were properly added to oplog entry.
+    auto o = oplogEntry.getObjectField("o");
+    auto oExpected = dropCmd;
+    ASSERT_BSONOBJ_EQ(oExpected, o);
+
+    // Ensure that the drop optime returned is the same as the last optime in the ReplClientInfo.
+    ASSERT_EQUALS(repl::ReplClientInfo::forClient(&cc()).getLastOp(), dropOpTime);
 }
 
 }  // namespace

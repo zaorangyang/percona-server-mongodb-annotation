@@ -42,7 +42,6 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/range_deleter_service.h"
 #include "mongo/db/s/chunk_move_write_concern_options.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/chunk_version.h"
@@ -87,7 +86,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string&,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) {
         auto shardingState = ShardingState::get(opCtx);
@@ -187,7 +186,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string&,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) {
         ShardingState::get(opCtx)->migrationDestinationManager()->report(result);
@@ -227,7 +226,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string&,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) {
         auto const sessionId = uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj));
@@ -274,7 +273,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string&,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) {
         auto const mdm = ShardingState::get(opCtx)->migrationDestinationManager();

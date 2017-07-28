@@ -90,22 +90,34 @@ void logOps(OperationContext* opCtx,
             std::vector<BSONObj>::const_iterator end,
             bool fromMigrate);
 
-/* For 'u' records, 'obj' captures the mutation made to the object but not
+/**
+ * For 'u' records, 'obj' captures the mutation made to the object but not
  * the object itself. 'o2' captures the the criteria for the object that will be modified.
+ * Returns the optime of the oplog entry written to the oplog.
+ * Returns a null optime if oplog was not modified.
  */
-void logOp(OperationContext* opCtx,
-           const char* opstr,
-           const NamespaceString& ns,
-           OptionalCollectionUUID uuid,
-           const BSONObj& obj,
-           const BSONObj* o2,
-           bool fromMigrate);
+OpTime logOp(OperationContext* opCtx,
+             const char* opstr,
+             const NamespaceString& ns,
+             OptionalCollectionUUID uuid,
+             const BSONObj& obj,
+             const BSONObj* o2,
+             bool fromMigrate);
 
 // Flush out the cached pointers to the local database and oplog.
 // Used by the closeDatabase command to ensure we don't cache closed things.
 void oplogCheckCloseDatabase(OperationContext* opCtx, Database* db);
 
 using IncrementOpsAppliedStatsFn = stdx::function<void()>;
+/**
+ * Take the object field of a BSONObj, the BSONObj, and the namespace of
+ * the operation and perform necessary validation to ensure the BSONObj is a
+ * properly-formed command to insert into system.indexes. This is only to
+ * be used for insert operations into system.indexes. It is called via applyOps.
+ */
+std::pair<BSONObj, NamespaceString> prepForApplyOpsIndexInsert(const BSONElement& fieldO,
+                                                               const BSONObj& op,
+                                                               const NamespaceString& requestNss);
 /**
  * Take a non-command op and apply it locally
  * Used for applying from an oplog

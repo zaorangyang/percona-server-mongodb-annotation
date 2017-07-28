@@ -242,9 +242,8 @@ def find_tests_by_executor(suites):
     memberships = {}
     test_membership = resmokelib.parser.create_test_membership_map()
     for suite in suites:
-        for group in suite.test_groups:
-            for test in group.tests:
-                memberships[test] = test_membership[test]
+        for test in suite.test_group.tests:
+            memberships[test] = test_membership[test]
     return memberships
 
 
@@ -258,10 +257,9 @@ def create_executor_list(suites, exclude_suites):
     memberships = collections.defaultdict(list)
     test_membership = resmokelib.parser.create_test_membership_map()
     for suite in suites:
-        for group in suite.test_groups:
-            for test in group.tests:
-                for executor in set(test_membership[test]) - set(exclude_suites):
-                    memberships[executor].append(test)
+        for test in suite.test_group.tests:
+            for executor in set(test_membership[test]) - set(exclude_suites):
+                memberships[executor].append(test)
     return memberships
 
 
@@ -379,6 +377,8 @@ def main():
         tests_by_task = _load_tests_file(values.test_list_file)
         # If there are no tests to run, carry on.
         if tests_by_task is None:
+            test_results = {"failures": 0, "results": []}
+            _write_report_file(test_results, values.report_file)
             sys.exit(0)
 
     # Run the executor finder.
@@ -399,6 +399,7 @@ def main():
         # If there are no changed tests, exit cleanly.
         if not changed_tests:
             print "No new or modified tests found."
+            _write_report_file({}, values.test_list_outfile)
             sys.exit(0)
         suites = resmokelib.parser.get_suites(values, changed_tests)
         tests_by_executor = create_executor_list(suites, exclude_suites)

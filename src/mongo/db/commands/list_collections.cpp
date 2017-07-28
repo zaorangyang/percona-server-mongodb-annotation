@@ -153,8 +153,16 @@ BSONObj buildCollectionBson(OperationContext* opCtx, const Collection* collectio
         return {};
     }
 
-    StringData collectionName = collection->ns().coll();
+    auto nss = collection->ns();
+    auto collectionName = nss.coll();
     if (collectionName == "system.namespaces") {
+        return {};
+    }
+
+    // Drop-pending collections are replicated collections that have been marked for deletion.
+    // These collections are considered dropped and should not be returned in the results for this
+    // command.
+    if (nss.isDropPendingNamespace()) {
         return {};
     }
 
@@ -220,7 +228,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& jsobj,
+             const BSONObj& jsobj,
              string& errmsg,
              BSONObjBuilder& result) {
         unique_ptr<MatchExpression> matcher;

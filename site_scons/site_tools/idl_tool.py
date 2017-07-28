@@ -32,18 +32,13 @@ def idlc_emitter(target, source, env):
     target_source = base_file_name + "_gen.cpp"
     target_header = base_file_name + "_gen.h"
 
+    env.Alias('generated-sources', [target_source, target_header])
+
     return [target_source, target_header], source
 
 
 IDLCAction = SCons.Action.Action('$IDLCCOM', '$IDLCCOMSTR')
 
-# TODO: create a scanner for imports when imports are implemented
-IDLCBuilder = SCons.Builder.Builder(
-    action=IDLCAction,
-    emitter=idlc_emitter,
-    srcsuffx=".idl",
-    suffix=".cpp"
-    )
 
 def idl_scanner(node, env, path):
     # Use the import scanner mode of the IDL compiler to file imported files
@@ -58,7 +53,18 @@ def idl_scanner(node, env, path):
 
     return nodes_deps_list
 
+
 idl_scanner = SCons.Scanner.Scanner(function=idl_scanner, skeys=['.idl'])
+
+# TODO: create a scanner for imports when imports are implemented
+IDLCBuilder = SCons.Builder.Builder(
+    action=IDLCAction,
+    emitter=idlc_emitter,
+    srcsuffx=".idl",
+    suffix=".cpp",
+    source_scanner = idl_scanner
+    )
+
 
 def generate(env):
     bld = IDLCBuilder

@@ -253,15 +253,14 @@ static WriteResult::SingleResult createIndex(OperationContext* opCtx,
     BSONObjBuilder cmdBuilder;
     cmdBuilder << "createIndexes" << ns.coll();
     cmdBuilder << "indexes" << BSON_ARRAY(spec);
-    cmdBuilder << "$db" << systemIndexes.db();
+    auto cmd = cmdBuilder.obj();
 
-    OpMsg request;
-    request.body = cmdBuilder.done();
-    rpc::OpMsgRequest cmdRequest(request);
-    rpc::OpMsgReplyBuilder cmdReplyBuilder;
-    Command::findCommand("createIndexes")->run(opCtx, cmdRequest, &cmdReplyBuilder);
-    auto cmdReplyMsg = cmdReplyBuilder.done();
-    auto cmdResult = OpMsg::parse(cmdReplyMsg).body;
+    BSONObjBuilder cmdReplyBuilder;
+    std::string errMsg;
+    bool ok = Command::findCommand("createIndexes")
+                  ->run(opCtx, systemIndexes.db().toString(), cmd, errMsg, cmdReplyBuilder);
+    Command::appendCommandStatus(cmdReplyBuilder, ok, errMsg);
+    auto cmdResult = cmdReplyBuilder.obj();
     uassertStatusOK(getStatusFromCommandResult(cmdResult));
 
     // Unlike normal inserts, it is not an error to "insert" a duplicate index.
@@ -482,8 +481,7 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* opCtx,
         curOp.setNS_inlock(ns.ns());
         curOp.setNetworkOp_inlock(dbUpdate);
         curOp.setLogicalOp_inlock(LogicalOp::opUpdate);
-        curOp.setQuery_inlock(op.query);
-        curOp.setCollation_inlock(op.collation);
+        curOp.setOpDescription_inlock(op.toBSON());
         curOp.ensureStarted();
     }
 
@@ -603,8 +601,7 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* opCtx,
         curOp.setNS_inlock(ns.ns());
         curOp.setNetworkOp_inlock(dbDelete);
         curOp.setLogicalOp_inlock(LogicalOp::opDelete);
-        curOp.setQuery_inlock(op.query);
-        curOp.setCollation_inlock(op.collation);
+        curOp.setOpDescription_inlock(op.toBSON());
         curOp.ensureStarted();
     }
 

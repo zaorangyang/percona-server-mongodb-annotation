@@ -42,7 +42,7 @@ namespace {
 
 class CmdShardingResetError : public Command {
 public:
-    CmdShardingResetError() : Command("resetError", false, "reseterror") {}
+    CmdShardingResetError() : Command("resetError", "reseterror") {}
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -61,7 +61,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         LastError::get(cc()).reset();

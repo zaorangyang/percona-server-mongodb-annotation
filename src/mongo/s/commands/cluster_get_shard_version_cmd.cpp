@@ -45,7 +45,7 @@ namespace {
 
 class GetShardVersion : public Command {
 public:
-    GetShardVersion() : Command("getShardVersion", false, "getshardversion") {}
+    GetShardVersion() : Command("getShardVersion", "getshardversion") {}
 
     bool slaveOk() const override {
         return true;
@@ -81,7 +81,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));

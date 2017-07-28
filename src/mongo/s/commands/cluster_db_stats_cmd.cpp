@@ -42,7 +42,7 @@ using std::vector;
 
 class DBStatsCmd : public Command {
 public:
-    DBStatsCmd() : Command("dbStats", false, "dbstats") {}
+    DBStatsCmd() : Command("dbStats", "dbstats") {}
 
     bool slaveOk() const override {
         return true;
@@ -65,7 +65,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& output) override {
         auto shardResponses =

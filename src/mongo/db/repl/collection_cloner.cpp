@@ -95,7 +95,7 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                       RemoteCommandRequest(_source,
                                            _sourceNss.db().toString(),
                                            BSON("count" << _sourceNss.coll()),
-                                           rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                                           ReadPreferenceSetting::secondaryPreferredMetadata(),
                                            nullptr,
                                            RemoteCommandRequest::kNoTimeout),
                       stdx::bind(&CollectionCloner::_countCallback, this, stdx::placeholders::_1),
@@ -112,7 +112,7 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                                      stdx::placeholders::_1,
                                      stdx::placeholders::_2,
                                      stdx::placeholders::_3),
-                          rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                          ReadPreferenceSetting::secondaryPreferredMetadata(),
                           RemoteCommandRequest::kNoTimeout,
                           RemoteCommandRetryScheduler::makeRetryPolicy(
                               numInitialSyncListIndexesAttempts.load(),
@@ -140,7 +140,7 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
     uassert(ErrorCodes::BadValue,
             "invalid collection namespace: " + sourceNss.ns(),
             sourceNss.isValid());
-    uassertStatusOK(options.validate());
+    uassertStatusOK(options.validateForStorage());
     uassert(ErrorCodes::BadValue, "callback function cannot be null", onCompletion);
     uassert(ErrorCodes::BadValue, "storage interface cannot be null", storageInterface);
     _stats.ns = _sourceNss.ns();
@@ -488,7 +488,7 @@ void CollectionCloner::_beginCollectionCallback(const executor::TaskExecutor::Ca
                    stdx::placeholders::_2,
                    stdx::placeholders::_3,
                    onCompletionGuard),
-        rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+        ReadPreferenceSetting::secondaryPreferredMetadata(),
         RemoteCommandRequest::kNoTimeout,
         RemoteCommandRetryScheduler::makeRetryPolicy(
             numInitialSyncCollectionFindAttempts.load(),

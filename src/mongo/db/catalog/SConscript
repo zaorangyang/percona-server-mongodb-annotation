@@ -4,6 +4,15 @@ Import("env")
 
 env = env.Clone()
 
+env.SConscript(
+    dirs=[
+        'util',
+    ],
+    exports=[
+        'env',
+    ],
+)
+
 env.Library(
     target='collection_options',
     source=[
@@ -81,6 +90,7 @@ env.Library(
         "collection.cpp",
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -90,6 +100,24 @@ env.Library(
         "database.cpp",
     ],
     LIBDEPS=[
+    ],
+)
+
+env.CppUnitTest(
+    target='database_test',
+    source=[
+        'database_test.cpp',
+    ],
+    LIBDEPS=[
+        'database',
+        'index_create',
+        '$BUILD_DIR/mongo/db/db_raii',
+        '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/op_observer_d',
+        '$BUILD_DIR/mongo/db/repl/optime',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
     ],
 )
 
@@ -114,7 +142,7 @@ env.Library(
 env.Library(
     target='index_create',
     source=[
-        "index_create.cpp",
+        'index_create.cpp',
     ],
     LIBDEPS=[
     ],
@@ -123,23 +151,15 @@ env.Library(
 env.Library(
     target='catalog',
     source=[
-        "apply_ops.cpp",
-        "capped_utils.cpp",
-        "coll_mod.cpp",
         "collection_compact.cpp",
         "collection_impl.cpp",
         "collection_info_cache_impl.cpp",
-        "create_collection.cpp",
         "cursor_manager.cpp",
         "database_impl.cpp",
         "database_holder_impl.cpp",
-        "drop_collection.cpp",
-        "drop_database.cpp",
-        "drop_indexes.cpp",
         "index_catalog_impl.cpp",
         "index_catalog_entry_impl.cpp",
         "index_create_impl.cpp",
-        "rename_collection.cpp",
     ],
     LIBDEPS=[
         'collection',
@@ -152,9 +172,11 @@ env.Library(
         'index_create',
         'index_key_validate',
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/auth/authmongod',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/query/query',
+        '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
         '$BUILD_DIR/mongo/db/repl/serveronly',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/service_context',
@@ -166,8 +188,30 @@ env.Library(
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/index/index_access_methods',
         '$BUILD_DIR/mongo/db/clientcursor',
-        '$BUILD_DIR/mongo/db/commands/dcommands',
-        '$BUILD_DIR/mongo/db/commands/core',
         '$BUILD_DIR/mongo/db/s/balancer',
+        '$BUILD_DIR/mongo/db/views/views_mongod',
+    ],
+)
+
+env.Library(
+    target='catalog_helpers',
+    source=[
+        'capped_utils.cpp',
+        'coll_mod.cpp',
+        'create_collection.cpp',
+        'drop_collection.cpp',
+        'drop_database.cpp',
+        'drop_indexes.cpp',
+        'rename_collection.cpp',
+    ],
+    LIBDEPS=[
+        'collection',
+        'database',
+        'index_catalog',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/background',
+        '$BUILD_DIR/mongo/db/db_raii',
+        '$BUILD_DIR/mongo/db/ops/write_ops',
+        '$BUILD_DIR/mongo/db/views/views',
     ],
 )

@@ -41,7 +41,7 @@ namespace {
 
 class ListShardsCmd : public Command {
 public:
-    ListShardsCmd() : Command("listShards", false, "listshards") {}
+    ListShardsCmd() : Command("listShards", "listshards") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -70,7 +70,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         auto shardsStatus = grid.catalogClient(opCtx)->getAllShards(

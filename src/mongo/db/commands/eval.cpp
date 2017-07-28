@@ -172,11 +172,11 @@ public:
         RoleGraph::generateUniversalPrivileges(out);
     }
 
-    CmdEval() : Command("eval", false, "$eval") {}
+    CmdEval() : Command("eval", "$eval") {}
 
     bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              string& errmsg,
              BSONObjBuilder& result) {
         // Note: 'eval' is not allowed to touch sharded namespaces, but we can't check the

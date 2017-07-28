@@ -160,6 +160,18 @@ CatalogCache::CatalogCache(std::unique_ptr<CatalogCacheLoader> cacheLoader)
 
 CatalogCache::~CatalogCache() = default;
 
+void CatalogCache::initializeReplicaSetRole(bool isPrimary) {
+    _cacheLoader->initializeReplicaSetRole(isPrimary);
+}
+
+void CatalogCache::onStepDown() {
+    _cacheLoader->onStepDown();
+}
+
+void CatalogCache::onStepUp() {
+    _cacheLoader->onStepUp();
+}
+
 StatusWith<CachedDatabaseInfo> CatalogCache::getDatabase(OperationContext* opCtx,
                                                          StringData dbName) {
     try {
@@ -212,7 +224,14 @@ StatusWith<CachedCollectionRoutingInfo> CatalogCache::getCollectionRoutingInfo(
             // Wait on the notification outside of the mutex
             ul.unlock();
 
-            auto refreshStatus = refreshNotification->get(opCtx);
+            auto refreshStatus = [&]() {
+                try {
+                    return refreshNotification->get(opCtx);
+                } catch (const DBException& ex) {
+                    return ex.toStatus();
+                }
+            }();
+
             if (!refreshStatus.isOK()) {
                 return refreshStatus;
             }

@@ -238,11 +238,24 @@ private:
 
     /**
      * Deregisters and invalidates all cursors on collection 'fullns'.  Callers must specify
-     * 'reason' for why the cache is being cleared.
+     * 'reason' for why the cache is being cleared. If 'collectionGoingAway' is false,
+     * unpinned cursors will not be killed.
      */
     void _clearCollectionCache(OperationContext* opCtx,
                                StringData fullns,
-                               const std::string& reason);
+                               const std::string& reason,
+                               bool collectionGoingAway);
+
+    /**
+     * Completes a collection drop by removing all the indexes and removing the collection itself
+     * from the storage engine.
+     *
+     * This is called from dropCollectionEvenIfSystem() to drop the collection immediately on
+     * unreplicated collection drops.
+     */
+    Status _finishDropCollection(OperationContext* opCtx,
+                                 const NamespaceString& fullns,
+                                 Collection* collection);
 
     class AddCollectionChange;
     class RemoveCollectionChange;

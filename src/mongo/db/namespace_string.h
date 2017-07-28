@@ -35,7 +35,9 @@
 #include <iosfwd>
 #include <string>
 
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/platform/hash_namespace.h"
 #include "mongo/util/assert_util.h"
 
@@ -92,6 +94,12 @@ public:
      * "dbName" must not contain a ".", and "collectionName" must not start with one.
      */
     NamespaceString(StringData dbName, StringData collectionName);
+
+    /**
+     * Constructs the namespace '<dbName>.$cmd.aggregate', which we use as the namespace for
+     * aggregation commands with the format {aggregate: 1}.
+     */
+    static NamespaceString makeCollectionlessAggregateNSS(StringData dbName);
 
     /**
      * Constructs a NamespaceString representing a listCollections namespace. The format for this
@@ -211,6 +219,7 @@ public:
         return coll().startsWith("$cmd."_sd);
     }
 
+    bool isCollectionlessAggregateNS() const;
     bool isListCollectionsCursorNS() const;
     bool isListIndexesCursorNS() const;
 
@@ -220,6 +229,34 @@ public:
      * do not target a collection.
      */
     boost::optional<NamespaceString> getTargetNSForGloballyManagedNamespace() const;
+
+    /**
+     * Returns true if this namespace refers to a drop-pending collection.
+     */
+    bool isDropPendingNamespace() const;
+
+    /**
+     * Returns the drop-pending namespace name for this namespace, provided the given optime.
+     *
+     * Example:
+     *     test.foo -> test.system.drop.<timestamp seconds>i<timestamp increment>t<term>.foo
+     *
+     * Original collection name may be truncated so that the generated namespace length does not
+     * exceed MaxNsCollectionLen.
+     */
+    NamespaceString makeDropPendingNamespace(const repl::OpTime& opTime) const;
+
+    /**
+     * Returns the optime used to generate the drop-pending namespace.
+     * Returns an error if this namespace is not drop-pending.
+     */
+    StatusWith<repl::OpTime> getDropPendingNamespaceOpTime() const;
+
+    /**
+     * Checks if this namespace is valid as a target namespace for a rename operation, given
+     * the length of the longest index name in the source collection.
+     */
+    Status checkLengthForRename(const std::string::size_type longestIndexNameLength) const;
 
     /**
      * Given a NamespaceString for which isListIndexesCursorNS() returns true, returns the

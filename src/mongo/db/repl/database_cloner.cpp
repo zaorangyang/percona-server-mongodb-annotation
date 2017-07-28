@@ -41,7 +41,6 @@
 #include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
@@ -115,7 +114,7 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
                                          stdx::placeholders::_1,
                                          stdx::placeholders::_2,
                                          stdx::placeholders::_3),
-                              rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                              ReadPreferenceSetting::secondaryPreferredMetadata(),
                               RemoteCommandRequest::kNoTimeout,
                               RemoteCommandRetryScheduler::makeRetryPolicy(
                                   numInitialSyncListCollectionsAttempts.load(),
@@ -325,7 +324,7 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
         }
         const BSONObj optionsObj = optionsElement.Obj();
         CollectionOptions options;
-        Status parseStatus = options.parse(optionsObj, CollectionOptions::parseForCommand);
+        auto parseStatus = options.parse(optionsObj, CollectionOptions::parseForStorage);
         if (!parseStatus.isOK()) {
             _finishCallback_inlock(lk, parseStatus);
             return;

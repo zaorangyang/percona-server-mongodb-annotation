@@ -75,12 +75,13 @@
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_metadata_hook.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repair_database.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
@@ -173,8 +174,6 @@ ntservice::NtServiceDefaultStrings defaultServiceStrings = {
     L"MongoDB", L"MongoDB", L"MongoDB Server"};
 #endif
 
-Timer startupSrandTimer;
-
 void logStartup(OperationContext* opCtx) {
     BSONObjBuilder toLog;
     stringstream id;
@@ -214,19 +213,32 @@ void logStartup(OperationContext* opCtx) {
     wunit.commit();
 }
 
-void checkForIdIndexes(OperationContext* opCtx, Database* db) {
+/**
+ * If we are in a replset, every replicated collection must have an _id index.
+ * As we scan each database, we also gather a list of drop-pending collection namespaces for
+ * the DropPendingCollectionReaper to clean up eventually.
+ */
+void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx, Database* db) {
     if (db->name() == "local") {
-        // we do not need an _id index on anything in the local database
+        // Collections in the local database are not replicated, so we do not need an _id index on
+        // any collection. For the same reason, it is not possible for the local database to contain
+        // any drop-pending collections (drops are effective immediately).
         return;
     }
 
     list<string> collections;
     db->getDatabaseCatalogEntry()->getCollectionNamespaces(&collections);
 
-    // for each collection, ensure there is a $_id_ index
     for (list<string>::iterator i = collections.begin(); i != collections.end(); ++i) {
         const string& collectionName = *i;
         NamespaceString ns(collectionName);
+
+        if (ns.isDropPendingNamespace()) {
+            auto dropOpTime = fassertStatusOK(40459, ns.getDropPendingNamespaceOpTime());
+            log() << "Found drop-pending namespace " << ns << " with drop optime " << dropOpTime;
+            repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(dropOpTime, ns);
+        }
+
         if (ns.isSystem())
             continue;
 
@@ -405,8 +417,8 @@ void repairDatabasesAndCheckVersion(OperationContext* opCtx) {
         invariant(PlanExecutor::IS_EOF == state);
 
         if (replSettings.usingReplSets()) {
-            // We only care about the _id index if we are in a replset
-            checkForIdIndexes(opCtx, db);
+            // We only care about _id indexes and drop-pending collections if we are in a replset.
+            checkForIdIndexesAndDropPendingCollections(opCtx, db);
             // Ensure oplog is capped (mmap does not guarantee order of inserts on noncapped
             // collections)
             if (db->name() == "local") {
@@ -577,14 +589,18 @@ ExitCode _initAndListen(int listenPort) {
     uassertStatusOK(getGlobalAuthorizationManager()->initialize(startupOpCtx.get()));
 
     /* this is for security on certain platforms (nonce generation) */
-    srand((unsigned)(curTimeMicros64() ^ startupSrandTimer.micros()));
+    srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));
 
     AuthorizationManager* globalAuthzManager = getGlobalAuthorizationManager();
     if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
         Status status = authindex::verifySystemIndexes(startupOpCtx.get());
         if (!status.isOK()) {
             log() << redact(status);
-            exitCleanly(EXIT_NEED_UPGRADE);
+            if (status.code() == ErrorCodes::AuthSchemaIncompatible) {
+                exitCleanly(EXIT_NEED_UPGRADE);
+            } else {
+                quickExit(EXIT_FAILURE);
+            }
         }
 
         // SERVER-14090: Verify that auth schema version is schemaVersion26Final.
@@ -622,6 +638,7 @@ ExitCode _initAndListen(int listenPort) {
               << startupWarningsLog;
     }
 
+    // This function may take the global lock.
     auto shardingInitialized =
         uassertStatusOK(ShardingState::get(startupOpCtx.get())
                             ->initializeShardingAwarenessIfNeeded(startupOpCtx.get()));
@@ -856,6 +873,21 @@ static void startupConfigActions(const std::vector<std::string>& args) {
 #endif
 }
 
+auto makeReplicationExecutor(ServiceContext* serviceContext) {
+    ThreadPool::Options tpOptions;
+    tpOptions.poolName = "replexec";
+    tpOptions.maxThreads = 50;
+    tpOptions.onCreateThread = [](const std::string& threadName) {
+        Client::initThread(threadName.c_str());
+    };
+    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
+    hookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
+    return stdx::make_unique<executor::ThreadPoolTaskExecutor>(
+        stdx::make_unique<ThreadPool>(tpOptions),
+        executor::makeNetworkInterface(
+            "NetworkInterfaceASIO-Replication", nullptr, std::move(hookList)));
+}
+
 MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
                                      ("SetGlobalEnvironment", "SSLManager", "default"))
 (InitializerContext* context) {
@@ -867,6 +899,10 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
                                   stdx::make_unique<repl::ReplicationProcess>(storageInterface));
     auto replicationProcess = repl::ReplicationProcess::get(serviceContext);
 
+    repl::DropPendingCollectionReaper::set(
+        serviceContext, stdx::make_unique<repl::DropPendingCollectionReaper>(storageInterface));
+    auto dropPendingCollectionReaper = repl::DropPendingCollectionReaper::get(serviceContext);
+
     repl::TopologyCoordinatorImpl::Options topoCoordOptions;
     topoCoordOptions.maxSyncSourceLagSecs = Seconds(repl::maxSyncSourceLagSecs);
     topoCoordOptions.clusterRole = serverGlobalParams.clusterRole;
@@ -874,16 +910,12 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
     auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
     LogicalClock::set(serviceContext, std::move(logicalClock));
 
-    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
-    hookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
-
     auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorImpl>(
         serviceContext,
         getGlobalReplSettings(),
-        stdx::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(serviceContext,
-                                                                         storageInterface),
-        executor::makeNetworkInterface(
-            "NetworkInterfaceASIO-Replication", nullptr, std::move(hookList)),
+        stdx::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(
+            serviceContext, dropPendingCollectionReaper, storageInterface),
+        makeReplicationExecutor(serviceContext),
         stdx::make_unique<repl::TopologyCoordinatorImpl>(topoCoordOptions),
         replicationProcess,
         storageInterface,
@@ -939,6 +971,12 @@ static void shutdownTask() {
     ReplicaSetMonitor::shutdown();
     if (auto sr = grid.shardRegistry()) {  // TODO: race: sr is a naked pointer
         sr->shutdown();
+    }
+
+    // Validator shutdown must be called after setKillAllOperations is called. Otherwise, this can
+    // deadlock.
+    if (auto validator = LogicalTimeValidator::get(serviceContext)) {
+        validator->shutDown();
     }
 
 #if __has_feature(address_sanitizer)

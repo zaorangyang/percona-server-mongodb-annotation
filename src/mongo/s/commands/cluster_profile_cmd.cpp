@@ -35,7 +35,7 @@ namespace {
 
 class ProfileCmd : public Command {
 public:
-    ProfileCmd() : Command("profile", false) {}
+    ProfileCmd() : Command("profile") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -60,7 +60,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         errmsg = "profile currently not supported via mongos";

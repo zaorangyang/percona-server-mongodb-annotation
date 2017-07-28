@@ -31,7 +31,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -123,7 +122,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         auto verbosity = ExplainOptions::parseCmdBSON(cmdObj);
@@ -150,7 +149,7 @@ public:
         bool commandCanRunOnSecondary = commToExplain->slaveOk();
 
         bool commandIsOverriddenToRunOnSecondary = commToExplain->slaveOverrideOk() &&
-            rpc::ServerSelectionMetadata::get(opCtx).canRunOnSecondary();
+            ReadPreferenceSetting::get(opCtx).canRunOnSecondary();
         bool iAmStandalone = !opCtx->writesAreReplicated();
 
         const bool canRunHere = iAmPrimary || commandCanRunOnSecondary ||
@@ -165,12 +164,8 @@ public:
         }
 
         // Actually call the nested command's explain(...) method.
-        Status explainStatus = commToExplain->explain(opCtx,
-                                                      dbname,
-                                                      explainObj,
-                                                      verbosity.getValue(),
-                                                      rpc::ServerSelectionMetadata::get(opCtx),
-                                                      &result);
+        Status explainStatus =
+            commToExplain->explain(opCtx, dbname, explainObj, verbosity.getValue(), &result);
         if (!explainStatus.isOK()) {
             return appendCommandStatus(result, explainStatus);
         }

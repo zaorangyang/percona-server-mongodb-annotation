@@ -343,7 +343,27 @@ class TestImport(testcase.IDLTestcase):
                     strict: false
                     fields:
                         foo: string
-            """)
+
+            enums:
+                IntEnum:
+                    description: "An example int enum"
+                    type: int
+                    values:
+                        a0: 0
+                        b1: 1
+
+            """),
+            "bug.idl":
+                textwrap.dedent("""
+            global:
+                cpp_namespace: 'something'
+
+            types:
+                bool:
+                    description: foo
+                    bson_serialization_type: bool
+                    deserializer: BSONElement::fake
+            """),
         }
 
         resolver = DictionaryImportResolver(import_dict)
@@ -415,6 +435,39 @@ class TestImport(testcase.IDLTestcase):
                 bson_serialization_type: string
             """),
             idl.errors.ERROR_ID_DUPLICATE_SYMBOL,
+            resolver=resolver)
+
+        # Duplicate enums
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        imports:
+            - "basetypes.idl"
+
+        enums:
+            IntEnum:
+                description: "An example int enum"
+                type: int
+                values:
+                    a0: 0
+                    b1: 1
+            """),
+            idl.errors.ERROR_ID_DUPLICATE_SYMBOL,
+            resolver=resolver)
+
+        # Import a file with errors
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        imports:
+            - "basetypes.idl"
+            - "bug.idl"
+
+        types:
+            string2:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+            """),
+            idl.errors.ERROR_ID_MISSING_REQUIRED_FIELD,
             resolver=resolver)
 
 

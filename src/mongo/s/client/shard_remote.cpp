@@ -47,7 +47,6 @@
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
@@ -68,9 +67,6 @@ namespace {
 // Include kReplSetMetadataFieldName in a request to get the shard's ReplSetMetadata in the
 // response.
 const BSONObj kReplMetadata(BSON(rpc::kReplSetMetadataFieldName << 1));
-
-// Allow the command to be executed on a secondary (see ServerSelectionMetadata).
-const BSONObj kSecondaryOkMetadata{rpc::ServerSelectionMetadata(true, boost::none).toBSON()};
 
 /**
  * Returns a new BSONObj describing the same command and arguments as 'cmdObj', but with maxTimeMS
@@ -164,12 +160,12 @@ BSONObj ShardRemote::_appendMetadataForCommand(OperationContext* opCtx,
         if (readPref.pref == ReadPreference::PrimaryOnly) {
             builder.appendElements(kReplMetadata);
         } else {
-            builder.appendElements(kSecondaryOkMetadata);
+            builder.appendElements(ReadPreferenceSetting::secondaryPreferredMetadata());
             builder.appendElements(kReplMetadata);
         }
     } else {
         if (readPref.pref != ReadPreference::PrimaryOnly) {
-            builder.appendElements(kSecondaryOkMetadata);
+            builder.appendElements(ReadPreferenceSetting::secondaryPreferredMetadata());
         }
     }
     return builder.obj();

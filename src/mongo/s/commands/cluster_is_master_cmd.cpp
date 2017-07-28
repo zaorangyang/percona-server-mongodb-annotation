@@ -46,7 +46,7 @@ namespace {
 
 class CmdIsMaster : public Command {
 public:
-    CmdIsMaster() : Command("isMaster", false, "ismaster") {}
+    CmdIsMaster() : Command("isMaster", "ismaster") {}
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -69,7 +69,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
 

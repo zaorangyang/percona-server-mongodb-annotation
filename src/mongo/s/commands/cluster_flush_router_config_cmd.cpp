@@ -37,7 +37,7 @@ namespace {
 
 class FlushRouterConfigCmd : public Command {
 public:
-    FlushRouterConfigCmd() : Command("flushRouterConfig", false, "flushrouterconfig") {}
+    FlushRouterConfigCmd() : Command("flushRouterConfig", "flushrouterconfig") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -66,7 +66,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         Grid::get(opCtx)->catalogCache()->purgeAllDatabases();

@@ -6,12 +6,14 @@
     "use strict";
 
     /**
-     * @param {Object} params - Configuration options for the test.
-     * @param {string} params.readMode - The read mode to use for the parallel shell. This allows
+     * @param {string} readMode - The read mode to use for the parallel shell. This allows
      * testing currentOp() output for both OP_QUERY and OP_GET_MORE queries, as well as "find" and
      * "getMore" commands.
+     * @params {function} currentOp - Function which takes a database object and a filter, and
+     * returns an array of matching current operations. This allows us to test output for both the
+     * currentOp command and the $currentOp aggregation stage.
      */
-    function runTest(params) {
+    function runTest({readMode, currentOp}) {
         var conn = MongoRunner.runMongod({smallfiles: "", nojournal: ""});
         assert.neq(null, conn, "mongod was unable to start up");
 
@@ -44,7 +46,7 @@
                 {configureFailPoint: "setYieldAllLocksHang", mode: "alwaysOn"}));
 
             // Set shell read mode for the parallel shell test.
-            TestData.shellReadMode = params.readMode;
+            TestData.shellReadMode = readMode;
             TestData.currentOpTest = testObj.test;
             testObj.test = function() {
                 db.getMongo().forceReadMode(TestData.shellReadMode);
@@ -62,16 +64,19 @@
                     testObj.currentOpFilter.ns = coll.getFullName();
                     testObj.currentOpFilter.planSummary = testObj.planSummary;
                     if (testObj.hasOwnProperty("command")) {
-                        testObj.currentOpFilter["query." + testObj.command] = {$exists: true};
+                        testObj.currentOpFilter["command." + testObj.command] = {$exists: true};
                     } else if (testObj.hasOwnProperty("operation")) {
                         testObj.currentOpFilter.op = testObj.operation;
                     }
 
-                    var result = testDB.currentOp(testObj.currentOpFilter);
+                    var result = currentOp(testDB, testObj.currentOpFilter);
                     assert.commandWorked(result);
 
                     if (result.inprog.length === 1) {
                         assert.eq(result.inprog[0].appName, "MongoDB Shell", tojson(result));
+                        assert.eq(result.inprog[0].clientMetadata.application.name,
+                                  "MongoDB Shell",
+                                  tojson(result));
 
                         return true;
                     }
@@ -80,7 +85,7 @@
                 },
                 function() {
                     return "Failed to find operation from " + tojson(testObj) +
-                        " in currentOp() output: " + tojson(testDB.currentOp());
+                        " in currentOp() output: " + tojson(currentOp(testDB, {}));
                 });
 
             // Allow the query to complete.
@@ -110,10 +115,10 @@
               command: "aggregate",
               planSummary: "IXSCAN { _id: 1 }",
               currentOpFilter: {
-                  "query.pipeline.0.$match.$comment": "currentop_query",
-                  "query.comment": "currentop_query_2",
-                  "query.collation": {locale: "fr"},
-                  "query.hint": {_id: 1}
+                  "command.pipeline.0.$match.$comment": "currentop_query",
+                  "command.comment": "currentop_query_2",
+                  "command.collation": {locale: "fr"},
+                  "command.hint": {_id: 1}
               }
             },
             {
@@ -125,8 +130,10 @@
               },
               command: "count",
               planSummary: "COLLSCAN",
-              currentOpFilter:
-                  {"query.query.$comment": "currentop_query", "query.collation": {locale: "fr"}}
+              currentOpFilter: {
+                  "command.query.$comment": "currentop_query",
+                  "command.collation": {locale: "fr"}
+              }
             },
             {
               test: function() {
@@ -137,8 +144,10 @@
               },
               command: "distinct",
               planSummary: "COLLSCAN",
-              currentOpFilter:
-                  {"query.query.$comment": "currentop_query", "query.collation": {locale: "fr"}}
+              currentOpFilter: {
+                  "command.query.$comment": "currentop_query",
+                  "command.collation": {locale: "fr"}
+              }
             },
             {
               test: function() {
@@ -147,7 +156,7 @@
               },
               command: "find",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.comment": "currentop_query"}
+              currentOpFilter: {"command.comment": "currentop_query"}
             },
             {
               test: function() {
@@ -160,8 +169,10 @@
               },
               command: "findandmodify",
               planSummary: "COLLSCAN",
-              currentOpFilter:
-                  {"query.query.$comment": "currentop_query", "query.collation": {locale: "fr"}}
+              currentOpFilter: {
+                  "command.query.$comment": "currentop_query",
+                  "command.collation": {locale: "fr"}
+              }
             },
             {
               test: function() {
@@ -177,8 +188,8 @@
               command: "group",
               planSummary: "COLLSCAN",
               currentOpFilter: {
-                  "query.group.cond.$comment": "currentop_query",
-                  "query.group.collation": {locale: "fr"}
+                  "command.group.cond.$comment": "currentop_query",
+                  "command.group.collation": {locale: "fr"}
               }
             },
             {
@@ -198,8 +209,10 @@
               },
               command: "mapreduce",
               planSummary: "COLLSCAN",
-              currentOpFilter:
-                  {"query.query.$comment": "currentop_query", "query.collation": {locale: "fr"}}
+              currentOpFilter: {
+                  "command.query.$comment": "currentop_query",
+                  "command.collation": {locale: "fr"}
+              }
             },
             {
               test: function() {
@@ -208,7 +221,8 @@
               },
               operation: "remove",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.$comment": "currentop_query", "collation": {locale: "fr"}}
+              currentOpFilter:
+                  {"command.q.$comment": "currentop_query", "command.collation": {locale: "fr"}}
             },
             {
               test: function() {
@@ -218,7 +232,8 @@
               },
               operation: "update",
               planSummary: "COLLSCAN",
-              currentOpFilter: {"query.$comment": "currentop_query", "collation": {locale: "fr"}}
+              currentOpFilter:
+                  {"command.q.$comment": "currentop_query", "command.collation": {locale: "fr"}}
             }
         ];
 
@@ -233,7 +248,7 @@
         //
         // Confirm currentOp contains collation for find command.
         //
-        if (params.readMode === "commands") {
+        if (readMode === "commands") {
             confirmCurrentOpContents({
                 test: function() {
                     assert.eq(db.currentop_query.find({a: 1})
@@ -245,7 +260,7 @@
                 command: "find",
                 planSummary: "COLLSCAN",
                 currentOpFilter:
-                    {"query.comment": "currentop_query", "query.collation": {locale: "fr"}}
+                    {"command.comment": "currentop_query", "command.collation": {locale: "fr"}}
             });
         }
 
@@ -270,8 +285,10 @@
             },
             command: "geoNear",
             planSummary: "GEO_NEAR_2DSPHERE { loc: \"2dsphere\" }",
-            currentOpFilter:
-                {"query.query.$comment": "currentop_query", "query.collation": {locale: "fr"}}
+            currentOpFilter: {
+                "command.query.$comment": "currentop_query",
+                "command.collation": {locale: "fr"}
+            }
         });
 
         //
@@ -290,7 +307,7 @@
         TestData.commandResult = cmdRes;
 
         var filter = {
-            "query.getMore": TestData.commandResult.cursor.id,
+            "command.getMore": TestData.commandResult.cursor.id,
             "originatingCommand.filter.$comment": "currentop_query"
         };
 
@@ -309,11 +326,11 @@
         // Confirm that currentOp displays upconverted getMore and originatingCommand in the case of
         // a legacy query.
         //
-        if (params.readMode === "legacy") {
+        if (readMode === "legacy") {
             let filter = {
-                "query.getMore": {$gt: 0},
-                "query.collection": "currentop_query",
-                "query.batchSize": 2,
+                "command.getMore": {$gt: 0},
+                "command.collection": "currentop_query",
+                "command.batchSize": 2,
                 originatingCommand: {
                     find: "currentop_query",
                     filter: {},
@@ -380,8 +397,8 @@
             },
             planSummary: "COLLSCAN",
             currentOpFilter: {
-                "query.$truncated": {$regex: truncatedQueryString},
-                "query.comment": "currentop_query"
+                "command.$truncated": {$regex: truncatedQueryString},
+                "command.comment": "currentop_query"
             }
         });
 
@@ -398,7 +415,7 @@
         TestData.commandResult = cmdRes;
 
         filter = {
-            "query.getMore": TestData.commandResult.cursor.id,
+            "command.getMore": TestData.commandResult.cursor.id,
             "originatingCommand.$truncated": {$regex: truncatedQueryString},
             "originatingCommand.comment": "currentop_query"
         };
@@ -431,14 +448,31 @@
             },
             planSummary: "COLLSCAN",
             currentOpFilter: {
-                "query.$truncated": {$regex: truncatedQueryString},
-                "query.comment": "currentop_query"
+                "command.$truncated": {$regex: truncatedQueryString},
+                "command.comment": "currentop_query"
             }
         });
 
         delete TestData.queryFilter;
     }
 
-    runTest({readMode: "commands"});
-    runTest({readMode: "legacy"});
+    function currentOpCommand(inputDB, filter) {
+        return inputDB.currentOp(filter);
+    }
+
+    function currentOpAgg(inputDB, filter) {
+        let adminDB = inputDB.getSiblingDB("admin");
+        let cmdRes = adminDB.runCommand(
+            {aggregate: 1, pipeline: [{$currentOp: {}}, {$match: filter}], cursor: {}});
+
+        assert.commandWorked(cmdRes);
+
+        return {inprog: new DBCommandCursor(inputDB.getMongo(), cmdRes, 5).toArray(), ok: 1};
+    }
+
+    runTest({readMode: "commands", currentOp: currentOpCommand});
+    runTest({readMode: "legacy", currentOp: currentOpCommand});
+
+    runTest({readMode: "commands", currentOp: currentOpAgg});
+    runTest({readMode: "legacy", currentOp: currentOpAgg});
 })();

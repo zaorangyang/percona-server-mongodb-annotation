@@ -62,7 +62,7 @@ namespace {
 
 class MoveDatabasePrimaryCommand : public Command {
 public:
-    MoveDatabasePrimaryCommand() : Command("movePrimary", false, "moveprimary") {}
+    MoveDatabasePrimaryCommand() : Command("movePrimary", "moveprimary") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -102,7 +102,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname_unused,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         const string dbname = parseNs("", cmdObj);

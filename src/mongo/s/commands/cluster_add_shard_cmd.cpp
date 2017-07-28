@@ -53,7 +53,7 @@ const char kShardAdded[] = "shardAdded";
 
 class AddShardCmd : public Command {
 public:
-    AddShardCmd() : Command("addShard", false, "addshard") {}
+    AddShardCmd() : Command("addShard", "addshard") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -82,7 +82,7 @@ public:
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
+                     const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
         auto parsedRequest = uassertStatusOK(AddShardRequest::parseFromMongosCommand(cmdObj));

@@ -33,7 +33,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/commands/dbhash.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
@@ -73,8 +72,6 @@ void OpObserverImpl::onCreateIndex(OperationContext* opCtx,
     if (!fromMigrate) {
         css->onInsertOp(opCtx, indexDoc);
     }
-
-    logOpForDbHash(opCtx, systemIndexes);
 }
 
 void OpObserverImpl::onInserts(OperationContext* opCtx,
@@ -100,7 +97,6 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
         }
     }
 
-    logOpForDbHash(opCtx, nss);
     if (strstr(nss.ns().c_str(), ".system.js")) {
         Scope::storedFuncMod(opCtx);
     }
@@ -124,7 +120,6 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
         css->onUpdateOp(opCtx, args.updatedDoc);
     }
 
-    logOpForDbHash(opCtx, args.nss);
     if (strstr(args.nss.ns().c_str(), ".system.js")) {
         Scope::storedFuncMod(opCtx);
     }
@@ -170,7 +165,6 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
         css->onDeleteOp(opCtx, deleteState);
     }
 
-    logOpForDbHash(opCtx, nss);
     if (nss.coll() == "system.js") {
         Scope::storedFuncMod(opCtx);
     }
@@ -219,7 +213,6 @@ void OpObserverImpl::onCreateCollection(OperationContext* opCtx,
     }
 
     getGlobalAuthorizationManager()->logOp(opCtx, "c", dbName, cmdObj, nullptr);
-    logOpForDbHash(opCtx, dbName);
 
     if (options.uuid) {
         UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
@@ -287,7 +280,6 @@ void OpObserverImpl::onCollMod(OperationContext* opCtx,
     }
 
     getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
-    logOpForDbHash(opCtx, cmdNss);
 }
 
 void OpObserverImpl::onDropDatabase(OperationContext* opCtx, const std::string& dbName) {
@@ -301,18 +293,18 @@ void OpObserverImpl::onDropDatabase(OperationContext* opCtx, const std::string& 
     }
 
     getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
-    logOpForDbHash(opCtx, cmdNss);
 }
 
-void OpObserverImpl::onDropCollection(OperationContext* opCtx,
-                                      const NamespaceString& collectionName,
-                                      OptionalCollectionUUID uuid) {
+repl::OpTime OpObserverImpl::onDropCollection(OperationContext* opCtx,
+                                              const NamespaceString& collectionName,
+                                              OptionalCollectionUUID uuid) {
     const NamespaceString dbName = collectionName.getCommandNS();
     BSONObj cmdObj = BSON("drop" << collectionName.coll().toString());
 
+    repl::OpTime dropOpTime;
     if (!collectionName.isSystemDotProfile()) {
         // do not replicate system.profile modifications
-        repl::logOp(opCtx, "c", dbName, uuid, cmdObj, nullptr, false);
+        dropOpTime = repl::logOp(opCtx, "c", dbName, uuid, cmdObj, nullptr, false);
     }
 
     if (collectionName.coll() == DurableViewCatalog::viewsCollectionName()) {
@@ -338,7 +330,7 @@ void OpObserverImpl::onDropCollection(OperationContext* opCtx,
         catalog.onDropCollection(opCtx, uuid.get());
     }
 
-    logOpForDbHash(opCtx, dbName);
+    return dropOpTime;
 }
 
 void OpObserverImpl::onDropIndex(OperationContext* opCtx,
@@ -351,7 +343,6 @@ void OpObserverImpl::onDropIndex(OperationContext* opCtx,
     repl::logOp(opCtx, "c", commandNS, uuid, cmdObj, &indexInfo, false);
 
     getGlobalAuthorizationManager()->logOp(opCtx, "c", commandNS, cmdObj, &indexInfo);
-    logOpForDbHash(opCtx, commandNS);
 }
 
 void OpObserverImpl::onRenameCollection(OperationContext* opCtx,
@@ -385,7 +376,6 @@ void OpObserverImpl::onRenameCollection(OperationContext* opCtx,
     }
 
     getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
-    logOpForDbHash(opCtx, cmdNss);
 
     // Evict namespace entry from the namespace/uuid cache if it exists.
     NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
@@ -399,7 +389,6 @@ void OpObserverImpl::onApplyOps(OperationContext* opCtx,
     repl::logOp(opCtx, "c", cmdNss, {}, applyOpCmd, nullptr, false);
 
     getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, applyOpCmd, nullptr);
-    logOpForDbHash(opCtx, cmdNss);
 }
 
 void OpObserverImpl::onConvertToCapped(OperationContext* opCtx,
@@ -415,7 +404,6 @@ void OpObserverImpl::onConvertToCapped(OperationContext* opCtx,
     }
 
     getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
-    logOpForDbHash(opCtx, cmdNss);
 }
 
 void OpObserverImpl::onEmptyCapped(OperationContext* opCtx,
@@ -430,7 +418,6 @@ void OpObserverImpl::onEmptyCapped(OperationContext* opCtx,
     }
 
     getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
-    logOpForDbHash(opCtx, cmdNss);
 }
 
 }  // namespace mongo

@@ -60,7 +60,7 @@ using std::vector;
 
 class FindAndModifyCmd : public Command {
 public:
-    FindAndModifyCmd() : Command("findAndModify", false, "findandmodify") {}
+    FindAndModifyCmd() : Command("findAndModify", "findandmodify") {}
 
     bool slaveOk() const override {
         return true;
@@ -84,7 +84,6 @@ public:
                    const std::string& dbName,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                    BSONObjBuilder* out) const override {
         const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
 
@@ -128,16 +127,13 @@ public:
             shard = shardStatus.getValue();
         }
 
-        BSONObjBuilder explainCmd;
-        int options = 0;
-        ClusterExplain::wrapAsExplainDeprecated(
-            cmdObj, verbosity, serverSelectionMetadata, &explainCmd, &options);
+        const auto explainCmd = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
 
         // Time how long it takes to run the explain command on the shard.
         Timer timer;
 
         BSONObjBuilder result;
-        bool ok = _runCommand(opCtx, chunkMgr, shard->getId(), nss, explainCmd.obj(), result);
+        bool ok = _runCommand(opCtx, chunkMgr, shard->getId(), nss, explainCmd, result);
         long long millisElapsed = timer.millis();
 
         if (!ok) {
@@ -160,7 +156,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbName,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss = parseNsCollectionRequired(dbName, cmdObj);

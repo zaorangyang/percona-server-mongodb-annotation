@@ -36,7 +36,6 @@
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/commands/cluster_aggregate.h"
 #include "mongo/s/commands/cluster_commands_common.h"
@@ -50,7 +49,7 @@ namespace {
 
 class ClusterCountCmd : public Command {
 public:
-    ClusterCountCmd() : Command("count", false) {}
+    ClusterCountCmd() : Command("count") {}
 
     bool slaveOk() const override {
         return true;
@@ -74,7 +73,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
@@ -241,7 +240,6 @@ public:
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata& ssm,
                    BSONObjBuilder* out) const override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
         uassert(ErrorCodes::InvalidNamespace,
@@ -265,8 +263,7 @@ public:
             return status;
         }
 
-        BSONObjBuilder explainCmdBob;
-        ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
+        const auto explainCmd = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
 
         // We will time how long it takes to run the commands on the shards
         Timer timer;
@@ -274,8 +271,8 @@ public:
         BSONObj viewDefinition;
         auto swShardResponses = scatterGatherForNamespace(opCtx,
                                                           nss,
-                                                          explainCmdBob.obj(),
-                                                          getReadPref(ssm),
+                                                          explainCmd,
+                                                          getReadPref(explainCmd),
                                                           targetingQuery,
                                                           targetingCollation,
                                                           true,  // do shard versioning

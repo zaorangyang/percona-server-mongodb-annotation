@@ -87,7 +87,7 @@ public:
 
     bool run(OperationContext* opCtx,
              const std::string& db,
-             BSONObj& cmdObj,
+             const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) final {
         const bool includeAll = cmdObj["$all"].trueValue();
@@ -150,6 +150,9 @@ public:
                 if (!appName.empty()) {
                     infoBuilder.append("appName", appName);
                 }
+
+                auto clientMetadataDocument = clientMetadata.get().getDocument();
+                infoBuilder.append("clientMetadata", clientMetadataDocument);
             }
 
             // Operation context specific information
