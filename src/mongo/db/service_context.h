@@ -33,15 +33,18 @@
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/unordered_set.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/decorable.h"
+#include "mongo/util/periodic_runner.h"
 #include "mongo/util/tick_source.h"
 
 namespace mongo {
@@ -54,7 +57,6 @@ class ServiceEntryPoint;
 
 namespace transport {
 class TransportLayer;
-class TransportLayerManager;
 }  // namespace transport
 
 /**
@@ -314,6 +316,38 @@ public:
     void registerKillOpListener(KillOpListenerInterface* listener);
 
     //
+    // Background tasks.
+    //
+
+    /**
+     * Set a periodic runner on the service context. The runner should already be
+     * started when it is moved onto the service context. The service context merely
+     * takes ownership of this object to allow it to continue running for the life of
+     * the process
+     */
+    void setPeriodicRunner(std::unique_ptr<PeriodicRunner> runner);
+
+    /**
+     * Returns a pointer to the global periodic runner owned by this service context.
+     */
+    PeriodicRunner* getPeriodicRunner() const;
+
+    //
+    // Logical sessions.
+    //
+
+    /**
+     * Set the logical session cache on this service context.
+     */
+    void setLogicalSessionCache(std::unique_ptr<LogicalSessionCache> cache) &;
+
+    /**
+     * Return a pointer to the logical session cache on this service context.
+     */
+    LogicalSessionCache* getLogicalSessionCache() const&;
+    LogicalSessionCache* getLogicalSessionCache() && = delete;
+
+    //
     // Transport.
     //
 
@@ -333,12 +367,17 @@ public:
     ServiceEntryPoint* getServiceEntryPoint() const;
 
     /**
-     * Add a new TransportLayer to this service context. The new TransportLayer will
-     * be added to the TransportLayerManager accessible via getTransportLayer().
+     * Waits for the ServiceContext to be fully initialized and for all TransportLayers to have been
+     * added/started.
      *
-     * It additionally calls start() on the TransportLayer after adding it.
+     * If startup is already complete this returns immediately.
      */
-    Status addAndStartTransportLayer(std::unique_ptr<transport::TransportLayer> tl);
+    void waitForStartupComplete();
+
+    /*
+     * Marks initialization as complete and all transport layers as started.
+     */
+    void notifyStartupComplete();
 
     //
     // Global OpObserver.
@@ -389,9 +428,17 @@ public:
     void setPreciseClockSource(std::unique_ptr<ClockSource> newSource);
 
     /**
-     * Binds the service entry point implementation to the service context
+     * Binds the service entry point implementation to the service context.
      */
     void setServiceEntryPoint(std::unique_ptr<ServiceEntryPoint> sep);
+
+    /**
+     * Binds the TransportLayer to the service context. The TransportLayer should have already
+     * had setup() called successfully, but not startup().
+     *
+     * This should be a TransportLayerManager created with the global server configuration.
+     */
+    void setTransportLayer(std::unique_ptr<transport::TransportLayer> tl);
 
 protected:
     ServiceContext();
@@ -417,11 +464,20 @@ private:
      */
     void _killOperation_inlock(OperationContext* opCtx, ErrorCodes::Error killCode);
 
+    /**
+     * The periodic runner.
+     */
+    std::unique_ptr<PeriodicRunner> _runner;
 
     /**
-     * The TransportLayerManager.
+     * The logical session cache.
      */
-    std::unique_ptr<transport::TransportLayerManager> _transportLayerManager;
+    std::unique_ptr<LogicalSessionCache> _sessionCache;
+
+    /**
+     * The TransportLayer.
+     */
+    std::unique_ptr<transport::TransportLayer> _transportLayer;
 
     /**
      * The service entry point
@@ -455,6 +511,9 @@ private:
 
     // Counter for assigning operation ids.
     AtomicUInt32 _nextOpId{1};
+
+    bool _startupComplete = false;
+    stdx::condition_variable _startupCompleteCondVar;
 };
 
 /**

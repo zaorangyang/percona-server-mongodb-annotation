@@ -7,6 +7,7 @@ from __future__ import absolute_import
 import os
 import os.path
 import shutil
+import sys
 import threading
 import unittest
 
@@ -47,7 +48,7 @@ class TestCase(unittest.TestCase):
         if not isinstance(test_name, basestring):
             raise TypeError("test_name must be a string")
 
-        # When the TestCase is created by the TestGroupExecutor (through a call to make_test_case())
+        # When the TestCase is created by the TestSuiteExecutor (through a call to make_test_case())
         # logger is an instance of TestQueueLogger. When the TestCase is created by a hook
         # implementation it is an instance of BaseLogger.
         self.logger = logger
@@ -299,9 +300,8 @@ class JSTestCase(TestCase):
         def run(self):
             try:
                 threading.Thread.run(self)
-            except Exception as e1:
-                self.err = e1
-                raise
+            except:
+                self.err = sys.exc_info()[1]
             else:
                 self.err = None
 

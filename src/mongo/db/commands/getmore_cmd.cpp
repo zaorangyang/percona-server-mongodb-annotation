@@ -36,11 +36,11 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/cursor_manager.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/cursor_response.h"
@@ -168,21 +168,21 @@ public:
         // Cursors come in one of two flavors:
         // - Cursors owned by the collection cursor manager, such as those generated via the find
         //   command. For these cursors, we hold the appropriate collection lock for the duration of
-        //   the getMore using AutoGetCollectionForRead. This will automatically update the CurOp
-        //   object appropriately and record execution time via Top upon completion.
+        //   the getMore using AutoGetCollectionForRead.
         // - Cursors owned by the global cursor manager, such as those generated via the aggregate
         //   command. These cursors either hold no collection state or manage their collection state
-        //   internally, so we acquire no locks. In this case we use the AutoStatsTracker object to
-        //   update the CurOp object appropriately and record execution time via Top upon
-        //   completion.
+        //   internally, so we acquire no locks.
         //
-        // Thus, only one of 'readLock' and 'statsTracker' will be populated as we populate
-        // 'cursorManager'.
+        // While we only need to acquire locks in the case of a cursor which is *not* globally
+        // owned, we need to create an AutoStatsTracker in either case. This is responsible for
+        // updating statistics in CurOp and Top. We avoid using AutoGetCollectionForReadCommand
+        // because we may need to drop and reacquire locks when the cursor is awaitData, but we
+        // don't want to update the stats twice.
         //
-        // Note that we declare our locks before our ClientCursorPin, in order to ensure that
+        // Note that we acquire our locks before our ClientCursorPin, in order to ensure that
         // the pin's destructor is called before the lock's destructor (if there is one) so that the
         // cursor cleanup can occur under the lock.
-        boost::optional<AutoGetCollectionForReadCommand> readLock;
+        boost::optional<AutoGetCollectionForRead> readLock;
         boost::optional<AutoStatsTracker> statsTracker;
         CursorManager* cursorManager;
 
@@ -204,6 +204,13 @@ public:
                                                                ChunkVersion::IGNORED());
 
             readLock.emplace(opCtx, request.nss);
+            const int doNotChangeProfilingLevel = 0;
+            statsTracker.emplace(opCtx,
+                                 request.nss,
+                                 Top::LockType::ReadLocked,
+                                 readLock->getDb() ? readLock->getDb()->getProfilingLevel()
+                                                   : doNotChangeProfilingLevel);
+
             Collection* collection = readLock->getCollection();
             if (!collection) {
                 return appendCommandStatus(result,
@@ -284,20 +291,16 @@ public:
 
         const bool hasOwnMaxTime = opCtx->hasDeadline();
 
-        if (!hasOwnMaxTime) {
+        // We assume that cursors created through a DBDirectClient are always used from their
+        // original OperationContext, so we do not need to move time to and from the cursor.
+        if (!hasOwnMaxTime && !opCtx->getClient()->isInDirectClient()) {
             // There is no time limit set directly on this getMore command. If the cursor is
             // awaitData, then we supply a default time of one second. Otherwise we roll over
             // any leftover time from the maxTimeMS of the operation that spawned this cursor,
             // applying it to this getMore.
             if (isCursorAwaitData(cursor)) {
-                uassert(40117,
-                        "Illegal attempt to set operation deadline within DBDirectClient",
-                        !opCtx->getClient()->isInDirectClient());
                 opCtx->setDeadlineAfterNowBy(Seconds{1});
             } else if (cursor->getLeftoverMaxTimeMicros() < Microseconds::max()) {
-                uassert(40118,
-                        "Illegal attempt to set operation deadline within DBDirectClient",
-                        !opCtx->getClient()->isInDirectClient());
                 opCtx->setDeadlineAfterNowBy(cursor->getLeftoverMaxTimeMicros());
             }
         }
@@ -372,15 +375,13 @@ public:
                 exec->saveState();
                 readLock.reset();
 
-                // Block waiting for data.
+                // Block waiting for data. Time spent blocking is not counted towards the total
+                // operation latency.
+                curOp->pauseTimer();
                 const auto timeout = opCtx->getRemainingMaxTimeMicros();
                 notifier->wait(notifierVersion, timeout);
                 notifier.reset();
-
-                // Set expected latency to match wait time. This makes sure the logs aren't spammed
-                // by awaitData queries that exceed slowms due to blocking on the
-                // CappedInsertNotifier.
-                curOp->setExpectedLatencyMs(durationCount<Milliseconds>(timeout));
+                curOp->resumeTimer();
 
                 readLock.emplace(opCtx, request.nss);
                 exec->restoreState();

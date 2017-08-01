@@ -130,6 +130,53 @@ private:
     AtomicBool _shuttingDown{false};
 };
 
+class WiredTigerKVEngine::WiredTigerCheckpointThread : public BackgroundJob {
+public:
+    explicit WiredTigerCheckpointThread(WiredTigerSessionCache* sessionCache)
+        : BackgroundJob(false /* deleteSelf */), _sessionCache(sessionCache) {}
+
+    virtual string name() const {
+        return "WTCheckpointThread";
+    }
+
+    virtual void run() {
+        Client::initThread(name().c_str());
+
+        LOG(1) << "starting " << name() << " thread";
+
+        while (!_shuttingDown.load()) {
+            {
+                stdx::unique_lock<stdx::mutex> lock(_mutex);
+                _condvar.wait_for(lock,
+                                  stdx::chrono::seconds(static_cast<std::int64_t>(
+                                      wiredTigerGlobalOptions.checkpointDelaySecs)));
+            }
+
+            try {
+                const bool forceCheckpoint = true;
+                _sessionCache->waitUntilDurable(forceCheckpoint);
+            } catch (const UserException& exc) {
+                invariant(exc.getCode() == ErrorCodes::ShutdownInProgress);
+            }
+        }
+        LOG(1) << "stopping " << name() << " thread";
+    }
+
+    void shutdown() {
+        _shuttingDown.store(true);
+        _condvar.notify_one();
+        wait();
+    }
+
+private:
+    WiredTigerSessionCache* _sessionCache;
+
+    // _mutex/_condvar used to notify when _shuttingDown is flipped.
+    stdx::mutex _mutex;
+    stdx::condition_variable _condvar;
+    AtomicBool _shuttingDown{false};
+};
+
 namespace {
 
 class TicketServerParameter : public ServerParameter {
@@ -228,8 +275,6 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         ss << "log=(enabled=true,archive=true,path=journal,compressor=";
         ss << wiredTigerGlobalOptions.journalCompressor << "),";
         ss << "file_manager=(close_idle_time=100000),";  //~28 hours, will put better fix in 3.1.x
-        ss << "checkpoint=(wait=" << wiredTigerGlobalOptions.checkpointDelaySecs;
-        ss << ",log_size=" << wiredTigerGlobalOptions.checkpointSizeMB << "MB),";
         ss << "statistics_log=(wait=" << wiredTigerGlobalOptions.statisticsLogDelaySecs << "),";
         ss << "verbose=(recovery_progress),";
     }
@@ -287,6 +332,11 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         _journalFlusher->go();
     }
 
+    if (!_readOnly && !_ephemeral) {
+        _checkpointThread = stdx::make_unique<WiredTigerCheckpointThread>(_sessionCache.get());
+        _checkpointThread->go();
+    }
+
     _sizeStorerUri = "table:sizeStorer";
     WiredTigerSession session(_conn);
     if (!_readOnly && repair && _hasUri(session.getSession(), _sizeStorerUri)) {
@@ -335,6 +385,8 @@ void WiredTigerKVEngine::cleanShutdown() {
         // these must be the last things we do before _conn->close();
         if (_journalFlusher)
             _journalFlusher->shutdown();
+        if (_checkpointThread)
+            _checkpointThread->shutdown();
         _sizeStorer.reset();
         _sessionCache->shuttingDown();
 
@@ -378,11 +430,12 @@ int64_t WiredTigerKVEngine::getIdentSize(OperationContext* opCtx, StringData ide
 
 Status WiredTigerKVEngine::repairIdent(OperationContext* opCtx, StringData ident) {
     WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx);
-    session->closeAllCursors();
+    string uri = _uri(ident);
+    session->closeAllCursors(uri);
+    _sessionCache->closeAllCursors(uri);
     if (isEphemeral()) {
         return Status::OK();
     }
-    string uri = _uri(ident);
     return _salvageIfNeeded(uri.c_str());
 }
 
@@ -539,8 +592,9 @@ Status WiredTigerKVEngine::createGroupedRecordStore(OperationContext* opCtx,
     _checkIdentPath(ident);
     WiredTigerSession session(_conn);
 
-    StatusWith<std::string> result =
-        WiredTigerRecordStore::generateCreateString(_canonicalName, ns, options, _rsOptions);
+    const bool prefixed = prefix.isPrefixed();
+    StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
+        _canonicalName, ns, options, _rsOptions, prefixed);
     if (!result.isOK()) {
         return result.getStatus();
     }
@@ -558,32 +612,37 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::getGroupedRecordStore(
     StringData ident,
     const CollectionOptions& options,
     KVPrefix prefix) {
+
+    WiredTigerRecordStore::Params params;
+    params.ns = ns;
+    params.uri = _uri(ident);
+    params.engineName = _canonicalName;
+    params.isCapped = options.capped;
+    params.isEphemeral = _ephemeral;
+    params.cappedCallback = nullptr;
+    params.sizeStorer = _sizeStorer.get();
+
+    params.cappedMaxSize = -1;
     if (options.capped) {
-        return stdx::make_unique<WiredTigerRecordStore>(
-            opCtx,
-            ns,
-            _uri(ident),
-            _canonicalName,
-            options.capped,
-            _ephemeral,
-            options.cappedSize ? options.cappedSize : 4096,
-            options.cappedMaxDocs ? options.cappedMaxDocs : -1,
-            nullptr,
-            _sizeStorer.get(),
-            prefix);
-    } else {
-        return stdx::make_unique<WiredTigerRecordStore>(opCtx,
-                                                        ns,
-                                                        _uri(ident),
-                                                        _canonicalName,
-                                                        false,
-                                                        _ephemeral,
-                                                        -1,
-                                                        -1,
-                                                        nullptr,
-                                                        _sizeStorer.get(),
-                                                        prefix);
+        if (options.cappedSize) {
+            params.cappedMaxSize = options.cappedSize;
+        } else {
+            params.cappedMaxSize = 4096;
+        }
     }
+    params.cappedMaxDocs = -1;
+    if (options.capped && options.cappedMaxDocs)
+        params.cappedMaxDocs = options.cappedMaxDocs;
+
+    std::unique_ptr<WiredTigerRecordStore> ret;
+    if (prefix == KVPrefix::kNotPrefixed) {
+        ret = stdx::make_unique<StandardWiredTigerRecordStore>(opCtx, params);
+    } else {
+        ret = stdx::make_unique<PrefixedWiredTigerRecordStore>(opCtx, params, prefix);
+    }
+    ret->postConstructorInit(opCtx);
+
+    return std::move(ret);
 }
 
 string WiredTigerKVEngine::_uri(StringData ident) const {
@@ -614,7 +673,7 @@ Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* op
     }
 
     StatusWith<std::string> result = WiredTigerIndex::generateCreateString(
-        _canonicalName, _indexOptions, collIndexOptions, *desc);
+        _canonicalName, _indexOptions, collIndexOptions, *desc, prefix.isPrefixed());
     if (!result.isOK()) {
         return result.getStatus();
     }
@@ -643,6 +702,8 @@ Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, StringData ident) 
 bool WiredTigerKVEngine::_drop(StringData ident) {
     string uri = _uri(ident);
 
+    _sessionCache->closeAllCursors(uri);
+
     WiredTigerSession session(_conn);
 
     int ret = session.getSession()->drop(
@@ -658,14 +719,36 @@ bool WiredTigerKVEngine::_drop(StringData ident) {
         // this is expected, queue it up
         {
             stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
-            _identToDrop.push(uri);
+            _identToDrop.push_front(uri);
         }
-        _sessionCache->closeAllCursors();
+        _sessionCache->closeCursorsForQueuedDrops();
         return false;
     }
 
     invariantWTOK(ret);
     return false;
+}
+
+std::list<WiredTigerCachedCursor> WiredTigerKVEngine::filterCursorsWithQueuedDrops(
+    std::list<WiredTigerCachedCursor>* cache) {
+    std::list<WiredTigerCachedCursor> toDrop;
+
+    stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
+    if (_identToDrop.empty())
+        return toDrop;
+
+    for (auto i = cache->begin(); i != cache->end();) {
+        if (!i->_cursor ||
+            std::find(_identToDrop.begin(), _identToDrop.end(), std::string(i->_cursor->uri)) ==
+                _identToDrop.end()) {
+            ++i;
+            continue;
+        }
+        toDrop.push_back(*i);
+        i = cache->erase(i);
+    }
+
+    return toDrop;
 }
 
 bool WiredTigerKVEngine::haveDropsQueued() const {
@@ -678,13 +761,14 @@ bool WiredTigerKVEngine::haveDropsQueued() const {
     }
 
     // We only want to check the queue max once per second or we'll thrash
-    // This is done in haveDropsQueued, not dropSomeQueuedIdents so we skip the mutex
     if (delta < Milliseconds(1000))
         return false;
 
     _previousCheckedDropsQueued = now;
-    stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
-    return !_identToDrop.empty();
+
+    // Don't wait for the mutex: if we can't get it, report that no drops are queued.
+    stdx::unique_lock<stdx::mutex> lk(_identToDropMutex, stdx::defer_lock);
+    return lk.try_lock() && !_identToDrop.empty();
 }
 
 void WiredTigerKVEngine::dropSomeQueuedIdents() {
@@ -710,7 +794,7 @@ void WiredTigerKVEngine::dropSomeQueuedIdents() {
             if (_identToDrop.empty())
                 break;
             uri = _identToDrop.front();
-            _identToDrop.pop();
+            _identToDrop.pop_front();
         }
         int ret = session.getSession()->drop(
             session.getSession(), uri.c_str(), "force,checkpoint_wait=false");
@@ -718,7 +802,7 @@ void WiredTigerKVEngine::dropSomeQueuedIdents() {
 
         if (ret == EBUSY) {
             stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
-            _identToDrop.push(uri);
+            _identToDrop.push_back(uri);
         } else {
             invariantWTOK(ret);
         }

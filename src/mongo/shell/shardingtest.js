@@ -65,11 +65,16 @@
  *          Can be used to specify options that are common all mongos.
  *       enableBalancer {boolean} : if true, enable the balancer
  *       enableAutoSplit {boolean} : if true, enable autosplitting; else, default to the
- * enableBalancer setting
+ *          enableBalancer setting
  *       manualAddShard {boolean}: shards will not be added if true.
  *
  *       useBridge {boolean}: If true, then a mongobridge process is started for each node in the
  *          sharded cluster. Defaults to false.
+ *
+ *       causallyConsistent {boolean}: Specifies whether the connections to the replica set nodes
+ *          should be created with the 'causal consistency' flag enabled, which means they will
+ *          gossip the cluster time and add readConcern afterClusterTime where applicable.
+ *          Defaults to false.
  *
  *       bridgeOptions {Object}: Options to apply to all mongobridge processes. Defaults to {}.
  *
@@ -1004,7 +1009,7 @@ var ShardingTest = function(params) {
      * be manually changed if and when there is a new feature compatibility version.
      */
     function _hasNewFeatureCompatibilityVersion() {
-        return false;
+        return true;
     }
 
     // ShardingTest initialization
@@ -1083,6 +1088,7 @@ var ShardingTest = function(params) {
     otherParams.useHostname = otherParams.useHostname == undefined ? true : otherParams.useHostname;
     otherParams.useBridge = otherParams.useBridge || false;
     otherParams.bridgeOptions = otherParams.bridgeOptions || {};
+    otherParams.causallyConsistent = otherParams.causallyConsistent || false;
 
     if (jsTestOptions().networkMessageCompressors) {
         otherParams.bridgeOptions["networkMessageCompressors"] =
@@ -1313,9 +1319,7 @@ var ShardingTest = function(params) {
     var csrsPrimary = this.configRS.getPrimary();
 
     // If 'otherParams.mongosOptions.binVersion' is an array value, then we'll end up constructing a
-    // version iterator. We initialize the options for the mongos processes before checking whether
-    // we need to run {setFeatureCompatibilityVersion: "3.2"} on the CSRS primary so we know
-    // definitively what binVersions will be used for the mongos processes.
+    // version iterator.
     const mongosOptions = [];
     for (var i = 0; i < numMongos; ++i) {
         let options = {
@@ -1335,19 +1339,11 @@ var ShardingTest = function(params) {
 
         options.port = options.port || allocatePort();
 
-        // TODO(esha): remove after v3.4 ships.
-        // Legacy mongoses use a command line option to disable autosplit instead of reading the
-        // config.settings collection.
-        if (options.binVersion && MongoRunner.areBinVersionsTheSame('3.2', options.binVersion) &&
-            !otherParams.enableAutoSplit) {
-            options.noAutoSplit = "";
-        }
-
         mongosOptions.push(options);
     }
 
     const configRS = this.configRS;
-    if (_hasNewFeatureCompatibilityVersion && _isMixedVersionCluster()) {
+    if (_hasNewFeatureCompatibilityVersion() && _isMixedVersionCluster()) {
         function setFeatureCompatibilityVersion() {
             assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: '3.4'}));
 
@@ -1419,6 +1415,10 @@ var ShardingTest = function(params) {
         var conn = MongoRunner.runMongos(options);
         if (!conn) {
             throw new Error("Failed to start mongos " + i);
+        }
+
+        if (options.causallyConsistent) {
+            conn.setCausalConsistency(true);
         }
 
         if (otherParams.useBridge) {

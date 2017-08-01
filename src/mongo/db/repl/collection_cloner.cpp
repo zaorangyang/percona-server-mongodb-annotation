@@ -61,9 +61,6 @@ constexpr auto kCountResponseDocumentCountFieldName = "n"_sd;
 const int kProgressMeterSecondsBetween = 60;
 const int kProgressMeterCheckInterval = 128;
 
-// The batchSize to use for the query to get all documents from the collection.
-// 16MB max batch size / 12 byte min doc size * 10 (for good measure) = batchSize to use.
-const auto batchSize = (16 * 1024 * 1024) / 12 * 10;
 // The number of attempts for the count command, which gets the document count.
 MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncCollectionCountAttempts, int, 3);
 // The number of attempts for the listIndexes commands.
@@ -76,13 +73,18 @@ MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncCollectionFindAttempts, int, 3);
 // collection 'namespace'.
 MONGO_FP_DECLARE(initialSyncHangDuringCollectionClone);
 
+// Failpoint which causes initial sync to hang after the initial 'find' command of collection
+// cloning, for a specific collection.
+MONGO_FP_DECLARE(initialSyncHangCollectionClonerAfterInitialFind);
+
 CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                                    OldThreadPool* dbWorkThreadPool,
                                    const HostAndPort& source,
                                    const NamespaceString& sourceNss,
                                    const CollectionOptions& options,
                                    const CallbackFn& onCompletion,
-                                   StorageInterface* storageInterface)
+                                   StorageInterface* storageInterface,
+                                   const int batchSize)
     : _executor(executor),
       _dbWorkThreadPool(dbWorkThreadPool),
       _source(source),
@@ -134,7 +136,8 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                      kProgressMeterSecondsBetween,
                      kProgressMeterCheckInterval,
                      "documents copied",
-                     str::stream() << _sourceNss.toString() << " collection clone progress") {
+                     str::stream() << _sourceNss.toString() << " collection clone progress"),
+      _batchSize(batchSize) {
     // Fetcher throws an exception on null executor.
     invariant(executor);
     uassert(ErrorCodes::BadValue,
@@ -432,10 +435,25 @@ void CollectionCloner::_findCallback(const StatusWith<Fetcher::QueryResponse>& f
         return;
     }
 
+    MONGO_FAIL_POINT_BLOCK(initialSyncHangCollectionClonerAfterInitialFind, nssData) {
+        const BSONObj& data = nssData.getData();
+        auto nss = data["nss"].str();
+        // Only hang when cloning the specified collection.
+        if (_destNss.toString() == nss) {
+            while (MONGO_FAIL_POINT(initialSyncHangCollectionClonerAfterInitialFind) &&
+                   !_isShuttingDown()) {
+                log() << "initialSyncHangCollectionClonerAfterInitialFind fail point enabled for "
+                      << nss << ". Blocking until fail point is disabled.";
+                mongo::sleepsecs(1);
+            }
+        }
+    }
+
     if (!lastBatch) {
         invariant(getMoreBob);
         getMoreBob->append("getMore", batchData.cursorId);
         getMoreBob->append("collection", batchData.nss.coll());
+        getMoreBob->append("batchSize", _batchSize);
     }
 }
 
@@ -480,8 +498,7 @@ void CollectionCloner::_beginCollectionCallback(const executor::TaskExecutor::Ca
         _executor,
         _source,
         _sourceNss.db().toString(),
-        // noCursorTimeout true, large batchSize (for older server versions to get larger batch)
-        BSON("find" << _sourceNss.coll() << "noCursorTimeout" << true << "batchSize" << batchSize),
+        BSON("find" << _sourceNss.coll() << "noCursorTimeout" << true << "batchSize" << _batchSize),
         stdx::bind(&CollectionCloner::_findCallback,
                    this,
                    stdx::placeholders::_1,

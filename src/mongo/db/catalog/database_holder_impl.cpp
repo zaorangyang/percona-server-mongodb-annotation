@@ -34,7 +34,6 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/auth/auth_index_d.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
@@ -198,7 +197,10 @@ void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns, const std
     delete it->second;
     _dbs.erase(it);
 
-    getGlobalServiceContext()->getGlobalStorageEngine()->closeDatabase(opCtx, dbName.toString());
+    getGlobalServiceContext()
+        ->getGlobalStorageEngine()
+        ->closeDatabase(opCtx, dbName.toString())
+        .transitional_ignore();
 }
 
 bool DatabaseHolderImpl::closeAll(OperationContext* opCtx,
@@ -234,7 +236,10 @@ bool DatabaseHolderImpl::closeAll(OperationContext* opCtx,
 
         _dbs.erase(name);
 
-        getGlobalServiceContext()->getGlobalStorageEngine()->closeDatabase(opCtx, name);
+        getGlobalServiceContext()
+            ->getGlobalStorageEngine()
+            ->closeDatabase(opCtx, name)
+            .transitional_ignore();
 
         bb.append(name);
     }

@@ -43,9 +43,11 @@
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/query_request.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_consistency_markers_mock.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/replication_process.h"
@@ -118,18 +120,26 @@ void ShardingMongodTestFixture::setUp() {
         serversBob.append(BSON("host" << _servers[i].toString() << "_id" << static_cast<int>(i)));
     }
     repl::ReplSetConfig replSetConfig;
-    replSetConfig.initialize(BSON("_id" << _setName << "protocolVersion" << 1 << "version" << 3
-                                        << "members"
-                                        << serversBob.arr()));
+    replSetConfig
+        .initialize(BSON("_id" << _setName << "protocolVersion" << 1 << "version" << 3 << "members"
+                               << serversBob.arr()))
+        .transitional_ignore();
     replCoordPtr->setGetConfigReturnValue(replSetConfig);
 
     repl::ReplicationCoordinator::set(service, std::move(replCoordPtr));
 
     auto storagePtr = stdx::make_unique<repl::StorageInterfaceMock>();
 
-    repl::ReplicationProcess::set(service,
-                                  stdx::make_unique<repl::ReplicationProcess>(storagePtr.get()));
-    repl::ReplicationProcess::get(_opCtx.get())->initializeRollbackID(_opCtx.get());
+    repl::DropPendingCollectionReaper::set(
+        service, stdx::make_unique<repl::DropPendingCollectionReaper>(storagePtr.get()));
+
+    repl::ReplicationProcess::set(
+        service,
+        stdx::make_unique<repl::ReplicationProcess>(
+            storagePtr.get(), stdx::make_unique<repl::ReplicationConsistencyMarkersMock>()));
+    repl::ReplicationProcess::get(_opCtx.get())
+        ->initializeRollbackID(_opCtx.get())
+        .transitional_ignore();
 
     repl::StorageInterface::set(service, std::move(storagePtr));
 

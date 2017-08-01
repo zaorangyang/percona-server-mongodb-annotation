@@ -47,9 +47,9 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_common.h"
-#include "mongo/s/commands/sharded_command_processing.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/move_primary_gen.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -105,6 +105,9 @@ public:
                      const BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
+
+        auto movePrimaryRequest = MovePrimary::parse(IDLParserErrorContext("MovePrimary"), cmdObj);
+
         const string dbname = parseNs("", cmdObj);
 
         uassert(
@@ -127,12 +130,9 @@ public:
 
         auto dbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, dbname));
 
-        const auto toElt = cmdObj["to"];
-        uassert(ErrorCodes::TypeMismatch,
-                "'to' must be of type String",
-                toElt.type() == BSONType::String);
-        const std::string to = toElt.str();
-        if (!to.size()) {
+        const std::string to = movePrimaryRequest.getTo().toString();
+
+        if (to.empty()) {
             errmsg = "you have to specify where you want to move it";
             return false;
         }
@@ -167,12 +167,14 @@ public:
         const auto shardedColls = getAllShardedCollectionsForDb(opCtx, dbname);
 
         // Record start in changelog
-        catalogClient->logChange(
-            opCtx,
-            "movePrimary.start",
-            dbname,
-            _buildMoveLogEntry(dbname, fromShard->toString(), toShard->toString(), shardedColls),
-            ShardingCatalogClient::kMajorityWriteConcern);
+        catalogClient
+            ->logChange(opCtx,
+                        "movePrimary.start",
+                        dbname,
+                        _buildMoveLogEntry(
+                            dbname, fromShard->toString(), toShard->toString(), shardedColls),
+                        ShardingCatalogClient::kMajorityWriteConcern)
+            .transitional_ignore();
 
         ScopedDbConnection toconn(toShard->getConnString());
 
@@ -292,12 +294,13 @@ public:
         result << "primary" << toShard->toString();
 
         // Record finish in changelog
-        catalogClient->logChange(
-            opCtx,
-            "movePrimary",
-            dbname,
-            _buildMoveLogEntry(dbname, oldPrimary, toShard->toString(), shardedColls),
-            ShardingCatalogClient::kMajorityWriteConcern);
+        catalogClient
+            ->logChange(opCtx,
+                        "movePrimary",
+                        dbname,
+                        _buildMoveLogEntry(dbname, oldPrimary, toShard->toString(), shardedColls),
+                        ShardingCatalogClient::kMajorityWriteConcern)
+            .transitional_ignore();
 
         return true;
     }

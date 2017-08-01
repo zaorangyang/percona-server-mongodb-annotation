@@ -54,13 +54,13 @@ StatusWith<UUID> UUID::parse(BSONElement from) {
     try {
         return UUID{from.uuid()};
     } catch (const UserException& e) {
-        return exceptionToStatus();
+        return e.toStatus();
     }
 }
 
 StatusWith<UUID> UUID::parse(const std::string& s) {
     if (!isUUIDString(s)) {
-        return {ErrorCodes::InvalidUUID, "Invalid uuid string"};
+        return {ErrorCodes::InvalidUUID, "Invalid UUID string: " + s};
     }
 
     UUIDStorage uuid;

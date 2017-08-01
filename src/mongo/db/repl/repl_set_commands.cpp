@@ -357,7 +357,8 @@ public:
             ReplicationCoordinatorExternalStateImpl externalState(
                 opCtx->getServiceContext(),
                 DropPendingCollectionReaper::get(opCtx),
-                StorageInterface::get(opCtx));
+                StorageInterface::get(opCtx),
+                ReplicationProcess::get(opCtx));
             std::string name;
             std::vector<HostAndPort> seeds;
             parseReplSetSeedList(&externalState, replSetString, &name, &seeds);  // may throw...
@@ -380,8 +381,7 @@ public:
 
         if (configObj.getField("version").eoo()) {
             // Missing version field defaults to version 1.
-            BSONObjBuilder builder;
-            builder.appendElements(configObj);
+            BSONObjBuilder builder(std::move(configObj));
             builder.append("version", 1);
             configObj = builder.obj();
         }

@@ -18,6 +18,7 @@ from ... import config
 from ... import core
 from ... import errors
 from ... import utils
+from ...utils import registry
 
 
 class ShardedClusterFixture(interface.Fixture):
@@ -292,6 +293,8 @@ class _MongoSFixture(interface.Fixture):
     Fixture which provides JSTests with a mongos to connect to.
     """
 
+    REGISTERED_NAME = registry.LEAVE_UNREGISTERED
+
     def __init__(self,
                  logger,
                  job_num,
@@ -359,10 +362,11 @@ class _MongoSFixture(interface.Fixture):
         running_at_start = self.is_running()
         success = True  # Still a success even if nothing is running.
 
-        if not running_at_start and self.port is not None:
+        if not running_at_start and self.mongos is not None:
             self.logger.info(
-                "mongos on port %d was expected to be running in _do_teardown(), but wasn't.",
-                self.port)
+                "mongos on port %d was expected to be running in _do_teardown(), but wasn't. "
+                "Exited with code %d.",
+                self.port, self.mongos.poll())
 
         if self.mongos is not None:
             if running_at_start:

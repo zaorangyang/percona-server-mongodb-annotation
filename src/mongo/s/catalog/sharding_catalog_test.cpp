@@ -78,7 +78,7 @@ const int kMaxCommandRetry = 3;
 
 const BSONObj kReplSecondaryOkMetadata{[] {
     BSONObjBuilder o;
-    o.appendElements(ReadPreferenceSetting::secondaryPreferredMetadata());
+    ReadPreferenceSetting(ReadPreference::Nearest).toContainingBSON(&o);
     o.append(rpc::kReplSetMetadataFieldName, 1);
     return o.obj();
 }()};
@@ -121,7 +121,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
 
             ReplSetMetadata metadata(10, newOpTime, newOpTime, 100, OID(), 30, -1);
             BSONObjBuilder builder;
-            metadata.writeToMetadata(&builder);
+            metadata.writeToMetadata(&builder).transitional_ignore();
 
             return std::make_tuple(vector<BSONObj>{expectedColl.toBSON()}, builder.obj());
         });
@@ -184,7 +184,7 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseExisting) {
 
         ReplSetMetadata metadata(10, newOpTime, newOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
-        metadata.writeToMetadata(&builder);
+        metadata.writeToMetadata(&builder).transitional_ignore();
 
         return std::make_tuple(vector<BSONObj>{expectedDb.toBSON()}, builder.obj());
     });
@@ -402,7 +402,7 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
 
             ReplSetMetadata metadata(10, newOpTime, newOpTime, 100, OID(), 30, -1);
             BSONObjBuilder builder;
-            metadata.writeToMetadata(&builder);
+            metadata.writeToMetadata(&builder).transitional_ignore();
 
             return std::make_tuple(vector<BSONObj>{chunkA.toConfigBSON(), chunkB.toConfigBSON()},
                                    builder.obj());
@@ -521,7 +521,14 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementReadCommand) {
     });
 
     onCommand([](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata,
+        const BSONObj kReplPrimaryPreferredMetadata = ([] {
+            BSONObjBuilder o;
+            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(&o);
+            o.append(rpc::kReplSetMetadataFieldName, 1);
+            return o.obj();
+        }());
+
+        ASSERT_BSONOBJ_EQ(kReplPrimaryPreferredMetadata,
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         ASSERT_EQUALS("test", request.dbname);
@@ -810,7 +817,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
 
             ReplSetMetadata metadata(10, newOpTime, newOpTime, 100, OID(), 30, -1);
             BSONObjBuilder builder;
-            metadata.writeToMetadata(&builder);
+            metadata.writeToMetadata(&builder).transitional_ignore();
 
             return std::make_tuple(vector<BSONObj>{coll1.toBSON(), coll2.toBSON(), coll3.toBSON()},
                                    builder.obj());
@@ -1115,8 +1122,8 @@ TEST_F(ShardingCatalogClientTest, UpdateDatabase) {
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         BatchedUpdateRequest actualBatchedUpdate;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        actualBatchedUpdate.parseRequest(
+            OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
         ASSERT_EQUALS(DatabaseType::ConfigNS, actualBatchedUpdate.getNS().ns());
         auto updates = actualBatchedUpdate.getUpdates();
         ASSERT_EQUALS(1U, updates.size());
@@ -1380,8 +1387,9 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(
+            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(),
+            rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 10);
     });
@@ -1394,8 +1402,9 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(
+            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(),
+            rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 1);
     });
@@ -1407,8 +1416,9 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
         string cmdName = request.cmdObj.firstElement().fieldName();
         ASSERT_EQUALS("listDatabases", cmdName);
 
-        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(
+            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(),
+            rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 100);
     });
@@ -1422,8 +1432,8 @@ TEST_F(ShardingCatalogClientTest, createDatabaseSuccess) {
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         BatchedInsertRequest actualBatchedInsert;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedInsert.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        actualBatchedInsert.parseRequest(
+            OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
         ASSERT_EQUALS(DatabaseType::ConfigNS, actualBatchedInsert.getNS().ns());
         auto inserts = actualBatchedInsert.getDocuments();
         ASSERT_EQUALS(1U, inserts.size());
@@ -1662,8 +1672,9 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(
+            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(),
+            rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 10);
     });
@@ -1676,8 +1687,9 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(
+            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(),
+            rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 1);
     });
@@ -1690,8 +1702,9 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
         ASSERT_EQUALS("listDatabases", cmdName);
         ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
 
-        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(
+            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(),
+            rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return BSON("ok" << 1 << "totalSize" << 100);
     });
@@ -1706,8 +1719,8 @@ TEST_F(ShardingCatalogClientTest, createDatabaseDuplicateKeyOnInsert) {
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         BatchedInsertRequest actualBatchedInsert;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedInsert.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        actualBatchedInsert.parseRequest(
+            OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
         ASSERT_EQUALS(DatabaseType::ConfigNS, actualBatchedInsert.getNS().ns());
         auto inserts = actualBatchedInsert.getDocuments();
         ASSERT_EQUALS(1U, inserts.size());
@@ -1786,10 +1799,11 @@ TEST_F(ShardingCatalogClientTest, EnableShardingNoDBExists) {
     onCommand([](const RemoteCommandRequest& request) {
         ASSERT_EQ(HostAndPort("shard0:12"), request.target);
         ASSERT_EQ("admin", request.dbname);
-        ASSERT_BSONOBJ_EQ(BSON("listDatabases" << 1), request.cmdObj);
+        ASSERT_BSONOBJ_EQ(BSON("listDatabases" << 1 << "maxTimeMS" << 600000), request.cmdObj);
 
-        ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(
+            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(),
+            rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
         return fromjson(R"({
                 databases: [],
@@ -2023,7 +2037,7 @@ TEST_F(ShardingCatalogClientTest, BasicReadAfterOpTime) {
 
             ReplSetMetadata metadata(10, newOpTime, newOpTime, 100, OID(), 30, -1);
             BSONObjBuilder builder;
-            metadata.writeToMetadata(&builder);
+            metadata.writeToMetadata(&builder).transitional_ignore();
 
             return RemoteCommandResponse(BSON("ok" << 1), builder.obj(), Milliseconds(1));
         });
@@ -2059,7 +2073,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeShouldNotGoBack) {
 
         ReplSetMetadata metadata(10, newOpTime, newOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
-        metadata.writeToMetadata(&builder);
+        metadata.writeToMetadata(&builder).transitional_ignore();
 
         return RemoteCommandResponse(BSON("ok" << 1), builder.obj(), Milliseconds(1));
     });
@@ -2088,7 +2102,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeShouldNotGoBack) {
 
         ReplSetMetadata metadata(10, oldOpTime, oldOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
-        metadata.writeToMetadata(&builder);
+        metadata.writeToMetadata(&builder).transitional_ignore();
 
         return RemoteCommandResponse(BSON("ok" << 1), builder.obj(), Milliseconds(1));
     });
@@ -2113,7 +2127,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeShouldNotGoBack) {
 
         ReplSetMetadata metadata(10, oldOpTime, oldOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
-        metadata.writeToMetadata(&builder);
+        metadata.writeToMetadata(&builder).transitional_ignore();
 
         return RemoteCommandResponse(BSON("ok" << 1), builder.obj(), Milliseconds(1));
     });
@@ -2139,7 +2153,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeFindThenCmd) {
 
             ReplSetMetadata metadata(10, newOpTime, newOpTime, 100, OID(), 30, -1);
             BSONObjBuilder builder;
-            metadata.writeToMetadata(&builder);
+            metadata.writeToMetadata(&builder).transitional_ignore();
 
             DatabaseType dbType;
             dbType.setName("TestDB");
@@ -2201,7 +2215,7 @@ TEST_F(ShardingCatalogClientTest, ReadAfterOpTimeCmdThenFind) {
 
         ReplSetMetadata metadata(10, newOpTime, newOpTime, 100, OID(), 30, -1);
         BSONObjBuilder builder;
-        metadata.writeToMetadata(&builder);
+        metadata.writeToMetadata(&builder).transitional_ignore();
 
         return RemoteCommandResponse(BSON("ok" << 1), builder.obj(), Milliseconds(1));
     });

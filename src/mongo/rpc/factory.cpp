@@ -48,19 +48,14 @@
 namespace mongo {
 namespace rpc {
 
-std::unique_ptr<RequestBuilderInterface> makeRequestBuilder(ProtocolSet clientProtos,
-                                                            ProtocolSet serverProtos) {
-    return makeRequestBuilder(uassertStatusOK(negotiate(clientProtos, serverProtos)));
-}
-
-std::unique_ptr<RequestBuilderInterface> makeRequestBuilder(Protocol proto) {
+Message messageFromOpMsgRequest(Protocol proto, const OpMsgRequest& request) {
     switch (proto) {
         case Protocol::kOpMsg:
-            return stdx::make_unique<OpMsgRequestBuilder>();
+            return request.serialize();
         case Protocol::kOpQuery:
-            return stdx::make_unique<LegacyRequestBuilder>();
+            return legacyRequestFromOpMsgRequest(request);
         case Protocol::kOpCommandV1:
-            return stdx::make_unique<CommandRequestBuilder>();
+            return opCommandRequestFromOpMsgRequest(request);
         default:
             MONGO_UNREACHABLE;
     }
@@ -69,7 +64,7 @@ std::unique_ptr<RequestBuilderInterface> makeRequestBuilder(Protocol proto) {
 std::unique_ptr<ReplyInterface> makeReply(const Message* unownedMessage) {
     switch (unownedMessage->operation()) {
         case mongo::dbMsg:
-            return stdx::make_unique<OpMsgReply>(OpMsg::parse(*unownedMessage));
+            return stdx::make_unique<OpMsgReply>(OpMsg::parseOwned(*unownedMessage));
         case mongo::opReply:
             return stdx::make_unique<LegacyReply>(unownedMessage);
         case mongo::dbCommandReply:
@@ -81,18 +76,18 @@ std::unique_ptr<ReplyInterface> makeReply(const Message* unownedMessage) {
     }
 }
 
-std::unique_ptr<RequestInterface> makeRequest(const Message* unownedMessage) {
-    switch (unownedMessage->operation()) {
+OpMsgRequest opMsgRequestFromAnyProtocol(const Message& unownedMessage) {
+    switch (unownedMessage.operation()) {
         case mongo::dbMsg:
-            return stdx::make_unique<OpMsgRequest>(OpMsg::parse(*unownedMessage));
+            return OpMsgRequest::parse(unownedMessage);
         case mongo::dbQuery:
-            return stdx::make_unique<LegacyRequest>(unownedMessage);
+            return opMsgRequestFromLegacyRequest(unownedMessage);
         case mongo::dbCommand:
-            return stdx::make_unique<CommandRequest>(unownedMessage);
+            return opMsgRequestFromCommandRequest(unownedMessage);
         default:
             uasserted(ErrorCodes::UnsupportedFormat,
                       str::stream() << "Received a reply message with unexpected opcode: "
-                                    << unownedMessage->operation());
+                                    << unownedMessage.operation());
     }
 }
 

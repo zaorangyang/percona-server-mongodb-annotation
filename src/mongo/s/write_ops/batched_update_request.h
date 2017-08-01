@@ -35,6 +35,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/write_ops/batched_update_document.h"
+#include "mongo/util/net/op_msg.h"
 
 namespace mongo {
 
@@ -66,12 +67,9 @@ public:
     BatchedUpdateRequest();
     ~BatchedUpdateRequest();
 
-    /** Copies all the fields present in 'this' to 'other'. */
-    void cloneTo(BatchedUpdateRequest* other) const;
-
     bool isValid(std::string* errMsg) const;
     BSONObj toBSON() const;
-    bool parseBSON(StringData dbName, const BSONObj& source, std::string* errMsg);
+    void parseRequest(const OpMsgRequest& request);
     void clear();
     std::string toString() const;
 

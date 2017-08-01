@@ -32,12 +32,13 @@
 
 #include "mongo/util/net/op_msg.h"
 
+#include <set>
+
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/rpc/object_check.h"
 #include "mongo/util/bufreader.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace {
@@ -150,6 +151,7 @@ void OpMsg::shareOwnershipWith(const ConstSharedBuffer& buffer) {
 auto OpMsgBuilder::beginDocSequence(StringData name) -> DocSequenceBuilder {
     invariant(_state == kEmpty || _state == kDocSequence);
     invariant(!_openBuilder);
+    _openBuilder = true;
     _state = kDocSequence;
     _buf.appendStruct(Section::kDocSequence);
     int sizeOffset = _buf.len();
@@ -182,7 +184,20 @@ BSONObjBuilder OpMsgBuilder::resumeBody() {
     return BSONObjBuilder(BSONObjBuilder::ResumeBuildingTag(), _buf, _bodyStart);
 }
 
+AtomicBool OpMsgBuilder::disableDupeFieldCheck_forTest{false};
+
 Message OpMsgBuilder::finish() {
+    if (kDebugBuild && !disableDupeFieldCheck_forTest.load()) {
+        std::set<StringData> seenFields;
+        for (auto elem : resumeBody().asTempObj()) {
+            if (!(seenFields.insert(elem.fieldNameStringData()).second)) {
+                severe() << "OP_MSG with duplicate field '" << elem.fieldNameStringData()
+                         << "' : " << redact(resumeBody().asTempObj());
+                fassert(40474, false);
+            }
+        }
+    }
+
     invariant(_state == kBody);
     invariant(_bodyStart);
     invariant(!_openBuilder);

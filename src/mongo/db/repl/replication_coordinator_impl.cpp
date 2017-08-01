@@ -77,7 +77,6 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/request_interface.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
@@ -266,6 +265,7 @@ InitialSyncerOptions createInitialSyncerOptions(
         replCoord->setMyLastAppliedOpTime(opTime);
         externalState->setGlobalTimestamp(replCoord->getServiceContext(), opTime.getTimestamp());
     };
+    options.resetOptimes = [replCoord]() { replCoord->resetMyLastOpTimes(); };
     options.getSlaveDelay = [replCoord]() { return replCoord->getSlaveDelaySecs(); };
     options.syncSourceSelector = replCoord;
     options.replBatchLimitBytes = dur::UncommittedBytesLimit;
@@ -388,6 +388,8 @@ void ReplicationCoordinatorImpl::appendConnectionStats(executor::ConnectionPoolS
 }
 
 bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) {
+    _replicationProcess->getConsistencyMarkers()->initializeMinValidDocument(opCtx);
+
     StatusWith<LastVote> lastVote = _externalState->loadLocalLastVoteDocument(opCtx);
     if (!lastVote.isOK()) {
         if (lastVote.getStatus() == ErrorCodes::NoMatchingDocument) {
@@ -609,7 +611,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
 
         // Clear maint. mode.
         while (getMaintenanceMode()) {
-            setMaintenanceMode(false);
+            setMaintenanceMode(false).transitional_ignore();
         }
 
         if (startCompleted) {
@@ -631,6 +633,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
                 stdx::make_unique<DataReplicatorExternalStateInitialSync>(this,
                                                                           _externalState.get()),
                 _storage,
+                _replicationProcess,
                 onCompletion);
             _initialSyncer = initialSyncerCopy;
         }
@@ -1653,7 +1656,8 @@ bool ReplicationCoordinatorImpl::_tryToStepDown_inlock(const Date_t waitUntil,
         uasserted(ErrorCodes::ExceededTimeLimit,
                   str::stream() << "No electable secondaries caught up as of "
                                 << dateToISOStringLocal(now)
-                                << ". Please use {force: true} to force node to step down.");
+                                << "Please use the replSetStepDown command with the argument "
+                                << "{force: true} to force node to step down.");
     }
     return false;
 }
@@ -2069,7 +2073,8 @@ Status ReplicationCoordinatorImpl::processHeartbeat(const ReplSetHeartbeatArgs& 
 Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCtx,
                                                           const ReplSetReconfigArgs& args,
                                                           BSONObjBuilder* resultObj) {
-    log() << "replSetReconfig admin command received from client";
+    log() << "replSetReconfig admin command received from client; new config: "
+          << args.newConfigObj;
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
@@ -2121,6 +2126,7 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
     if (args.force) {
         newConfigObj = incrementConfigVersionByRandom(newConfigObj);
     }
+
     Status status = newConfig.initialize(
         newConfigObj, oldConfig.getProtocolVersion() == 1, oldConfig.getReplicaSetId());
     if (!status.isOK()) {
@@ -2202,14 +2208,16 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(
     // Do not conduct an election during a reconfig, as the node may not be electable post-reconfig.
     if (auto electionFinishedEvent = _cancelElectionIfNeeded_inlock()) {
         // Wait for the election to complete and the node's Role to be set to follower.
-        _replExecutor->onEvent(electionFinishedEvent,
-                               stdx::bind(&ReplicationCoordinatorImpl::_finishReplSetReconfig,
-                                          this,
-                                          stdx::placeholders::_1,
-                                          newConfig,
-                                          isForceReconfig,
-                                          myIndex,
-                                          finishedEvent));
+        _replExecutor
+            ->onEvent(electionFinishedEvent,
+                      stdx::bind(&ReplicationCoordinatorImpl::_finishReplSetReconfig,
+                                 this,
+                                 stdx::placeholders::_1,
+                                 newConfig,
+                                 isForceReconfig,
+                                 myIndex,
+                                 finishedEvent))
+            .status_with_transitional_ignore();
         return;
     }
 
@@ -2498,12 +2506,17 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
         return;
     }
 
-    auto timeoutCB = [this](const CallbackArgs& cbData) {
+    auto mutex = &_repl->_mutex;
+    auto timeoutCB = [this, mutex](const CallbackArgs& cbData) {
         if (!cbData.status.isOK()) {
             return;
         }
+        stdx::lock_guard<stdx::mutex> lk(*mutex);
+        // Check whether the callback has been cancelled while holding mutex.
+        if (cbData.myHandle.isCanceled()) {
+            return;
+        }
         log() << "Catchup timed out after becoming primary.";
-        stdx::lock_guard<stdx::mutex> lk(_repl->_mutex);
         abort_inlock();
     };
 
@@ -2538,8 +2551,8 @@ void ReplicationCoordinatorImpl::CatchupState::abort_inlock() {
 
     // Enter primary drain mode.
     _repl->_enterDrainMode_inlock();
-    // Destruct the state itself.
-    _repl->_catchupState.reset(nullptr);
+    // Destroy the state itself.
+    _repl->_catchupState.reset();
 }
 
 void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
@@ -2551,7 +2564,7 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
 
     // We've caught up.
     if (*targetOpTime <= _repl->_getMyLastAppliedOpTime_inlock()) {
-        log() << "Caught up to the latest known optime via heartbeats after becoming primary.";
+        log() << "Caught up to the latest optime known via heartbeats after becoming primary.";
         abort_inlock();
         return;
     }
@@ -3017,12 +3030,12 @@ void ReplicationCoordinatorImpl::_prepareReplSetMetadata_inlock(const OpTime& la
     OpTime lastVisibleOpTime =
         std::max(lastOpTimeFromClient, _getCurrentCommittedSnapshotOpTime_inlock());
     auto metadata = _topCoord->prepareReplSetMetadata(lastVisibleOpTime);
-    metadata.writeToMetadata(builder);
+    metadata.writeToMetadata(builder).transitional_ignore();
 }
 
 void ReplicationCoordinatorImpl::_prepareOplogQueryMetadata_inlock(int rbid,
                                                                    BSONObjBuilder* builder) const {
-    _topCoord->prepareOplogQueryMetadata(rbid).writeToMetadata(builder);
+    _topCoord->prepareOplogQueryMetadata(rbid).writeToMetadata(builder).transitional_ignore();
 }
 
 bool ReplicationCoordinatorImpl::isV1ElectionProtocol() const {

@@ -189,6 +189,10 @@ void fillOutPlannerParams(OperationContext* opCtx,
         plannerParams->options |= QueryPlannerParams::INDEX_INTERSECTION;
     }
 
+    if (internalQueryPlannerGenerateCoveredWholeIndexScans.load()) {
+        plannerParams->options |= QueryPlannerParams::GENERATE_COVERED_IXSCANS;
+    }
+
     plannerParams->options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
 
     // Doc-level locking storage engines cannot answer predicates implicitly via exact index
@@ -296,13 +300,12 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
 
             // Add a SortKeyGeneratorStage if there is a $meta sortKey projection.
             if (canonicalQuery->getProj()->wantSortKey()) {
-                root = make_unique<SortKeyGeneratorStage>(
-                    opCtx,
-                    root.release(),
-                    ws,
-                    canonicalQuery->getQueryRequest().getSort(),
-                    canonicalQuery->getQueryRequest().getFilter(),
-                    canonicalQuery->getCollator());
+                root =
+                    make_unique<SortKeyGeneratorStage>(opCtx,
+                                                       root.release(),
+                                                       ws,
+                                                       canonicalQuery->getQueryRequest().getSort(),
+                                                       canonicalQuery->getCollator());
             }
 
             // Stuff the right data into the params depending on what proj impl we use.
@@ -1056,21 +1059,23 @@ namespace {
 bool turnIxscanIntoCount(QuerySolution* soln) {
     QuerySolutionNode* root = soln->root.get();
 
-    // Root should be a fetch w/o any filters.
-    if (STAGE_FETCH != root->getType()) {
+    // Root should be an ixscan or fetch w/o any filters.
+    if (!(STAGE_FETCH == root->getType() || STAGE_IXSCAN == root->getType())) {
         return false;
     }
 
-    if (NULL != root->filter.get()) {
+    if (STAGE_FETCH == root->getType() && NULL != root->filter.get()) {
         return false;
     }
 
-    // Child should be an ixscan.
-    if (STAGE_IXSCAN != root->children[0]->getType()) {
+    // If the root is a fetch, its child should be an ixscan
+    if (STAGE_FETCH == root->getType() && STAGE_IXSCAN != root->children[0]->getType()) {
         return false;
     }
 
-    IndexScanNode* isn = static_cast<IndexScanNode*>(root->children[0]);
+    IndexScanNode* isn = (STAGE_FETCH == root->getType())
+        ? static_cast<IndexScanNode*>(root->children[0])
+        : static_cast<IndexScanNode*>(root);
 
     // No filters allowed and side-stepping isSimpleRange for now.  TODO: do we ever see
     // isSimpleRange here?  because we could well use it.  I just don't think we ever do see
@@ -1310,6 +1315,11 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
 
 bool turnIxscanIntoDistinctIxscan(QuerySolution* soln, const string& field) {
     QuerySolutionNode* root = soln->root.get();
+
+    // Solution must have a filter.
+    if (soln->filterData.isEmpty()) {
+        return false;
+    }
 
     // Root stage must be a project.
     if (STAGE_PROJECTION != root->getType()) {

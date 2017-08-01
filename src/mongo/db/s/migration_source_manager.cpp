@@ -164,15 +164,16 @@ Status MigrationSourceManager::startClone(OperationContext* opCtx) {
     invariant(_state == kCreated);
     auto scopedGuard = MakeGuard([&] { cleanupOnError(opCtx); });
 
-    grid.catalogClient(opCtx)->logChange(
-        opCtx,
-        "moveChunk.start",
-        getNss().ns(),
-        BSON("min" << _args.getMinKey() << "max" << _args.getMaxKey() << "from"
-                   << _args.getFromShardId()
-                   << "to"
-                   << _args.getToShardId()),
-        ShardingCatalogClient::kMajorityWriteConcern);
+    grid.catalogClient(opCtx)
+        ->logChange(opCtx,
+                    "moveChunk.start",
+                    getNss().ns(),
+                    BSON("min" << _args.getMinKey() << "max" << _args.getMaxKey() << "from"
+                               << _args.getFromShardId()
+                               << "to"
+                               << _args.getToShardId()),
+                    ShardingCatalogClient::kMajorityWriteConcern)
+        .transitional_ignore();
 
     _cloneDriver = stdx::make_unique<MigrationChunkClonerSourceLegacy>(
         _args, _collectionMetadata->getKeyPattern(), _donorConnStr, _recipientHost);
@@ -311,6 +312,13 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
 
     builder.append(kWriteConcernField, kMajorityWriteConcern.toBSON());
 
+    // Read operations must begin to wait on the critical section just before we send the commit
+    // operation to the config server
+    {
+        AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_X);
+        _readsShouldWaitOnCritSec = true;
+    }
+
     auto commitChunkMigrationResponse =
         grid.shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
             opCtx,
@@ -427,15 +435,16 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
     scopedGuard.Dismiss();
     _cleanup(opCtx);
 
-    grid.catalogClient(opCtx)->logChange(
-        opCtx,
-        "moveChunk.commit",
-        getNss().ns(),
-        BSON("min" << _args.getMinKey() << "max" << _args.getMaxKey() << "from"
-                   << _args.getFromShardId()
-                   << "to"
-                   << _args.getToShardId()),
-        ShardingCatalogClient::kMajorityWriteConcern);
+    grid.catalogClient(opCtx)
+        ->logChange(opCtx,
+                    "moveChunk.commit",
+                    getNss().ns(),
+                    BSON("min" << _args.getMinKey() << "max" << _args.getMaxKey() << "from"
+                               << _args.getFromShardId()
+                               << "to"
+                               << _args.getToShardId()),
+                    ShardingCatalogClient::kMajorityWriteConcern)
+        .transitional_ignore();
 
     return Status::OK();
 }
@@ -445,15 +454,16 @@ void MigrationSourceManager::cleanupOnError(OperationContext* opCtx) {
         return;
     }
 
-    grid.catalogClient(opCtx)->logChange(
-        opCtx,
-        "moveChunk.error",
-        getNss().ns(),
-        BSON("min" << _args.getMinKey() << "max" << _args.getMaxKey() << "from"
-                   << _args.getFromShardId()
-                   << "to"
-                   << _args.getToShardId()),
-        ShardingCatalogClient::kMajorityWriteConcern);
+    grid.catalogClient(opCtx)
+        ->logChange(opCtx,
+                    "moveChunk.error",
+                    getNss().ns(),
+                    BSON("min" << _args.getMinKey() << "max" << _args.getMaxKey() << "from"
+                               << _args.getFromShardId()
+                               << "to"
+                               << _args.getToShardId()),
+                    ShardingCatalogClient::kMajorityWriteConcern)
+        .transitional_ignore();
 
     _cleanup(opCtx);
 }
@@ -490,6 +500,19 @@ void MigrationSourceManager::_cleanup(OperationContext* opCtx) {
     }
 
     _state = kDone;
+}
+
+std::shared_ptr<Notification<void>> MigrationSourceManager::getMigrationCriticalSectionSignal(
+    bool isForReadOnlyOperation) const {
+    if (!isForReadOnlyOperation) {
+        return _critSecSignal;
+    }
+
+    if (_readsShouldWaitOnCritSec) {
+        return _critSecSignal;
+    }
+
+    return nullptr;
 }
 
 BSONObj MigrationSourceManager::getMigrationStatusReport() const {

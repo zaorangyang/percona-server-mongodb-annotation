@@ -51,6 +51,7 @@
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/db/server_parameters.h"
@@ -97,11 +98,17 @@ using QueryResponseStatus = StatusWith<Fetcher::QueryResponse>;
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
 using LockGuard = stdx::lock_guard<stdx::mutex>;
 
+// 16MB max batch size / 12 byte min doc size * 10 (for good measure) = defaultBatchSize to use.
+const auto defaultBatchSize = (16 * 1024 * 1024) / 12 * 10;
+
 // The number of attempts to connect to a sync source.
 MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncConnectAttempts, int, 10);
 
 // The number of attempts to call find on the remote oplog.
 MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncOplogFindAttempts, int, 3);
+
+// The batchSize to use for the find/getMore queries called by the OplogFetcher
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(initialSyncOplogFetcherBatchSize, int, defaultBatchSize);
 
 // The number of initial sync attempts that have failed since server startup. Each instance of
 // InitialSyncer may run multiple attempts to fulfill an initial sync request that is triggered
@@ -203,17 +210,21 @@ InitialSyncer::InitialSyncer(
     InitialSyncerOptions opts,
     std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
     StorageInterface* storage,
+    ReplicationProcess* replicationProcess,
     const OnCompletionFn& onCompletion)
     : _fetchCount(0),
       _opts(opts),
       _dataReplicatorExternalState(std::move(dataReplicatorExternalState)),
       _exec(_dataReplicatorExternalState->getTaskExecutor()),
       _storage(storage),
+      _replicationProcess(replicationProcess),
       _onCompletion(onCompletion) {
     uassert(ErrorCodes::BadValue, "task executor cannot be null", _exec);
     uassert(ErrorCodes::BadValue, "invalid storage interface", _storage);
+    uassert(ErrorCodes::BadValue, "invalid replication process", _replicationProcess);
     uassert(ErrorCodes::BadValue, "invalid getMyLastOptime function", _opts.getMyLastOptime);
     uassert(ErrorCodes::BadValue, "invalid setMyLastOptime function", _opts.setMyLastOptime);
+    uassert(ErrorCodes::BadValue, "invalid resetOptimes function", _opts.resetOptimes);
     uassert(ErrorCodes::BadValue, "invalid getSlaveDelay function", _opts.getSlaveDelay);
     uassert(ErrorCodes::BadValue, "invalid sync source selector", _opts.syncSourceSelector);
     uassert(ErrorCodes::BadValue, "callback function cannot be null", _onCompletion);
@@ -221,7 +232,7 @@ InitialSyncer::InitialSyncer(
 
 InitialSyncer::~InitialSyncer() {
     DESTRUCTOR_GUARD({
-        shutdown();
+        shutdown().transitional_ignore();
         join();
     });
 }
@@ -381,9 +392,8 @@ void InitialSyncer::setScheduleDbWorkFn_forTest(const CollectionCloner::Schedule
 }
 
 void InitialSyncer::_setUp_inlock(OperationContext* opCtx, std::uint32_t initialSyncMaxAttempts) {
-    // This will call through to the storageInterfaceImpl to ReplicationCoordinatorImpl.
     // 'opCtx' is passed through from startup().
-    _storage->setInitialSyncFlag(opCtx);
+    _replicationProcess->getConsistencyMarkers()->setInitialSyncFlag(opCtx);
 
     LOG(1) << "Creating oplogBuffer.";
     _oplogBuffer = _dataReplicatorExternalState->makeInitialSyncOplogBuffer(opCtx);
@@ -405,7 +415,7 @@ void InitialSyncer::_tearDown_inlock(OperationContext* opCtx,
     if (!lastApplied.isOK()) {
         return;
     }
-    _storage->clearInitialSyncFlag(opCtx);
+    _replicationProcess->getConsistencyMarkers()->clearInitialSyncFlag(opCtx);
     _opts.setMyLastOptime(lastApplied.getValue().opTime);
     log() << "initial sync done; took "
           << duration_cast<Seconds>(_stats.initialSyncEnd - _stats.initialSyncStart) << ".";
@@ -444,8 +454,12 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
     LOG(2) << "Resetting sync source so a new one can be chosen for this initial sync attempt.";
     _syncSource = HostAndPort();
 
+    // Reset all optimes before a new initial sync attempt.
+    _opts.resetOptimes();
     _lastApplied = {};
     _lastFetched = {};
+
+    // Clear the oplog buffer.
     _oplogBuffer->clear(makeOpCtx().get());
 
     // Get sync source.
@@ -658,25 +672,24 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForBeginTimestamp(
     }
 
     const auto& config = configResult.getValue();
-    _oplogFetcher =
-        stdx::make_unique<OplogFetcher>(_exec,
-                                        lastOpTimeWithHash,
-                                        _syncSource,
-                                        _opts.remoteOplogNS,
-                                        config,
-                                        _opts.oplogFetcherMaxFetcherRestarts,
-                                        _rollbackChecker->getBaseRBID(),
-                                        false /* requireFresherSyncSource */,
-                                        _dataReplicatorExternalState.get(),
-                                        stdx::bind(&InitialSyncer::_enqueueDocuments,
-                                                   this,
-                                                   stdx::placeholders::_1,
-                                                   stdx::placeholders::_2,
-                                                   stdx::placeholders::_3),
-                                        stdx::bind(&InitialSyncer::_oplogFetcherCallback,
-                                                   this,
-                                                   stdx::placeholders::_1,
-                                                   onCompletionGuard));
+    _oplogFetcher = stdx::make_unique<OplogFetcher>(
+        _exec,
+        lastOpTimeWithHash,
+        _syncSource,
+        _opts.remoteOplogNS,
+        config,
+        _opts.oplogFetcherMaxFetcherRestarts,
+        _rollbackChecker->getBaseRBID(),
+        false /* requireFresherSyncSource */,
+        _dataReplicatorExternalState.get(),
+        stdx::bind(&InitialSyncer::_enqueueDocuments,
+                   this,
+                   stdx::placeholders::_1,
+                   stdx::placeholders::_2,
+                   stdx::placeholders::_3),
+        stdx::bind(
+            &InitialSyncer::_oplogFetcherCallback, this, stdx::placeholders::_1, onCompletionGuard),
+        initialSyncOplogFetcherBatchSize);
 
     LOG(2) << "Starting OplogFetcher: " << _oplogFetcher->toString();
 

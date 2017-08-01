@@ -52,9 +52,9 @@ struct CompressionHeader {
     uint8_t compressorId;
 
     void serialize(DataRangeCursor* cursor) {
-        cursor->writeAndAdvance<LittleEndian<int32_t>>(originalOpCode);
-        cursor->writeAndAdvance<LittleEndian<int32_t>>(uncompressedSize);
-        cursor->writeAndAdvance<LittleEndian<uint8_t>>(compressorId);
+        cursor->writeAndAdvance<LittleEndian<int32_t>>(originalOpCode).transitional_ignore();
+        cursor->writeAndAdvance<LittleEndian<int32_t>>(uncompressedSize).transitional_ignore();
+        cursor->writeAndAdvance<LittleEndian<uint8_t>>(compressorId).transitional_ignore();
     }
 
     CompressionHeader(int32_t _opcode, int32_t _size, uint8_t _id)
@@ -221,6 +221,8 @@ void MessageCompressorManager::serverNegotiate(const BSONObj& input, BSONObjBuil
                 sub.append(algo->getName());
             }
             sub.doneFast();
+        } else {
+            LOG(3) << "Compression negotiation not requested by client";
         }
         return;
     }
@@ -231,6 +233,12 @@ void MessageCompressorManager::serverNegotiate(const BSONObj& input, BSONObjBuil
 
     // First we go through all the compressor names that the client has requested support for
     BSONObj theirObj = elem.Obj();
+
+    if (!theirObj.nFields()) {
+        LOG(3) << "No compressors provided";
+        return;
+    }
+
     for (const auto& elem : theirObj) {
         MessageCompressorBase* cur;
         auto curName = elem.checkAndGetStringData();
@@ -252,6 +260,8 @@ void MessageCompressorManager::serverNegotiate(const BSONObj& input, BSONObjBuil
             sub.append(algo->getName());
         }
         sub.doneFast();
+    } else {
+        LOG(3) << "Could not agree on compressor to use";
     }
 }
 

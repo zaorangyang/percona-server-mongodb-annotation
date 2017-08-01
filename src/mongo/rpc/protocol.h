@@ -34,6 +34,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/wire_version.h"
+#include "mongo/util/net/message.h"
 
 namespace mongo {
 class BSONObj;
@@ -84,6 +85,8 @@ const ProtocolSet kAll = kOpQueryOnly | kOpCommandOnly | kOpMsgOnly;
 
 }  // namespace supports
 
+Protocol protocolForMessage(const Message& message);
+
 /**
  * Returns the protocol used to initiate the current operation.
  */
@@ -133,11 +136,6 @@ struct ProtocolSetAndWireVersionInfo {
  */
 StatusWith<ProtocolSetAndWireVersionInfo> parseProtocolSetFromIsMasterReply(
     const BSONObj& isMasterReply);
-
-/**
- * Returns true if wire version supports OP_COMMAND in mongod (not mongos).
- */
-bool supportsWireVersionForOpCommandInMongod(const WireVersionInfo version);
 
 /**
   * Computes supported protocols from wire versions.

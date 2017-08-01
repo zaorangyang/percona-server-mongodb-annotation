@@ -49,6 +49,7 @@ env.Library(
     LIBDEPS=[
         'field_path',
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
         '$BUILD_DIR/mongo/util/intrusive_counter',
         ]
     )
@@ -75,6 +76,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
         'document_value',
         'document_value_test_util',
         ],
@@ -127,6 +129,7 @@ env.CppUnitTest(
         'document_source_add_fields_test.cpp',
         'document_source_bucket_auto_test.cpp',
         'document_source_bucket_test.cpp',
+        'document_source_change_notification_test.cpp',
         'document_source_count_test.cpp',
         'document_source_current_op_test.cpp',
         'document_source_geo_near_test.cpp',
@@ -177,6 +180,7 @@ env.Library(
         'dependencies',
         'document_value',
         'expression_context',
+        '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
         '$BUILD_DIR/mongo/util/summation',
     ]
 )
@@ -226,6 +230,7 @@ docSourceEnv.Library(
         'document_source_add_fields.cpp',
         'document_source_bucket.cpp',
         'document_source_bucket_auto.cpp',
+        'document_source_change_notification.cpp',
         'document_source_coll_stats.cpp',
         'document_source_count.cpp',
         'document_source_current_op.cpp',
@@ -399,6 +404,7 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
         'document_value',
     ]
 )

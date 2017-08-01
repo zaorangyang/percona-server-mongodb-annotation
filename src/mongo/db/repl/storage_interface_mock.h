@@ -53,7 +53,7 @@ class CollectionBulkLoaderMock : public CollectionBulkLoader {
 public:
     CollectionBulkLoaderMock(CollectionMockStats* collStats) : stats(collStats){};
     virtual ~CollectionBulkLoaderMock() = default;
-    virtual Status init(Collection* coll, const std::vector<BSONObj>& secondaryIndexSpecs) override;
+    virtual Status init(const std::vector<BSONObj>& secondaryIndexSpecs) override;
 
     virtual Status insertDocuments(const std::vector<BSONObj>::const_iterator begin,
                                    const std::vector<BSONObj>::const_iterator end) override;
@@ -75,8 +75,6 @@ public:
                           const std::vector<BSONObj>::const_iterator) { return Status::OK(); };
     stdx::function<Status()> abortFn = []() { return Status::OK(); };
     stdx::function<Status()> commitFn = []() { return Status::OK(); };
-    stdx::function<Status(Collection* coll, const std::vector<BSONObj>& secondaryIndexSpecs)>
-        initFn = [](Collection*, const std::vector<BSONObj>&) { return Status::OK(); };
 };
 
 class StorageInterfaceMock : public StorageInterface {
@@ -122,20 +120,9 @@ public:
 
     StorageInterfaceMock() = default;
 
-    bool getInitialSyncFlag(OperationContext* opCtx) const override;
-    void setInitialSyncFlag(OperationContext* opCtx) override;
-    void clearInitialSyncFlag(OperationContext* opCtx) override;
-
-    OpTime getMinValid(OperationContext* opCtx) const override;
-    void setMinValid(OperationContext* opCtx, const OpTime& minValid) override;
-    void setMinValidToAtLeast(OperationContext* opCtx, const OpTime& minValid) override;
     StatusWith<int> getRollbackID(OperationContext* opCtx) override;
     Status initializeRollbackID(OperationContext* opCtx) override;
     Status incrementRollbackID(OperationContext* opCtx) override;
-    void setOplogDeleteFromPoint(OperationContext* opCtx, const Timestamp& timestamp) override;
-    Timestamp getOplogDeleteFromPoint(OperationContext* opCtx) override;
-    void setAppliedThrough(OperationContext* opCtx, const OpTime& optime) override;
-    OpTime getAppliedThrough(OperationContext* opCtx) override;
 
     StatusWith<std::unique_ptr<CollectionBulkLoader>> createCollectionForBulkLoading(
         const NamespaceString& nss,
@@ -179,6 +166,14 @@ public:
     Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) override {
         return dropCollFn(opCtx, nss);
     };
+
+    Status renameCollection(OperationContext* opCtx,
+                            const NamespaceString& fromNS,
+                            const NamespaceString& toNS,
+                            bool stayTemp) override {
+
+        return Status{ErrorCodes::IllegalOperation, "renameCollection not implemented."};
+    }
 
     StatusWith<std::vector<BSONObj>> findDocuments(OperationContext* opCtx,
                                                    const NamespaceString& nss,
@@ -306,15 +301,9 @@ public:
     };
 
 private:
-    mutable stdx::mutex _initialSyncFlagMutex;
-    bool _initialSyncFlag = false;
-
-    mutable stdx::mutex _minValidBoundariesMutex;
-    OpTime _appliedThrough;
-    OpTime _minValid;
+    mutable stdx::mutex _rbidMutex;
     int _rbid;
     bool _rbidInitialized = false;
-    Timestamp _oplogDeleteFromPoint;
 };
 
 }  // namespace repl

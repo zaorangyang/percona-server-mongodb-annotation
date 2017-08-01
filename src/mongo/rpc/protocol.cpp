@@ -69,6 +69,21 @@ constexpr ProtocolSetAndName protocolSetNames[] = {
 
 }  // namespace
 
+Protocol protocolForMessage(const Message& message) {
+    switch (message.operation()) {
+        case mongo::dbMsg:
+            return Protocol::kOpMsg;
+        case mongo::dbQuery:
+            return Protocol::kOpQuery;
+        case mongo::dbCommand:
+            return Protocol::kOpCommandV1;
+        default:
+            uasserted(ErrorCodes::UnsupportedFormat,
+                      str::stream() << "Received a reply message with unexpected opcode: "
+                                    << message.operation());
+    }
+}
+
 StatusWith<Protocol> negotiate(ProtocolSet fst, ProtocolSet snd) {
     using std::begin;
     using std::end;
@@ -157,12 +172,6 @@ StatusWith<ProtocolSetAndWireVersionInfo> parseProtocolSetFromIsMasterReply(
     }
 
     return {{protos, version}};
-}
-
-bool supportsWireVersionForOpCommandInMongod(const WireVersionInfo version) {
-    // FIND_COMMAND versions support OP_COMMAND (in mongod but not mongos).
-    return (version.minWireVersion <= WireVersion::FIND_COMMAND) &&
-        (version.maxWireVersion >= WireVersion::FIND_COMMAND);
 }
 
 ProtocolSet computeProtocolSet(const WireVersionInfo version) {

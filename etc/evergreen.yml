@@ -511,56 +511,106 @@ functions:
         # The "resmoke_wrapper" expansion is used by the 'burn_in_tests' task to wrap the resmoke.py
         # invocation. It must be placed between $preamble and $resmoke.
         wrapper="${resmoke_wrapper}"
-        resmoke_report_file="--reportFile=report.json"
         resmoke="${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/resmoke.py \
                  ${resmoke_args}                   \
                  $extra_args                       \
                  ${test_flags}                     \
                  --log=buildlogger                 \
                  --staggerJobs=on                  \
-                 --tagFile=etc/test_lifecycle.yml  \
                  --taskId=${task_id}"
+
+        # Set variables for mainline builds. Patch builds will override these values below.
+        tag_file=etc/test_retrial.yml
+        retry_on_failure_options="--continueOnFailure --repeat=2"
+        resmoke_tags="retry_on_failure,                                \
+                      retry_on_failure|${task_name},                   \
+                      retry_on_failure|${task_name}|${build_variant},  \
+                      retry_on_failure|${task_name}|${build_variant}|${distro_id}"
+
+        # promote_silent_failures.py is only run on Evergreen mainline. Override in patch builds.
+        run_promote_silent_failures="${python|/opt/mongodbtoolchain/v2/bin/python2}  \
+                                     buildscripts/promote_silent_failures.py -o      \
+                                     report_unreliable.json report_unreliable.json"
 
         # For patch builds, we run reliable and then unreliable tests and combine the reports.
         if [ "${is_patch|}" = "true" ]; then
-          # Disable errexit, until we run combine_reports, so we can execute the reliable and
-          # unreliable tests.
-          set +o errexit
-          # If the "resmoke_wrapper" expansion is used for 'burn_in_tests' then add the reportFile.
-          echo "$wrapper" | grep -q burn_in_tests
-          add_report_file=$?
+          tag_file=etc/test_lifecycle.yml
+          retry_on_failure_options=""
+          run_promote_silent_failures=""
           resmoke_tags="unreliable,                                \
                         unreliable|${task_name},                   \
                         unreliable|${task_name}|${build_variant},  \
                         unreliable|${task_name}|${build_variant}|${distro_id}"
-          # Remove spaces from the tags argument.
-          resmoke_tags=$(echo $resmoke_tags| tr -d " ")
-          report_file=report_reliable.json
-          resmoke_base="$resmoke                         \
-                   --excludeWithAnyTags='$resmoke_tags'  \
-                   --reportFailureStatus=fail            \
-                   --reportFile=$report_file"
-          wrapper_report_file=""
-          if [ $add_report_file -eq 0 ]; then
-            wrapper_report_file="--reportFile=$report_file"
-          fi
-          eval $preamble $wrapper $wrapper_report_file $resmoke_base
-          report_file=report_unreliable.json
-          resmoke_base="$resmoke                         \
-                   --includeWithAnyTags='$resmoke_tags'  \
-                   --reportFailureStatus=silentfail      \
-                   --reportFile=$report_file"
-          if [ $add_report_file -eq 0 ]; then
-            wrapper_report_file="--reportFile=$report_file"
-          fi
-          eval $preamble $wrapper $wrapper_report_file  $resmoke_base
-          #  Reenable errexit, as the return from combine_reports will return the cumulative error.
-          set -o errexit
-          ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/combine_reports.py -o report.json report_reliable.json report_unreliable.json
-        else
-          eval $preamble $wrapper $resmoke $resmoke_report_file
         fi
 
+        # Remove spaces from the tags argument.
+        resmoke_tags=$(echo $resmoke_tags| tr -d " ")
+
+        # Set report file for reliable test run.
+        report_file=report_reliable.json
+
+        # Disable errexit, until we run combine_reports, so we can execute the reliable and
+        # unreliable tests.
+        set +o errexit
+
+        # If the "resmoke_wrapper" expansion is used for 'burn_in_tests' then add the reportFile.
+        echo "$wrapper" | grep -q burn_in_tests
+        add_report_file=$?
+        wrapper_report_file=""
+        if [ $add_report_file -eq 0 ]; then
+          wrapper_report_file="--reportFile=$report_file"
+        fi
+
+        # Set up resmoke to run without tagged tests.
+        resmoke_base="$resmoke                         \
+                 --excludeWithAnyTags='$resmoke_tags'  \
+                 --reportFailureStatus=fail            \
+                 --reportFile=$report_file             \
+                 --tagFile=$tag_file"
+
+        # Run reliable set of tests once.
+        eval $preamble $wrapper $wrapper_report_file $resmoke_base
+        exit_codes=$?
+
+        # Set report file for unreliable test run.
+        report_file=report_unreliable.json
+
+        # Set up resmoke to run with only tagged tests.
+        resmoke_base="$resmoke                         \
+                 --includeWithAnyTags='$resmoke_tags'  \
+                 --reportFailureStatus=silentfail      \
+                 --reportFile=$report_file             \
+                 --tagFile=$tag_file                   \
+                 $retry_on_failure_options"
+
+        if [ $add_report_file -eq 0 ]; then
+          wrapper_report_file="--reportFile=$report_file"
+        fi
+
+        # Run unreliable set of tests.
+        eval $preamble $wrapper $wrapper_report_file $resmoke_base
+        exit_codes="$exit_codes $?"
+
+        #  Reenable errexit, as the return from combine_reports will return the cumulative error.
+        set -o errexit
+
+        # If both executions of the test with an "retry_on_failure*" tag fail, promote the task as
+        # a failure. Only promote silent failures on mainline.
+        eval $run_promote_silent_failures
+
+        # Combine reliable and unreliable reports.
+        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/combine_reports.py -m -o report.json report_reliable.json report_unreliable.json
+
+        # We mask any errors from the resmoke runs above (by disabling errexit) until both have
+        # completed. If any of the resmoke runs failed due to non-test failures
+        # (i.e fixture failures), we need to exit with non-zero status.
+        for exit_code in $exit_codes
+        do
+          if [ $exit_code -ne 0 ]; then
+            echo "resmoke.py failed with error code: $exit_code"
+            exit $exit_code
+          fi
+        done
 
   "do jepsen setup" :
     - command: shell.exec
@@ -975,9 +1025,7 @@ post:
     params:
       working_dir: src
       script: |
-        if [ -f report_reliable.json ]; then
-          ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/combine_reports.py -o report.json report_reliable.json report_unreliable.json
-        fi
+        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/combine_reports.py -m -o report.json report_reliable.json report_unreliable.json
   - command: attach.results
     params:
       file_location: src/report.json
@@ -1155,6 +1203,60 @@ post:
       display_name: Core Dumps - Execution ${execution}
       optional: true
 
+  # Gather and archive failed unit test binaries.
+  - command: shell.exec
+    params:
+      working_dir: "src"
+      script: |
+        mkdir unittest_binaries
+        # Find all core files
+        core_files=$(/usr/bin/find -H . -name "dump_*.core" -o -name "*.mdmp" 2> /dev/null)
+        for core_file in $core_files
+        do
+          # A core file name does not always have the executable name that generated it.
+          # See http://stackoverflow.com/questions/34801353/core-dump-filename-gets-thread-name-instead-of-executable-name-with-core-pattern
+          # On platforms with GDB, we get the binary name from core file
+          gdb=/opt/mongodbtoolchain/gdb/bin/gdb
+          if [ -f $gdb ]; then
+            binary_file=$($gdb -batch --quiet -ex "core $core_file" 2> /dev/null | grep "Core was generated" | cut -f2 -d "\`" | cut -f1 -d "'" | cut -f1 -d " ")
+            binary_file_locations=$binary_file
+          else
+            # Find the base file name from the core file name, note it may be truncated.
+            # Remove leading 'dump_' and trailing '.<pid>.core' or '.<pid or time>.mdmp'
+            binary_file=$(echo $core_file | sed "s/.*\///;s/dump_//;s/\..*\.core//;s/\..*\.mdmp//")
+            # Locate the binary file. Since the base file name might be truncated, the find
+            # may return more than 1 file.
+            binary_file_locations=$(/usr/bin/find -H . -name "$binary_file*${exe}" 2> /dev/null)
+          fi
+          if [ -z "$binary_file_locations" ]; then
+            echo "Cannot locate the unittest binary file ($binary_file) that generated the core file $core_file"
+          fi
+          for binary_file_location in $binary_file_locations
+          do
+            new_binary_file=unittest_binaries/$(echo $binary_file_location | sed "s/.*\///")
+            if [ ! -f $new_binary_file ]; then
+              mv $binary_file_location $new_binary_file
+            fi
+          done
+        done
+  - command: archive.targz_pack
+    params:
+      target: "mongo-unittests.tgz"
+      source_dir: "src/unittest_binaries"
+      include:
+        - "./*_test${exe}"
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: mongo-unittests.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/unittests/mongo-unittests-${build_id}-${task_name}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Unit tests - Execution ${execution}
+      optional: true
+
   # Gather and archive hang_analyzer debugger files.
   - command: archive.targz_pack
     params:
@@ -1232,6 +1334,24 @@ timeout:
 #               Tasks                 #
 #######################################
 
+## The test_lifecycle_excluded_tasks are a list of tasks names which include:
+##   - Non jstests, i.e., compile, unittests
+##   - Non standard jstests, i.e., jstestfuzz
+## Note that the task name supports glob patterns.
+test_lifecycle_excluded_tasks:
+- burn_in_tests
+- compile*
+- dbtest*
+- idl_tests
+- integration*
+- jepsen*
+- jstestfuzz*
+- lint
+- mongos*
+- package
+- push
+- unittests*
+
 tasks:
 
 ## compile - build all scons targets except unittests ##
@@ -1258,7 +1378,7 @@ tasks:
 
           rm -rf ${install_directory|/data/mongo-install-directory}
 
-          ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" core tools dbtest integration_tests dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|} MONGO_VERSION=${version}
+          ${compile_env|} ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" core tools dbtest integration_tests dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|} MONGO_VERSION=${version}
 
           mv mongodb-src-*.${ext|tgz} distsrc.${ext|tgz}
           mv mongodb-*-debugsymbols.${ext|tgz} mongo-debugsymbols.tgz || true
@@ -1323,6 +1443,7 @@ tasks:
           - "./etc/*san.suppressions"
           - "./etc/repo_config.yaml"
           - "./etc/test_lifecycle.yml"
+          - "./etc/test_retrial.yml"
           - "./build/integration_tests/**"
           - "./build/integration_tests.txt"
           - "./build/**.gcno"
@@ -1400,7 +1521,7 @@ tasks:
 
           rm -rf ${install_directory|/data/mongo-install-directory}
 
-          ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" all ${additional_targets|} MONGO_VERSION=${version}
+          ${compile_env|} ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" all ${additional_targets|} MONGO_VERSION=${version}
 
     - command: s3.put
       params:
@@ -1435,7 +1556,7 @@ tasks:
           set -o errexit
           set -o verbose
 
-          ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
+          ${compile_env|} ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
 
 - <<: *task_template
   name: burn_in_tests
@@ -3045,6 +3166,17 @@ tasks:
       resmoke_args: --suites=causally_consistent_jscore_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
+- <<: *task_template
+  name: causally_consistent_jscore_passthrough_auth_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=causally_consistent_jscore_passthrough_auth --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
 - name: idl_tests
   depends_on:
   - name: compile
@@ -3722,24 +3854,20 @@ buildvariants:
 - name: linux-64-debug
   display_name: Linux DEBUG
   run_on:
-  - rhel62-small
+  - rhel62-large
   batchtime: 1440 # 1 day
   expansions:
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux-debug
     push_arch: x86_64
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 2)) # Avoid starting too many mongod's
     compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     use_scons_cache: true
     build_mongoreplay: true
   tasks:
   - name: compile
-    distros:
-    - rhel62-large
   - name: compile_all
-    distros:
-    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_auth
@@ -3774,31 +3902,13 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: concurrency
-    # Some concurrency workloads require a lot of memory, so we use machines
-    # with more RAM for these suites.
-    distros:
-    - rhel62-large
   - name: concurrency_WT
-    distros:
-    - rhel62-large
   - name: concurrency_replication
-    distros:
-    - rhel62-large
   - name: concurrency_replication_WT
-    distros:
-    - rhel62-large
   - name: concurrency_sharded
-    distros:
-    - rhel62-large
   - name: concurrency_sharded_WT
-    distros:
-    - rhel62-large
   - name: concurrency_simultaneous
-    distros:
-    - rhel62-large
   - name: concurrency_simultaneous_WT
-    distros:
-    - rhel62-large
   - name: read_concern_linearizable_passthrough
   - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
@@ -4721,11 +4831,12 @@ buildvariants:
     - ubuntu1604-test
 
 - name: enterprise-linux-64-amazon-ami
-  display_name: "* Enterprise Amazon Linux"
+  display_name: "Enterprise Amazon Linux"
   modules:
   - enterprise
   run_on:
   - linux-64-amzn-test
+  batchtime: 1440 # 1 day
   expansions:
     tooltags: "-tags 'ssl sasl'"
     push_path: linux
@@ -4976,7 +5087,8 @@ buildvariants:
   - name: aggregation_sharded_collections_passthrough_WT
   - name: auth
   - name: auth_WT
-    # SERVER-29094 add causally_consistent_jscore_passthrough_WT once resolved.
+  - name: causally_consistent_jscore_passthrough_WT
+  - name: causally_consistent_jscore_passthrough_auth_WT
   - name: dbtest
   - name: dbtest_WT
   - name: disk
@@ -5383,7 +5495,7 @@ buildvariants:
 - name: osx-1010-ssl
   display_name: SSL OS X 10.10
   run_on:
-  - osx-1010
+  - macos-1012
   batchtime: 1440 # 1 day
   expansions:
     push_path: osx
@@ -5391,6 +5503,8 @@ buildvariants:
     push_name: osx-ssl
     push_arch: x86_64
     tooltags: "-tags ssl"
+    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
+    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
     python: python2.7
     num_jobs_available: 1
@@ -5407,6 +5521,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
   - name: causally_consistent_jscore_passthrough_WT
+  - name: causally_consistent_jscore_passthrough_auth_WT
   - name: concurrency
   - name: concurrency_WT
   - name: concurrency_replication
@@ -5491,13 +5606,15 @@ buildvariants:
 - name: osx-1010-debug
   display_name: "* OS X 10.10 DEBUG"
   run_on:
-  - osx-1010
+  - macos-1012
   expansions:
     push_path: osx
     push_bucket: downloads.mongodb.org
     push_name: osx-debug
     push_arch: x86_64
     num_jobs_available: 1
+    gorootvars: CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
+    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --dbg=on --opt=on --allocator=system -j$(sysctl -n hw.logicalcpu) --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
     python: python2.7
     build_mongoreplay: true
@@ -5534,7 +5651,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - osx-1010
+  - macos-1012
   batchtime: 1440 # 1 day
   expansions:
     push_path: osx
@@ -5542,6 +5659,8 @@ buildvariants:
     push_name: osx
     push_arch: x86_64-enterprise
     tooltags: "-tags 'ssl sasl'"
+    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
+    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
     python: python2.7
     num_jobs_available: 1
@@ -5636,6 +5755,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
   - name: causally_consistent_jscore_passthrough_WT
+  - name: causally_consistent_jscore_passthrough_auth_WT
   - name: concurrency
   - name: concurrency_WT
   - name: concurrency_replication
@@ -5820,7 +5940,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel62-small
+  - rhel62-large
   batchtime: 10080 # 7 days
   stepback: false
   expansions:
@@ -5829,7 +5949,7 @@ buildvariants:
     compile_flags: --dbg=on --gcov --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     multiversion_platform_arch: "rhel62"
     multiversion_edition: "targeted"
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 2)) # Avoid starting too many mongod's
     # The gcov instrumentation saves the path the .gcno files were created in as the default path
     # for the .gcda files. In Evergreen the path will start with /data/mci/[Hashed ID]/src/... where
     # the hashed ID is unique per task run. GCOV_PREFIX_STRIP is the number of directory levels to
@@ -5841,11 +5961,7 @@ buildvariants:
     build_mongoreplay: true
   tasks:
   - name: compile
-    distros:
-    - rhel62-large
   - name: compile_all
-    distros:
-    - rhel62-large
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -5861,29 +5977,13 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
   - name: concurrency
-    distros:
-    - rhel62-large
   - name: concurrency_WT
-    distros:
-    - rhel62-large
   - name: concurrency_replication
-    distros:
-    - rhel62-large
   - name: concurrency_replication_WT
-    distros:
-    - rhel62-large
   - name: concurrency_sharded
-    distros:
-    - rhel62-large
   - name: concurrency_sharded_WT
-    distros:
-    - rhel62-large
   - name: concurrency_simultaneous
-    distros:
-    - rhel62-large
   - name: concurrency_simultaneous_WT
-    distros:
-    - rhel62-large
   - name: dbtest
   - name: dbtest_WT
   - name: disk
@@ -5930,60 +6030,26 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_linearizable_passthrough
-    distros:
-    - rhel62-large
   - name: read_concern_linearizable_passthrough_WT
-    distros:
-    - rhel62-large
   - name: read_concern_majority_passthrough_WT
-    distros:
-    - rhel62-large
   - name: read_only
   - name: read_only_WT
   - name: read_only_sharded
   - name: read_only_sharded_WT
   - name: replica_sets
-    distros:
-    - rhel62-large
   - name: replica_sets_WT
-    distros:
-    - rhel62-large
   - name: replica_sets_WT_ese
-    distros:
-    - rhel62-large
   - name: replica_sets_auth
-    distros:
-    - rhel62-large
   - name: replica_sets_pv0
-    distros:
-    - rhel62-large
   - name: replica_sets_jscore_passthrough
-    distros:
-    - rhel62-large
   - name: replica_sets_jscore_passthrough_WT
-    distros:
-    - rhel62-large
   - name: replica_sets_initsync_jscore_passthrough
-    distros:
-    - rhel62-large
   - name: replica_sets_initsync_jscore_passthrough_WT
-    distros:
-    - rhel62-large
   - name: replica_sets_initsync_static_jscore_passthrough
-    distros:
-    - rhel62-large
   - name: replica_sets_initsync_static_jscore_passthrough_WT
-    distros:
-    - rhel62-large
   - name: replica_sets_resync_static_jscore_passthrough
-    distros:
-    - rhel62-large
   - name: replica_sets_resync_static_jscore_passthrough_WT
-    distros:
-    - rhel62-large
   - name: replica_sets_kill_secondaries_jscore_passthrough_WT
-    distros:
-    - rhel62-large
   - name: master_slave
   - name: master_slave_WT
   - name: master_slave_auth
@@ -5993,20 +6059,10 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding
-    distros:
-    - rhel62-large
   - name: sharding_WT
-    distros:
-    - rhel62-large
   - name: sharding_WT_ese
-    distros:
-    - rhel62-large
   - name: sharding_auth
-    distros:
-    - rhel62-large
   - name: sharding_auth_audit_WT
-    distros:
-    - rhel62-large
   - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd
@@ -6015,14 +6071,8 @@ buildvariants:
   - name: sharding_jscore_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_last_stable_mongos_and_mixed_shards
-    distros:
-    - rhel62-large
   - name: sharding_op_query_WT
-    distros:
-    - rhel62-large
   - name: sharding_csrs_continuous_config_stepdown_WT
-    distros:
-    - rhel62-large
   - name: slow1
   - name: slow1_WT
   - name: serial_run
@@ -6707,7 +6757,8 @@ buildvariants:
   - name: tool_WT
   - name: push
     distros:
-    - rhel62-small
+    - rhel70
+    - rhel62-large
 
 ###########################################
 #          Ubuntu buildvariants           #
@@ -6929,8 +6980,8 @@ buildvariants:
   - name: push
 
 
-- name: enterprise-ubuntu1604-clang-3.7-libcxx
-  display_name: "! Enterprise Ubuntu 16.04 (Clang 3.7/libc++)"
+- name: enterprise-ubuntu1604-clang-3.8-libcxx
+  display_name: "! Enterprise Ubuntu 16.04 (Clang 3.8)"
   modules:
   - enterprise
   run_on:
@@ -6938,7 +6989,7 @@ buildvariants:
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
-    compile_flags: --link-model=dynamic --ssl CC=/usr/bin/clang-3.7 CXX=/usr/bin/clang++-3.7 --libc++ -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
+    compile_flags: --link-model=dynamic --ssl CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
     use_scons_cache: true
     build_mongoreplay: true
   tasks:
@@ -7539,7 +7590,9 @@ buildvariants:
     push_arch: x86_64
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "-lsocket -lnsl"
-    compile_flags: --variables-files=etc/scons/mongodbtoolchain_gcc.vars -j$(kstat cpu | sort -u | grep -c "^module") --release CCFLAGS="-m64" LINKFLAGS="-m64 -static-libstdc++ -static-libgcc"
+    # We invoke SCons using --jobs = (# of CPUs / 2) to avoid causing out of memory errors due to
+    # spawning a large number of linker processes.
+    compile_flags: --variables-files=etc/scons/mongodbtoolchain_gcc.vars -j$(( $(kstat cpu | sort -u | grep -c "^module") / 2 )) --release CCFLAGS="-m64" LINKFLAGS="-m64 -static-libstdc++ -static-libgcc"
     num_jobs_available: $(( $(kstat cpu | sort -u | grep -c "^module") / 2 ))
     use_scons_cache: true
   tasks:
@@ -8038,6 +8091,7 @@ buildvariants:
   - name: auth_audit
   - name: bulk_gle_passthrough
   - name: causally_consistent_jscore_passthrough_WT
+  - name: causally_consistent_jscore_passthrough_auth_WT
   - name: concurrency
     distros:
     - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
@@ -8457,6 +8511,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
   - name: causally_consistent_jscore_passthrough_WT
+  - name: causally_consistent_jscore_passthrough_auth_WT
   - name: concurrency
   - name: concurrency_WT
   - name: concurrency_replication
@@ -8600,7 +8655,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-test
+  - ubuntu1604-build
   stepback: true
   batchtime: 1440 # 1 day
   expansions:
@@ -8612,15 +8667,11 @@ buildvariants:
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform_arch: "ubuntu1604"
     multiversion_edition: "targeted"
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under UBSAN build.
     build_mongoreplay: true
   tasks:
   - name: compile
-    distros:
-    - ubuntu1604-build
   - name: compile_all
-    distros:
-    - ubuntu1604-build
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -8637,6 +8688,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
   - name: causally_consistent_jscore_passthrough_WT
+  - name: causally_consistent_jscore_passthrough_auth_WT
   - name: concurrency
   - name: concurrency_WT
   - name: concurrency_replication
@@ -8744,6 +8796,29 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: tool_WT
+
+- name: ubuntu1604-debug-aubsan-lite
+  display_name: "! {A,UB}SAN Enterprise SSL Ubuntu 16.04 DEBUG"
+  modules:
+  - enterprise
+  run_on:
+  - ubuntu1604-build
+  stepback: true
+  expansions:
+    tooltags: "-tags 'ssl'"
+    # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
+    variant_path_suffix: /opt/mongodbtoolchain/v2/bin
+    san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true
+    compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
+    num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
+    build_mongoreplay: true
+  tasks:
+  - name: compile
+  - name: compile_all
+  - name: dbtest
+  - name: dbtest_WT
+  - name: jsCore
+  - name: jsCore_WT
 
 - name: enterprise-ubuntu-dynamic-1604-64-bit
   display_name: "* Shared Library Enterprise Ubuntu 16.04"

@@ -64,7 +64,6 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -83,7 +82,8 @@ MONGO_FP_DECLARE(failAllRemoves);
 void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
     try {
         curOp->done();
-        long long executionTimeMicros = curOp->totalTimeMicros();
+        long long executionTimeMicros =
+            durationCount<Microseconds>(curOp->elapsedTimeExcludingPauses());
         curOp->debug().executionTimeMicros = executionTimeMicros;
 
         recordCurOpMetrics(opCtx);
@@ -92,7 +92,7 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
                     curOp->getNS(),
                     curOp->getLogicalOp(),
                     Top::LockType::WriteLocked,
-                    curOp->totalTimeMicros(),
+                    durationCount<Microseconds>(curOp->elapsedTimeExcludingPauses()),
                     curOp->isCommand(),
                     curOp->getReadWriteType());
 
@@ -103,8 +103,7 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
 
         const bool logAll = logger::globalLogDomain()->shouldLog(logger::LogComponent::kCommand,
                                                                  logger::LogSeverity::Debug(1));
-        const bool logSlow = executionTimeMicros >
-            (serverGlobalParams.slowMS + curOp->getExpectedLatencyMs()) * 1000LL;
+        const bool logSlow = executionTimeMicros > (serverGlobalParams.slowMS * 1000LL);
 
         const bool shouldSample = serverGlobalParams.sampleRate == 1.0
             ? true
@@ -219,8 +218,9 @@ bool handleError(OperationContext* opCtx,
         }
 
         if (!opCtx->getClient()->isInDirectClient()) {
-            ShardingState::get(opCtx)->onStaleShardVersion(
-                opCtx, wholeOp.ns, staleConfigException->getVersionReceived());
+            ShardingState::get(opCtx)
+                ->onStaleShardVersion(opCtx, wholeOp.ns, staleConfigException->getVersionReceived())
+                .transitional_ignore();
         }
         out->staleConfigException =
             stdx::make_unique<SendStaleConfigException>(*staleConfigException);
@@ -233,9 +233,9 @@ bool handleError(OperationContext* opCtx,
 
 }  // namespace
 
-static WriteResult::SingleResult createIndex(OperationContext* opCtx,
-                                             const NamespaceString& systemIndexes,
-                                             const BSONObj& spec) {
+static SingleWriteResult createIndex(OperationContext* opCtx,
+                                     const NamespaceString& systemIndexes,
+                                     const BSONObj& spec) {
     BSONElement nsElement = spec["ns"];
     uassert(ErrorCodes::NoSuchKey, "Missing \"ns\" field in index description", !nsElement.eoo());
     uassert(ErrorCodes::TypeMismatch,
@@ -268,7 +268,9 @@ static WriteResult::SingleResult createIndex(OperationContext* opCtx,
         cmdResult["numIndexesAfter"].numberInt() - cmdResult["numIndexesBefore"].numberInt();
     CurOp::get(opCtx)->debug().ninserted += n;
 
-    return {n};
+    SingleWriteResult result;
+    result.setN(n);
+    return result;
 }
 
 static WriteResult performCreateIndexes(OperationContext* opCtx, const InsertOp& wholeOp) {
@@ -351,8 +353,10 @@ static bool insertBatchAndHandleErrors(OperationContext* opCtx,
             insertDocuments(opCtx, collection->getCollection(), batch.begin(), batch.end());
             lastOpFixer->finishedOpSuccessfully();
             globalOpCounters.gotInserts(batch.size());
-            std::fill_n(
-                std::back_inserter(out->results), batch.size(), WriteResult::SingleResult{1});
+            SingleWriteResult result;
+            result.setN(1);
+
+            std::fill_n(std::back_inserter(out->results), batch.size(), std::move(result));
             curOp.debug().ninserted += batch.size();
             return true;
         }
@@ -374,7 +378,9 @@ static bool insertBatchAndHandleErrors(OperationContext* opCtx,
                     lastOpFixer->startingOp();
                     insertDocuments(opCtx, collection->getCollection(), it, it + 1);
                     lastOpFixer->finishedOpSuccessfully();
-                    out->results.emplace_back(WriteResult::SingleResult{1});
+                    SingleWriteResult result;
+                    result.setN(1);
+                    out->results.emplace_back(std::move(result));
                     curOp.debug().ninserted++;
                 } catch (...) {
                     // Release the lock following any error. Among other things, this ensures that
@@ -406,7 +412,7 @@ WriteResult performInserts(OperationContext* opCtx, const InsertOp& wholeOp) {
                     wholeOp.ns.ns(),
                     LogicalOp::opInsert,
                     Top::LockType::WriteLocked,
-                    curOp.totalTimeMicros(),
+                    durationCount<Microseconds>(curOp.elapsedTimeExcludingPauses()),
                     curOp.isCommand(),
                     curOp.getReadWriteType());
 
@@ -471,9 +477,9 @@ WriteResult performInserts(OperationContext* opCtx, const InsertOp& wholeOp) {
     return out;
 }
 
-static WriteResult::SingleResult performSingleUpdateOp(OperationContext* opCtx,
-                                                       const NamespaceString& ns,
-                                                       const UpdateOp::SingleUpdate& op) {
+static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
+                                               const NamespaceString& ns,
+                                               const UpdateOp::SingleUpdate& op) {
     globalOpCounters.gotUpdate();
     auto& curOp = *CurOp::get(opCtx);
     {
@@ -554,7 +560,12 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* opCtx,
     const long long nMatchedOrInserted = didInsert ? 1 : res.numMatched;
     LastError::get(opCtx->getClient()).recordUpdate(res.existing, nMatchedOrInserted, res.upserted);
 
-    return {nMatchedOrInserted, res.numDocsModified, res.upserted};
+    SingleWriteResult result;
+    result.setN(nMatchedOrInserted);
+    result.setNModified(res.numDocsModified);
+    result.setUpsertedId(res.upserted);
+
+    return result;
 }
 
 WriteResult performUpdates(OperationContext* opCtx, const UpdateOp& wholeOp) {
@@ -591,9 +602,9 @@ WriteResult performUpdates(OperationContext* opCtx, const UpdateOp& wholeOp) {
     return out;
 }
 
-static WriteResult::SingleResult performSingleDeleteOp(OperationContext* opCtx,
-                                                       const NamespaceString& ns,
-                                                       const DeleteOp::SingleDelete& op) {
+static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
+                                               const NamespaceString& ns,
+                                               const DeleteOp::SingleDelete& op) {
     globalOpCounters.gotDelete();
     auto& curOp = *CurOp::get(opCtx);
     {
@@ -659,7 +670,9 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* opCtx,
 
     LastError::get(opCtx->getClient()).recordDelete(n);
 
-    return {n};
+    SingleWriteResult result;
+    result.setN(n);
+    return result;
 }
 
 WriteResult performDeletes(OperationContext* opCtx, const DeleteOp& wholeOp) {

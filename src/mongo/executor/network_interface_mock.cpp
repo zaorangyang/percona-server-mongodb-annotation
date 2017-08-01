@@ -196,6 +196,10 @@ bool NetworkInterfaceMock::onNetworkThread() {
 
 void NetworkInterfaceMock::startup() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _startup_inlock();
+}
+
+void NetworkInterfaceMock::_startup_inlock() {
     invariant(!_hasStarted);
     _hasStarted = true;
     _inShutdown.store(false);
@@ -207,7 +211,9 @@ void NetworkInterfaceMock::shutdown() {
     invariant(!inShutdown());
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    invariant(_hasStarted);
+    if (!_hasStarted) {
+        _startup_inlock();
+    }
     _inShutdown.store(true);
     NetworkOperationList todo;
     todo.splice(todo.end(), _scheduled);
@@ -302,7 +308,8 @@ void NetworkInterfaceMock::scheduleResponse(NetworkOperationIterator noi,
     // If no RemoteCommandResponse was returned (for example, on a simulated network error), then
     // do not attempt to run the metadata hook, since there is no returned metadata.
     if (_metadataHook && response.isOK()) {
-        _metadataHook->readReplyMetadata(noi->getRequest().target.toString(), response.metadata);
+        _metadataHook->readReplyMetadata(noi->getRequest().target.toString(), response.metadata)
+            .transitional_ignore();
     }
 
     noi->setResponse(when, response);

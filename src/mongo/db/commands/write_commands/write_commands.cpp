@@ -71,7 +71,7 @@ void redactTooLongLog(mutablebson::Document* cmdObj, StringData fieldName) {
 
     // Redact the log if there are more than one documents or operations.
     if (field.countChildren() > 1) {
-        field.setValueInt(field.countChildren());
+        field.setValueInt(field.countChildren()).transitional_ignore();
     }
 }
 
@@ -114,13 +114,13 @@ void serializeReply(OperationContext* opCtx,
     for (size_t i = 0; i < result.results.size(); i++) {
         if (result.results[i].isOK()) {
             const auto& opResult = result.results[i].getValue();
-            n += opResult.n;  // Always there.
+            n += opResult.getN();  // Always there.
             if (replyStyle == ReplyStyle::kUpdate) {
-                nModified += opResult.nModified;
-                if (!opResult.upsertedId.isEmpty()) {
+                nModified += opResult.getNModified();
+                if (auto idElement = opResult.getUpsertedId().firstElement()) {
                     BSONObjBuilder upsertedId(upsertInfoSizeTracker);
                     upsertedId.append("index", int(i));
-                    upsertedId.appendAs(opResult.upsertedId.firstElement(), "_id");
+                    upsertedId.appendAs(idElement, "_id");
                     upsertInfo.push_back(upsertedId.obj());
                 }
             }
@@ -207,13 +207,12 @@ public:
         return ReadWriteType::kWrite;
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             std::string& errmsg,
-             BSONObjBuilder& result) final {
+    bool enhancedRun(OperationContext* opCtx,
+                     const OpMsgRequest& request,
+                     std::string& errmsg,
+                     BSONObjBuilder& result) final {
         try {
-            runImpl(opCtx, dbname, cmdObj, result);
+            runImpl(opCtx, request, result);
             return true;
         } catch (const DBException& ex) {
             LastError::get(opCtx->getClient()).setLastError(ex.getCode(), ex.getInfo().msg);
@@ -222,8 +221,7 @@ public:
     }
 
     virtual void runImpl(OperationContext* opCtx,
-                         const std::string& dbname,
-                         const BSONObj& cmdObj,
+                         const OpMsgRequest& request,
                          BSONObjBuilder& result) = 0;
 };
 
@@ -251,10 +249,9 @@ public:
     }
 
     void runImpl(OperationContext* opCtx,
-                 const std::string& dbname,
-                 const BSONObj& cmdObj,
+                 const OpMsgRequest& request,
                  BSONObjBuilder& result) final {
-        const auto batch = parseInsertCommand(dbname, cmdObj);
+        const auto batch = parseInsertCommand(request);
         const auto reply = performInserts(opCtx, batch);
         serializeReply(opCtx,
                        ReplyStyle::kNotUpdate,
@@ -287,10 +284,9 @@ public:
     }
 
     void runImpl(OperationContext* opCtx,
-                 const std::string& dbname,
-                 const BSONObj& cmdObj,
+                 const OpMsgRequest& request,
                  BSONObjBuilder& result) final {
-        const auto batch = parseUpdateCommand(dbname, cmdObj);
+        const auto batch = parseUpdateCommand(request);
         const auto reply = performUpdates(opCtx, batch);
         serializeReply(opCtx,
                        ReplyStyle::kUpdate,
@@ -305,7 +301,8 @@ public:
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const final {
-        const auto batch = parseUpdateCommand(dbname, cmdObj);
+        auto request = OpMsgRequest::fromDBAndBody(dbname, cmdObj);
+        const auto batch = parseUpdateCommand(request);
         uassert(ErrorCodes::InvalidLength,
                 "explained write batches must be of size 1",
                 batch.updates.size() == 1);
@@ -316,6 +313,7 @@ public:
         updateRequest.setQuery(batch.updates[0].query);
         updateRequest.setCollation(batch.updates[0].collation);
         updateRequest.setUpdates(batch.updates[0].update);
+        updateRequest.setArrayFilters(batch.updates[0].arrayFilters);
         updateRequest.setMulti(batch.updates[0].multi);
         updateRequest.setUpsert(batch.updates[0].upsert);
         updateRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
@@ -357,10 +355,9 @@ public:
     }
 
     void runImpl(OperationContext* opCtx,
-                 const std::string& dbname,
-                 const BSONObj& cmdObj,
+                 const OpMsgRequest& request,
                  BSONObjBuilder& result) final {
-        const auto batch = parseDeleteCommand(dbname, cmdObj);
+        const auto batch = parseDeleteCommand(request);
         const auto reply = performDeletes(opCtx, batch);
         serializeReply(opCtx,
                        ReplyStyle::kNotUpdate,
@@ -375,7 +372,8 @@ public:
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const final {
-        const auto batch = parseDeleteCommand(dbname, cmdObj);
+        auto request = OpMsgRequest::fromDBAndBody(dbname, cmdObj);
+        const auto batch = parseDeleteCommand(request);
         uassert(ErrorCodes::InvalidLength,
                 "explained write batches must be of size 1",
                 batch.deletes.size() == 1);

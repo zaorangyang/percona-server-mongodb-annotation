@@ -235,6 +235,7 @@ Message getMore(OperationContext* opCtx,
     invariant(ntoreturn >= 0);
 
     CurOp& curOp = *CurOp::get(opCtx);
+    curOp.ensureStarted();
 
     // For testing, we may want to fail if we receive a getmore.
     if (MONGO_FAIL_POINT(failReceivedGetmore)) {
@@ -247,18 +248,22 @@ Message getMore(OperationContext* opCtx,
 
     // Cursors come in one of two flavors:
     // - Cursors owned by the collection cursor manager, such as those generated via the find
-    //   command. For these cursors, we hold the appropriate collection lock for the duration of
-    //   the getMore using AutoGetCollectionForRead. This will automatically update the CurOp
-    //   object appropriately and record execution time via Top upon completion.
+    //   command. For these cursors, we hold the appropriate collection lock for the duration of the
+    //   getMore using AutoGetCollectionForRead.
     // - Cursors owned by the global cursor manager, such as those generated via the aggregate
     //   command. These cursors either hold no collection state or manage their collection state
-    //   internally, so we acquire no locks. In this case we use the AutoStatsTracker object to
-    //   update the CurOp object appropriately and record execution time via Top upon
-    //   completion.
+    //   internally, so we acquire no locks.
     //
-    // Thus, only one of 'readLock' and 'statsTracker' will be populated as we populate
-    // 'cursorManager'.
-    boost::optional<AutoGetCollectionForReadCommand> readLock;
+    // While we only need to acquire locks in the case of a cursor which is *not* globally owned, we
+    // need to create an AutoStatsTracker in either case. This is responsible for updating
+    // statistics in CurOp and Top. We avoid using AutoGetCollectionForReadCommand because we may
+    // need to drop and reacquire locks when the cursor is awaitData, but we don't want to update
+    // the stats twice.
+    //
+    // Note that we acquire our locks before our ClientCursorPin, in order to ensure that the pin's
+    // destructor is called before the lock's destructor (if there is one) so that the cursor
+    // cleanup can occur under the lock.
+    boost::optional<AutoGetCollectionForRead> readLock;
     boost::optional<AutoStatsTracker> statsTracker;
     CursorManager* cursorManager;
 
@@ -273,16 +278,25 @@ Message getMore(OperationContext* opCtx,
                 ? boost::optional<int>{autoDb.getDb()->getProfilingLevel()}
                 : boost::none;
             statsTracker.emplace(opCtx, *nssForCurOp, Top::LockType::NotLocked, profilingLevel);
+            auto view = autoDb.getDb()
+                ? autoDb.getDb()->getViewCatalog()->lookup(opCtx, nssForCurOp->ns())
+                : nullptr;
             uassert(
                 ErrorCodes::CommandNotSupportedOnView,
                 str::stream() << "Namespace " << nssForCurOp->ns()
                               << " is a view. OP_GET_MORE operations are not supported on views. "
                               << "Only clients which support the getMore command can be used to "
                                  "query views.",
-                !autoDb.getDb()->getViewCatalog()->lookup(opCtx, nssForCurOp->ns()));
+                !view);
         }
     } else {
         readLock.emplace(opCtx, nss);
+        const int doNotChangeProfilingLevel = 0;
+        statsTracker.emplace(opCtx,
+                             nss,
+                             Top::LockType::ReadLocked,
+                             readLock->getDb() ? readLock->getDb()->getProfilingLevel()
+                                               : doNotChangeProfilingLevel);
         Collection* collection = readLock->getCollection();
         uassert(
             ErrorCodes::OperationFailed, "collection dropped between getMore calls", collection);
@@ -416,14 +430,13 @@ Message getMore(OperationContext* opCtx,
             exec->saveState();
             readLock.reset();
 
-            // Block waiting for data for up to 1 second.
+            // Block waiting for data for up to 1 second. Time spent blocking is not counted towards
+            // the total operation latency.
+            curOp.pauseTimer();
             Seconds timeout(1);
             notifier->wait(notifierVersion, timeout);
             notifier.reset();
-
-            // Set expected latency to match wait time. This makes sure the logs aren't spammed
-            // by awaitData queries that exceed slowms due to blocking on the CappedInsertNotifier.
-            curOp.setExpectedLatencyMs(durationCount<Milliseconds>(timeout));
+            curOp.resumeTimer();
 
             // Reacquiring locks.
             readLock.emplace(opCtx, nss);
@@ -481,9 +494,13 @@ Message getMore(OperationContext* opCtx,
 
             *exhaust = cc->queryOptions() & QueryOption_Exhaust;
 
-            // If the getmore had a time limit, remaining time is "rolled over" back to the
-            // cursor (for use by future getmore ops).
-            cc->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
+            // We assume that cursors created through a DBDirectClient are always used from their
+            // original OperationContext, so we do not need to move time to and from the cursor.
+            if (!opCtx->getClient()->isInDirectClient()) {
+                // If the getmore had a time limit, remaining time is "rolled over" back to the
+                // cursor (for use by future getmore ops).
+                cc->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
+            }
         }
     }
 
@@ -503,6 +520,7 @@ std::string runQuery(OperationContext* opCtx,
                      const NamespaceString& nss,
                      Message& result) {
     CurOp& curOp = *CurOp::get(opCtx);
+    curOp.ensureStarted();
 
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "Invalid ns [" << nss.ns() << "]",
@@ -684,9 +702,13 @@ std::string runQuery(OperationContext* opCtx,
 
         pinnedCursor.getCursor()->setPos(numResults);
 
-        // If the query had a time limit, remaining time is "rolled over" to the cursor (for
-        // use by future getmore ops).
-        pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
+        // We assume that cursors created through a DBDirectClient are always used from their
+        // original OperationContext, so we do not need to move time to and from the cursor.
+        if (!opCtx->getClient()->isInDirectClient()) {
+            // If the query had a time limit, remaining time is "rolled over" to the cursor (for
+            // use by future getmore ops).
+            pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
+        }
 
         endQueryOp(opCtx, collection, *pinnedCursor.getCursor()->getExecutor(), numResults, ccId);
     } else {

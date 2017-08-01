@@ -256,13 +256,12 @@ void ClusterWriter::write(OperationContext* opCtx,
 
             Status targetInitStatus = targeter.init(opCtx);
             if (!targetInitStatus.isOK()) {
-                toBatchError(Status(targetInitStatus.code(),
-                                    str::stream()
-                                        << "unable to target"
-                                        << (request->isInsertIndexRequest() ? " index" : "")
-                                        << " write op for collection "
-                                        << request->getTargetingNS()
-                                        << causedBy(targetInitStatus)),
+                toBatchError({targetInitStatus.code(),
+                              str::stream() << "unable to target"
+                                            << (request->isInsertIndexRequest() ? " index" : "")
+                                            << " write op for collection "
+                                            << request->getTargetingNSS().toString()
+                                            << causedBy(targetInitStatus)},
                              response);
                 return;
             }
@@ -455,7 +454,11 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
     } catch (const DBException& ex) {
         chunk->randomizeBytesWritten();
 
-        log() << "Unable to auto-split chunk " << redact(chunkRange.toString()) << causedBy(ex);
+        if (ErrorCodes::isStaleShardingError(ErrorCodes::Error(ex.getCode()))) {
+            log() << "Unable to auto-split chunk " << redact(chunkRange.toString()) << causedBy(ex)
+                  << ", going to invalidate routing table entry for " << nss;
+            Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss);
+        }
     }
 }
 

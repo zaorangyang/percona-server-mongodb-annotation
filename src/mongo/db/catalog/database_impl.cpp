@@ -38,7 +38,6 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/auth/auth_index_d.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
@@ -63,6 +62,7 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/system_index.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -286,7 +286,7 @@ void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) {
             continue;
         try {
             WriteUnitOfWork wunit(opCtx);
-            Status status = dropCollection(opCtx, ns);
+            Status status = dropCollection(opCtx, ns, {});
 
             if (!status.isOK()) {
                 warning() << "could not drop temp collection '" << ns << "': " << redact(status);
@@ -325,6 +325,24 @@ Status DatabaseImpl::setProfilingLevel(OperationContext* opCtx, int newLevel) {
     _profile = newLevel;
 
     return Status::OK();
+}
+
+void DatabaseImpl::setDropPending(OperationContext* opCtx, bool dropPending) {
+    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_X));
+    if (dropPending) {
+        uassert(ErrorCodes::DatabaseDropPending,
+                str::stream() << "Unable to drop database " << name()
+                              << " because it is already in the process of being dropped.",
+                !_dropPending);
+        _dropPending = true;
+    } else {
+        _dropPending = false;
+    }
+}
+
+bool DatabaseImpl::isDropPending(OperationContext* opCtx) const {
+    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_X));
+    return _dropPending;
 }
 
 void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, double scale) {
@@ -381,7 +399,9 @@ Status DatabaseImpl::dropView(OperationContext* opCtx, StringData fullns) {
     return status;
 }
 
-Status DatabaseImpl::dropCollection(OperationContext* opCtx, StringData fullns) {
+Status DatabaseImpl::dropCollection(OperationContext* opCtx,
+                                    StringData fullns,
+                                    repl::OpTime dropOpTime) {
     if (!getCollection(opCtx, fullns)) {
         // Collection doesn't exist so don't bother validating if it can be dropped.
         return Status::OK();
@@ -403,14 +423,22 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx, StringData fullns) 
         }
     }
 
-    return dropCollectionEvenIfSystem(opCtx, nss);
+    return dropCollectionEvenIfSystem(opCtx, nss, dropOpTime);
 }
 
 Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
-                                                const NamespaceString& fullns) {
+                                                const NamespaceString& fullns,
+                                                repl::OpTime dropOpTime) {
     invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_X));
 
     LOG(1) << "dropCollection: " << fullns;
+
+    // A valid 'dropOpTime' is not allowed when writes are replicated.
+    if (!dropOpTime.isNull() && opCtx->writesAreReplicated()) {
+        return Status(
+            ErrorCodes::BadValue,
+            "dropCollection() cannot accept a valid drop optime when writes are replicated.");
+    }
 
     Collection* collection = getCollection(opCtx, fullns);
 
@@ -438,33 +466,49 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     auto uuid = collection->uuid();
 
     // Drop unreplicated collections immediately.
-    // Replicated collections should also be dropped immediately if there is no active reaper to
-    // remove the drop-pending collections.
-    auto isOplogDisabledForNamespace =
-        repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, fullns);
-    auto reaper = repl::DropPendingCollectionReaper::get(opCtx);
-    if (isOplogDisabledForNamespace || !reaper) {
+    // If 'dropOpTime' is provided, we should proceed to rename the collection.
+    // Under master/slave, collections are always dropped immediately. This is because drop-pending
+    // collections support the rollback process which is not applicable to master/slave.
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    auto opObserver = getGlobalServiceContext()->getOpObserver();
+    auto isOplogDisabledForNamespace = replCoord->isOplogDisabledFor(opCtx, fullns);
+    auto isMasterSlave =
+        repl::ReplicationCoordinator::modeMasterSlave == replCoord->getReplicationMode();
+    if ((dropOpTime.isNull() && isOplogDisabledForNamespace) || isMasterSlave) {
         auto status = _finishDropCollection(opCtx, fullns, collection);
         if (!status.isOK()) {
             return status;
         }
-        getGlobalServiceContext()->getOpObserver()->onDropCollection(opCtx, fullns, uuid);
+        opObserver->onDropCollection(opCtx, fullns, uuid);
         return Status::OK();
     }
 
     // Replicated collections will be renamed with a special drop-pending namespace and dropped when
     // the replica set optime reaches the drop optime.
-    auto dropOpTime =
-        getGlobalServiceContext()->getOpObserver()->onDropCollection(opCtx, fullns, uuid);
-
-    // Drop collection immediately if OpObserver did not write entry to oplog.
-    // After writing the oplog entry, all errors are fatal. See getNextOpTime() comments in
-    // oplog.cpp.
     if (dropOpTime.isNull()) {
-        log() << "dropCollection: " << fullns << " - no drop optime available for pending-drop. "
-              << "Dropping collection immediately.";
-        fassertStatusOK(40462, _finishDropCollection(opCtx, fullns, collection));
-        return Status::OK();
+        dropOpTime = opObserver->onDropCollection(opCtx, fullns, uuid);
+
+        // Drop collection immediately if OpObserver did not write entry to oplog.
+        // After writing the oplog entry, all errors are fatal. See getNextOpTime() comments in
+        // oplog.cpp.
+        if (dropOpTime.isNull()) {
+            log() << "dropCollection: " << fullns
+                  << " - no drop optime available for pending-drop. "
+                  << "Dropping collection immediately.";
+            fassertStatusOK(40462, _finishDropCollection(opCtx, fullns, collection));
+            return Status::OK();
+        }
+    } else {
+        // If we are provided with a valid 'dropOpTime', it means we are dropping this collection
+        // in the context of applying an oplog entry on a secondary.
+        // OpObserver::onDropCollection() should be returning a null OpTime because we should not be
+        // writing to the oplog.
+        auto opTime = opObserver->onDropCollection(opCtx, fullns, uuid);
+        if (!opTime.isNull()) {
+            severe() << "dropCollection: " << fullns
+                     << " - unexpected oplog entry written to the oplog with optime " << opTime;
+            fassertFailed(40468);
+        }
     }
 
     // Check if drop-pending namespace is too long for the index names in the collection.
@@ -487,8 +531,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 
     // Register this drop-pending namespace with DropPendingCollectionReaper to remove when the
     // committed optime reaches the drop optime.
-    invariant(reaper);
-    reaper->addDropPendingNamespace(dropOpTime, dpns);
+    repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(dropOpTime, dpns);
 
     return Status::OK();
 }
@@ -623,6 +666,10 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
 
     uassert(17316, "cannot create a blank collection", nss.coll() > 0);
     uassert(28838, "cannot create a non-capped oplog collection", options.capped || !nss.isOplog());
+    uassert(ErrorCodes::DatabaseDropPending,
+            str::stream() << "Cannot create collection " << nss.ns()
+                          << " - database is in the process of being dropped.",
+            !_dropPending);
 }
 
 Status DatabaseImpl::createView(OperationContext* opCtx,
@@ -680,7 +727,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
         }
 
         if (nss.isSystem()) {
-            authindex::createSystemIndexes(opCtx, collection);
+            createSystemIndexes(opCtx, collection);
         }
     }
 
@@ -712,10 +759,12 @@ void DatabaseImpl::dropDatabase(OperationContext* opCtx, Database* db) {
     }
 
     dbHolder().close(opCtx, name, "database dropped");
-    db = NULL;  // d is now deleted
 
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-        getGlobalServiceContext()->getGlobalStorageEngine()->dropDatabase(opCtx, name);
+        getGlobalServiceContext()
+            ->getGlobalStorageEngine()
+            ->dropDatabase(opCtx, name)
+            .transitional_ignore();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "dropDatabase", name);
 }

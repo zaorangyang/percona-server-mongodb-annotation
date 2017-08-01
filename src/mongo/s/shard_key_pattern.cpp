@@ -107,7 +107,7 @@ bool isShardKeyElement(const BSONElement& element, bool allowRegex) {
     if (!allowRegex && element.type() == RegEx)
         return false;
 
-    if (element.type() == Object && !element.embeddedObject().okForStorage())
+    if (element.type() == Object && !element.embeddedObject().storageValidEmbedded().isOK())
         return false;
 
     return true;
@@ -208,7 +208,7 @@ BSONObj ShardKeyPattern::normalizeShardKey(const BSONObj& shardKey) const {
 static BSONElement extractKeyElementFromMatchable(const MatchableDocument& matchable,
                                                   StringData pathStr) {
     ElementPath path;
-    path.init(pathStr);
+    path.init(pathStr).transitional_ignore();
     path.setTraverseNonleafArrays(false);
     path.setTraverseLeafArray(false);
 

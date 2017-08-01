@@ -34,17 +34,15 @@
 
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
-#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/index_builder.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -69,17 +67,34 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
                                         << " because it does not exist");
         }
 
-        bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-            !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(opCtx, dbName);
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        bool userInitiatedWritesAndNotPrimary =
+            opCtx->writesAreReplicated() && !replCoord->canAcceptWritesForDatabase(opCtx, dbName);
 
         if (userInitiatedWritesAndNotPrimary) {
             return Status(ErrorCodes::NotMaster,
                           str::stream() << "Not primary while dropping database " << dbName);
         }
 
-        log() << "dropDatabase " << dbName << " starting";
+        log() << "dropDatabase " << dbName << " - starting";
+        db->setDropPending(opCtx, true);
+
+        // If Database::dropDatabase() fails, we should reset the drop-pending state on Database.
+        auto dropPendingGuard = MakeGuard([&db, opCtx] { db->setDropPending(opCtx, false); });
+
+        for (auto collection : *db) {
+            const auto& nss = collection->ns();
+            if (replCoord->isOplogDisabledFor(opCtx, nss) || nss.isSystemDotIndexes()) {
+                continue;
+            }
+            log() << "dropDatabase " << dbName << " - dropping collection: " << nss;
+            WriteUnitOfWork wunit(opCtx);
+            fassertStatusOK(40476, db->dropCollectionEvenIfSystem(opCtx, nss));
+            wunit.commit();
+        }
         Database::dropDatabase(opCtx, db);
-        log() << "dropDatabase " << dbName << " finished";
+        dropPendingGuard.Dismiss();
+        log() << "dropDatabase " << dbName << " - finished";
 
         WriteUnitOfWork wunit(opCtx);
 

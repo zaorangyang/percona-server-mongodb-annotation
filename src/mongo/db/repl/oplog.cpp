@@ -257,7 +257,8 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
                             const BSONObj* o2,
                             bool fromMigrate,
                             OpTime optime,
-                            long long hashNew) {
+                            long long hashNew,
+                            Date_t wallTime) {
     BSONObjBuilder b(256);
 
     b.append("ts", optime.getTimestamp());
@@ -273,6 +274,10 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
         b.appendBool("fromMigrate", true);
     if (o2)
         b.append("o2", *o2);
+
+    if (wallTime != Date_t{}) {
+        b.appendDate("wt", wallTime);
+    }
 
     return OplogDocWriter(OplogDocWriter(b.obj(), obj));
 }
@@ -388,8 +393,9 @@ OpTime logOp(OperationContext* opCtx,
     auto replMode = replCoord->getReplicationMode();
     OplogSlot slot;
     getNextOpTime(opCtx, oplog, replCoord, replMode, 1, &slot);
-    auto writer =
-        _logOpWriter(opCtx, opstr, nss, uuid, obj, o2, fromMigrate, slot.opTime, slot.hash);
+
+    auto writer = _logOpWriter(
+        opCtx, opstr, nss, uuid, obj, o2, fromMigrate, slot.opTime, slot.hash, Date_t::now());
     const DocWriter* basePtr = &writer;
     _logOpsInner(opCtx, nss, &basePtr, 1, oplog, replMode, slot.opTime);
     return slot.opTime;
@@ -418,9 +424,18 @@ void logOps(OperationContext* opCtx,
     std::unique_ptr<OplogSlot[]> slots(new OplogSlot[count]);
     auto replMode = replCoord->getReplicationMode();
     getNextOpTime(opCtx, oplog, replCoord, replMode, count, slots.get());
+    auto wallTime = Date_t::now();
     for (size_t i = 0; i < count; i++) {
-        writers.emplace_back(_logOpWriter(
-            opCtx, opstr, nss, uuid, begin[i], NULL, fromMigrate, slots[i].opTime, slots[i].hash));
+        writers.emplace_back(_logOpWriter(opCtx,
+                                          opstr,
+                                          nss,
+                                          uuid,
+                                          begin[i],
+                                          NULL,
+                                          fromMigrate,
+                                          slots[i].opTime,
+                                          slots[i].hash,
+                                          wallTime));
     }
 
     std::unique_ptr<DocWriter const* []> basePtrs(new DocWriter const*[count]);
@@ -549,7 +564,8 @@ NamespaceString parseNs(const string& ns, const BSONObj& cmdObj) {
     return NamespaceString(NamespaceString(ns).db().toString(), coll);
 }
 
-using OpApplyFn = stdx::function<Status(OperationContext*, const char*, BSONObj&)>;
+using OpApplyFn = stdx::function<Status(
+    OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime)>;
 
 struct ApplyOpMetadata {
     OpApplyFn applyFunc;
@@ -567,7 +583,7 @@ struct ApplyOpMetadata {
 
 std::map<std::string, ApplyOpMetadata> opsMap = {
     {"create",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
           const NamespaceString nss(parseNs(ns, cmd));
           if (auto idIndexElem = cmd["idIndex"]) {
               // Remove "idIndex" field from command.
@@ -587,51 +603,51 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
       },
       {ErrorCodes::NamespaceExists}}},
     {"collMod",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return collMod(opCtx, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
     {"dropDatabase",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
           return dropDatabase(opCtx, NamespaceString(ns).db().toString());
       },
       {ErrorCodes::NamespaceNotFound}}},
     {"drop",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
-          return dropCollection(opCtx, parseNs(ns, cmd), resultWeDontCareAbout);
+          return dropCollection(opCtx, parseNs(ns, cmd), resultWeDontCareAbout, opTime);
       },
       // IllegalOperation is necessary because in 3.0 we replicate drops of system.profile
       // TODO(dannenberg) remove IllegalOperation once we no longer need 3.0 compatibility
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IllegalOperation}}},
     // deleteIndex(es) is deprecated but still works as of April 10, 2015
     {"deleteIndex",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"deleteIndexes",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"dropIndex",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"dropIndexes",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"renameCollection",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
           const auto sourceNsElt = cmd.firstElement();
           const auto targetNsElt = cmd["to"];
           uassert(ErrorCodes::TypeMismatch,
@@ -648,15 +664,17 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::NamespaceExists}}},
     {"applyOps",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return applyOps(opCtx, nsToDatabase(ns), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::UnknownError}}},
-    {"convertToCapped", {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+    {"convertToCapped",
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
          return convertToCapped(opCtx, parseNs(ns, cmd), cmd["size"].number());
      }}},
-    {"emptycapped", {[](OperationContext* opCtx, const char* ns, BSONObj& cmd) -> Status {
+    {"emptycapped",
+     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
          return emptyCapped(opCtx, parseNs(ns, cmd));
      }}},
 };
@@ -1039,6 +1057,16 @@ Status applyCommand_inlock(OperationContext* opCtx,
     // perform the current DB checks after reacquiring the lock.
     invariant(opCtx->lockState()->isW());
 
+    // Parse optime from oplog entry unless we are applying this command in standalone or on a
+    // primary (replicated writes enabled).
+    OpTime opTime;
+    if (!opCtx->writesAreReplicated()) {
+        auto opTimeResult = OpTime::parseFromOplogEntry(op);
+        if (opTimeResult.isOK()) {
+            opTime = opTimeResult.getValue();
+        }
+    }
+
     bool done = false;
 
     while (!done) {
@@ -1051,7 +1079,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
         ApplyOpMetadata curOpToApply = op->second;
         Status status = Status::OK();
         try {
-            status = curOpToApply.applyFunc(opCtx, nss.ns().c_str(), o);
+            status = curOpToApply.applyFunc(opCtx, nss.ns().c_str(), o, opTime);
         } catch (...) {
             status = exceptionToStatus();
         }
@@ -1239,7 +1267,7 @@ void SnapshotThread::run() {
                 name = replCoord->reserveSnapshotName(nullptr);
 
                 // This establishes the view that we will name.
-                _manager->prepareForCreateSnapshot(opCtx.get());
+                _manager->prepareForCreateSnapshot(opCtx.get()).transitional_ignore();
             }
 
             auto opTimeOfSnapshot = OpTime();

@@ -63,10 +63,10 @@ void ASIOTimer::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
 
         cancelTimeout();
 
-        std::error_code ec;
-        _impl.expires_after(std::min(kMaxTimerDuration, timeout).toSystemDuration(), ec);
-        if (ec) {
-            severe() << "Failed to set connection pool timer: " << ec.message();
+        try {
+            _impl.expires_after(std::min(kMaxTimerDuration, timeout).toSystemDuration());
+        } catch (const asio::system_error& ec) {
+            severe() << "Failed to set connection pool timer: " << ec.what();
             fassertFailed(40333);
         }
 
@@ -189,13 +189,8 @@ std::unique_ptr<NetworkInterfaceASIO::AsyncOp> ASIOConnection::makeAsyncOp(ASIOC
 }
 
 Message ASIOConnection::makeIsMasterRequest(ASIOConnection* conn) {
-    rpc::LegacyRequestBuilder requestBuilder{};
-    requestBuilder.setDatabase("admin");
-    requestBuilder.setCommandName("isMaster");
-    requestBuilder.setCommandArgs(BSON("isMaster" << 1));
-    requestBuilder.setMetadata(rpc::makeEmptyMetadata());
-
-    return requestBuilder.done();
+    return rpc::legacyRequestFromOpMsgRequest(
+        OpMsgRequest::fromDBAndBody("admin", BSON("isMaster" << 1)));
 }
 
 void ASIOConnection::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
