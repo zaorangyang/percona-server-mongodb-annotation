@@ -67,12 +67,14 @@ DIETIME=10
 # let some servers to die gracefully and
 # 'restart' will not work
 
-
+get_defaults() {
 # Include mongodb defaults if available
-if [ -f /etc/default/$NAME ] ; then
-	. /etc/default/$NAME
-fi
+  if [ -f "/etc/default/$NAME" ] ; then
+    . "/etc/default/$NAME"
+  fi
+}
 
+get_defaults
 if test ! -x $DAEMON; then
   echo "Could not find $DAEMON"
   exit 0
@@ -128,8 +130,9 @@ start_server() {
     ulimit -u 64000
   fi
 
-# Start the process using the wrapper
   /usr/bin/percona-server-mongodb-helper.sh
+  get_defaults
+# Start the process using the wrapper
   if [ -z "${NUMACTL}" -o ! -f /usr/bin/numactl ]; then
     start-stop-daemon --background --start --quiet --pidfile $PIDFILEPATH \
       --make-pidfile --chuid ${MONGO_USER} \
