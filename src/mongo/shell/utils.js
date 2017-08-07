@@ -229,8 +229,8 @@ jsTestOptions = function() {
             shardMixedBinVersions: TestData.shardMixedBinVersions || false,
             networkMessageCompressors: TestData.networkMessageCompressors,
             skipValidationOnInvalidViewDefinitions: TestData.skipValidationOnInvalidViewDefinitions,
-            forceValidationWithFeatureCompatibilityVersion:
-                TestData.forceValidationWithFeatureCompatibilityVersion
+            skipCollectionAndIndexValidation: TestData.skipCollectionAndIndexValidation,
+            skipValidationOnNamespaceNotFound: TestData.skipValidationOnNamespaceNotFound
         });
     }
     return _jsTestOptions;

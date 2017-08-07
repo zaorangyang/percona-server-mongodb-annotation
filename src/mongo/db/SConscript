@@ -458,8 +458,9 @@ env.Library(
         '$BUILD_DIR/mongo/util/decorable',
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/util/periodic_runner',
         '$BUILD_DIR/mongo/transport/transport_layer_common',
-        '$BUILD_DIR/mongo/transport/transport_layer_manager',
+        'logical_session_cache',
     ],
 )
 
@@ -555,7 +556,6 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver',
         'curop',
         'lasterror',
-        'assemble_response',
     ],
 )
 
@@ -572,17 +572,37 @@ env.Library(
 )
 
 env.Library(
+    target='system_index',
+    source=[
+        'system_index.cpp',
+    ],
+    LIBDEPS=[
+        'db_raii',
+        'catalog/index_key_validate',
+        'logical_session_cache',
+    ],
+)
+
+env.Library(
     target="service_context_d",
     source=[
-        "operation_context_impl.cpp",
         "service_context_d.cpp",
+        "service_entry_point_mongod.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/transport/service_entry_point',
+        'auth/authmongod',
+        'commands/dcommands_fsync',
         'concurrency/lock_manager',
         'curop',
-        'storage/storage_engine_lock_file',
-        'storage/storage_engine_metadata',
+        'curop_metrics',
+        'diag_log',
+        'lasterror',
+        'ops/write_ops',
+        'ops/write_ops_parsers',
+        'rw_concern_d',
+        's/sharding',
         'storage/storage_options',
     ],
 )
@@ -614,16 +634,14 @@ env.Library(
     target="clientcursor",
     source=[
         "clientcursor.cpp",
+        "cursor_manager.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/logical_session_id",
         "$BUILD_DIR/mongo/util/background_job",
         "query/query",
-        #"catalog/catalog", # CYCLE (CursorManager)
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-03-10): See `CYCLE` tags above
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
+        "background",
     ],
 )
 
@@ -747,30 +765,6 @@ env.Library(
 )
 
 env.Library(
-    target="assemble_response",
-    source=[
-        "assemble_response.cpp",
-        "run_commands.cpp",
-    ],
-    LIBDEPS=[
-        "curop",
-        "curop_metrics",
-        "diag_log",
-        "lasterror",
-        "ops/write_ops_parsers",
-        "storage/storage_options",
-        #'introspect', # CYCLE
-        #'$BUILD_DIR/mongo/db/ops/write_ops', # CYCLE
-        #'$BUILD_DIR/mongo/db/catalog/catalog', # CYCLE
-        #'$BUILD_DIR/mongo/db/commands/dcommands_fsync', # CYCLE
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-05-16): See `CYCLE` tags above
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
-    ],
-)
-
-env.Library(
     target="authz_manager_external_state_factory_d",
     source=[
         "authz_manager_external_state_factory_d.cpp",
@@ -803,7 +797,6 @@ env.Library(
         "$BUILD_DIR/mongo/db/storage/mmap_v1/file_allocator",
         "$BUILD_DIR/third_party/shim_snappy",
         '$BUILD_DIR/mongo/db/ttl_collection_cache',
-        "assemble_response",
         "auth/authmongod",
         "authz_manager_external_state_factory_d",
         "background",
@@ -914,7 +907,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/auth/authcore',
+        '$BUILD_DIR/mongo/db/auth/user_name',
         '$BUILD_DIR/mongo/idl/idl_parser',
         'logical_session_id'
     ],
@@ -929,6 +922,101 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/base',
         'logical_session_id',
         'logical_session_record',
+    ],
+)
+
+env.Library(
+    target='service_liason',
+    source=[
+        'service_liason.cpp',
+    ],
+    LIBDEPS=[
+    ],
+)
+
+envWithAsio = env.Clone()
+envWithAsio.InjectThirdPartyIncludePaths(libraries=['asio'])
+
+envWithAsio.Library(
+    target='service_liason_mock',
+    source=[
+        'service_liason_mock.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/executor/async_timer_mock',
+        '$BUILD_DIR/mongo/util/periodic_runner_asio',
+        'service_liason',
+    ],
+)
+
+env.Library(
+    target='sessions_collection',
+    source=[
+        'sessions_collection.cpp',
+    ],
+    LIBDEPS=[
+    ],
+)
+
+env.Library(
+    target='sessions_collection_mock',
+    source=[
+        'sessions_collection_mock.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/logical_session_id',
+        'sessions_collection',
+    ],
+)
+
+env.Library(
+    target='logical_session_cache',
+    source=[
+        'logical_session_cache.cpp',
+    ],
+    LIBDEPS=[
+        'logical_session_record',
+        'sessions_collection',
+        'server_parameters',
+        'service_liason',
+    ],
+)
+
+envWithAsio.CppUnitTest(
+    target='logical_session_cache_test',
+    source=[
+        'logical_session_cache_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/executor/async_timer_mock',
+        'logical_session_cache',
+        'service_liason_mock',
+        'sessions_collection_mock',
+    ],
+)
+
+envWithAsio.Library(
+    target='logical_session_cache_factory_mongod',
+    source=[
+        'logical_session_cache_factory_mongod.cpp',
+    ],
+    LIBDEPS=[
+        'logical_session_cache',
+        'service_liason_mock', # TODO SERVER-29198 replace with service_liason_mongod
+        'sessions_collection_mock', # TODO SERVER-29201, SERVER-29202, SERVER-29203
+    ],
+)
+
+envWithAsio.Library(
+    target='logical_session_cache_factory_mongos',
+    source=[
+        'logical_session_cache_factory_mongos.cpp',
+    ],
+    LIBDEPS=[
+        'logical_session_cache',
+        'service_liason_mock', # TODO SERVER-29199 replace with service_liason_mongos
+        'sessions_collection_mock', # TODO SERVER-29203 replace with sessions_collection_sharded
     ],
 )
 

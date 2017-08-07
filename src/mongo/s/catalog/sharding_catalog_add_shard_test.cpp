@@ -69,7 +69,7 @@ using unittest::assertGet;
 
 const BSONObj kReplSecondaryOkMetadata{[] {
     BSONObjBuilder o;
-    o.appendElements(ReadPreferenceSetting::secondaryPreferredMetadata());
+    ReadPreferenceSetting(ReadPreference::Nearest).toContainingBSON(&o);
     o.append(rpc::kReplSetMetadataFieldName, 1);
     return o.obj();
 }()};
@@ -132,6 +132,19 @@ protected:
         });
     }
 
+    void expectSetFeatureCompatibilityVersion(const HostAndPort& target,
+                                              StatusWith<BSONObj> response) {
+        onCommandForAddShard([&, target, response](const RemoteCommandRequest& request) {
+            ASSERT_EQ(request.target, target);
+            ASSERT_EQ(request.dbname, "admin");
+            ASSERT_BSONOBJ_EQ(request.cmdObj,
+                              BSON("setFeatureCompatibilityVersion"
+                                   << "3.4"));
+
+            return response;
+        });
+    }
+
     /**
      * Waits for a request for the shardIdentity document to be upserted into a shard from the
      * config server on addShard.
@@ -144,11 +157,10 @@ protected:
 
         // Get the BatchedUpdateRequest from the upsert command.
         BatchedCommandRequest request(BatchedCommandRequest::BatchType::BatchType_Update);
-        std::string errMsg;
-        invariant(request.parseBSON("admin", upsertCmdObj, &errMsg) || !request.isValid(&errMsg));
+        request.parseRequest(OpMsgRequest::fromDBAndBody("admin", upsertCmdObj));
 
         expectUpdatesReturnSuccess(expectedHost,
-                                   NamespaceString(NamespaceString::kConfigCollectionNamespace),
+                                   NamespaceString(NamespaceString::kServerConfigurationNamespace),
                                    request.getUpdateRequest());
     }
 
@@ -161,11 +173,10 @@ protected:
 
         // Get the BatchedUpdateRequest from the upsert command.
         BatchedCommandRequest request(BatchedCommandRequest::BatchType::BatchType_Update);
-        std::string errMsg;
-        invariant(request.parseBSON("admin", upsertCmdObj, &errMsg) || !request.isValid(&errMsg));
+        request.parseRequest(OpMsgRequest::fromDBAndBody("admin", upsertCmdObj));
 
         expectUpdatesReturnFailure(expectedHost,
-                                   NamespaceString(NamespaceString::kConfigCollectionNamespace),
+                                   NamespaceString(NamespaceString::kServerConfigurationNamespace),
                                    request.getUpdateRequest(),
                                    statusToReturn);
     }
@@ -185,8 +196,8 @@ protected:
             ASSERT_EQUALS(expectedNss.db(), request.dbname);
 
             BatchedUpdateRequest actualBatchedUpdates;
-            std::string errmsg;
-            ASSERT_TRUE(actualBatchedUpdates.parseBSON(request.dbname, request.cmdObj, &errmsg));
+            actualBatchedUpdates.parseRequest(
+                OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
 
             // Check that the db and collection names in the BatchedUpdateRequest match the
             // expected.
@@ -231,8 +242,8 @@ protected:
             ASSERT_EQUALS(expectedNss.db(), request.dbname);
 
             BatchedUpdateRequest actualBatchedUpdates;
-            std::string errmsg;
-            ASSERT_TRUE(actualBatchedUpdates.parseBSON(request.dbname, request.cmdObj, &errmsg));
+            actualBatchedUpdates.parseRequest(
+                OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
 
             // Check that the db and collection names in the BatchedUpdateRequest match the
             // expected.
@@ -404,6 +415,9 @@ TEST_F(AddShardTest, StandaloneBasicSuccess) {
                              BSON("name" << discoveredDB1.getName() << "sizeOnDisk" << 2000),
                              BSON("name" << discoveredDB2.getName() << "sizeOnDisk" << 5000)});
 
+    // The shard receives the setFeatureCompatibilityVersion command.
+    expectSetFeatureCompatibilityVersion(shardTarget, BSON("ok" << 1));
+
     // The shardIdentity doc inserted into the admin.system.version collection on the shard.
     expectShardIdentityUpsertReturnSuccess(shardTarget, expectedShardName);
 
@@ -482,6 +496,9 @@ TEST_F(AddShardTest, StandaloneGenerateName) {
                                   << 1000),
                              BSON("name" << discoveredDB1.getName() << "sizeOnDisk" << 2000),
                              BSON("name" << discoveredDB2.getName() << "sizeOnDisk" << 5000)});
+
+    // The shard receives the setFeatureCompatibilityVersion command.
+    expectSetFeatureCompatibilityVersion(shardTarget, BSON("ok" << 1));
 
     // The shardIdentity doc inserted into the admin.system.version collection on the shard.
     expectShardIdentityUpsertReturnSuccess(shardTarget, expectedShardName);
@@ -896,6 +913,9 @@ TEST_F(AddShardTest, SuccessfullyAddReplicaSet) {
     // Get databases list from new shard
     expectListDatabases(shardTarget, std::vector<BSONObj>{BSON("name" << discoveredDB.getName())});
 
+    // The shard receives the setFeatureCompatibilityVersion command.
+    expectSetFeatureCompatibilityVersion(shardTarget, BSON("ok" << 1));
+
     // The shardIdentity doc inserted into the admin.system.version collection on the shard.
     expectShardIdentityUpsertReturnSuccess(shardTarget, expectedShardName);
 
@@ -957,6 +977,9 @@ TEST_F(AddShardTest, ReplicaSetExtraHostsDiscovered) {
 
     // Get databases list from new shard
     expectListDatabases(shardTarget, std::vector<BSONObj>{BSON("name" << discoveredDB.getName())});
+
+    // The shard receives the setFeatureCompatibilityVersion command.
+    expectSetFeatureCompatibilityVersion(shardTarget, BSON("ok" << 1));
 
     // The shardIdentity doc inserted into the admin.system.version collection on the shard.
     expectShardIdentityUpsertReturnSuccess(shardTarget, expectedShardName);
@@ -1033,6 +1056,9 @@ TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
                                   << 1000),
                              BSON("name" << discoveredDB1.getName() << "sizeOnDisk" << 2000),
                              BSON("name" << discoveredDB2.getName() << "sizeOnDisk" << 5000)});
+
+    // The shard receives the setFeatureCompatibilityVersion command.
+    expectSetFeatureCompatibilityVersion(shardTarget, BSON("ok" << 1));
 
     // The shardIdentity doc inserted into the admin.system.version collection on the shard.
     expectShardIdentityUpsertReturnSuccess(shardTarget, expectedShardName);

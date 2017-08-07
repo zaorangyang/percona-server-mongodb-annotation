@@ -37,12 +37,12 @@ namespace {
 
 using namespace mongo;
 
-TEST(RequestBuilder, RoundTrip) {
+TEST(CommandRequestBuilder, RoundTrip) {
     auto databaseName = "barbaz";
     auto commandName = "foobar";
 
     BSONObjBuilder metadataBob{};
-    metadataBob.append("foo", "bar");
+    metadataBob.append("$replData", BSONObj());
     auto metadata = metadataBob.done();
 
     BSONObjBuilder commandArgsBob{};
@@ -61,25 +61,44 @@ TEST(RequestBuilder, RoundTrip) {
     inputDoc3Bob.append("g", "p");
     auto inputDoc3 = inputDoc3Bob.done();
 
-    BufBuilder inputDocs;
-    inputDoc1.appendSelfToBufBuilder(inputDocs);
-    inputDoc2.appendSelfToBufBuilder(inputDocs);
-    inputDoc3.appendSelfToBufBuilder(inputDocs);
+    auto msg = rpc::opCommandRequestFromOpMsgRequest(
+        OpMsgRequest::fromDBAndBody(databaseName, commandArgs, metadata));
 
-    rpc::CommandRequestBuilder r;
+    auto parsed = mongo::rpc::ParsedOpCommand::parse(msg);
 
-    auto msg = r.setDatabase(databaseName)
-                   .setCommandName(commandName)
-                   .setCommandArgs(commandArgs)
-                   .setMetadata(metadata)
-                   .done();
+    ASSERT_EQUALS(parsed.database, databaseName);
+    ASSERT_EQUALS(StringData(parsed.body.firstElementFieldName()), commandName);
+    ASSERT_BSONOBJ_EQ(parsed.metadata, metadata);
+    ASSERT_BSONOBJ_EQ(parsed.body, commandArgs);
+}
 
-    rpc::CommandRequest parsed(&msg);
+TEST(CommandRequestBuilder, DownconvertSecondaryReadPreferenceToSSM) {
+    auto readPref = BSON("mode"
+                         << "secondary");
+    auto msg = rpc::opCommandRequestFromOpMsgRequest(
+        OpMsgRequest::fromDBAndBody("admin", BSON("ping" << 1 << "$readPreference" << readPref)));
+    auto parsed = mongo::rpc::ParsedOpCommand::parse(msg);
 
-    ASSERT_EQUALS(parsed.getDatabase(), databaseName);
-    ASSERT_EQUALS(parsed.getCommandName(), commandName);
-    ASSERT_BSONOBJ_EQ(parsed.getMetadata(), metadata);
-    ASSERT_BSONOBJ_EQ(parsed.getCommandArgs(), commandArgs);
+    ASSERT(!parsed.body.hasField("$readPreference"));
+    ASSERT(!parsed.body.hasField("$ssm"));
+    ASSERT(!parsed.metadata.hasField("$readPreference"));
+
+    ASSERT_BSONOBJ_EQ(parsed.metadata["$ssm"]["$readPreference"].Obj(), readPref);
+    ASSERT(parsed.metadata["$ssm"]["$secondaryOk"].trueValue());
+}
+
+TEST(CommandRequestBuilder, DownconvertPrimaryReadPreferenceToSSM) {
+    auto readPref = BSON("mode"
+                         << "primary");
+    auto msg = rpc::opCommandRequestFromOpMsgRequest(
+        OpMsgRequest::fromDBAndBody("admin", BSON("ping" << 1 << "$readPreference" << readPref)));
+    auto parsed = mongo::rpc::ParsedOpCommand::parse(msg);
+
+    ASSERT(!parsed.body.hasField("$readPreference"));
+    ASSERT(!parsed.body.hasField("$ssm"));
+    ASSERT(!parsed.metadata.hasField("$readPreference"));
+
+    ASSERT(!parsed.metadata["$ssm"]["$secondaryOk"].trueValue());
 }
 
 }  // namespace

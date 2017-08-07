@@ -77,32 +77,82 @@ TEST(CommandRequest, ParseAllFields) {
     Message toSend;
     toSend.setData(dbCommand, opCommandData.data(), opCommandData.size());
 
-    rpc::CommandRequest opCmd{&toSend};
+    auto opCmd = rpc::ParsedOpCommand::parse(toSend);
 
-    ASSERT_EQUALS(opCmd.getCommandName(), commandName);
-    ASSERT_EQUALS(opCmd.getDatabase(), database);
-    ASSERT_BSONOBJ_EQ(opCmd.getMetadata(), metadata);
-    ASSERT_BSONOBJ_EQ(opCmd.getCommandArgs(), commandArgs);
+    ASSERT_EQUALS(opCmd.body.firstElementFieldName(), commandName);
+    ASSERT_EQUALS(opCmd.database, database);
+    ASSERT_BSONOBJ_EQ(opCmd.metadata, metadata);
+    ASSERT_BSONOBJ_EQ(opCmd.body, commandArgs);
 }
 
 TEST(CommandRequest, EmptyCommandObjThrows) {
-    rpc::CommandRequestBuilder crb;
-    crb.setDatabase("someDb");
-    crb.setCommandName("ping");
-    crb.setCommandArgs(BSONObj());
-    crb.setMetadata(BSONObj());
-    auto msg = crb.done();
-    ASSERT_THROWS_CODE(rpc::CommandRequest{&msg}, UserException, 39950);
+    std::vector<char> opCommandData;
+
+    using std::begin;
+    using std::end;
+
+    auto writeString = [&opCommandData](const std::string& str) {
+        opCommandData.insert(end(opCommandData), begin(str), end(str));
+        opCommandData.push_back('\0');
+    };
+
+    auto writeObj = [&opCommandData](const BSONObj& obj) {
+        opCommandData.insert(end(opCommandData), obj.objdata(), obj.objdata() + obj.objsize());
+    };
+
+    auto database = std::string{"someDb"};
+    writeString(database);
+
+    auto commandName = std::string{"baz"};
+    writeString(commandName);
+
+    auto commandArgs = BSONObj();
+    writeObj(commandArgs);
+
+    BSONObjBuilder metadataBob{};
+    metadataBob.append("foo", "bar");
+    auto metadata = metadataBob.done();
+    writeObj(metadata);
+
+    Message msg;
+    msg.setData(dbCommand, opCommandData.data(), opCommandData.size());
+
+    ASSERT_THROWS_CODE(rpc::ParsedOpCommand::parse(msg), UserException, 39950);
 }
 
 TEST(CommandRequest, MismatchBetweenCommandNamesThrows) {
-    rpc::CommandRequestBuilder crb;
-    crb.setDatabase("someDb");
-    crb.setCommandName("ping");
-    crb.setCommandArgs(BSON("launchMissiles" << 1));
-    crb.setMetadata(BSONObj());
-    auto msg = crb.done();
-    ASSERT_THROWS_CODE(rpc::CommandRequest{&msg}, UserException, 39950);
+    std::vector<char> opCommandData;
+
+    using std::begin;
+    using std::end;
+
+    auto writeString = [&opCommandData](const std::string& str) {
+        opCommandData.insert(end(opCommandData), begin(str), end(str));
+        opCommandData.push_back('\0');
+    };
+
+    auto writeObj = [&opCommandData](const BSONObj& obj) {
+        opCommandData.insert(end(opCommandData), obj.objdata(), obj.objdata() + obj.objsize());
+    };
+
+    auto database = std::string{"someDb"};
+    writeString(database);
+
+    auto commandName = std::string{"fakeName"};
+    writeString(commandName);
+
+    auto commandArgs = BSON("realName" << 1);
+    writeObj(commandArgs);
+
+    BSONObjBuilder metadataBob{};
+    metadataBob.append("foo", "bar");
+    auto metadata = metadataBob.done();
+    writeObj(metadata);
+
+    Message msg;
+    msg.setData(dbCommand, opCommandData.data(), opCommandData.size());
+
+    ASSERT_THROWS_CODE(rpc::ParsedOpCommand::parse(msg), UserException, 39950);
 }
 
 }  // namespace

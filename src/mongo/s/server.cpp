@@ -54,6 +54,8 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_session_cache.h"
+#include "mongo/db/logical_session_cache_factory_mongos.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
@@ -87,7 +89,7 @@
 #include "mongo/s/version_mongos.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/transport/transport_layer_legacy.h"
+#include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/admin_access.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
@@ -101,6 +103,8 @@
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/periodic_runner.h"
+#include "mongo/util/periodic_runner_factory.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
@@ -145,8 +149,15 @@ static void cleanupTask() {
             opCtx = uniqueTxn.get();
         }
 
-        if (serviceContext)
+        if (serviceContext) {
             serviceContext->setKillAllOperations();
+
+            // Shut down the background periodic task runner.
+            auto runner = serviceContext->getPeriodicRunner();
+            if (runner) {
+                runner->shutdown();
+            }
+        }
 
         // Validator shutdown must be called after setKillAllOperations is called. Otherwise, this
         // can deadlock.
@@ -227,7 +238,7 @@ static Status initializeSharding(OperationContext* opCtx) {
         return status;
     }
 
-    status = reloadShardRegistryUntilSuccess(opCtx);
+    status = waitForShardRegistryReload(opCtx);
     if (!status.isOK()) {
         return status;
     }
@@ -250,21 +261,17 @@ static ExitCode runMongosServer() {
 
     _initWireSpec();
 
-    transport::TransportLayerLegacy::Options opts;
-    opts.port = serverGlobalParams.port;
-    opts.ipList = serverGlobalParams.bind_ip;
-
-    auto sep =
-        stdx::make_unique<ServiceEntryPointMongos>(getGlobalServiceContext()->getTransportLayer());
-    auto sepPtr = sep.get();
-
+    auto sep = stdx::make_unique<ServiceEntryPointMongos>(getGlobalServiceContext());
     getGlobalServiceContext()->setServiceEntryPoint(std::move(sep));
 
-    auto transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(opts, sepPtr);
-    auto res = transportLayer->setup();
+    auto tl = transport::TransportLayerManager::createWithConfig(&serverGlobalParams,
+                                                                 getGlobalServiceContext());
+    auto res = tl->setup();
     if (!res.isOK()) {
+        error() << "Failed to set up listener: " << res;
         return EXIT_NET_ERROR;
     }
+    getGlobalServiceContext()->setTransportLayer(std::move(tl));
 
     auto unshardedHookList = stdx::make_unique<rpc::EgressMetadataHookList>();
     unshardedHookList->addHook(
@@ -311,7 +318,10 @@ static ExitCode runMongosServer() {
             return EXIT_SHARDING_ERROR;
         }
 
-        Grid::get(opCtx.get())->getBalancerConfiguration()->refreshAndCheck(opCtx.get());
+        Grid::get(opCtx.get())
+            ->getBalancerConfiguration()
+            ->refreshAndCheck(opCtx.get())
+            .transitional_ignore();
     }
 
     Status status = getGlobalAuthorizationManager()->initialize(NULL);
@@ -335,11 +345,20 @@ static ExitCode runMongosServer() {
 
     PeriodicTask::startRunningPeriodicTasks();
 
-    auto start = getGlobalServiceContext()->addAndStartTransportLayer(std::move(transportLayer));
+    // Set up the periodic runner for background job execution
+    auto runner = makePeriodicRunner();
+    runner->startup().transitional_ignore();
+    getGlobalServiceContext()->setPeriodicRunner(std::move(runner));
+
+    // Set up the logical session cache
+    getGlobalServiceContext()->setLogicalSessionCache(makeLogicalSessionCacheS());
+
+    auto start = getGlobalServiceContext()->getTransportLayer()->start();
     if (!start.isOK()) {
         return EXIT_NET_ERROR;
     }
 
+    getGlobalServiceContext()->notifyStartupComplete();
 #if !defined(_WIN32)
     mongo::signalForkSuccess();
 #else
@@ -362,12 +381,12 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 }
 }  // namespace
 
-// We set the featureCompatibilityVersion to 3.4 in the mongos so that BSON validation always uses
-// BSONVersion::kLatest.
-MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion34, ("EndStartupOptionStorage"))
+// We set the featureCompatibilityVersion to 3.6 in the mongos and rely on the shards to reject
+// usages of new features if their featureCompatibilityVersion is lower.
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion36, ("EndStartupOptionStorage"))
 (InitializerContext* context) {
     mongo::serverGlobalParams.featureCompatibility.version.store(
-        ServerGlobalParams::FeatureCompatibility::Version::k34);
+        ServerGlobalParams::FeatureCompatibility::Version::k36);
     return Status::OK();
 }
 

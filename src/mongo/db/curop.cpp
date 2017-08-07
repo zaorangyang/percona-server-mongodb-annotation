@@ -350,8 +350,8 @@ void appendAsObjOrString(StringData name,
 
 void CurOp::reportState(BSONObjBuilder* builder) {
     if (_start) {
-        builder->append("secs_running", elapsedSeconds());
-        builder->append("microsecs_running", static_cast<long long int>(elapsedMicros()));
+        builder->append("secs_running", durationCount<Seconds>(elapsedTimeTotal()));
+        builder->append("microsecs_running", durationCount<Microseconds>(elapsedTimeTotal()));
     }
 
     builder->append("op", logicalOpToString(_logicalOp));
@@ -429,9 +429,8 @@ bool CurOp::_shouldDBProfileWithRateLimit() {
     if (_dbprofile <= 0)
         return false;
 
-    long long opMicros = isDone() ? totalTimeMicros() : elapsedMicros();
     // Slow operations are always profiled in both "slow queries" and "all queries" modes
-    if (opMicros >= serverGlobalParams.slowMS * 1000LL)
+    if (elapsedTimeExcludingPauses() >= Milliseconds{serverGlobalParams.slowMS})
         return true;
     // Fast operations are sampled by rate limit (only in "all queries" mode)
     if (_dbprofile >= 2)

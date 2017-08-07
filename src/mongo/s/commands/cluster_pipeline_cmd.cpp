@@ -62,8 +62,8 @@ public:
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj);
+        const NamespaceString nss(AggregationRequest::parseNs(dbname, cmdObj));
+        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj, true);
     }
 
     bool run(OperationContext* opCtx,
@@ -80,19 +80,7 @@ public:
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
-        // Add the read preference to the aggregate command in the "unwrapped" format that
-        // runAggregate() expects: {aggregate: ..., $queryOptions: {$readPreference: ...}}.
-        const auto& readPref = ReadPreferenceSetting::get(opCtx);
-        BSONObjBuilder aggCmdBuilder;
-        aggCmdBuilder.appendElements(cmdObj);
-        if (readPref.canRunOnSecondary()) {
-            auto queryOptionsBuilder =
-                BSONObjBuilder(aggCmdBuilder.subobjStart(QueryRequest::kUnwrappedReadPrefField));
-            readPref.toContainingBSON(&queryOptionsBuilder);
-        }
-        BSONObj aggCmd = aggCmdBuilder.obj();
-
-        return _runAggCommand(opCtx, dbname, aggCmd, verbosity, out);
+        return _runAggCommand(opCtx, dbname, cmdObj, verbosity, out);
     }
 
 private:
@@ -101,16 +89,13 @@ private:
                                  const BSONObj& cmdObj,
                                  boost::optional<ExplainOptions::Verbosity> verbosity,
                                  BSONObjBuilder* result) {
-        NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
-
         const auto aggregationRequest =
-            uassertStatusOK(AggregationRequest::parseFromBSON(nss, cmdObj, verbosity));
+            uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, verbosity));
 
-        return ClusterAggregate::runAggregate(opCtx,
-                                              ClusterAggregate::Namespaces{nss, std::move(nss)},
-                                              aggregationRequest,
-                                              cmdObj,
-                                              result);
+        const auto& nss = aggregationRequest.getNamespaceString();
+
+        return ClusterAggregate::runAggregate(
+            opCtx, ClusterAggregate::Namespaces{nss, nss}, aggregationRequest, cmdObj, result);
     }
 
 } clusterPipelineCmd;

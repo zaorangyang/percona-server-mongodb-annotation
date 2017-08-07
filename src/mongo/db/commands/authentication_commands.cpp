@@ -145,7 +145,7 @@ void CmdAuthenticate::redactForLogging(mutablebson::Document* cmdObj) {
         for (mmb::Element element = mmb::findFirstChildNamed(cmdObj->root(), redactedFields[i]);
              element.ok();
              element = mmb::findElementNamed(element.rightSibling(), redactedFields[i])) {
-            element.setValueString("xxx");
+            element.setValueString("xxx").transitional_ignore();
         }
     }
 }
@@ -184,8 +184,10 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
     audit::logAuthentication(Client::getCurrent(), mechanism, user, status.code());
     if (!status.isOK()) {
         if (!serverGlobalParams.quiet.load()) {
-            log() << "Failed to authenticate " << user << " with mechanism " << mechanism << ": "
-                  << status;
+            auto const client = opCtx->getClient();
+            log() << "Failed to authenticate " << user
+                  << (client->hasRemote() ? (" from client " + client->getRemote().toString()) : "")
+                  << " with mechanism " << mechanism << ": " << status;
         }
         if (status.code() == ErrorCodes::AuthenticationFailed) {
             // Statuses with code AuthenticationFailed may contain messages we do not wish to

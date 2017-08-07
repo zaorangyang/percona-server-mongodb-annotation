@@ -33,15 +33,13 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/rpc/reply_interface.h"
-#include "mongo/rpc/request_interface.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
 namespace rpc {
 
 /**
- * A wrapper around an owned message that includes access to an associated
- * ReplyInterface or RequestInterface.
+ * A wrapper around an owned message that includes access to an associated ReplyInterface.
  */
 template <typename MessageViewType>
 class UniqueMessage {
@@ -77,7 +75,6 @@ private:
 };
 
 using UniqueReply = UniqueMessage<ReplyInterface>;
-using UniqueRequest = UniqueMessage<RequestInterface>;
 
 }  // namespace rpc
 }  // namespace mongo

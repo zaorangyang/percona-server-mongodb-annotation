@@ -31,12 +31,16 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/util/net/listen.h"  // For DEFAULT_MAX_CONN
+
+// TODO(SERVER-29687) Remove this include. A bunch of places assume they can call
+// getHostName()/getHostNameCached() by including server_options.h.
+#include "mongo/util/net/sock.h"
 
 namespace mongo {
 
 const int DEFAULT_UNIX_PERMS = 0700;
 const int RATE_LIMIT_MAX = 1000;
+constexpr auto DEFAULT_MAX_CONN = 1000000;
 
 enum class ClusterRole { None, ShardServer, ConfigServer };
 
@@ -51,7 +55,8 @@ struct ServerGlobalParams {
     }
 
     std::string bind_ip;  // --bind_ip
-    bool rest = false;    // --rest
+    bool enableIPv6 = false;
+    bool rest = false;  // --rest
 
     bool indexBuildRetry = true;  // --noIndexBuildRetry
 
@@ -70,16 +75,17 @@ struct ServerGlobalParams {
     int defaultLocalThresholdMillis = 15;  // --localThreshold in ms to consider a node local
     bool moveParanoia = false;             // for move chunk paranoia
 
-    bool noUnixSocket = false;    // --nounixsocket
-    bool doFork = false;          // --fork
-    std::string socket = "/tmp";  // UNIX domain socket directory
-
+    bool noUnixSocket = false;        // --nounixsocket
+    bool doFork = false;              // --fork
+    std::string socket = "/tmp";      // UNIX domain socket directory
+    std::string transportLayer;       // --transportLayer (must be either "asio" or "legacy")
     int maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
 
     int unixSocketPermissions = DEFAULT_UNIX_PERMS;  // permissions for the UNIX domain socket
 
-    std::string keyFile;  // Path to keyfile, or empty if none.
-    std::string pidFile;  // Path to pid file, or empty if none.
+    std::string keyFile;           // Path to keyfile, or empty if none.
+    std::string pidFile;           // Path to pid file, or empty if none.
+    std::string timeZoneInfoPath;  // Path to time zone info directory, or empty if none.
 
     std::string logpath;            // Path to log file, if logging to a file; otherwise, empty.
     bool logAppend = false;         // True if logging to a file in append mode.
@@ -153,21 +159,20 @@ struct ServerGlobalParams {
     struct FeatureCompatibility {
         enum class Version {
             /**
-             * In this mode, the cluster will expose a 3.2-like API. Attempts by a client to use new
-             * features in 3.4, such as read-only views, collation, or the decimal128 BSON type,
-             * will be rejected.
-             */
-            k32,
-
-            /**
-             * In this mode, new features in 3.4 are allowed. The system should guarantee that no
-             * 3.2 node can participate in a cluster whose feature compatibility version is 3.4.
+             * In this mode, the cluster will expose a 3.4-like API. Attempts by a client to use new
+             * features in 3.6 will be rejected.
              */
             k34,
+
+            /**
+             * In this mode, new features in 3.6 are allowed. The system should guarantee that no
+             * 3.4 node can participate in a cluster whose feature compatibility version is 3.6.
+             */
+            k36,
         };
 
         // Read-only parameter featureCompatibilityVersion.
-        AtomicWord<Version> version{Version::k32};
+        AtomicWord<Version> version{Version::k34};
 
         // Feature validation differs depending on the role of a mongod in a replica set or
         // master/slave configuration. Masters/primaries can accept user-initiated writes and

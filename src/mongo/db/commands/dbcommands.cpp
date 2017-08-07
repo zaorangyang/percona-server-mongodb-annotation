@@ -93,9 +93,6 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/rpc/metadata.h"
-#include "mongo/rpc/reply_builder_interface.h"
-#include "mongo/rpc/request_interface.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
@@ -545,7 +542,7 @@ public:
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         const NamespaceString nss(parseNs(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForCreate(nss, cmdObj);
+        return AuthorizationSession::get(client)->checkAuthForCreate(nss, cmdObj, false);
     }
 
     virtual bool run(OperationContext* opCtx,
@@ -560,19 +557,6 @@ public:
                 "the autoIndexId option is deprecated and will be removed in a future release";
             warning() << deprecationWarning;
             result.append("note", deprecationWarning);
-        }
-
-        auto featureCompatibilityVersion = serverGlobalParams.featureCompatibility.version.load();
-        auto validateFeaturesAsMaster =
-            serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.load();
-        if (ServerGlobalParams::FeatureCompatibility::Version::k32 == featureCompatibilityVersion &&
-            validateFeaturesAsMaster && cmdObj.hasField("collation")) {
-            return appendCommandStatus(
-                result,
-                {ErrorCodes::InvalidOptions,
-                 "The featureCompatibilityVersion must be 3.4 to create a collection or "
-                 "view with a default collation. See "
-                 "http://dochub.mongodb.org/core/3.4-feature-compatibility."});
         }
 
         // Validate _id index spec and fill in missing fields.
@@ -1056,7 +1040,7 @@ public:
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         const NamespaceString nss(parseNs(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForCollMod(nss, cmdObj);
+        return AuthorizationSession::get(client)->checkAuthForCollMod(nss, cmdObj, false);
     }
 
     bool run(OperationContext* opCtx,

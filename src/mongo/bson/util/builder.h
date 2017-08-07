@@ -30,6 +30,7 @@
 #pragma once
 
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <sstream>
 #include <stdio.h>
@@ -48,6 +49,7 @@
 #include "mongo/stdx/type_traits.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/itoa.h"
 #include "mongo/util/shared_buffer.h"
 
 namespace mongo {
@@ -78,6 +80,9 @@ class SharedBufferAllocator {
 
 public:
     SharedBufferAllocator() = default;
+    SharedBufferAllocator(SharedBuffer buf) : _buf(std::move(buf)) {
+        invariant(!_buf.isShared());
+    }
 
     // Allow moving but not copying. It would be an error for two SharedBufferAllocators to use the
     // same underlying buffer.
@@ -312,6 +317,18 @@ public:
         reservedBytes -= bytes;
     }
 
+    /**
+     * Replaces the buffer backing this BufBuilder with the passed in SharedBuffer.
+     * Only legal to call when this builder is empty and when the SharedBuffer isn't shared.
+     */
+    void useSharedBuffer(SharedBuffer buf) {
+        MONGO_STATIC_ASSERT(std::is_same<BufferAllocator, SharedBufferAllocator>());
+        invariant(l == 0);  // Can only do this while empty.
+        invariant(reservedBytes == 0);
+        size = buf.capacity();
+        _buf = SharedBufferAllocator(std::move(buf));
+    }
+
 private:
     template <typename T>
     void appendNumImpl(T t) {
@@ -380,25 +397,25 @@ public:
         return SBNUM(x, MONGO_DBL_SIZE, "%g");
     }
     StringBuilderImpl& operator<<(int x) {
-        return SBNUM(x, MONGO_S32_SIZE, "%d");
+        return appendIntegral(x, MONGO_S32_SIZE);
     }
     StringBuilderImpl& operator<<(unsigned x) {
-        return SBNUM(x, MONGO_U32_SIZE, "%u");
+        return appendIntegral(x, MONGO_U32_SIZE);
     }
     StringBuilderImpl& operator<<(long x) {
-        return SBNUM(x, MONGO_S64_SIZE, "%ld");
+        return appendIntegral(x, MONGO_S64_SIZE);
     }
     StringBuilderImpl& operator<<(unsigned long x) {
-        return SBNUM(x, MONGO_U64_SIZE, "%lu");
+        return appendIntegral(x, MONGO_U64_SIZE);
     }
     StringBuilderImpl& operator<<(long long x) {
-        return SBNUM(x, MONGO_S64_SIZE, "%lld");
+        return appendIntegral(x, MONGO_S64_SIZE);
     }
     StringBuilderImpl& operator<<(unsigned long long x) {
-        return SBNUM(x, MONGO_U64_SIZE, "%llu");
+        return appendIntegral(x, MONGO_U64_SIZE);
     }
     StringBuilderImpl& operator<<(short x) {
-        return SBNUM(x, MONGO_S16_SIZE, "%hd");
+        return appendIntegral(x, MONGO_S16_SIZE);
     }
     StringBuilderImpl& operator<<(const void* x) {
         if (sizeof(x) == 8) {
@@ -472,6 +489,20 @@ public:
 
 private:
     _BufBuilder<Allocator> _buf;
+    template <typename T>
+    StringBuilderImpl& appendIntegral(T val, int maxSize) {
+        MONGO_STATIC_ASSERT(!std::is_same<T, char>());  // char shouldn't append as number.
+        MONGO_STATIC_ASSERT(std::is_integral<T>());
+
+        if (val < 0) {
+            *this << '-';
+            append(StringData(ItoA(0 - uint64_t(val))));  // Send the magnitude to ItoA.
+        } else {
+            append(StringData(ItoA(uint64_t(val))));
+        }
+
+        return *this;
+    }
 
     template <typename T>
     StringBuilderImpl& SBNUM(T val, int maxSize, const char* macro) {

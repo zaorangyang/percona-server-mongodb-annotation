@@ -827,6 +827,8 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
     MongoRunner.EXIT_UNCAUGHT = 100;  // top level exception that wasn't caught
     MongoRunner.EXIT_TEST = 101;
 
+    MongoRunner.validateCollectionsCallback = function(port) {};
+
     /**
      * Kills a mongod process.
      *
@@ -849,6 +851,11 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                             "it is usually the object returned from MongoRunner.runMongod/s");
         }
 
+        if (!conn.port) {
+            throw new Error("first arg must have a `port` property; " +
+                            "it is usually the object returned from MongoRunner.runMongod/s");
+        }
+
         signal = parseInt(signal) || 15;
         opts = opts || {};
 
@@ -868,6 +875,13 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
             returnCode = serverExitCodeMap[pid];
             delete serverExitCodeMap[pid];
         } else {
+            // Invoke callback to validate collections and indexes before shutting down mongod.
+            // We skip calling the callback function when the expected return code of
+            // the mongod process is non-zero since it's likely the process has already exited.
+            if (allowedExitCode === MongoRunner.EXIT_CLEAN) {
+                MongoRunner.validateCollectionsCallback(port);
+            }
+
             returnCode = _stopMongoProgram(port, signal, opts);
         }
         if (allowedExitCode !== returnCode) {
@@ -1116,7 +1130,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
     /**
      * Start a mongo process with a particular argument array.
      * If we aren't waiting for connect, return {pid: <pid>}.
-     * If we are not waiting for connect:
+     * If we are waiting for connect:
      *     returns connection to process on success;
      *     otherwise returns null if we fail to connect.
      */

@@ -149,14 +149,8 @@ CommandAndMetadata upconvertRequestMetadata(BSONObj legacyCmdObj, int queryFlags
         ReadPreferenceSetting(ReadPreference::SecondaryPreferred).toContainingBSON(&metadataBob);
     }
 
-    // Ordering is important here - AuditMetadata::upconvert() expects the above up-conversion to
-    // already be done.
-    BSONObjBuilder auditCommandBob;
-    uassertStatusOK(
-        AuditMetadata::upconvert(legacyCmdObj, queryFlags, &auditCommandBob, &metadataBob));
-
     BSONObjBuilder logicalTimeCommandBob;
-    for (auto elem : auditCommandBob.done()) {
+    for (auto elem : legacyCmdObj) {
         if (elem.fieldNameStringData() == LogicalTimeMetadata::fieldName()) {
             metadataBob.append(elem);
         } else {
@@ -165,40 +159,6 @@ CommandAndMetadata upconvertRequestMetadata(BSONObj legacyCmdObj, int queryFlags
     }
 
     return std::make_tuple(logicalTimeCommandBob.obj(), metadataBob.obj());
-}
-
-LegacyCommandAndFlags downconvertRequestMetadata(BSONObj cmdObj, BSONObj metadata) {
-    int legacyQueryFlags = 0;
-    BSONObjBuilder logicalTimeCommandBob;
-    logicalTimeCommandBob.appendElements(cmdObj);
-    if (auto logicalTime = metadata[LogicalTimeMetadata::fieldName()]) {
-        logicalTimeCommandBob.append(logicalTime);
-    }
-
-    // Ordering is important here - AuditingMetadata must be downconverted before ReadPreference.
-    BSONObjBuilder auditCommandBob;
-    uassertStatusOK(AuditMetadata::downconvert(
-        logicalTimeCommandBob.done(), metadata, &auditCommandBob, &legacyQueryFlags));
-
-    cmdObj = auditCommandBob.obj();
-
-    auto readPref = metadata["$readPreference"];
-    if (!readPref)
-        readPref = cmdObj["$readPreference"];
-
-    if (readPref) {
-        BSONObjBuilder bob;
-        bob.append("$query", cmdObj);
-        bob.append(readPref);
-        cmdObj = bob.obj();
-
-        auto parsed = ReadPreferenceSetting::fromInnerBSON(readPref);
-        if (parsed.isOK() && parsed.getValue().canRunOnSecondary()) {
-            legacyQueryFlags |= QueryOption_SlaveOk;
-        }
-    }
-
-    return std::make_tuple(cmdObj, std::move(legacyQueryFlags));
 }
 
 CommandReplyWithMetadata upconvertReplyMetadata(const BSONObj& legacyReply) {

@@ -38,7 +38,7 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/commands/cluster_aggregate.h"
-#include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
@@ -141,14 +141,16 @@ public:
         auto countCmdObj = countCmdBuilder.done();
 
         BSONObj viewDefinition;
-        auto swShardResponses = scatterGatherForNamespace(opCtx,
-                                                          nss,
-                                                          countCmdObj,
-                                                          getReadPref(countCmdObj),
-                                                          filter,
-                                                          collation,
-                                                          true,  // do shard versioning
-                                                          &viewDefinition);
+        auto swShardResponses = scatterGather(opCtx,
+                                              dbname,
+                                              nss,
+                                              countCmdObj,
+                                              ReadPreferenceSetting::get(opCtx),
+                                              ShardTargetingPolicy::UseRoutingTable,
+                                              filter,
+                                              collation,
+                                              true,  // do shard versioning
+                                              &viewDefinition);
 
         if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == swShardResponses.getStatus()) {
             if (viewDefinition.isEmpty()) {
@@ -269,14 +271,16 @@ public:
         Timer timer;
 
         BSONObj viewDefinition;
-        auto swShardResponses = scatterGatherForNamespace(opCtx,
-                                                          nss,
-                                                          explainCmd,
-                                                          getReadPref(explainCmd),
-                                                          targetingQuery,
-                                                          targetingCollation,
-                                                          true,  // do shard versioning
-                                                          &viewDefinition);
+        auto swShardResponses = scatterGather(opCtx,
+                                              dbname,
+                                              nss,
+                                              explainCmd,
+                                              ReadPreferenceSetting::get(opCtx),
+                                              ShardTargetingPolicy::UseRoutingTable,
+                                              targetingQuery,
+                                              targetingCollation,
+                                              true,  // do shard versioning
+                                              &viewDefinition);
 
         long long millisElapsed = timer.millis();
 

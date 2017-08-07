@@ -33,25 +33,22 @@
 #include <memory>
 
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface_local.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
@@ -84,22 +81,6 @@ NamespaceString makeNamespace(const T& t, const std::string& suffix = "") {
     return NamespaceString(std::string("local." + t.getSuiteName() + "_" + t.getTestName())
                                .substr(0, NamespaceString::MaxNsCollectionLen - suffix.length()) +
                            suffix);
-}
-
-/**
- * Returns min valid document.
- */
-BSONObj getMinValidDocument(OperationContext* opCtx, const NamespaceString& minValidNss) {
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-        Lock::DBLock dblk(opCtx, minValidNss.db(), MODE_IS);
-        Lock::CollectionLock lk(opCtx->lockState(), minValidNss.ns(), MODE_IS);
-        BSONObj mv;
-        if (Helpers::getSingleton(opCtx, minValidNss.ns().c_str(), mv)) {
-            return mv;
-        }
-    }
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "getMinValidDocument", minValidNss.ns());
-    return BSONObj();
 }
 
 /**
@@ -137,8 +118,7 @@ void createCollection(OperationContext* opCtx,
  * Creates an oplog entry with given optime.
  */
 BSONObj makeOplogEntry(OpTime opTime) {
-    BSONObjBuilder bob;
-    bob.appendElements(opTime.toBSON());
+    BSONObjBuilder bob(opTime.toBSON());
     bob.append("h", 1LL);
     bob.append("op", "c");
     bob.append("ns", "test.t");
@@ -152,7 +132,7 @@ int64_t getIndexKeyCount(OperationContext* opCtx, IndexCatalog* cat, IndexDescri
     auto idx = cat->getIndex(desc);
     int64_t numKeys;
     ValidateResults fullRes;
-    idx->validate(opCtx, &numKeys, &fullRes);
+    idx->validate(opCtx, &numKeys, &fullRes).transitional_ignore();
     return numKeys;
 }
 
@@ -194,26 +174,11 @@ private:
         _ddv = stdx::make_unique<DisableDocumentValidation>(_opCtx.get());
     }
 
-private:
     ServiceContext::UniqueOperationContext _opCtx;
     std::unique_ptr<UnreplicatedWritesBlock> _uwb;
     std::unique_ptr<DisableDocumentValidation> _ddv;
     ReplicationCoordinatorMock* _replicationCoordinatorMock = nullptr;
 };
-
-/**
- * Recovery unit that tracks if waitUntilDurable() is called.
- */
-class RecoveryUnitWithDurabilityTracking : public RecoveryUnitNoop {
-public:
-    bool waitUntilDurable() override;
-    bool waitUntilDurableCalled = false;
-};
-
-bool RecoveryUnitWithDurabilityTracking::waitUntilDurable() {
-    waitUntilDurableCalled = true;
-    return RecoveryUnitNoop::waitUntilDurable();
-}
 
 TEST_F(StorageInterfaceImplTest, ServiceContextDecorator) {
     auto serviceContext = getServiceContext();
@@ -223,108 +188,6 @@ TEST_F(StorageInterfaceImplTest, ServiceContextDecorator) {
     ASSERT_TRUE(storage == StorageInterface::get(serviceContext));
     ASSERT_TRUE(storage == StorageInterface::get(*serviceContext));
     ASSERT_TRUE(storage == StorageInterface::get(getOperationContext()));
-}
-
-TEST_F(StorageInterfaceImplTest, DefaultMinValidNamespace) {
-    ASSERT_EQUALS(NamespaceString(StorageInterfaceImpl::kDefaultMinValidNamespace),
-                  StorageInterfaceImpl().getMinValidNss());
-}
-
-TEST_F(StorageInterfaceImplTest, InitialSyncFlag) {
-    auto nss = makeNamespace(_agent);
-
-    StorageInterfaceImpl storage(nss);
-    auto opCtx = getOperationContext();
-
-    // Initial sync flag should be unset after initializing a new storage engine.
-    ASSERT_FALSE(storage.getInitialSyncFlag(opCtx));
-
-    // Setting initial sync flag should affect getInitialSyncFlag() result.
-    storage.setInitialSyncFlag(opCtx);
-    ASSERT_TRUE(storage.getInitialSyncFlag(opCtx));
-
-    // Check min valid document using storage engine interface.
-    auto minValidDocument = getMinValidDocument(opCtx, nss);
-    ASSERT_TRUE(minValidDocument.hasField(StorageInterfaceImpl::kInitialSyncFlagFieldName));
-    ASSERT_TRUE(minValidDocument.getBoolField(StorageInterfaceImpl::kInitialSyncFlagFieldName));
-
-    // Clearing initial sync flag should affect getInitialSyncFlag() result.
-    storage.clearInitialSyncFlag(opCtx);
-    ASSERT_FALSE(storage.getInitialSyncFlag(opCtx));
-}
-
-TEST_F(StorageInterfaceImplTest, GetMinValidAfterSettingInitialSyncFlagWorks) {
-    auto nss = makeNamespace(_agent);
-
-    StorageInterfaceImpl storage(nss);
-    auto opCtx = getOperationContext();
-
-    // Initial sync flag should be unset after initializing a new storage engine.
-    ASSERT_FALSE(storage.getInitialSyncFlag(opCtx));
-
-    // Setting initial sync flag should affect getInitialSyncFlag() result.
-    storage.setInitialSyncFlag(opCtx);
-    ASSERT_TRUE(storage.getInitialSyncFlag(opCtx));
-
-    ASSERT(storage.getMinValid(opCtx).isNull());
-    ASSERT(storage.getAppliedThrough(opCtx).isNull());
-    ASSERT(storage.getOplogDeleteFromPoint(opCtx).isNull());
-}
-
-TEST_F(StorageInterfaceImplTest, MinValid) {
-    auto nss = makeNamespace(_agent);
-
-    StorageInterfaceImpl storage(nss);
-    auto opCtx = getOperationContext();
-
-    // MinValid boundaries should all be null after initializing a new storage engine.
-    ASSERT(storage.getMinValid(opCtx).isNull());
-    ASSERT(storage.getAppliedThrough(opCtx).isNull());
-    ASSERT(storage.getOplogDeleteFromPoint(opCtx).isNull());
-
-    // Setting min valid boundaries should affect getMinValid() result.
-    OpTime startOpTime({Seconds(123), 0}, 1LL);
-    OpTime endOpTime({Seconds(456), 0}, 1LL);
-    storage.setAppliedThrough(opCtx, startOpTime);
-    storage.setMinValid(opCtx, endOpTime);
-    storage.setOplogDeleteFromPoint(opCtx, endOpTime.getTimestamp());
-
-    ASSERT_EQ(storage.getAppliedThrough(opCtx), startOpTime);
-    ASSERT_EQ(storage.getMinValid(opCtx), endOpTime);
-    ASSERT_EQ(storage.getOplogDeleteFromPoint(opCtx), endOpTime.getTimestamp());
-
-
-    // setMinValid always changes minValid, but setMinValidToAtLeast only does if higher.
-    storage.setMinValid(opCtx, startOpTime);  // Forcibly lower it.
-    ASSERT_EQ(storage.getMinValid(opCtx), startOpTime);
-    storage.setMinValidToAtLeast(opCtx, endOpTime);  // Higher than current (sets it).
-    ASSERT_EQ(storage.getMinValid(opCtx), endOpTime);
-    storage.setMinValidToAtLeast(opCtx, startOpTime);  // Lower than current (no-op).
-    ASSERT_EQ(storage.getMinValid(opCtx), endOpTime);
-
-    // Check min valid document using storage engine interface.
-    auto minValidDocument = getMinValidDocument(opCtx, nss);
-    ASSERT_TRUE(minValidDocument.hasField(StorageInterfaceImpl::kBeginFieldName));
-    ASSERT_TRUE(minValidDocument[StorageInterfaceImpl::kBeginFieldName].isABSONObj());
-    ASSERT_EQUALS(startOpTime,
-                  unittest::assertGet(OpTime::parseFromOplogEntry(
-                      minValidDocument[StorageInterfaceImpl::kBeginFieldName].Obj())));
-    ASSERT_EQUALS(endOpTime, unittest::assertGet(OpTime::parseFromOplogEntry(minValidDocument)));
-    ASSERT_EQUALS(
-        endOpTime.getTimestamp(),
-        minValidDocument[StorageInterfaceImpl::kOplogDeleteFromPointFieldName].timestamp());
-
-    // Recovery unit will be owned by "opCtx".
-    RecoveryUnitWithDurabilityTracking* recoveryUnit = new RecoveryUnitWithDurabilityTracking();
-    opCtx->setRecoveryUnit(recoveryUnit, OperationContext::kNotInUnitOfWork);
-
-    // Set min valid without waiting for the changes to be durable.
-    OpTime endOpTime2({Seconds(789), 0}, 1LL);
-    storage.setMinValid(opCtx, endOpTime2);
-    storage.setAppliedThrough(opCtx, {});
-    ASSERT_EQUALS(storage.getAppliedThrough(opCtx), OpTime());
-    ASSERT_EQUALS(storage.getMinValid(opCtx), endOpTime2);
-    ASSERT_FALSE(recoveryUnit->waitUntilDurableCalled);
 }
 
 TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsNamespaceNotFoundOnMissingCollection) {
@@ -474,7 +337,7 @@ TEST_F(StorageInterfaceImplTest, InsertDocumentsReturnsOKWhenNoOperationsAreGive
     auto opCtx = getOperationContext();
     auto nss = makeNamespace(_agent);
     createCollection(opCtx, nss);
-    StorageInterfaceImpl storage(nss);
+    StorageInterfaceImpl storage;
     ASSERT_OK(storage.insertDocuments(opCtx, nss, {}));
 }
 
@@ -487,7 +350,7 @@ TEST_F(StorageInterfaceImplTest,
     createCollection(opCtx, nss);
 
     // Non-oplog collection will enforce mandatory _id field requirement on insertion.
-    StorageInterfaceImpl storage(nss);
+    StorageInterfaceImpl storage;
     auto op = makeOplogEntry({Timestamp(Seconds(1), 0), 1LL});
     auto status = storage.insertDocuments(opCtx, nss, {op});
     ASSERT_EQUALS(ErrorCodes::InternalError, status);
@@ -504,7 +367,7 @@ TEST_F(StorageInterfaceImplTest,
     options.cappedSize = 1024 * 1024;
     createCollection(opCtx, nss, options);
     // StorageInterfaceImpl::insertDocuments should fall back on inserting the batch one at a time.
-    StorageInterfaceImpl storage(nss);
+    StorageInterfaceImpl storage;
     auto doc1 = BSON("_id" << 1);
     auto doc2 = BSON("_id" << 2);
     std::vector<BSONObj> docs({doc1, doc2});
@@ -794,6 +657,108 @@ TEST_F(StorageInterfaceImplTest, DropCollectionWorksWithSystemCollection) {
 
     ASSERT_OK(storage.dropCollection(opCtx, nss));
     ASSERT_FALSE(AutoGetCollectionForReadCommand(opCtx, nss).getCollection());
+}
+
+TEST_F(StorageInterfaceImplTest, RenameCollectionWorksWhenCollectionExists) {
+    auto opCtx = getOperationContext();
+    StorageInterfaceImpl storage;
+    auto nss = makeNamespace(_agent);
+    auto toNss = NamespaceString("local.toNs");
+    createCollection(opCtx, nss);
+
+    ASSERT_OK(storage.renameCollection(opCtx, nss, toNss, false));
+
+    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    ASSERT_FALSE(autoColl.getCollection());
+
+    AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
+    ASSERT_TRUE(autoColl2.getCollection());
+}
+
+TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempFalseMakesItNotTemp) {
+    auto opCtx = getOperationContext();
+    StorageInterfaceImpl storage;
+    auto nss = makeNamespace(_agent);
+    auto toNss = NamespaceString("local.toNs");
+    CollectionOptions opts;
+    opts.temp = true;
+    createCollection(opCtx, nss, opts);
+
+    ASSERT_OK(storage.renameCollection(opCtx, nss, toNss, false));
+
+    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    ASSERT_FALSE(autoColl.getCollection());
+
+    AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
+    ASSERT_TRUE(autoColl2.getCollection());
+    ASSERT_FALSE(autoColl2.getCollection()->getCatalogEntry()->getCollectionOptions(opCtx).temp);
+}
+
+TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempTrueMakesItTemp) {
+    auto opCtx = getOperationContext();
+    StorageInterfaceImpl storage;
+    auto nss = makeNamespace(_agent);
+    auto toNss = NamespaceString("local.toNs");
+    CollectionOptions opts;
+    opts.temp = true;
+    createCollection(opCtx, nss, opts);
+
+    ASSERT_OK(storage.renameCollection(opCtx, nss, toNss, true));
+
+    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    ASSERT_FALSE(autoColl.getCollection());
+
+    AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
+    ASSERT_TRUE(autoColl2.getCollection());
+    ASSERT_TRUE(autoColl2.getCollection()->getCatalogEntry()->getCollectionOptions(opCtx).temp);
+}
+
+TEST_F(StorageInterfaceImplTest, RenameCollectionFailsBetweenDatabases) {
+    auto opCtx = getOperationContext();
+    StorageInterfaceImpl storage;
+    auto nss = makeNamespace(_agent);
+    auto toNss = NamespaceString("notLocal.toNs");
+    createCollection(opCtx, nss);
+
+    ASSERT_EQ(ErrorCodes::InvalidNamespace, storage.renameCollection(opCtx, nss, toNss, false));
+
+    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    ASSERT_TRUE(autoColl.getCollection());
+
+    AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
+    ASSERT_FALSE(autoColl2.getCollection());
+}
+
+TEST_F(StorageInterfaceImplTest, RenameCollectionFailsWhenToCollectionAlreadyExists) {
+    auto opCtx = getOperationContext();
+    StorageInterfaceImpl storage;
+    auto nss = makeNamespace(_agent);
+    auto toNss = NamespaceString("local.toNs");
+    createCollection(opCtx, nss);
+    createCollection(opCtx, toNss);
+
+    ASSERT_EQ(ErrorCodes::NamespaceExists, storage.renameCollection(opCtx, nss, toNss, false));
+
+    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    ASSERT_TRUE(autoColl.getCollection());
+
+    AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
+    ASSERT_TRUE(autoColl2.getCollection());
+}
+
+TEST_F(StorageInterfaceImplTest, RenameCollectionFailsWhenFromCollectionDoesNotExist) {
+    auto opCtx = getOperationContext();
+    StorageInterfaceImpl storage;
+    auto nss = makeNamespace(_agent);
+    auto toNss = NamespaceString("local.toNs");
+
+    ASSERT_EQ(ErrorCodes::NamespaceNotFound, storage.renameCollection(opCtx, nss, toNss, false));
+
+    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    ASSERT_FALSE(autoColl.getCollection());
+
+    AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
+    ASSERT_FALSE(autoColl2.getCollection());
 }
 
 TEST_F(StorageInterfaceImplTest, FindDocumentsReturnsInvalidNamespaceIfCollectionIsMissing) {
@@ -1924,10 +1889,15 @@ TEST_F(StorageInterfaceImplTest,
     auto nss = makeNamespace(_agent);
     ASSERT_OK(storage.createCollection(opCtx, nss, CollectionOptions()));
 
-    auto status = storage.upsertById(
-        opCtx, nss, BSON("" << 1).firstElement(), BSON("$unknownUpdateOp" << BSON("x" << 1000)));
-    ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
-    ASSERT_STRING_CONTAINS(status.reason(), "Unknown modifier: $unknownUpdateOp");
+    ASSERT_THROWS_CODE_AND_WHAT(storage
+                                    .upsertById(opCtx,
+                                                nss,
+                                                BSON("" << 1).firstElement(),
+                                                BSON("$unknownUpdateOp" << BSON("x" << 1000)))
+                                    .transitional_ignore(),
+                                UserException,
+                                ErrorCodes::FailedToParse,
+                                "Unknown modifier: $unknownUpdateOp");
 }
 
 TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {

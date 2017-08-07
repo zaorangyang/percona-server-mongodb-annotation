@@ -110,7 +110,8 @@ void ShardingTestFixture::setUp() {
         service->setTickSource(stdx::make_unique<TickSourceMock>());
         auto tlMock = stdx::make_unique<transport::TransportLayerMock>();
         _transportLayer = tlMock.get();
-        service->addAndStartTransportLayer(std::move(tlMock));
+        service->setTransportLayer(std::move(tlMock));
+        _transportLayer->start().transitional_ignore();
 
         // Set the newly created service context to be the current global context so that tests,
         // which invoke code still referencing getGlobalServiceContext will work properly.
@@ -147,7 +148,7 @@ void ShardingTestFixture::setUp() {
     std::unique_ptr<ShardingCatalogClientImpl> catalogClient(
         stdx::make_unique<ShardingCatalogClientImpl>(std::move(uniqueDistLockManager)));
     _catalogClient = catalogClient.get();
-    catalogClient->startup();
+    catalogClient->startup().transitional_ignore();
 
     ConnectionString configCS = ConnectionString::forReplicaSet(
         "configRS", {HostAndPort{"TestHost1"}, HostAndPort{"TestHost2"}});
@@ -327,8 +328,8 @@ void ShardingTestFixture::expectInserts(const NamespaceString& nss,
         ASSERT_EQUALS(nss.db(), request.dbname);
 
         BatchedInsertRequest actualBatchedInsert;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedInsert.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        actualBatchedInsert.parseRequest(
+            OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
 
         ASSERT_EQUALS(nss.toString(), actualBatchedInsert.getNS().toString());
 
@@ -382,8 +383,8 @@ void ShardingTestFixture::expectConfigCollectionInsert(const HostAndPort& config
         ASSERT_EQUALS("config", request.dbname);
 
         BatchedInsertRequest actualBatchedInsert;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedInsert.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        actualBatchedInsert.parseRequest(
+            OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
 
         ASSERT_EQ("config", actualBatchedInsert.getNS().db());
         ASSERT_EQ(collName, actualBatchedInsert.getNS().coll());
@@ -447,8 +448,8 @@ void ShardingTestFixture::expectUpdateCollection(const HostAndPort& expectedHost
         ASSERT_EQUALS("config", request.dbname);
 
         BatchedUpdateRequest actualBatchedUpdate;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.dbname, request.cmdObj, &errmsg));
+        actualBatchedUpdate.parseRequest(
+            OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
         ASSERT_EQUALS(CollectionType::ConfigNS, actualBatchedUpdate.getNS().ns());
         auto updates = actualBatchedUpdate.getUpdates();
         ASSERT_EQUALS(1U, updates.size());

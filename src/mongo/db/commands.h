@@ -44,8 +44,8 @@
 #include "mongo/db/query/explain.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/reply_builder_interface.h"
-#include "mongo/rpc/request_interface.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/util/net/op_msg.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -105,7 +105,22 @@ public:
                      const std::string& db,
                      const BSONObj& cmdObj,
                      std::string& errmsg,
-                     BSONObjBuilder& result) = 0;
+                     BSONObjBuilder& result) {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Runs the command.
+     *
+     * The default implementation verifies that request has no document sections then forwards to
+     * run().
+     *
+     * For now commands should only implement if they need access to OP_MSG-specific functionality.
+     */
+    virtual bool enhancedRun(OperationContext* opCtx,
+                             const OpMsgRequest& request,
+                             std::string& errmsg,
+                             BSONObjBuilder& result) = 0;
 
     /**
      * supportsWriteConcern returns true if this command should be parsed for a writeConcern
@@ -310,6 +325,11 @@ public:
         return 0u;
     }
 
+    bool enhancedRun(OperationContext* opCtx,
+                     const OpMsgRequest& request,
+                     std::string& errmsg,
+                     BSONObjBuilder& result) override;
+
     bool adminOnly() const override {
         return false;
     }
@@ -447,7 +467,6 @@ public:
      * the passed ReplyBuilder will be in kOutputDocs after calling this method.
      */
     static void generateHelpResponse(OperationContext* opCtx,
-                                     const rpc::RequestInterface& request,
                                      rpc::ReplyBuilderInterface* replyBuilder,
                                      const Command& command);
 
@@ -477,12 +496,11 @@ public:
     static bool isGenericArgument(StringData arg) {
         // Not including "help" since we don't pass help requests through to the command parser.
         // If that changes, it should be added. When you add to this list, consider whether you
-        // should also change the filterCommandRequestForPassthrough() function in sharding.
+        // should also change the filterCommandRequestForPassthrough() function.
         return arg == "$audit" ||           //
             arg == "$client" ||             //
             arg == "$configServerState" ||  //
             arg == "$db" ||                 //
-            arg == "$gleStats" ||           //
             arg == "$oplogQueryData" ||     //
             arg == "$queryOptions" ||       //
             arg == "$readPreference" ||     //
@@ -495,6 +513,33 @@ public:
             arg == "writeConcern" ||        //
             false;  // These comments tell clang-format to keep this line-oriented.
     }
+
+    /**
+     * Rewrites cmdObj into a format safe to blindly forward to shards.
+     *
+     * This performs 2 transformations:
+     * 1) $readPreference fields are moved into a subobject called $queryOptions. This matches the
+     *    "wrapped" format historically used internally by mongos. Moving off of that format will be
+     *    done as SERVER-29091.
+     *
+     * 2) Filter out generic arguments that shouldn't be blindly passed to the shards.  This is
+     *    necessary because many mongos implementations of Command::run() just pass cmdObj through
+     *    directly to the shards. However, some of the generic arguments fields are automatically
+     *    appended in the egress layer. Removing them here ensures that they don't get duplicated.
+     *
+     * Ideally this function can be deleted once mongos run() implementations are more careful about
+     * what they send to the shards.
+     */
+    static BSONObj filterCommandRequestForPassthrough(const BSONObj& cmdObj);
+
+    /**
+     * Rewrites reply into a format safe to blindly forward from shards to clients.
+     *
+     * Ideally this function can be deleted once mongos run() implementations are more careful about
+     * what they return from the shards.
+     */
+    static void filterCommandReplyForPassthrough(const BSONObj& reply, BSONObjBuilder* output);
+    static BSONObj filterCommandReplyForPassthrough(const BSONObj& reply);
 
 private:
     Status checkAuthForCommand(Client* client,

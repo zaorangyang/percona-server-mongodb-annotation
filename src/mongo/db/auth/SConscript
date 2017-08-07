@@ -27,6 +27,39 @@ env.Library('auth_rolename', ['role_name.cpp'],
             ]
 )
 
+env.Library(
+    target = 'authentication_restriction',
+    source = [
+        'restriction.cpp',
+        'restriction_environment.cpp',
+    ],
+    LIBDEPS = [
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/decorable',
+        '$BUILD_DIR/mongo/util/net/network',
+    ],
+)
+
+env.Library(
+    target='user_name',
+    source=[
+        'user_name.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target = 'restriction_test',
+    source = 'restriction_test.cpp',
+    LIBDEPS = [
+        '$BUILD_DIR/mongo/base',
+        'authentication_restriction',
+    ],
+)
+
+
 # Just the data structures used
 env.Library('authcore', ['action_set.cpp',
                          'action_type.cpp',
@@ -45,10 +78,11 @@ env.Library('authcore', ['action_set.cpp',
                          'user.cpp',
                          'user_document_parser.cpp',
                          'user_management_commands_parser.cpp',
-                         'user_name.cpp',
                          'user_set.cpp'],
             LIBDEPS=['auth_rolename',
+                     'authentication_restriction',
                      'sasl_options',
+                     'user_name',
                      '$BUILD_DIR/mongo/base',
                      '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
                      '$BUILD_DIR/mongo/bson/util/bson_extract',
@@ -151,12 +185,10 @@ env.Library('saslauth',
 env.Library('authmongod',
             ['authz_manager_external_state_d.cpp',
              'authz_session_external_state_d.cpp',
-             'auth_index_d.cpp',
              'impersonation_session.cpp'
             ],
             LIBDEPS=[
                 'authservercommon',
-                '$BUILD_DIR/mongo/db/catalog/index_key_validate',
                 '$BUILD_DIR/mongo/db/db_raii',
                 '$BUILD_DIR/mongo/db/dbdirectclient',
                 '$BUILD_DIR/mongo/db/dbhelpers',

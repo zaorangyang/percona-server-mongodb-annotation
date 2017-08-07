@@ -64,12 +64,11 @@
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/record_fetcher.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/update/update_driver.h"
 
 #include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
 #include "mongo/rpc/object_check.h"
-#include "mongo/util/fail_point.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -194,7 +193,7 @@ CollectionImpl::CollectionImpl(Collection* _this_init,
 
 void CollectionImpl::init(OperationContext* opCtx) {
     _magic = kMagicNumber;
-    _indexCatalog.init(opCtx);
+    _indexCatalog.init(opCtx).transitional_ignore();
     if (isCapped())
         _recordStore->setCappedCallback(this);
 
@@ -1006,16 +1005,8 @@ public:
     virtual Status validate(const RecordId& recordId, const RecordData& record, size_t* dataSize) {
         BSONObj recordBson = record.toBson();
 
-        // Secondaries are configured to always validate using the latest enabled BSON version. But
-        // users should be able to run collection validation on a secondary in "3.2"
-        // featureCompatibilityVersion in order to be alerted to the presence of NumberDecimal.
-        auto bsonValidationVersion = (serverGlobalParams.featureCompatibility.version.load() ==
-                                      ServerGlobalParams::FeatureCompatibility::Version::k32)
-            ? BSONVersion::kV1_0
-            : Validator<BSONObj>::enabledBSONVersion();
-
-        const Status status =
-            validateBSON(recordBson.objdata(), recordBson.objsize(), bsonValidationVersion);
+        const Status status = validateBSON(
+            recordBson.objdata(), recordBson.objsize(), Validator<BSONObj>::enabledBSONVersion());
         if (status.isOK()) {
             *dataSize = recordBson.objsize();
         } else {
@@ -1064,6 +1055,8 @@ public:
             }
 
             uint32_t indexNsHash;
+            const auto& pattern = descriptor->keyPattern();
+            const Ordering ord = Ordering::make(pattern);
             MurmurHash3_x86_32(indexNs.c_str(), indexNs.size(), 0, &indexNsHash);
 
             for (const auto& key : documentKeySet) {
@@ -1072,9 +1065,11 @@ public:
                     _longKeys[indexNs]++;
                     continue;
                 }
-                uint32_t indexEntryHash = hashIndexEntry(key, recordId, indexNsHash);
-                uint64_t& indexEntryCount = (*_ikc)[indexEntryHash];
 
+                // We want to use the latest version of KeyString here.
+                KeyString ks(KeyString::kLatestVersion, key, ord, recordId);
+                uint32_t indexEntryHash = hashIndexEntry(ks, indexNsHash);
+                uint64_t& indexEntryCount = (*_ikc)[indexEntryHash];
                 if (indexEntryCount != 0) {
                     indexEntryCount--;
                     dassert(indexEntryCount >= 0);
@@ -1113,15 +1108,21 @@ public:
 
         if (_level == kValidateFull) {
             const auto& key = descriptor->keyPattern();
-            BSONObj prevIndexEntryKey;
+            const Ordering ord = Ordering::make(key);
+            KeyString::Version version = KeyString::kLatestVersion;
+            std::unique_ptr<KeyString> prevIndexKeyString = nullptr;
             bool isFirstEntry = true;
 
             std::unique_ptr<SortedDataInterface::Cursor> cursor = iam->newCursor(_opCtx, true);
             // Seeking to BSONObj() is equivalent to seeking to the first entry of an index.
             for (auto indexEntry = cursor->seek(BSONObj(), true); indexEntry;
                  indexEntry = cursor->next()) {
+
+                // We want to use the latest version of KeyString here.
+                std::unique_ptr<KeyString> indexKeyString =
+                    stdx::make_unique<KeyString>(version, indexEntry->key, ord, indexEntry->loc);
                 // Ensure that the index entries are in increasing or decreasing order.
-                if (!isFirstEntry && (indexEntry->key).woCompare(prevIndexEntryKey, key) < 0) {
+                if (!isFirstEntry && *indexKeyString < *prevIndexKeyString) {
                     if (results.valid) {
                         results.errors.push_back(
                             "one or more indexes are not in strictly ascending or descending "
@@ -1129,15 +1130,16 @@ public:
                     }
                     results.valid = false;
                 }
-                isFirstEntry = false;
-                prevIndexEntryKey = indexEntry->key;
 
                 // Cache the index keys to cross-validate with documents later.
-                uint32_t keyHash = hashIndexEntry(indexEntry->key, indexEntry->loc, indexNsHash);
+                uint32_t keyHash = hashIndexEntry(*indexKeyString, indexNsHash);
                 if ((*_ikc)[keyHash] == 0) {
                     _indexKeyCountTableNumEntries++;
                 }
                 (*_ikc)[keyHash]++;
+
+                isFirstEntry = false;
+                prevIndexKeyString.swap(indexKeyString);
             }
         }
     }
@@ -1212,9 +1214,7 @@ private:
     IndexCatalog* _indexCatalog;             // Not owned.
     ValidateResultsMap* _indexNsResultsMap;  // Not owned.
 
-    uint32_t hashIndexEntry(const BSONObj& key, const RecordId& loc, uint32_t hash) {
-        // We're only using KeyString to get something hashable here, so version doesn't matter.
-        KeyString ks(KeyString::Version::V1, key, Ordering::make(BSONObj()), loc);
+    uint32_t hashIndexEntry(KeyString& ks, uint32_t hash) {
         MurmurHash3_x86_32(ks.getTypeBits().getBuffer(), ks.getTypeBits().getSize(), hash, &hash);
         MurmurHash3_x86_32(ks.getBuffer(), ks.getSize(), hash, &hash);
         return hash % kKeyCountTableSize;
@@ -1245,7 +1245,7 @@ Status CollectionImpl::validate(OperationContext* opCtx,
             IndexAccessMethod* iam = _indexCatalog.getIndex(descriptor);
             ValidateResults curIndexResults;
             int64_t numKeys;
-            iam->validate(opCtx, &numKeys, &curIndexResults);
+            iam->validate(opCtx, &numKeys, &curIndexResults).transitional_ignore();
             keysPerIndex.appendNumber(descriptor->indexNamespace(),
                                       static_cast<long long>(numKeys));
 
@@ -1266,7 +1266,18 @@ Status CollectionImpl::validate(OperationContext* opCtx,
             // `results`.
             dassert(status.isOK());
 
-            if (indexValidator->tooManyIndexEntries()) {
+
+            string msg = "One or more indexes contain invalid index entries.";
+            // when there's an index key/document mismatch, both `if` and `else if` statements
+            // will be true. But if we only check tooFewIndexEntries(), we'll be able to see
+            // which specific index is invalid.
+            if (indexValidator->tooFewIndexEntries()) {
+                // The error message can't be more specific because even though the index is
+                // invalid, we won't know if the corruption occurred on the index entry or in
+                // the document.
+                results->errors.push_back(msg);
+                results->valid = false;
+            } else if (indexValidator->tooManyIndexEntries()) {
                 for (auto& it : indexNsResultsMap) {
                     // Marking all indexes as invalid since we don't know which one failed.
                     ValidateResults& r = it.second;
@@ -1274,8 +1285,6 @@ Status CollectionImpl::validate(OperationContext* opCtx,
                 }
                 string msg = "One or more indexes contain invalid index entries.";
                 results->errors.push_back(msg);
-                results->valid = false;
-            } else if (indexValidator->tooFewIndexEntries()) {
                 results->valid = false;
             }
         }

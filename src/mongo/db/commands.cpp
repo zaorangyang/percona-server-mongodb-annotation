@@ -295,7 +295,6 @@ bool Command::isHelpRequest(const BSONElement& helpElem) {
 const char Command::kHelpFieldName[] = "help";
 
 void Command::generateHelpResponse(OperationContext* opCtx,
-                                   const rpc::RequestInterface& request,
                                    rpc::ReplyBuilderInterface* replyBuilder,
                                    const Command& command) {
     std::stringstream ss;
@@ -304,7 +303,7 @@ void Command::generateHelpResponse(OperationContext* opCtx,
     command.help(ss);
     helpBuilder.append("help", ss.str());
 
-    replyBuilder->setCommandReply(helpBuilder.done());
+    replyBuilder->setCommandReply(helpBuilder.obj());
     replyBuilder->setMetadata(rpc::makeEmptyMetadata());
 }
 
@@ -329,6 +328,57 @@ const stdx::unordered_set<std::string> userManagementCommands{"createUser",
 
 bool Command::isUserManagementCommand(const std::string& name) {
     return userManagementCommands.count(name);
+}
+
+bool Command::enhancedRun(OperationContext* opCtx,
+                          const OpMsgRequest& request,
+                          std::string& errmsg,
+                          BSONObjBuilder& result) {
+    uassert(40472,
+            str::stream() << "The " << getName() << " command does not support document sequences.",
+            request.sequences.empty());
+
+    return run(opCtx, request.getDatabase().toString(), request.body, errmsg, result);
+}
+
+BSONObj Command::filterCommandRequestForPassthrough(const BSONObj& cmdObj) {
+    BSONObjBuilder bob;
+    for (auto elem : cmdObj) {
+        const auto name = elem.fieldNameStringData();
+        if (name == "$readPreference") {
+            BSONObjBuilder(bob.subobjStart("$queryOptions")).append(elem);
+        } else if (!Command::isGenericArgument(name) ||  //
+                   name == "$queryOptions" ||            //
+                   name == "maxTimeMS" ||                //
+                   name == "readConcern" ||              //
+                   name == "writeConcern") {
+            // This is the whitelist of generic arguments that commands can be trusted to blindly
+            // forward to the shards.
+            bob.append(elem);
+        }
+    }
+    return bob.obj();
+}
+
+void Command::filterCommandReplyForPassthrough(const BSONObj& cmdObj, BSONObjBuilder* output) {
+    for (auto elem : cmdObj) {
+        const auto name = elem.fieldNameStringData();
+        if (name == "$configServerState" ||  //
+            name == "$gleStats" ||           //
+            name == "$logicalTime" ||        //
+            name == "$oplogQueryData" ||     //
+            name == "$replData" ||           //
+            name == "operationTime") {
+            continue;
+        }
+        output->append(elem);
+    }
+}
+
+BSONObj Command::filterCommandReplyForPassthrough(const BSONObj& cmdObj) {
+    BSONObjBuilder bob;
+    filterCommandReplyForPassthrough(cmdObj, &bob);
+    return bob.obj();
 }
 
 }  // namespace mongo

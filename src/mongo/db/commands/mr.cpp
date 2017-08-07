@@ -41,6 +41,7 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -375,12 +376,12 @@ void State::dropTempCollections() {
                         "no longer primary",
                         repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(
                             _opCtx, _config.tempNamespace));
-                db->dropCollection(_opCtx, _config.tempNamespace.ns());
+                db->dropCollection(_opCtx, _config.tempNamespace.ns()).transitional_ignore();
                 wunit.commit();
             }
         }
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
-            _opCtx, "M/R dropTempCollections", _config.tempNamespace.ns())
+            _opCtx, "M/R dropTempCollections", _config.tempNamespace.ns());
         // Always forget about temporary namespaces, so we don't cache lots of them
         ShardConnection::forgetNS(_config.tempNamespace.ns());
     }
@@ -393,11 +394,12 @@ void State::dropTempCollections() {
             Lock::DBLock lk(_opCtx, _config.incLong.db(), MODE_X);
             if (Database* db = dbHolder().get(_opCtx, _config.incLong.ns())) {
                 WriteUnitOfWork wunit(_opCtx);
-                db->dropCollection(_opCtx, _config.incLong.ns());
+                db->dropCollection(_opCtx, _config.incLong.ns()).transitional_ignore();
                 wunit.commit();
             }
         }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_opCtx, "M/R dropTempCollections", _config.incLong.ns())
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
+            _opCtx, "M/R dropTempCollections", _config.incLong.ns());
 
         ShardConnection::forgetNS(_config.incLong.ns());
     }
@@ -431,15 +433,12 @@ void State::prepTempCollection() {
             incColl = incCtx.db()->createCollection(_opCtx, _config.incLong.ns(), options);
             invariant(incColl);
 
-            // We explicitly create a v=2 index on the "0" field so that it is always possible for a
-            // user to emit() decimal keys. Since the incremental collection is not replicated to
-            // any secondaries, there is no risk of inadvertently crashing an older version of
-            // MongoDB when the featureCompatibilityVersion of this server is 3.2.
-            BSONObj indexSpec =
+            auto rawIndexSpec =
                 BSON("key" << BSON("0" << 1) << "ns" << _config.incLong.ns() << "name"
-                           << "_temp_0"
-                           << "v"
-                           << static_cast<int>(IndexVersion::kV2));
+                           << "_temp_0");
+            auto indexSpec = uassertStatusOK(index_key_validate::validateIndexSpec(
+                rawIndexSpec, _config.incLong, serverGlobalParams.featureCompatibility));
+
             Status status = incColl->getIndexCatalog()
                                 ->createIndexOnEmptyCollection(_opCtx, indexSpec)
                                 .getStatus();
@@ -522,7 +521,7 @@ void State::prepTempCollection() {
         wuow.commit();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
-        _opCtx, "M/R prepTempCollection", _config.tempNamespace.ns())
+        _opCtx, "M/R prepTempCollection", _config.tempNamespace.ns());
 }
 
 /**
@@ -1396,16 +1395,6 @@ public:
 
         const Config config(dbname, cmd);
 
-        if (!config.collation.isEmpty() &&
-            serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k32) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::InvalidOptions,
-                       "The featureCompatibilityVersion must be 3.4 to use collation. See "
-                       "http://dochub.mongodb.org/core/3.4-feature-compatibility."));
-        }
-
         LOG(1) << "mr ns: " << config.nss;
 
         uassert(16149, "cannot run map reduce without the js engine", getGlobalScriptEngine());
@@ -1774,17 +1763,6 @@ public:
 
         state.prepTempCollection();
         ON_BLOCK_EXIT_OBJ(state, &State::dropTempCollections);
-
-        if (!config.outputOptions.outDB.empty()) {
-            BSONObjBuilder loc;
-            if (!config.outputOptions.outDB.empty())
-                loc.append("db", config.outputOptions.outDB);
-            if (!config.outputOptions.collectionName.empty())
-                loc.append("collection", config.outputOptions.collectionName);
-            result.append("result", loc.obj());
-        } else if (!config.outputOptions.collectionName.empty()) {
-            result.append("result", config.outputOptions.collectionName);
-        }
 
         std::vector<std::shared_ptr<Chunk>> chunks;
 

@@ -31,14 +31,42 @@
 #include <unordered_set>
 
 #include "mongo/db/client.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/util/net/op_msg.h"
 
 using namespace mongo;
 
 namespace CommandTests {
+
+TEST(CommandTests, InputDocumentSequeceWorksEndToEnd) {
+    const auto opCtxHolder = cc().makeOperationContext();
+    auto opCtx = opCtxHolder.get();
+
+    NamespaceString ns("test", "doc_seq");
+    DBDirectClient db(opCtx);
+    db.dropCollection(ns.ns());
+    ASSERT_EQ(db.count(ns.ns()), 0u);
+
+    OpMsgRequest request;
+    request.body = BSON("insert" << ns.coll() << "$db" << ns.db());
+    request.sequences = {{"documents",
+                          {
+                              BSON("_id" << 1),
+                              BSON("_id" << 2),
+                              BSON("_id" << 3),
+                              BSON("_id" << 4),
+                              BSON("_id" << 5),
+                          }}};
+
+    const auto reply = db.runCommand(std::move(request));
+    ASSERT_EQ(int(reply->getProtocol()), int(rpc::Protocol::kOpMsg));
+    ASSERT_BSONOBJ_EQ(reply->getCommandReply(), BSON("n" << 5 << "ok" << 1.0));
+    ASSERT_EQ(db.count(ns.ns()), 5u);
+}
 
 using std::string;
 

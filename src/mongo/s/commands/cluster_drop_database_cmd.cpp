@@ -38,8 +38,7 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_common.h"
-#include "mongo/s/commands/sharded_command_processing.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 
@@ -104,11 +103,13 @@ public:
 
         uassertStatusOK(dbInfoStatus.getStatus());
 
-        catalogClient->logChange(opCtx,
-                                 "dropDatabase.start",
-                                 dbname,
-                                 BSONObj(),
-                                 ShardingCatalogClient::kMajorityWriteConcern);
+        catalogClient
+            ->logChange(opCtx,
+                        "dropDatabase.start",
+                        dbname,
+                        BSONObj(),
+                        ShardingCatalogClient::kMajorityWriteConcern)
+            .transitional_ignore();
 
         auto& dbInfo = dbInfoStatus.getValue();
 
@@ -146,8 +147,13 @@ public:
         // Invalidate the database so the next access will do a full reload
         catalogCache->purgeDatabase(dbname);
 
-        catalogClient->logChange(
-            opCtx, "dropDatabase", dbname, BSONObj(), ShardingCatalogClient::kMajorityWriteConcern);
+        catalogClient
+            ->logChange(opCtx,
+                        "dropDatabase",
+                        dbname,
+                        BSONObj(),
+                        ShardingCatalogClient::kMajorityWriteConcern)
+            .transitional_ignore();
 
         result.append("dropped", dbname);
         return true;

@@ -86,7 +86,7 @@ Status TransportLayerMock::wait(Ticket&& ticket) {
 }
 
 void TransportLayerMock::asyncWait(Ticket&& ticket, TicketCallback callback) {
-    callback(Status::OK());
+    callback(wait(std::move(ticket)));
 }
 
 TransportLayer::Stats TransportLayerMock::sessionStats() {
@@ -125,6 +125,10 @@ void TransportLayerMock::endAllSessions(Session::TagMask tags) {
         end(it->second.session);
         it++;
     }
+}
+
+Status TransportLayerMock::setup() {
+    return Status::OK();
 }
 
 Status TransportLayerMock::start() {

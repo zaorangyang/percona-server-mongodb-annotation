@@ -70,6 +70,19 @@ public:
     using Parser = stdx::function<boost::intrusive_ptr<Expression>(
         const boost::intrusive_ptr<ExpressionContext>&, BSONElement, const VariablesParseState&)>;
 
+    /**
+     * Represents new paths computed by an expression. Computed paths are partitioned into renames
+     * and non-renames. See the comments for Expression::getComputedPaths() for more information.
+     */
+    struct ComputedPaths {
+        // Non-rename computed paths.
+        std::set<std::string> paths;
+
+        // Mappings from the old name of a path before applying this expression, to the new one
+        // after applying this expression.
+        StringMap<std::string> renames;
+    };
+
     virtual ~Expression(){};
 
     /**
@@ -106,6 +119,35 @@ public:
      * Evaluate expression with respect to the Document given by 'root', and return the result.
      */
     virtual Value evaluate(const Document& root) const = 0;
+
+    /**
+     * Returns information about the paths computed by this expression. This only needs to be
+     * overridden by expressions that have renaming semantics, where optimization code could take
+     * advantage of knowledge of these renames.
+     *
+     * Partitions paths involved in this expression into the set of computed paths and the set of
+     * ("new" => "old") rename mappings. Here "new" refers to the name of the path after applying
+     * this expression, whereas "old" refers to the name of the path before applying this
+     * expression.
+     *
+     * The 'exprFieldPath' is the field path at which the result of this expression will be stored.
+     * This is used to determine the value of the "new" path created by the rename.
+     *
+     * The 'renamingVar' is needed for checking whether a field path is a rename. For example, at
+     * the top level only field paths that begin with the ROOT variable, as in "$$ROOT.path", are
+     * renames. A field path such as "$$var.path" is not a rename.
+     *
+     * Now consider the example of a rename expressed via a $map:
+     *
+     *    {$map: {input: "$array", as: "iter", in: {...}}}
+     *
+     * In this case, only field paths inside the "in" clause beginning with "iter", such as
+     * "$$iter.path", are renames.
+     */
+    virtual ComputedPaths getComputedPaths(const std::string& exprFieldPath,
+                                           Variables::Id renamingVar = Variables::kRootId) const {
+        return {{exprFieldPath}, {}};
+    }
 
     /**
      * Parses a BSON Object that could represent an object literal or a functional expression like
@@ -636,13 +678,6 @@ private:
                            const std::string& format,               // the format string
                            boost::intrusive_ptr<Expression> date);  // the date to format
 
-    // Will uassert on invalid data
-    static void validateFormat(const std::string& format);
-
-    // Need raw date as tm doesn't have millisecond resolution.
-    // Format must be valid.
-    static std::string formatDate(const std::string& format, const tm& tm, const long long date);
-
     static void insertPadded(StringBuilder& sb, int number, int spaces);
 
     const std::string _format;
@@ -656,10 +691,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    static inline int extract(const tm& tm) {
-        return tm.tm_mday;
-    }
 };
 
 
@@ -670,11 +701,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    // MySQL uses 1-7, tm uses 0-6
-    static inline int extract(const tm& tm) {
-        return tm.tm_wday + 1;
-    }
 };
 
 
@@ -685,11 +711,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    // MySQL uses 1-366, tm uses 0-365
-    static inline int extract(const tm& tm) {
-        return tm.tm_yday + 1;
-    }
 };
 
 
@@ -746,9 +767,8 @@ public:
         return _fieldPath;
     }
 
-    Variables::Id getVariableId() const {
-        return _variable;
-    }
+    ComputedPaths getComputedPaths(const std::string& exprFieldPath,
+                                   Variables::Id renamingVar) const final;
 
 private:
     ExpressionFieldPath(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -825,10 +845,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    static inline int extract(const tm& tm) {
-        return tm.tm_hour;
-    }
 };
 
 
@@ -956,6 +972,9 @@ public:
         BSONElement expr,
         const VariablesParseState& vps);
 
+    ComputedPaths getComputedPaths(const std::string& exprFieldPath,
+                                   Variables::Id renamingVar) const final;
+
 private:
     ExpressionMap(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -999,8 +1018,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    static int extract(const long long date);
 };
 
 
@@ -1011,10 +1028,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    static int extract(const tm& tm) {
-        return tm.tm_min;
-    }
 };
 
 
@@ -1053,11 +1066,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    // MySQL uses 1-12, tm uses 0-11
-    static inline int extract(const tm& tm) {
-        return tm.tm_mon + 1;
-    }
 };
 
 
@@ -1105,6 +1113,9 @@ public:
     getChildExpressions() const {
         return _expressions;
     }
+
+    ComputedPaths getComputedPaths(const std::string& exprFieldPath,
+                                   Variables::Id renamingVar) const final;
 
 private:
     ExpressionObject(
@@ -1190,10 +1201,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    static inline int extract(const tm& tm) {
-        return tm.tm_sec;
-    }
 };
 
 
@@ -1459,8 +1466,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    static int extract(const tm& tm);
 };
 
 
@@ -1471,8 +1476,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    static int extract(const tm& tm);
 };
 
 
@@ -1483,8 +1486,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    static int extract(const tm& tm);
 };
 
 
@@ -1495,8 +1496,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    static int extract(const tm& tm);
 };
 
 
@@ -1507,11 +1506,6 @@ public:
 
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
-
-    // tm_year is years since 1990
-    static int extract(const tm& tm) {
-        return tm.tm_year + 1900;
-    }
 };
 
 

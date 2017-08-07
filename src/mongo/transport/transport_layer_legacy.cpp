@@ -38,10 +38,10 @@
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/config.h"
+#include "mongo/db/auth/restriction_environment.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/stdx/functional.h"
-#include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -59,6 +59,9 @@ struct lock_weak {
     }
 };
 }  // namespace
+
+TransportLayerLegacy::Options::Options(const ServerGlobalParams* params)
+    : port(params->port), ipList(params->bind_ip) {}
 
 TransportLayerLegacy::ListenerLegacy::ListenerLegacy(const TransportLayerLegacy::Options& opts,
                                                      NewConnectionCb callback)
@@ -144,20 +147,12 @@ TransportLayerLegacy::~TransportLayerLegacy() = default;
 Ticket TransportLayerLegacy::sourceMessage(const SessionHandle& session,
                                            Message* message,
                                            Date_t expiration) {
-    auto& compressorMgr = MessageCompressorManager::forSession(session);
-    auto sourceCb = [message, &compressorMgr](AbstractMessagingPort* amp) -> Status {
+    auto sourceCb = [message](AbstractMessagingPort* amp) -> Status {
         if (!amp->recv(*message)) {
             return {ErrorCodes::HostUnreachable, "Recv failed"};
         }
 
         networkCounter.hitPhysical(message->size(), 0);
-        if (message->operation() == dbCompressed) {
-            auto swm = compressorMgr.decompressMessage(*message);
-            if (!swm.isOK())
-                return swm.getStatus();
-            *message = swm.getValue();
-        }
-        networkCounter.hitLogical(message->size(), 0);
         return Status::OK();
     };
 
@@ -183,16 +178,10 @@ TransportLayer::Stats TransportLayerLegacy::sessionStats() {
 Ticket TransportLayerLegacy::sinkMessage(const SessionHandle& session,
                                          const Message& message,
                                          Date_t expiration) {
-    auto& compressorMgr = MessageCompressorManager::forSession(session);
-    auto sinkCb = [&message, &compressorMgr](AbstractMessagingPort* amp) -> Status {
+    auto sinkCb = [&message](AbstractMessagingPort* amp) -> Status {
         try {
-            networkCounter.hitLogical(0, message.size());
-            auto swm = compressorMgr.compressMessage(message);
-            if (!swm.isOK())
-                return swm.getStatus();
-            const auto& compressedMessage = swm.getValue();
-            amp->say(compressedMessage);
-            networkCounter.hitPhysical(0, compressedMessage.size());
+            amp->say(message);
+            networkCounter.hitPhysical(0, message.size());
 
             return Status::OK();
         } catch (const SocketException& e) {
@@ -339,7 +328,10 @@ void TransportLayerLegacy::_handleNewConnection(std::unique_ptr<AbstractMessagin
     }
 
     amp->setLogLevel(logger::LogSeverity::Debug(1));
+    auto restrictionEnvironment =
+        stdx::make_unique<RestrictionEnvironment>(amp->remoteAddr(), amp->localAddr());
     auto session = LegacySession::create(std::move(amp), this);
+    RestrictionEnvironment::set(session, std::move(restrictionEnvironment));
 
     stdx::list<std::weak_ptr<LegacySession>> list;
     auto it = list.emplace(list.begin(), session);

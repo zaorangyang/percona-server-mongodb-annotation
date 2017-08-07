@@ -45,7 +45,6 @@
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/auth/auth_index_d.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/collection.h"
@@ -74,6 +73,8 @@
 #include "mongo/db/json.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_session_cache.h"
+#include "mongo/db/logical_session_cache_factory_mongod.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/mongod_options.h"
@@ -84,6 +85,7 @@
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
@@ -106,6 +108,7 @@
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/system_index.h"
 #include "mongo/db/ttl.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_connection_hook.h"
@@ -120,7 +123,7 @@
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/transport/transport_layer_legacy.h"
+#include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
@@ -135,6 +138,8 @@
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/periodic_runner.h"
+#include "mongo/util/periodic_runner_factory.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/ramlog.h"
 #include "mongo/util/scopeguard.h"
@@ -483,21 +488,17 @@ ExitCode _initAndListen(int listenPort) {
 
     globalServiceContext->createLockFile();
 
-    transport::TransportLayerLegacy::Options options;
-    options.port = listenPort;
-    options.ipList = serverGlobalParams.bind_ip;
-
     globalServiceContext->setServiceEntryPoint(
-        stdx::make_unique<ServiceEntryPointMongod>(globalServiceContext->getTransportLayer()));
+        stdx::make_unique<ServiceEntryPointMongod>(globalServiceContext));
 
-    // Create, start, and attach the TL
-    auto transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(
-        options, globalServiceContext->getServiceEntryPoint());
-    auto res = transportLayer->setup();
+    auto tl = transport::TransportLayerManager::createWithConfig(&serverGlobalParams,
+                                                                 globalServiceContext);
+    auto res = tl->setup();
     if (!res.isOK()) {
         error() << "Failed to set up listener: " << res;
         return EXIT_NET_ERROR;
     }
+    globalServiceContext->setTransportLayer(std::move(tl));
 
     globalServiceContext->initializeGlobalStorageEngine();
 
@@ -593,7 +594,7 @@ ExitCode _initAndListen(int listenPort) {
 
     AuthorizationManager* globalAuthzManager = getGlobalAuthorizationManager();
     if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
-        Status status = authindex::verifySystemIndexes(startupOpCtx.get());
+        Status status = verifySystemIndexes(startupOpCtx.get());
         if (!status.isOK()) {
             log() << redact(status);
             if (status.code() == ErrorCodes::AuthSchemaIncompatible) {
@@ -643,7 +644,7 @@ ExitCode _initAndListen(int listenPort) {
         uassertStatusOK(ShardingState::get(startupOpCtx.get())
                             ->initializeShardingAwarenessIfNeeded(startupOpCtx.get()));
     if (shardingInitialized) {
-        reloadShardRegistryUntilSuccess(startupOpCtx.get());
+        waitForShardRegistryReload(startupOpCtx.get()).transitional_ignore();
     }
 
     if (!storageGlobalParams.readOnly) {
@@ -702,16 +703,33 @@ ExitCode _initAndListen(int listenPort) {
 
     PeriodicTask::startRunningPeriodicTasks();
 
+    // Set up the periodic runner for background job execution
+    auto runner = makePeriodicRunner();
+    runner->startup().transitional_ignore();
+    globalServiceContext->setPeriodicRunner(std::move(runner));
+
+    // Set up the logical session cache
+    LogicalSessionCacheServer kind = LogicalSessionCacheServer::kStandalone;
+    if (shardingInitialized) {
+        kind = LogicalSessionCacheServer::kSharded;
+    } else if (replSettings.usingReplSets()) {
+        kind = LogicalSessionCacheServer::kReplicaSet;
+    }
+
+    auto sessionCache = makeLogicalSessionCacheD(kind);
+    globalServiceContext->setLogicalSessionCache(std::move(sessionCache));
+
     // MessageServer::run will return when exit code closes its socket and we don't need the
     // operation context anymore
     startupOpCtx.reset();
 
-    auto start = globalServiceContext->addAndStartTransportLayer(std::move(transportLayer));
+    auto start = globalServiceContext->getTransportLayer()->start();
     if (!start.isOK()) {
         error() << "Failed to start the listener: " << start.toString();
         return EXIT_NET_ERROR;
     }
 
+    globalServiceContext->notifyStartupComplete();
 #ifndef _WIN32
     mongo::signalForkSuccess();
 #else
@@ -895,8 +913,11 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
     repl::StorageInterface::set(serviceContext, stdx::make_unique<repl::StorageInterfaceImpl>());
     auto storageInterface = repl::StorageInterface::get(serviceContext);
 
-    repl::ReplicationProcess::set(serviceContext,
-                                  stdx::make_unique<repl::ReplicationProcess>(storageInterface));
+    repl::ReplicationProcess::set(
+        serviceContext,
+        stdx::make_unique<repl::ReplicationProcess>(
+            storageInterface,
+            stdx::make_unique<repl::ReplicationConsistencyMarkersImpl>(storageInterface)));
     auto replicationProcess = repl::ReplicationProcess::get(serviceContext);
 
     repl::DropPendingCollectionReaper::set(
@@ -914,7 +935,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
         serviceContext,
         getGlobalReplSettings(),
         stdx::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(
-            serviceContext, dropPendingCollectionReaper, storageInterface),
+            serviceContext, dropPendingCollectionReaper, storageInterface, replicationProcess),
         makeReplicationExecutor(serviceContext),
         stdx::make_unique<repl::TopologyCoordinatorImpl>(topoCoordOptions),
         replicationProcess,
@@ -965,8 +986,15 @@ static void shutdownTask() {
         repl::ReplicationCoordinator::get(opCtx)->shutdown(opCtx);
     }
 
-    if (serviceContext)
+    if (serviceContext) {
         serviceContext->setKillAllOperations();
+
+        // Shut down the background periodic task runner.
+        auto runner = serviceContext->getPeriodicRunner();
+        if (runner) {
+            runner->shutdown();
+        }
+    }
 
     ReplicaSetMonitor::shutdown();
     if (auto sr = grid.shardRegistry()) {  // TODO: race: sr is a naked pointer

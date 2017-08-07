@@ -33,6 +33,8 @@
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/message_compressor_noop.h"
 #include "mongo/transport/message_compressor_registry.h"
+#include "mongo/transport/message_compressor_snappy.h"
+#include "mongo/transport/message_compressor_zlib.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/message.h"
 
@@ -48,7 +50,7 @@ MessageCompressorRegistry buildRegistry() {
     std::vector<std::string> compressorList = {compressor->getName()};
     ret.setSupportedCompressors(std::move(compressorList));
     ret.registerImplementation(std::move(compressor));
-    ret.finalizeSupportedCompressors();
+    ret.finalizeSupportedCompressors().transitional_ignore();
 
     return ret;
 }
@@ -90,7 +92,7 @@ void checkFidelity(const Message& msg, std::unique_ptr<MessageCompressorBase> co
     std::vector<std::string> compressorList = {compressorName};
     registry.setSupportedCompressors(std::move(compressorList));
     registry.registerImplementation(std::move(compressor));
-    registry.finalizeSupportedCompressors();
+    registry.finalizeSupportedCompressors().transitional_ignore();
 
     MessageCompressorManager mgr(&registry);
     auto negotiator = BSON("isMaster" << 1 << "compression" << BSON_ARRAY(compressorName));
@@ -179,7 +181,12 @@ TEST(NoopMessageCompressor, Fidelity) {
 
 TEST(SnappyMessageCompressor, Fidelity) {
     auto testMessage = buildMessage();
-    checkFidelity(testMessage, stdx::make_unique<NoopMessageCompressor>());
+    checkFidelity(testMessage, stdx::make_unique<SnappyMessageCompressor>());
+}
+
+TEST(ZlibMessageCompressor, Fidelity) {
+    auto testMessage = buildMessage();
+    checkFidelity(testMessage, stdx::make_unique<ZlibMessageCompressor>());
 }
 
 }  // namespace mongo

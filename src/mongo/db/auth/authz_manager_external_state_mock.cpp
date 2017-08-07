@@ -179,7 +179,8 @@ Status AuthzManagerExternalStateMock::updateOne(OperationContext* opCtx,
     namespace mmb = mutablebson;
     UpdateDriver::Options updateOptions;
     UpdateDriver driver(updateOptions);
-    Status status = driver.parse(updatePattern);
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    Status status = driver.parse(updatePattern, arrayFilters);
     if (!status.isOK())
         return status;
 
@@ -203,7 +204,7 @@ Status AuthzManagerExternalStateMock::updateOne(OperationContext* opCtx,
         return Status::OK();
     } else if (status == ErrorCodes::NoMatchingDocument && upsert) {
         if (query.hasField("_id")) {
-            document.root().appendElement(query["_id"]);
+            document.root().appendElement(query["_id"]).transitional_ignore();
         }
         status = driver.populateDocumentWithQueryFields(opCtx, query, NULL, document);
         if (!status.isOK()) {

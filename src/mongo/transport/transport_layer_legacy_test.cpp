@@ -47,9 +47,7 @@ public:
         tll->end(session);
     }
 
-    DbResponse handleRequest(OperationContext* opCtx,
-                             const Message& request,
-                             const HostAndPort& client) override {
+    DbResponse handleRequest(OperationContext* opCtx, const Message& request) override {
         MONGO_UNREACHABLE;
     }
 
@@ -72,8 +70,8 @@ TEST(TransportLayerLegacy, endSessionsDoesntDoubleClose) {
 
     sepu.tll = &tll;
 
-    tll.setup();
-    tll.start();
+    tll.setup().transitional_ignore();
+    tll.start().transitional_ignore();
 
     stdx::mutex mutex;
     bool end = false;

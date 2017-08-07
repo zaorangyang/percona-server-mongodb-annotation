@@ -203,6 +203,14 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
         "net.maxIncomingConnections", "maxConns", moe::Int, maxConnInfoBuilder.str().c_str());
 
     options
+        ->addOptionChaining("net.transportLayer",
+                            "transportLayer",
+                            moe::String,
+                            "sets the ingress transport layer implementation")
+        .hidden()
+        .setDefault(moe::Value("asio"));
+
+    options
         ->addOptionChaining(
             "logpath",
             "logpath",
@@ -269,6 +277,11 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
                                "pidfilepath",
                                moe::String,
                                "full path to pidfile (if not set, no pidfile is created)");
+
+    options->addOptionChaining("processManagement.timeZoneInfo",
+                               "timeZoneInfo",
+                               moe::String,
+                               "full path to time zone info directory, e.g. /usr/share/zoneinfo");
 
     options
         ->addOptionChaining(
@@ -638,7 +651,7 @@ Status canonicalizeServerOptions(moe::Environment* params) {
 
         if (params->count("verbose")) {
             std::string verbosity;
-            params->get("verbose", &verbosity);
+            params->get("verbose", &verbosity).transitional_ignore();
             if (s == verbosity ||
                 // Treat a verbosity of "true" the same as a single "v".  See SERVER-11471.
                 (s == "v" && verbosity == "true")) {
@@ -780,7 +793,17 @@ Status storeServerOptions(const moe::Environment& params) {
     }
 
     if (params.count("net.ipv6") && params["net.ipv6"].as<bool>() == true) {
+        serverGlobalParams.enableIPv6 = true;
         enableIPv6();
+    }
+
+    if (params.count("net.transportLayer")) {
+        serverGlobalParams.transportLayer = params["net.transportLayer"].as<std::string>();
+        if (serverGlobalParams.transportLayer != "asio" &&
+            serverGlobalParams.transportLayer != "legacy") {
+            return {ErrorCodes::BadValue,
+                    "Unsupported value for transportLayer. Must be \"asio\" or \"legacy\""};
+        }
     }
 
     if (params.count("security.transitionToAuth")) {
@@ -981,6 +1004,10 @@ Status storeServerOptions(const moe::Environment& params) {
 
     if (params.count("processManagement.pidFilePath")) {
         serverGlobalParams.pidFile = params["processManagement.pidFilePath"].as<string>();
+    }
+
+    if (params.count("processManagement.timeZoneInfo")) {
+        serverGlobalParams.timeZoneInfoPath = params["processManagement.timeZoneInfo"].as<string>();
     }
 
     if (params.count("setParameter")) {
