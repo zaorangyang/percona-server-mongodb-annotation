@@ -86,7 +86,9 @@ public:
         for (auto&& child : _children) {
             child.second->setCollator(collator);
         }
-        _positionalChild->setCollator(collator);
+        if (_positionalChild) {
+            _positionalChild->setCollator(collator);
+        }
     }
 
     void apply(mutablebson::Element element,
@@ -94,6 +96,8 @@ public:
                FieldRef* pathTaken,
                StringData matchedField,
                bool fromReplication,
+               bool validateForStorage,
+               const FieldRefSet& immutablePaths,
                const UpdateIndexData* indexData,
                LogBuilder* logBuilder,
                bool* indexesAffected,

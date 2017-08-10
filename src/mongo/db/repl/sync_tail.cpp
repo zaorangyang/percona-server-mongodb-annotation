@@ -290,37 +290,9 @@ Status SyncTail::syncApply(OperationContext* opCtx,
     // Count each log op application as a separate operation, for reporting purposes
     CurOp individualOp(opCtx);
 
-    const char* ns = op.getStringField("ns");
-    verify(ns);
+    const NamespaceString nss(op.getStringField("ns"));
 
     const char* opType = op["op"].valuestrsafe();
-
-    bool isCommand(opType[0] == 'c');
-    bool isNoOp(opType[0] == 'n');
-
-    if ((*ns == '\0') || (*ns == '.')) {
-        // this is ugly
-        // this is often a no-op
-        // but can't be 100% sure
-        if (!isNoOp) {
-            error() << "skipping bad op in oplog: " << redact(op);
-        }
-        return Status::OK();
-    }
-
-    if (isCommand) {
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            // a command may need a global write lock. so we will conservatively go
-            // ahead and grab one here. suboptimal. :-(
-            Lock::GlobalWrite globalWriteLock(opCtx);
-
-            // special case apply for commands to avoid implicit database creation
-            Status status = applyCommandInLock(opCtx, op, inSteadyStateReplication);
-            incrementOpsAppliedStats();
-            return status;
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "syncApply_command", ns);
-    }
 
     auto applyOp = [&](Database* db) {
         // For non-initial-sync, we convert updates to upserts
@@ -336,24 +308,25 @@ Status SyncTail::syncApply(OperationContext* opCtx,
         return status;
     };
 
-    if (isNoOp || (opType[0] == 'i' && nsToCollectionSubstring(ns) == "system.indexes")) {
+    bool isNoOp = opType[0] == 'n';
+    if (isNoOp || (opType[0] == 'i' && nss.isSystemDotIndexes())) {
         auto opStr = isNoOp ? "syncApply_noop" : "syncApply_indexBuild";
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            Lock::DBLock dbLock(opCtx, nsToDatabaseSubstring(ns), MODE_X);
-            OldClientContext ctx(opCtx, ns);
+        if (isNoOp && nss.db() == "")
+            return Status::OK();
+        return writeConflictRetry(opCtx, opStr, nss.ns(), [&] {
+            Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
+            OldClientContext ctx(opCtx, nss.ns());
             return applyOp(ctx.db());
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, opStr, ns);
+        });
     }
 
     if (isCrudOpType(opType)) {
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        return writeConflictRetry(opCtx, "syncApply_CRUD", nss.ns(), [&] {
             // DB lock always acquires the global lock
             std::unique_ptr<Lock::DBLock> dbLock;
             std::unique_ptr<Lock::CollectionLock> collectionLock;
             std::unique_ptr<OldClientContext> ctx;
 
-            NamespaceString nss(ns);
             auto dbName = nss.db();
 
             auto resetLocks = [&](LockMode mode) {
@@ -363,28 +336,40 @@ Status SyncTail::syncApply(OperationContext* opCtx,
                 // the upgraded one.
                 dbLock.reset();
                 dbLock.reset(new Lock::DBLock(opCtx, dbName, mode));
-                collectionLock.reset(new Lock::CollectionLock(opCtx->lockState(), ns, mode));
+                collectionLock.reset(new Lock::CollectionLock(opCtx->lockState(), nss.ns(), mode));
             };
 
             resetLocks(MODE_IX);
             if (!dbHolder().get(opCtx, dbName)) {
                 // Need to create database, so reset lock to stronger mode.
                 resetLocks(MODE_X);
-                ctx.reset(new OldClientContext(opCtx, ns));
+                ctx.reset(new OldClientContext(opCtx, nss.ns()));
             } else {
-                ctx.reset(new OldClientContext(opCtx, ns));
+                ctx.reset(new OldClientContext(opCtx, nss.ns()));
                 if (!ctx->db()->getCollection(opCtx, nss)) {
                     // Need to implicitly create collection.  This occurs for 'u' opTypes,
                     // but not for 'i' nor 'd'.
                     ctx.reset();
                     resetLocks(MODE_X);
-                    ctx.reset(new OldClientContext(opCtx, ns));
+                    ctx.reset(new OldClientContext(opCtx, nss.ns()));
                 }
             }
 
             return applyOp(ctx->db());
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "syncApply_CRUD", ns);
+        });
+    }
+
+    if (opType[0] == 'c') {
+        return writeConflictRetry(opCtx, "syncApply_command", nss.ns(), [&] {
+            // a command may need a global write lock. so we will conservatively go
+            // ahead and grab one here. suboptimal. :-(
+            Lock::GlobalWrite globalWriteLock(opCtx);
+
+            // special case apply for commands to avoid implicit database creation
+            Status status = applyCommandInLock(opCtx, op, inSteadyStateReplication);
+            incrementOpsAppliedStats();
+            return status;
+        });
     }
 
     // unknown opType
@@ -484,12 +469,12 @@ void scheduleWritesToOplog(OperationContext* opCtx,
             opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
             UnreplicatedWritesBlock uwb(opCtx);
 
-            std::vector<BSONObj> docs;
+            std::vector<InsertStatement> docs;
             docs.reserve(end - begin);
             for (size_t i = begin; i < end; i++) {
                 // Add as unowned BSON to avoid unnecessary ref-count bumps.
                 // 'ops' will outlive 'docs' so the BSON lifetime will be guaranteed.
-                docs.emplace_back(ops[i].raw.objdata());
+                docs.emplace_back(BSONObj(ops[i].raw.objdata()));
             }
 
             fassertStatusOK(40141,
@@ -662,10 +647,10 @@ void tryToGoLiveAsASecondary(OperationContext* opCtx, ReplicationCoordinator* re
         return;
     }
 
-    bool worked = replCoord->setFollowerMode(MemberState::RS_SECONDARY);
-    if (!worked) {
+    auto status = replCoord->setFollowerMode(MemberState::RS_SECONDARY);
+    if (!status.isOK()) {
         warning() << "Failed to transition into " << MemberState(MemberState::RS_SECONDARY)
-                  << ". Current state: " << replCoord->getMemberState();
+                  << ". Current state: " << replCoord->getMemberState() << causedBy(status);
     }
 }
 }
@@ -756,14 +741,17 @@ private:
 void SyncTail::oplogApplication(ReplicationCoordinator* replCoord) {
     OpQueueBatcher batcher(this);
 
-    const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
-    OperationContext& opCtx = *opCtxPtr;
     std::unique_ptr<ApplyBatchFinalizer> finalizer{
         getGlobalServiceContext()->getGlobalStorageEngine()->isDurable()
             ? new ApplyBatchFinalizerForJournal(replCoord)
             : new ApplyBatchFinalizer(replCoord)};
 
     while (true) {  // Exits on message from OpQueueBatcher.
+        // Use a new operation context each iteration, as otherwise we may appear to use a single
+        // collection name to refer to collections with different UUIDs.
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+
         // For pausing replication in tests.
         while (MONGO_FAIL_POINT(rsSyncApplyStop)) {
             // Tests should not trigger clean shutdown while that failpoint is active. If we
@@ -927,16 +915,9 @@ OldThreadPool* SyncTail::getWriterPool() {
     return _writerPool.get();
 }
 
-BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, Database* db, const BSONObj& o) {
+BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, const BSONObj& o) {
     OplogReader missingObjReader;  // why are we using OplogReader to run a non-oplog query?
     const char* ns = o.getStringField("ns");
-
-    // capped collections
-    Collection* collection = db->getCollection(opCtx, ns);
-    if (collection && collection->isCapped()) {
-        log() << "missing doc, but this is okay for a capped collection (" << ns << ")";
-        return BSONObj();
-    }
 
     if (MONGO_FAIL_POINT(initialSyncHangBeforeGettingMissingDocument)) {
         log() << "initial sync - initialSyncHangBeforeGettingMissingDocument fail point enabled. "
@@ -996,48 +977,53 @@ BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, Database* db, const BSO
                 str::stream() << "Can no longer connect to initial sync source: " << _hostname);
 }
 
-bool SyncTail::shouldRetry(OperationContext* opCtx, const BSONObj& o) {
+bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx, const BSONObj& o) {
     const NamespaceString nss(o.getStringField("ns"));
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+
+    {
+        // If the document is in a capped collection then it's okay for it to be missing.
+        AutoGetCollectionForRead autoColl(opCtx, nss);
+        Collection* const collection = autoColl.getCollection();
+        if (collection && collection->isCapped()) {
+            log() << "Not fetching missing document in capped collection (" << nss << ")";
+            return false;
+        }
+    }
+
+    log() << "Fetching missing document: " << redact(o);
+    BSONObj missingObj = getMissingDoc(opCtx, o);
+
+    if (missingObj.isEmpty()) {
+        log() << "Missing document not found on source; presumably deleted later in oplog. o first "
+                 "field: "
+              << o.getObjectField("o").firstElementFieldName()
+              << ", o2: " << redact(o.getObjectField("o2"));
+
+        return false;
+    }
+
+    return writeConflictRetry(opCtx, "fetchAndInsertMissingDocument", nss.ns(), [&] {
         // Take an X lock on the database in order to preclude other modifications.
         // Also, the database might not exist yet, so create it.
         AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_X);
         Database* const db = autoDb.getDb();
 
-        // we don't have the object yet, which is possible on initial sync.  get it.
-        log() << "adding missing object" << endl;  // rare enough we can log
+        WriteUnitOfWork wunit(opCtx);
 
-        BSONObj missingObj = getMissingDoc(opCtx, db, o);
+        Collection* const coll = db->getOrCreateCollection(opCtx, nss);
+        invariant(coll);
 
-        if (missingObj.isEmpty()) {
-            log() << "missing object not found on source."
-                     " presumably deleted later in oplog";
-            log() << "o2: " << redact(o.getObjectField("o2"));
-            log() << "o firstfield: " << o.getObjectField("o").firstElementFieldName();
+        OpDebug* const nullOpDebug = nullptr;
+        Status status = coll->insertDocument(opCtx, InsertStatement(missingObj), nullOpDebug, true);
+        uassert(15917,
+                str::stream() << "Failed to insert missing document: " << status.toString(),
+                status.isOK());
 
-            return false;
-        } else {
-            WriteUnitOfWork wunit(opCtx);
+        LOG(1) << "Inserted missing document: " << redact(missingObj);
 
-            Collection* const coll = db->getOrCreateCollection(opCtx, nss);
-            invariant(coll);
-
-            OpDebug* const nullOpDebug = nullptr;
-            Status status = coll->insertDocument(opCtx, missingObj, nullOpDebug, true);
-            uassert(15917,
-                    str::stream() << "failed to insert missing doc: " << status.toString(),
-                    status.isOK());
-
-            LOG(1) << "inserted missing doc: " << redact(missingObj);
-
-            wunit.commit();
-            return true;
-        }
-    }
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "InsertRetry", nss.ns());
-
-    // fixes compile errors on GCC - see SERVER-18219 for details
-    MONGO_UNREACHABLE;
+        wunit.commit();
+        return true;
+    });
 }
 
 // This free function is used by the writer threads to apply each op
@@ -1191,28 +1177,19 @@ Status multiInitialSyncApply_noAbort(OperationContext* opCtx,
         try {
             const Status s = SyncTail::syncApply(opCtx, entry.raw, inSteadyStateReplication);
             if (!s.isOK()) {
-                // Don't retry on commands.
-                if (entry.isCommand()) {
-                    error() << "Error applying command (" << redact(entry.raw)
-                            << "): " << redact(s);
+                // In initial sync, update operations can cause documents to be missed during
+                // collection cloning. As a result, it is possible that a document that we need to
+                // update is not present locally. In that case we fetch the document from the
+                // sync source.
+                if (s != ErrorCodes::UpdateOperationFailed) {
+                    error() << "Error applying operation: " << redact(s) << " ("
+                            << redact(entry.raw) << ")";
                     return s;
                 }
 
                 // We might need to fetch the missing docs from the sync source.
                 fetchCount->fetchAndAdd(1);
-                if (st->shouldRetry(opCtx, entry.raw)) {
-                    const Status s2 =
-                        SyncTail::syncApply(opCtx, entry.raw, inSteadyStateReplication);
-                    if (!s2.isOK()) {
-                        severe() << "Error applying operation (" << redact(entry.raw)
-                                 << "): " << redact(s2);
-                        return s2;
-                    }
-                }
-
-                // If shouldRetry() returns false, fall through.
-                // This can happen if the document that was moved and missed by Cloner
-                // subsequently got deleted and no longer exists on the Sync Target at all
+                st->fetchAndInsertMissingDocument(opCtx, entry.raw);
             }
         } catch (const DBException& e) {
             // SERVER-24927 If we have a NamespaceNotFound exception, then this document will be
@@ -1277,7 +1254,7 @@ StatusWith<OpTime> multiApply(OperationContext* opCtx,
         ON_BLOCK_EXIT([&] { workerPool->join(); });
 
         // Write batch of ops into oplog.
-        consistencyMarkers->setOplogDeleteFromPoint(opCtx, ops.front().getTimestamp());
+        consistencyMarkers->setOplogTruncateAfterPoint(opCtx, ops.front().getTimestamp());
         scheduleWritesToOplog(opCtx, workerPool, ops);
         fillWriterVectors(opCtx, &ops, &writerVectors);
 
@@ -1285,7 +1262,7 @@ StatusWith<OpTime> multiApply(OperationContext* opCtx,
         workerPool->join();
 
         // Reset consistency markers in case the node fails while applying ops.
-        consistencyMarkers->setOplogDeleteFromPoint(opCtx, Timestamp());
+        consistencyMarkers->setOplogTruncateAfterPoint(opCtx, Timestamp());
         consistencyMarkers->setMinValidToAtLeast(opCtx, ops.back().getOpTime());
 
         applyOps(writerVectors, workerPool, applyOperation, &statusVector);

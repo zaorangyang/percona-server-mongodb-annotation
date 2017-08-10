@@ -122,6 +122,73 @@ TimeZone TimeZoneDatabase::utcZone() {
     return TimeZone{nullptr};
 }
 
+TimeZone TimeZoneDatabase::getTimeZone(StringData timeZoneId) const {
+    auto tz = _timeZones.find(timeZoneId);
+    if (tz != _timeZones.end()) {
+        return tz->second;
+    }
+
+    uasserted(40485,
+              str::stream() << "unrecognized time zone identifier: \"" << timeZoneId << "\"");
+}
+
+Date_t TimeZone::createFromDateParts(
+    int year, int month, int day, int hour, int minute, int second, int millisecond) const {
+    auto t = timelib_time_ctor();
+
+    t->y = year;
+    t->m = month;
+    t->d = day;
+    t->h = hour;
+    t->i = minute;
+    t->s = second;
+    t->f = millisecond / 1000.0;
+
+    if (_tzInfo) {
+        timelib_update_ts(t, _tzInfo.get());
+        timelib_set_timezone(t, _tzInfo.get());
+    } else {
+        timelib_update_ts(t, nullptr);
+    }
+    timelib_unixtime2gmt(t, t->sse);
+
+    auto returnValue = Date_t::fromMillisSinceEpoch((t->f + t->sse) * 1000);
+
+    timelib_time_dtor(t);
+
+    return returnValue;
+}
+
+Date_t TimeZone::createFromIso8601DateParts(int isoYear,
+                                            int isoWeekYear,
+                                            int isoDayOfWeek,
+                                            int hour,
+                                            int minute,
+                                            int second,
+                                            int millisecond) const {
+    auto t = timelib_time_ctor();
+
+    timelib_date_from_isodate(isoYear, isoWeekYear, isoDayOfWeek, &t->y, &t->m, &t->d);
+    t->h = hour;
+    t->i = minute;
+    t->s = second;
+    t->f = millisecond / 1000.0;
+
+    if (_tzInfo) {
+        timelib_update_ts(t, _tzInfo.get());
+        timelib_set_timezone(t, _tzInfo.get());
+    } else {
+        timelib_update_ts(t, nullptr);
+    }
+    timelib_unixtime2gmt(t, t->sse);
+
+    auto returnValue = Date_t::fromMillisSinceEpoch((t->f + t->sse) * 1000);
+
+    timelib_time_dtor(t);
+
+    return returnValue;
+}
+
 TimeZone::DateParts::DateParts(const timelib_time& timelib_time, Date_t date)
     : year(timelib_time.y),
       month(timelib_time.m),
@@ -134,6 +201,28 @@ TimeZone::DateParts::DateParts(const timelib_time& timelib_time, Date_t date)
     millisecond = ms >= 0 ? ms : 1000 + ms;
 }
 
+TimeZone::Iso8601DateParts::Iso8601DateParts(const timelib_time& timelib_time, Date_t date)
+    : hour(timelib_time.h), minute(timelib_time.i), second(timelib_time.s) {
+
+    timelib_sll tmpIsoYear, tmpIsoWeekOfYear, tmpIsoDayOfWeek;
+
+    timelib_isodate_from_date(timelib_time.y,
+                              timelib_time.m,
+                              timelib_time.d,
+                              &tmpIsoYear,
+                              &tmpIsoWeekOfYear,
+                              &tmpIsoDayOfWeek);
+
+    year = static_cast<int>(tmpIsoYear);
+    weekOfYear = static_cast<int>(tmpIsoWeekOfYear);
+    dayOfWeek = static_cast<int>(tmpIsoDayOfWeek);
+
+    const int ms = date.toMillisSinceEpoch() % 1000LL;
+    // Add 1000 since dates before 1970 would have negative milliseconds.
+    millisecond = ms >= 0 ? ms : 1000 + ms;
+}
+
+
 void TimeZone::TimelibTZInfoDeleter::operator()(timelib_tzinfo* tzInfo) {
     if (tzInfo) {
         timelib_tzinfo_dtor(tzInfo);
@@ -142,26 +231,36 @@ void TimeZone::TimelibTZInfoDeleter::operator()(timelib_tzinfo* tzInfo) {
 
 TimeZone::TimeZone(timelib_tzinfo* tzInfo) : _tzInfo(tzInfo, TimelibTZInfoDeleter()) {}
 
-timelib_time TimeZone::getTimelibTime(Date_t date) const {
-    timelib_time time{};
+void TimeZone::TimelibTimeDeleter::operator()(timelib_time* time) {
+    timelib_time_dtor(time);
+}
+
+std::unique_ptr<timelib_time, TimeZone::TimelibTimeDeleter> TimeZone::getTimelibTime(
+    Date_t date) const {
+    std::unique_ptr<timelib_time, TimeZone::TimelibTimeDeleter> time(timelib_time_ctor());
     if (_tzInfo) {
-        timelib_set_timezone(&time, _tzInfo.get());
-        timelib_unixtime2local(&time, seconds(date));
+        timelib_set_timezone(time.get(), _tzInfo.get());
+        timelib_unixtime2local(time.get(), seconds(date));
     } else {
-        timelib_unixtime2gmt(&time, seconds(date));
+        timelib_unixtime2gmt(time.get(), seconds(date));
     }
     return time;
 }
 
+TimeZone::Iso8601DateParts TimeZone::dateIso8601Parts(Date_t date) const {
+    auto time = getTimelibTime(date);
+    return Iso8601DateParts(*time, date);
+}
+
 TimeZone::DateParts TimeZone::dateParts(Date_t date) const {
     auto time = getTimelibTime(date);
-    return DateParts(time, date);
+    return DateParts(*time, date);
 }
 
 int TimeZone::dayOfWeek(Date_t date) const {
     auto time = getTimelibTime(date);
     // timelib_day_of_week() returns a number in the range [0,6], we want [1,7], so add one.
-    return timelib_day_of_week(time.y, time.m, time.d) + 1;
+    return timelib_day_of_week(time->y, time->m, time->d) + 1;
 }
 
 int TimeZone::week(Date_t date) const {
@@ -180,19 +279,19 @@ int TimeZone::week(Date_t date) const {
 int TimeZone::dayOfYear(Date_t date) const {
     auto time = getTimelibTime(date);
     // timelib_day_of_year() returns a number in the range [0,365], we want [1,366], so add one.
-    return timelib_day_of_year(time.y, time.m, time.d) + 1;
+    return timelib_day_of_year(time->y, time->m, time->d) + 1;
 }
 
 int TimeZone::isoDayOfWeek(Date_t date) const {
     auto time = getTimelibTime(date);
-    return timelib_iso_day_of_week(time.y, time.m, time.d);
+    return timelib_iso_day_of_week(time->y, time->m, time->d);
 }
 
 int TimeZone::isoWeek(Date_t date) const {
     auto time = getTimelibTime(date);
     long long isoWeek;
     long long isoYear;
-    timelib_isoweek_from_date(time.y, time.m, time.d, &isoWeek, &isoYear);
+    timelib_isoweek_from_date(time->y, time->m, time->d, &isoWeek, &isoYear);
     return isoWeek;
 }
 
@@ -200,8 +299,13 @@ long long TimeZone::isoYear(Date_t date) const {
     auto time = getTimelibTime(date);
     long long isoWeek;
     long long isoYear;
-    timelib_isoweek_from_date(time.y, time.m, time.d, &isoWeek, &isoYear);
+    timelib_isoweek_from_date(time->y, time->m, time->d, &isoWeek, &isoYear);
     return isoYear;
+}
+
+Seconds TimeZone::utcOffset(Date_t date) const {
+    auto time = getTimelibTime(date);
+    return Seconds(time->z);
 }
 
 void TimeZone::validateFormat(StringData format) {
@@ -230,6 +334,8 @@ void TimeZone::validateFormat(StringData format) {
             case 'G':
             case 'V':
             case 'u':
+            case 'z':
+            case 'Z':
                 break;
             default:
                 uasserted(18536,

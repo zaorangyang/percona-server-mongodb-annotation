@@ -214,13 +214,14 @@ TEST_F(ConfigInitializationTest, ReRunsIfDocRolledBackThenReElected) {
     // Now remove the version document and re-run initializeConfigDatabaseIfNeeded().
     {
         // Mirror what happens if the config.version document is rolled back.
-        ON_BLOCK_EXIT(
-            [&] { replicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY); });
-        replicationCoordinator()->setFollowerMode(repl::MemberState::RS_ROLLBACK);
+        ON_BLOCK_EXIT([&] {
+            replicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY).ignore();
+        });
+        ASSERT_OK(replicationCoordinator()->setFollowerMode(repl::MemberState::RS_ROLLBACK));
         auto opCtx = operationContext();
         repl::UnreplicatedWritesBlock uwb(opCtx);
         auto nss = NamespaceString(VersionType::ConfigNS);
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        writeConflictRetry(opCtx, "removeConfigDocuments", nss.ns(), [&] {
             AutoGetCollection autoColl(opCtx, nss, MODE_IX);
             auto coll = autoColl.getCollection();
             ASSERT_TRUE(coll);
@@ -235,8 +236,7 @@ TEST_F(ConfigInitializationTest, ReRunsIfDocRolledBackThenReElected) {
             }
             wuow.commit();
             ASSERT_EQUALS(0UL, coll->numRecords(opCtx));
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "removeConfigDocuments", nss.ns());
+        });
     }
 
     // Verify the document was actually removed.

@@ -43,6 +43,7 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
@@ -50,7 +51,6 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/util/log.h"
-#include "mongo/util/uuid_catalog.h"
 
 namespace mongo {
 
@@ -74,6 +74,20 @@ ExportedServerParameter<bool, ServerParameterType::kStartupOnly> testCommandsPar
 }  // namespace
 
 Command::~Command() = default;
+
+BSONObj Command::appendPassthroughFields(const BSONObj& cmdObjWithPassthroughFields,
+                                         const BSONObj& request) {
+    BSONObjBuilder b;
+    b.appendElements(request);
+    for (const auto& elem : cmdObjWithPassthroughFields) {
+        const auto name = elem.fieldNameStringData();
+        // $db is one of the generic arguments, but is implicitly contained in request
+        if (Command::isGenericArgument(name) && !request.hasField(name) && name != "$db") {
+            b.append(elem);
+        }
+    }
+    return b.obj();
+}
 
 string Command::parseNsFullyQualified(const string& dbname, const BSONObj& cmdObj) {
     BSONElement first = cmdObj.firstElement();
@@ -108,7 +122,7 @@ NamespaceString Command::parseNsOrUUID(OperationContext* opCtx,
     if (first.type() == BinData && first.binDataType() == BinDataType::newUUID) {
         StatusWith<UUID> uuidRes = UUID::parse(first);
         uassertStatusOK(uuidRes);
-        UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
+        UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
         return catalog.lookupNSSByUUID(uuidRes.getValue());
     } else {
         // Ensure collection identifier is not a Command or specialCommand
@@ -365,7 +379,7 @@ void Command::filterCommandReplyForPassthrough(const BSONObj& cmdObj, BSONObjBui
         const auto name = elem.fieldNameStringData();
         if (name == "$configServerState" ||  //
             name == "$gleStats" ||           //
-            name == "$logicalTime" ||        //
+            name == "$clusterTime" ||        //
             name == "$oplogQueryData" ||     //
             name == "$replData" ||           //
             name == "operationTime") {

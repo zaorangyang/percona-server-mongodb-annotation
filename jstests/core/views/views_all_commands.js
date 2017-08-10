@@ -69,6 +69,7 @@
         _configsvrMoveChunk: {skip: isAnInternalCommand},
         _configsvrMovePrimary: {skip: isAnInternalCommand},
         _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
+        _configsvrShardCollection: {skip: isAnInternalCommand},
         _configsvrSetFeatureCompatibilityVersion: {skip: isAnInternalCommand},
         _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
         _getUserCacheGeneration: {skip: isAnInternalCommand},
@@ -167,7 +168,7 @@
                                      "could not create view 'view2' on 'view'");
                 let hash2 = getHash();
                 assert.neq(hash1, hash2, "expected hash to change after creating new view");
-                assert.commandWorked(conn.runCommand({drop: "view2"}, "problem dropping view2"));
+                assert.commandWorked(conn.runCommand({drop: "view2"}), "problem dropping view2");
                 let hash3 = getHash();
                 assert.eq(hash1, hash3, "hash should be the same again after removing 'view2'");
             }
@@ -209,6 +210,7 @@
         },
         flushRouterConfig: {skip: isUnrelated},
         forceerror: {skip: isUnrelated},
+        forceRoutingTableRefresh: {skip: isUnrelated},
         fsync: {skip: isUnrelated},
         fsyncUnlock: {skip: isUnrelated},
         geoNear: {
@@ -316,7 +318,7 @@
                     ok: 1
                 };
                 delete res.operationTime;
-                delete res.$logicalTime;
+                delete res.$clusterTime;
                 assert.eq(expectedRes, res, "unexpected result for: " + tojson(killCursorsCmd));
             }
         },
@@ -400,6 +402,7 @@
         replSetSyncFrom: {skip: isUnrelated},
         replSetTest: {skip: isUnrelated},
         replSetUpdatePosition: {skip: isUnrelated},
+        replSetResizeOplog: {skip: isUnrelated},
         resetError: {skip: isUnrelated},
         resync: {skip: isUnrelated},
         revokePrivilegesFromRole: {

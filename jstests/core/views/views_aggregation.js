@@ -129,14 +129,14 @@
                                            .aggregate([{$limit: 1}, {$match: {pop: 3}}]));
     assert.eq(explainPlan.stages[0].$cursor.queryPlanner.namespace, "views_aggregation.coll");
     assert(explainPlan.stages[0].$cursor.hasOwnProperty("executionStats"));
-    assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 1);
+    assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 5);
     assert(!explainPlan.stages[0].$cursor.executionStats.hasOwnProperty("allPlansExecution"));
 
     explainPlan = assert.commandWorked(viewsDB.popSortedView.explain("allPlansExecution")
                                            .aggregate([{$limit: 1}, {$match: {pop: 3}}]));
     assert.eq(explainPlan.stages[0].$cursor.queryPlanner.namespace, "views_aggregation.coll");
     assert(explainPlan.stages[0].$cursor.hasOwnProperty("executionStats"));
-    assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 1);
+    assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 5);
     assert(explainPlan.stages[0].$cursor.executionStats.hasOwnProperty("allPlansExecution"));
 
     // Passing a value of true for the explain option to the aggregation command, without using the
@@ -151,7 +151,6 @@
         viewsDB.coll.explain("allPlansExecution").aggregate([{$limit: 1}, {$match: {pop: 3}}]));
     assert.eq(explainPlan.stages[0].$cursor.queryPlanner.namespace, "views_aggregation.coll");
     assert(explainPlan.stages[0].$cursor.hasOwnProperty("executionStats"));
-    printjson(explainPlan.stages[0].$cursor.executionStats);
     assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 5);
     assert(explainPlan.stages[0].$cursor.executionStats.hasOwnProperty("allPlansExecution"));
 
@@ -251,6 +250,41 @@
     assertAggResultEq(coll.getName(),
                       graphLookupPipeline,
                       [{_id: "New York", matchedId1: "New York", matchedId2: "New York"}]);
+
+    // Test that the $lookup stage on a view with a nested $lookup on a different view resolves the
+    // view namespaces referenced in their respective 'from' fields.
+    assertAggResultEq(
+        coll.getName(),
+        [
+          {$match: {_id: "Trenton"}},
+          {$project: {state: 1}},
+          {
+            $lookup: {
+                from: "identityView",
+                as: "lookup1",
+                pipeline: [
+                    {$match: {_id: "Trenton"}},
+                    {$project: {state: 1}},
+                    {$lookup: {from: "popSortedView", as: "lookup2", pipeline: []}}
+                ]
+            }
+          }
+        ],
+        [{
+           "_id": "Trenton",
+           "state": "NJ",
+           "lookup1": [{
+               "_id": "Trenton",
+               "state": "NJ",
+               "lookup2": [
+                   {"_id": "Newark", "state": "NJ", "pop": 3},
+                   {"_id": "San Francisco", "state": "CA", "pop": 4},
+                   {"_id": "Trenton", "state": "NJ", "pop": 5},
+                   {"_id": "New York", "state": "NY", "pop": 7},
+                   {"_id": "Palo Alto", "state": "CA", "pop": 10}
+               ]
+           }]
+        }]);
 
     // Test that the $facet stage resolves the view namespace referenced in the 'from' field of a
     // $lookup stage nested inside of a $graphLookup stage.

@@ -43,10 +43,11 @@
 #include "mongo/util/system_tick_source.h"
 
 namespace mongo {
-
 namespace {
 
-ServiceContext* globalServiceContext = NULL;
+ServiceContext* globalServiceContext = nullptr;
+stdx::mutex globalServiceContextMutex;
+stdx::condition_variable globalServiceContextCV;
 
 }  // namespace
 
@@ -59,10 +60,23 @@ ServiceContext* getGlobalServiceContext() {
     return globalServiceContext;
 }
 
+ServiceContext* waitAndGetGlobalServiceContext() {
+    stdx::unique_lock<stdx::mutex> lk(globalServiceContextMutex);
+    globalServiceContextCV.wait(lk, [] { return globalServiceContext; });
+    fassert(40549, globalServiceContext);
+    return globalServiceContext;
+}
+
 void setGlobalServiceContext(std::unique_ptr<ServiceContext>&& serviceContext) {
     fassert(17509, serviceContext.get());
 
     delete globalServiceContext;
+
+    stdx::lock_guard<stdx::mutex> lk(globalServiceContextMutex);
+
+    if (!globalServiceContext) {
+        globalServiceContextCV.notify_all();
+    }
 
     globalServiceContext = serviceContext.release();
 }
@@ -227,9 +241,8 @@ void ServiceContext::ClientDeleter::operator()(Client* client) const {
     delete client;
 }
 
-ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(
-    Client* client, boost::optional<LogicalSessionId> lsid) {
-    auto opCtx = _newOpCtx(client, _nextOpId.fetchAndAdd(1), std::move(lsid));
+ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(Client* client) {
+    auto opCtx = _newOpCtx(client, _nextOpId.fetchAndAdd(1));
     auto observer = _clientObservers.begin();
     try {
         for (; observer != _clientObservers.cend(); ++observer) {

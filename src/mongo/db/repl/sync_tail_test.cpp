@@ -199,19 +199,19 @@ protected:
 class SyncTailWithLocalDocumentFetcher : public SyncTail {
 public:
     SyncTailWithLocalDocumentFetcher(const BSONObj& document);
-    BSONObj getMissingDoc(OperationContext* opCtx, Database* db, const BSONObj& o) override;
+    BSONObj getMissingDoc(OperationContext* opCtx, const BSONObj& o) override;
 
 private:
     BSONObj _document;
 };
 
 /**
- * Testing-only SyncTail that checks the operation context in shouldRetry().
+ * Testing-only SyncTail that checks the operation context in fetchAndInsertMissingDocument().
  */
 class SyncTailWithOperationContextChecker : public SyncTail {
 public:
     SyncTailWithOperationContextChecker();
-    bool shouldRetry(OperationContext* opCtx, const BSONObj& o) override;
+    bool fetchAndInsertMissingDocument(OperationContext* opCtx, const BSONObj& o) override;
 };
 
 void SyncTailTest::setUp() {
@@ -221,9 +221,10 @@ void SyncTailTest::setUp() {
     ReplicationCoordinator::set(service, stdx::make_unique<ReplicationCoordinatorMock>(service));
     auto storageInterface = stdx::make_unique<StorageInterfaceMock>();
     _storageInterface = storageInterface.get();
-    storageInterface->insertDocumentsFn = [](OperationContext*,
-                                             const NamespaceString&,
-                                             const std::vector<BSONObj>&) { return Status::OK(); };
+    storageInterface->insertDocumentsFn =
+        [](OperationContext*, const NamespaceString&, const std::vector<InsertStatement>&) {
+            return Status::OK();
+        };
     StorageInterface::set(service, std::move(storageInterface));
     DropPendingCollectionReaper::set(
         service, stdx::make_unique<DropPendingCollectionReaper>(_storageInterface));
@@ -257,16 +258,15 @@ void SyncTailTest::tearDown() {
 SyncTailWithLocalDocumentFetcher::SyncTailWithLocalDocumentFetcher(const BSONObj& document)
     : SyncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr), _document(document) {}
 
-BSONObj SyncTailWithLocalDocumentFetcher::getMissingDoc(OperationContext*,
-                                                        Database*,
-                                                        const BSONObj&) {
+BSONObj SyncTailWithLocalDocumentFetcher::getMissingDoc(OperationContext*, const BSONObj&) {
     return _document;
 }
 
 SyncTailWithOperationContextChecker::SyncTailWithOperationContextChecker()
     : SyncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr) {}
 
-bool SyncTailWithOperationContextChecker::shouldRetry(OperationContext* opCtx, const BSONObj&) {
+bool SyncTailWithOperationContextChecker::fetchAndInsertMissingDocument(OperationContext* opCtx,
+                                                                        const BSONObj&) {
     ASSERT_FALSE(opCtx->writesAreReplicated());
     ASSERT_FALSE(opCtx->lockState()->shouldConflictWithSecondaryBatchApplication());
     ASSERT_TRUE(documentValidationDisabled(opCtx));
@@ -291,7 +291,7 @@ CollectionOptions createOplogCollectionOptions() {
 void createCollection(OperationContext* opCtx,
                       const NamespaceString& nss,
                       const CollectionOptions& options) {
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+    writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
         Lock::DBLock dblk(opCtx, nss.db(), MODE_X);
         OldClientContext ctx(opCtx, nss.ns());
         auto db = ctx.db();
@@ -300,8 +300,7 @@ void createCollection(OperationContext* opCtx,
         auto coll = db->createCollection(opCtx, nss.ns(), options);
         ASSERT_TRUE(coll);
         wuow.commit();
-    }
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "createCollection", nss.ns());
+    });
 }
 
 /**
@@ -368,7 +367,8 @@ Status failedApplyCommand(OperationContext* opCtx, const BSONObj& theOperation, 
 TEST_F(SyncTailTest, SyncApplyNoNamespaceBadOp) {
     const BSONObj op = BSON("op"
                             << "x");
-    ASSERT_OK(SyncTail::syncApply(_opCtx.get(), op, false, _applyOp, _applyCmd, _incOps));
+    ASSERT_EQUALS(ErrorCodes::BadValue,
+                  SyncTail::syncApply(_opCtx.get(), op, false, _applyOp, _applyCmd, _incOps));
     ASSERT_EQUALS(0U, _opsApplied);
 }
 
@@ -679,9 +679,11 @@ TEST_F(SyncTailTest, MultiApplyAssignsOperationsToWriterThreadsBasedOnNamespaceH
     auto op2 = makeInsertDocumentOplogEntry({Timestamp(Seconds(2), 0), 1LL}, nss2, BSON("x" << 2));
 
     NamespaceString nssForInsert;
-    std::vector<BSONObj> operationsWrittenToOplog;
+    std::vector<InsertStatement> operationsWrittenToOplog;
     _storageInterface->insertDocumentsFn = [&mutex, &nssForInsert, &operationsWrittenToOplog](
-        OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const std::vector<InsertStatement>& docs) {
         stdx::lock_guard<stdx::mutex> lock(mutex);
         nssForInsert = nss;
         operationsWrittenToOplog = docs;
@@ -711,8 +713,8 @@ TEST_F(SyncTailTest, MultiApplyAssignsOperationsToWriterThreadsBasedOnNamespaceH
     stdx::lock_guard<stdx::mutex> lock(mutex);
     ASSERT_EQUALS(2U, operationsWrittenToOplog.size());
     ASSERT_EQUALS(NamespaceString(rsOplogName), nssForInsert);
-    ASSERT_BSONOBJ_EQ(op1.raw, operationsWrittenToOplog[0]);
-    ASSERT_BSONOBJ_EQ(op2.raw, operationsWrittenToOplog[1]);
+    ASSERT_BSONOBJ_EQ(op1.raw, operationsWrittenToOplog[0].doc);
+    ASSERT_BSONOBJ_EQ(op2.raw, operationsWrittenToOplog[1].doc);
 }
 
 TEST_F(SyncTailTest, MultiSyncApplyUsesSyncApplyToApplyOperation) {
@@ -953,8 +955,7 @@ TEST_F(SyncTailTest, MultiInitialSyncApplyDisablesDocumentValidationWhileApplyin
     ASSERT_EQUALS(fetchCount.load(), 1U);
 }
 
-TEST_F(SyncTailTest,
-       MultiInitialSyncApplyDoesNotRetryFailedUpdateIfDocumentIsMissingFromSyncSource) {
+TEST_F(SyncTailTest, MultiInitialSyncApplyIgnoresUpdateOperationIfDocumentIsMissingFromSyncSource) {
     BSONObj emptyDoc;
     SyncTailWithLocalDocumentFetcher syncTail(emptyDoc);
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
@@ -1022,10 +1023,11 @@ TEST_F(SyncTailTest, MultiInitialSyncApplySkipsIndexCreationOnNamespaceNotFound)
     ASSERT_FALSE(AutoGetCollectionForReadCommand(_opCtx.get(), badNss).getCollection());
 }
 
-TEST_F(SyncTailTest, MultiInitialSyncApplyRetriesFailedUpdateIfDocumentIsAvailableFromSyncSource) {
+TEST_F(SyncTailTest,
+       MultiInitialSyncApplyFetchesMissingDocumentIfDocumentIsAvailableFromSyncSource) {
     SyncTailWithLocalDocumentFetcher syncTail(BSON("_id" << 0 << "x" << 1));
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
-    auto updatedDocument = BSON("_id" << 0 << "x" << 2);
+    auto updatedDocument = BSON("_id" << 0 << "x" << 1);
     auto op = makeUpdateDocumentOplogEntry(
         {Timestamp(Seconds(1), 0), 1LL}, nss, BSON("_id" << 0), updatedDocument);
     MultiApplier::OperationPtrs ops = {&op};
@@ -1040,37 +1042,6 @@ TEST_F(SyncTailTest, MultiInitialSyncApplyRetriesFailedUpdateIfDocumentIsAvailab
     auto iter = collectionReader.makeIterator();
     ASSERT_BSONOBJ_EQ(updatedDocument, unittest::assertGet(iter->next()).first);
     ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
-}
-
-TEST_F(SyncTailTest, MultiInitialSyncApplyPassesThroughSyncApplyErrorAfterFailingToRetryBadOp) {
-    SyncTailWithLocalDocumentFetcher syncTail(BSON("_id" << 0 << "x" << 1));
-    NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
-    OplogEntry op(OpTime(Timestamp(1, 1), 1),
-                  1LL,
-                  OpTypeEnum::kUpdate,
-                  nss,
-                  BSON("_id" << 1),
-                  BSON("_id" << 1));
-    MultiApplier::OperationPtrs ops = {&op};
-    AtomicUInt32 fetchCount(0);
-    ASSERT_EQUALS(ErrorCodes::OperationFailed,
-                  multiInitialSyncApply_noAbort(_opCtx.get(), &ops, &syncTail, &fetchCount));
-    ASSERT_EQUALS(fetchCount.load(), 1U);
-}
-
-TEST_F(SyncTailTest, MultiInitialSyncApplyPassesThroughShouldSyncTailRetryError) {
-    SyncTail syncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr);
-    NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
-    auto op = makeUpdateDocumentOplogEntry(
-        {Timestamp(Seconds(1), 0), 1LL}, nss, BSON("_id" << 0), BSON("_id" << 0 << "x" << 2));
-    ASSERT_THROWS_CODE(syncTail.shouldRetry(_opCtx.get(), op.raw),
-                       mongo::UserException,
-                       ErrorCodes::FailedToParse);
-    MultiApplier::OperationPtrs ops = {&op};
-    AtomicUInt32 fetchCount(0);
-    ASSERT_EQUALS(ErrorCodes::FailedToParse,
-                  multiInitialSyncApply_noAbort(_opCtx.get(), &ops, &syncTail, &fetchCount));
-    ASSERT_EQUALS(fetchCount.load(), 1U);
 }
 
 class IdempotencyTest : public SyncTailTest {
@@ -1137,6 +1108,11 @@ OplogEntry IdempotencyTest::dropIndex(const std::string& indexName) {
 }
 
 CollectionState IdempotencyTest::validate() {
+    // We check that a given operation will not resolve the same NamespaceString to different UUIDs,
+    // make sure to use a new operation here.
+    _opCtx.reset();
+    _opCtx = cc().makeOperationContext();
+
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
     auto collection = autoColl.getCollection();
 
@@ -1178,6 +1154,7 @@ CollectionState IdempotencyTest::validate() {
 
     auto collectionCatalog = collection->getCatalogEntry();
     auto collectionOptions = collectionCatalog->getCollectionOptions(_opCtx.get());
+    collectionOptions.uuid.reset();
     std::vector<std::string> allIndexes;
     BSONObjSet indexSpecs = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     collectionCatalog->getAllIndexes(_opCtx.get(), &allIndexes);
@@ -1192,7 +1169,8 @@ CollectionState IdempotencyTest::validate() {
 }
 
 TEST_F(IdempotencyTest, Geo2dsphereIndexFailedOnUpdate) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
     ASSERT_OK(runOp(createCollection()));
     auto insertOp = insert(fromjson("{_id: 1, loc: 'hi'}"));
     auto updateOp = update(1, fromjson("{$set: {loc: [1, 2]}}"));
@@ -1205,13 +1183,14 @@ TEST_F(IdempotencyTest, Geo2dsphereIndexFailedOnUpdate) {
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), 16755);
 }
 
 TEST_F(IdempotencyTest, Geo2dsphereIndexFailedOnIndexing) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
     ASSERT_OK(runOp(createCollection()));
     auto indexOp = buildIndex(fromjson("{loc: '2dsphere'}"), BSON("2dsphereIndexVersion" << 3));
     auto dropIndexOp = dropIndex("loc_index");
@@ -1224,13 +1203,14 @@ TEST_F(IdempotencyTest, Geo2dsphereIndexFailedOnIndexing) {
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), 16755);
 }
 
 TEST_F(IdempotencyTest, Geo2dIndex) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
     ASSERT_OK(runOp(createCollection()));
     auto insertOp = insert(fromjson("{_id: 1, loc: [1]}"));
     auto updateOp = update(1, fromjson("{$set: {loc: [1, 2]}}"));
@@ -1243,13 +1223,14 @@ TEST_F(IdempotencyTest, Geo2dIndex) {
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), 13068);
 }
 
 TEST_F(IdempotencyTest, UniqueKeyIndex) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
     ASSERT_OK(runOp(createCollection()));
     auto insertOp = insert(fromjson("{_id: 1, x: 5}"));
     auto updateOp = update(1, fromjson("{$set: {x: 6}}"));
@@ -1263,13 +1244,14 @@ TEST_F(IdempotencyTest, UniqueKeyIndex) {
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), ErrorCodes::DuplicateKey);
 }
 
 TEST_F(IdempotencyTest, ParallelArrayError) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     ASSERT_OK(runOp(createCollection()));
     ASSERT_OK(runOp(insert(fromjson("{_id: 1}"))));
@@ -1286,13 +1268,14 @@ TEST_F(IdempotencyTest, ParallelArrayError) {
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), ErrorCodes::CannotIndexParallelArrays);
 }
 
 TEST_F(IdempotencyTest, IndexKeyTooLongError) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     ASSERT_OK(runOp(createCollection()));
     ASSERT_OK(runOp(insert(fromjson("{_id: 1}"))));
@@ -1312,13 +1295,14 @@ TEST_F(IdempotencyTest, IndexKeyTooLongError) {
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), ErrorCodes::KeyTooLong);
 }
 
 TEST_F(IdempotencyTest, IndexWithDifferentOptions) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     ASSERT_OK(runOp(createCollection()));
     ASSERT_OK(runOp(insert(fromjson("{_id: 1, x: 'hi'}"))));
@@ -1334,13 +1318,14 @@ TEST_F(IdempotencyTest, IndexWithDifferentOptions) {
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), ErrorCodes::IndexOptionsConflict);
 }
 
 TEST_F(IdempotencyTest, TextIndexDocumentHasNonStringLanguageField) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     ASSERT_OK(runOp(createCollection()));
     auto insertOp = insert(fromjson("{_id: 1, x: 'words to index', language: 1}"));
@@ -1354,13 +1339,14 @@ TEST_F(IdempotencyTest, TextIndexDocumentHasNonStringLanguageField) {
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), 17261);
 }
 
 TEST_F(IdempotencyTest, InsertDocumentWithNonStringLanguageFieldWhenTextIndexExists) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     ASSERT_OK(runOp(createCollection()));
     auto indexOp = buildIndex(fromjson("{x: 'text'}"), BSONObj());
@@ -1374,13 +1360,14 @@ TEST_F(IdempotencyTest, InsertDocumentWithNonStringLanguageFieldWhenTextIndexExi
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), 17261);
 }
 
 TEST_F(IdempotencyTest, TextIndexDocumentHasNonStringLanguageOverrideField) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     ASSERT_OK(runOp(createCollection()));
     auto insertOp = insert(fromjson("{_id: 1, x: 'words to index', y: 1}"));
@@ -1394,13 +1381,14 @@ TEST_F(IdempotencyTest, TextIndexDocumentHasNonStringLanguageOverrideField) {
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), 17261);
 }
 
 TEST_F(IdempotencyTest, InsertDocumentWithNonStringLanguageOverrideFieldWhenTextIndexExists) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     ASSERT_OK(runOp(createCollection()));
     auto indexOp = buildIndex(fromjson("{x: 'text'}"), fromjson("{language_override: 'y'}"));
@@ -1414,13 +1402,14 @@ TEST_F(IdempotencyTest, InsertDocumentWithNonStringLanguageOverrideFieldWhenText
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), 17261);
 }
 
 TEST_F(IdempotencyTest, TextIndexDocumentHasUnknownLanguage) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     ASSERT_OK(runOp(createCollection()));
     auto insertOp = insert(fromjson("{_id: 1, x: 'words to index', language: 'bad'}"));
@@ -1434,13 +1423,14 @@ TEST_F(IdempotencyTest, TextIndexDocumentHasUnknownLanguage) {
     ASSERT_OK(runOps(ops));
     ASSERT_EQUALS(state, validate());
 
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY);
+    ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
     auto status = runOps(ops);
     ASSERT_EQ(status.code(), 17262);
 }
 
 TEST_F(IdempotencyTest, CreateCollectionWithValidation) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     auto runOpsAndValidate = [this]() {
         auto options1 = fromjson("{'validator' : {'phone' : {'$type' : 'string' } } }");
@@ -1463,7 +1453,7 @@ TEST_F(IdempotencyTest, CreateCollectionWithValidation) {
 }
 
 TEST_F(IdempotencyTest, CreateCollectionWithCollation) {
-    getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_RECOVERING));
     ASSERT_OK(runOp(createCollection()));
 
     auto runOpsAndValidate = [this]() {
@@ -1507,7 +1497,7 @@ TEST_F(IdempotencyTest, CreateCollectionWithCollation) {
 }
 
 TEST_F(IdempotencyTest, CreateCollectionWithIdIndex) {
-    getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_RECOVERING));
 
     auto options1 = BSON("idIndex" << BSON("key" << fromjson("{_id: 1}") << "name"
                                                  << "_id_"
@@ -1537,7 +1527,7 @@ TEST_F(IdempotencyTest, CreateCollectionWithIdIndex) {
 }
 
 TEST_F(IdempotencyTest, CreateCollectionWithView) {
-    getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_RECOVERING));
 
     // Create data collection
     ASSERT_OK(runOp(createCollection()));
@@ -1560,7 +1550,7 @@ TEST_F(IdempotencyTest, CreateCollectionWithView) {
 }
 
 TEST_F(IdempotencyTest, CollModNamespaceNotFound) {
-    getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_RECOVERING));
 
     ASSERT_OK(runOp(createCollection()));
     ASSERT_OK(runOp(buildIndex(BSON("createdAt" << 1), BSON("expireAfterSeconds" << 3600))));
@@ -1579,7 +1569,7 @@ TEST_F(IdempotencyTest, CollModNamespaceNotFound) {
 }
 
 TEST_F(IdempotencyTest, CollModIndexNotFound) {
-    getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_RECOVERING));
 
     ASSERT_OK(runOp(createCollection()));
     ASSERT_OK(runOp(buildIndex(BSON("createdAt" << 1), BSON("expireAfterSeconds" << 3600))));
@@ -1598,7 +1588,8 @@ TEST_F(IdempotencyTest, CollModIndexNotFound) {
 }
 
 TEST_F(IdempotencyTest, ResyncOnRenameCollection) {
-    ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     auto cmd = BSON("renameCollection" << nss.ns() << "to"
                                        << "test.bar"

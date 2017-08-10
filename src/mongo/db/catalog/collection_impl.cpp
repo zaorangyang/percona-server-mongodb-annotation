@@ -45,6 +45,8 @@
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/namespace_uuid_cache.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -206,6 +208,17 @@ CollectionImpl::~CollectionImpl() {
         _recordStore->setCappedCallback(nullptr);
         _cappedNotifier->kill();
     }
+
+    if (_uuid) {
+        if (auto opCtx = cc().getOperationContext()) {
+            auto& uuidCatalog = UUIDCatalog::get(opCtx);
+            invariant(uuidCatalog.lookupCollectionByUUID(_uuid.get()) != _this);
+            auto& cache = NamespaceUUIDCache::get(opCtx);
+            // TODO(geert): cache.verifyNotCached(ns(), uuid().get());
+            cache.evictNamespace(ns());
+        }
+        LOG(2) << "destructed collection " << ns() << " with UUID " << uuid()->toString();
+    }
     _magic = 0;
 }
 
@@ -329,8 +342,8 @@ Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
 
 
 Status CollectionImpl::insertDocuments(OperationContext* opCtx,
-                                       const vector<BSONObj>::const_iterator begin,
-                                       const vector<BSONObj>::const_iterator end,
+                                       const vector<InsertStatement>::const_iterator begin,
+                                       const vector<InsertStatement>::const_iterator end,
                                        OpDebug* opDebug,
                                        bool enforceQuota,
                                        bool fromMigrate) {
@@ -342,7 +355,7 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
         if (!collElem || _ns == collElem.str()) {
             const std::string msg = str::stream()
                 << "Failpoint (failCollectionInserts) has been enabled (" << data
-                << "), so rejecting insert (first doc): " << *begin;
+                << "), so rejecting insert (first doc): " << begin->doc;
             log() << msg;
             return {ErrorCodes::FailPointEnabled, msg};
         }
@@ -352,14 +365,14 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
     const bool hasIdIndex = _indexCatalog.findIdIndex(opCtx);
 
     for (auto it = begin; it != end; it++) {
-        if (hasIdIndex && (*it)["_id"].eoo()) {
+        if (hasIdIndex && it->doc["_id"].eoo()) {
             return Status(ErrorCodes::InternalError,
                           str::stream()
                               << "Collection::insertDocument got document without _id for ns:"
                               << _ns.ns());
         }
 
-        auto status = checkValidation(opCtx, *it);
+        auto status = checkValidation(opCtx, it->doc);
         if (!status.isOK())
             return status;
     }
@@ -383,11 +396,11 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
 }
 
 Status CollectionImpl::insertDocument(OperationContext* opCtx,
-                                      const BSONObj& docToInsert,
+                                      const InsertStatement& docToInsert,
                                       OpDebug* opDebug,
                                       bool enforceQuota,
                                       bool fromMigrate) {
-    vector<BSONObj> docs;
+    vector<InsertStatement> docs;
     docs.push_back(docToInsert);
     return insertDocuments(opCtx, docs.begin(), docs.end(), opDebug, enforceQuota, fromMigrate);
 }
@@ -434,11 +447,11 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
         }
     }
 
-    vector<BSONObj> docs;
-    docs.push_back(doc);
+    vector<InsertStatement> inserts;
+    inserts.emplace_back(doc);
 
     getGlobalServiceContext()->getOpObserver()->onInserts(
-        opCtx, ns(), uuid(), docs.begin(), docs.end(), false);
+        opCtx, ns(), uuid(), inserts.begin(), inserts.end(), false);
 
     opCtx->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
@@ -446,8 +459,8 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
 }
 
 Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
-                                        const vector<BSONObj>::const_iterator begin,
-                                        const vector<BSONObj>::const_iterator end,
+                                        const vector<InsertStatement>::const_iterator begin,
+                                        const vector<InsertStatement>::const_iterator end,
                                         bool enforceQuota,
                                         OpDebug* opDebug) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
@@ -473,7 +486,7 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
     std::vector<Record> records;
     records.reserve(count);
     for (auto it = begin; it != end; it++) {
-        Record record = {RecordId(), RecordData(it->objdata(), it->objsize())};
+        Record record = {RecordId(), RecordData(it->doc.objdata(), it->doc.objsize())};
         records.push_back(record);
     }
     Status status = _recordStore->insertRecords(opCtx, &records, _enforceQuota(enforceQuota));
@@ -488,7 +501,7 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
         invariant(RecordId::min() < loc);
         invariant(loc < RecordId::max());
 
-        BsonRecord bsonRecord = {loc, &(*it)};
+        BsonRecord bsonRecord = {loc, &(it->doc)};
         bsonRecords.push_back(bsonRecord);
     }
 
@@ -1266,16 +1279,15 @@ Status CollectionImpl::validate(OperationContext* opCtx,
             // `results`.
             dassert(status.isOK());
 
+            // The error message can't be more specific because even if the index is invalid, we
+            // won't know if the corruption occurred on the index entry or in the document.
+            const std::string invalidIdxMsg = "One or more indexes contain invalid index entries.";
 
-            string msg = "One or more indexes contain invalid index entries.";
             // when there's an index key/document mismatch, both `if` and `else if` statements
             // will be true. But if we only check tooFewIndexEntries(), we'll be able to see
             // which specific index is invalid.
             if (indexValidator->tooFewIndexEntries()) {
-                // The error message can't be more specific because even though the index is
-                // invalid, we won't know if the corruption occurred on the index entry or in
-                // the document.
-                results->errors.push_back(msg);
+                results->errors.push_back(invalidIdxMsg);
                 results->valid = false;
             } else if (indexValidator->tooManyIndexEntries()) {
                 for (auto& it : indexNsResultsMap) {
@@ -1283,8 +1295,7 @@ Status CollectionImpl::validate(OperationContext* opCtx,
                     ValidateResults& r = it.second;
                     r.valid = false;
                 }
-                string msg = "One or more indexes contain invalid index entries.";
-                results->errors.push_back(msg);
+                results->errors.push_back(invalidIdxMsg);
                 results->valid = false;
             }
         }

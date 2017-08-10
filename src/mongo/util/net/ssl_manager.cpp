@@ -53,9 +53,9 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_exception.h"
-#include "mongo/util/net/ssl_expiration.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/scopeguard.h"
@@ -102,6 +102,31 @@ ExportedServerParameter<bool, ServerParameterType::kStartupOnly>
     disableNonSSLConnectionLoggingParameter(ServerParameterSet::getGlobal(),
                                             "disableNonSSLConnectionLogging",
                                             &sslGlobalParams.disableNonSSLConnectionLogging);
+
+class OpenSSLCipherConfigParameter
+    : public ExportedServerParameter<std::string, ServerParameterType::kStartupOnly> {
+public:
+    OpenSSLCipherConfigParameter()
+        : ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>(
+              ServerParameterSet::getGlobal(),
+              "opensslCipherConfig",
+              &sslGlobalParams.sslCipherConfig) {}
+    Status validate(const std::string& potentialNewValue) final {
+        if (!sslGlobalParams.sslCipherConfig.empty()) {
+            return Status(
+                ErrorCodes::BadValue,
+                "opensslCipherConfig setParameter is incompatible with net.ssl.sslCipherConfig");
+        }
+        // Note that there is very little validation that we can do here.
+        // OpenSSL exposes no API to validate a cipher config string. The only way to figure out
+        // what a string maps to is to make an SSL_CTX object, set the string on it, then parse the
+        // resulting STACK_OF object. If provided an invalid entry in the string, it will silently
+        // ignore it. Because an entry in the string may map to multiple ciphers, or remove ciphers
+        // from the final set produced by the full string, we can't tell if any entry failed
+        // to parse.
+        return Status::OK();
+    }
+} openSSLCipherConfig;
 
 #ifdef MONGO_CONFIG_SSL
 // Old copies of OpenSSL will not have constants to disable protocols they don't support.
@@ -904,8 +929,11 @@ inline Status checkX509_STORE_error() {
 Status importCertStoreToX509_STORE(const wchar_t* storeName,
                                    DWORD storeLocation,
                                    X509_STORE* verifyStore) {
-    HCERTSTORE systemStore = CertOpenStore(
-        CERT_STORE_PROV_SYSTEM_W, 0, NULL, storeLocation, const_cast<LPWSTR>(storeName));
+    HCERTSTORE systemStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_W,
+                                           0,
+                                           NULL,
+                                           storeLocation | CERT_STORE_READONLY_FLAG,
+                                           const_cast<LPWSTR>(storeName));
     if (systemStore == NULL) {
         return {ErrorCodes::InvalidSSLConfiguration,
                 str::stream() << "error opening system CA store: " << errnoWithDescription()};

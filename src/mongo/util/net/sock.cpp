@@ -61,8 +61,8 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/message.h"
+#include "mongo/util/net/private/socket_poll.h"
 #include "mongo/util/net/socket_exception.h"
-#include "mongo/util/net/socket_poll.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/quick_exit.h"
 
@@ -194,15 +194,6 @@ void disableNagle(int sock) {
 
 #endif
 
-string getAddrInfoStrError(int code) {
-#if !defined(_WIN32)
-    return gai_strerror(code);
-#else
-    /* gai_strerrorA is not threadsafe on windows. don't use it. */
-    return errnoWithDescription(code);
-#endif
-}
-
 // --- SockAddr
 
 string makeUnixSockPath(int port) {
@@ -213,7 +204,7 @@ string makeUnixSockPath(int port) {
 // If an ip address is passed in, just return that.  If a hostname is passed
 // in, look up its ip and return that.  Returns "" on failure.
 string hostbyname(const char* hostname) {
-    SockAddr sockAddr(hostname, 0);
+    SockAddr sockAddr(hostname, 0, IPv6Enabled() ? AF_UNSPEC : AF_INET);
     if (!sockAddr.isValid() || sockAddr.getAddr() == "0.0.0.0")
         return "";
     else
@@ -244,12 +235,14 @@ string getHostNameCached() {
     return temp;
 }
 
+string getHostNameCachedAndPort() {
+    return str::stream() << getHostNameCached() << ':' << serverGlobalParams.port;
+}
+
 string prettyHostName() {
-    StringBuilder s;
-    s << getHostNameCached();
-    if (serverGlobalParams.port != ServerGlobalParams::DefaultDBPort)
-        s << ':' << mongo::serverGlobalParams.port;
-    return s.str();
+    return (serverGlobalParams.port == ServerGlobalParams::DefaultDBPort
+                ? getHostNameCached()
+                : getHostNameCachedAndPort());
 }
 
 #ifdef MSG_NOSIGNAL

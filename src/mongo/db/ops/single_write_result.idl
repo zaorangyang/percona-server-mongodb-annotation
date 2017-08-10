@@ -31,7 +31,6 @@ global:
 
 imports:
     - "mongo/idl/basic_types.idl"
-    - "mongo/db/logical_session_id.idl"
 
 structs:
     singleWriteResult:
@@ -48,7 +47,4 @@ structs:
             upsertedId:
                 type: object
                 description: "The _id value of the object that was upserted."
-            stmtId:
-                type: StmtId
-                description: "The statement id of the write."
 

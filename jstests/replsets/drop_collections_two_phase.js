@@ -60,6 +60,21 @@
     primaryDB.createCollection(collToDrop);
     replTest.awaitReplication();
 
+    // Two phase collection should handle long index names gracefully.
+    // MMAP imposes a hard limit on index namespaces so we have to drop indexes that are too long
+    // to store on disk after renaming the collection. See SERVER-29747.
+    // Other storage engines should allow the implicit index renames to proceed because these
+    // renamed indexes are internal and will not be visible to users (no risk of being exported to
+    // another storage engine).
+    // TODO: remove storage engine check when SERVER-29474 is completed.
+    var storageEngine = jsTest.options().storageEngine;
+    if (storageEngine !== 'mmapv1') {
+        var coll = primaryDB.getCollection(collToDrop);
+        var maxNsLength = 127;
+        var indexName = ''.pad(maxNsLength - (coll.getFullName() + '.$').length, true, 'a');
+        assert.commandWorked(coll.ensureIndex({a: 1}, {name: indexName}));
+    }
+
     // Pause application on secondary so that commit point doesn't advance, meaning that a dropped
     // collection on the primary will remain in 'drop-pending' state.
     jsTestLog("Pausing oplog application on the secondary node.");
@@ -76,7 +91,7 @@
 
     // Drop the collection on the primary.
     jsTestLog("Dropping collection '" + collToDrop + "' on primary node.");
-    assert.commandWorked(primaryDB.runCommand({drop: collToDrop}, {writeConcern: {w: 1}}));
+    assert.commandWorked(primaryDB.runCommand({drop: collToDrop, writeConcern: {w: 1}}));
 
     // Make sure the collection is now in 'drop-pending' state. The collection name should be of the
     // format "system.drop.<optime>.<collectionName>", where 'optime' is the optime of the

@@ -1,5 +1,3 @@
-// expression_leaf.cpp
-
 /**
  *    Copyright (C) 2013 10gen Inc.
  *
@@ -28,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/matcher/expression_leaf.h"
 
 #include <cmath>
@@ -39,34 +39,13 @@
 #include "mongo/config.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/path.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
-Status LeafMatchExpression::setPath(StringData path) {
-    _path = path;
-    return _elementPath.init(_path);
-}
-
-
-bool LeafMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
-    MatchableDocument::IteratorHolder cursor(doc, &_elementPath);
-    while (cursor->more()) {
-        ElementIterator::Context e = cursor->next();
-        if (!matchesSingleElement(e.element()))
-            continue;
-        if (details && details->needRecord() && !e.arrayOffset().eoo()) {
-            details->setElemMatchKey(e.arrayOffset().fieldName());
-        }
-        return true;
-    }
-    return false;
-}
-
-// -------------
 
 bool ComparisonMatchExpression::equivalent(const MatchExpression* other) const {
     if (other->matchType() != matchType())
@@ -655,9 +634,6 @@ Status InMatchExpression::addRegex(std::unique_ptr<RegexMatchExpression> expr) {
 
 // -----------
 
-const double BitTestMatchExpression::kLongLongMaxPlusOneAsDouble =
-    scalbn(1, std::numeric_limits<long long>::digits);
-
 Status BitTestMatchExpression::init(StringData path, std::vector<uint32_t> bitPositions) {
     _bitPositions = std::move(bitPositions);
 
@@ -796,7 +772,7 @@ bool BitTestMatchExpression::matchesSingleElement(const BSONElement& e) const {
         // integer are treated as 0. We use 'kLongLongMaxAsDouble' because if we just did
         // eDouble > 2^63-1, it would be compared against 2^63. eDouble=2^63 would not get caught
         // that way.
-        if (eDouble >= kLongLongMaxPlusOneAsDouble ||
+        if (eDouble >= MatchExpressionParser::kLongLongMaxPlusOneAsDouble ||
             eDouble < std::numeric_limits<long long>::min()) {
             return false;
         }

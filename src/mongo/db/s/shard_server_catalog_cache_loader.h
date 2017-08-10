@@ -28,13 +28,11 @@
 
 #pragma once
 
+#include "mongo/db/s/namespace_metadata_change_notifications.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
-
-class ConfigServerCatalogCacheLoader;
-class ThreadPoolInterface;
 
 /**
  * Shard implementation of the CatalogCacheLoader used by the CatalogCache. Retrieves chunk metadata
@@ -66,6 +64,14 @@ public:
      * Updates internal state so that the loader can start behaving like a primary.
      */
     void onStepUp() override;
+
+    /**
+     * Sets any notifications waiting for this version to arrive and invalidates the catalog cache's
+     * chunk metadata for collection 'nss' so that the next caller provokes a refresh.
+     */
+    void notifyOfCollectionVersionUpdate(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         const ChunkVersion& version);
 
     /**
      * This must be called serially, never in parallel, including waiting for the returned
@@ -194,6 +200,29 @@ private:
     typedef std::map<NamespaceString, TaskList> TaskLists;
 
     /**
+     * Forces the primary to refresh its metadata for 'nss' and waits until this node's metadata
+     * has caught up to the primary's.
+     * Then retrieves chunk metadata from this node's persisted metadata store and passes it to
+     * 'callbackFn'.
+     */
+    void _runSecondaryGetChunksSince(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const ChunkVersion& catalogCacheSinceVersion,
+        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn);
+
+    /**
+     * Forces the  primary to refresh its chunk metadata for 'nss' and obtain's the primary's
+     * collectionVersion after the refresh.
+     *
+     * Then waits until it has replicated chunk metadata up to at least that collectionVersion.
+     *
+     * Throws on error.
+     */
+    void _forcePrimaryRefreshAndWaitForReplication(OperationContext* opCtx,
+                                                   const NamespaceString& nss);
+
+    /**
      * Refreshes chunk metadata from the config server's metadata store, and schedules maintenance
      * of the shard's persisted metadata store with the latest updates retrieved from the config
      * server.
@@ -268,11 +297,28 @@ private:
      */
     bool _updatePersistedMetadata(OperationContext* opCtx, const NamespaceString& nss);
 
+    /**
+     * Attempt to read the collection and chunk metadata since version 'sinceVersion' from the shard
+     * persisted metadata store.
+     *
+     * Retries reading the metadata if the shard persisted metadata store becomes imcomplete due to
+     * concurrent updates being applied -- complete here means that every chunk range is accounted
+     * for.
+     *
+     * May return: a complete metadata update, which when applied to a complete metadata store up to
+     * 'sinceVersion' again produces a complete metadata store; or a NamespaceNotFound error, which
+     * means no metadata was found and the collection was dropped.
+     */
+    StatusWith<CollectionAndChangedChunks> _getCompletePersistedMetadataForSecondarySinceVersion(
+        OperationContext* opCtx, const NamespaceString& nss, const ChunkVersion& version);
+
     // Used by the shard primary to retrieve chunk metadata from the config server.
     const std::unique_ptr<CatalogCacheLoader> _configServerLoader;
 
     // Thread pool used to load chunk metadata.
     ThreadPool _threadPool;
+
+    NamespaceMetadataChangeNotifications _namespaceNotifications;
 
     // Protects the class state below.
     stdx::mutex _mutex;

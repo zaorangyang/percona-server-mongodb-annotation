@@ -32,6 +32,7 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 
 namespace mongo {
+class UUIDCatalog;
 class CollectionImpl final : virtual public Collection::Impl,
                              virtual CappedCallback,
                              virtual UpdateNotifier {
@@ -149,8 +150,8 @@ public:
      * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
      */
     Status insertDocuments(OperationContext* opCtx,
-                           std::vector<BSONObj>::const_iterator begin,
-                           std::vector<BSONObj>::const_iterator end,
+                           std::vector<InsertStatement>::const_iterator begin,
+                           std::vector<InsertStatement>::const_iterator end,
                            OpDebug* opDebug,
                            bool enforceQuota,
                            bool fromMigrate = false) final;
@@ -163,7 +164,7 @@ public:
      * 'enforceQuota' If false, quotas will be ignored.
      */
     Status insertDocument(OperationContext* opCtx,
-                          const BSONObj& doc,
+                          const InsertStatement& doc,
                           OpDebug* opDebug,
                           bool enforceQuota,
                           bool fromMigrate = false) final;
@@ -364,8 +365,8 @@ private:
     Status _insertDocument(OperationContext* opCtx, const BSONObj& doc, bool enforceQuota);
 
     Status _insertDocuments(OperationContext* opCtx,
-                            std::vector<BSONObj>::const_iterator begin,
-                            std::vector<BSONObj>::const_iterator end,
+                            std::vector<InsertStatement>::const_iterator begin,
+                            std::vector<InsertStatement>::const_iterator end,
                             bool enforceQuota,
                             OpDebug* opDebug);
 

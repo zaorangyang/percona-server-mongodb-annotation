@@ -175,7 +175,7 @@ public:
 
     virtual int getMyId() const override;
 
-    virtual bool setFollowerMode(const MemberState& newState) override;
+    virtual Status setFollowerMode(const MemberState& newState) override;
 
     virtual ApplierState getApplierState() override;
 
@@ -359,6 +359,17 @@ public:
      * takeover has not been scheduled, returns boost::none.
      */
     boost::optional<Date_t> getPriorityTakeover_forTest() const;
+
+    /**
+     * Returns the scheduled time of the catchup takeover callback. If a catchup
+     * takeover has not been scheduled, returns boost::none.
+     */
+    boost::optional<Date_t> getCatchupTakeover_forTest() const;
+
+    /**
+     * Returns the catchup takeover CallbackHandle.
+     */
+    executor::TaskExecutor::CallbackHandle getCatchupTakeoverCbh_forTest() const;
 
     /**
      * Simple wrappers around _setLastOptime_inlock to make it easier to test.
@@ -1033,6 +1044,11 @@ private:
     void _cancelPriorityTakeover_inlock();
 
     /**
+     * Cancels all outstanding _catchupTakeover callbacks.
+     */
+    void _cancelCatchupTakeover_inlock();
+
+    /**
      * Cancels the current _handleElectionTimeout callback and reschedules a new callback.
      * Returns immediately otherwise.
      */
@@ -1094,18 +1110,24 @@ private:
     executor::TaskExecutor::EventHandle _cancelElectionIfNeeded_inlock();
 
     /**
-     * Waits until the optime of the current node is at least the opTime specified in 'readConcern'.
-     * It supports local readConcern, which _waitUntilClusterTimeForRead does not.
-     * TODO: remove when SERVER-28150 is done.
+     * Waits until the optime of the current node is at least the 'opTime'.
      */
+    Status _waitUntilOpTime(OperationContext* opCtx, bool isMajorityReadConcern, OpTime opTime);
+
+    /**
+     * Waits until the optime of the current node is at least the opTime specified in 'readConcern'.
+     * Supports local and majority readConcern.
+     */
+    // TODO: remove when SERVER-29729 is done
     Status _waitUntilOpTimeForReadDeprecated(OperationContext* opCtx,
                                              const ReadConcernArgs& readConcern);
 
     /**
-     * Waits until the logicalTime of the current node is at least the 'clusterTime'.
-     * TODO: Merge with waitUntilOpTimeForRead() when SERVER-28150 is done.
+     * Waits until the optime of the current node is at least the clusterTime specified in
+     * 'readConcern'. Supports local and majority readConcern.
      */
-    Status _waitUntilClusterTimeForRead(OperationContext* opCtx, LogicalTime clusterTime);
+    Status _waitUntilClusterTimeForRead(OperationContext* opCtx,
+                                        const ReadConcernArgs& readConcern);
 
     /**
      * Returns a pseudorandom number no less than 0 and less than limit (which must be positive).
@@ -1276,13 +1298,21 @@ private:
     // Used for testing only.
     Date_t _handleElectionTimeoutWhen;  // (M)
 
-    // Callback Handle used to cancel a scheduled PriorityTakover callback.
+    // Callback Handle used to cancel a scheduled PriorityTakeover callback.
     executor::TaskExecutor::CallbackHandle _priorityTakeoverCbh;  // (M)
 
     // Priority takeover callback will not run before this time.
     // If this date is Date_t(), the callback is either unscheduled or canceled.
     // Used for testing only.
     Date_t _priorityTakeoverWhen;  // (M)
+
+    // Callback Handle used to cancel a scheduled CatchupTakeover callback.
+    executor::TaskExecutor::CallbackHandle _catchupTakeoverCbh;  // (M)
+
+    // Catchup takeover callback will not run before this time.
+    // If this date is Date_t(), the callback is either unscheduled or canceled.
+    // Used for testing only.
+    Date_t _catchupTakeoverWhen;  // (M)
 
     // Callback handle used by _waitForStartUpComplete() to block until configuration
     // is loaded and external state threads have been started (unless this node is an arbiter).

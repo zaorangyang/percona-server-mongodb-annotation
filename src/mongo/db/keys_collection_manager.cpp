@@ -35,19 +35,26 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
+const Seconds KeysCollectionManager::kKeyValidInterval{3 * 30 * 24 * 60 * 60};  // ~3 months
 namespace {
 
 Milliseconds kDefaultRefreshWaitTime(30 * 1000);
 Milliseconds kRefreshIntervalIfErrored(200);
 Milliseconds kMaxRefreshWaitTime(10 * 60 * 1000);
+
+// Prevents the refresher thread from waiting longer than the given number of milliseconds, even on
+// a successful refresh.
+MONGO_FP_DECLARE(maxKeyRefreshWaitTimeOverrideMS);
 
 /**
  * Returns the amount of time to wait until the monitoring thread should attempt to refresh again.
@@ -170,6 +177,10 @@ void KeysCollectionManager::enableKeyGenerator(OperationContext* opCtx, bool doE
     }
 }
 
+bool KeysCollectionManager::hasSeenKeys() {
+    return _refresher.hasSeenKeys();
+}
+
 void KeysCollectionManager::PeriodicRunner::refreshNow(OperationContext* opCtx) {
     auto refreshRequest = [this]() {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -221,19 +232,38 @@ void KeysCollectionManager::PeriodicRunner::_doPeriodicRefresh(ServiceContext* s
 
         Milliseconds nextWakeup = kRefreshIntervalIfErrored;
 
-        auto latestKeyStatusWith = (*doRefresh)(opCtx.get());
-        if (latestKeyStatusWith.getStatus().isOK()) {
-            errorCount = 0;
-            const auto& latestKey = latestKeyStatusWith.getValue();
-            auto currentTime = LogicalClock::get(service)->getClusterTime();
+        // No need to refresh keys in FCV 3.4, since key generation will be disabled.
+        if (serverGlobalParams.featureCompatibility.version.load() !=
+            ServerGlobalParams::FeatureCompatibility::Version::k34) {
+            auto latestKeyStatusWith = (*doRefresh)(opCtx.get());
+            if (latestKeyStatusWith.getStatus().isOK()) {
+                errorCount = 0;
+                const auto& latestKey = latestKeyStatusWith.getValue();
+                auto currentTime = LogicalClock::get(service)->getClusterTime();
 
-            nextWakeup =
-                howMuchSleepNeedFor(currentTime, latestKey.getExpiresAt(), refreshInterval);
+                {
+                    stdx::unique_lock<stdx::mutex> lock(_mutex);
+                    _hasSeenKeys = true;
+                }
+
+                nextWakeup =
+                    howMuchSleepNeedFor(currentTime, latestKey.getExpiresAt(), refreshInterval);
+            } else {
+                errorCount += 1;
+                nextWakeup = Milliseconds(kRefreshIntervalIfErrored.count() * errorCount);
+                if (nextWakeup > kMaxRefreshWaitTime) {
+                    nextWakeup = kMaxRefreshWaitTime;
+                }
+            }
         } else {
-            errorCount += 1;
-            nextWakeup = Milliseconds(kRefreshIntervalIfErrored.count() * errorCount);
-            if (nextWakeup > kMaxRefreshWaitTime) {
-                nextWakeup = kMaxRefreshWaitTime;
+            nextWakeup = kDefaultRefreshWaitTime;
+        }
+
+        MONGO_FAIL_POINT_BLOCK(maxKeyRefreshWaitTimeOverrideMS, data) {
+            const BSONObj& dataObj = data.getData();
+            auto overrideMS = Milliseconds(dataObj["overrideMS"].numberInt());
+            if (nextWakeup > overrideMS) {
+                nextWakeup = overrideMS;
             }
         }
 
@@ -306,6 +336,11 @@ void KeysCollectionManager::PeriodicRunner::stop() {
     }
 
     _backgroundThread.join();
+}
+
+bool KeysCollectionManager::PeriodicRunner::hasSeenKeys() {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _hasSeenKeys;
 }
 
 }  // namespace mongo

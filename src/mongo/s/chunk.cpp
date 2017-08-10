@@ -32,34 +32,16 @@
 
 #include "mongo/s/chunk.h"
 
-#include "mongo/platform/random.h"
-#include "mongo/s/balancer_configuration.h"
-#include "mongo/s/grid.h"
-#include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-namespace {
-
-// Test whether we should split once data * splitTestFactor > chunkSize (approximately)
-const int splitTestFactor = 5;
-
-/**
- * Generates a random value for _dataWritten so that a mongos restart wouldn't cause delay in
- * splitting.
- */
-int64_t mkDataWritten() {
-    PseudoRandom r(static_cast<int64_t>(time(0)));
-    return r.nextInt32(grid.getBalancerConfiguration()->getMaxChunkSizeBytes() / splitTestFactor);
-}
-
-}  // namespace
 
 Chunk::Chunk(const ChunkType& from)
     : _range(from.getMin(), from.getMax()),
       _shardId(from.getShard()),
       _lastmod(from.getVersion()),
       _jumbo(from.getJumbo()),
-      _dataWritten(mkDataWritten()) {
+      _dataWritten(0) {
     invariantOK(from.validate());
 }
 
@@ -80,14 +62,9 @@ void Chunk::clearBytesWritten() {
     _dataWritten = 0;
 }
 
-void Chunk::randomizeBytesWritten() {
-    _dataWritten = mkDataWritten();
-}
-
 std::string Chunk::toString() const {
-    return str::stream() << ChunkType::shard() << ": " << _shardId << ", "
-                         << ChunkType::DEPRECATED_lastmod() << ": " << _lastmod.toString() << ", "
-                         << _range.toString();
+    return str::stream() << ChunkType::shard() << ": " << _shardId << ", " << ChunkType::lastmod()
+                         << ": " << _lastmod.toString() << ", " << _range.toString();
 }
 
 void Chunk::markAsJumbo() {

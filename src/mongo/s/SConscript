@@ -91,12 +91,10 @@ env.Library(
         'move_chunk_request.cpp',
         'set_shard_version_request.cpp',
         'shard_key_pattern.cpp',
-        env.Idlc('request_types/move_primary.idl')[0],
-        env.Idlc('request_types/shard_collection.idl')[0],
     ],
     LIBDEPS=[
         'shard_id',
-        '$BUILD_DIR/mongo/base',
+        'sharding_request_types',
         '$BUILD_DIR/mongo/client/connection_string',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/matcher/expressions',
@@ -104,9 +102,20 @@ env.Library(
         '$BUILD_DIR/mongo/db/query/query_request',
         '$BUILD_DIR/mongo/db/repl/optime',
         '$BUILD_DIR/mongo/db/update/update_common',
-        '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/rpc/metadata',
     ]
+)
+
+env.Library(
+    target='sharding_request_types',
+    source=[
+        env.Idlc('request_types/move_primary.idl')[0],
+        env.Idlc('request_types/shard_collection.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
 )
 
 env.Library(
@@ -128,7 +137,6 @@ env.Library(
         '$BUILD_DIR/mongo/s/coreshard',
         '$BUILD_DIR/mongo/transport/transport_layer_mock',
         '$BUILD_DIR/mongo/util/clock_source_mock',
-        '$BUILD_DIR/mongo/util/net/message_port_mock',
         'sharding_egress_metadata_hook_for_mongos',
     ],
 )
@@ -165,7 +173,6 @@ env.Library(
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_manager_impl',
         '$BUILD_DIR/mongo/s/coreshard',
         '$BUILD_DIR/mongo/util/clock_source_mock',
-        '$BUILD_DIR/mongo/util/net/message_port_mock',
     ],
 )
 
@@ -242,14 +249,25 @@ env.CppUnitTest('request_types_test',
     ],
 )
 
+env.Library(
+    target='routing_table',
+    source=[
+        'chunk.cpp',
+        'chunk_manager.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/storage/key_string',
+        'common',
+    ],
+)
+
 # This library contains sharding functionality used by both mongod and mongos
 env.Library(
     target='coreshard',
     source=[
         'balancer_configuration.cpp',
         'catalog_cache.cpp',
-        'chunk.cpp',
-        'chunk_manager.cpp',
+        'catalog_cache_loader.cpp',
         'cluster_identity_loader.cpp',
         'config_server_catalog_cache_loader.cpp',
         'config_server_client.cpp',
@@ -266,6 +284,7 @@ env.Library(
         '$BUILD_DIR/mongo/s/query/cluster_cursor_manager',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
         'common',
+        'routing_table',
         #'client/sharding_client', # CYCLE
     ],
     LIBDEPS_TAGS=[

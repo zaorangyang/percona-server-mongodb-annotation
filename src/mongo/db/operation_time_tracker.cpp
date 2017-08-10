@@ -37,7 +37,6 @@ auto getOperationTimeTracker =
     OperationContext::declareDecoration<std::shared_ptr<OperationTimeTracker>>();
 }
 
-
 std::shared_ptr<OperationTimeTracker> OperationTimeTracker::get(OperationContext* opCtx) {
     return getOperationTimeTracker(opCtx);
 }

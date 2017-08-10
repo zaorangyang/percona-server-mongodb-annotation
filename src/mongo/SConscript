@@ -116,6 +116,7 @@ baseSource=[
     'util/concurrency/idle_thread_block.cpp',
     'util/concurrency/thread_name.cpp',
     'util/duration.cpp',
+    'util/errno_util.cpp',
     'util/exception_filter_win32.cpp',
     'util/exit.cpp',
     'util/file.cpp',
@@ -279,17 +280,17 @@ generateConfigHeaderFile = env.Substfile(
 )
 env.Alias('generated-sources', generateConfigHeaderFile)
 
-mongod = env.Program(
-    target="mongod",
+env.Library(
+    target="mongodmain",
     source=[
         "db/db.cpp",
         "db/mongod_options_init.cpp",
-    ] + env.WindowsResourceFile("db/db.rc"),
+    ],
     LIBDEPS=[
-        'db/commands/core',
-        'db/conn_pool_options',
         'db/catalog/catalog',
         'db/clientcursor',
+        'db/commands/core',
+        'db/conn_pool_options',
         'db/dbdirectclient',
         'db/ftdc/ftdc_mongod',
         'db/index_d',
@@ -298,8 +299,8 @@ mongod = env.Program(
         'db/mongod_options',
         'db/mongodandmongos',
         'db/op_observer_d',
-        'db/repl/repl_set_commands',
         'db/repair_database',
+        'db/repl/repl_set_commands',
         'db/repl/storage_interface_impl',
         'db/repl/topology_coordinator_impl',
         'db/s/balancer',
@@ -318,6 +319,15 @@ mongod = env.Program(
         'util/ntservice',
         'util/periodic_runner_factory',
         'util/version_impl',
+    ],
+)
+mongod = env.Program(
+    target="mongod",
+    source=[
+        "db/dbmain.cpp",
+    ] + env.WindowsResourceFile("db/db.rc"),
+    LIBDEPS=[
+        'mongodmain',
     ],
 )
 env.Default(env.Install('#/', mongod))
@@ -357,6 +367,7 @@ env.Install(
             'db/commands/core',
             'db/commands/server_status',
             'db/conn_pool_options',
+            'db/ftdc/ftdc_mongos',
             'db/logical_time_metadata_hook',
             'db/mongodandmongos',
             'db/server_options',
@@ -534,8 +545,9 @@ installBinary( env, "mongos" )
 
 if shellEnv is not None:
     installBinary( shellEnv, "mongo" )
+    env.Alias( "core", [ '#/%s' % b for b in [ add_exe( "mongo" ) ] ] )
 
-env.Alias( "core", [ '#/%s' % b for b in [ add_exe( "mongo" ), add_exe( "mongod" ), add_exe( "mongos" ) ] ] )
+env.Alias( "core", [ '#/%s' % b for b in [ add_exe( "mongod" ), add_exe( "mongos" ) ] ] )
 
 # Stage the top-level mongodb banners
 distsrc = env.Dir('#distsrc')

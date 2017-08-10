@@ -55,11 +55,18 @@ public:
      * Used as a return value for getChunksSince.
      */
     struct CollectionAndChangedChunks {
+        CollectionAndChangedChunks();
+        CollectionAndChangedChunks(const OID& collEpoch,
+                                   const BSONObj& collShardKeyPattern,
+                                   const BSONObj& collDefaultCollation,
+                                   bool collShardKeyIsUnique,
+                                   std::vector<ChunkType> chunks);
+
         // Information about the entire collection
         OID epoch;
         BSONObj shardKeyPattern;
         BSONObj defaultCollation;
-        bool shardKeyIsUnique;
+        bool shardKeyIsUnique{false};
 
         // The chunks which have changed sorted by their chunkVersion. This list might potentially
         // contain all the chunks in the collection.
@@ -80,6 +87,13 @@ public:
      * Changes internal state on step up.
      */
     virtual void onStepUp() = 0;
+
+    /**
+     * Notifies the loader that the persisted collection version for 'nss' has been updated.
+     */
+    virtual void notifyOfCollectionVersionUpdate(OperationContext* opCtx,
+                                                 const NamespaceString& nss,
+                                                 const ChunkVersion& version) = 0;
 
     /**
      * Non-blocking call, which requests the chunks changed since the specified version to be

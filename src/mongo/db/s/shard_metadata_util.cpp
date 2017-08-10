@@ -68,36 +68,41 @@ Status getStatusFromWriteCommandResponse(const BSONObj& commandResult) {
 }  // namespace
 
 QueryAndSort createShardChunkDiffQuery(const ChunkVersion& collectionVersion) {
-    return {BSON(ChunkType::DEPRECATED_lastmod()
-                 << BSON("$gte" << Timestamp(collectionVersion.toLong()))),
-            BSON(ChunkType::DEPRECATED_lastmod() << 1)};
+    return {BSON(ChunkType::lastmod() << BSON("$gte" << Timestamp(collectionVersion.toLong()))),
+            BSON(ChunkType::lastmod() << 1)};
 }
 
-bool RefreshState::operator==(RefreshState& other) {
+bool RefreshState::operator==(const RefreshState& other) const {
     return (other.epoch == epoch) && (other.refreshing == refreshing) &&
-        (other.sequenceNumber == sequenceNumber);
+        (other.lastRefreshedCollectionVersion == lastRefreshedCollectionVersion);
+}
+
+std::string RefreshState::toString() const {
+    return str::stream() << "epoch: " << epoch
+                         << ", refreshing: " << (refreshing ? "true" : "false")
+                         << ", lastRefreshedCollectionVersion: "
+                         << lastRefreshedCollectionVersion.toString();
 }
 
 Status setPersistedRefreshFlags(OperationContext* opCtx, const NamespaceString& nss) {
     // Set 'refreshing' to true.
     BSONObj update = BSON(ShardCollectionType::refreshing() << true);
     return updateShardCollectionsEntry(
-        opCtx, BSON(ShardCollectionType::uuid() << nss.ns()), update, BSONObj(), false /*upsert*/);
+        opCtx, BSON(ShardCollectionType::uuid() << nss.ns()), update, false /*upsert*/);
 }
 
-Status unsetPersistedRefreshFlags(OperationContext* opCtx, const NamespaceString& nss) {
-    // Set 'refreshing' to false and increment the sequence number so it's differs from the last
-    // stable state. Note: incrementing a non-existent field sets the field to the increment value,
-    // so such a situation is safe.
-    BSONObj update = BSON(ShardCollectionType::refreshing()
-                          << false
-                          << "$inc"
-                          << BSON(ShardCollectionType::refreshSequenceNumber() << 1));
+Status unsetPersistedRefreshFlags(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  const ChunkVersion& refreshedVersion) {
+    // Set 'refreshing' to false and update the last refreshed collection version.
+    BSONObjBuilder updateBuilder;
+    updateBuilder.append(ShardCollectionType::refreshing(), false);
+    updateBuilder.appendTimestamp(ShardCollectionType::lastRefreshedCollectionVersion(),
+                                  refreshedVersion.toLong());
 
     return updateShardCollectionsEntry(opCtx,
                                        BSON(ShardCollectionType::uuid() << nss.ns()),
-                                       BSON(ShardCollectionType::refreshing() << false),
-                                       BSON(ShardCollectionType::refreshSequenceNumber() << 1),
+                                       updateBuilder.obj(),
                                        false /*upsert*/);
 }
 
@@ -109,9 +114,26 @@ StatusWith<RefreshState> getPersistedRefreshFlags(OperationContext* opCtx,
     }
     ShardCollectionType entry = statusWithCollectionEntry.getValue();
 
+    // Ensure the results have not been incorrectly set somehow.
+    if (entry.hasRefreshing()) {
+        // If 'refreshing' is present and false, a refresh must have occurred (otherwise the field
+        // would never have been added to the document) and there should always be a refresh
+        // version.
+        invariant(entry.getRefreshing() ? true : entry.hasLastRefreshedCollectionVersion());
+    } else {
+        // If 'refreshing' is not present, no refresh version should exist.
+        invariant(!entry.hasLastRefreshedCollectionVersion());
+    }
+
     return RefreshState{entry.getEpoch(),
-                        entry.hasRefreshing() ? entry.getRefreshing() : false,
-                        entry.hasRefreshSequenceNumber() ? entry.getRefreshSequenceNumber() : 0LL};
+                        // If the refreshing field has not yet been added, this means that the first
+                        // refresh has started, but no chunks have ever yet been applied, around
+                        // which these flags are set. So default to refreshing true because the
+                        // chunk metadata is being updated and is not yet ready to be read.
+                        entry.hasRefreshing() ? entry.getRefreshing() : true,
+                        entry.hasLastRefreshedCollectionVersion()
+                            ? entry.getLastRefreshedCollectionVersion()
+                            : ChunkVersion(0, 0, entry.getEpoch())};
 }
 
 StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCtx,
@@ -154,24 +176,18 @@ StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCt
 Status updateShardCollectionsEntry(OperationContext* opCtx,
                                    const BSONObj& query,
                                    const BSONObj& update,
-                                   const BSONObj& inc,
                                    const bool upsert) {
     invariant(query.hasField("_id"));
     if (upsert) {
         // If upserting, this should be an update from the config server that does not have shard
         // refresh information.
         invariant(!update.hasField(ShardCollectionType::refreshing()));
-        invariant(!update.hasField(ShardCollectionType::refreshSequenceNumber()));
-        invariant(inc.isEmpty());
+        invariant(!update.hasField(ShardCollectionType::lastRefreshedCollectionVersion()));
     }
 
     // Want to modify the document, not replace it.
     BSONObjBuilder updateBuilder;
     updateBuilder.append("$set", update);
-    if (!inc.isEmpty()) {
-        updateBuilder.append("$inc", inc);
-    }
-
     std::unique_ptr<BatchedUpdateDocument> updateDoc(new BatchedUpdateDocument());
     updateDoc->setQuery(query);
     updateDoc->setUpdateExpr(updateBuilder.obj());
@@ -188,8 +204,8 @@ Status updateShardCollectionsEntry(OperationContext* opCtx,
     try {
         DBDirectClient client(opCtx);
 
-        rpc::UniqueReply commandResponse = client.runCommandWithMetadata(
-            "config", cmdObj.firstElementFieldName(), rpc::makeEmptyMetadata(), cmdObj);
+        rpc::UniqueReply commandResponse =
+            client.runCommand(OpMsgRequest::fromDBAndBody("config", cmdObj));
         BSONObj responseReply = commandResponse->getCommandReply().getOwned();
 
         Status commandStatus =
@@ -312,10 +328,7 @@ Status updateShardChunks(OperationContext* opCtx,
             const BSONObj deleteCmdObj = batchedDeleteRequest.toBSON();
 
             rpc::UniqueReply deleteCommandResponse =
-                client.runCommandWithMetadata(chunkMetadataNss.db().toString(),
-                                              deleteCmdObj.firstElementFieldName(),
-                                              rpc::makeEmptyMetadata(),
-                                              deleteCmdObj);
+                client.runCommand(OpMsgRequest::fromDBAndBody(chunkMetadataNss.db(), deleteCmdObj));
 
             auto deleteStatus =
                 getStatusFromWriteCommandResponse(deleteCommandResponse->getCommandReply());
@@ -332,10 +345,7 @@ Status updateShardChunks(OperationContext* opCtx,
             const BSONObj insertCmdObj = insertRequest.toBSON();
 
             rpc::UniqueReply insertCommandResponse =
-                client.runCommandWithMetadata(chunkMetadataNss.db().toString(),
-                                              insertCmdObj.firstElementFieldName(),
-                                              rpc::makeEmptyMetadata(),
-                                              insertCmdObj);
+                client.runCommand(OpMsgRequest::fromDBAndBody(chunkMetadataNss.db(), insertCmdObj));
 
             auto insertStatus =
                 getStatusFromWriteCommandResponse(insertCommandResponse->getCommandReply());
@@ -368,8 +378,8 @@ Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const Namesp
         batchedDeleteRequest.setNS(NamespaceString(ShardCollectionType::ConfigNS));
         const BSONObj deleteCmdObj = batchedDeleteRequest.toBSON();
 
-        rpc::UniqueReply deleteCommandResponse = client.runCommandWithMetadata(
-            "config", deleteCmdObj.firstElementFieldName(), rpc::makeEmptyMetadata(), deleteCmdObj);
+        rpc::UniqueReply deleteCommandResponse =
+            client.runCommand(OpMsgRequest::fromDBAndBody("config", deleteCmdObj));
 
         auto deleteStatus =
             getStatusFromWriteCommandResponse(deleteCommandResponse->getCommandReply());

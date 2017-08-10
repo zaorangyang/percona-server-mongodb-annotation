@@ -245,6 +245,13 @@ public:
     /** note: addFields always adds _id even if not specified */
     int addFields(BSONObj& from, std::set<std::string>& fields); /* returns n added */
 
+    /**
+     * Add specific field to the end of the object if it did not exist, otherwise replace it
+     * preserving original field order. Returns newly built object. Returns copy of this for empty
+     * field.
+     */
+    BSONObj addField(const BSONElement& field) const;
+
     /** remove specified field and return a new object with the remaining fields.
         slowish as builds a full new object
      */
@@ -521,6 +528,10 @@ public:
         opBITS_ALL_CLEAR = 0x18,
         opBITS_ANY_SET = 0x19,
         opBITS_ANY_CLEAR = 0x1A,
+        opINTERNAL_SCHEMA_MIN_ITEMS = 0x1B,
+        opINTERNAL_SCHEMA_MAX_ITEMS = 0x1C,
+        opINTERNAL_SCHEMA_UNIQUE_ITEMS = 0x1D,
+        opINTERNAL_SCHEMA_OBJECT_MATCH = 0x1E,
     };
 
     /** add all elements of the object to the specified vector */

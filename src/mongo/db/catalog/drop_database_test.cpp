@@ -50,6 +50,7 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace {
 
@@ -139,7 +140,7 @@ void DropDatabaseTest::setUp() {
     repl::createOplog(_opCtx.get());
 
     // Ensure that we are primary.
-    ASSERT_TRUE(_replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
+    ASSERT_OK(_replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
     // Use OpObserverMock to track notifications for collection and database drops.
     auto opObserver = stdx::make_unique<OpObserverMock>();
@@ -179,6 +180,17 @@ void _createCollection(OperationContext* opCtx, const NamespaceString& nss) {
     ASSERT_TRUE(AutoGetCollectionForRead(opCtx, nss).getCollection());
 }
 
+/**
+ * Removes database from catalog, bypassing dropDatabase().
+ */
+void _removeDatabaseFromCatalog(OperationContext* opCtx, StringData dbName) {
+    Lock::GlobalWrite lk(opCtx);
+    AutoGetDb autoDB(opCtx, dbName, MODE_X);
+    auto db = autoDB.getDb();
+    ASSERT_TRUE(db);
+    Database::dropDatabase(opCtx, db);
+}
+
 TEST_F(DropDatabaseTest, DropDatabaseReturnsNamespaceNotFoundIfDatabaseDoesNotExist) {
     ASSERT_FALSE(AutoGetDb(_opCtx.get(), _nss.db(), MODE_X).getDb());
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, dropDatabase(_opCtx.get(), _nss.db().toString()));
@@ -186,7 +198,7 @@ TEST_F(DropDatabaseTest, DropDatabaseReturnsNamespaceNotFoundIfDatabaseDoesNotEx
 
 TEST_F(DropDatabaseTest, DropDatabaseReturnsNotMasterIfNotPrimary) {
     _createCollection(_opCtx.get(), _nss);
-    ASSERT_TRUE(_replCoord->setFollowerMode(repl::MemberState::RS_SECONDARY));
+    ASSERT_OK(_replCoord->setFollowerMode(repl::MemberState::RS_SECONDARY));
     ASSERT_TRUE(_opCtx->writesAreReplicated());
     ASSERT_FALSE(_replCoord->canAcceptWritesForDatabase(_opCtx.get(), _nss.db()));
     ASSERT_EQUALS(ErrorCodes::NotMaster, dropDatabase(_opCtx.get(), _nss.db().toString()));
@@ -234,10 +246,37 @@ TEST_F(DropDatabaseTest, DropDatabaseNotifiesOpObserverOfDroppedReplicatedSystem
     _testDropDatabase(_opCtx.get(), _opObserver, replicatedSystemNss, true);
 }
 
-TEST_F(DropDatabaseTest, DropDatabaseSkipsDropPendingCollectionWhenDroppingCollections) {
+TEST_F(DropDatabaseTest, DropDatabaseWaitsForDropPendingCollectionOpTimeIfNoCollectionsAreDropped) {
+    repl::OpTime clientLastOpTime;
+
+    // Update ReplicationCoordinatorMock so that we record the optime passed to awaitReplication().
+    _replCoord->setAwaitReplicationReturnValueFunction(
+        [&clientLastOpTime, this](const repl::OpTime& opTime) {
+            clientLastOpTime = opTime;
+            ASSERT_GREATER_THAN(clientLastOpTime, repl::OpTime());
+            return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
+        });
+
     repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
     auto dpns = _nss.makeDropPendingNamespace(dropOpTime);
     _testDropDatabase(_opCtx.get(), _opObserver, dpns, false);
+
+    ASSERT_EQUALS(dropOpTime, clientLastOpTime);
+}
+
+TEST_F(DropDatabaseTest, DropDatabasePassedThroughAwaitReplicationErrorForDropPendingCollection) {
+    // Update ReplicationCoordinatorMock so that we record the optime passed to awaitReplication().
+    _replCoord->setAwaitReplicationReturnValueFunction([this](const repl::OpTime& opTime) {
+        ASSERT_GREATER_THAN(opTime, repl::OpTime());
+        return repl::ReplicationCoordinator::StatusAndDuration(
+            Status(ErrorCodes::WriteConcernFailed, ""), Milliseconds(0));
+    });
+
+    repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
+    auto dpns = _nss.makeDropPendingNamespace(dropOpTime);
+    _createCollection(_opCtx.get(), dpns);
+
+    ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, dropDatabase(_opCtx.get(), _nss.db().toString()));
 }
 
 TEST_F(DropDatabaseTest, DropDatabaseSkipsSystemDotIndexesCollectionWhenDroppingCollections) {
@@ -272,6 +311,119 @@ TEST_F(DropDatabaseTest, DropDatabaseResetsDropPendingStateOnException) {
                                 "onDropCollection() failed");
 
     ASSERT_FALSE(db->isDropPending(_opCtx.get()));
+}
+
+void _testDropDatabaseResetsDropPendingStateIfAwaitReplicationFails(OperationContext* opCtx,
+                                                                    const NamespaceString& nss,
+                                                                    bool expectDbPresent) {
+    _createCollection(opCtx, nss);
+
+    ASSERT_TRUE(AutoGetDb(opCtx, nss.db(), MODE_X).getDb());
+
+    ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, dropDatabase(opCtx, nss.db().toString()));
+
+    AutoGetDb autoDb(opCtx, nss.db(), MODE_X);
+    auto db = autoDb.getDb();
+    if (expectDbPresent) {
+        ASSERT_TRUE(db);
+        ASSERT_FALSE(db->isDropPending(opCtx));
+    } else {
+        ASSERT_FALSE(db);
+    }
+}
+
+TEST_F(DropDatabaseTest,
+       DropDatabaseResetsDropPendingStateIfAwaitReplicationFailsAndDatabaseIsPresent) {
+    // Update ReplicationCoordinatorMock so that awaitReplicationOfLastOpForClient() fails.
+    _replCoord->setAwaitReplicationReturnValueFunction([](const repl::OpTime&) {
+        return repl::ReplicationCoordinator::StatusAndDuration(
+            Status(ErrorCodes::WriteConcernFailed, ""), Milliseconds(0));
+    });
+
+    _testDropDatabaseResetsDropPendingStateIfAwaitReplicationFails(_opCtx.get(), _nss, true);
+}
+
+TEST_F(DropDatabaseTest,
+       DropDatabaseResetsDropPendingStateIfAwaitReplicationFailsAndDatabaseIsMissing) {
+    // Update ReplicationCoordinatorMock so that awaitReplicationOfLastOpForClient() fails.
+    _replCoord->setAwaitReplicationReturnValueFunction([this](const repl::OpTime&) {
+        _removeDatabaseFromCatalog(_opCtx.get(), _nss.db());
+        return repl::ReplicationCoordinator::StatusAndDuration(
+            Status(ErrorCodes::WriteConcernFailed, ""), Milliseconds(0));
+    });
+
+    _testDropDatabaseResetsDropPendingStateIfAwaitReplicationFails(_opCtx.get(), _nss, false);
+}
+
+TEST_F(DropDatabaseTest,
+       DropDatabaseReleasesLocksWhileCallingAwaitReplicationIfCalledWhileHoldingGlobalLock) {
+    // The applyOps command holds the global lock while calling dropDatabase().
+    // dropDatabase() should detect this and release the global lock temporarily if it needs to call
+    // ReplicationCoordinator::awaitReplicationOfLastOpForClient().
+    bool isAwaitReplicationCalled = false;
+    _replCoord->setAwaitReplicationReturnValueFunction([&, this](const repl::OpTime& opTime) {
+        isAwaitReplicationCalled = true;
+        ASSERT_EQUALS(opTime, repl::OpTime());
+        ASSERT_FALSE(_opCtx->lockState()->isW());
+        ASSERT_FALSE(_opCtx->lockState()->isDbLockedForMode(_nss.db(), MODE_X));
+        ASSERT_FALSE(_opCtx->lockState()->isLocked());
+        return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
+    });
+
+    {
+        Lock::GlobalWrite lk(_opCtx.get());
+        _testDropDatabase(_opCtx.get(), _opObserver, _nss, true);
+    }
+
+    ASSERT_TRUE(isAwaitReplicationCalled);
+}
+
+TEST_F(DropDatabaseTest,
+       DropDatabaseReleasesLocksWhileCallingAwaitReplicationForDropPendingCollection) {
+    // The applyOps command holds the global lock while calling dropDatabase().
+    // dropDatabase() should detect this and release the global lock temporarily if it needs to call
+    // ReplicationCoordinator::awaitReplication().
+    bool isAwaitReplicationCalled = false;
+    _replCoord->setAwaitReplicationReturnValueFunction([&, this](const repl::OpTime& opTime) {
+        isAwaitReplicationCalled = true;
+        ASSERT_GREATER_THAN(opTime, repl::OpTime());
+        ASSERT_FALSE(_opCtx->lockState()->isW());
+        ASSERT_FALSE(_opCtx->lockState()->isDbLockedForMode(_nss.db(), MODE_X));
+        ASSERT_FALSE(_opCtx->lockState()->isLocked());
+        return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
+    });
+
+    repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
+    auto dpns = _nss.makeDropPendingNamespace(dropOpTime);
+    _createCollection(_opCtx.get(), dpns);
+
+    {
+        Lock::GlobalWrite lk(_opCtx.get());
+        ASSERT_OK(dropDatabase(_opCtx.get(), _nss.db().toString()));
+    }
+
+    ASSERT_TRUE(isAwaitReplicationCalled);
+}
+
+TEST_F(DropDatabaseTest,
+       DropDatabaseReturnsNamespaceNotFoundIfDatabaseIsRemovedAfterCollectionsDropsAreReplicated) {
+    // Update ReplicationCoordinatorMock so that awaitReplicationOfLastOpForClient() fails.
+    _replCoord->setAwaitReplicationReturnValueFunction([this](const repl::OpTime&) {
+        _removeDatabaseFromCatalog(_opCtx.get(), _nss.db());
+        return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
+    });
+
+    _createCollection(_opCtx.get(), _nss);
+
+    ASSERT_TRUE(AutoGetDb(_opCtx.get(), _nss.db(), MODE_X).getDb());
+
+    auto status = dropDatabase(_opCtx.get(), _nss.db().toString());
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
+    ASSERT_EQUALS(status.reason(),
+                  str::stream() << "Could not drop database " << _nss.db()
+                                << " because it does not exist after dropping 1 collection(s).");
+
+    ASSERT_FALSE(AutoGetDb(_opCtx.get(), _nss.db(), MODE_X).getDb());
 }
 
 }  // namespace

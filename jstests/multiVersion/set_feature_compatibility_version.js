@@ -173,7 +173,8 @@
     rst.startSet();
     rst.initiate();
 
-    primaryAdminDB = rst.getPrimary().getDB("admin");
+    let primary = rst.getPrimary();
+    primaryAdminDB = primary.getDB("admin");
     assert.commandWorked(primaryAdminDB.runCommand({setFeatureCompatibilityVersion: "3.4"}));
     let secondary = rst.add({binVersion: downgrade});
     secondaryAdminDB = secondary.getDB("admin");
@@ -183,7 +184,6 @@
     replSetConfig = rst.getReplSetConfig();
     replSetConfig.version = 3;
     replSetConfig.members[1].priority = 0;
-    replSetConfig.members[1].votes = 0;
 
     // The default value for 'catchUpTimeoutMillis' on 3.6 is -1. A 3.4 secondary will refuse to
     // join a replica set with catchUpTimeoutMillis=-1.
@@ -195,8 +195,17 @@
         primaryAdminDB.getSiblingDB("test").coll.insert({awaitRepl: true}, {writeConcern: {w: 2}}));
 
     // Test that a 3.4 secondary crashes when syncing from a 3.6 primary and the
-    // featureCompatibilityVersion is set to 3.6.
-    assert.commandWorked(primaryAdminDB.runCommand({setFeatureCompatibilityVersion: "3.6"}));
+    // featureCompatibilityVersion is set to 3.6. The primary may step down before the command
+    // returns.
+    assert.adminCommandWorkedAllowingNetworkError(primary, {setFeatureCompatibilityVersion: "3.6"});
+    assert.soon(function() {
+        try {
+            secondaryAdminDB.runCommand({ping: 1});
+        } catch (e) {
+            return true;
+        }
+        return false;
+    }, "Expected 3.4 secondary to terminate due to replicating featureCompatibilityVersion=3.6");
     rst.stop(secondary, undefined, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
     rst.stopSet();
 
@@ -322,6 +331,36 @@
     assert.commandWorked(res);
     assert.eq(res.featureCompatibilityVersion, "3.4");
 
+    // Shard some collections before upgrade, to ensure UUIDs are generated for them on upgrade.
+    // This specifically tests 3.4 -> 3.6 upgrade behavior.
+    let dbName = "test";
+    assert.commandWorked(mongosAdminDB.runCommand({enableSharding: dbName}));
+    let existingShardedCollNames = [];
+    for (let i = 0; i < 5; i++) {
+        let collName = "coll" + i;
+        assert.commandWorked(
+            mongosAdminDB.runCommand({shardCollection: dbName + "." + collName, key: {_id: 1}}));
+        existingShardedCollNames.push(collName);
+    }
+
+    // Additionally simulate that some sharded collections already have UUIDs from a previous failed
+    // upgrade attempt (for example, due to repeated config server failover).
+    let existingShardedCollEntriesWithUUIDs = [];
+    for (let i = 0; i < 3; i++) {
+        let collName = "collWithUUID" + i;
+        let collEntry = {
+            _id: dbName + "." + collName,
+            lastmod: ISODate(),
+            dropped: false,
+            key: {_id: 1},
+            unique: false,
+            lastmodEpoch: ObjectId(),
+            uuid: UUID()
+        };
+        assert.writeOK(st.s.getDB("config").collections.insert(collEntry));
+        existingShardedCollEntriesWithUUIDs.push(collEntry);
+    }
+
     // featureCompatibilityVersion can be set to 3.6 on mongos.
     assert.commandWorked(mongosAdminDB.runCommand({setFeatureCompatibilityVersion: "3.6"}));
     res = st.configRS.getPrimary().getDB("admin").runCommand(
@@ -337,6 +376,21 @@
     assert.eq(
         shardPrimaryAdminDB.system.version.findOne({_id: "featureCompatibilityVersion"}).version,
         "3.6");
+
+    // Check that the existing sharded collections that did not have UUIDs were assigned new UUIDs,
+    // and existing sharded collections that already had a UUID (from the simulated earlier failed
+    // upgrade attempt) were *not* assigned new UUIDs.
+    // This specifically tests 3.4 -> 3.6 upgrade behavior.
+    existingShardedCollNames.forEach(function(collName) {
+        let collEntry = st.s.getDB("config").collections.findOne({_id: dbName + "." + collName});
+        assert.neq(null, collEntry);
+        assert.hasFields(collEntry, ["uuid"]);
+    });
+    existingShardedCollEntriesWithUUIDs.forEach(function(expectedEntry) {
+        let actualEntry = st.s.getDB("config").collections.findOne({_id: expectedEntry._id});
+        assert.neq(null, actualEntry);
+        assert.docEq(expectedEntry, actualEntry);
+    });
 
     latestShard.stopSet();
     st.stop();

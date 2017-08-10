@@ -513,7 +513,13 @@ public:
             return false;
         }
 
-        return appendCommandStatus(result, dropCollection(opCtx, nsToDrop, result));
+        return appendCommandStatus(
+            result,
+            dropCollection(opCtx,
+                           nsToDrop,
+                           result,
+                           {},
+                           DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
     }
 
 } cmdDrop;
@@ -705,7 +711,7 @@ public:
         BSONObj query = BSON("files_id" << jsobj["filemd5"] << "n" << GTE << n);
         BSONObj sort = BSON("files_id" << 1 << "n" << 1);
 
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        return writeConflictRetry(opCtx, "filemd5", dbname, [&] {
             auto qr = stdx::make_unique<QueryRequest>(nss);
             qr->setFilter(query);
             qr->setSort(sort);
@@ -714,7 +720,7 @@ public:
                 opCtx, std::move(qr), ExtensionsCallbackDisallowExtensions());
             if (!statusWithCQ.isOK()) {
                 uasserted(17240, "Can't canonicalize query " + query.toString());
-                return 0;
+                return false;
             }
             unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -725,17 +731,11 @@ public:
                 new AutoGetCollectionForReadCommand(opCtx, nss));
             Collection* coll = ctx->getCollection();
 
-            auto statusWithPlanExecutor = getExecutor(opCtx,
-                                                      coll,
-                                                      std::move(cq),
-                                                      PlanExecutor::YIELD_MANUAL,
-                                                      QueryPlannerParams::NO_TABLE_SCAN);
-            if (!statusWithPlanExecutor.isOK()) {
-                uasserted(17241, "Can't get executor for query " + query.toString());
-                return 0;
-            }
-
-            auto exec = std::move(statusWithPlanExecutor.getValue());
+            auto exec = uassertStatusOK(getExecutor(opCtx,
+                                                    coll,
+                                                    std::move(cq),
+                                                    PlanExecutor::YIELD_MANUAL,
+                                                    QueryPlannerParams::NO_TABLE_SCAN));
 
             BSONObj obj;
             PlanExecutor::ExecState state;
@@ -796,9 +796,9 @@ public:
 
             result.append("numChunks", n);
             result.append("md5", digestToString(d));
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "filemd5", dbname);
-        return true;
+
+            return true;
+        });
     }
 
     void dumpChunks(OperationContext* opCtx,
