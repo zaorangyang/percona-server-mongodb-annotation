@@ -42,16 +42,18 @@ Status InMemoryGlobalOptions::add(moe::OptionSection* options) {
                            moe::Double,
                            "The maximum memory in gigabytes to use for InMemory storage. "
                            "See documentation for default.");
+
+    // hidden options
     inMemoryOptions
         .addOptionChaining("storage.inMemory.engineConfig.statisticsLogDelaySecs",
                            "inMemoryStatisticsLogDelaySecs",
                            moe::Int,
                            "The number of seconds between writes to statistics log. "
                            "If 0 is specified then statistics will not be logged.")
+        // FTDC supercedes inMemory's statistics logging.
+        .hidden()
         .validRange(0, 100000)
         .setDefault(moe::Value(0));
-
-    // hidden options
     inMemoryOptions
         .addOptionChaining("storage.inMemory.engineConfig.configString",
                            "inMemoryEngineConfigString",
